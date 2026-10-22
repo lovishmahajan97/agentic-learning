@@ -5,7 +5,8 @@ name: Fallbacks
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - system-design/model-fallback-strategies
   - reliability/circuit-breakers
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-A fallback is a pre-decided alternative when the primary fails or is slow: another endpoint, a smaller
-model, a cached answer, or an honest "unavailable". Retrying a broken target burns the latency budget;
-the hard parts are fast decisions, compatibility and protecting the backup.
+A fallback is the pre-decided next move when an agent's model call fails or stalls: another endpoint, a
+smaller model, a cached answer, or an honest "unavailable". The hard parts are tool-schema
+compatibility, one deadline and never repeating a side effect.
+
+## For agent builders
+- **Why it matters for agents.** A 15-step run touches the provider 15 times, so one bad minute hits far
+  more runs than chat. A fallback model must also speak your tool-calling format, or the run fails at the
+  next step instead of this one.
+- **Where it shows up in your stack.** LangChain's `.with_fallbacks()` on a chat model or chain, LiteLLM
+  router fallbacks, gateways such as OpenRouter or Portkey, and LangSmith traces where you tag which model
+  served each step.
+- **What you control.** The ladder per step type (planner, tool-argument writer, summariser), which
+  errors fail over, the run's shared deadline, and whether a step that already fired a tool may be
+  replayed on another model.
+- **What you can skip.** Circuit-breaker theory beyond "rate-based, with a minimum call count, and a
+  half-open probe". Gateways implement the rest.
 
 ## Why it exists
 - **Hosted models fail in ways a retry cannot fix.** A provider returns 529 overloaded or 429 for minutes
@@ -123,9 +137,23 @@ The fallback must receive an equivalent request:
   response under a new message id (so the client can discard the partial one) or surfaces an error with a
   retry button.
 
+### Fallbacks inside an agent loop
+An agent changes three things about the ladder:
+1. **Fall back per step, not per run.** Step 9 failing does not mean restarting at step 1; the transcript
+   so far is the state, so the next rung receives the same history and continues.
+2. **Tool-calling parity is a hard requirement.** Every rung must accept your tool definitions and return
+   well-formed tool calls. A rung that answers in prose ends the run at the next parse, so evaluate tool
+   selection and argument accuracy per rung, not just answer quality.
+3. **Side effects pin the step.** If the primary's tool call may have executed (timeout after dispatch),
+   the fallback must not regenerate and re-run it. Check the tool's idempotency key or its result store
+   first.
+- **Mixed-model transcripts.** After a fallback the history contains another model's turns. Most chat
+  APIs accept that, but provider-specific content (thinking blocks, cached-prompt markers, vendor tool-call
+  ids) may need stripping or translating when the run switches vendor.
+
 ## Diagram
-Trace one request down the ladder: each rung is skipped if its breaker is open, request-specific errors
-stop the chain, and every rung shares the same remaining deadline.
+Trace one agent step's model call down the ladder: each rung is skipped if its breaker is open,
+request-specific errors stop the chain, and every rung shares the run's remaining deadline.
 
 ```mermaid
 flowchart TD
@@ -215,7 +243,46 @@ for p in (0.2, 0.6):
 # error rate 60%: P(5 in a row) = 0.0778, about 1 in 13 windows     -> opens and closes repeatedly
 ```
 
+### Agent step with a tool-compatible fallback (LangChain)
+Bind the tools to *each* model before chaining them, because the fallback wrapper does not carry the
+primary's tool binding. Only transient errors fail over; a 400 from a bad tool schema still raises.
+
+```python
+import anthropic
+from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI
+
+tools = [search_tickets, create_ticket]          # your @tool functions
+
+primary = ChatAnthropic(model="primary-model", timeout=10, max_retries=1).bind_tools(tools)
+second = ChatOpenAI(model="evaluated-fallback-model", timeout=10, max_retries=1).bind_tools(tools)
+
+agent_llm = primary.with_fallbacks(
+    [second],
+    exceptions_to_handle=(anthropic.RateLimitError, anthropic.InternalServerError,
+                          anthropic.APITimeoutError, anthropic.APIConnectionError),
+)
+
+msg = agent_llm.invoke(history)                  # same transcript, either model
+for call in msg.tool_calls:                      # check the step's idempotency key before executing
+    run_tool_once(call, key=f"{run_id}:{step}:{call['name']}")
+```
+
+### Worked scenario: a 15-step support agent during a 529 burst
+Illustrative: primary fails 20% of calls with fast 529s for 30 minutes; each run makes 15 model calls.
+
+| Design | Runs that hit at least one failure | Outcome |
+|---|---|---|
+| No fallback, no retry | 1 − 0.8^15 ≈ 96% | almost every run errors out somewhere |
+| One retry on the same target | per call 0.2² = 4% fail, so 1 − 0.96^15 ≈ 46% | still about half the runs fail |
+| One retry, then a tool-compatible fallback | near zero, if the fallback is healthy and provisioned | runs finish; trace shows mixed served_by tags |
+| Fallback without tool parity | the step "succeeds" in prose | run fails at the next tool-call parse instead |
+
 ## Production patterns
+- **Per-step ladders with tool-call evals.** Agent teams give the planner and tool-calling steps a
+  ladder whose every rung passed the tool-selection and argument evals, and may give summarisation steps
+  a cheaper ladder. Tag each step's span in LangSmith or your tracer with served_by and fallback reason;
+  monitor run success rate by served_by mix.
 - **Same model in a second region first.** When a provider or cloud offers the model in several regions
   or platforms, make that rung one, because prompts and evals carry over. Monitor per-target error rate
   and latency per rung.
@@ -244,6 +311,10 @@ for p in (0.2, 0.6):
   provider is cheaper when the risk you fear is regional rather than vendor-wide.
 - **Degraded answers vs honesty.** Non-LLM answers keep the interface alive, but presenting a cached or
   templated response as fresh can be worse than an honest error for time-sensitive questions.
+- **Switching models mid-run vs restarting the run.** Continuing on the fallback keeps the work already
+  done, but the run mixes two models' reasoning styles and tool habits. When the fallback is much weaker
+  at planning, restarting the whole run on one model (or failing it cleanly) gives more predictable
+  results.
 
 ## Pitfalls
 - **A fallback that has never served traffic.** Symptom: fallback rate and error rate spike together in
@@ -258,10 +329,14 @@ for p in (0.2, 0.6):
   rate, because output formatting quirks differ between models and the parser was tuned to one.
 - **Falling back after a side effect.** Symptom: duplicate tickets or emails whenever the primary times
   out mid-tool-call, an idempotency problem the fallback exposes.
+- **A fallback that never sees the tools.** Symptom: during an incident the agent stops calling tools and
+  answers in prose, or the parser fails on every fallback step. Cause: tools were bound to the primary
+  only, or the fallback model does not support the schema. Fix: bind tools per rung and eval each rung.
 
 ## When to use
 - **Use when** an LLM call sits on a user-facing path with an availability target one provider cannot
-  meet alone, and wherever a cheaper degraded answer is genuinely acceptable.
+  meet alone, and wherever a cheaper degraded answer is genuinely acceptable. Multi-step agents need it
+  sooner than chat, because each run makes many calls.
 - **Avoid when** a worse answer is worse than no answer, or when the "fallback" would silently change
   compliance posture.
 - **Build order:** same model on a second endpoint first (preserves prompts and evals), a smaller model
@@ -310,12 +385,6 @@ failing over tool-executing turns without idempotency keys, which would duplicat
 - **No breaker is open,** so every request still pays the primary's full timeout first.
 - **Fix:** one deadline per request with each rung given the remainder, plus a rate-based breaker per target.
 
-### When would you deliberately not add a fallback?
-- **When a worse answer is worse than none,** such as medical triage, where failing closed is correct.
-- **When the backup changes compliance posture,** for example moving data to a vendor or region the
-  customer has not approved.
-- **When the fallback has not been evaluated** against the product's accuracy bar.
-
 ### How do you size and verify quota on a backup provider?
 - **Size for the share that will move:** if the primary fails on about 20% of requests, the backup needs
   quota for about a fifth of peak; for a full outage, all of it.
@@ -326,6 +395,20 @@ failing over tool-executing turns without idempotency keys, which would duplicat
 - **Tokens are already on the user's screen,** and a different model will not continue the same sentence.
 - **Decide before the first byte;** after that, restart under a new message id so the client discards the
   partial answer, or surface an error with a retry button.
+
+### Your agent's primary model times out at step 9, right after emitting a create_ticket call. How should the fallback behave?
+- **Find out whether the tool ran.** The timeout may have fired after dispatch, so look up the step's
+  idempotency key or the ticket system before doing anything else.
+- **If it ran, record the result and continue** on the fallback with that tool result appended; do not let
+  the fallback regenerate the call, which would create a second ticket.
+- **If it did not, the fallback gets the same transcript** and makes its own call, under the same key.
+
+### How do you choose and validate a fallback model for a tool-calling agent?
+- **Tool-calling parity first:** it must accept your tool schemas and structured-output mode, and fit the
+  run's context length with its own tokenizer.
+- **Evaluate per step type** on recorded agent traces: tool selection accuracy, argument validity and
+  task success, not just answer quality.
+- **Keep it warm** with a few percent of live runs and alert on run success rate broken down by served_by.
 
 ## Quiz
 ### Q: Why put a circuit breaker in front of the primary model instead of simply catching its errors and calling the fallback?

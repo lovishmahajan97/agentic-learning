@@ -5,7 +5,8 @@ name: Queueing theory
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - infra-capacity-economics/capacity-planning
   - infra-capacity-economics/latency-budgets
@@ -21,30 +22,42 @@ sources:
 ---
 
 ## TL;DR
-Random arrivals plus variable service times mean waiting, and waiting grows non-linearly near 100%
-utilization: in a 16-slot fleet, 75% to 95% busy multiplies mean queue wait about twentyfold. Little's
-law, M/M/c and Kingman predict that knee early.
+Each agent task fans out into many model calls, each able to queue. Near full utilization waiting grows
+non-linearly (75% to 95% busy is about 20× the mean wait in a 16-slot fleet), and an 8-step agent pays
+it eight times.
+
+## For agent builders
+- **Why it matters for agents.** One user task becomes 5-20 LLM calls plus tool calls, so the arrival
+  rate your model fleet or provider sees is tasks per second times calls per task. Queue wait is paid
+  on every step, so a small per-call wait becomes a large per-task delay.
+- **Where it shows up in your stack.** Provider rate limits (requests and tokens per minute), the engine
+  concurrency cap (vLLM `--max-num-seqs`) on self-hosted models, your gateway queue, and per-step spans in
+  traces (LangSmith, Langfuse or OpenTelemetry) where queue wait and model time appear side by side.
+- **What you control.** Concurrency caps per agent run and per tenant, retry policy inside the agent
+  loop, `max_tokens` per step, and whether long batch agents share a queue with interactive ones.
+- **What you can skip.** Deriving Erlang C. Know Little's law, the ρ/(1−ρ) knee, and that variability
+  makes it worse; use the code below for the numbers.
 
 ## Why it exists
 - **The naive model is division.** A replica handles 4 requests per second, peak traffic is 40, so buy
   10 replicas. That assumes evenly spaced arrivals and every request taking exactly the average time.
-  Neither is true.
-- **Arrivals are bursty and LLM service times vary wildly.** Users arrive in uncoordinated bursts, and
-  output length varies: one request generates 20 tokens, the next 2,000. When three long requests land
-  together everything behind them waits, and the server cannot "bank" idle time from a minute ago.
-- **Latency bends long before the cliff.** It is not flat until capacity; it curves upward well before
-  100% utilization. Teams that size to the mean see fine dashboards at 60% load and mysterious p99
-  explosions at 85%, with no code change.
+  Neither is true, and agents make both worse.
+- **Arrivals are bursty and LLM service times vary wildly.** Users arrive in uncoordinated bursts, an agent
+  fires several calls in quick succession, and output length varies: one request generates 20 tokens, the
+  next 2,000. When three long requests land together everything behind them waits, and the server cannot
+  "bank" idle time from a minute ago.
+- **Latency bends long before the cliff.** It curves upward well before 100% utilization. Teams that size
+  to the mean see fine dashboards at 60% load and mysterious p99 explosions at 85%, with no code change.
 - **It quantifies the curve.** How much waiting a utilization buys, how variability makes it worse, and
   how pooling, admission control and headroom make it better.
-- **It bridges two teams' numbers.** Throughput measured by serving and latency promised by product.
-  Without it, "how much headroom do we need" gets nothing better than a guess.
+- **It bridges two teams' numbers.** Throughput measured by serving and task latency promised by product.
+  Without it, "how much headroom do our agents need" gets nothing better than a guess.
 
 ## How it works
 ### Vocabulary
 | Symbol | Meaning |
 |---|---|
-| **λ (lambda)** | Arrival rate, requests per second |
+| **λ (lambda)** | Arrival rate, requests per second; for agents, tasks/s × model calls per task |
 | **μ (mu)** | Service rate of one server, so mean service time is 1/μ |
 | **c** | Number of servers; for an LLM think *concurrency slots*, not machines (see below) |
 | **ρ = λ / (c·μ)** | Utilization, fraction of time servers are busy; must stay below 1 or the queue grows without bound |
@@ -58,6 +71,8 @@ law, M/M/c and Kingman predict that knee early.
   at least 300 concurrent slots across the fleet before any headroom.
 - **Backwards.** If a gateway caps in-flight requests at L and latency is W, the best throughput you can
   see is L/W.
+- **Twice for agents.** Apply it to tasks (tasks/s × task duration = concurrent agent runs, which sizes
+  memory and worker pools) and again to model calls (calls/s × call latency = model slots).
 
 ### Why waiting explodes: the 1/(1−ρ) term
 - **M/M/1** (one server, random Poisson arrivals, exponential service): W = 1/(μ − λ) and
@@ -82,7 +97,8 @@ Wq ≈ ( ρ / (1 − ρ) ) × ( (Ca² + Cs²) / 2 ) × mean_service_time
 
 - **Ca and Cs** are coefficients of variation (std dev / mean) of inter-arrival times and service times.
 - **Three levers:** utilization; *arrival* variability (bursts, retry storms, batch jobs released on the
-  hour); *service* variability (output-length spread, tool calls, cache hits vs misses).
+  hour, agents firing calls back to back); *service* variability (output-length spread, tool calls, cache
+  hits vs misses).
 - **LLM traffic is high-variance.** Cs is often around or above 1 (an exponential has exactly 1), and
   agentic traffic with tool calls and long-tail outputs can push it higher. When Cs > 1, queues are worse
   than a textbook M/M/1 at the same utilization.
@@ -96,8 +112,8 @@ wait, and the mean wait. Two results matter:
 1. **Larger pools tolerate higher utilization at the same wait**, because a burst is more likely to find
    some server free. This is statistical multiplexing.
 2. **One shared queue beats several separate ones of the same total capacity**, because separate queues
-   can leave one pool idle while another is backed up. Every dedicated per-tenant or per-model pool pays
-   this tax.
+   can leave one pool idle while another is backed up. Every dedicated per-tenant, per-agent or per-model
+   pool pays this tax.
 
 ### Mapping it onto LLM serving
 - **A replica is many servers.** With continuous batching it serves many sequences at once, and each
@@ -105,7 +121,7 @@ wait, and the mean wait. Two results matter:
 - **Workable approximation:** treat each replica as roughly `max_concurrent_sequences` servers whose
   service time is the measured latency *at that concurrency*.
 - **The queue is wherever requests wait for a slot:** the engine's waiting list, the gateway, or a
-  provider's rate limiter.
+  provider's rate limiter (a 429 from a provider is its admission control talking).
 - **Measure under load.** Take service time and its variance from real traffic, not a single-request
   benchmark, because per-request speed depends on load.
 
@@ -122,32 +138,36 @@ P(Wq > t) = P(wait) × exp(−(c·μ − λ)·t)      →   t_p = ln(P(wait) / (
   proportion.
 - **In the 16-slot example below** p99 queue wait is about 3 s at 75% utilization and about 22 s at 95%,
   while the mean goes from 0.2 s to 3.9 s. Planning on the mean hides most of the damage an SLO will see.
+- **Agent tasks compound it.** An 8-step task adds eight queue waits; means add exactly, and the chance
+  that at least one step hits a tail wait rises with every step.
 
 ### Open versus closed load, and queue order
-- **Open system:** arrivals keep coming regardless of how slow you are. True of public traffic, and what
-  the formulas above assume.
+- **Open system:** arrivals keep coming regardless of how slow you are. True of public traffic and of new
+  agent tasks, and what the formulas above assume.
 - **Closed system:** a fixed population waits for each response before sending the next (a load test with
-  N virtual users, or an agent calling the model, then a tool, then the model again).
+  N virtual users, or one agent calling the model, then a tool, then the model again).
 - **Closed systems self-throttle**, because slow responses delay the next request. So a closed-loop load
   test reports gentler latency than real open traffic at the same throughput.
-- **FIFO hurts short requests.** One 2,000-token job can delay many 20-token ones.
+- **FIFO hurts short requests.** One 2,000-token job can delay many 20-token ones, such as an agent's
+  quick routing or tool-selection call.
 - **Priority classes or shortest-expected-job-first** cut mean wait for interactive traffic, at the price
   of possible starvation for long jobs unless they are aged up or given reserved capacity.
 
 ## Diagram
-Requests arrive, pass admission, wait for a free slot, then hold it for one service time. Retries feed
-back into arrivals, which is why they make saturation worse.
+Agent steps arrive, pass admission, wait for a free slot, then hold it for one service time. Retries and
+the agent's next step both feed back into arrivals, which is why saturation compounds.
 
 ```mermaid
 flowchart TD
-    A["Arrivals at rate lambda"] --> G{"Gateway: queue below cap?"}
+    T["Agent tasks: tasks/s x calls"] --> G{"Gateway: queue below cap?"}
     G -->|"no"| R["Reject fast: 429"]
     G -->|"yes"| Q[("Shared queue: Wq")]
     Q --> S{"Free slot among c?"}
     S -->|"no, wait"| Q
     S -->|"yes"| P["Hold slot for 1/mu"]
-    P --> D["Response: W = Wq + 1/mu"]
-    R -.->|"client retry raises lambda"| A
+    P --> D["Step result: W = Wq + 1/mu"]
+    D -.->|"next agent step"| T
+    R -.->|"client retry raises lambda"| T
     Q -.->|"deadline passed"| X["Drop stale request"]
 ```
 
@@ -190,9 +210,25 @@ print(mmc(3.5, mu, 16)[2], mmc(1.75, mu, 8)[2])   # pooled 16 slots: ~1.0 s; spl
   than doubles the wait.
 - **Little's law** holds throughout: L = λ·W in every row.
 
-### Sizing slots for a p99 queue-wait target
+### Worked scenario: queue wait compounds across agent steps
+Same 16-slot fleet, but every request is one step of an 8-step agent task. Mean task-level queue wait is
+8 × the per-call mean (means add; tails do not, so the p99 task is worse than this column suggests).
+
+| Arrival rate (calls) | ρ | Mean Wq per call | Added queue wait per 8-step task |
+|---|---|---|---|
+| 3.0 req/s | 0.75 | 0.20 s | ~1.6 s |
+| 3.5 req/s | 0.88 | 1.02 s | ~8.1 s |
+| 3.8 req/s | 0.95 | 3.90 s | ~31.2 s |
+
+- **The user feels the right column.** A per-call dashboard reading "Wq under 4 s" hides half a minute of
+  pure waiting per task at 95% utilization.
+- **Retries inside the loop raise λ.** A 10% step-retry rate turns 3.5 calls/s into 3.85, already past the
+  0.95 row.
+
+### Sizing slots for an agent workload
 This uses the tail formula above with the numerically stable Erlang B recursion, so it works for
-hundreds of slots where `factorial` would overflow. Same M/M/c idealization.
+hundreds of slots where `factorial` would overflow. Same M/M/c idealization. `agent_slots` converts task
+traffic into model-call traffic first.
 
 ```python
 from math import log
@@ -218,9 +254,15 @@ def slots_for(lam, mu, target_s, p=0.99):
         c += 1
     return c
 
+def agent_slots(tasks_per_s, calls_per_task, retry_rate, call_s, target_s=1.0):
+    lam = tasks_per_s * calls_per_task * (1 + retry_rate)   # model calls per second
+    return slots_for(lam, 1 / call_s, target_s)
+
 print(round(wait_pct(3.8, 1 / 4, 16), 1))   # 21.8 s p99 wait at rho 0.95
 print(slots_for(3.8, 1 / 4, 1.0))           # 23 slots for p99 wait <= 1 s
 print(slots_for(50, 1 / 6, 1.0))            # 319 slots: Little's law floor is 300
+print(agent_slots(0.5, 8, 0.0, 4))          # 24 slots: 0.5 tasks/s x 8 calls = 4 calls/s
+print(agent_slots(0.5, 8, 0.1, 4))          # 26 slots once 10% of steps retry
 ```
 
 | Fleet | Little's law floor | Slots for p99 wait ≤ 1 s | Utilization at that size |
@@ -244,25 +286,27 @@ The p99 grows faster than the mean, so an SLO on p99 binds long before the mean 
 - **Cap concurrency and reject fast.** When load can exceed capacity, cap in-flight sequences per replica
   (for example vLLM's `--max-num-seqs`) and bound the gateway queue; beyond it return 429 or 503 with a
   `Retry-After` header. Monitor queue depth, queue wait p99 and rejection rate.
-- **Set utilization targets from the SLO, not from cost.** Compute slots with Little's law, then add
-  headroom from an M/M/c tail estimate like the one above. Autoscale on slot occupancy or queue wait
-  rather than CPU, and alert when occupancy stays above the planned ρ.
-- **Separate queues for long and batch work.** Route requests with large expected output or offline
-  batch jobs to their own pool or a lower-priority class, so interactive traffic sees lower Cs. Monitor
-  each class's queue wait and the batch pool's idle time.
-- **Retry with exponential backoff, jitter and a budget.** Clients should never retry immediately on
-  timeout; cap retries as a fraction of total traffic. Monitor the ratio of attempted requests to
-  successful completions; a rising gap signals a retry storm.
-- **Deadline-aware queues.** Attach a deadline to each request and drop it from the queue once the client
-  has given up, so the fleet does not do work nobody is waiting for. Monitor drops and client
-  cancellations.
-- **Open-loop load tests.** Drive a fixed arrival rate (for example k6's `constant-arrival-rate`
-  executor) and replay real output-length distributions, then sweep the rate up to find the knee.
+- **Size from tasks, not calls alone.** Multiply task rate by measured calls per task (from traces) and
+  by the retry rate, then run Little's law and an M/M/c tail estimate. Autoscale on slot occupancy or
+  queue wait rather than CPU, and alert when occupancy stays above the planned ρ or calls per task drift.
+- **Separate queues for long and batch agents.** Route offline or long-horizon agent runs to their own
+  pool or a lower-priority class, so interactive agents see lower Cs. Monitor each class's queue wait and
+  the batch pool's idle time.
+- **One retry policy per stack, with a budget.** Retries with exponential backoff and jitter should live in
+  one layer (SDK, gateway or agent loop), never all three, because nested retries multiply λ during an
+  outage. Cap retries as a fraction of traffic and monitor attempted calls versus completed steps.
+- **Deadline-aware queues.** Attach the task's remaining deadline to each model call and drop it from the
+  queue once the user or orchestrator has given up, so the fleet does not do work nobody is waiting for.
+  Monitor drops and client cancellations.
+- **Open-loop load tests with real traces.** Drive a fixed task arrival rate (for example k6's
+  `constant-arrival-rate` executor) and replay recorded agent runs with their real step counts and output
+  lengths, then sweep the rate up to find the knee.
 
 ## Trade-offs
-- **High utilization vs latency.** It lowers cost per request, but queueing delay grows as ρ/(1−ρ). The
-  trade flips toward headroom as soon as a latency SLO, not throughput, is the binding requirement.
-- **Dedicated pools vs pooling.** Per-tenant or per-model pools give isolation and predictable
+- **High utilization vs latency.** It lowers cost per request, but queueing delay grows as ρ/(1−ρ), and an
+  agent pays it per step. The trade flips toward headroom as soon as a task latency SLO, not throughput, is
+  the binding requirement.
+- **Dedicated pools vs pooling.** Per-tenant or per-agent pools give isolation and predictable
   noisy-neighbour behaviour but lose pooling efficiency. They win only when isolation or compliance is
   worth the extra capacity.
 - **Larger batches vs per-request time.** Throughput per GPU rises but each request's service time
@@ -270,10 +314,15 @@ The p99 grows faster than the mean, so an SLO on p99 binds long before the mean 
   completion time.
 - **Separate long-job queue vs idle capacity.** It cuts service variability for interactive traffic, at
   the cost of a second pool that can sit idle. It pays off when output-length spread is large.
+- **Parallel tool or sub-agent calls vs burstiness.** Fanning out steps in parallel shortens one task but
+  raises Ca for everyone else; it pays when the fleet has headroom and hurts near the knee.
 
 ## Pitfalls
 - **Sizing capacity to mean traffic.** Symptom: p99 latency fine off-peak that spikes sharply during
   ordinary daily peaks with no deploy. Fix: size on peak arrival rate and the tail, with headroom.
+- **Counting tasks instead of calls.** Symptom: capacity plan says 40% utilization, provider returns 429s.
+  The agent makes 8-12 calls per task, so real λ is an order of magnitude higher. Fix: size from traced
+  calls per task.
 - **Benchmarking service time one request at a time.** Under real concurrency each request is slower, so
   the model underestimates ρ and the fleet saturates earlier than predicted. Fix: measure at target
   concurrency.
@@ -286,12 +335,12 @@ The p99 grows faster than the mean, so an SLO on p99 binds long before the mean 
   bound the queue and enforce deadlines.
 
 ## When to use
-- **Use when** someone proposes a utilization target, a replica count, a concurrency cap or a per-tenant
-  pool.
+- **Use when** someone proposes a utilization target, a replica count, a concurrency cap, a per-tenant
+  pool, or a new agent feature that adds steps per task.
 - **Order of tools:** Little's law first, because it needs no distribution assumptions; then M/M/c or
-  Kingman to sanity-check headroom; then a load test replaying real request-length distributions.
-- **Measure** arrival rate, slot occupancy, queue depth and queue wait separately from service time,
-  since only the split tells you whether to add capacity or reduce variability.
+  Kingman to sanity-check headroom; then a load test replaying real agent traces.
+- **Measure** task arrival rate, calls per task, slot occupancy, queue depth and queue wait separately
+  from service time, since only the split tells you whether to add capacity or reduce variability.
 - **Interviews:** explaining why 90% utilization is dangerous, and deriving in-flight concurrency from
   rate times latency, signals real production experience.
 
@@ -321,6 +370,13 @@ validate with a load test replaying real output-length distributions before laun
 - **Use:** at 50 req/s and 6 s latency you need at least 300 concurrent slots before headroom; run it
   backwards to get the throughput ceiling L/W from a gateway cap.
 
+### Your agent handles 0.5 tasks/s and each task makes 8 model calls of about 4 s. How many slots do you provision?
+- **Convert to calls first:** 0.5 × 8 = 4 calls/s; Little's law gives 4 × 4 = 16 slots busy on average.
+- **Add tail headroom:** an M/M/c estimate for p99 queue wait under 1 s gives about 24 slots, roughly 0.67
+  utilization; a 10% step-retry rate pushes it to about 26.
+- **Then validate** with an open-loop replay of real agent traces, since Cs for tool-heavy steps is
+  usually above the exponential assumption.
+
 ### p99 latency spikes every weekday at 9 a.m., but there was no deploy. How do you debug it?
 - **Split the latency:** compare queue wait with service time. If queue wait jumps while service time is
   flat, the fleet is saturating, not the model slowing.
@@ -328,6 +384,13 @@ validate with a load test replaying real output-length distributions before laun
   hour; check whether request rate climbs while completions stay flat.
 - **Fix in order:** spread or separately queue the batch arrivals, add backoff to retries, then add
   capacity sized from the tail, not the mean.
+
+### Per-call latency dashboards look healthy, but users say the agent got slow. What is going on?
+- **Queue wait compounds per step:** a 1 s mean wait is invisible per call but adds 8 s to an 8-step task,
+  and one tail wait anywhere in the chain stretches the whole task.
+- **Steps per task may have grown:** a prompt or tool change that adds two steps raises λ by 25% and
+  pushes the fleet up the knee.
+- **Fix:** trace task-level latency broken into queue, model and tool time, and alert on calls per task.
 
 ### When would you not pool all tenants into one shared queue?
 - **When isolation is worth the capacity tax:** compliance, a contractual SLO, or a tenant whose bursts
@@ -337,17 +400,12 @@ validate with a load test replaying real output-length distributions before laun
 - **Otherwise pool**, because one shared queue never leaves a slot idle while requests wait elsewhere,
   and larger pools run safely at higher utilization.
 
-### Why is a load test with a fixed number of virtual users misleading?
+### Why is a load test with a fixed number of virtual users misleading, and why do LLM queues behave worse than M/M/c?
 - **It is a closed system:** each user waits for a response before sending again, so slow responses lower
-  the arrival rate.
-- **Production is open:** users keep arriving regardless of latency, so queues grow without that brake.
-- **Result:** the test passes at a rate where real traffic hits a p99 cliff; use a constant-arrival-rate
-  generator instead.
-
-### Why do LLM queues behave worse than the M/M/c numbers suggest, and what reduces it?
+  the arrival rate; production is open, so the test passes where real traffic hits a p99 cliff. Use a
+  constant-arrival-rate generator instead.
 - **Service variability:** output length ranges from 20 to 2,000 tokens, and tool calls add spread, so Cs
   is often at or above 1; Kingman shows wait scales with (Ca² + Cs²)/2.
-- **Arrival variability:** bursts and retries raise Ca.
 - **Levers:** cap `max_tokens`, route long jobs to their own queue, smooth batch arrivals, and use
   priority classes for interactive traffic.
 

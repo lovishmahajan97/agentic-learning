@@ -5,7 +5,8 @@ name: CPU offloading
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - serving-inference/gpu-memory-optimization
   - serving-inference/kv-cache-paging-and-eviction
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-CPU offloading keeps weights or KV cache in host RAM or NVMe, behind PCIe 50–100× slower than HBM.
-Decode reads every weight per token, so offloaded weights wreck latency unless the share is tiny or
-batches huge; it suits fitting, offline jobs, idle KV.
+CPU offloading keeps weights or KV cache in host RAM, behind PCIe 50–100× slower than HBM. Offloaded
+weights make every agent step crawl; offloading the idle KV of paused agents, or offline batch runs,
+is where it pays.
+
+## For agent builders
+- **Why it matters for agents.** Agent runs multiply per-token latency by steps and tokens per step, so
+  the seconds-per-token of offloaded weights turns a 3-minute run into an hour. The useful case is the
+  opposite: agents spend long stretches waiting on tools or humans, and their idle KV can leave the GPU.
+- **Where it shows up in your stack.** Local agent development with llama.cpp (`-ngl`) or Hugging Face
+  `device_map="auto"`, vLLM's `--cpu-offload-gb` and swap options, and tiered prefix caches that keep
+  shared system-prompt blocks in CPU RAM.
+- **What you control.** Model size and quantization for the agent, a load-time guard against silent
+  offload, and context caps that decide whether a paused agent's KV must be swapped or recomputed.
+- **What you can skip.** ZeRO-Infinity and NVMe tiers, which matter for training and offline research
+  jobs, not for serving agents.
 
 ## Why it exists
 - **The model does not fit.** A 70B model is about 140 GB in bf16 and about 40 GB at 4-bit, and the GPU on
@@ -43,6 +56,14 @@ batches huge; it suits fitting, offline jobs, idle KV.
   offloaded is KV cache for idle or preempted sequences, read once on resume rather than every step.
 
 ## How it works
+### Two very different offloads for an agent
+- **Weights off the GPU: every step pays.** Each decoded token of every tool call and every reasoning
+  step re-reads the offloaded bytes over PCIe. Avoid it for any agent a user waits on.
+- **Idle KV off the GPU: paid once per resume.** While an agent waits on a 30 s tool call or a human
+  approval, its cache does nothing. Parking it in host RAM frees blocks for active agents, and costs one
+  transfer when the agent resumes.
+- **The rest of this section** covers both mechanisms and the arithmetic to choose.
+
 ### What can live off the GPU
 1. **Weights**, usually at layer granularity.
    - Hugging Face Accelerate's `device_map="auto"` places layers on GPU until full and the rest on CPU (or
@@ -109,6 +130,8 @@ dropped and recomputed by re-running prefill.
   requests by default and swapped multi-sequence groups (beam search, `n > 1`), for which it did not
   implement recomputation.
 - **Swap space size bounds** how many sequences can be parked.
+- **Agents waiting on tools look like this.** A paused agent's next step re-sends the transcript; if
+  its blocks were evicted, prefix caching misses and the engine re-prefills, the recompute row above.
 
 ### Mixture-of-experts changes the arithmetic
 - **Each token reads only routed experts,** a few per layer, not the whole expert set.
@@ -128,8 +151,8 @@ dropped and recomputed by re-running prefill.
   is why llama.cpp runs large models acceptably there.
 
 ## Diagram
-The decision path for a model that does not fit: quantize first, and offload weights only when latency
-does not matter or the offloaded share is tiny.
+The decision path for an agent model that does not fit: quantize first, and offload weights only when
+latency does not matter or the offloaded share is tiny. Idle KV of paused agents is the cheap case.
 
 ```mermaid
 flowchart TD
@@ -177,6 +200,21 @@ max_offload_gb = budget_ms / 1000 * 25.0         # bytes PCIe can move within th
 print(f"a {budget_ms} ms budget tolerates at most {max_offload_gb:.1f} GB offloaded")
 ```
 
+### Worked scenario: a local coding agent on that 24 GB GPU
+A 15-step agent run that decodes ~300 tokens per step (reasoning plus a tool call) is 4,500 output
+tokens. Decode time only, from the step times above; prefill and tool time are extra.
+
+| Placement | Speed | Decode per run |
+|---|---|---|
+| 40 layers resident, 40 streamed | about 1.2 tokens/s | about 62 min |
+| Only 10% (4 GB) offloaded | 160 ms per token, about 6 tokens/s | about 12 min |
+| Whole model resident (hypothetical) | roughly 25 tokens/s | about 3 min |
+
+- **The agent becomes unusable long before the chat does.** 1.2 tokens/s is tolerable for one answer,
+  not for 15 dependent steps.
+- **Better options:** a smaller model that fits fully resident for the agent loop, or a hosted model for
+  development, keeping the 70B for offline evaluation runs where an hour does not matter.
+
 ### Catch accidental offloading at load time
 `device_map="auto"` falls back to CPU or disk silently. This production guard caps GPU memory
 explicitly and fails the deploy if any module landed off the GPU.
@@ -201,6 +239,10 @@ print("fully resident on GPU:", set(placement.values()))
 ```
 
 ## Production patterns
+- **Plan for paused agents' KV.** When agents wait seconds to minutes on tools or approvals, decide
+  whether their cache stays resident, is parked in host RAM (where the engine supports a CPU tier or
+  swap), or is recomputed on resume. Monitor prefix-cache hit rate on resumed steps and TTFT after long
+  tool calls.
 - **Fail the deploy on silent offload.** For interactive services, check the placement after loading (as
   above, or the engine's startup log) and refuse to serve if weights are off the GPU. Monitor GPU
   utilisation: single digits with host RAM full is the signature.
@@ -228,6 +270,9 @@ print("fully resident on GPU:", set(placement.values()))
 - **KV swap vs reserved host memory.** Swap preserves long contexts cheaply compared with recomputation,
   but pinned host memory is reserved up front and PCIe traffic competes with any weight streaming on the
   same link.
+- **Resident KV for paused agents vs capacity for active ones.** Keeping a waiting agent's cache on the
+  GPU makes its next step fast, but blocks other agents. Parking it frees blocks for one ~40 ms transfer
+  per 8k-token resume; it flips when tool waits are short and resumes frequent.
 - **Split execution vs concurrency.** Computing on the CPU avoids bus traffic and suits a few layers on a
   fast machine, yet CPU matmul throughput caps batch size, so it does not scale to many users.
 
@@ -242,6 +287,9 @@ print("fully resident on GPU:", set(placement.values()))
   prefill-heavy GPU traces, when concurrency rises.
 - **Benchmarking on a Gen5 x16 workstation** and deploying to a cloud instance whose GPU sits on a shared
   or narrower link: identical settings, half the speed. Fix: benchmark on the target instance type.
+- **Evaluating an agent on a partially offloaded local model.** Runs take an hour, so the team tests a
+  handful of tasks and calls it done. Symptom: tiny eval sets and timeouts in the agent harness. Fix:
+  run evals on a fully resident or hosted model, and offload only for offline batch jobs.
 - **Treating offloading as an alternative to quantization.** Quantizing from fp16 to 4-bit removes 75% of
   the bytes with modest quality cost; offloading 75% of the bytes multiplies latency by tens.
 
@@ -249,7 +297,8 @@ print("fully resident on GPU:", set(placement.values()))
 - **Use weight offloading when** a model is a few percent too large and a short-term fix is acceptable,
   for offline batch jobs where tokens per hour matter and latency does not, for local experimentation on
   a machine that serves no one, or when remaining layers can run on a strong CPU via split execution.
-- **Avoid for anything interactive:** prefer quantization, a smaller model, or tensor parallelism.
+- **Avoid for anything interactive:** prefer quantization, a smaller model, or tensor parallelism. Agent
+  loops are the strictest case, because every step pays the penalty again.
 - **Use KV offloading deliberately:** size the swap space for your long-context tail and watch preemption
   and swap metrics.
 - **Measure** tokens/s with and without offload before deciding; the formula above predicts it well.
@@ -296,10 +345,16 @@ transfer time first, then predict the gain of each option before they buy anythi
 - **Pilots on owned hardware,** local experiments, or a model a few percent too big for a short-term fix.
 - **MoE models on one GPU,** with expert FFNs in host RAM, because each token reads only its routed experts.
 
-### Estimate the latency cost of offloading 4 GB of weights over Gen4 PCIe.
-- **Bus time:** 4 GB ÷ ~25 GB/s ≈ 160 ms per token, since decode moves it every step.
-- **Compare:** a fully resident 40 GB model on a ~1 TB/s GPU reads its weights in about 40 ms, so the
-  offload alone is about 4× the whole resident step.
+### A developer wants to run your 15-step coding agent locally on a partially offloaded 70B. What do you tell them?
+- **Do the arithmetic:** at about 1.2 tokens/s, 4,500 output tokens per run is about an hour of decode.
+- **Recommend:** a smaller model that fits fully resident for the inner loop, or a hosted endpoint, and
+  keep the 70B for offline eval runs.
+
+### Your agents pause for minutes on human approval, and the GPU runs out of KV blocks. What are the options?
+- **Leave it to eviction:** blocks of waiting agents get evicted, and the resumed step pays a re-prefill.
+- **Park the cache in host RAM** where the engine supports it: about 40 ms to bring back 8k tokens versus
+  several hundred milliseconds to recompute.
+- **Or shrink what is parked:** compact the transcript before pausing, so the resume prefill is short.
 
 ### Swap or recompute for a preempted 8k-token sequence?
 - **Swap:** about 1 GB over Gen4, roughly 40 ms, versus several hundred milliseconds to re-run prefill.

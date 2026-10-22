@@ -5,7 +5,8 @@ name: Batching & concurrency limits
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/continuous-batching
   - serving-inference/prefill-vs-decode
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Decode reads every weight once per step whatever the batch, so batching multiplies throughput almost
-free until compute or KV reads bind. Past that knee each request slows everyone and over-admission
-thrashes, so measure the knee and enforce it at engine, gateway and client.
+Every agent run is many LLM calls, and parallel tool calls and subagents multiply them. Batching makes
+concurrent calls nearly free until a knee; past it every call slows every agent, so measure the knee and
+enforce it at engine, gateway and agent client.
+
+## For agent builders
+- **Why it matters for agents.** Agents are bursty, multiplying clients: one user task becomes 5 to 20
+  sequential LLM calls, and a planner that fans out to subagents turns one call into many at once.
+  Without limits, a few fan-outs push the engine past its knee and every agent's step gets slower.
+- **Where it shows up in your stack.** The client-side semaphore around your LLM client (or your
+  framework's max-concurrency setting), the gateway's per-tenant caps, provider rate limits and 429s
+  for hosted models, and `max_num_seqs` and `max_num_batched_tokens` when you self-host with vLLM.
+- **What you control.** How many LLM calls one agent run may have in flight, how many runs share the
+  pool, timeouts and retry policy, and how much retrieved context each call carries.
+- **What you can skip.** Deriving the roofline yourself. Remember that long contexts move the knee down
+  and that Little's law turns call rate into replicas.
 
 ## Why it exists
 - **Decode is bandwidth-bound.** A Llama-3-8B-class model in fp16 has about 16 GB of weights. At roughly
@@ -44,7 +57,15 @@ thrashes, so measure the knee and enforce it at engine, gateway and client.
   degrading for everyone.
 
 ## How it works
-### Where batching stops being free
+### Agent traffic is calls, not users
+- **One run, many calls.** A tool-calling loop makes one LLM call per step, so a 10-step run is 10
+  requests to the engine, each with a longer context than the last.
+- **Fan-out is instantaneous concurrency.** Parallel tool calls that each need a model call, or a
+  planner that launches 5 subagents, add 5 in-flight requests in the same second.
+- **Context grows inside a run.** Later steps carry the whole transcript, so the same request count
+  costs more KV reads at step 10 than at step 1. That is why limits belong in tokens.
+
+### Background: where batching stops being free
 - **Arithmetic intensity grows with batch.** Each 2-byte bf16 weight does 2 FLOPs (a multiply and an add)
   per sequence, so a batch of B gives about B FLOPs per weight byte.
 - **The ridge point.** Peak FLOPs ÷ bandwidth is roughly 300 FLOP/byte for that GPU in bf16. Past it the
@@ -103,13 +124,15 @@ bytes_read = weights + KV cache of every active sequence
   without bound. No scheduler setting fixes that; only more replicas, a smaller model, shorter outputs or
   load shedding do.
 - **This converts an engine benchmark into a replica count.**
+- **For agents, count LLM calls.** Arrival rate is runs per second × calls per run, and residence time is
+  one call's queue + prefill + decode, not the whole run.
 
 ### Enforcing the limit at three layers
 | Layer | Mechanism |
 |---|---|
 | Engine | the parameters above plus a bounded waiting queue; when full, fail fast with 429/503 rather than accept a request that will time out anyway |
 | Gateway | per-tenant concurrency and token-rate caps so one client cannot consume the whole knee; priority or fair-share queuing where SLOs differ |
-| Client | a semaphore sized to its share, retries with jitter only on explicit retry-after signals, timeouts longer than expected queueing time so retries do not amplify load |
+| Client (agent runtime) | a semaphore sized to its share, a per-run cap on parallel calls and subagents, retries with jitter only on explicit retry-after signals, timeouts longer than expected queueing time so retries do not amplify load |
 
 ### Measuring the knee
 1. **Sweep concurrency** with prompts and output lengths that match production.
@@ -120,8 +143,9 @@ bytes_read = weights + KV cache of every active sequence
    them moves it.
 
 ## Diagram
-One scheduler step: decode tokens go in first, waiting prompts fill the remaining token budget in
-chunks, and a full queue rejects instead of accepting work that will time out.
+One scheduler step as agent calls see it: decode tokens go in first, waiting prompts (new agent steps)
+fill the remaining token budget in chunks, and a full queue rejects instead of accepting work that will
+time out.
 
 ```mermaid
 flowchart TD
@@ -217,7 +241,45 @@ reads, not the weights, now set the step time.
 | Measured knee per replica, production-shaped traffic | 48 |
 | Replicas | 80 ÷ 48 ≈ 1.7, so 2 at the knee, 3 with headroom for bursts and one replica down |
 
+### Agent runtime: a shared call budget plus a per-run fan-out cap
+A planner fans out to subagents. A global semaphore keeps total in-flight LLM calls at the engine's
+knee; a per-run semaphore stops one run's fan-out from taking the whole budget. The model call is faked
+with a sleep so the script runs as is.
+
+```python
+import asyncio, random, time
+
+KNEE, MAX_FANOUT = 48, 4                # measured engine knee, per-run cap on parallel calls
+GLOBAL = None                           # created inside the event loop (Python 3.9 binds loops)
+
+async def llm_call(prompt: str) -> str:
+    async with GLOBAL:                  # every call, from every run, goes through here
+        await asyncio.sleep(random.uniform(0.5, 1.5))   # stand-in for the HTTP call
+        return f"answer to {prompt[:20]}"
+
+async def run_agent(task: str, subtasks: int = 10) -> list[str]:
+    plan = await llm_call(f"plan: {task}")
+    local = asyncio.Semaphore(MAX_FANOUT)
+    async def sub(i: int) -> str:
+        async with local:
+            return await llm_call(f"{plan} / step {i}")
+    results = await asyncio.gather(*(sub(i) for i in range(subtasks)))
+    return [await llm_call(f"summarize {len(results)} results")]
+
+async def main(runs: int = 30):
+    global GLOBAL
+    GLOBAL, t0 = asyncio.Semaphore(KNEE), time.perf_counter()
+    await asyncio.gather(*(run_agent(f"task {r}") for r in range(runs)))
+    print(f"{runs} runs, {runs * 12} calls, {time.perf_counter() - t0:.1f}s")
+
+asyncio.run(main())
+# Without MAX_FANOUT the first runs grab all 48 slots and later runs' planning calls queue behind them.
+```
+
 ## Production patterns
+- **Two-level limits in the agent runtime.** Wrap every LLM call in one shared semaphore sized to the
+  engine knee (or your provider rate limit), and give each run its own cap on parallel tool calls and
+  subagents. Monitor in-flight calls, queue wait inside the client, and steps per run.
 - **Limit in tokens, not just requests.** When contexts vary widely, set `max_num_seqs` near the measured
   knee and size `max_num_batched_tokens` so one long prompt cannot dominate a step. Monitor KV-cache
   usage, preemptions and p95 TPOT together.
@@ -242,6 +304,9 @@ reads, not the weights, now set the step time.
 - **Rejecting vs accepting everything.** Rejecting at the queue (429/503) protects latency for admitted
   requests but pushes retry logic and fairness onto clients; accepting everything is simpler and fails
   slowly for all.
+- **Agent fan-out vs fleet latency.** Parallel subagents finish one run sooner, but each fan-out adds
+  in-flight calls that raise TPOT for every other run. Cap fan-out low when many runs share one engine;
+  raise it when a single run's wall-clock time is what users see.
 - **Per-tenant caps vs utilisation.** Caps guarantee isolation, yet leave capacity idle when one tenant is
   quiet unless the gateway can lend unused share, which adds scheduling complexity.
 
@@ -255,6 +320,9 @@ reads, not the weights, now set the step time.
 - **Client timeouts shorter than queueing time.** Clients retry while the original request is still
   running, so load doubles exactly when the system is saturated. Fix: timeouts above expected queueing
   time, and retry only on an explicit `Retry-After`.
+- **Retrying each agent step independently.** A loop that retries every failed call three times turns
+  a saturated engine into a retry storm across dozens of runs. Symptom: 429s and timeouts spike together.
+  Fix: one retry budget per run, honour `Retry-After`, and fail the run cleanly when it is spent.
 - **Disabling chunked prefill for peak prefill speed.** In-flight conversations then stall for hundreds of
   milliseconds each time a long prompt arrives. Fix: keep it on and tune the token budget instead.
 - **Setting the tokens-per-step budget very high.** Engines that profile the activation peak at startup
@@ -265,7 +333,10 @@ reads, not the weights, now set the step time.
 Every self-hosted deployment needs explicit limits; the question is their values.
 - **Start from VRAM** to get a token ceiling, run the sweep with production-shaped traffic to find the
   latency knee, and set the sequence and token limits a little below it.
-- **Use Little's law** to convert the target request rate into replicas.
+- **Use Little's law** to convert the target request rate into replicas; for agents, the rate is runs
+  per second times LLM calls per run.
+- **Cap agent fan-out** whenever a planner can launch parallel tool calls or subagents, on self-hosted
+  and hosted models alike.
 - **Apply per-tenant caps** whenever more than one team or customer shares an engine, and always bound the
   queue.
 - **Hosted APIs too:** the same thinking applies to provider rate limits; a client-side semaphore and
@@ -314,10 +385,19 @@ model, or shorter contexts, not a higher limit on the same GPU.
 - **Not for generation:** a dynamic batch holds every slot until the longest output finishes, wasting the
   GPU on finished sequences.
 
-### You need 30 requests/s, each lives 4 s, and your knee is 40. How many replicas, and what else matters?
+### Your agents make 30 LLM requests/s, each lives 4 s, and your knee is 40. How many replicas, and what else matters?
 - **Little's law:** 30 × 4 = 120 in flight, so 3 replicas at the knee, more with headroom.
 - **Residence time is not fixed:** past the knee queueing raises it, which raises required concurrency
   again, so size with margin and bound the queue.
+- **Agent twist:** 30 requests/s may be only 3 runs/s at 10 calls each, and later calls carry longer
+  contexts, so measure the knee with replayed agent traces.
+
+### A planner agent fans out to 8 subagents and the whole platform slows down. What do you change?
+- **Diagnose:** each fan-out adds 8 in-flight calls at once; a few concurrent planners push the engine
+  past its knee, so TPOT rises for every run.
+- **Fix in the runtime:** a per-run fan-out cap plus one shared semaphore sized to the knee, so runs
+  queue in the client instead of thrashing the engine.
+- **Then measure:** per-run wall-clock time against fleet p95 TPOT to pick the cap.
 
 ### Why should clients retry only on explicit retry-after signals?
 - **Blind retries amplify overload:** a client that times out while its request still runs adds a second

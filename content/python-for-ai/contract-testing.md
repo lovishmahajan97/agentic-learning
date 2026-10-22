@@ -5,7 +5,8 @@ name: Contract testing
 kind: practice
 difficulty: advanced
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/test-doubles-mocks-fixtures
   - python-for-ai/integration-and-end-to-end-testing
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-A contract test checks that two components agree on their interface (request shapes, response fields,
-status codes, error formats) without running both at once: the consumer records what it relies on, and
-the provider verifies it in its own build.
+An agent sits on many interfaces: tool services, retrieval, MCP servers, tool schemas. A contract test checks that two sides agree on one (shapes, fields, status codes, errors)
+without running both: the consumer records what it relies on, the provider verifies it.
+
+## For agent builders
+- **Why it matters for agents.** When a tool or retrieval service renames a field, an agent rarely
+  crashes; it quietly answers without context or calls a tool with arguments that no longer mean
+  anything. Contracts turn that silent degradation into a failed build in the commit that caused it.
+- **Where it shows up in your stack.** The agent as consumer of retrieval, tool gateways and MCP
+  servers; your tool service as provider to several agents; tool and structured-output JSON schemas,
+  which are a contract with the model; vendor model APIs, which you can only validate and canary.
+- **What you control.** Which boundaries get consumer-driven contracts versus a shared schema, strict
+  validation at every boundary, a snapshot of each tool schema the model sees, and a deploy gate on
+  deployed versions.
+- **What you can skip.** Running a broker for interfaces one team owns end to end; shared Pydantic
+  models and a schema snapshot are enough there.
 
 ## Why it exists
 - **AI systems are services talking over interfaces.** An agent service calls a retrieval service, a
@@ -106,6 +119,15 @@ You cannot run provider verification against a model vendor's API. For third-par
 - **Tool schemas and structured-output schemas shown to a model are contracts too**, verified the same
   way: by validating what actually comes back.
 
+### The agent's contract map
+| Boundary | Agent's role | Contract style | Verified by |
+|---|---|---|---|
+| Retrieval or tool service another team owns | consumer | consumer-driven (Pact or hand-rolled) | provider CI plus deploy gate |
+| Your tool service used by several agents | provider | consumer-driven, one contract per agent | your CI |
+| MCP server's tool list and result shapes | consumer | schema snapshot plus strict validation | your CI and a live canary |
+| Tool schemas shown to the model | provider (the model consumes) | committed schema snapshot | review on every change |
+| Vendor model API | consumer, unverifiable | strict boundary models | recorded fixtures and a canary |
+
 ## Diagram
 Follow one contract from the consumer's build to the provider's deploy gate; the provider never needs
 the consumer running, only its published file.
@@ -128,6 +150,45 @@ sequenceDiagram
 ```
 
 ## Examples
+### Agent scenario: snapshot the tool schemas the model sees
+A renamed argument or a tightened limit changes what the model is told, so it is an interface change
+with the model as consumer. This test fails on any schema change until someone reviews the diff and
+regenerates the committed file. Runnable with `pip install pydantic pytest`.
+
+```python
+import json
+from pathlib import Path
+import pytest
+from pydantic import BaseModel, Field
+
+class SearchDocs(BaseModel):
+    """Search the help-centre index and return the top passages."""
+    query: str = Field(description="What to search for, in the user's words")
+    k: int = Field(3, ge=1, le=10, description="How many passages to return")
+
+TOOLS = {"search_docs": SearchDocs}
+SNAPSHOT = Path(__file__).with_name("tool_schemas.json")
+
+def current_schemas() -> dict:
+    return {name: model.model_json_schema() for name, model in TOOLS.items()}
+
+def test_tool_schemas_match_snapshot():
+    if not SNAPSHOT.exists():                      # first run: write it, commit it
+        SNAPSHOT.write_text(json.dumps(current_schemas(), indent=2, sort_keys=True))
+        pytest.skip("snapshot created; commit tool_schemas.json")
+    assert current_schemas() == json.loads(SNAPSHOT.read_text()), (
+        "tool schema changed: review what the model will now see, then regenerate the snapshot")
+
+def test_model_tool_call_honours_schema():
+    raw = '{"query": "refund policy", "k": 3}'      # a recorded real tool call
+    assert SearchDocs.model_validate_json(raw).k == 3
+```
+
+- **Descriptions are part of the contract.** Rewording a field description changes model behaviour, so
+  the snapshot flags it for review just like a renamed field.
+- **Recorded tool calls as fixtures** check the other direction: what the model actually sends still
+  validates against the schema you now publish.
+
 ### Hand-rolled contract: consumer model, provider verification
 An agent service consumes a retrieval service. The consumer models only the fields it reads and
 publishes one interaction; the provider's test replays it against the real app in a seeded state. This
@@ -257,6 +318,9 @@ running.
 - **Snapshot tool and structured-output schemas.** A test compares each tool's `model_json_schema()` with
   a committed JSON file, so any change to what the model is shown needs an explicit, reviewed update.
   Monitor schema validation failures on model tool calls after each change.
+- **Pin and validate MCP servers you consume.** Snapshot the tool list and input schemas a third-party
+  MCP server advertises, validate every tool result with strict models, and run a scheduled check that
+  lists its tools and diffs them against the snapshot. Alert on any added, removed or changed tool.
 
 ## Trade-offs
 - **Fast interface checks vs narrow coverage.** Contracts catch interface breaks in seconds per build,
@@ -286,6 +350,9 @@ running.
   before the last consumer is redeployed, which a deploy gate on deployed versions prevents.
 - **Verifying against the main-branch contract instead of the deployed one.** Symptom: a provider release
   that passes CI and still breaks the consumer version currently running in production.
+- **Tool schema edits shipped without review.** A renamed argument or reworded description reaches the
+  model unnoticed. Symptom: tool-call validation errors or a drop in tool-selection accuracy right after
+  a deploy. Fix: a committed schema snapshot plus an eval run on schema changes.
 
 ## When to use
 - **Use consumer-driven contracts when** separately deployed services are owned by different teams and
@@ -348,6 +415,13 @@ replaces evals of answer quality; contracts only guarantee the shape of the conv
 - **Keep recorded real responses as fixtures and pin the SDK**, re-recording on upgrades.
 - **Run a scheduled canary** that calls the live API with a small fixed prompt and validates the shape, so a
   vendor-side change alerts before users notice.
+
+### Your agent depends on a third-party MCP server. How do you protect it from changes on their side?
+- **Treat it as an unverifiable provider:** you cannot run verification in their CI, so validate every
+  tool result with strict models at your boundary.
+- **Snapshot what it advertises:** the tool names and input schemas, diffed by a scheduled job that
+  alerts on any change.
+- **Keep recorded results as fixtures** for your own tests, and pin the server version where you can.
 
 ### Provider verification passes, yet the consumer in production broke. What are the likely causes?
 - **Verified against the wrong version:** the provider checked the consumer's main-branch contract, not

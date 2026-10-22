@@ -5,7 +5,8 @@ name: Exceptions and custom exception hierarchies
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/tenacity
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Exceptions carry a failure up the stack to code that can handle it. A custom hierarchy groups failures
-by *handling policy* (retry, shrink, re-prompt, give up), so rate limits differ from bad keys and your
-bugs never retry at provider prices.
+For every failure an agent must know who handles it: retry it, shrink the context, show it to the
+model as a tool error, or stop the run. A custom hierarchy groups failures by that *handling policy*, so
+your bugs never retry at provider prices.
+
+## For agent builders
+- **Why it matters for agents.** A tool-calling loop has a policy most services lack: some errors belong
+  to the model ("order not found", "bad date format") and go back as an error tool result so it can
+  re-plan, while others (rate limits, timeouts, your own bugs) must never reach the transcript.
+- **Where it shows up in your stack.** Provider SDK error classes you translate in an adapter, tenacity
+  retry predicates, LangGraph and other frameworks' retry or error-handling options on nodes and tools,
+  `TaskGroup` fan-out of parallel tool calls, and the error flag on tool results in provider APIs.
+- **What you control.** The policy branches (`Transient`, `Permanent`, `Recoverable`, model-visible
+  `ToolError`), where vendor errors are translated, and the step and retry budgets that end a run.
+- **What you can skip.** Exception internals such as traceback objects and frame details; `except*`
+  beyond fan-out of tools.
 
 ## Why it exists
 - **One LLM call, a dozen failure modes, different fixes.**
@@ -36,6 +49,7 @@ bugs never retry at provider prices.
 | Output fails schema validation | Corrective re-prompt |
 | Authentication error or content-policy refusal | No retry; a human |
 | `KeyError` in your own parsing code | A bug fix, not a retry loop that quietly triples your bill |
+| A tool reports bad arguments or "not found" | Return it to the model as an error tool result, so it can fix the call or re-plan |
 
 - **`except Exception: retry()` is wrong.** If all of these arrive as "an exception", the handler can
   only pick one policy. It retries the unretryable, including your own bugs, and hides them behind
@@ -81,6 +95,9 @@ LLMError(Exception)              one base per subsystem: "anything from the LLM 
 ```
 
 - **Split by handling policy, not by source.**
+- **Agents add a model-visible branch.** A `ToolError(AgentError)` subtree (`ToolInputError`, `NotFound`)
+  means "the model can act on this": the loop turns it into an error tool result and continues. Every
+  other branch is handled by code and never enters the transcript.
 - **Leaves carry what the handler needs** as attributes: `retry_after` seconds, token counts and limits,
   the list of validation errors. Give leaves a clear `__str__` for logs.
 - **Keep it shallow.** Three levels is usually enough, and every class must match a different decision
@@ -135,6 +152,55 @@ flowchart TD
 ```
 
 ## Examples
+### Agent tool step: model-visible errors versus infrastructure errors
+`ToolError` subclasses become an error tool result the model reads; `Transient` is retried silently;
+when retries run out the run aborts. Passes `mypy --strict`.
+
+```python
+class AgentError(Exception): ...
+class ToolError(AgentError):                     # the model can act on it: show it, keep going
+    def __init__(self, tool: str, message: str):
+        super().__init__(tool, message)
+        self.tool, self.message = tool, message
+class ToolInputError(ToolError): ...             # bad arguments: the model should fix the call
+class NotFound(ToolError): ...                   # valid call, empty world: the model should re-plan
+class Transient(AgentError): ...                 # infrastructure blip: retry, the model never sees it
+class RunAborted(AgentError): ...                # stop the run, keep the trace
+
+def lookup(order_id: str) -> str:
+    if not order_id.startswith("ORD-"):
+        raise ToolInputError("lookup", f"order_id must look like ORD-123456, got {order_id!r}")
+    if order_id == "ORD-000000":
+        raise NotFound("lookup", "no such order")
+    if order_id == "ORD-999999":
+        raise Transient("orders API timed out")
+    return f"{order_id}: shipped"
+
+def run_tool(order_id: str, retries: int = 2) -> dict[str, object]:
+    for attempt in range(retries + 1):
+        try:
+            return {"content": lookup(order_id)}
+        except ToolError as e:                   # model-visible: becomes the tool result
+            return {"content": f"{type(e).__name__}: {e.message}", "is_error": True}
+        except Transient:
+            if attempt == retries:
+                raise RunAborted("lookup kept failing") from None
+    raise AssertionError("unreachable")          # loop always returns or raises
+
+print(run_tool("12345"))       # {'content': "ToolInputError: order_id must look like ORD-123456, got '12345'", 'is_error': True}
+print(run_tool("ORD-000000"))  # {'content': 'NotFound: no such order', 'is_error': True}
+print(run_tool("ORD-123456"))  # {'content': 'ORD-123456: shipped'}
+# run_tool("ORD-999999") retries twice, then raises RunAborted; a KeyError in lookup escapes at once
+```
+
+| Failure in a tool step | Seen by the model? | Cost |
+|---|---|---|
+| `ToolInputError` | yes, as an error result | one more model turn to fix the call |
+| `NotFound` | yes | one more turn to re-plan |
+| `Transient`, then success | no | a retry, no extra tokens |
+| `Transient` three times | no; run ends with `RunAborted` | the run, with its trace kept |
+| Your own `KeyError` | no; escapes as a bug | zero retries, one clear trace |
+
 ### A hierarchy, an adapter and a policy-aware retry loop
 HTTP failures are translated once at the adapter; the loop retries only what is marked retryable. The
 error-body shape is illustrative; map your provider's codes the same way.
@@ -245,16 +311,20 @@ asyncio.run(main())
   every outcome.
 
 ## Production patterns
+- **Model-visible errors as tool results, with a budget.** Catch only `ToolError` in the agent loop and
+  return it as an error tool result with a short, actionable message (what was wrong, what a valid call
+  looks like). Count those turns against the step budget, and monitor error-result rate per tool; a high
+  rate on one tool means its schema or description is unclear.
 - **Retry by class, not by catch-all.** With tenacity, use `retry=retry_if_exception_type(Transient)` plus
   `stop_after_attempt(3)` and exponential waits, so `Permanent` and your own bugs fail on the first
   attempt. Monitor retries per exception class; a rise in one leaf points at one cause.
 - **One adapter per provider, unmapped means `Permanent`.** Every vendor exception is translated in a
   single module with `raise ... from e`, and anything unrecognised becomes `Permanent`, not a silent
   retry. Alert on a new or rising count of unmapped errors after SDK upgrades.
-- **Map the hierarchy to HTTP once.** In FastAPI, register `@app.exception_handler(Permanent)` and friends
-  so `RateLimited` becomes 429 and `ContextTooLong` a 4xx with the limit in the body. Track the status
-  mix per route.
-- **Log once, at the top, with notes.** Add identifiers on the way up with `e.add_note(...)`, and call
+- **Map the hierarchy to HTTP once, log once at the top.** In FastAPI, register
+  `@app.exception_handler(Permanent)` and friends so `RateLimited` becomes 429 and `ContextTooLong` a 4xx
+  with the limit in the body. Track the status mix per route.
+- **Notes on the way up.** Add identifiers on the way up with `e.add_note(...)`, and call
   `logger.exception` only in the top-level handler, so one failure is one trace with the full chain.
 - **Trip a breaker on `Transient` rate.** When `Transient` errors from one provider exceed a threshold in
   a window, route to a fallback model instead of retrying; this works because classification is already
@@ -282,6 +352,9 @@ asyncio.run(main())
   another exception occurred", and on-call chases a phantom second bug.
 - **`assert` to reject bad model output or tool arguments.** Asserts are removed under `python -O`, so
   validation works in tests and silently vanishes in an optimised deployment. Raise a real exception.
+- **Feeding raw stack traces to the model.** Catching everything in the tool step and returning `str(e)`
+  or a traceback as the tool result leaks internals, wastes tokens and invites the model to retry a bug.
+  Fix: only `ToolError` messages reach the model; the rest propagate.
 - **Matching on `str(e)` from an SDK.** It works until a minor release rewords the message and every rate
   limit becomes a permanent failure overnight.
 - **`logger.exception` at every layer, then re-raise.** One failure produces a dozen stack traces, which
@@ -337,6 +410,14 @@ propagate to a single top-level handler that logs once with the full chain and m
   use `finally` or re-raise with a bare `raise` after the cleanup.
 - **Verify** by sending SIGINT in staging and checking that `TaskGroup` or `task.cancel()` completes
   within your shutdown timeout.
+
+### In an agent loop, which tool failures should the model see, and how do you enforce that?
+- **The model sees what it can act on:** invalid arguments, not-found results, permission denials it can
+  route around. These are `ToolError` subclasses returned as error tool results with a short fix hint.
+- **Code handles the rest:** rate limits and timeouts are retried by class without spending a model turn,
+  and your own bugs propagate to the top-level handler, never into the transcript.
+- **Enforce it structurally:** the loop catches only `ToolError`; both kinds count toward step and retry
+  budgets so a confused model cannot loop forever.
 
 ### When would you use an attribute such as `retryable` instead of a new subclass?
 - **When handling depends on data,** for example the same `ProviderHTTPError` is retryable for 503 but

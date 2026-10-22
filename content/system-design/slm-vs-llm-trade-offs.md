@@ -5,7 +5,8 @@ name: SLM vs LLM trade-offs
 kind: decision
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - model-internals/small-language-models
   - model-internals/scaling-laws
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Small language models trade breadth for cost, latency and deployability. On narrow, in-distribution
-tasks, especially fine-tuned, they often match large models; on open reasoning, long tool use and world
-knowledge they do not. Decide by task narrowness, tail-error cost and data location.
+In an agent, small models earn their place on the narrow, high-frequency steps (routing, guardrail
+checks, extraction, tool-argument filling) where they match large models cheaply and fast; planning,
+long tool use and world knowledge stay on the LLM. Decide per step.
+
+## For agent builders
+- **Why it matters for agents.** An agent makes many calls per task, and several are narrow and
+  repeated on every step: intent routing, a PII or policy check, classifying a tool result. Moving
+  those to a small model cuts cost and latency on every step, while the planner stays large.
+- **Where it shows up in your stack.** A small open-weight model served by vLLM, Ollama or a hosted
+  small-model API behind the same gateway, called by logical name from the agent loop; a cascade that
+  escalates low-confidence steps to the LLM.
+- **What you control.** Which step types are SLM-eligible, the distillation data (often your own agent
+  traces), the calibrated confidence threshold for escalation, and which quantized artefact you
+  evaluate and serve.
+- **What you can skip.** Scaling-law fitting and the details of distillation losses. Know which
+  capabilities shrink first, the bandwidth arithmetic, and how to calibrate a cascade.
 
 ## Why it exists
 - **What "small" means.** Roughly up to the low tens of billions of parameters, runnable on one GPU or a
@@ -33,30 +47,40 @@ knowledge they do not. Decide by task narrowness, tail-error cost and data locat
   more in price per token, a similar factor in weight bytes read per generated token and therefore
   latency, and the difference between "fits in the customer's VPC on one GPU, or on the device" and
   "requires an external API". That leverage needs a reasoned basis, not a default.
-- **"Always use the biggest model" is wrong.** It overpays on the large fraction of easy traffic, blows
-  latency budgets for interactive and on-device use, and is unavailable wherever data cannot leave the
-  premises.
+- **"Always use the biggest model" is wrong.** It overpays on the large fraction of easy traffic and easy
+  agent steps, blows latency budgets for interactive and on-device use, and is unavailable wherever data
+  cannot leave the premises.
 - **"Small models are good enough now" is wrong too.** It fails on the hard five percent of inputs where
   errors, incidents and compliance findings concentrate. Small models follow long, complex instructions
   less reliably, hallucinate more on knowledge (fewer facts fit in fewer parameters) and degrade more
-  sharply in long contexts.
+  sharply in long contexts, which is exactly what a long agent transcript is.
 - **The gap is task-dependent.** Pattern-following tasks (classify, extract, reformat, answer from
   supplied text) saturate early: beyond some size a bigger model does not do them measurably better,
-  and fine-tuning closes the remaining gap; broad reasoning and knowledge keep improving with scale. The question is "does this task saturate", and that must be measured.
+  and fine-tuning closes the remaining gap. Broad reasoning and knowledge keep improving with scale.
+  The question is "does this task saturate", and that must be measured.
 
 ## How it works
-### What shrinks when a model shrinks
+### Background: what shrinks when a model shrinks
 - **Scaling laws.** Loss falls smoothly with parameters and training tokens. The compute-optimal
   follow-up showed smaller models trained on far more tokens recover much of the gap, which is why
   current small models are much stronger than their parameter count once suggested.
 - **Capabilities do not shrink uniformly.** First to go:
   - **stored world knowledge**: facts live in parameters, so fewer parameters means fewer facts and more
     confident invention unless retrieval supplies them;
-  - **multi-step reasoning and planning**;
-  - **robustness to long or intricate instruction sets**;
-  - **long-context use**.
+  - **multi-step reasoning and planning**, the core of an agent's outer loop;
+  - **robustness to long or intricate instruction sets**, such as many tool definitions;
+  - **long-context use**, such as a 30-step transcript.
 - **What holds up:** in-distribution pattern behaviour, *because* a narrow task occupies a small region
   of input space that fine-tuning can cover directly.
+
+### Mapping agent steps to sizes
+| Agent step | Usual home | Why |
+|---|---|---|
+| Plan, choose among many tools, recover from errors | LLM | multi-step reasoning and long context |
+| Route the request to a sub-agent or workflow | SLM (fine-tuned classifier) | closed label set, runs on every request |
+| Guardrail check on input, tool result or output | SLM | narrow, high-frequency, latency adds up per step |
+| Extract fields from a tool result into a schema | SLM, with schema validation | pattern-following over supplied text |
+| Summarise a long tool result for the transcript | workhorse or SLM, measured | depends on how much judgement the summary needs |
 
 ### The physical arithmetic
 | Quantity | 7B model | 70B model |
@@ -77,7 +101,7 @@ knowledge they do not. Decide by task narrowness, tail-error cost and data locat
 
 ### Closing the gap: fine-tuning and distillation
 1. **Use the large model as a teacher.** Run it over your task's inputs to produce labels or target
-   outputs.
+   outputs; for agents, the logged LLM decisions for one step type are a ready-made source.
 2. **Verify a sample by hand.**
 3. **Fine-tune the small model** on the result, typically with a parameter-efficient method. Narrow
    tasks commonly need hundreds to a few thousand examples (an order of magnitude, not a rule).
@@ -88,7 +112,7 @@ knowledge they do not. Decide by task narrowness, tail-error cost and data locat
 ### The decision dimensions
 | Dimension | Favours SLM | Favours LLM (or cascade) |
 |---|---|---|
-| **Task breadth** | closed schema, bounded inputs | open-ended generation |
+| **Task breadth** | closed schema, bounded inputs | open-ended generation, agent planning |
 | **Tail cost** | errors cheap and reviewable | one error in the hard cases is expensive |
 | **Latency budget** | sub-second interactive or on-device targets usually force it | relaxed budgets |
 | **Volume** | self-hosted SLM cost is fixed per GPU-hour and amortises only at volume | low volume |
@@ -108,15 +132,16 @@ knowledge they do not. Decide by task narrowness, tail-error cost and data locat
   accuracy on accepted items still meets the bar; everything below escalates.
 - **The threshold is the dial.** It directly sets the trade between escalation rate (cost) and
   accepted-item accuracy (quality).
-- **Free-form output** uses validators instead: schema checks, citation checks, or agreement between
-  two samples.
+- **Free-form output** uses validators instead: schema checks on tool arguments, citation checks, or
+  agreement between two samples.
 - **Rarely binary.** Routing and cascading have their own lesson; the point here is the choice is
-  rarely SLM-or-LLM.
+  rarely SLM-or-LLM, and in an agent it is made per step type.
 
 ## Diagram
-The usual answer is a cascade: the distilled SLM takes every request first, and only low-confidence or
-invalid outputs pay for the LLM. The gate before serving tests the exact quantized artefact on a
-human-labelled set; the calibrated threshold on the confidence check is the cost-quality dial.
+The usual answer is a cascade: the distilled SLM takes every request or agent step first, and only
+low-confidence or invalid outputs pay for the LLM. The gate before serving tests the exact quantized
+artefact on a human-labelled set; the calibrated threshold on the confidence check is the cost-quality
+dial.
 
 ```mermaid
 flowchart TD
@@ -124,7 +149,7 @@ flowchart TD
     FT --> EV{"Deployed artefact meets bar?"}
     EV -->|"no"| L["Stay on LLM or larger open-weight model"]
     EV -->|"yes"| S["SLM serves every request"]
-    R["Request"] --> S
+    R["Request or agent step"] --> S
     S --> C{"Confident and output valid?"}
     C -->|"yes, most traffic"| OK["Accept SLM answer"]
     C -->|"no, the tail"| ESC["Escalate to LLM or review queue"]
@@ -135,8 +160,9 @@ flowchart TD
 
 ## Examples
 ### Worked scenario: classifying 5M support messages a day
-**Illustrative figures.** A support platform classifies 5,000,000 inbound messages a day into intents
-and PII categories; each call is about 300 input and 10 output tokens.
+This classifier is the first step of a support agent: it routes each message to a sub-agent and flags
+PII before anything else runs. **Illustrative figures.** The platform classifies 5,000,000 inbound
+messages a day into intents and PII categories; each call is about 300 input and 10 output tokens.
 
 **Evaluation on 1,000 human-labelled messages:**
 
@@ -187,6 +213,33 @@ for v in (100_000, 5_000_000):
 # 5000000 {'api': 1650, 'slm': 1100, 'cascade': 348, 'break_even_req': 303030} cascade wins
 ```
 
+### An SLM-first guardrail step inside the agent loop
+Sketch of the per-step cascade. `slm_classify` returns a label and its calibrated probability from the
+self-hosted model; `llm_classify` is the API fallback. Both are your own wrappers, not a library API.
+
+```python
+THRESHOLD = 0.789          # from pick_threshold() below, recalibrated monthly
+
+def check_step(text, slm_classify, llm_classify, trace):
+    label, p = slm_classify(text)                 # e.g. "ok", "pii", "policy_violation"
+    if p >= THRESHOLD:
+        trace.append({"guard": "slm", "label": label, "p": round(p, 3)})
+        return label
+    label = llm_classify(text)                     # the tail pays for the LLM
+    trace.append({"guard": "llm_escalation", "label": label, "slm_p": round(p, 3)})
+    return label
+
+def run_agent_step(tool_result, slm_classify, llm_classify, trace):
+    if check_step(tool_result, slm_classify, llm_classify, trace) != "ok":
+        return {"action": "block_and_review"}      # never feed a flagged result to the planner
+    return {"action": "continue", "observation": tool_result}
+```
+
+| Per 8-step run (illustrative latencies) | LLM guardrail every step | SLM-first cascade |
+|---|---|---|
+| Guardrail latency per check | ~0.8 s | ~0.08 s, 10% escalated at ~0.8 s |
+| Added latency per run | ~6.4 s | ~1.3 s (escalations pay both calls) |
+
 ### Calibrating the cascade threshold
 Runnable, standard library only; the held-out set is synthetic. In production `scored` comes from the
 SLM's top-label probability on human-labelled items.
@@ -217,9 +270,12 @@ print(f"threshold {t:.3f}  escalate {esc:.0%}  accepted accuracy {acc:.1%}")
 Raising `bar` raises the threshold and the escalation rate; that is the cost-quality dial in one number.
 
 ## Production patterns
-- **Prototype large, distil when stable.** For any new task. Ship on the LLM first, log inputs and
-  outputs, and distil into an SLM once the task definition has stopped changing. Monitor how often the
-  task's schema or labels change; frequent changes mean stay on the LLM.
+- **Prototype large, distil when stable.** For any new task or agent step type. Ship on the LLM first,
+  log inputs and outputs per step, and distil into an SLM once the step's definition has stopped
+  changing. Monitor how often the task's schema or labels change; frequent changes mean stay on the LLM.
+- **Distil from your own agent traces.** For high-frequency steps such as routing or guardrails. Export
+  the LLM's logged decisions for one step type, human-verify a sample, fine-tune, and compare on a
+  human-labelled set. Monitor agreement with sampled human reviews, not with the teacher.
 - **Evaluate the exact deployed artefact.** Whenever quantizing or changing the serving engine. Run the
   human-labelled set against the specific 4-bit (or other) build you will serve, not the fp16
   original. Monitor task accuracy per artefact version.
@@ -236,7 +292,7 @@ Raising `bar` raises the threshold and the escalation rate; that is the cost-qua
 ## Trade-offs
 - **SLM cost and latency vs competence.** Roughly an order of magnitude lower cost and latency but a
   narrower competence; it flips as soon as the task needs world knowledge or multi-step reasoning that
-  retrieval cannot supply.
+  retrieval cannot supply, which is why the agent's planner rarely moves.
 - **Fine-tuning vs maintenance.** It closes the in-distribution gap but creates an artefact to retrain
   when the input distribution shifts or the base model is retired; it flips when the task changes
   faster than you can label.
@@ -254,7 +310,10 @@ Raising `bar` raises the threshold and the escalation rate; that is the cost-qua
 - **SLM for knowledge-heavy QA without retrieval.** Symptom: fluent, confident, wrong answers about facts
   the model never held.
 - **Handing an SLM a 3,000-token instruction set written for a frontier model.** Symptom: rules late in
-  the prompt are ignored and output format drifts.
+  the prompt are ignored and output format drifts. In agents the same happens with a long list of tool
+  schemas: the SLM picks the wrong tool or invents arguments.
+- **Putting an SLM in the planner seat of a long agent loop.** Symptom: runs wander, repeat tool calls
+  or lose the goal after a dozen steps. Fix: keep planning on the LLM and move only narrow step types.
 - **Comparing price per token only.** Symptom: the business case omits the cost of errors and
   escalations, and the GPU's fixed cost at low utilisation.
 - **Assuming quantization is free.** Symptom: the 4-bit artefact that looked fine on a general benchmark
@@ -264,11 +323,13 @@ Raising `bar` raises the threshold and the escalation rate; that is the cost-qua
 
 ## When to use
 - **Use an SLM for:** narrow, high-volume, latency-sensitive work: classification, routing, schema-bound
-  extraction, guardrail checks, on-device or on-prem features, and anywhere data cannot leave.
-- **Use the LLM for:** open-ended generation, complex tool use, low-volume high-value analysis, and any
-  task still being discovered: prototype with the large model, distil once the definition is stable.
+  extraction, guardrail checks on every agent step, on-device or on-prem features, and anywhere data
+  cannot leave.
+- **Use the LLM for:** open-ended generation, complex tool use and agent planning, low-volume
+  high-value analysis, and any task still being discovered: prototype with the large model, distil once
+  the definition is stable.
 - **Measure:** accuracy with a confidence interval on your own set, cost per successful task including
-  the cost of errors, p95 latency, and the escalation rate if you cascade.
+  the cost of errors, p95 latency per step, and the escalation rate if you cascade.
 - **Interviews:** name which capabilities degrade with size, the bandwidth arithmetic behind the latency
   gain, distillation with a human-labelled test set, and the cascade as the usual answer.
 
@@ -303,6 +364,14 @@ a human review queue for low-confidence outputs, or budget a larger open-weight 
 - **It falls behind on stored world knowledge, multi-step reasoning, long intricate instructions and
   long-context use,** because those keep improving with scale.
 - **So the real question is whether this task saturates,** and that must be measured on your own data.
+
+### Your agent runs on a frontier model for every step. Which steps would you move to a small model, and how?
+- **Pick narrow, high-frequency step types:** request routing, guardrail checks on tool results,
+  schema extraction. Keep planning, tool choice among many tools and error recovery on the LLM.
+- **Distil from the agent's own traces** for that step type, human-verify a sample, and evaluate the
+  quantized artefact on a human-labelled set.
+- **Deploy as a cascade with a calibrated threshold,** then re-run the full agent eval, because a
+  wrong route or a missed flag changes everything downstream.
 
 ### Explain where the latency advantage of a 7B model over a 70B model comes from.
 - **Decode is memory-bandwidth bound.** Each generated token reads the active weights once, so

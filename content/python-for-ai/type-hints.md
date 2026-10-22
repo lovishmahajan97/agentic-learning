@@ -5,7 +5,8 @@ name: Type hints
 kind: concept
 difficulty: intro
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/mypy
   - python-for-ai/protocols-generics-structural-typing
@@ -21,18 +22,30 @@ sources:
 ---
 
 ## TL;DR
-Type hints describe what a value should be. The interpreter ignores them; mypy, pyright, Pydantic and
-FastAPI read them. AI code is glue between untyped JSON and SDKs, so catching a shape mismatch before
-the run beats a failed thirty-minute batch job.
+In an agent, type hints are the tool contract: the interpreter ignores them, but mypy checks your loop
+before it runs, and Pydantic, FastAPI and agent frameworks turn them into the JSON Schema the model sees
+and the validator its arguments must pass.
+
+## For agent builders
+- **Why it matters for agents.** An agent loop is glue between untyped JSON (model tool calls, tool
+  results, SDK responses) and your code. Hints catch `None` content and wrong field names before a
+  thirty-minute eval run, and they are the source the tool schema is generated from.
+- **Where it shows up in your stack.** LangChain's `@tool` decorator and the OpenAI Agents SDK's
+  `@function_tool` read a function's annotations and docstring to build the tool schema; LangGraph state
+  is usually a `TypedDict` with `Annotated` reducers; Pydantic AI and `instructor` use them for outputs.
+- **What you control.** Annotate every tool handler and the function that receives raw model JSON,
+  choose `X | None` honestly where the API can omit a field, and run a checker in CI.
+- **What you can skip.** Variance theory and the full PEP history. Know `Any` versus `object`,
+  narrowing, `Annotated` and when annotations are evaluated; that covers agent code.
 
 ## Why it exists
 - **Python is dynamically typed.** A name can hold anything, and a function discovers what it got only
-  when it uses it. Fine for a fifty-line script; it falls apart in AI pipelines.
+  when it uses it. Fine for a fifty-line script; it falls apart in agent loops and AI pipelines.
 - **AI glue code fails late.** Dicts of dicts flow from a provider SDK through five helpers into a prompt
   template. The first symptom is `KeyError: 'content'` inside a retry loop, or a `TypeError` about
   concatenating `str` and `NoneType` two hours into an eval run.
 - **Docstrings do not hold.** They drift, nobody checks them, and a refactor that renames a field
-  silently breaks every caller.
+  silently breaks every caller, including the tool schema the model was trained against in your prompt.
 - **Runtime assertions everywhere are not enough.** They catch the error only on the path that executes,
   and clutter every function with checks that belong to the contract, not the logic.
 - **One machine-readable contract serves three readers.** A checker walks the call graph without running
@@ -48,6 +61,8 @@ the run beats a failed thirty-minute batch job.
   `__annotations__`.
 - **No checking.** `f("hello")` runs normally, because CPython performs no checking. This is deliberate:
   near-zero runtime cost and full backward compatibility, with enforcement left to tools.
+- **Agent consequence.** A model that sends `{"limit": "5"}` to a tool typed `limit: int` is not stopped
+  by Python; only a validator built from the hint (Pydantic, or your framework) rejects or coerces it.
 
 ### When the annotation is evaluated
 | Python version | Behaviour | Forward reference to a later class |
@@ -56,7 +71,8 @@ the run beats a failed thirty-minute batch job.
 | Any version, with the future import | Postponed: every annotation stored as a string | Libraries that need the real type resolve strings with `typing.get_type_hints(obj)` |
 | 3.14 (PEP 649 and PEP 749) | Lazy: computed when something first reads `__annotations__` (or calls `annotationlib.get_annotations`) | No failure at `def` time, but can still fail later if the name is undefined when a library inspects it |
 
-Check which version your project runs when a library complains about unresolved forward references.
+Check which version your project runs when a library (or a tool decorator building a schema) complains
+about unresolved forward references.
 
 ### What a checker does with it
 1. **Builds a type for every expression** from annotations plus inference.
@@ -66,20 +82,21 @@ Check which version your project runs when a library complains about unresolved 
    adopted.
 3. **Pays for it with holes.** Once a value is `Any`, every downstream error is invisible. Most "mypy
    said it was fine" surprises trace back to an `Any` from `json.loads`, an untyped library or a
-   missing annotation.
+   missing annotation. In agents the classic source is the tool-call `arguments` string or `input` dict.
 
 ### The vocabulary that matters
 - **`X | None` (older spelling `Optional[X]`)** says the value may be absent; the checker forces you to
-  narrow it with `if x is not None` before use. Provider SDK responses are full of these.
+  narrow it with `if x is not None` before use. Provider SDK responses are full of these: text content
+  is absent on tool-call turns.
 
-| Spelling | Meaning | Why you care in AI code |
+| Spelling | Meaning | Why you care in agent code |
 |---|---|---|
 | `list[str]`, `dict[str, float]`, `tuple[int, ...]` | Built-in generic containers | Prefer abstract inputs (`Sequence[str]`, `Mapping[str, float]`, `Iterable[str]`) and concrete outputs (`list[str]`) so callers can pass tuples or generators |
-| `Callable[[str, int], bool]` | A function value | Typing callbacks and handlers |
-| `Awaitable[T]`, `Coroutine` | Async results | Matters when wrapping an async client |
+| `Callable[[str, int], bool]` | A function value | Typing callbacks, hooks and tool handlers in a registry |
+| `Awaitable[T]`, `Coroutine` | Async results | Matters when wrapping an async client or async tools |
 | `Any` | Opt out of checking | Every use is a hole |
 | `object` | Anything, but you may only use what every object supports until you narrow it (for example with `isinstance`) | Choosing `object` over `Any` for genuinely unknown inputs keeps the hole small |
-| `Annotated[T, meta]` | Extra data on a type without changing it | Pydantic's `Field` and FastAPI's `Depends` carry runtime constraints alongside the static type |
+| `Annotated[T, meta]` | Extra data on a type without changing it | Pydantic's `Field` and FastAPI's `Depends` carry runtime constraints; tool frameworks read descriptions from it |
 | `TYPE_CHECKING` | Import a type only for the checker | Breaks import cycles; avoids loading torch or transformers just for an annotation |
 | `cast(T, value)` | "Trust me", no runtime effect | Escape hatch; use sparingly |
 | `reveal_type(x)` | Prints what the checker thinks `x` is | Fastest way to debug an inference surprise |
@@ -107,31 +124,65 @@ Check which version your project runs when a library complains about unresolved 
 
 ### Why runtime libraries read them
 - **Who reads them:** Pydantic, dataclasses and `attrs` at class creation; FastAPI when a route is
-  registered; libraries such as `instructor` reuse Pydantic's models.
+  registered; libraries such as `instructor` reuse Pydantic's models; agent frameworks read a tool
+  function's signature when it is registered.
 - **What it buys:** a `BaseModel` with `temperature: float = 0.7` becomes a validator that coerces `"0.7"`
   to `0.7` and rejects `"hot"`.
 - **The bridge:** the annotation you wrote for the checker becomes the schema that validates a model's
   JSON output and the JSON Schema you hand to a tool-calling API. Write the type once, get all three
-  behaviours; that is the main practical payoff in AI work.
+  behaviours; that is the main practical payoff in agent work.
 
 ## Diagram
 One annotation, three readers: the interpreter only stores it in `__annotations__`, a checker reads it
-before the run, and runtime libraries turn it into a validator (coerce `"0.7"`, reject `"hot"`) and a
-JSON Schema for tools and OpenAPI. Follow the dotted `Any` edge to see where checking stops.
+before the run, and runtime libraries turn it into the tool's JSON Schema and the validator for the
+model's arguments (coerce `"0.7"`, reject `"hot"`). The dotted `Any` edge is where checking stops.
 
 ```mermaid
 flowchart TD
-    A["Annotation: temperature float"] --> I["CPython: store only"]
+    A["Tool signature with hints"] --> I["CPython: store only"]
     A --> C["Static checker: mypy, pyright"]
-    A --> R["Runtime: Pydantic, FastAPI"]
+    A --> R["Runtime: Pydantic, tool decorator"]
     C -->|"declared type plus inference"| N["Narrowing in branches"]
     N --> E["Errors before tokens spent"]
     C -.->|"value is Any"| H["Hole: errors invisible"]
-    R --> V["Validator: coerce or reject"]
-    R --> S["JSON Schema for tools"]
+    R --> S["JSON Schema sent to model"]
+    R --> V["Validator on tool arguments"]
+    V -->|"error text"| M["Model retries the call"]
 ```
 
 ## Examples
+### A typed tool: one hint, schema plus validation
+The argument model is the single source for the schema the model sees and the check on what it sends
+back. The shape matches the Anthropic `tools` entry (`name`, `description`, `input_schema`).
+
+```python
+from typing import Annotated, Literal
+from pydantic import BaseModel, Field, ValidationError
+
+class SearchArgs(BaseModel):
+    query: Annotated[str, Field(min_length=1, description="What to search for")]
+    limit: Annotated[int, Field(ge=1, le=20)] = 5
+    source: Literal["docs", "tickets"] = "docs"
+
+TOOL = {"name": "search", "description": "Search internal docs or tickets.",
+        "input_schema": SearchArgs.model_json_schema()}
+
+def search(args: SearchArgs) -> list[str]:
+    return [f"{args.source}:{args.query}:{i}" for i in range(args.limit)]
+
+def run_tool_call(name: str, raw_input: dict[str, object]) -> str:
+    if name != "search":
+        return f"error: unknown tool {name}"
+    try:
+        args = SearchArgs.model_validate(raw_input)     # raw model JSON becomes a typed object
+    except ValidationError as e:
+        return f"error: invalid arguments: {e.errors()[0]['msg']}"   # fed back so the model retries
+    return "\n".join(search(args))
+
+print(run_tool_call("search", {"query": "kv cache", "limit": "3"}))   # "3" coerced to 3
+print(run_tool_call("search", {"query": "kv cache", "limit": 50}))    # error: ... less than or equal to 20
+```
+
 ### A typed wrapper around a chat completion
 The checker flags any caller that forgets `content` can be `None`, and `Annotated` carries a constraint
 Pydantic enforces at runtime.
@@ -185,12 +236,13 @@ Run `mypy` on the file above after each edit.
 | Same call with Pydantic's mypy plugin enabled | Silent by default | The plugin deliberately types `__init__` parameters as `Any` unless you set `init_typed = True` |
 
 - **The first error is the whole point:** `str | None` has no attribute `strip`, reported before any
-  tokens are spent.
+  tokens are spent. On a tool-call turn that `None` is the normal case, not an edge case.
 - **Lesson 1:** the annotation on the function that touches raw JSON matters more than any other.
 - **Lesson 2:** untyped input goes through `model_validate` at the boundary, not through `__init__`.
 
 ### Narrowing helper with `TypeIs`
 Without `TypeIs` the checker cannot see inside the helper, so `turn.tool_name` would still be an error.
+This is the shape of the dispatch step in an agent loop.
 
 ```python
 from dataclasses import dataclass
@@ -217,12 +269,16 @@ print(describe(ToolTurn("search", {"q": "kv cache"})))   # call search
 ```
 
 ## Production patterns
+- **Generate tool schemas from types, never by hand.** Define each tool's arguments as a Pydantic model
+  (or let a framework decorator read the signature) and send `model_json_schema()` as the tool schema.
+  Hand-written JSON drifts from the handler. Monitor the tool-argument validation-error rate per tool; a
+  spike after a prompt or schema change means the model and contract disagree.
 - **Strict at the edges, gradual inside.** Set `strict = true` under `[tool.mypy]` (it is a global-only
   option, so it cannot be scoped to one package), then add `[[tool.mypy.overrides]]` with a `module`
   pattern for legacy code that relaxes it, for example `ignore_errors = true` or
   `disallow_untyped_defs = false`. SDK wrappers and tool handlers stay strict. Track the count of
   overridden modules and shrink it each sprint.
-- **Validate at the boundary.** Parse every `json.loads` result or raw SDK dict with
+- **Validate at the boundary.** Parse every `json.loads` result, raw SDK dict or tool-call input with
   `Model.model_validate(...)` (or `TypeAdapter(list[Message]).validate_python(...)`) in the first
   function that receives it. Monitor validation-error rate per provider; a spike means an API changed
   shape.
@@ -234,8 +290,8 @@ print(describe(ToolTurn("search", {"q": "kv cache"})))   # call search
   arguments checked. Without that setting the plugin treats `__init__` parameters as `Any`, so
   `GenConfig(temperature="0.2")` passes the checker.
 - **Keep heavy imports behind `TYPE_CHECKING`.** Wrap torch or transformers imports used only in
-  annotations in `if TYPE_CHECKING:`. Measure import time of your CLI or worker (`python -X importtime`)
-  before and after.
+  annotations in `if TYPE_CHECKING:`, so an agent worker or CLI starts fast. Measure import time
+  (`python -X importtime`) before and after.
 
 ## Trade-offs
 - **Early detection vs annotation effort.** You catch shape bugs across the call graph before running,
@@ -243,18 +299,22 @@ print(describe(ToolTurn("search", {"q": "kv cache"})))   # call search
   whole life is a single run, where the runtime error *is* the cheapest check.
 - **Gradual adoption vs leaks.** You can adopt incrementally, but every `Any` leak silently disables
   checking downstream, so a codebase "typed" at 60% often catches far fewer bugs than it looks.
-- **One source of truth vs library coupling.** Annotations double as Pydantic and FastAPI schemas, saving
-  duplicated validation code. But your static types are now coupled to a library's interpretation (for
-  example, how a `float` field coerces strings), which can surprise you on a major version change.
+- **One source of truth vs library coupling.** Annotations double as Pydantic, FastAPI and tool schemas,
+  saving duplicated validation code. But your static types are now coupled to a library's interpretation
+  (for example, how a `float` field coerces strings), which can surprise you on a major version change.
 - **Precise SDK types vs verbosity.** They make the editor useful and catch `None` cases, but deeply
   nested unions make simple code verbose. Wrapping them in your own small models pays off once the same
-  response shape is consumed in more than one place.
+  response shape is consumed in more than one place, as it is in any agent loop.
+- **Rich tool types vs what the model handles.** Nested unions and many constrained fields make an exact
+  schema but a harder one for the model to fill. Flat argument models with a few `Literal` choices tend
+  to produce fewer invalid calls; measure on your eval set.
 
 ## Pitfalls
 - **Over-specific parameters.** Annotating `list[str]` when callers pass tuples or generators gives a wall
   of checker errors at call sites. Fix: accept `Sequence[str]` or `Iterable[str]`.
 - **Treating annotations as enforcement.** A function typed `-> int` happily returns a string at runtime
-  because nothing checked it; you find out much later in a `TypeError`.
+  because nothing checked it; you find out much later in a `TypeError`. A tool handler called with
+  model-supplied arguments is exactly this case unless a validator sits in front of it.
 - **Letting `json.loads` output (typed `Any`) flow untouched.** Symptom: a clean mypy run, then
   `KeyError` in production, because `Any` suppressed every downstream error. Fix: validate at the
   boundary with Pydantic or a `TypedDict` so the type becomes concrete.
@@ -264,16 +324,17 @@ print(describe(ToolTurn("search", {"q": "kv cache"})))   # call search
 - **Expecting a `bool` helper to narrow.** After `if is_valid(x):` with `is_valid(x) -> bool`, you get the
   same "may be None" error. Fix: annotate the helper with `TypeIs`/`TypeGuard` or inline the test.
 - **Reading `Optional[X]` as "optional argument".** `Optional` only means "may be None"; without a
-  default, the checker still requires the argument be passed.
+  default, the checker still requires the argument be passed. In a tool schema the field is then
+  required too, so the model must send it.
 
 ## When to use
 - **Always annotate boundaries:** public module functions, anything taking or returning provider SDK
-  objects, tool handlers an agent calls, and data structures that get serialized.
+  objects, tool handlers an agent calls, and data structures that get serialized into prompts or traces.
 - **Skip inside tight private helpers:** inference is usually enough.
 - **Run a checker in CI once annotations exist:** hints without a checker are documentation that rots.
 - **Measure the `Any` surface:** mypy's `--strict` flag or `warn_return_any` shows where typing leaks.
-- **Day to day:** type hints let you refactor a prompt-assembly pipeline with confidence and make
-  Pydantic models and tool schemas possible at all.
+- **Day to day:** type hints let you refactor a prompt-assembly pipeline or tool registry with confidence
+  and make Pydantic models and tool schemas possible at all.
 - **Interviews:** know that annotations are inert at runtime, how gradual typing and `Any` interact, and
   how Pydantic turns an annotation into a validator and a JSON Schema.
 
@@ -304,6 +365,14 @@ that third-party stubs are installed so SDK calls are not silently `Any` either.
 - **Deliberately so:** near-zero runtime cost and full backward compatibility, with enforcement left to
   static checkers and to libraries such as Pydantic that choose to read the annotations.
 
+### How do type hints on a tool function become something the model can use, and what still has to happen at runtime?
+- **Schema generation.** A framework decorator or a Pydantic argument model reads the annotations (plus
+  `Annotated` descriptions and constraints) and emits the JSON Schema sent with the request.
+- **Runtime validation is separate.** The model can still send `"5"` or omit a field, so validate the
+  call's input with the same model before running the handler.
+- **Close the loop:** return the validation message to the model as the tool result so it can retry,
+  and count those errors per tool as a signal of a confusing schema.
+
 ### You call `if is_tool_turn(turn):` and mypy still says `turn` has no attribute `tool_name`. Why, and what is the fix?
 - **The checker does not look inside helpers.** A `-> bool` return says nothing about the argument, so
   `turn` keeps its declared union type inside the branch.
@@ -318,11 +387,11 @@ that third-party stubs are installed so SDK calls are not silently `Any` either.
 - **`Any` turns checking off** in both directions for that value and everything derived from it.
 - **Use `Any` only** as a temporary escape hatch at an untyped library seam, and wrap it quickly.
 
-### How would you introduce type checking into a 50,000-line untyped AI service without stopping feature work?
+### How would you introduce type checking into a 50,000-line untyped agent service without stopping feature work?
 - **Gradual by design:** unannotated code is `Any`, so you can start with zero errors and tighten module
   by module.
-- **Order:** type the boundaries first (SDK wrappers, tool handlers, serialized models), set
-  `strict = true` globally, and relax untouched legacy modules with `[[tool.mypy.overrides]]`
+- **Order:** type the boundaries first (SDK wrappers, tool handlers, serialized models and agent
+  state), set `strict = true` globally, and relax untouched legacy modules with `[[tool.mypy.overrides]]`
   (`strict` itself cannot be set per module).
 - **Track progress** by the number of overridden modules and the `Any` surface, not by the share of
   functions with annotations.

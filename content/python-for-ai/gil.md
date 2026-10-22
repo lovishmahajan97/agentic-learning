@@ -5,7 +5,8 @@ name: GIL (Global Interpreter Lock)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/asyncio-vs-threads-vs-multiprocessing
   - python-for-ai/race-conditions-and-synchronization-primitives
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-The GIL is a mutex in standard CPython letting one thread run bytecode at a time, protecting reference
-counts and C extensions. Threads still help with I/O and GIL-releasing native code, not pure-Python CPU work. It
-does not make code thread-safe.
+The GIL lets one thread run Python bytecode at a time in standard CPython. It is why threads help agent
+model and tool I/O but not pure-Python parsing, which also makes token streams jitter. It does not make
+code thread-safe.
+
+## For agent builders
+- **Why it matters for agents.** Agent workers mix network waits (model, tools) with CPU work (chunking
+  retrieved documents, validating big JSON tool outputs, local scoring). The GIL decides whether that CPU
+  work can share the process with the event loop or must move out, and it explains slow, jittery streams.
+- **Where it shows up in your stack.** `asyncio.to_thread` around CPU-heavy tools, thread pools in eval and
+  ingestion scripts, local embedding or reranking models in PyTorch, and Uvicorn worker counts.
+- **What you control.** Which executor runs each CPU-heavy step, native thread counts (`OMP_NUM_THREADS`,
+  `torch.set_num_threads(...)`), locks around shared agent state, and whether you deploy a free-threaded
+  build.
+- **What you can skip.** Eval-loop internals and the C API beyond knowing that native code can release the
+  GIL. Learn the CPU/wall diagnostic and the threads-versus-processes rule.
 
 ## Why it exists
 - **Reference counts change constantly.** Every CPython object's count is updated on nearly every
@@ -37,12 +50,12 @@ does not make code thread-safe.
 - **One lock bought simplicity and speed.** The interpreter and its huge C ecosystem (NumPy, database
   drivers, compression) stayed easy to write correctly and single-threaded Python stayed fast. The cost
   came with multi-core machines: a CPU-bound Python program using threads still uses roughly one core.
-- **AI workloads straddle the line.** Calling LLM APIs is I/O-bound, fine with threads or asyncio.
-  Tokenising a corpus, parsing documents or a pure-Python scoring loop is CPU-bound, and threads give
-  almost nothing. Knowing the side decides threads, processes or native code.
+- **Agent workloads straddle the line.** Calling LLM APIs and tools is I/O-bound, fine with threads or
+  asyncio. Tokenising a corpus, parsing documents or a pure-Python scoring loop is CPU-bound, and threads
+  give almost nothing. Knowing the side decides threads, processes or native code.
 
 ## How it works
-### Holding and handing over
+### Background: holding and handing over
 A thread must hold the GIL to run bytecode or touch Python objects. It gives the GIL up in two ways:
 
 | Handover | When | Why |
@@ -51,17 +64,19 @@ A thread must hold the GIL to run bytecode or touch Python objects. It gives the
 | **On request** | Another thread has waited longer than the switch interval (`sys.getswitchinterval()`, 5 ms by default); it sets a flag and the running thread drops the GIL at its next eval-loop check point | Keeps threads fair |
 
 - **The forced handover is also why CPU-bound threads add switching overhead rather than speed.**
+- **Model and tool calls are the voluntary case:** a thread waiting on a provider socket holds no GIL, so
+  sync SDK calls in a thread pool overlap fine.
 
-### The hidden cost: CPU threads slow down I/O threads
-1. An I/O thread's socket becomes ready and the kernel wakes it.
+### The hidden cost: CPU threads slow down the agent's event loop
+1. An I/O thread's socket becomes ready (the next model tokens arrived) and the kernel wakes it.
 2. It must still reacquire the GIL before running any Python.
 3. If a CPU-bound thread holds the GIL, the I/O thread waits until that thread reaches a check point and
    yields, roughly bounded by the switch interval each time it needs the lock back.
 
 - **The event loop pays this on every task step**, because it needs the GIL for each one.
 - **So `asyncio.to_thread` for pure-Python CPU work** keeps the loop *unblocked* but not *unaffected*: each
-  step can be delayed by milliseconds and streaming responses get visibly jittery. The work belongs in a
-  process.
+  step can be delayed by milliseconds and streaming agent responses get visibly jittery. The work belongs
+  in a process.
 
 ### Native code can opt out
 - **How.** C, C++ and Rust extensions can release the GIL while working on their own memory, as long as
@@ -69,14 +84,15 @@ A thread must hold the GIL to run bytecode or touch Python objects. It gives the
   around the native work; the extension must reacquire the GIL before building the Python result.
 - **Who does it.** NumPy for many operations on large arrays, PyTorch for most tensor ops, `hashlib` for
   large inputs, compression libraries for large buffers.
-- **So "Python is single-core" is wrong here:** a thread pool running NumPy-heavy or PyTorch CPU work can
-  use several cores.
+- **So "Python is single-core" is wrong here:** a thread pool running NumPy-heavy or PyTorch CPU work (a
+  local embedding model, a cosine-similarity pass over retrieved vectors) can use several cores.
 - **It is per function.** Whether a call releases the GIL is a property of that library and function, so
   check or measure rather than assume.
 
 ### What the GIL does not give you
 - **It protects the interpreter, not your invariants.** `counter += 1` compiles to several bytecodes
-  (load, add, store), and a switch can occur between them, so two threads can lose an update.
+  (load, add, store), and a switch can occur between them, so two threads can lose an update to a shared
+  token counter.
 - **Check-then-act on a dict across threads needs a `threading.Lock`.**
 - **Reproducibility varies** with Python version and timing, which makes the race more dangerous, not less.
 - **Some single operations are atomic by accident.** One `list.append` or one `d[key] = value` cannot be
@@ -97,18 +113,18 @@ A thread must hold the GIL to run bytecode or touch Python objects. It gives the
   around it.
 
 ## Diagram
-Handover between a CPU-bound thread and an I/O thread: the I/O thread is woken by the kernel but still
-waits for the GIL, and only a drop request after the switch interval gets it back.
+Handover between a CPU-bound thread and the agent's event-loop thread: the loop is woken by the kernel
+but still waits for the GIL, and only a drop request after the switch interval gets it back.
 
 ```mermaid
 sequenceDiagram
-    participant A as Thread A (pure-Python CPU loop)
+    participant A as Thread A (pure-Python parse)
     participant G as GIL
-    participant B as Thread B (I/O, event loop)
+    participant B as Thread B (agent event loop)
     participant K as Kernel
     B->>G: release before socket read system call
     A->>G: acquire, run bytecode
-    K-->>B: socket ready, thread woken
+    K-->>B: model tokens arrived, thread woken
     B->>G: request GIL, must wait
     Note over B,G: waits up to the switch interval (5 ms default)
     B->>G: set drop request flag
@@ -118,6 +134,19 @@ sequenceDiagram
 ```
 
 ## Examples
+### Worked scenario: a streaming agent worker with a CPU-heavy tool
+One Uvicorn worker streams answers for 40 sessions. A new tool post-processes retrieved documents with a
+pure-Python cleaning loop taking about 400 ms per call. Figures are illustrative.
+
+| Placement of the cleaning tool | Event loop | What users see |
+|---|---|---|
+| Called directly in the coroutine | Blocked about 400 ms per call | Every stream on the worker freezes during each call |
+| `asyncio.to_thread` | Unblocked, but each task step may wait up to about 5 ms for the GIL | Streams keep moving but tokens arrive in uneven bursts |
+| `ProcessPoolExecutor` via `run_in_executor` | Unblocked and not contending for this process's GIL | Smooth streams; the tool pays pickling for its input and output |
+| Rewritten with vectorised native code that releases the GIL | Unblocked | Smooth, and the tool may also get faster |
+
+The diagnostic below tells you which row you are in before you pick a fix.
+
 ### Threads vs processes vs GIL-releasing C code
 ```python
 import hashlib, time
@@ -161,7 +190,8 @@ Absolute times depend on the machine; the ratios are the lesson.
 
 ### A two-number GIL diagnostic
 Ask the interpreter whether a GIL is active, then measure process CPU time over wall time with N threads:
-about 1.0 means the GIL is serialising you, close to N means the work releases it.
+about 1.0 means the GIL is serialising you, close to N means the work releases it. Run it on each
+CPU-heavy tool before deciding where it runs.
 
 ```python
 import hashlib, sys, sysconfig, threading, time
@@ -190,21 +220,22 @@ Note `BLOB` is built once outside the threads: building a 200 MB bytes object in
 Python-level work that holds the GIL, and in testing it pulled the hashing ratio well below 4.
 
 ## Production patterns
-- **Profile CPU/wall before adding threads.** For any slow batch stage, record process CPU time against wall
-  time with the planned thread count. Ratio near 1.0: move to processes or native code; near N: threads are
-  fine. Track the ratio per stage in benchmarks.
-- **Keep CPU work away from the event loop process.** Run pure-Python preprocessing (chunking, cleaning,
-  scoring) in a process pool or a separate worker service, not in `to_thread` beside a streaming loop.
-  Monitor loop lag and inter-token jitter on streams.
+- **Keep CPU-heavy tools away from the agent's event loop process.** Run pure-Python preprocessing
+  (chunking, cleaning, scoring retrieved documents) in a process pool or a separate worker service, not in
+  `to_thread` beside a streaming loop. Monitor loop lag and inter-token jitter on streams.
+- **Profile CPU/wall before adding threads.** For any slow batch stage (RAG ingestion, eval scoring),
+  record process CPU time against wall time with the planned thread count. Ratio near 1.0: move to
+  processes or native code; near N: threads are fine. Track the ratio per stage in benchmarks.
 - **Cap native thread pools when you also use Python threads.** NumPy and PyTorch run their own thread pools;
   set `OMP_NUM_THREADS` or `torch.set_num_threads(...)` so Python threads × native threads does not exceed
-  the cores. Monitor CPU saturation and run-queue length.
+  the cores, which matters when a local embedding model shares a box with the agent API. Monitor CPU
+  saturation and run-queue length.
 - **Verify the GIL state on free-threaded deploys.** Log `sys._is_gil_enabled()` at startup and fail the
   health check if it is `True` where you expected `False`, because an incompatible extension re-enables the
   GIL at runtime with only a warning.
-- **Lock shared state anyway.** Guard counters, caches and check-then-act sequences with `threading.Lock` or
-  hand work through `queue.Queue`, so the code stays correct under any interpreter. Look for lost updates in
-  load tests, not unit tests.
+- **Lock shared state anyway.** Guard usage counters, caches and check-then-act sequences with
+  `threading.Lock` or hand work through `queue.Queue`, so the code stays correct under any interpreter.
+  Look for lost updates in load tests, not unit tests.
 
 ## Trade-offs
 - **Simple, fast single thread vs one core.** The GIL keeps single-threaded code and C extensions simple
@@ -224,7 +255,7 @@ Python-level work that holds the GIL, and in testing it pulled the hashing ratio
   core and no wall-clock improvement. Fix: a process pool, or move the hot loop into native code.
 - **Assuming the GIL makes shared counters or dicts thread-safe.** Symptom: occasional lost updates or
   inconsistent state that disappears when you add logging. Fix: a `threading.Lock` or `queue.Queue`.
-- **Blaming the GIL for a slow I/O-bound service.** If CPU is low and latency high, the problem is waiting
+- **Blaming the GIL for a slow I/O-bound agent.** If CPU is low and latency high, the problem is waiting
   or blocking calls; the GIL is not the bottleneck. Fix: find the blocking call or the slow dependency.
 - **Assuming a library releases the GIL because it is written in C.** Some hold it for the whole call, and
   profiling shows threads queuing instead of running in parallel. Fix: measure CPU/wall per call first.
@@ -234,7 +265,7 @@ Python-level work that holds the GIL, and in testing it pulled the hashing ratio
 
 ## When to use
 You do not use the GIL; you design around it.
-- **First ask:** is the slow service waiting (I/O) or computing (CPU)?
+- **First ask:** is the slow agent step waiting (I/O) or computing (CPU)?
 - **I/O:** threads or asyncio are fine and the GIL is irrelevant.
 - **CPU-bound pure Python:** processes, vectorise with NumPy or Polars, or move the hot loop to native code.
 - **CPU work inside NumPy or PyTorch:** threads can work; measure with a quick timing like the examples.
@@ -273,20 +304,28 @@ the full million. Threads would be right only if the work were I/O or GIL-releas
 - **One lock was the cheap option**, because fine-grained locks or atomic refcounts slow the common
   single-threaded case and burden every C extension author.
 
+### Agent streams get jittery after a teammate moved a document-cleaning tool into asyncio.to_thread. Why?
+- **The loop is unblocked but not unaffected.** The cleaning thread holds the GIL running pure Python,
+  and the event loop needs the GIL for every task step.
+- **Each loop step can wait** up to about the switch interval (5 ms by default) for a handover, so token
+  delivery becomes uneven across every session on the worker.
+- **Fix:** move the CPU work to a process pool or a separate worker service, and monitor loop lag and
+  inter-token jitter.
+
+### Your agent service runs many tool calls in a thread pool. Does the GIL limit its throughput?
+- **Not for I/O-bound tools.** Threads waiting on model, search or database sockets release the GIL, so
+  they overlap; the limits are pool size and provider quotas.
+- **Yes for pure-Python CPU tools**, which serialise on one core however many threads you add; measure
+  CPU/wall per tool and move those to processes.
+- **Shared state still needs locks** (usage counters, caches), because the GIL does not protect
+  multi-bytecode updates.
+
 ### Does the GIL make my shared dict or counter thread-safe?
 - **No, it protects the interpreter, not your invariants.** `counter += 1` is several bytecodes (load,
   add, store), and a switch between them loses updates.
 - **Check-then-act needs a `threading.Lock`**, or hand work through `queue.Queue`.
 - **Single operations like `list.append` happen to be atomic**, but relying on that is an implementation
   accident; the free-threaded build had to add per-object locks to preserve it.
-
-### Streaming responses get jittery after a teammate moved text cleaning into asyncio.to_thread. Why?
-- **The loop is unblocked but not unaffected.** The cleaning thread holds the GIL running pure Python,
-  and the event loop needs the GIL for every task step.
-- **Each loop step can wait** up to about the switch interval (5 ms by default) for a handover, so token
-  delivery becomes uneven.
-- **Fix:** move the CPU work to a process pool or a separate worker service, and monitor loop lag and
-  inter-token jitter.
 
 ### When are Python threads a good choice for CPU-heavy AI work despite the GIL?
 - **When the hot path is GIL-releasing native code:** NumPy on large arrays, most PyTorch tensor ops,

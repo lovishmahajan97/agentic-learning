@@ -5,7 +5,8 @@ name: Anthropic SDK
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/litellm
@@ -21,9 +22,23 @@ sources:
 ---
 
 ## TL;DR
-The `anthropic` package is the official typed client for Claude's Messages API. Its shapes differ from
-OpenAI's: typed content blocks, top-level `system`, required `max_tokens`, tool results as user blocks,
-and explicit `cache_control`. Learn them and most integration bugs become obvious.
+The `anthropic` package is the typed client for building Claude agents on the Messages API: typed content
+blocks, top-level `system`, required `max_tokens`, tool results as user blocks, and explicit
+`cache_control`. Its tool loop and caching rules decide agent correctness and cost.
+
+## For agent builders
+- **Why it matters for agents.** A Claude agent is a loop driven by `stop_reason`: on `tool_use`, echo
+  every block back, run the tools, return all results in one user message, repeat. Most broken Claude
+  agents break one of those rules, and most expensive ones miss the prompt cache.
+- **Where it shows up in your stack.** Directly in hand-written agents, under LangChain's `ChatAnthropic`
+  (the `langchain-anthropic` package) and so LangGraph nodes, under Anthropic's Claude Agent SDK, inside
+  LiteLLM for Claude models, and on Bedrock, Vertex AI or Microsoft Foundry through this SDK's platform
+  clients.
+- **What you control.** Prompt layout for caching (tools, then system, then messages), `max_tokens`,
+  `tool_choice` and `strict` tools, append-only history, streaming, batches for evals, and per-path
+  timeouts and retries.
+- **What you can skip.** Raw SSE parsing and hand-merging stream deltas; the streaming helper and
+  `get_final_message()` do it. Learn the content-block shapes before trusting a wrapper to translate them.
 
 ## Why it exists
 - **The usual transport problems.** Authentication, retries on 429 and 5xx, timeouts and server-sent-event
@@ -99,6 +114,8 @@ and explicit `cache_control`. Learn them and most integration bugs become obviou
 - **Portable well-formed calls.** Forcing is not supported on every current model, so use `auto` plus a
   clear instruction, with `strict: true` on the tool so `input` always validates against `input_schema`
   (strict mode needs the schema to list `required` fields and set `additionalProperties: false`).
+- **Your guards still apply.** Schema-valid input is not permission: cap iterations, set a task
+  deadline, allow-list tool names, and check what each call may touch before running it.
 
 ### Structured output
 - **Schema-constrained JSON.** `output_config={"format": ...}` with a JSON Schema constrains the response.
@@ -230,7 +247,26 @@ check current pricing).
 
 If a timestamp sits at the top of the system prompt, every call is a write and the saving goes negative.
 
+### Worked scenario: a 15-step coding agent with and without a warm prefix
+Illustrative: 8,000 tokens of tools and system prompt, each step appends ~1,500 tokens of tool call and
+result, same multipliers as above, all steps inside the cache lifetime. History is not cached here, only
+the prefix.
+
+| Step | Prefix cost, no caching | Prefix cost, cached |
+|---|---|---|
+| 1 | 8,000 | 10,000 (write at 1.25×) |
+| 2-15 (14 steps) | 14 × 8,000 = 112,000 | 14 × 800 = 11,200 (reads at 0.1×) |
+| **Total prefix** | **120,000** | **21,200** |
+
+- **The history still grows** by ~1,500 tokens a step; a second breakpoint on the latest turn lets
+  earlier history be read from cache on the next step too, if the history is append-only.
+- **Editing earlier turns** (trimming tool results mid-run) moves the cache miss to that point, so
+  compact rarely and in one step.
+
 ## Production patterns
+- **Trace every agent step.** Log `resp._request_id`, `stop_reason`, tool names, `usage` including cache
+  fields, and latency per call, to a tracer such as LangSmith, Langfuse or OpenTelemetry. Replaying one
+  bad trajectory beats reading aggregate metrics.
 - **Lay out prompts for the cache.** Put tools and a frozen system prompt first with one `cache_control`
   breakpoint after them, and volatile data (dates, user names, retrieved text) after it. Alert when
   `cache_read_input_tokens` / input tokens drops on a route that should be warm.
@@ -318,6 +354,14 @@ would move volatile data after the last breakpoint and watch the read counter ri
 - **Other suspects:** results split across several user messages, a missing result for one of several
   parallel calls, or thinking blocks dropped or edited, since their `signature` is verified.
 - **Fix:** treat history as append-only and return every result, including failures with `is_error: True`.
+
+### Your Claude agent runs 30 steps per task and costs keep climbing per step. How do you design for it?
+- **Cache the stable prefix:** tools and a frozen system prompt first with a `cache_control` breakpoint,
+  volatile data after it; verify `cache_read_input_tokens` rises from step 2.
+- **Keep history append-only** and compact at a boundary when it nears the window, accepting one cache
+  miss rather than one per step; echo thinking blocks unchanged.
+- **Cap the loop:** iteration limit, deadline and per-tool result size, and measure tokens and steps per
+  task alongside task success.
 
 ### When would you not use the native Anthropic SDK?
 - **When several providers are genuinely in production** and you need routing, fallbacks or central spend

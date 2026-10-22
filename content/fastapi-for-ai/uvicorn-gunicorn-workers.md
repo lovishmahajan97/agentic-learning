@@ -5,7 +5,8 @@ name: Uvicorn / Gunicorn workers
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/lifespan
@@ -22,23 +23,35 @@ sources:
 ---
 
 ## TL;DR
-Uvicorn runs FastAPI's event loop; Gunicorn is a pre-fork manager that supervises several Uvicorn workers.
-Workers (processes) use more cores, but each loads its own copy of any in-process model, so AI services
-size workers by memory and GPUs, not CPU.
+Uvicorn runs the event loop your agent service awaits LLM calls on; Gunicorn supervises several Uvicorn
+workers. Workers are separate processes, so each holds its own model copy and in-memory run state: size
+by memory, and keep agent state out of process.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a long chain of awaits (model call, tool call, model
+  call), so one event loop can hold hundreds of concurrent runs cheaply. What breaks is everything
+  per-process: a local reranker loaded once per worker, an in-memory checkpointer or run registry that
+  the next request for the same run never sees, and blocking tool code that freezes every run on a worker.
+- **Where it shows up in your stack.** The run command of the FastAPI service hosting your LangGraph,
+  OpenAI Agents SDK or custom loop, the Dockerfile `CMD`, a `gunicorn.conf.py`, and the pod spec.
+- **What you control.** Worker count, `--timeout`, `--graceful-timeout`, `--max-requests`, whether to
+  `--preload`, the HTTP pool size per worker, and where run state lives (a database or Redis, not a dict).
+- **What you can skip.** Gunicorn's other worker classes and the internals of the pre-fork model. Know the
+  four flags in the table below and the memory formula.
 
 ## Why it exists
 - **FastAPI is a framework, not a server.** Something must open the socket, parse HTTP, speak ASGI to your
   app and run the asyncio event loop. Uvicorn does that.
 - **One process is great for I/O.** A single Uvicorn process handles thousands of concurrent connections
-  while handlers mostly await I/O, exactly the shape of an LLM gateway: a request waits seconds for a
-  provider using almost no CPU.
+  while handlers mostly await I/O, exactly the shape of an LLM gateway or agent runner: a request waits
+  seconds for a provider using almost no CPU.
 - **Limit 1: one core of Python.** On the standard CPython build the global interpreter lock means one
   process executes Python bytecode on one core at a time. The experimental free-threaded builds from
   Python 3.13 relax this, but most AI library stacks still assume the GIL. CPU work (tokenizing,
-  JSON-heavy post-processing, local embedding inference, PDF parsing) saturates one core and stalls the
-  event loop for everyone.
+  JSON-heavy post-processing, local embedding inference, PDF parsing in a document tool) saturates one
+  core and stalls the event loop for everyone.
 - **Limit 2: a single point of failure.** If the process crashes, segfaults in a native library or leaks
-  memory until killed, the service is down.
+  memory until killed, the service is down, along with every agent run it was holding.
 - **N workers fix both, but need a supervisor** to fork them, restart the ones that die, recycle leakers
   and pass signals through. Gunicorn was built for that role; in containers it is often handed to the
   orchestrator instead.
@@ -50,6 +63,8 @@ size workers by memory and GPUs, not CPU.
   spreads incoming *connections* across them (not perfectly evenly).
 - **The unit is the connection, not the request.** Behind a proxy holding a handful of long-lived
   keep-alive connections, most requests can land on one or two workers while the others idle.
+- **Consecutive requests for one agent run can hit different workers.** "Start run" and "approve tool
+  call" for the same run id are separate requests, so run state must live where every worker can read it.
 - **Restarts:** recent Uvicorn versions (0.30 onward) also restart children that die.
 - **Per-worker startup:** each child runs lifespan startup independently, so every worker builds its own
   HTTP client pool, DB engine and model.
@@ -61,14 +76,16 @@ any that exit.
 
 | Flag | Default | What it does | Watch out |
 |---|---|---|---|
-| **`--timeout`** | 30 s | kills and replaces a worker that misses its heartbeat that long | async heartbeat runs on the event loop, so a blocking handler (a synchronous model call) gets its worker killed |
-| **`--graceful-timeout`** | 30 s | time to finish in-flight requests on shutdown or reload | must cover your longest normal request |
+| **`--timeout`** | 30 s | kills and replaces a worker that misses its heartbeat that long | async heartbeat runs on the event loop, so a blocking handler (a synchronous model call or tool) gets its worker killed |
+| **`--graceful-timeout`** | 30 s | time to finish in-flight requests on shutdown or reload | must cover your longest normal request; a multi-minute agent run rarely fits |
 | **`--max-requests` + `--max-requests-jitter`** | 0, off | recycle each worker after a number of requests | blunt but effective cure for slow native-library leaks; jitter stops all workers restarting at once |
 | **`--preload`** | off | import the app in the master before forking, sharing read-only pages copy-on-write | refcounting writes erode sharing over time; CUDA must not be initialised before a fork, so preloading a GPU model is a trap |
 
 - **Import path changed.** Since Uvicorn 0.30 the built-in `uvicorn.workers` module is deprecated in
   favour of the separate `uvicorn-worker` package (`-k uvicorn_worker.UvicornWorker`). The old path still
   works in many versions but warns, so check which path your pinned versions expect.
+- **`--timeout` is not a request timeout for async workers.** It measures heartbeat silence, so a
+  10-minute agent run that keeps awaiting is fine; a 40-second blocking tool call is not.
 
 ### Sizing
 1. **Start from cores, async-style.** Gunicorn's classic `2 × cores + 1` is for synchronous workers that
@@ -90,32 +107,65 @@ workers per GPU: usually 1, because each process would load its own copy of the 
   orchestrator already restarts dead processes and scales replicas. Per-pod memory and metrics stay simple.
 - **Multiple workers per pod** still make sense when pods are large and per-pod overhead (sidecars, memory
   reserved for the model) is significant.
+- **Long agent runs change the scaling unit.** When runs last minutes, many teams move the loop into a
+  durable worker (a job queue) and keep FastAPI workers for starting runs and streaming their events.
 
 ## Diagram
 The Gunicorn master serves nothing: it forks workers, watches their heartbeats and replaces any that are
-killed or exit (a worker that hits `--max-requests` exits by itself and the master forks a fresh one). Each
-worker is a full process with its own event loop, pools and model copy, which is why memory caps the count.
+killed or exit (a worker that hits `--max-requests` exits by itself and the master forks a fresh one).
+
+Each worker is a full process with its own event loop, pools, model copy and memory, which is why memory
+caps the count and why run state must live outside.
 
 ```mermaid
 flowchart TD
     K["Kernel: shared listening socket"] -->|"spreads connections"| W1
     K -->|"spreads connections"| W2
-    M["Gunicorn master, serves no requests"] -->|"fork"| W1["Worker 1: event loop, pools, model copy"]
-    M -->|"fork"| W2["Worker 2: event loop, pools, model copy"]
+    M["Gunicorn master, serves no requests"] -->|"fork"| W1["Worker 1: loop, pools, model copy"]
+    M -->|"fork"| W2["Worker 2: loop, pools, model copy"]
     W1 -.->|"heartbeat"| M
     W2 -.->|"heartbeat"| M
     M --> T{"Heartbeat missed for the timeout, 30 s default?"}
     T -->|"yes, loop blocked"| X["Kill and replace worker"]
-    W2 --> R{"This worker served max requests plus jitter?"}
+    W2 --> R{"Served max requests plus jitter?"}
     R -->|"yes, worker exits gracefully"| M
-    W1 -->|"RSS adds up"| L["Pod memory limit"]
-    W2 -->|"RSS adds up"| L
+    W1 -->|"run state"| S[("Shared store: Redis or Postgres")]
+    W2 -->|"run state"| S
 ```
 
 ## Examples
+### Agent scenario: sizing a worker for concurrent agent runs
+An agent service runs research agents. Numbers are illustrative: each run makes 10 model calls of ~4 s
+and 9 tool calls of ~1.5 s, so it lasts ~54 s and holds at most one outbound connection at a time.
+
+```python
+def agent_runs_in_flight(runs_per_s, model_calls, model_s, tool_calls, tool_s):
+    run_seconds = model_calls * model_s + tool_calls * tool_s
+    return runs_per_s * run_seconds, run_seconds          # Little's law per run
+
+def plan_agents(runs_per_s, workers, pool_size=100, **run):
+    in_flight, run_s = agent_runs_in_flight(runs_per_s, **run)
+    per_worker = in_flight / workers
+    return {"run_seconds": run_s, "runs_in_flight": in_flight,
+            "runs_per_worker": per_worker, "pool_saturated": per_worker > pool_size}
+
+shape = dict(model_calls=10, model_s=4.0, tool_calls=9, tool_s=1.5)
+print(plan_agents(2, workers=2, **shape))
+# {'run_seconds': 53.5, 'runs_in_flight': 107.0, 'runs_per_worker': 53.5, 'pool_saturated': False}
+print(plan_agents(8, workers=2, **shape))
+# {'run_seconds': 53.5, 'runs_in_flight': 428.0, 'runs_per_worker': 214.0, 'pool_saturated': True}
+```
+
+- **At 2 runs/s, 2 workers are plenty:** ~54 runs per worker are just pending awaits on one loop.
+- **At 8 runs/s the pool, not the CPU, saturates:** raise the per-worker pool limit within the
+  provider's concurrency allowance, or add replicas. Adding workers to the same pod only helps if
+  memory allows.
+- **Each run is a ~54 s request**, longer than the 30 s `--graceful-timeout` default, which is why
+  deploys interrupt runs unless you drain or make runs durable.
+
 ### Worked sizing: API with a local CPU reranker
-A FastAPI retrieval service calls a hosted LLM over HTTP and runs a local cross-encoder reranker on CPU.
-Numbers are illustrative. Each pod gets 4 vCPU and 8 GiB.
+A FastAPI retrieval service for a RAG agent calls a hosted LLM over HTTP and runs a local cross-encoder
+reranker on CPU. Numbers are illustrative. Each pod gets 4 vCPU and 8 GiB.
 
 | Measured per worker after startup | GiB |
 |---|---|
@@ -144,7 +194,8 @@ gunicorn app.main:app -k uvicorn_worker.UvicornWorker -w 4 --bind 0.0.0.0:8000 \
 
 - **Why `--timeout 120`:** a large rerank batch run synchronously can block the loop long enough to miss
   the default 30 s heartbeat.
-- **A workaround, not a fix:** while the loop is blocked, every other request on that worker stalls too.
+- **A workaround, not a fix:** while the loop is blocked, every other request on that worker stalls too,
+  including every agent run waiting on it.
 - **The real fix:** move CPU work off the loop (`run_in_threadpool` works for libraries such as PyTorch
   that release the GIL during heavy ops; pure-Python work needs a process pool), then lower the timeout
   back.
@@ -178,7 +229,11 @@ With the bigger model, memory halves the workers and each worker's 100-connectio
 oversubscribed, so either raise the pool limit or add replicas.
 
 ## Production patterns
-- **One process per pod on Kubernetes.** For an I/O-bound gateway run plain
+- **Externalise agent run state before adding workers.** Agent teams store checkpoints, pending tool
+  approvals and run status in Postgres or Redis (for example a database-backed checkpointer rather than an
+  in-memory one), so any worker can resume any run. Monitor: "run not found" errors, which rise with
+  worker count when state is still per-process.
+- **One process per pod on Kubernetes.** For an I/O-bound gateway or agent API run plain
   `uvicorn app.main:app --host 0.0.0.0 --port 8000` and scale replicas with the autoscaler. Monitor:
   per-pod CPU (one process tops out near one core), event-loop lag and p99 latency.
 - **A checked-in `gunicorn.conf.py` on VMs and large pods.** Set `workers`, `worker_class`, `timeout`,
@@ -191,8 +246,8 @@ oversubscribed, so either raise the pool limit or add replicas.
   provider's connection limits, and create pools in lifespan, never at import. Monitor: open connections
   on the database and pool-timeout errors in the client.
 - **Event-loop lag as a first-class metric.** Run a small background task that sleeps a fixed interval and
-  records how late it wakes; export the overshoot. Monitor: lag climbing with load is a blocking call, not
-  a worker shortage.
+  records how late it wakes; export the overshoot. Monitor: lag climbing with load is a blocking call
+  (often a synchronous tool implementation), not a worker shortage.
 
 ## Trade-offs
 - **More workers vs duplicated models.** Workers use more cores and survive single-process crashes, but
@@ -206,23 +261,28 @@ oversubscribed, so either raise the pool limit or add replicas.
   to harmful with GPU models.
 - **`--max-requests` vs cold starts.** Recycling hides leaks cheaply but periodically cold-starts workers;
   if lifespan startup takes tens of seconds, recycling causes visible latency spikes.
+- **Runs in the API worker vs a durable job worker.** Running the agent loop inside the request is simple
+  and streams naturally, but every restart, recycle or OOM kills in-flight runs; past roughly the length
+  of your graceful timeout, a durable worker with resumable checkpoints wins.
 
 ## Pitfalls
 - **DB pools or HTTP clients at import time with `--preload`.** Symptom: connection errors or hangs in
   workers, because sockets and threads created before fork do not survive it correctly.
-- **Synchronous model inference inside `async def` handlers.** Symptom: Gunicorn logs `WORKER TIMEOUT`
-  and kills workers under load, and every in-flight request on them fails.
+- **Synchronous model inference or tool code inside `async def` handlers.** Symptom: Gunicorn logs
+  `WORKER TIMEOUT` and kills workers under load, and every in-flight request and agent run on them fails.
 - **Sizing workers by CPU count and ignoring per-worker model memory.** Symptom: pods OOM-killed during
   traffic peaks, often reported as mysterious restarts with exit code 137.
-- **In-process state, then more workers.** A dict cache or a rate-limit counter per process. Symptom: rate
-  limits N times too generous and cache hit rates that drop as workers increase.
+- **In-process state, then more workers.** A dict cache, a rate-limit counter or an in-memory agent
+  checkpointer per process. Symptom: rate limits N times too generous, cache hit rates that drop as
+  workers increase, and "resume run" requests that fail on whichever worker did not start the run.
 - **Workers behind a proxy reusing a few keep-alive connections.** Symptom: one worker pinned near 100% CPU
   with high event-loop lag while siblings idle, so p99 barely improves.
 - **Ignoring total connections.** Many workers per pod and many pods. Symptom: the database or provider
   rejects connections because workers × pool size × replicas exceeds its limit.
 
 ## When to use
-- **I/O-bound LLM gateway on Kubernetes:** start with one Uvicorn process per container and scale replicas.
+- **I/O-bound LLM gateway or agent API on Kubernetes:** start with one Uvicorn process per container and
+  scale replicas.
 - **VMs or large pods:** use Gunicorn with Uvicorn workers for in-pod supervision, leak recycling and
   heartbeat kills.
 - **Size by:** measured RSS and GPU count before CPU.
@@ -260,6 +320,13 @@ memory and DB connection limits allow it. If something blocks, fix it with an as
 - **Together** (`-k uvicorn_worker.UvicornWorker`) you get async request handling plus in-host
   supervision, useful on VMs and large pods.
 
+### Your agent service works with one worker, but after scaling to four, "resume run" calls randomly fail. Why?
+- **Run state was per-process:** an in-memory checkpointer, run registry or pending-approval dict lives in
+  the worker that started the run, and the kernel spreads later connections across all four workers.
+- **Fix:** move checkpoints, run status and pending tool approvals into a shared store (Postgres or Redis)
+  so any worker can resume any run.
+- **Do not reach for sticky sessions first:** they break again on worker recycle, restart or deploy.
+
 ### How would you choose the worker count when each worker, model included, uses 3 GiB of RSS?
 - **Memory first:** workers ≤ (container memory − headroom) ÷ per-worker RSS, so on
   an 8 GiB pod with 1.6 GiB headroom, 6.4 ÷ 3 rounds down to 2 workers.
@@ -268,10 +335,10 @@ memory and DB connection limits allow it. If something blocks, fix it with an as
   HTTP pool, or raise the pool or add replicas.
 - **If weights dominate RSS**, move the model to a separate model server instead.
 
-### Gunicorn logs WORKER TIMEOUT under load and in-flight requests fail. What is happening?
-- **The async worker's heartbeat runs on the event loop,** so a blocking call (synchronous inference,
-  a sync HTTP client) stops the heartbeat and the master kills the worker after `--timeout`, 30 s by
-  default.
+### Gunicorn logs WORKER TIMEOUT under load and in-flight agent runs fail. What is happening?
+- **The async worker's heartbeat runs on the event loop,** so a blocking call (synchronous inference, a
+  sync HTTP client inside a tool) stops the heartbeat and the master kills the worker after `--timeout`,
+  30 s by default.
 - **Raising `--timeout` is a workaround:** every other request on that worker still stalls while the loop
   is blocked.
 - **The fix:** move the work off the loop, with `run_in_threadpool` for GIL-releasing libraries or a

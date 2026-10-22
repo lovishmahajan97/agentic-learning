@@ -5,7 +5,8 @@ name: Memory architecture
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-memory
   - agents/memory-retrieval-update-deletion-policies
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Models are stateless and windows finite, so anything remembered across turns, sessions or users lives
-outside the model and returns selectively. Memory architecture designs those scoped stores and their
-write, read, update and delete policies; the hard part is what to remember and forget.
+Models are stateless and windows finite, so anything your agent remembers across turns, sessions or
+users lives outside the model and returns selectively. Memory architecture designs those scoped stores
+and their write, read, update and delete policies; the hard part is what to forget.
+
+## For agent builders
+- **Why it matters for agents.** An agent that runs for 200 turns or returns next week either replays
+  everything (cost and quality collapse) or depends on memory you designed. Scoping, supersession and
+  deletion decide whether it feels continuous or leaks one user's facts into another's session.
+- **Where it shows up in your stack.** LangGraph separates a checkpointer (per-thread session state) from
+  a store (cross-thread memories under a namespace); memory layers such as Mem0, Letta (the MemGPT
+  line) and Zep package extraction and retrieval; underneath sit Postgres, pgvector or Redis.
+- **What you control.** Which memory types exist, the keys (tenant, user, purpose), whether code or a
+  `remember` tool writes, the read budget and ranking weights, consolidation jobs, TTLs and lineage for
+  deletion.
+- **What you can skip.** Cognitive-science taxonomies beyond the five types below, and building your own
+  vector index. A small typed-slot table plus a scoped vector search covers most agents.
 
 ## Why it exists
 - **Every model call starts from zero.** The model knows only what the application puts in the prompt.
@@ -107,6 +121,17 @@ under a token budget:
 - **The trade:** flexibility on open-ended tasks, at the cost of predictability, extra calls, and a model
   that sometimes forgets to remember.
 - **Common production mix:** a code-driven baseline read plus model-callable memory tools for the rest.
+
+### Where the tiers land in a typical agent stack
+| Tier | LangGraph | Hand-rolled |
+|---|---|---|
+| Working memory | the state passed to the model node, trimmed or summarized | prompt assembly code |
+| Session state | a checkpointer keyed by `thread_id` | transcript table by conversation id |
+| Semantic and episodic memory | a store with a namespace such as (tenant, user) and optional semantic search | slot table plus pgvector rows |
+| Procedural memory | prompts and tool notes you version | prompt files and config |
+
+- **A framework store is plumbing, not policy.** It persists and searches what you put in; supersession,
+  provenance gating and lineage-driven deletion are still yours to write.
 
 ### Scoping and isolation
 - **Every memory row carries** tenant id, user id, the agent or purpose it was collected for, a source
@@ -351,6 +376,14 @@ no retrieval, summary or extraction can surface it afterwards.
   extracted as a memory and reappears in later, unrelated sessions.
 - **The fix:** extract only from the user's own turns, tag every memory with its source type, reject
   non-user sources, and alert on memories created from anything other than the user.
+
+### You are adding cross-session memory to an existing agent. What do you build first, and how do you know it helps?
+- **First, session state and compaction:** a durable transcript per thread and a rolling summary,
+  because every multi-turn agent needs them before any long-term memory.
+- **Then a few typed slots** for facts you can name that change behaviour, keyed by tenant and user,
+  written by a background extractor from user turns only.
+- **Prove it:** A/B task success with memory on versus off, plus memory hit rate and working-set tokens
+  per call; remove memory types that do not move task success.
 
 ## Quiz
 ### Q: Why is a session transcript store, rather than the context window, treated as the source of truth for a conversation?

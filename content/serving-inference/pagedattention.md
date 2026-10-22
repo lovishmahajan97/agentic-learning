@@ -5,7 +5,8 @@ name: PagedAttention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - model-internals/kv-cache
   - serving-inference/kv-cache-memory-estimation
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-PagedAttention stores each request's KV cache in fixed-size blocks (usually 16 tokens) behind a
-per-request block table, allocated on demand and shareable. Because decode is memory-bound, the recovered
-memory becomes more concurrent requests, the source of vLLM's throughput gains.
+Agent transcripts grow unpredictably, step by step. PagedAttention stores each request's KV cache in
+fixed-size blocks (usually 16 tokens), allocated on demand and shareable, so a self-hosted engine runs
+many more concurrent agents per GPU.
+
+## For agent builders
+- **Why it matters for agents.** You never know how long an agent run will get: a 3-step lookup and a
+  20-step research loop hit the same server. Paged allocation charges each agent only for the tokens it
+  actually holds, so short runs do not pay for the longest one.
+- **Where it shows up in your stack.** Inside vLLM, SGLang and TensorRT-LLM when you self-host the model
+  behind your agent framework. Its knobs are `gpu_memory_utilization`, `max_model_len`, prefix caching
+  and the KV-cache dtype; its symptoms are preemption counters and latency jitter.
+- **What you control.** Prompt layout (shared system prompt and tool schemas first, byte-identical, so
+  blocks are shared across agents), the context cap per route, and when to compact long transcripts.
+- **What you can skip.** The kernel internals and online-softmax math. Know blocks, block tables,
+  copy-on-write and preemption; that is enough to size and debug an agent deployment.
 
 ## Why it exists
 - **Every token in flight costs memory.** About 0.5 MB per token for a Llama-2-7B-style model in fp16
@@ -41,6 +54,14 @@ memory becomes more concurrent requests, the source of vLLM's throughput gains.
   addresses through a table.
 
 ## How it works
+### Why agent traffic is the worst case for contiguous allocation
+- **Length variance is extreme.** One agent answers in 2 steps at 7k tokens; another loops 20 times to
+  34.5k tokens. A contiguous allocator must reserve the route's maximum for both.
+- **Growth happens between calls.** Each step appends a tool call and its result, then the engine
+  decodes again, so the cache grows in bursts the engine cannot predict at admission.
+- **Agents share a lot.** Every run starts with the same system prompt and tool schemas, often thousands
+  of tokens. Block sharing stores that prefix once instead of once per agent.
+
 ### Blocks and block tables
 - **Physical blocks.** The cache is carved into blocks of a fixed number of tokens, B. For one layer a
   block holds K and V for B tokens across all KV heads: `2 × n_kv_heads × head_dim × B ×
@@ -61,7 +82,7 @@ memory becomes more concurrent requests, the source of vLLM's throughput gains.
    request. Fixed-size units are the one scheme where freed space is always reusable, which is why the
    OS page allocator works the same way.
 
-### The attention kernel
+### Background: the attention kernel
 - **Inputs.** A block-table tensor of shape [num_seqs, max_blocks_per_seq] plus each sequence's current
   length.
 - **Per sequence.** Take the new token's query, walk that row of the table, load K and V from each
@@ -114,8 +135,8 @@ memory becomes more concurrent requests, the source of vLLM's throughput gains.
 Sixteen tokens is the common compromise.
 
 ## Diagram
-A request's logical blocks map through its block table to scattered physical blocks; a full last block
-triggers one more allocation, and an empty pool triggers preemption.
+Each agent step is a request whose logical blocks map through its block table to scattered physical
+blocks; a full last block triggers one more allocation, and an empty pool preempts some agent's step.
 
 ```mermaid
 flowchart TD
@@ -222,7 +243,33 @@ a.append(); b.append()                             # both write into the shared 
 print(a.table, b.table, "free:", len(pool.free))   # [7, 6, 4] [7, 6, 5] free: 4
 ```
 
+### Worked scenario: how many research agents fit on one GPU
+Same 8B GQA model and pool as above (27,648 blocks ≈ 442,000 tokens).
+
+Each agent starts with a 6k-token
+prefix (system prompt plus tool schemas) and appends ~1.5k tokens per step, up to 20 steps (34.5k
+tokens, about 4.2 GB of KV). Agents are spread evenly across steps 1 to 20, so the average context is
+about 20,250 tokens.
+
+| Allocator | Memory charged per agent | Agents resident |
+|---|---|---|
+| Contiguous, `max_model_len` 32,768 | 32,768 tokens, always | 13 |
+| Paged | ~20,250 tokens + a partial block | about 21 |
+| Paged + prefix caching | 6k prefix stored once, ~14,250 unique tokens each | about 30 |
+
+- **The win is smaller than for chat.** Long agents use much of their limit, so paging alone gives
+  ~1.6×, not 5×. Prefix sharing adds most of the rest, because the 6k prefix is 375 shared blocks.
+- **The real limit is the tail.** If all 30 agents reach step 20 together they need ~860,000 tokens,
+  so the pool empties and the engine preempts. Cap steps or compact transcripts before that point.
+
 ## Production patterns
+- **Lay out agent prompts for block sharing.** Turn on prefix caching (`--enable-prefix-caching` in
+  vLLM; the V1 engine enables it by default). Put the system prompt and tool schemas first and
+  byte-identical across every run, with dates and user IDs after them. Monitor prefix-cache hit rate per
+  agent type and time to first token.
+- **Compact long agent transcripts at a step boundary.** When a run nears its context cap, summarize old
+  tool results into one block and continue, instead of letting long runs drain the pool and trigger
+  preemptions for every other agent. Monitor context length per step and blocks in use.
 - **Profile, then set the memory fraction.** When deploying a new model or GPU, start vLLM at the
   default `gpu_memory_utilization` (0.9) and raise it only after re-profiling activation peaks with your
   real `max_model_len` and batch size. Monitor KV-cache usage and OOMs.
@@ -232,10 +279,6 @@ print(a.table, b.table, "free:", len(pool.free))   # [7, 6, 4] [7, 6, 5] free: 4
 - **Cap context per route.** When long-document chats share a deployment with short Q&A, lower
   `max_model_len` (or route long requests to their own deployment) so a few long chats cannot drain the
   pool. Monitor block usage per route and p95 prompt length.
-- **Design prompts for block sharing.** Turn on prefix caching (`--enable-prefix-caching` in vLLM; the V1
-  engine enables it by default) and
-  keep the system prompt and tool definitions byte-identical and first, with dates and user IDs after
-  them. Monitor the prefix-cache hit rate and time to first token.
 - **Stretch the pool with an FP8 cache.** When block usage is the bottleneck, set the KV-cache dtype to
   fp8 (`--kv-cache-dtype fp8` in vLLM) and run your eval set before rollout. It roughly doubles tokens
   of capacity per GPU versus an fp16 cache.
@@ -253,6 +296,9 @@ print(a.table, b.table, "free:", len(pool.free))   # [7, 6, 4] [7, 6, 5] free: 4
 - **Large vs small blocks.** Larger blocks give faster kernels and fewer table entries; smaller ones
   waste less in partial blocks and share prefixes at finer granularity. The best size flips as average
   request length shrinks.
+- **More concurrent agents vs tail latency.** Admitting more agents raises GPU throughput, but when many
+  runs grow long at once the pool empties and preemption adds seconds to some agent's step. Admit fewer
+  agents when a slow step breaks a user-facing deadline.
 
 ## Pitfalls
 - **Reading the gain as "a faster attention kernel".** The kernel is slightly slower; the paper's 2–4×
@@ -264,10 +310,15 @@ print(a.table, b.table, "free:", len(pool.free))   # [7, 6, 4] [7, 6, 5] free: 4
   symptom is a prefix-cache hit rate near zero for prompts that look identical.
 - **Setting `gpu_memory_utilization` to 0.98 for more blocks.** It then OOMs when another process, a CUDA
   graph or a larger-than-profiled activation peak needs the headroom.
+- **Sizing agent capacity from the first step.** Load tests with fresh runs show plenty of free blocks;
+  production agents at step 15 do not. Symptom: preemptions appear only hours into real traffic. Fix:
+  load-test with replayed full-length agent traces.
 
 ## When to use
 You do not switch PagedAttention on: every mainstream open engine (vLLM, SGLang, TensorRT-LLM and others)
 uses block-based KV management. The decision is how to configure and observe it.
+- **Self-hosting agents:** this is the lesson to know when your agent framework calls a vLLM or SGLang
+  endpoint; with a hosted API the provider manages blocks and you only see the prompt-caching effect.
 - **Sizing a deployment:** use the block arithmetic for tokens of capacity, expected tokens per request,
   and therefore concurrency.
 - **In production:** watch block utilization and preemption counts. They tell you whether to lower
@@ -318,16 +369,24 @@ share a long system prompt, enabling prefix caching recovers blocks too.
 - **Requests that always use their full length.** If actual length is close to the limit, contiguous
   reservation wastes little, so paging recovers little.
 
-### How would you pick a block size, and what does it change?
-- **Larger blocks:** fewer table entries and better memory coalescing, but more tail waste per sequence
-  and coarser prefix sharing because only complete blocks are shared.
-- **Smaller blocks:** less waste and finer sharing, at more table overhead. Sixteen tokens is the common
-  default; deviate only after measuring with your length distribution.
-
 ### Estimate how many 1,500-token chats fit on an 80 GB GPU for an 8B GQA model.
 - **Per token:** 2 × 32 layers × 8 KV heads × 128 × 2 bytes = 128 KB.
 - **Pool:** 80 × 0.9 − 16 GB weights − ~2 GB activations ≈ 54 GB, about 442,000 tokens.
 - **Answer:** around 290 chats paged versus 54 with contiguous 8,192-token reservations, roughly 5× more.
+
+### Your self-hosted agents get slow only in the afternoon, with no OOMs. How do you debug it?
+- **Suspect the long tail of runs.** As the day goes on, more agents are mid-run with long transcripts,
+  so the block pool empties and the engine preempts and recomputes steps.
+- **Confirm with metrics:** preemption counter rising while KV-cache usage sits near 100%, and context
+  length per step climbing.
+- **Fix:** compact transcripts at a step boundary, cap steps per run, keep the prefix shareable, or
+  admit fewer concurrent agents.
+
+### How would you design agent prompts to get the most out of block sharing?
+- **Stable prefix first:** system prompt and tool schemas byte-identical and at the top, because only
+  whole blocks with identical content and prefix are shared.
+- **Variable content later:** dates, user IDs and retrieved documents after the shared prefix.
+- **Append only:** never rewrite earlier turns, since a change invalidates every block after it.
 
 ## Quiz
 ### Q: Where does most of PagedAttention's throughput improvement come from?

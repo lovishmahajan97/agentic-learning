@@ -5,7 +5,8 @@ name: Backpressure
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - serving-inference/batching-and-concurrency-limits
   - serving-inference/timeouts
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Backpressure is how an overloaded stage tells its feeder to slow down instead of buffering until memory
-or latency blows up. Bound admission, measure queue wait, and reject the rest fast with 429 or 503 plus
-`Retry-After`.
+One agent run fans out into many model and tool calls, so overload arrives faster than with chat.
+Backpressure bounds admission per run, measures queue wait, and rejects the excess fast with 429 or 503
+plus `Retry-After`.
+
+## For agent builders
+- **Why it matters for agents.** A user turn is not one request: a ReAct loop often makes 5-20 model calls
+  (illustrative), and parallel tool calls or sub-agents multiply that. Ten users can look like two
+  hundred requests, and a run
+  shed at step 9 has already wasted eight steps of GPU time and tokens.
+- **Where it shows up in your stack.** Provider 429s and `Retry-After` reaching your agent loop; the
+  concurrency setting on LangChain or LangGraph batch and parallel execution; vLLM's `--max-num-seqs` and
+  waiting gauges when you self-host; the semaphore in your FastAPI agent server.
+- **What you control.** Admit whole runs at the front door, cap parallel tool and sub-agent fan-out, give
+  each run a step and token budget, and make the loop honour `Retry-After` instead of hammering.
+- **What you can skip.** Queueing-theory proofs and CoDel internals. Little's law and "bound queue time,
+  not queue length" are enough to size an agent gateway.
 
 ## Why it exists
 - **Capacity is fixed.** The running batch is capped by KV-cache memory (`max_num_seqs` and free cache
@@ -117,9 +131,23 @@ A system needs all three.
   producers enqueue freely, consumers pull at the GPU's pace.
 - **Only with a maximum depth or age;** an unbounded queue is the original problem wearing a different hat.
 
+### Agent runs: admit the run, not the call
+An agent run is a chain of dependent calls, so admission has to happen at two levels:
+1. **Run admission at the front door.** Decide once, before step 1, whether the run can start. Rejecting
+   a new run costs nothing; aborting a half-finished run wastes every step already paid for.
+2. **Call-level gate inside the run.** Each model call still passes a shared semaphore or token gate, but
+   admitted runs get priority over new runs, so work in progress drains first.
+3. **Bounded fan-out.** Parallel tool calls and sub-agents share a per-run cap, because one planner that
+   spawns 20 parallel searches can starve every other run.
+4. **Budgets per run.** A maximum step count and token budget turn a looping agent into a bounded cost,
+   which makes run-level admission predictable.
+5. **Honour pushback in the loop.** On 429 or 503 the loop waits for `Retry-After` within the run's
+   deadline, then either continues or ends the run with a clear "busy" result, never a tight retry loop.
+
 ## Diagram
 Follow a request from arrival: it is shed at the edge if the wait budget runs out, and work starts only
-after the disconnect check, so no GPU time goes to callers who left.
+after the disconnect check, so no GPU time goes to callers who left. For an agent, "request" is the
+whole run: the gate sits before step 1.
 
 ```mermaid
 flowchart TD
@@ -216,7 +244,58 @@ Illustrative numbers from 4 req/s at 8 s mean latency, engine capped near 32 con
 The wait grows by about 2 s every second (8 join, 4 leave), so after about 15 s of overload new arrivals
 already wait past a 30 s client timeout; from then on the GPU serves mostly clients who have left.
 
+### Agent server: run admission plus bounded tool fan-out
+Admit whole runs with a cheap check, cap in-flight model calls across all runs, and cap parallel tool
+calls per run. `llm_step` and `run_tool` stand in for your model client and tool executor.
+
+```python
+import asyncio
+
+MAX_RUNS = 8              # runs in progress; size from Little's law on run duration, not call duration
+MAX_LLM_CALLS = 32        # shared with every run: matches the engine or provider concurrency
+MAX_TOOLS_PER_RUN = 4     # parallel tool calls one run may have in flight
+MAX_STEPS = 12            # per-run step budget keeps a looping agent bounded
+
+runs = asyncio.Semaphore(MAX_RUNS)
+llm_calls = asyncio.Semaphore(MAX_LLM_CALLS)
+
+class Busy(Exception):
+    """Mapped to 503 + Retry-After by the API layer."""
+
+async def start_run(task):
+    if runs.locked():                      # admit or reject before step 1: no work wasted
+        raise Busy("agent capacity full")
+    async with runs:
+        return await agent_loop(task)
+
+async def agent_loop(task):
+    tools_gate = asyncio.Semaphore(MAX_TOOLS_PER_RUN)
+    history = [task]
+    for step in range(MAX_STEPS):
+        async with llm_calls:              # every model call passes the shared gate
+            action = await llm_step(history)
+        if action.final:
+            return action.answer
+        async def one(call):
+            async with tools_gate:         # a planner asking for 20 searches runs 4 at a time
+                return await run_tool(call)
+        history += await asyncio.gather(*(one(c) for c in action.tool_calls))
+    return "stopped: step budget reached"
+```
+
+### Worked scenario: ten users, one agent each
+Illustrative: each run takes about 10 model calls of ~4 s, with 3 parallel tool calls per step.
+
+| Setup | Model calls in flight at peak | What users see |
+|---|---|---|
+| No run admission, no fan-out cap | 10 runs × parallel sub-calls, often over 32 | everyone's step latency doubles, many runs time out at step 7-9 |
+| Run admission at 8, fan-out cap 4 | at most 8 runs, calls capped at 32 | 8 runs finish at normal speed, 2 get an instant "busy, retry in a few seconds" |
+| Same, plus priority to admitted runs | in-progress steps go first | no run is abandoned halfway, so no tokens are wasted on unfinished work |
+
 ## Production patterns
+- **Run-level admission for agents.** Agent teams gate the start of a run, cap parallel tool calls and
+  sub-agents per run, and give in-progress runs priority over new ones at the model-call gate. Monitor
+  runs rejected at start versus runs aborted mid-way; the second number should be near zero.
 - **Semaphore plus wait budget at the API layer.** Use for every route that fronts a GPU or metered quota.
   Size it with Little's law, set a 1–2 s budget for interactive traffic, return 503 with `Retry-After`.
   Monitor the queue-wait histogram and rejection rate.
@@ -228,7 +307,8 @@ already wait past a 30 s client timeout; from then on the GPU serves mostly clie
 - **AIMD in the shared client library.** Internal callers halve their concurrency on a 503 and add one
   slot per success window. Monitor client-side concurrency over time; a sawtooth shows it working.
 - **Autoscale on queue wait, not GPU utilisation.** Trigger scale-out when p95 queue wait crosses part of
-  the budget, because utilisation stays near 95% whether the queue is empty or exploding.
+  the budget, because utilisation stays near 95% whether the queue is empty or exploding. For hosted
+  models the equivalent signal is your own gate's wait time and the provider's 429 rate.
 
 ## Trade-offs
 - **Fast 503s vs slow timeouts.** Shedding early turns some requests into fast 503s instead of all into
@@ -242,6 +322,9 @@ already wait past a 30 s client timeout; from then on the GPU serves mostly clie
 - **Durable queue vs explicit rejection.** A durable queue hides overload from producers, right for
   pipelines and wrong for chat: once a reply takes longer than a user will wait, finishing it is wasted
   GPU time, so interactive paths need explicit rejection.
+- **Admitting runs vs admitting calls.** Run-level admission protects finished-run throughput, but it
+  reserves capacity for runs that may idle on slow tools. It flips when tool time dominates: then admit
+  more runs than model-call slots and let the call gate do the real limiting.
 
 ## Pitfalls
 - **Unbounded in-memory queues,** which many frameworks give you by default. Symptom: p99 latency climbs
@@ -255,10 +338,17 @@ already wait past a 30 s client timeout; from then on the GPU serves mostly clie
 - **Wiring load shedding into the load balancer's health check.** Symptom: total outage during a partial
   overload, because every instance reports unhealthy at once and is removed. Keep liveness separate from
   load.
+- **Shedding agent runs halfway.** Symptom: token spend rises during overload while completed runs fall,
+  because runs are rejected at step 6 or 8 by the call-level gate. Fix: admit at run start and give
+  in-progress runs priority.
+- **Agent loops that retry 429s immediately.** Symptom: provider 429 rate climbs after each incident and
+  one user's run consumes the whole quota. Fix: honour `Retry-After` in the loop and cap waits by the
+  run's deadline.
 
 ## When to use
 - **Use at every boundary that fronts a GPU or a metered provider quota:** the gateway in front of your
-  API, the application in front of the engine, and the engine's own scheduler limits.
+  API, the application in front of the engine, and the engine's own scheduler limits. For agents, add
+  the run-level gate and the per-run fan-out cap.
 - **Start simple.** Semaphore plus wait budget first; add token weighting when prompt lengths vary widely,
   and priority tiers when batch and interactive traffic share a deployment.
 - **Measure** queue wait time, rejection rate, in-flight tokens and KV-cache usage. Alert on wait time
@@ -307,11 +397,21 @@ control for a different problem.
 - **Fix** with a wait budget and fast 503s at the edge, then lower the engine limit until its own queue
   stays near zero.
 
-### When would you queue work instead of rejecting it?
-- **Queue when callers can wait:** batch pipelines and offline jobs, behind a durable queue with a bounded
-  consumer pool and a maximum depth or age.
+### Your background research agents and your chat agent share one deployment. When do you queue and when do you reject?
+- **Queue when callers can wait:** batch pipelines, offline jobs and background agent runs, behind a
+  durable queue with a bounded consumer pool and a maximum depth or age.
 - **Reject for interactive traffic,** because once a reply takes longer than the user will wait, finishing
   it is wasted GPU time.
+- **Give each class its own limit** and shed background runs first, monitoring rejections per class so
+  they are not starved forever.
+
+### During a traffic spike your agent's token spend rises but completed runs fall. What is happening?
+- **Runs are shed halfway.** A call-level gate rejects step 7 of a run that already paid for six steps,
+  so tokens are spent with no answer delivered.
+- **Fix with run-level admission:** decide before step 1, give in-progress runs priority at the call gate,
+  and cap parallel tool calls per run so one planner cannot starve the rest.
+- **Check the loop's retry behaviour,** because tight retries on 429 inside the loop add load exactly when
+  the system is full; honour `Retry-After` within the run's deadline.
 
 ### Traffic is 6 req/s at 5 s mean latency, and users abandon after 8 s. How do you size the gate?
 - **Concurrency from Little's law:** 6 × 5 = 30 in flight, then lower it under a load test until the

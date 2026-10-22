@@ -5,7 +5,8 @@ name: Shared vs isolated model-serving infrastructure
 kind: decision
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - infra-capacity-economics/inference-clusters
   - infra-capacity-economics/cost-allocation-by-tenant-and-feature
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Shared serving runs every tenant through one pool of replicas; isolated serving gives a tenant its own
-replicas, nodes, cluster or account. Sharing wins on cost; isolation wins on noisy neighbours,
-compliance and custom configs. It is a spectrum, and most platforms use both.
+When many agents or customers share self-hosted models, shared serving runs them all through one pool;
+isolated serving gives a tenant its own replicas, nodes, cluster or account. Sharing wins on cost,
+isolation on noisy neighbours, compliance and custom configs; most platforms use both.
+
+## For agent builders
+- **Why it matters for agents.** Agents are the classic noisy neighbour: a research agent fanning out 30
+  sub-agents, or an eval sweep running 500 tasks, can hold most of a shared pool's sequences and push up
+  TTFT for every interactive agent on it.
+- **Where it shows up in your stack.** Per-tenant and per-agent rate limits at your LLM gateway, priority
+  tags, a separate batch pool for evals and offline agents, multi-LoRA serving (vLLM `--enable-lora`) for
+  per-customer tool-calling fine-tunes, and tenant-salted prefix caching.
+- **What you control.** The tenant and agent ids your agent runtime attaches to every model call, the
+  in-flight cap per tenant (counted across a run's whole fan-out), and which agent workloads are tagged
+  batch.
+- **What you can skip.** On a hosted API this is the provider's problem; you meet the same idea as
+  provisioned throughput versus pay-as-you-go, and per-project limits.
 
 ## Why it exists
 - **A GPU is efficient only when busy.** Continuous batching reaches its throughput at tens of concurrent
@@ -33,12 +47,12 @@ compliance and custom configs. It is a spectrum, and most platforms use both.
 - **Pooling fills the batch.** A tenant peaking at five concurrent requests cannot fill a replica alone.
   Because many tenants' peaks fall at different times, the pool needs capacity for the peak of the sum,
   which is much less than the sum of the peaks.
-- **The pull is strong.** For a platform serving dozens of internal teams, dedicated replicas per team can
-  multiply the GPU bill several times for the same total tokens.
-- **"Share everything" fails fast.** One tenant's batch job of 50k-token documents fills the KV cache and
-  everyone's TTFT jumps. Nobody can say whose fault it is or stop it, because the engine's scheduler is
-  first-come-first-served by default (some engines offer a request-priority policy) and knows nothing
-  about tenants or fair shares.
+- **The pull is strong.** For a platform serving dozens of internal agent teams, dedicated replicas per
+  team can multiply the GPU bill several times for the same total tokens.
+- **"Share everything" fails fast.** One tenant's batch job of 50k-token documents (or an agent that
+  pastes whole files into context) fills the KV cache and everyone's TTFT jumps. Nobody can say whose
+  fault it is or stop it, because the engine's scheduler is first-come-first-served by default (some
+  engines offer a request-priority policy) and knows nothing about tenants or fair shares.
 - **And again on guarantees.** A regulated tenant asks whether their prompts ever shared a GPU with another
   company's; another needs a different model, context limit, fine-tuned adapter or region. Sharing without
   isolation quietly removes fairness, blast-radius control and contractual guarantees. So decide which
@@ -80,9 +94,10 @@ shared replicas   = ceil( max_t Σᵢ Lᵢ(t) / C ) + spare
    different times. For many independent tenants the aggregate's relative fluctuation shrinks roughly as
    1/√N, so a large pool needs proportionally less headroom.
 3. **The second effect is the one that flips.** When peaks are correlated (one time zone, the same
-   month-end process, the same upstream event), the peak of the sum approaches the sum of the peaks and
-   sharing saves little beyond rounding and spares.
-4. **So the input is a per-tenant load time series,** not a per-tenant average.
+   month-end process, the same upstream event, every team's nightly eval at 02:00), the peak of the sum
+   approaches the sum of the peaks and sharing saves little beyond rounding and spares.
+4. **So the input is a per-tenant load time series,** not a per-tenant average. For agents, count
+   in-flight sequences, because one agent run can hold several at once when it calls tools in parallel.
 
 ### What is actually shared at each level
 - **Sharing a replica** means sharing GPU memory: tenants' KV caches sit in the same pool of blocks and the
@@ -93,7 +108,9 @@ shared replicas   = ceil( max_t Σᵢ Lᵢ(t) / C ) + spare
   tenant's identical text, the cached KV is never returned to the caller. But the faster TTFT of a hit is
   a timing side channel that can reveal someone else recently sent that prefix.
 - **So cross-tenant cache sharing is an explicit decision.** The usual answer is to salt the cache key with
-  the tenant id (some engines accept a per-request cache salt).
+  the tenant id (some engines accept a per-request cache salt). For agents the trade is concrete: a
+  shared agent framework's system prompt and tool schemas are a big common prefix, and salting makes each
+  tenant warm its own copy.
 - **Sharing a node but not a replica** removes cache co-residency and leaves shared host RAM, network and
   the node's failure domain.
 - **Sharing a cluster** leaves a shared control plane and shared operators.
@@ -101,11 +118,12 @@ shared replicas   = ceil( max_t Σᵢ Lᵢ(t) / C ) + spare
   because "dedicated" is sold at every level.
 
 ### Multi-LoRA: sharing the base, isolating the behaviour
-- **Expensive choice:** a dedicated replica per fine-tune.
+- **Expensive choice:** a dedicated replica per fine-tune, for example one per customer's tool-calling
+  adapter.
 - **Cheaper design:** one shared base model, with each tenant's LoRA adapter loaded into the same engine.
   Adapters are small and swapped per request; base weights are shared.
-- **What it gives:** behavioural isolation (each tenant's outputs come from their adapter) with shared
-  economics.
+- **What it gives:** behavioural isolation (each tenant's agent outputs come from their adapter) with
+  shared economics.
 - **The limit:** all tenants must agree on the base model, context limit and quantization.
 
 ### Logical isolation mechanics
@@ -114,14 +132,14 @@ shared replicas   = ceil( max_t Σᵢ Lᵢ(t) / C ) + spare
 - **At the pool:** weighted fair queueing across tenants before admission, so a tenant with a batch backlog
   cannot starve interactive users, and the option to route a tenant's batch traffic to a separate
   low-priority pool.
-- **In observability:** every request carries a tenant id into metrics and traces so cost and tail latency
-  can be attributed. Without attribution you cannot even argue about whether a tenant deserves dedicated
-  capacity.
+- **In observability:** every request carries a tenant id (and, for agents, agent and run ids) into
+  metrics and traces so cost and tail latency can be attributed. Without attribution you cannot even
+  argue about whether a tenant deserves dedicated capacity.
 
 ### How the decision is made
 Score each tenant on four questions:
 
-1. Does their traffic shape threaten others (long contexts, bursty batch jobs)?
+1. Does their traffic shape threaten others (long contexts, bursty batch jobs, agent fan-out)?
 2. Do they need guarantees others would violate (latency SLO, data separation, region)?
 3. Do they need a different model configuration?
 4. Would their dedicated capacity sit idle most of the day?
@@ -135,12 +153,12 @@ Score each tenant on four questions:
   pool plus a short list of exceptions, each with a documented reason.
 
 ## Diagram
-Walk a tenant down the decision path: hard requirements first, then configuration, then traffic shape;
-everyone who reaches the bottom stays in the shared pool.
+Walk a tenant or agent workload down the decision path: hard requirements first, then configuration,
+then traffic shape; everyone who reaches the bottom stays in the shared pool.
 
 ```mermaid
 flowchart TD
-    T["Tenant request for capacity"] --> R{"Contract or regulation forbids sharing?"}
+    T["Tenant asks for capacity"] --> R{"Contract or regulation forbids sharing?"}
     R -->|"yes"| D5["Level 4 or 5: dedicated nodes, cluster or account"]
     R -->|"no"| C{"Needs a different model config?"}
     C -->|"only an adapter"| ML["Multi-LoRA on the shared base"]
@@ -154,7 +172,7 @@ flowchart TD
 
 ## Examples
 ### Peak of the sum vs sum of the peaks, in code
-A runnable model of the multiplexing formula. Loads are illustrative hourly concurrency per team.
+A runnable model of the multiplexing formula. Loads are illustrative hourly concurrency per agent team.
 
 ```python
 import math
@@ -185,6 +203,19 @@ for name, loads in (("peaks spread over the day", spread), ("all peak at 14:00",
 - **Spread peaks:** the combined peak is 20 + 9 × 4 = 56 sequences, so two replicas plus a spare.
 - **Correlated peaks:** the combined peak is 200, so the saving falls back to rounding and shared spares.
 
+### Worked scenario: an eval sweep as the noisy neighbour
+A shared pool of 3 replicas × 48 = 144 sequence slots serves interactive support agents. A team launches
+an eval sweep of 500 agent tasks at client concurrency 100. Illustrative numbers.
+
+| Setup | Slots held by the sweep | Left for interactive agents | Effect |
+|---|---|---|---|
+| No tenant caps | ~100 of 144 | ~44 | interactive TTFT climbs as their steps queue behind eval steps |
+| Per-tenant cap of 24 in-flight sequences | 24 | 120 | sweep takes ~4× longer; interactive latency unchanged |
+| Sweep tagged batch, routed to its own pool | 0 | 144 | sweep speed set by the batch pool's size |
+
+- **Fan-out counts:** an agent issuing 3 parallel tool-result summaries holds 3 sequences, so caps must
+  count sequences, not runs.
+
 ### Worked comparison: ten product teams on one 70B model
 Numbers are illustrative and come from the kind of measurements you would make yourself. Each team peaks
 at 20 concurrent sequences, but peaks are spread over the day; the measured combined peak is 80
@@ -210,34 +241,38 @@ concurrent sequences, not 200. A replica holds 48 concurrent sequences within th
 ## Production patterns
 - **Per-tenant token buckets at the gateway.** For any shared pool, enforce requests-per-minute,
   tokens-per-minute and an in-flight concurrency cap per tenant id (for example counters in Redis keyed by
-  tenant), returning 429 when exceeded. Monitor 429s and in-flight sequences per tenant.
+  tenant), returning 429 when exceeded, and have agent loops back off on it. Monitor 429s and in-flight
+  sequences per tenant and per agent.
 - **Fair-share queue in front of the engine.** Keep one queue per tenant at the gateway and dequeue by
   weight, because the engine itself is FCFS. Monitor per-tenant p95 TTFT against the pool-wide p95.
+- **Batch pool for evals and offline agents.** Route requests tagged as batch (eval sweeps, nightly
+  research agents, backfills) to their own pool sized for throughput, so batch windows never touch
+  interactive replicas. Monitor batch backlog and interactive TTFT during the batch window.
 - **Tenant-salted prefix cache.** Where the engine supports a per-request cache salt, pass the tenant id so
-  cache hits never cross tenants; share only deliberately public prefixes. Monitor prefix-cache hit rate
-  per tenant to see what the salt costs.
-- **Multi-LoRA on one base.** In vLLM, start the server with `--enable-lora`, register adapters with
-  `--lora-modules name=path` and bound residency with `--max-loras`; requests pick an adapter by model
-  name. Monitor TTFT per adapter and how often adapters are swapped in.
-- **Separate low-priority batch pool.** Route requests tagged as batch to their own pool sized for
-  throughput, so batch windows never touch interactive replicas. Monitor batch backlog and interactive TTFT
-  during the batch window.
+  cache hits never cross tenants; share only deliberately public prefixes such as a common agent system
+  prompt. Monitor prefix-cache hit rate per tenant to see what the salt costs.
+- **Multi-LoRA on one base.** In vLLM, start the server with `--enable-lora`, register per-customer agent
+  adapters with `--lora-modules name=path` and bound residency with `--max-loras`; requests pick an
+  adapter by model name. Monitor TTFT per adapter and how often adapters are swapped in.
 - **Exception register with quarterly review.** Every reserved or dedicated tenant has an owner, a reason
   and a cost line. Monitor each exception's utilization and demote tenants that no longer fill their
   capacity.
 
 ## Trade-offs
 - **Utilization vs latency isolation.** Sharing raises utilization and lowers cost per token, but removes
-  latency isolation; the balance flips when one tenant's traffic shape (long prompts, batch bursts)
-  dominates the pool.
+  latency isolation; the balance flips when one tenant's traffic shape (long prompts, batch bursts, agent
+  fan-out) dominates the pool.
 - **Logical isolation vs hard SLOs.** Gateway isolation preserves batching economics and gives fairness,
   but cannot prevent cache contention once requests are admitted, so it does not satisfy hard latency SLOs.
 - **Dedicated replicas vs idle capacity.** They give predictable latency and freedom to change model
   configuration, but capacity sits idle outside the tenant's peak; worthwhile when the tenant's own traffic
   can fill a replica most of the day.
-- **Multi-LoRA vs configuration freedom.** Many customised models ride one base at shared cost, but every
-  tenant is constrained to the same base model, context and quantization, which breaks when one needs a
-  different model.
+- **Multi-LoRA vs configuration freedom.** Many customised agent models ride one base at shared cost, but
+  every tenant is constrained to the same base model, context and quantization, which breaks when one
+  needs a different model.
+- **Tenant-salted cache vs shared agent prefixes.** Salting closes the timing side channel but loses
+  cross-tenant hits on a common agent scaffold prompt; it flips toward sharing only for prefixes you have
+  declared public.
 - **Dedicated clusters vs operating burden.** They give the strongest compliance story, yet duplicate every
   platform component and operator burden; justified by contract or regulation, rarely by performance.
 
@@ -245,7 +280,9 @@ concurrent sequences, not 200. A replica holds 48 concurrent sequences within th
 - **Promising "dedicated" without stating the level.** Symptom: a security review discovers the tenant's
   "dedicated" model shares a node, control plane or prefix cache with others. Fix: name what is not shared.
 - **A shared pool without per-tenant concurrency caps.** Symptom: platform-wide TTFT spikes that line up
-  with one tenant's cron schedule. Fix: caps and fair-share admission.
+  with one tenant's cron schedule or eval sweep. Fix: caps and fair-share admission.
+- **Counting agent runs instead of sequences.** Symptom: a tenant under its "10 runs" cap still floods the
+  pool because each run fans out parallel calls. Fix: cap in-flight sequences.
 - **Keying a shared prefix cache on prompt text alone** without deciding whether cross-tenant hits are
   acceptable. Symptom: an auditor asks why tenant B's request was faster because tenant A had sent the same
   prompt. Fix: salt with the tenant id.
@@ -258,7 +295,7 @@ concurrent sequences, not 200. A replica holds 48 concurrent sequences within th
 
 ## When to use
 - **Start shared with logical isolation:** gateway limits, fair-share admission, per-tenant metrics. That is
-  the default for internal platforms and for SaaS tiers without hard SLOs.
+  the default for internal agent platforms and for SaaS tiers without hard SLOs.
 - **Move to reserved or dedicated capacity** when a tenant's traffic shape measurably damages others, when
   a contract specifies latency or data-separation guarantees you cannot meet in the pool, or when they need
   a different model configuration.
@@ -300,6 +337,14 @@ along with its cost. Dedicated capacity is reviewed against their utilization ev
 - **When it disappears:** correlated peaks (one time zone, month-end, one upstream event); then sharing
   saves only rounding and spares.
 
+### Your interactive agents slow down every night when another team runs its eval suite on the same pool. What do you change?
+- **Confirm it:** per-tenant in-flight sequences and interactive p95 TTFT over the eval window; the sweep
+  holding most slots is the signature.
+- **Contain it:** a per-tenant in-flight sequence cap at the gateway (counting parallel tool calls), and
+  tag eval traffic as batch so it routes to a low-priority pool.
+- **Make the eval client polite:** bounded concurrency and backoff on 429, so the sweep takes longer
+  rather than taking the pool.
+
 ### A security reviewer asks whether tenants can learn anything from each other through your shared pool. What do you answer?
 - **No direct read path:** in a correct engine one sequence cannot read another's KV cache, even in the
   same batch.
@@ -308,12 +353,13 @@ along with its cost. Dedicated capacity is reviewed against their utilization ev
 - **Mitigation and precision:** salt the cache key with the tenant id, and state exactly what is shared
   (replica, node, cluster) rather than saying "dedicated".
 
-### Ten teams want their own fine-tuned version of the same 8B model. Dedicated replicas or multi-LoRA?
-- **Multi-LoRA by default:** one shared base with per-team adapters swapped per request keeps batching
-  economics while each team gets its own behaviour.
-- **Dedicated replicas when** a team needs a different base model, context limit or quantization, or has
-  a contractual reason not to share.
-- **Cost of dedicated:** ten replicas sized for ten separate peaks, mostly idle outside each team's peak.
+### Ten customers want their own fine-tuned tool-calling version of the same 8B agent model. Dedicated replicas or multi-LoRA?
+- **Multi-LoRA by default:** one shared base with per-customer adapters swapped per request keeps
+  batching economics while each customer's agent gets its own behaviour.
+- **Dedicated replicas when** a customer needs a different base model, context limit or quantization, or
+  has a contractual reason not to share.
+- **Cost of dedicated:** ten replicas sized for ten separate peaks, mostly idle outside each customer's
+  peak.
 
 ### What would you measure before agreeing to give a tenant dedicated capacity?
 - **Their load shape:** a per-tenant time series of in-flight sequences and tokens, not an average, to see

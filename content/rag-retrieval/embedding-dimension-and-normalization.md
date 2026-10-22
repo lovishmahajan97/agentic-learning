@@ -5,7 +5,8 @@ name: Embedding dimension & normalization
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - rag-retrieval/embedding-models
   - rag-retrieval/similarity-search
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Dimension is how many floats a vector holds; it sets storage and compare cost linearly.
-Normalizing to unit length makes cosine, dot product and Euclidean rank identically and stops long
-chunks winning on norm. Matryoshka truncation and quantization trade a little recall for much memory.
+Dimension sets what every vector behind your agent's search and memory costs to store and compare.
+Normalizing to unit length makes cosine, dot product and Euclidean rank identically. Matryoshka
+truncation and quantization trade a little recall for much memory.
+
+## For agent builders
+- **Why it matters for agents.** Agent memory multiplies vectors: every user, conversation and saved
+  fact adds rows, so dimension and bytes per float decide whether the store fits in RAM. Normalization
+  decides whether the score your search tool uses to say "nothing relevant found" means anything.
+- **Where it shows up in your stack.** `normalize_embeddings=True` in sentence-transformers, the
+  `dimensions` parameter on OpenAI text-embedding-3, pgvector operator classes and `halfvec`, and the
+  distance metric you pick when creating a collection in any vector store.
+- **What you control.** Normalizing in one shared embed function, the index metric, truncated dimension,
+  quantization with rescoring, and a per-model calibrated threshold for "no good hit".
+- **What you can skip.** The anisotropy literature and PCA tricks. Know the identity, the sizing formula
+  and that thresholds do not transfer between models.
 
 ## Why it exists
 - **Every vector costs `d × bytes_per_float`.** At float32 a 1536-dimensional embedding is 6,144 bytes,
@@ -68,6 +81,8 @@ When both are unit length, cosine *is* the dot product, and
 - **So absolute values are model-specific.** A score of 0.8 is "related" under one model and "noise
   floor" under another. Rankings are portable, thresholds are not; calibrate any threshold per model on
   labelled pairs.
+- **Agents feel this most.** A search tool that returns "no relevant results" below a cut-off, or a memory
+  layer that only recalls facts above one, depends entirely on that calibration.
 
 ### What dimension buys
 - **Dimensions are capacity:** enough axes to separate the concepts the model was trained on.
@@ -119,17 +134,17 @@ memory levers you pull when `vectors × d × bytes` does not fit.
 
 ```mermaid
 flowchart TD
-    E["Raw embedding, d floats"] --> MC{"Model card says unnormalized dot product?"}
-    MC -->|"yes"| RAW["Keep raw vectors, use the named similarity"]
+    E["Raw embedding, d floats"] --> MC{"Model card: unnormalized dot?"}
+    MC -->|"yes"| RAW["Keep raw, use named similarity"]
     MC -->|"no"| N["L2-normalize to unit length"]
-    N --> FIT{"vectors x d x bytes fits in RAM?"}
-    FIT -->|"yes"| IP[("Inner-product index on full vectors")]
+    N --> FIT{"vectors x d x bytes fits RAM?"}
+    FIT -->|"yes"| IP[("Inner-product index, full vectors")]
     FIT -->|"no, MRL model"| T["Keep first k dims, renormalize"]
-    FIT -->|"no, any model"| QZ["Quantize: float16, int8 or binary"]
-    T --> C[("Compact index for candidates")]
+    FIT -->|"no, any model"| QZ["Quantize: float16, int8, binary"]
+    T --> C[("Compact candidate index")]
     QZ --> C
-    C -->|"top 50 to 100"| RS["Rescore with full-precision vectors"]
-    RS --> R["Final top-k"]
+    C -->|"top 50 to 100"| RS["Rescore with full precision"]
+    RS --> R["Final top-k to agent tool"]
     IP --> R
 ```
 
@@ -171,6 +186,31 @@ print("10M x 1536 x 4 bytes =", 10_000_000 * 1536 * 4 / 1e9, "GB")   # 61.44 GB,
 With random vectors the truncation keeps the order only because the signal is spread evenly; for a real
 model the prefix retains the order only if the model was trained Matryoshka-style.
 
+### Agent scenario: a calibrated "nothing relevant" gate in the search tool
+The agent should hear "no good match" rather than five weak hits it will treat as evidence. The cut-off
+is calibrated on labelled pairs for this model, never copied.
+
+```python
+import numpy as np
+
+def calibrate(pos_scores, neg_scores):
+    """Pick the cut-off that best separates labelled relevant from irrelevant pairs."""
+    cands = np.unique(np.concatenate([pos_scores, neg_scores]))
+    acc = [((pos_scores >= t).mean() + (neg_scores < t).mean()) / 2 for t in cands]
+    return float(cands[int(np.argmax(acc))])
+
+THRESHOLD = calibrate(np.array(labelled_pos), np.array(labelled_neg))   # store with the model id
+
+def search_tool(query_vec, k=5):
+    assert abs(np.linalg.norm(query_vec) - 1) < 1e-3, "query not normalized"
+    hits = store.search(query_vec, k=k)          # inner product on unit vectors
+    good = [h for h in hits if h.score >= THRESHOLD]
+    return good or "No sufficiently relevant passages. Ask the user or try another tool."
+```
+
+- **Why the assert:** an unnormalized query shifts every score, so the gate silently opens or closes.
+- **Re-run `calibrate` on every model change,** because the noise floor moves with the model.
+
 ### Worked sizing: ten million chunks at 1536 dimensions
 Raw vector bytes only; HNSW links, payloads and chunk text come on top.
 
@@ -184,6 +224,17 @@ Raw vector bytes only; HNSW links, payloads and chunk text come on top.
 
 Pick by measuring recall@10 of each row against the float32 baseline, then take the cheapest row that
 meets the target.
+
+### Worked sizing: long-term memory for an agent product
+50,000 users with up to 2,000 stored memories each is 100,000,000 vectors (illustrative).
+
+| Configuration | Bytes per vector | Raw vectors |
+|---|---|---|
+| 1536 dims, float32 | 6,144 | 614.4 GB |
+| MRL prefix 512, float32 | 2,048 | 204.8 GB |
+| MRL prefix 512, int8 | 512 | 51.2 GB |
+
+Memory recall is filtered per user, so check that your store filters efficiently before shrinking further.
 
 ### Binary search with full-precision rescoring in pgvector
 Unit vectors in a `vector(1536)` column; a Hamming-distance index over the binary form picks 100
@@ -209,17 +260,20 @@ LIMIT 10;
 
 ## Production patterns
 - **Normalize inside the shared embed function** — apply L2 normalization (for sentence-transformers,
-  `normalize_embeddings=True`) in the one function both index and query paths call. Add a test that a
-  stored vector has norm 1 within tolerance, and monitor the norm of a sample of query vectors.
+  `normalize_embeddings=True`) in the one function both index, query and memory-write paths call. Add a
+  test that a stored vector has norm 1 within tolerance, and monitor the norm of a sample of query vectors.
 - **Inner-product index on unit vectors** — build the ANN index with the inner-product operator class
   (pgvector `vector_ip_ops`, or the dot-product metric in your store) once vectors are normalized. Monitor
   for scores above 1.0, which signal an unnormalized write.
+- **Per-model relevance gate** — calibrate the search tool's "nothing relevant" cut-off on labelled pairs
+  and store it next to the model id. Monitor the rate of empty tool results; a jump after a release
+  points at a model or normalization change.
 - **Truncate via the provider, not by hand** — for OpenAI text-embedding-3, request a smaller vector with
   the `dimensions` parameter; for open MRL models, slice the prefix and renormalize. Record the
   dimension in index metadata and monitor recall@k against the full-dimension baseline.
 - **Quantize with rescoring** — keep a compact index (binary or int8) for candidate generation and full
   vectors for reordering the top 50 to 100. Monitor recall@10 versus float32 and the extra rescoring
-  latency.
+  latency added to each agent search step.
 - **Mind store dimension limits** — pgvector's HNSW and IVFFlat indexes accept `vector` columns up to
   2,000 dimensions, and `halfvec` raises that to 4,000, so a 3072-dimension model needs halfvec, a
   truncated prefix or another store. Check the limit before choosing the model.
@@ -233,6 +287,8 @@ LIMIT 10;
 - **Quantization memory vs a second lookup.** Binary or int8 gives large memory wins with small recall
   loss when top candidates are rescored, but needs full vectors somewhere; without rescoring, recall on
   hard queries drops noticeably.
+- **Hard relevance gate vs recall.** A cut-off stops the agent acting on junk, but set too high it hides
+  real answers; let the agent see "low confidence" hits flagged, rather than nothing, when misses are costly.
 - **Bigger model vs saturation.** More dimensions improve quality until the corpus is small enough that
   recall is already saturated; past that point the extra dimensions only cost money.
 
@@ -246,7 +302,7 @@ LIMIT 10;
 - **Forgetting to renormalize after truncation.** A cosine index returns different scores from a
   dot-product index on the same data, and thresholds drift.
 - **Copying a cosine threshold such as 0.75.** Taken from another model or a blog post, it lets nothing
-  or everything through after a model swap.
+  or everything through after a model swap, so the agent either never finds anything or trusts noise.
 - **Sizing storage from raw vectors alone.** Out-of-memory during index build, because HNSW links,
   payloads and copies of chunk text add to the vector bytes. Links alone are small for high-dimensional
   vectors, but stored text and payload indexes can add a large fraction.
@@ -255,7 +311,8 @@ LIMIT 10;
 
 ## When to use
 - **Size every vector store with it:** `vectors × d × bytes` tells you whether the index fits in RAM, and
-  whether you need truncation, quantization, disk-based indexes or sharding.
+  whether you need truncation, quantization, disk-based indexes or sharding. Agent memory stores grow
+  with users, so redo the sum at projected scale.
 - **Always store normalized vectors** unless the model card specifies an unnormalized dot product, and
   make normalization part of the shared embed function so index and query paths agree.
 - **Matryoshka truncation:** when the model supports it and memory or latency binds.
@@ -305,6 +362,14 @@ picking the cheapest configuration that meets the recall target.
   renormalizing.
 - **Fix** by normalizing inside the shared embed function and adding a unit-norm test before writes.
 
+### After swapping embedding models, your agent's search tool returns "no relevant results" on most calls. What happened?
+- **The relevance gate was not recalibrated:** the cut-off was tuned on the old model's score
+  distribution, and the new model's noise floor and spread differ.
+- **Check** score histograms for relevant and irrelevant labelled pairs under the new model, and confirm
+  query vectors are still normalized.
+- **Fix** by recalibrating per model, storing the threshold with the model id, and alerting on the empty
+  tool-result rate.
+
 ### When does Matryoshka truncation beat quantization, and when would you combine them?
 - **Truncation** fits when the model is MRL-trained, because the leading dimensions hold the most
   information; on an ordinary model it collapses recall.
@@ -318,7 +383,8 @@ picking the cheapest configuration that meets the recall target.
 ### Why can you not reuse a similarity threshold such as 0.75 across models?
 - **Contextual embeddings are anisotropic,** so unrelated pairs already score well above zero, at a noise
   floor that differs by model.
-- **Rankings are portable, thresholds are not:** calibrate any cut-off per model on labelled pairs.
+- **Rankings are portable, thresholds are not:** calibrate any cut-off per model on labelled pairs,
+  including the ones an agent's memory recall or search gate depends on.
 
 ## Quiz
 ### Q: Why does L2-normalizing all vectors make the choice between cosine, dot product and Euclidean distance irrelevant for ranking?

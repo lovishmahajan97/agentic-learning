@@ -5,7 +5,8 @@ name: TypedDict, Literal and Enum
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/type-hints
   - python-for-ai/pydantic
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-`TypedDict` types a plain dict with fixed keys; `Literal` limits a value to a few constants at zero
-runtime cost; `Enum` makes such a set real objects with methods. Together they guard AI wire dicts and
-vocabularies (roles, finish reasons, tool names).
+Agents run on dicts and small vocabularies: `TypedDict` types messages and graph state that must stay
+plain dicts, `Literal` closes sets like tool names and next-node routes at zero runtime cost, and `Enum`
+gives finish reasons behaviour.
+
+## For agent builders
+- **Why it matters for agents.** The loop branches on closed sets: role, finish reason, tool name, next
+  step. A typo or an unhandled new value becomes a silently skipped tool call or a stuck run;
+  `assert_never` turns that into a CI failure.
+- **Where it shows up in your stack.** LangGraph's state schema is commonly a `TypedDict`, with
+  `Annotated[list, add_messages]` as the reducer for the message list, and a conditional-edge function
+  returns the next node's name (a `Literal` return type documents the branches). Provider SDKs type
+  their message params as TypedDicts too.
+- **What you control.** Which shapes stay dicts (state, wire messages), which values are closed
+  (`Literal` or `StrEnum`), and where validation happens, since TypedDict checks nothing at runtime.
+- **What you can skip.** Enum flags, `IntFlag` and the functional Enum API. Know `StrEnum`, `NotRequired`
+  and `assert_never`.
 
 ## Why it exists
 - **Wire data arrives as dicts.** Provider responses, tool-call arguments and agent state typed as
@@ -77,7 +91,8 @@ vocabularies (roles, finish reasons, tool names).
   unless something validates it.
 - **The alias survives.** `typing.get_args(Role)` returns `("system", "user", "assistant")`; that is how Pydantic turns a Literal into a schema `enum`,
   and how you iterate when you must, though the checker sees the tuple only as `tuple[Any, ...]`.
-- **Hence Literal suits** values that are only compared and serialized.
+- **Hence Literal suits** values that are only compared and serialized: tool names in a dispatcher,
+  next-node names returned by a router, an agent's mode.
 
 ### Enum: a finite set of runtime objects
 - **Singleton members.** `class Reason(Enum): STOP = "stop"`; each member has `.name` (`"STOP"`) and
@@ -113,8 +128,9 @@ vocabularies (roles, finish reasons, tool names).
   multi-value Literal inline, and a single-value Literal as `const`.
 
 ## Diagram
-The decision path from the Choosing table: first ask whether you are typing a dict's shape or one
-value's vocabulary, then how much runtime behaviour you need.
+The decision path from the Choosing table, as you meet it designing an agent: first ask whether you are
+typing a dict's shape (a message, graph state) or one value's vocabulary (a tool name, a finish reason),
+then how much runtime behaviour you need.
 
 ```mermaid
 flowchart TD
@@ -130,6 +146,50 @@ flowchart TD
 ```
 
 ## Examples
+### Agent graph state and an exhaustive router
+The state is a plain dict any graph framework can store and checkpoint; the router's `Literal` return is
+the set of next nodes, and `assert_never` forces a branch for every finish reason. Passes
+`mypy --strict` on 3.11+.
+
+```python
+from enum import StrEnum
+from typing import Literal, NotRequired, TypedDict, assert_never
+
+class ToolCall(TypedDict):
+    id: str
+    name: Literal["search", "calculator"]       # the tool vocabulary, closed
+    arguments: str
+
+class AgentState(TypedDict):                     # graph state: stays a plain dict
+    messages: list[dict[str, object]]
+    steps: int
+    pending: NotRequired[list[ToolCall]]
+
+class Finish(StrEnum):
+    STOP = "stop"
+    LENGTH = "length"
+    TOOL_CALLS = "tool_calls"
+
+Next = Literal["run_tools", "respond", "give_up"]
+
+def route(state: AgentState, finish: Finish, max_steps: int = 8) -> Next:
+    if state["steps"] >= max_steps:
+        return "give_up"
+    match finish:
+        case Finish.TOOL_CALLS: return "run_tools" if state.get("pending") else "respond"
+        case Finish.STOP: return "respond"
+        case Finish.LENGTH: return "respond"
+        case _: assert_never(finish)
+
+state: AgentState = {"messages": [], "steps": 2,
+                     "pending": [{"id": "c1", "name": "search", "arguments": '{"q": "refund policy"}'}]}
+print(route(state, Finish("tool_calls")))       # run_tools
+print(route({"messages": [], "steps": 8}, Finish.STOP))   # give_up
+```
+
+- **Add a member and see:** a new `Finish.PAUSE` without a case makes the checker flag `assert_never`;
+  a `return "run_tool"` typo is flagged because it is not a `Next`.
+
 ### Wire message, behavioural StrEnum, exhaustive match
 An optional key, a `StrEnum` carrying behaviour, and an exhaustive `match` the checker polices. Requires
 Python 3.11+ for `NotRequired`, `StrEnum` and `assert_never`.
@@ -214,6 +274,13 @@ print(type(ok[0]), ok[0])                         # <class 'dict'> {'role': 'ass
 ```
 
 ## Production patterns
+- **Type graph state, keep it a dict.** Declare the agent's state as a `TypedDict` (messages, step
+  count, pending tool calls, scratch fields) so checkpointers and tracers store it unchanged, and give
+  each node a typed return. Monitor checkpoint size per run; state that grows without bound usually means
+  tool results are stored whole instead of referenced.
+- **Close the tool-name set.** Derive a `Literal` (or `StrEnum`) of tool names from the registry and
+  type dispatch against it, so a renamed tool fails CI everywhere it was routed by name. At runtime,
+  answer an unknown name from the model with an error tool result, and count those per model version.
 - **One shared vocabulary package.** Put roles, finish reasons and error classes as `StrEnum`s in a
   common package that every service imports, and generate tool and output schemas from the same
   definitions. Monitor for raw string literals of those values in code review or a lint rule.
@@ -223,8 +290,6 @@ print(type(ok[0]), ok[0])                         # <class 'dict'> {'role': 'ass
 - **Validate once, then trust the TypedDict.** Build `TypeAdapter(ChatMessage)` once at module import
   and call `validate_python` where provider JSON enters. Downstream code keeps plain dicts with no
   conversion. Log validation failures with the field `loc` and provider name.
-- **Read-only helpers take `Mapping[str, object]`.** Logging, redaction and metrics helpers accept any
-  TypedDict through `Mapping`, because a `dict[str, Any]` parameter is rejected (it could insert keys).
 - **Unknown-value fallback at the edge.** When a provider may add a finish reason before you do, map
   unknown wire values to a logged `UNKNOWN` path at the parsing boundary instead of crashing mid-run.
   Alert on its count.
@@ -241,6 +306,9 @@ print(type(ok[0]), ok[0])                         # <class 'dict'> {'role': 'ass
 - **`NotRequired`: precision vs narrowing noise.** It models optional payload fields precisely, but every
   `.get()` returns `T | None` and forces narrowing; when the field is always present but nullable, a
   required `T | None` key is simpler.
+- **Closed tool-name Literal vs dynamic tools.** A `Literal` of tool names catches routing typos, but
+  tools loaded at runtime (from an MCP server or a plugin directory) cannot appear in a static type.
+  Use the Literal for built-in tools and a validated `str` plus registry lookup for dynamic ones.
 
 ## Pitfalls
 - **`isinstance(x, SomeTypedDict)` as validation.** It raises `TypeError` at runtime because TypedDict is
@@ -256,7 +324,8 @@ print(type(ok[0]), ok[0])                         # <class 'dict'> {'role': 'ass
   `Reason.STOP`, not `stop`, so a prompt says "finish reason Reason.STOP". `StrEnum` formats as its value;
   or interpolate `.value` explicitly.
 - **Passing a TypedDict to a helper typed `dict[str, Any]`.** The checker rejects it, because the helper
-  could insert arbitrary keys. Type read-only helpers as `Mapping[str, object]`.
+  could insert arbitrary keys. Type read-only helpers as `Mapping[str, object]`: logging, redaction and
+  metrics helpers then accept any TypedDict, agent state included.
 - **Two Enum members with the same value.** The second silently becomes an alias and disappears from
   iteration, which looks like a "missing" member in a dropdown or a prompt listing valid options.
 - **New member without an `assert_never` guard.** Nothing warns, and the new value falls through to a
@@ -319,6 +388,14 @@ dict's shape, not a single value's vocabulary.
   the Enum or Literal fails CI at each unhandled site.
 - **At runtime:** the provider may ship the value before you add it, so map unknown wire values to a
   logged fallback path at the parsing boundary and alert on its count, instead of crashing mid-run.
+
+### You are designing the state for a multi-step agent graph. Why a TypedDict rather than a class, and what must you add?
+- **TypedDict keeps the runtime object a dict,** which graph frameworks, checkpointers and trace
+  exporters serialize as-is, while the checker still catches `state["mesages"]` and wrong value types.
+- **Add validation where state is rebuilt from storage** (resuming a checkpoint) with a `TypeAdapter`,
+  because TypedDict validates nothing.
+- **Close the branching values:** `Literal` next-node names and a `StrEnum` finish reason, each `match`
+  ending in `assert_never`, so a new branch cannot be forgotten.
 
 ### Why does passing a TypedDict to a helper typed `dict[str, Any]` fail, and what do you use instead?
 - **Because** the helper could insert arbitrary keys or values, breaking the declared shape the caller

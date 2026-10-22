@@ -5,7 +5,8 @@ name: Async endpoints
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/async-await
   - python-for-ai/asyncio
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-FastAPI runs `async def` endpoints on the one event loop and `def` endpoints in a thread pool. Awaiting
-I/O lets one process hold hundreds of requests; blocking inside `async def` freezes them all. Await remote
-models, offload local ones.
+An agent loop is mostly waiting on LLM and tool calls. FastAPI runs `async def` endpoints on one event
+loop and `def` in a thread pool: awaiting lets one process hold hundreds of runs, one blocking tool
+freezes them all.
+
+## For agent builders
+- **Why it matters for agents.** Each agent step is a 2-60 second LLM call plus tool calls (HTTP APIs,
+  vector search, SQL). Awaited, hundreds of runs share one process; one sync tool or SDK call on the loop
+  stalls every run, health check and stream in it.
+- **Where it shows up in your stack.** `AsyncOpenAI` / `AsyncAnthropic` clients, async `ainvoke` /
+  `astream` paths in LangChain and LangGraph, `httpx.AsyncClient` for tool APIs, `asyncio.gather` for
+  parallel tool calls, and `anyio.to_thread.run_sync` for tools with no async form.
+- **What you control.** Whether every tool is async or explicitly offloaded, how many tool calls run at
+  once (a semaphore sized to quotas), timeouts per tool, and whether a run can be cancelled when the user
+  leaves.
+- **What you can skip.** Event-loop internals. Know the two execution paths, what blocks, and the
+  Little's-law ceiling per process; that covers almost every agent latency cliff.
 
 ## Why it exists
 - **AI endpoints mostly wait.** A hosted chat completion takes anywhere from two to sixty seconds; the
@@ -74,8 +88,9 @@ Blocking means the thread can do nothing else until the call returns.
 
 ### Fan-out
 - **Awaits yield, so calls overlap.** One request can run several provider calls with `asyncio.gather`
-  or an AnyIO task group: embed three chunks at once, call two models and pick the better answer, or run a
-  guardrail classifier beside the main completion.
+  or an AnyIO task group: embed three chunks at once, call two models and pick the better answer, run a
+  guardrail classifier beside the main completion, or execute the parallel tool calls a model returned in
+  one turn.
 - **Latency becomes the maximum, not the sum.**
 - **Async path only.** A `def` endpoint would need its own threads for the same overlap.
 
@@ -133,6 +148,52 @@ flowchart TD
 ```
 
 ## Examples
+### Agent step: run the model's parallel tool calls concurrently
+When the model returns several tool calls in one turn, run them together. Async tools are awaited, the
+one sync tool is offloaded, a semaphore caps concurrency, and each call gets its own timeout so one slow
+tool cannot hang the run. Failures go back to the model as tool results instead of crashing the step.
+
+```python
+import asyncio, httpx
+
+TOOL_SLOTS = asyncio.Semaphore(8)                 # per-process cap, sized to tool and provider quotas
+
+async def web_search(q: str, client: httpx.AsyncClient) -> str:
+    r = await client.get("https://search.example.com", params={"q": q}, timeout=10)
+    return r.text[:2000]
+
+def read_local_file(path: str) -> str:           # sync library, no async form
+    with open(path) as f:
+        return f.read()[:2000]
+
+async def run_tool(call: dict, client: httpx.AsyncClient) -> dict:
+    async with TOOL_SLOTS:
+        try:
+            if call["name"] == "web_search":
+                out = await asyncio.wait_for(web_search(call["args"]["q"], client), 15)
+            elif call["name"] == "read_file":       # offload: never block the loop
+                out = await asyncio.wait_for(asyncio.to_thread(read_local_file, call["args"]["path"]), 15)
+            else:
+                out = f"unknown tool {call['name']}"
+        except Exception as e:                    # timeout or tool error becomes an observation
+            out = f"error: {type(e).__name__}: {e}"
+    return {"tool_call_id": call["id"], "content": out}
+
+async def execute_tool_calls(calls: list[dict], client: httpx.AsyncClient) -> list[dict]:
+    # latency is the slowest tool, not the sum; order of results matches order of calls
+    return await asyncio.gather(*(run_tool(c, client) for c in calls))
+```
+
+### Worked scenario: one agent turn with three tool calls
+The model asks for three tools in one turn (illustrative latencies). A 40-run burst shares one process.
+
+| Approach | Turn latency | What the other 39 runs see |
+|---|---|---|
+| Sequential awaits | 2 + 3 + 1.5 = 6.5 s | unaffected: all waits yield |
+| `asyncio.gather` | max(2, 3, 1.5) = 3 s | unaffected |
+| `gather`, but one tool uses `requests` (1.5 s) | 3 s | the loop freezes 1.5 s per call: every stream and health check stalls |
+| `gather`, that tool via `asyncio.to_thread` | 3 s | unaffected; uses 1 of 40 pool threads |
+
 ### RAG endpoint: offload the reranker, fan out the calls
 The commented-out version blocks the loop twice: a CPU reranker and a sync HTTP call. The live version
 runs the reranker in the thread pool, borrows the shared async client created in lifespan, and fans out
@@ -218,6 +279,9 @@ asyncio.run(run(offload=True))    # ~0.2 s total, loop lag ~1 ms
 - **The lag number is the point.** On the blocking path, a health check would have waited two seconds.
 
 ## Production patterns
+- **Async-only tools, enforced at registration.** Use for every agent tool registry: require tools to be
+  `async def`, or wrap sync ones once with `anyio.to_thread.run_sync` when registering, with a timeout per
+  tool. Monitor per-tool latency and timeout rate, and the loop-lag gauge after adding any new tool.
 - **Export an event-loop lag gauge.** Use on every async worker: start a probe task like the one above in
   lifespan and publish its lateness as a metric. Alert when lag stays above a few milliseconds under load,
   because it means something is blocking the loop.
@@ -260,6 +324,9 @@ asyncio.run(run(offload=True))    # ~0.2 s total, loop lag ~1 ms
   thrash with no throughput gain for Python-bound code.
 
 ## When to use
+- **Use `asyncio.gather` for parallel tool calls** when the model emits several independent calls in one
+  turn; keep sequential execution when one tool's output feeds the next or a tool has side effects that
+  must be ordered.
 - **Default to `async def`** for any endpoint whose time goes to remote calls, which is most AI gateway,
   RAG and agent endpoints, and make sure every library on that path is actually async.
 - **Use `def` or `run_in_threadpool`** for unavoidable blocking work, and bound how much can run at once.
@@ -301,14 +368,22 @@ than by CPU time spent on the loop.
   work is ideal for `await`: one thread keeps thousands of waits in flight instead of one sleeping thread
   per request.
 
-### Health checks start timing out at about twenty concurrent users, though each request is fast alone. How do you debug it?
+### Your agent service passes every test, but at about twenty concurrent runs health checks time out. How do you debug it?
 - **Suspect a blocking call on the loop.** The signature is a cliff: fine at one request per second,
-  then every latency equals the slowest call.
+  then every latency equals the slowest call. In agents the culprit is often a newly added tool.
 - **Measure event-loop lag** with a no-op task scheduled every second; lag in the hundreds of
   milliseconds confirms it.
 - **Find the call:** a sync provider SDK (`OpenAI()` rather than `AsyncOpenAI()`), `requests`,
   `time.sleep` in a retry, or a sync driver in an `async def` dependency. Swap in the async client or wrap
   it with `run_in_threadpool`.
+
+### Your agent framework lets a model request five tools in one turn. How do you execute them in a FastAPI service?
+- **Concurrently, on the loop.** `asyncio.gather` (or a task group) over async tool wrappers, so turn
+  latency is the slowest tool, not the sum of all five.
+- **Never block.** Sync tools go through `anyio.to_thread.run_sync` or `run_in_threadpool`; a single
+  `requests` call inside the gather freezes every other run in the process.
+- **Bound and isolate.** A semaphore sized to tool quotas, a timeout per tool, and errors returned to the
+  model as tool results, so one failing tool does not crash the run.
 
 ### When would you deliberately write a `def` endpoint instead of `async def`?
 - **When the work is blocking and has no async form**, such as a local model or a sync-only library you

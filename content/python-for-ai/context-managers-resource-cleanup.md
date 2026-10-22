@@ -5,7 +5,8 @@ name: Context managers / resource cleanup
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/generators
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -22,15 +23,29 @@ sources:
 ---
 
 ## TL;DR
-A context manager pairs setup with guaranteed teardown: `with` runs `__enter__`, your block, then
-`__exit__` whether the block returns, raises or is cancelled, so AI-service resources stop leaking on
-error paths. `async with` and `contextlib` extend it.
+A context manager pairs setup with guaranteed teardown: `with` runs `__enter__`, the block, then
+`__exit__` on return, error or cancellation. Agent runs open streams, MCP sessions, sandboxes and spans;
+`async with` and `contextlib` stop them leaking when a run fails or is stopped.
+
+## For agent builders
+- **Why it matters for agents.** An agent run acquires a lot: a model stream, MCP server sessions, a code
+  sandbox or browser, a temp working directory, a trace span, a DB transaction for memory writes. Runs fail
+  and get cancelled often (bad tool output, user Stop, step limit), and every one of those paths must
+  release everything.
+- **Where it shows up in your stack.** `httpx.AsyncClient` and provider stream helpers, the MCP Python SDK
+  client (its transports and sessions are async context managers), FastAPI `lifespan`, SQLAlchemy
+  sessions, tracing spans, `asyncio.timeout` and `asyncio.Lock`.
+- **What you control.** Which resources are process-scoped (clients, pools in a lifespan) versus run-scoped
+  (sandbox, MCP session, span), an `AsyncExitStack` for the tools a run turns out to need, and bounded,
+  non-masking cleanup.
+- **What you can skip.** The exact PEP 343 expansion beyond its three consequences, and writing class-based
+  managers when `@asynccontextmanager` will do.
 
 ## Why it exists
 - **Resources leak on the unhappy path.** A streaming LLM call opens a connection; the client
   disconnects, a parser raises on malformed JSON, or a timeout cancels the task, and the line that closes
-  the stream never runs.
-- **Small leaks compound.** An AI backend does this thousands of times an hour: the connection pool
+  the stream never runs. A sandbox container started for a code tool stays up after the run crashes.
+- **Small leaks compound.** An agent backend does this thousands of times an hour: the connection pool
   fills, new requests wait for a free connection, and latency climbs until the service looks down. GPU
   code has the same shape: forget to restore a mode or release a buffer and memory creeps up.
 - **The naive fixes fall short.**
@@ -80,17 +95,17 @@ Three consequences follow from that expansion:
 | Consequence | Why | What to do |
 |---|---|---|
 | `__exit__` runs only if `__enter__` succeeded | The protocol cannot know how far a failed setup got | A manager that acquires two things in `__enter__` must clean up the first itself if the second fails |
-| Interrupts trigger cleanup too | `except BaseException` catches `KeyboardInterrupt` and `CancelledError` | Rely on `with` for cleanup in cancellable code |
+| Interrupts trigger cleanup too | `except BaseException` catches `KeyboardInterrupt` and `CancelledError` | Rely on `with` for cleanup in cancellable agent code |
 | A raising `__exit__` replaces the original error | The original survives only as `__context__` in the traceback | A cleanup that can fail should log and swallow its own error rather than mask the real one |
 
 ### async with
 - **Awaited entry and exit.** `async with` calls `await __aenter__()` and `await __aexit__(...)`,
   *because* closing a network resource is itself I/O: flushing a stream, returning a connection, sending a
-  close frame.
-- **Common examples:** `httpx.AsyncClient`, async DB sessions and `asyncio.Lock` are all async context
-  managers.
+  close frame, stopping a sandbox.
+- **Common examples:** `httpx.AsyncClient`, async DB sessions, MCP client sessions and `asyncio.Lock` are
+  all async context managers.
 - **Cancellation passes through.** It arrives as `CancelledError` and passes through `__aexit__` like any
-  exception, which is why `async with` is the reliable way to release resources in cancellable code.
+  exception, which is why `async with` is the reliable way to release resources when a user stops a run.
 - **Keep exit code short and bounded**, because it can itself be interrupted during shutdown.
 
 ### contextlib: managers without classes
@@ -99,9 +114,9 @@ Three consequences follow from that expansion:
 - **Teardown belongs in `finally`.** The exception from the block is thrown in at the `yield`, so teardown
   must sit in `finally` or it is skipped on error.
 - **`@asynccontextmanager`** is the async version, and it is what FastAPI's `lifespan` expects.
-- **`ExitStack` and `AsyncExitStack`** manage a number of resources known only at runtime and unwind
-  whatever was entered if a later setup step fails, which is exactly the partial-setup problem from the
-  expansion above.
+- **`ExitStack` and `AsyncExitStack`** manage a number of resources known only at runtime (the MCP servers
+  and tools this particular run needs) and unwind whatever was entered if a later setup step fails, which
+  is exactly the partial-setup problem from the expansion above.
 - **Smaller helpers:** `closing()` for objects with only `close()`, `suppress()`, `nullcontext()` for
   optional managers, and `aclosing()` for async generators.
 - **Rules for generator managers.** A `@contextmanager` object is single-use (it wraps one generator, so
@@ -110,9 +125,9 @@ Three consequences follow from that expansion:
 
 ### When there is no block to hang it on
 - **Some lifetimes do not fit a lexical block:** an object handed to a caller, a cache entry, a worker
-  that lives until shutdown.
-- **Then the owner of that lifetime closes it explicitly:** the app's lifespan, the pool, or the cache's
-  eviction hook.
+  that lives until shutdown, a long-lived agent session that spans many HTTP requests.
+- **Then the owner of that lifetime closes it explicitly:** the app's lifespan, the pool, the session
+  manager's idle timeout, or the cache's eviction hook.
 - **`weakref.finalize(obj, cleanup)` is a better last resort than `__del__`**, since it runs at most once
   and also at interpreter exit. It still runs on garbage-collection timing, so treat it as leak insurance,
   not as the cleanup plan.
@@ -122,7 +137,8 @@ Three consequences follow from that expansion:
   restore it after.
 - **Temporary state:** `decimal.localcontext()` and temporary environment patches in tests follow the same
   pattern: change state, guarantee restoration.
-- **The principle generalises** to anything with a "before" and a mandatory "after".
+- **The principle generalises** to anything with a "before" and a mandatory "after", including a trace span
+  around an agent step.
 
 ## Diagram
 The life of one `with` statement: `__exit__` runs on every path once `__enter__` has succeeded, and its
@@ -131,17 +147,64 @@ return value decides whether an exception propagates.
 ```mermaid
 flowchart TD
     E["Evaluate expr to a manager"] --> EN["Call __enter__"]
-    EN -->|"raises"| P0["Error propagates, __exit__ never runs"]
+    EN -->|"raises"| P0["Error propagates, no __exit__"]
     EN -->|"returns value"| B["Bind to x, run the block"]
     B -->|"normal end, return or break"| X1["__exit__(None, None, None)"]
     B -->|"raises, incl. CancelledError"| X2["__exit__(type, exc, tb)"]
     X2 --> Q{"Truthy return value?"}
-    Q -->|"yes"| S["Exception suppressed, continue after with"]
+    Q -->|"yes"| S["Exception suppressed"]
     Q -->|"no"| P1["Original exception re-raised"]
     X1 --> D["Continue after with"]
 ```
 
 ## Examples
+### Per-run resources for an agent with AsyncExitStack
+A run opens a sandbox and only the tool servers its task needs, decided at runtime. Whether the run
+finishes, a tool fails or the user stops it, everything closes in reverse order. Resources are stubs.
+
+```python
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
+
+@asynccontextmanager
+async def resource(kind: str, name: str):
+    print(f"open  {kind}:{name}")
+    try:
+        yield f"{kind}:{name}"
+    finally:
+        await asyncio.sleep(0)                       # async teardown: stop container, close session
+        print(f"close {kind}:{name}")
+
+async def agent_run(task: str, servers: list[str], fail: bool = False) -> str:
+    async with AsyncExitStack() as stack:
+        await stack.enter_async_context(resource("span", task))         # trace span for the run
+        sandbox = await stack.enter_async_context(resource("sandbox", "py"))
+        sessions = [await stack.enter_async_context(resource("mcp", s)) for s in servers]
+        await asyncio.sleep(0.05)                    # model and tool steps would run here
+        if fail:
+            raise RuntimeError("tool returned malformed output")
+        return f"done with {sandbox} and {len(sessions)} servers"
+
+async def main():
+    print(await agent_run("triage", ["github", "jira"]))
+    try:
+        await agent_run("triage", ["github"], fail=True)
+    except RuntimeError as e:
+        print("run failed:", e)
+    t = asyncio.create_task(agent_run("long", ["github", "jira"]))
+    await asyncio.sleep(0.01); t.cancel()            # user pressed Stop
+    try:
+        await t
+    except asyncio.CancelledError:
+        print("run cancelled")
+
+asyncio.run(main())
+```
+
+- **Every path closes everything:** success, the raised tool error and the cancellation all print the same
+  `close` lines, newest first, so the MCP sessions close before the sandbox and the span ends last.
+- **The list of servers is data**, which is why `AsyncExitStack` beats nested `async with` here.
+
 ### App lifespan with AsyncExitStack
 Two process-scoped clients opened in a lifespan; a crash mid-request still closes both, in reverse order.
 
@@ -186,8 +249,8 @@ asyncio.run(main())
 3. `propagated: crash mid-request`.
 
 - **The error is not suppressed**, both clients are closed, and the dependency opened last is closed first.
-- **The clients are created once per process**, not once per request, which is the point of putting them
-  in a lifespan.
+- **The clients are created once per process**, not once per request or agent run, which is the point of
+  putting them in a lifespan.
 
 ### Guarding partial setup, plus a timing span that is also a decorator
 A class that acquires two resources in `__enter__` uses an `ExitStack` so a failure on the second closes
@@ -249,17 +312,21 @@ Without the `ExitStack` in `__enter__`, the failing run would leak `llm`, becaus
 when `__enter__` raises.
 
 ### Worked incident: a stream leaked on the error path
-Illustrative numbers for one worker using a shared `httpx.AsyncClient` (100 connections by default).
+Illustrative numbers for one agent worker using a shared `httpx.AsyncClient` (100 connections by default).
 
 | Step | What happens |
 |---|---|
 | Code opens the provider stream, parses chunks, closes it at the end | Happy path releases the connection |
-| About 1% of responses contain malformed JSON and the parser raises | The close line is skipped, the connection stays checked out |
+| About 1% of responses contain malformed JSON (a bad tool-call payload) and the parser raises | The close line is skipped, the connection stays checked out |
 | At 10,000 streams an hour, about 100 leak per hour | The pool's 100 connections are gone in roughly an hour |
 | New requests wait for a free connection, then hit pool timeouts | Latency climbs while CPU is idle; restarts "fix" it for an hour |
 | Fix: iterate inside `async with client.stream(...)` | The connection returns on success, parse error and cancellation |
 
 ## Production patterns
+- **One exit stack per agent run.** Open run-scoped resources (sandbox, MCP sessions, browser, temp
+  directory, trace span) through an `AsyncExitStack` owned by the run, so success, failure and Stop share
+  one cleanup path. Monitor sandboxes and sessions still open after their run ended; the number should be
+  zero.
 - **Process-scoped clients in a lifespan.** Open shared clients and pools in an `@asynccontextmanager`
   passed to FastAPI as `lifespan=`, with an `AsyncExitStack` when there are several. Monitor open
   connections and pool wait time per worker.
@@ -271,16 +338,16 @@ Illustrative numbers for one worker using a shared `httpx.AsyncClient` (100 conn
   and treat "unclosed" warnings as failures. Add error-injection tests that
   assert the pool is idle afterwards.
 - **Bound cleanup that does I/O.** Wrap awaited cleanup in `__aexit__` or `finally` with
-  `asyncio.timeout(...)`, and log rather than raise if it fails, so a hung close neither stalls shutdown
-  nor masks the real error. Monitor shutdown duration.
-- **Transactions as managers.** Use the driver's transaction manager (for example
+  `asyncio.timeout(...)`, and log rather than raise if it fails, so a hung close (a sandbox that will not
+  stop) neither stalls shutdown nor masks the real error. Monitor shutdown duration.
+- **Transactions as managers for memory writes.** Use the driver's transaction manager (for example
   `with Session(engine) as session, session.begin():` in SQLAlchemy) so commit happens on success and
   rollback on any exception. Monitor rollback rate and long-open transactions.
 
 ## Trade-offs
 - **Visible cleanup point vs tied lifetime.** `with` guarantees cleanup at a lexically visible point, but
   ties resource lifetime to a block. When a resource must outlive the function (a pool shared by all
-  requests), move it to an app-level lifespan.
+  requests, an agent session spanning many turns), move it to an app-level lifespan or a session manager.
 - **Short vs easy to get wrong.** `@contextmanager` is far shorter than a class, but forgets cleanup on
   error if you omit `try/finally`. A class with `__exit__` is clearer when the manager carries state or is
   reused often.
@@ -312,12 +379,12 @@ Illustrative numbers for one worker using a shared `httpx.AsyncClient` (100 conn
   exception". Fix: log and swallow the cleanup's own error so the original propagates.
 
 ## When to use
-- **Use for anything with an acquire-and-release pair:** clients and connection pools, streams, DB sessions
-  and transactions, locks and semaphores, temp files and directories, tracing spans, and temporary mode
-  changes such as `torch.inference_mode()`.
+- **Use for anything with an acquire-and-release pair:** clients and connection pools, streams, MCP
+  sessions, sandboxes, DB sessions and transactions, locks and semaphores, temp files and directories,
+  tracing spans, and temporary mode changes such as `torch.inference_mode()`.
 - **Prefer the library's own manager** over manual `close()` calls.
-- **Match scope to lifetime:** give long-lived resources a lifespan-scoped manager and short-lived ones a
-  block-scoped manager.
+- **Match scope to lifetime:** give long-lived resources a lifespan-scoped manager, per-run resources a
+  run-scoped exit stack, and short-lived ones a block-scoped manager.
 - **Measure:** watch open connections, pool wait time and file descriptors under load and after error
   injection; if they climb after errors, a path is skipping cleanup.
 - **Interviews:** expect to explain `__exit__`'s arguments and return value and write a `@contextmanager`
@@ -349,6 +416,14 @@ the caller controls its lifetime with `with`.
 - **Return value:** truthy suppresses the exception, which is how `contextlib.suppress` works; anything
   else must return `None` or `False`, or errors silently vanish.
 
+### An agent run uses a code sandbox and a varying set of MCP servers. How do you guarantee cleanup?
+- **One `AsyncExitStack` per run.** Enter the span, the sandbox and each MCP session through it as the run
+  discovers what it needs, so the set can be decided at runtime.
+- **Every exit path unwinds it:** success, a tool error and cancellation from a user Stop all run the
+  stack's exits in reverse order, newest resource first.
+- **Bound and isolate cleanup:** wrap slow teardown in `asyncio.timeout`, log rather than raise, and
+  monitor resources still open after their run ended.
+
 ### Write a @contextmanager that always releases its resource. What is the common bug?
 - **Setup before `yield`, teardown in `finally`.** The block's exception is thrown in at the `yield`, so
   teardown placed after it without `finally` is skipped on error.
@@ -356,7 +431,7 @@ the caller controls its lifetime with `with`.
   `@asynccontextmanager` and await the close.
 - **Test the error path:** raise inside the block and assert the resource was released.
 
-### A service's open connections climb slowly after every upstream outage. How do you find the leak?
+### An agent service's open connections climb slowly after every upstream outage. How do you find the leak?
 - **Suspect a setup-failure or error path.** A second resource acquired in `__enter__` without a guard
   leaks the first when it fails, because `__exit__` never runs.
 - **Reproduce with error injection** while watching open connections, pool wait time and file

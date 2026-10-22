@@ -5,7 +5,8 @@ name: MCP Python SDK
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-The MCP Python SDK (the `mcp` package) exposes Python tools, data and prompts to any MCP host and
-calls MCP servers from Python. FastMCP turns type-hinted functions into tools; lower layers handle
-JSON-RPC and transports. The protocol is taught in the agents module.
+The MCP Python SDK (the `mcp` package) lets you publish tools to any agent host and plug MCP servers
+into your own agent loop. FastMCP turns type-hinted functions into tools; lower layers handle JSON-RPC
+and transports. The agents module teaches the protocol.
+
+## For agent builders
+- **Why it matters for agents.** Tools are what make an agent act. MCP gives them one interface, so a
+  ticket or search tool you write once works in IDE assistants, desktop chat apps and your own agents,
+  and your agent can use third-party servers without bespoke glue.
+- **Where it shows up in your stack.** Server side: `FastMCP` with `@mcp.tool()`. Client side:
+  `ClientSession` feeding `list_tools()` into your model's tool definitions; agent frameworks such as the
+  OpenAI Agents SDK and LangChain (through its MCP adapters package) can load MCP servers as tools.
+- **What you control.** Tool names, docstrings and type hints (the model reads them), error messages the
+  model recovers from, the transport, auth, and how many tools you expose per agent.
+- **What you can skip.** Hand-writing JSON-RPC, capability negotiation and transport framing; the SDK
+  owns those. Know the lifecycle, the two failure channels and why stdout is sacred on stdio.
 
 ## Why it exists
 - **Every host defined tools its own way.** An OpenAI function schema here, a LangChain tool class there,
@@ -30,7 +43,7 @@ JSON-RPC and transports. The protocol is taught in the agents module.
 - **So integrations multiplied.** A team wanting internal search, ticketing and database tools in three
   assistants wrote three integrations and kept them in sync.
 - **MCP fixes the interface.** A server advertises tools, resources and prompts over a standard protocol,
-  and any compliant host can use them.
+  and any compliant host, including your own agent, can use them.
 - **The protocol is not trivial by hand.** JSON-RPC 2.0, version and capability negotiation during
   `initialize`, JSON Schema for every tool input, request routing, notifications and cancellation, over at
   least two transports with different framing.
@@ -45,7 +58,7 @@ JSON-RPC and transports. The protocol is taught in the agents module.
   as the tool's `inputSchema`.
 - **Why derive the schema:** the signature is already the source of truth, so the two cannot drift.
   Incoming arguments are validated against the same model before your function runs. The docstring
-  becomes the tool description the LLM reads.
+  becomes the tool description the LLM reads when choosing a tool.
 - **Low-level `Server`.** Explicit handlers for `list_tools`, `call_tool` and so on, for dynamic tool
   lists or full control over the wire format.
 - **Name clash to watch.** A separately maintained project, also called FastMCP, extends the original API
@@ -58,18 +71,21 @@ JSON-RPC and transports. The protocol is taught in the agents module.
 | `@mcp.resource("tickets://{id}")` | Readable data addressed by URI | The host application (not necessarily the model) |
 | `@mcp.prompt()` | A reusable prompt template a user can pick | The user |
 
-The split exists *because* control differs, and hosts present the three differently.
+The split exists *because* control differs, and hosts present the three differently. In your own agent,
+tools go into the model's tool list; resources are context your code decides to load.
 
 ### The session lifecycle
 1. **Connect.** The client starts or connects to the server through a transport.
 2. **`initialize`.** Client and server exchange protocol versions and capabilities.
-3. **Discovery.** `tools/list`, `resources/list`, `prompts/list`.
-4. **Use.** `tools/call` with JSON arguments. The result is a list of content items (text, image,
-   embedded resource), with an `isError` flag for tool-level failures. Recent protocol versions also allow
-   structured output validated against an output schema, which the SDK can derive from a typed return.
+3. **Discovery.** `tools/list`, `resources/list`, `prompts/list`. Your agent turns the tool list into
+   the model's tool definitions.
+4. **Use.** `tools/call` with JSON arguments the model produced. The result is a list of content items
+   (text, image, embedded resource), with an `isError` flag for tool-level failures. Recent protocol
+   versions also allow structured output validated against an output schema, which the SDK can derive
+   from a typed return.
 
 On the wire, step 4 is one JSON-RPC request and one response matched by `id`, which is what lets many
-calls be in flight on one connection:
+calls be in flight on one connection (for example parallel tool calls in one agent turn):
 
 ```
 -> {"jsonrpc":"2.0","id":3,"method":"tools/call",
@@ -85,13 +101,15 @@ calls be in flight on one connection:
 | Tool ran and failed | Normal `result` with `isError: true` | The model, which can read the message and try something else |
 
 - **Notifications** (messages with no `id`) carry logs and progress and need no reply.
+- **In your agent loop,** feed `isError` results back to the model as the tool result, and handle
+  JSON-RPC errors in code (retry, drop the tool, or fail the step).
 
 ### Transports
 | | stdio | Streamable HTTP |
 |---|---|---|
 | Start | `mcp.run()` (the default) | `mcp.run(transport="streamable-http")` |
 | Mechanics | Host spawns your server as a subprocess; newline-delimited JSON-RPC over stdin and stdout | Same protocol over HTTP |
-| Fits | Local tools; simple, no network | Remote, multi-client servers |
+| Fits | Local tools; simple, no network | Remote, multi-client servers shared by many agents |
 | Auth | Not needed | Your concern |
 
 - **The older HTTP+SSE transport is deprecated** in favour of Streamable HTTP.
@@ -113,29 +131,68 @@ calls be in flight on one connection:
 
 ### Client side
 - **`ClientSession` plus a transport helper such as `stdio_client`** lets Python code act as a host:
-  initialize, list tools, call them.
+  initialize, list tools, call them. This is how your own agent consumes MCP servers.
 - **Everything is async,** built on `anyio`.
 
 ## Diagram
-One session over stdio: version and capability negotiation first, then discovery, then a tool call whose
-log message travels back as a notification, never through `print`.
+One session over stdio inside an agent: negotiation first, then discovery feeding the model's tool list,
+then a tool call whose log message travels back as a notification, never through `print`.
 
 ```mermaid
 sequenceDiagram
-    participant H as Host or ClientSession
+    participant H as Agent host with ClientSession
     participant S as FastMCP server
     H->>S: initialize with protocol version and capabilities
     S-->>H: server version and capabilities
     H->>S: tools/list
     S-->>H: tools with inputSchema from type hints
+    Note over H: model picks create_ticket from the tool list
     H->>S: tools/call create_ticket, id 3
     Note over S: validate arguments against the Pydantic model
     S-->>H: notification from ctx.info, no id
     S-->>H: result for id 3, content list and isError false
-    Note over H,S: unknown tool returns a JSON-RPC error instead
 ```
 
 ## Examples
+### Agent scenario: MCP tools in your own tool-calling loop
+The agent connects to the ticket server below, exposes its tools to the model, executes the calls the
+model makes, and feeds results (including `isError` ones) back until the model answers.
+
+```python
+import asyncio, json
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from openai import AsyncOpenAI
+
+llm = AsyncOpenAI()
+
+async def run_agent(task: str, max_steps: int = 6) -> str:
+    params = StdioServerParameters(command="python", args=["server.py"])
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+        await session.initialize()
+        tools = [{"type": "function", "function": {"name": t.name, "description": t.description,
+                  "parameters": t.inputSchema}} for t in (await session.list_tools()).tools]
+        messages = [{"role": "user", "content": task}]
+        for _ in range(max_steps):                         # step budget
+            msg = (await llm.chat.completions.create(
+                model="gpt-4o-mini", messages=messages, tools=tools)).choices[0].message
+            if not msg.tool_calls:
+                return msg.content
+            messages.append(msg)
+            for call in msg.tool_calls:
+                res = await session.call_tool(call.function.name, json.loads(call.function.arguments))
+                text = "".join(c.text for c in res.content if c.type == "text")
+                messages.append({"role": "tool", "tool_call_id": call.id,
+                                 "content": ("ERROR: " if res.isError else "") + text})
+        return "step budget exhausted"
+
+print(asyncio.run(run_agent("Open a high-priority ticket: VPN is down for the Berlin office.")))
+```
+
+- **The MCP schema is passed straight through** as the function's `parameters`, so the type hints on the
+  server are what constrain the model.
+- **`isError` results go back to the model,** which is the channel for recovering from a bad call.
+
 ### Ticket server and stdio client
 A small ticket server and a client that calls it over stdio.
 
@@ -189,7 +246,7 @@ asyncio.run(main())
 
 ### Production shape: lifespan pool, actionable errors, stateless HTTP
 One database pool per process, errors the model can act on, and a transport that scales behind a load
-balancer.
+balancer when many agents share the server.
 
 ```python
 import sys, logging
@@ -232,10 +289,26 @@ A stateful Streamable HTTP server goes from 1 replica to 3 behind a round-robin 
 | 3, sticky on session ID header | 100% | Works, but a replica restart drops its sessions |
 | 3, `stateless_http=True` | Not needed: no session to find | Works; server-initiated messages that need a live session are gone |
 
+### Worked scenario: what a large tool list costs an agent
+Illustrative: an agent connects to four MCP servers exposing 40 tools, each schema plus description about
+150 tokens.
+
+| Quantity | Value |
+|---|---|
+| Tool definitions per model call | 40 × ~150 ≈ 6,000 tokens |
+| Over a 20-step run | ~120,000 input tokens on tool definitions alone |
+| Exposing only the 8 tools this task needs | ~1,200 tokens per call, ~24,000 per run |
+
+Prompt caching softens the price when the tool list is byte-identical and first, but selection accuracy
+still falls as near-duplicate tools pile up.
+
 ## Production patterns
 - **Keep stdout clean on stdio.** Configure `logging` to `sys.stderr` at startup, log through `ctx` for
   client-visible messages, and silence libraries that print progress bars. Monitor the host's MCP logs
   for parse errors and unexpected disconnects.
+- **Curate the tool list per agent.** Load only the servers and tools a given agent needs, and keep their
+  order stable so the prefix caches. Monitor tokens spent on tool definitions per call and the rate of
+  wrong-tool selections in agent evals.
 - **Pick a scaling mode for HTTP explicitly.** Either run `stateless_http=True` behind any load balancer,
   or route on the session ID header with sticky sessions. Alert on "session not found" and 4xx rates per
   replica.
@@ -244,11 +317,10 @@ A stateful Streamable HTTP server goes from 1 replica to 3 behind a round-robin 
 - **Write errors for the model.** Raise exceptions whose message says what was wrong and what to call
   instead; FastMCP returns them as `isError` results. Monitor `isError` rate per tool and repeated identical
   calls, which signal an unhelpful message.
-- **Contract-test the schema in CI.** Start the server under a real `ClientSession`, snapshot the
-  `list_tools()` output (names, descriptions, `inputSchema`) and fail the build on unreviewed changes,
-  because a renamed parameter or reworded docstring changes model behaviour.
-- **Authenticate every HTTP server.** Put Streamable HTTP behind auth and origin checks before exposing a
-  port. Audit-log every `tools/call` with caller identity.
+- **Contract-test the schema and authenticate HTTP.** Snapshot `list_tools()` output (names, descriptions,
+  `inputSchema`) under a real `ClientSession` in CI and fail on unreviewed changes, because a renamed
+  parameter or reworded docstring changes model behaviour. Put Streamable HTTP behind auth and origin
+  checks, and audit-log every `tools/call` with caller identity.
 
 ## Trade-offs
 - **Every host vs a process boundary.** One MCP server makes a tool usable from every compliant host, but
@@ -263,6 +335,8 @@ A stateful Streamable HTTP server goes from 1 replica to 3 behind a round-robin 
 - **Precise tools vs context cost.** Many small, focused tools give the model precise choices, but every
   schema occupies context on every turn; past a few dozen tools, selection accuracy and token cost both
   suffer.
+- **Third-party servers vs trust.** Plugging in someone else's MCP server is fast, but its tool
+  descriptions and results enter your agent's context unfiltered; treat them as untrusted input.
 
 ## Pitfalls
 - **`print()` in a stdio server.** stdout is the protocol channel. Symptom: the host reports parse errors
@@ -280,6 +354,8 @@ A stateful Streamable HTTP server goes from 1 replica to 3 behind a round-robin 
   Fix: sticky routing on the session ID header, or `stateless_http=True`.
 - **No authentication or origin checks on Streamable HTTP.** Symptom: discovering that anything that can
   reach the port can invoke your tools.
+- **Dropping `isError` in the agent loop.** Symptom: the model believes a failed call succeeded and
+  reports a ticket that was never created. Fix: pass the error text back as the tool result.
 
 ## When to use
 - **Use when:** tools or data must work across several agent hosts (IDE assistants, desktop chat apps,
@@ -288,7 +364,8 @@ A stateful Streamable HTTP server goes from 1 replica to 3 behind a round-robin 
   proper auth.
 - **Avoid when:** one application calls the function in-process; do not wrap every internal function as
   an MCP tool.
-- **Measure:** tool-call error rate, latency per tool, and how often the model picks the intended tool.
+- **Measure:** tool-call error rate, latency per tool, tokens spent on tool definitions, and how often the
+  model picks the intended tool.
 - **Go deeper / interviews:** the agents module's MCP lessons cover protocol design, the security model and
   when MCP is the right boundary; expect to explain the lifecycle and why stdout matters on stdio.
 
@@ -319,6 +396,13 @@ inside a FastMCP tool does not do this, because it is returned to the client as 
 - **It handles the protocol:** JSON-RPC 2.0 framing, `initialize` version and capability negotiation,
   routing, notifications and the transports.
 - **The docstring becomes the tool description,** which is the text the model uses to choose the tool.
+
+### How do you wire MCP servers into your own tool-calling agent?
+- **Discover, then translate.** Open a `ClientSession`, call `list_tools()`, and map each tool's name,
+  description and `inputSchema` into your model provider's tool definition format.
+- **Execute and feed back.** For each tool call the model makes, run `call_tool` and append the content
+  as the tool result, prefixing or flagging `isError` results so the model can recover.
+- **Budget it.** Cap steps, expose only the tools the task needs, and log every call in the trace.
 
 ### Explain the difference between a JSON-RPC error and an `isError` result.
 - **JSON-RPC `error` is a protocol failure,** such as a malformed request or unknown tool, and the host

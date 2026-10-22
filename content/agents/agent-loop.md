@@ -5,7 +5,8 @@ name: Agent loop
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/tool-calling
   - agents/workflows-vs-agents
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-An agent is a loop, not a model: the model proposes a tool call, your harness executes it, the result
-is appended, and the model is called again until it stops or a budget trips. The loop lets it observe
-consequences and correct course.
+An agent is a loop you write, not a model: the model proposes a tool call, your harness executes it,
+appends the result and calls again until the model stops or a budget trips. Every agent framework is
+this loop with defaults.
+
+## For agent builders
+- **Why it matters for agents.** This loop is the agent. Tools, memory, RAG, guardrails and evals all
+  plug into one of its steps, so if you can write it by hand you can debug any framework that writes it
+  for you, and read any trace it produces.
+- **Where it shows up in your stack.** Hand-rolled on the Claude or OpenAI SDK, or prebuilt: LangGraph's
+  `create_react_agent` (a model node and a tool node joined by a conditional edge), the OpenAI Agents SDK
+  `Runner.run`, the Claude Agent SDK and Pydantic AI's `Agent`. LangSmith, Langfuse or OpenTelemetry
+  tracing shows one span per iteration.
+- **What you control.** Step, token and wall-clock budgets (LangGraph's `recursion_limit`, the Agents
+  SDK's `max_turns`), how tool exceptions become results, which tools need approval, when to compact, and
+  the status the loop returns when it stops.
+- **What you can skip.** ReAct-style regex parsing of "Thought / Action" text. Native tool calling
+  replaced it; know the history, not the parser.
 
 ## Why it exists
 - **A model call is a pure function from prompt to text.** It cannot read a database, run a test or
@@ -323,6 +338,13 @@ transcript from the model.
 - **Make one tools-off call** (`tool_choice: {"type": "none"}`) asking for what was done, found and left.
 - **Return an explicit status** such as `budget_exhausted` plus that report, so the caller decides whether
   to resume, escalate or fail.
+
+### A LangGraph agent starts failing with `GraphRecursionError`. Do you raise `recursion_limit`?
+- **Not first.** The error means the graph hit its step budget, which is the same harness stop as above,
+  so read the trace (LangSmith or your tracer) to see whether runs are long-but-progressing or looping.
+- **If they loop,** fix the cause: an ambiguous tool result, a missing stop condition, or two tools the
+  model keeps alternating between, and add a repetition guard.
+- **Raise the limit only** when successful traces genuinely need more steps, setting it from their p95.
 
 ## Quiz
 ### Q: Why must the assistant message containing the tool_use blocks be appended to the history before the tool results?

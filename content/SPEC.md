@@ -18,6 +18,10 @@ appears only as much as an agent builder needs it, framed by what it changes in 
   agent terms: at least one example is an agent scenario (tool-calling loop, RAG step, memory, eval,
   serving agents); production patterns are things agent teams do; at least 2 interview questions are
   about building or operating agents;
+- a closing `## Use cases & projects` section AFTER the Quiz, with `### Use cases` (3-5 bold-led bullets:
+  real situations where agent teams use this) and `### Mini project` (a 1-3 hour hands-on build: **Goal**,
+  **Steps**, **Done when**, framed around an agent). The module guide's Capstone is the module's MAJOR
+  project (multi-day, combines the module's lessons into a working agent or agent component);
 - unchanged: Role lens, Check yourself and Quiz (copied exactly);
 - no-loss rule vs tag `pre-agentic`: front matter (except status and agent_relevance), Role lens, Check
   yourself and Quiz unchanged; every number and inline code span must still appear. Generic code blocks

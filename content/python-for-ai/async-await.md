@@ -5,7 +5,8 @@ name: async / await
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-`async def` defines a coroutine that pauses at `await` while waiting on I/O, letting an event loop run
-other coroutines on one thread. AI work is mostly waiting on networks, so this beats a thread per call;
-it does nothing for CPU-bound work.
+An agent spends most of its life waiting on model calls, tool calls and streams. `async def` coroutines
+pause at `await` so one event loop runs parallel tool calls and many agent sessions on one thread; it
+does nothing for CPU-bound work.
+
+## For agent builders
+- **Why it matters for agents.** When a model returns three tool calls in one turn, running them
+  concurrently makes the step cost the slowest call, not the sum. Serving many chats, streaming tokens
+  to a UI and fanning out an eval suite are the same shape.
+- **Where it shows up in your stack.** `AsyncOpenAI` and the async Anthropic client, `httpx.AsyncClient`,
+  FastAPI endpoints, async tools in LangChain, LangGraph and the OpenAI Agents SDK (which mostly offer
+  both sync and async entry points), MCP clients, and eval harnesses that call the model thousands of
+  times.
+- **What you control.** Which tool calls run in parallel, the per-provider concurrency cap, the per-tool
+  timeout, and keeping every call in the loop on an async client so one sync call cannot stall them all.
+- **What you can skip.** Writing your own event loop or awaitables; the generator machinery under
+  `await` beyond "the frame is parked".
 
 ## Why it exists
 - **AI workloads are mostly waiting.** An LLM request takes on the order of seconds (illustrative; it
@@ -120,8 +134,9 @@ Tasks A and B each send a request and await a reply that takes 1 s.
   this module; this one is about the syntax and the cooperative model they build on.
 
 ## Diagram
-The two-call trace above as messages: both tasks park at `await`, the loop sleeps in the OS
-multiplexer, and both resume when their sockets are readable, for about 1 s total instead of 2 s.
+The two-call trace above as messages (read A and B as two tool calls from one agent turn): both tasks
+park at `await`, the loop sleeps in the OS multiplexer, and both resume when their sockets are readable,
+for about 1 s total instead of 2 s.
 
 ```mermaid
 sequenceDiagram
@@ -141,6 +156,55 @@ sequenceDiagram
 ```
 
 ## Examples
+### Running one turn's tool calls in parallel, with a per-tool timeout
+The model asked for three tools in one turn. They run concurrently under a cap, each with its own
+budget; a hung tool becomes an error result instead of stalling the run, and `gather` keeps results in
+call order so each pairs with its `tool_use_id`. Passes `mypy --strict`.
+
+```python
+import asyncio, time
+
+async def search(q: str) -> str:
+    await asyncio.sleep(0.8); return f"3 docs for {q!r}"
+async def weather(city: str) -> str:
+    await asyncio.sleep(0.5); return f"{city}: 14C"
+async def crm(customer: str) -> str:
+    await asyncio.sleep(5.0); return "never returns in time"     # a hung dependency
+
+TOOLS = {"search": search, "weather": weather, "crm": crm}
+
+async def run_one(call: dict[str, str], sem: asyncio.Semaphore, budget_s: float) -> dict[str, object]:
+    async with sem:
+        try:
+            async with asyncio.timeout(budget_s):
+                out = await TOOLS[call["name"]](call["arg"])
+            return {"tool_use_id": call["id"], "content": out}
+        except TimeoutError:
+            return {"tool_use_id": call["id"], "content": f"{call['name']} timed out", "is_error": True}
+
+async def run_tool_calls(calls: list[dict[str, str]], max_parallel: int = 4) -> list[dict[str, object]]:
+    sem = asyncio.Semaphore(max_parallel)
+    return await asyncio.gather(*(run_one(c, sem, budget_s=2.0) for c in calls))  # keeps call order
+
+calls = [{"id": "t1", "name": "search", "arg": "refund policy"},
+         {"id": "t2", "name": "weather", "arg": "Oslo"},
+         {"id": "t3", "name": "crm", "arg": "acme"}]
+t0 = time.perf_counter()
+for r in asyncio.run(run_tool_calls(calls)):
+    print(r)
+print(f"{time.perf_counter() - t0:.1f}s")   # about 2.0s: bounded by the timeout, not 0.8 + 0.5 + 5.0
+```
+
+| Execution of this turn | Step latency (simulated) | Notes |
+|---|---|---|
+| Sequential, no timeout | 0.8 + 0.5 + 5.0 = 6.3 s | the hung tool dominates |
+| Sequential, 2 s timeout each | 0.8 + 0.5 + 2.0 = 3.3 s | still the sum |
+| Parallel, 2 s timeout | about 2.0 s | the slowest bounded call |
+| Parallel, no timeout | 5.0 s | parallelism alone does not fix a hung tool |
+
+- **Only parallelise independent calls.** If one tool's output feeds another's input, or two tools write
+  the same record, run them in order.
+
 ### Capped fan-out, per-call timeout and a token stream
 Twenty simulated model calls with a concurrency cap of five, a per-call timeout, references kept to every
 task, and an async generator standing in for a token stream. `asyncio.sleep` plays the role of network
@@ -248,6 +312,10 @@ asyncio.run(main())
   must await (for example reading the budget from Redis).
 
 ## Production patterns
+- **Parallel tool execution with per-tool budgets.** When a model turn contains several independent tool
+  calls, run them with `gather` (or a `TaskGroup` when one failure should cancel the rest) under a
+  semaphore, with an `asyncio.timeout` per tool and timeouts returned as error tool results. Monitor
+  per-tool latency p95 and timeout rate, and the step latency per agent turn.
 - **One shared async client per process.** Create a single `httpx.AsyncClient` or `AsyncOpenAI` at startup
   (for example in a FastAPI lifespan), reuse it for every request and close it with `async with` or
   `aclose()` on shutdown, so connections are pooled. Monitor connection-pool waits and open sockets.
@@ -261,9 +329,10 @@ asyncio.run(main())
 - **Offload, do not block.** Wrap unavoidable sync SDKs in `await asyncio.to_thread(...)` and send CPU work
   (tokenizing a corpus, local embeddings) to a `ProcessPoolExecutor` via `loop.run_in_executor`. Monitor
   executor queue depth; `to_thread` shares the loop's default thread pool.
-- **Keep references to background tasks.** Add each `create_task` result to a module-level `set` and call
-  `task.add_done_callback(tasks.discard)`, so the loop's weak reference is not the only one. Log
-  exceptions from the done callback so failures are not silent.
+- **Keep references to background tasks.** Add each `create_task` result (a background memory write,
+  a trace upload) to a module-level `set` and call `task.add_done_callback(tasks.discard)`, so the
+  loop's weak reference is not the only one. Log exceptions from the done callback so failures are not
+  silent.
 
 ## Trade-offs
 - **Thousands of cheap waits vs one blocking call freezes all.** One thread handles thousands of
@@ -295,6 +364,9 @@ asyncio.run(main())
   every task passes the check before any of them subtracts, so a token budget or quota is overspent by
   roughly the concurrency factor. Hold an `asyncio.Lock` across the check-and-act, or reserve before
   awaiting.
+- **Parallelising dependent or conflicting tool calls.** Two calls that update the same record, or where
+  one needs the other's output, run concurrently and produce a lost update or a call with stale input.
+  Fix: parallelise only calls the dispatcher knows are independent and read-only; run the rest in order.
 - **Calling `asyncio.run()` from inside a running loop** (notebooks, some frameworks). It raises
   `RuntimeError`; `await` directly or use the framework's loop.
 - **Catching `BaseException` or bare `except:` around awaits.** It swallows `CancelledError` and produces
@@ -353,6 +425,14 @@ fix the unrelated endpoint's latency should no longer move.
 - **Overspend matches the concurrency factor,** which is the tell.
 - **Fix:** reserve (subtract) before awaiting and refund on failure, or hold an `asyncio.Lock` across the
   whole check-and-act when the check itself awaits.
+
+### The model returns four tool calls in one turn and one of them sometimes hangs. How do you execute the turn?
+- **Run independent calls concurrently** with `gather` under a semaphore, so the turn costs the slowest
+  call rather than the sum; keep results in call order so each pairs with its tool-call id.
+- **Bound each call** with `asyncio.timeout(...)` and turn a timeout into an error tool result, so the
+  model can retry or route around it and the run does not stall.
+- **Decide all-or-nothing deliberately:** `TaskGroup` cancels siblings on the first failure, which suits
+  calls whose results are useless alone; otherwise collect partial results.
 
 ### When would you not use async, or prefer a thread pool?
 - **CPU-bound work** such as tokenizing a large corpus or computing embeddings locally: it never yields,

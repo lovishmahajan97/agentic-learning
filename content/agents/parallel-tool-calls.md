@@ -5,7 +5,8 @@ name: Parallel tool calls
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/tool-calling
   - agents/agent-loop
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-A model can emit several tool calls in one turn; the harness runs independent ones concurrently and
-answers every call before the next turn, saving a round trip per call. The model picks the batch; only
-the harness knows what may overlap.
+An agent's model can emit several tool calls in one turn; the harness runs independent ones
+concurrently and answers every call before the next turn, saving a round trip per call. The model
+picks the batch; only the harness knows what may overlap.
+
+## For agent builders
+- **Why it matters for agents.** Round trips dominate agent latency, and research or support agents
+  often need several independent lookups per step. Batching them can cut seconds per turn, but running
+  two writes at once can corrupt state, so the harness, not the model, decides what overlaps.
+- **Where it shows up in your stack.** `disable_parallel_tool_use` on the Claude API and
+  `parallel_tool_calls` on OpenAI; LangGraph's prebuilt `ToolNode` runs the calls from one model message
+  concurrently, and the OpenAI Agents SDK runs one turn's function tools together. Check whether your
+  framework lets you hold writes back.
+- **What you control.** Which tools are parallel-safe (from contract metadata), the concurrency cap,
+  per-call timeouts, failure isolation, and a single message answering every call.
+- **What you can skip.** Building a dependency planner. Dependent calls arrive in later turns on their
+  own; programmatic tool calling covers long chains.
 
 ## Why it exists
 - **The model call dominates step latency.** A step is a model call plus a tool call, and the model call is
@@ -302,6 +316,14 @@ effects it must be excluded from the concurrent group. Confirm with calls per tu
 - **Write-heavy, low-volume agents** where ordering and correctness matter more than seconds.
 - **Fragile downstream systems** that cannot absorb bursts even with caps.
 - **The cost** is giving up the latency win, so measure wall-clock per task before and after.
+
+### Your framework runs every call in a turn concurrently, writes included. How do you make it safe?
+- **Classify tools in your own registry** as read-only or side-effecting, because the framework does not
+  know which calls race.
+- **Serialize writes yourself:** route side-effecting tools through a lock or queue per resource, or turn
+  off parallel calls for agents that mostly write.
+- **Verify in traces** that two writes to one record never overlap, and keep per-call timeouts and error
+  results so one failure does not drop the others.
 
 ## Quiz
 ### Q: On the Claude API, why must all the tool results for one assistant turn be returned in a single user message?

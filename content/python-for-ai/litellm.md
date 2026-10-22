@@ -5,7 +5,8 @@ name: LiteLLM
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/anthropic-sdk
@@ -20,9 +21,23 @@ sources:
 ---
 
 ## TL;DR
-LiteLLM is an open-source library and proxy that puts many LLM providers behind one OpenAI-style call,
-adding routing, retries, fallbacks, cost tracking, virtual keys and budgets. Its main cost: translation
-can hide or lag provider-specific features.
+LiteLLM puts many LLM providers behind one OpenAI-style call, so one agent loop can route steps to
+different models, fail over, and track cost and budgets per agent. Its main cost: translation can hide or
+lag provider-specific features agents rely on.
+
+## For agent builders
+- **Why it matters for agents.** Agents make many calls per task, often to different models (a cheap
+  router step, a strong planner, a judge for evals). One call shape means one tool-calling loop for every
+  provider, and one place for retries, fallbacks and spend caps per agent or tenant.
+- **Where it shows up in your stack.** As the model layer under hand-written agent loops, via LangChain's
+  LiteLLM chat model integration (and so LangGraph), inside other agent frameworks that accept a LiteLLM
+  model string, as a proxy that every agent service calls with an OpenAI client, and in eval harnesses
+  that compare models on the same agent tasks.
+- **What you control.** Logical model names per agent role, `fallbacks` and `num_retries`, which layer
+  owns retries, `drop_params`, virtual keys with budgets per agent or tenant, `metadata` for cost
+  attribution, and callbacks to tracing backends.
+- **What you can skip.** The internals of each provider translation. Test the parts your agent depends on
+  (tool calls, streaming usage, caching) on every provider in the route instead.
 
 ## Why it exists
 - **Teams rarely stay on one model.** A cheap model for classification, a strong one for reasoning, a
@@ -76,6 +91,9 @@ Response, Anthropic reply in, OpenAI shape out:
 - **Every mapping is a fidelity risk.** A feature with no OpenAI equivalent (thinking blocks, cache
   breakpoints, citations) must ride in an extra field or is lost, which is why translation fidelity is the
   thing to test.
+- **Agent history is the hardest case.** A multi-step transcript with parallel tool calls, tool results
+  and reasoning blocks must round-trip through translation on every step; test full multi-step traces,
+  not single calls.
 
 ### Errors
 - **One hierarchy.** Provider errors map onto OpenAI-style exception types (rate limit, context window
@@ -121,7 +139,7 @@ down, and only when the whole group fails does the call fall back to another pro
 
 ```mermaid
 flowchart TD
-    APP["App: OpenAI-format call, model chat"] --> R["Router or proxy: logical name to deployments"]
+    APP["Agent step: OpenAI-format call, model chat"] --> R["Router or proxy: logical name to deployments"]
     R -->|"routing_strategy, simple-shuffle default"| D1["openai/gpt-4o-mini"]
     R --> D2["azure/my-gpt4o-mini-eu"]
     D1 -->|"429 or 5xx"| RT{"num_retries left in group?"}
@@ -135,6 +153,44 @@ flowchart TD
 ```
 
 ## Examples
+### One agent loop, a model per role
+The same tool loop runs whichever provider serves each step; a cheap model decides whether tools are
+needed, a stronger one does the work. Model names are illustrative; take them from config.
+
+```python
+import json, litellm
+
+ROLES = {"router": "openai/gpt-4o-mini", "worker": "anthropic/claude-haiku-5-5"}
+tools = [{"type": "function", "function": {
+    "name": "get_order", "description": "Look up an order by id",
+    "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                   "required": ["order_id"]}}}]
+
+def get_order(order_id: str) -> dict:
+    return {"order_id": order_id, "status": "shipped"}
+
+def run(question: str, tenant: str, max_steps: int = 6) -> str:
+    messages = [{"role": "user", "content": question}]
+    for step in range(max_steps):
+        model = ROLES["router"] if step == 0 else ROLES["worker"]
+        resp = litellm.completion(model=model, messages=messages, tools=tools, timeout=20,
+                                  metadata={"agent": "support", "tenant": tenant, "step": step})
+        msg = resp.choices[0].message
+        print(step, resp.model, resp.usage.prompt_tokens, litellm.completion_cost(resp))
+        if resp.choices[0].finish_reason != "tool_calls":
+            return msg.content                     # same finish_reason names for every provider
+        messages.append(msg.model_dump())
+        for call in msg.tool_calls:
+            args = json.loads(call.function.arguments)   # validate before running in production
+            messages.append({"role": "tool", "tool_call_id": call.id,
+                             "content": json.dumps(get_order(**args))})
+    return "Step limit reached."
+```
+
+- **Switching models mid-run is a design choice.** History written by one model is read by another;
+  provider-specific blocks (reasoning, cache markers) do not carry over, so eval the mixed trajectory.
+- **Per-step cost** comes from `completion_cost`, so you can report cost per task and per agent role.
+
 ### Router with two deployments, retries and a cross-provider fallback
 Model names are illustrative; take them from config.
 
@@ -220,7 +276,26 @@ Eighteen calls for one user request, sent exactly when the provider is already r
 retries owned only by the router (`max_retries=0` on the app client), the same request makes 3 × 2 = 6
 calls.
 
+### Worked scenario: the same outage, inside an agent
+An agent task averages 8 model calls (illustrative). With the stacked setup above, each call can become
+18 upstream attempts.
+
+| Setup | Upstream calls for one agent task, worst case |
+|---|---|
+| Stacked retries: 8 × 18 | 144 |
+| Router-owned retries only: 8 × 6 | 48 |
+| Router-owned retries plus a task deadline that stops after 3 failed steps: 3 × 6 | 18 |
+
+Agents multiply every per-call retry policy by their step count, which is why the loop needs its own
+deadline and failure budget on top of the router.
+
 ## Production patterns
+- **One logical name per agent role.** Call `planner`, `router`, `judge` instead of provider model names,
+  and map them in router or proxy config, so swapping a model is a config change plus an eval run.
+  Monitor cost and latency per role.
+- **Budget each agent with its own key.** In proxy mode give each agent or tenant a virtual key with a
+  spend budget and rate limit, so one runaway loop cannot spend the whole month. Monitor budget burn per
+  key and alert well before the cap.
 - **Own retries in one layer.** Set `num_retries` and `timeout` in the router or proxy, and `max_retries=0`
   on clients that call the proxy. Monitor upstream calls per user request during incidents.
 - **Eval every fallback pair.** Run the eval suite on each `fallbacks` target before enabling it, and alert
@@ -236,6 +311,9 @@ calls.
   changes after upgrades.
 
 ## Trade-offs
+- **Per-step model choice vs trajectory consistency.** Routing cheap steps to a small model cuts agent
+  cost, but each switch hands a transcript written by one model to another; it pays off only when evals
+  on mixed trajectories hold up.
 - **One interface vs lowest common denominator.** Switching and A/B testing become cheap, but features get
   hidden; Claude cache breakpoints or Responses-API tools may need provider-specific params.
 - **Library vs proxy.** The in-process library adds no network hop, but every service needs credentials
@@ -248,6 +326,9 @@ calls.
   changes and negotiated rates; reconcile against provider invoices before using them for chargeback.
 
 ## Pitfalls
+- **Testing translation with single calls only.** A one-shot prompt works on every provider, but the
+  agent fails on step 3 when a parallel tool-call history is translated. Fix: replay full multi-step
+  agent traces against each provider in the route.
 - **`drop_params=True` globally.** A parameter you rely on (structured output, a stop sequence) is quietly
   discarded for one provider, and outputs change format only when a fallback fires.
 - **Assuming tool calling and streaming behave identically everywhere.** Translation edge cases show up as
@@ -266,7 +347,8 @@ calls.
 
 ## When to use
 - **Use when** you genuinely use, or must be able to switch between, several providers: routing by cost or
-  capability, cross-provider fallbacks, eval harnesses comparing many models.
+  capability, cross-provider fallbacks, eval harnesses comparing many models on the same agent tasks, or
+  agents that use different models for different roles.
 - **Use proxy mode when** a platform team needs central keys, budgets and spend attribution across many
   services.
 - **Stay with a native SDK when** one provider is strategic and you depend on its newest features, or call
@@ -305,12 +387,19 @@ silent permanent failover with worse quality is noticed.
 - **Lost or hidden:** features with no OpenAI equivalent, such as thinking blocks, cache breakpoints or
   citations, which must ride in extra fields.
 
-### After a provider outage, support tickets spiked but logs showed no errors. What happened?
+### After a provider outage, your agent's task success dropped and support tickets spiked, but logs showed no errors. What happened?
 - **Likely a silent fallback:** the router moved traffic to `chat-backup`, so requests succeeded on a
-  model with different style or accuracy on your prompts.
+  model with different style, tool-calling accuracy or instruction following on your prompts.
 - **Check `drop_params`:** if it is on globally, a stop sequence or response format may have been dropped
   only for the fallback provider, changing output format.
 - **Fix:** run the eval suite on every fallback pair before enabling it and alert on fallback rate per route.
+
+### A fallback fires halfway through a 10-step agent run. What can go wrong, and how do you design for it?
+- **Mixed trajectories:** steps 1 to 5 were written by one model and steps 6 to 10 by another; reasoning
+  blocks and cache state do not carry over, and the new model may call tools differently.
+- **Design choices:** either pin a task to one model group for its whole run and retry the task, or allow
+  mid-run fallback only to pairs whose mixed trajectories passed your agent evals.
+- **Observe it:** tag each step with the serving model in traces and alert on fallback rate per agent.
 
 ### When would you not introduce LiteLLM?
 - **One strategic provider:** if you depend on its newest features, a native SDK exposes them first and

@@ -5,7 +5,8 @@ name: Inverted indexes
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - rag-retrieval/bm25-internals
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -20,15 +21,27 @@ sources:
 ---
 
 ## TL;DR
-An inverted index maps each term to a sorted posting list of the documents containing it, so a query
-reads only its terms' lists. Sorted ids, compression, skips and immutable segments make lexical search
-over hundreds of millions of documents answer in milliseconds.
+The inverted index is the engine under an agent's keyword search: each term maps to a sorted posting list,
+so a query reads only its terms' lists. For agents, its refresh delay, analyzer and cheap filters matter
+more than its internals.
+
+## For agent builders
+- **Why it matters for agents.** Agents write and then read: create a ticket, save a note, then search
+  for it one step later. Inverted-index engines make writes searchable only after a refresh, so an agent
+  can miss its own write. Analyzer choices decide whether ids copied between tools match at all.
+- **Where it shows up in your stack.** Elasticsearch and OpenSearch (Lucene), Tantivy-based engines, the
+  keyword half of hybrid vector databases, and LangChain or LlamaIndex retrievers that wrap them.
+- **What you control.** Field mappings and analyzers, `refresh_interval` and per-write refresh, keyword
+  fields for tenant and ACL filters, and whether the tool asks for exact hit counts.
+- **What you can skip.** Posting compression formats, the term-dictionary FST and the details of WAND.
+  Know that top-k is cheap, exact counts are not, and pruning is exact.
 
 ## Why it exists
 - **The forward index is too slow.** Document id → words means "which documents mention indemnification"
   opens and scans every document: O(total tokens) per query. A million documents of a thousand tokens each
   is a billion token comparisons per query, growing linearly with the corpus.
-- **Caching does not help,** because queries are too diverse.
+- **Caching does not help,** because queries are too diverse, and agent-written queries are more diverse
+  still.
 - **Queries are short; vocabularies are smaller than corpora.** Precompute, per term, the documents that
   contain it, and a five-term query reads five lists. Cost tracks how many documents contain the query
   terms, not how many exist.
@@ -41,38 +54,23 @@ over hundreds of millions of documents answer in milliseconds.
   across machines, still on CPUs.
 
 ## How it works
-### Analysis defines the terms
-1. Tokenize, lowercase, maybe strip accents.
-2. Stem ("running" → "run"), drop stopwords, split or keep hyphenated tokens.
-3. The output tokens are the index keys.
-
-- **The analyzer is the entire semantic contract.** A query is analyzed the same way and looked up by
-  exact key, so whatever the analyzer does not normalize cannot match.
-- **Consequences:** the same text in two fields with different analyzers behaves like two different
-  indexes, and changing an analyzer requires a full re-index.
-
-### Dictionary and postings
-- **Term dictionary.** Maps each term to its posting list's location and to collection statistics such as
-  document frequency. It needs exact lookup and, for prefix and wildcard queries, ordered traversal.
-  Lucene keeps a finite-state transducer (a compressed, trie-like automaton) over term prefixes in memory,
-  pointing into on-disk blocks of sorted terms, so many millions of terms stay fast without being fully
-  resident.
-- **Posting list.** The documents containing the term, sorted by document id; each entry carries term
-  frequency, optionally positions (for phrase and proximity queries) and payload data. Sorted order makes
-  everything else possible.
-
-### Why sorted ids and compression
-- **Merge intersection.** Two cursors, advance the smaller: O(|A| + |B|) instead of O(|A|·|B|).
-- **Gap encoding.** Store differences between consecutive ids; gaps are small, especially for common
-  terms. Variable-byte or bit-packed encodings (PForDelta and relatives) use a byte or two, often fewer
-  bits, instead of four.
-- **Cache-friendly.** A list for a term in ten million documents shrinks several-fold and, more
-  importantly, streams through the CPU cache.
+### Background: dictionary, postings and pruning
+- **Term dictionary.** Maps each term to its posting list's location and statistics such as document
+  frequency; supports exact lookup and ordered traversal for prefix and wildcard queries. Lucene keeps a
+  finite-state transducer (a compressed, trie-like automaton) over term prefixes in memory, pointing into
+  on-disk blocks of sorted terms.
+- **Posting list.** Documents containing the term, sorted by document id, each with term frequency,
+  optionally positions (for phrase and proximity queries) and payload data.
+- **Sorted ids pay three ways.** Merge intersection with two cursors costs O(|A| + |B|) instead of
+  O(|A|·|B|); gap encoding (variable-byte or bit-packed, PForDelta and relatives) uses a byte or two, often
+  fewer bits, instead of four; and lists stream through the CPU cache.
 - **Skip data.** Stored per block of roughly a hundred entries (Lucene encodes postings in blocks of 128),
-  it lets an intersection jump over stretches that cannot match. Rare AND common costs about the size of
-  the rare list.
+  it lets an intersection jump stretches that cannot match. Rare AND common costs about the size of the
+  rare list.
+- **Ranking data.** BM25 needs document length from a per-field norms structure, plus collection-wide N
+  and average length; in a sharded engine each shard holds its own statistics unless the coordinator
+  fetches global ones first.
 
-### Query evaluation
 | Strategy | How | Consequence |
 |---|---|---|
 | Term-at-a-time | walk each term's list fully, accumulate partial scores per document | every list is read to the end |
@@ -97,20 +95,28 @@ MaxScore step by step, OR query "iphone15 case" (rare term max 9.0, common term 
 - **The pruning is exact,** not approximate: the top k is identical to scoring everything, only cheaper.
   It improves as θ rises, which is why engines prefer not to compute an exact total hit count.
 
-Ranking data beyond postings:
-- BM25 needs document length, stored in a separate per-field norms structure, plus collection-wide N and
-  average length as index statistics.
-- In a sharded engine each shard holds its own statistics unless the coordinator fetches global ones first.
+### Analysis defines the terms
+1. Tokenize, lowercase, maybe strip accents.
+2. Stem ("running" → "run"), drop stopwords, split or keep hyphenated tokens.
+3. The output tokens are the index keys.
 
-### Segments, immutability and updates
+- **The analyzer is the entire semantic contract.** A query is analyzed the same way and looked up by
+  exact key, so whatever the analyzer does not normalize cannot match.
+- **Consequences:** the same text in two fields with different analyzers behaves like two different
+  indexes, and changing an analyzer requires a full re-index.
+- **Agent consequence:** ids flow between tools verbatim (`INC-20931`, `sku_44-B`), so map them as
+  `keyword` fields or analyze them to keep the whole token, or the agent's exact lookup fails.
+
+### Segments, immutability and read-after-write
 - **Write-once,** because mutating a compressed, sorted list in place is impractical.
 - **Segments.** New documents accumulate in memory and flush as a new immutable **segment**, a complete
   mini-index. Queries run against every segment and merge results.
 - **Deletes** go into a per-segment bitset of live documents; postings stay until a background merge
   rewrites the segments without them. **Updates** are a delete plus a re-add.
 - **Easy to forget, 1:** a document is not searchable until its segment is flushed (the refresh interval).
+  An agent whose next step runs faster than the refresh cannot find what it just wrote.
 - **Easy to forget, 2:** deleted documents still affect statistics like document frequency until merged,
-  so scores drift slightly on churning indexes.
+  so scores drift slightly on churning indexes such as agent memory.
 
 ### Phrase and positional queries
 - **Phrase** "fuser overheating": intersect the two lists, then check within each shared document whether
@@ -121,21 +127,21 @@ Ranking data beyond postings:
 ### Relationship to filtering and to IVF
 - **Filters are postings too.** Tenant id, date ranges and document type are posting lists or bitsets
   intersected with term lists, so lexical search gets filtering almost for free; vector indexes struggle
-  to match this.
+  to match this. Per-user and ACL filters on agent tools are cheap here.
 - **IVF is an inverted index** whose "terms" are cluster ids, which is why the name carries over.
 
 ## Diagram
-Read the top row as the write path (documents become immutable segments on refresh, merges drop deletes)
-and the bottom row as the read path (the same analyzer, a dictionary lookup, then pruned traversal of
-sorted posting lists across every segment).
+Read the top half as the write path an agent's save-note tool triggers (documents become immutable
+segments on refresh, merges drop deletes) and the bottom half as the read path its search tool triggers
+(the same analyzer, a dictionary lookup, then pruned traversal of sorted posting lists in every segment).
 
 ```mermaid
-flowchart LR
-    D["New or updated document"] --> A1["Analyzer"]
+flowchart TD
+    D["Agent writes or updates a document"] --> A1["Analyzer"]
     A1 --> B["In-memory buffer"]
     B -->|"refresh interval"| S[("Immutable segments, live-docs bitset")]
     S -->|"background merge drops deletes"| S
-    Q["Query"] --> A2["Same analyzer"]
+    Q["Agent search query"] --> A2["Same analyzer"]
     A2 --> DI["Term dictionary, FST in memory"]
     DI --> PL["Sorted, compressed posting lists per segment"]
     S --> PL
@@ -144,6 +150,50 @@ flowchart LR
 ```
 
 ## Examples
+### Worked scenario: the agent cannot find the ticket it just created
+A support agent calls `create_ticket`, then two steps later `search_tickets` to link related issues.
+Timings are illustrative.
+
+| Time | Event | Searchable? |
+|---|---|---|
+| 0 ms | `create_ticket` indexes INC-20931 into the buffer | no |
+| ~400 ms | next LLM step decides to search | no |
+| ~600 ms | `search_tickets("INC-20931")` runs | no: refresh not yet run, zero hits |
+| 1,000 ms | refresh at `refresh_interval` `1s` flushes a segment | yes, too late |
+
+- **What the agent does.** It concludes the ticket failed to save and creates a duplicate.
+- **Fixes.** Index agent-written documents with `refresh=wait_for`, return the new id from the write tool
+  so the agent does not need to search for it, or read by id (a get by id does not wait for refresh in
+  Elasticsearch, as it reads the latest version).
+
+### Agent write tool that is searchable on return
+The write tool blocks until the document is visible to search and returns the id, so the next step's
+search sees it. Use the Elasticsearch Python client; the index mapping matches the production snippet.
+
+```python
+from elasticsearch import Elasticsearch
+
+es = Elasticsearch("http://localhost:9200")
+
+def create_ticket(tenant_id: str, title: str, body: str) -> dict:
+    resp = es.index(
+        index="tickets",
+        document={"tenant_id": tenant_id, "title": title, "body": body},
+        refresh="wait_for",          # return only after a refresh makes it searchable
+    )
+    return {"id": resp["_id"], "status": "created"}   # hand the id back to the agent
+
+def search_tickets(tenant_id: str, query: str, k: int = 5) -> list[dict]:
+    resp = es.search(index="tickets", size=k, query={"bool": {
+        "must": {"multi_match": {"query": query, "fields": ["title^3", "body"]}},
+        "filter": {"term": {"tenant_id": tenant_id}},   # postings filter: cheap and exact
+    }})
+    return [{"id": h["_id"], "title": h["_source"]["title"]} for h in resp["hits"]["hits"]]
+```
+
+- **Cost:** `wait_for` adds up to one refresh interval to the write call, which is fine for agent writes
+  and wrong for bulk loads.
+
 ### A tiny index by hand
 Build postings with positions, intersect sorted lists with two cursors, and answer a phrase query from
 positions: the three operations every engine performs.
@@ -214,22 +264,25 @@ PUT /products
 ```
 
 - `body` keeps frequencies for BM25 but drops positions, so no phrase queries on it and a smaller index.
-- `tenant_id` and `sku` are `keyword` fields: one exact term each, ideal for filters.
+- `tenant_id` and `sku` are `keyword` fields: one exact term each, ideal for filters and for ids an agent
+  copies between tools.
 
 ## Production patterns
+- **Make agent writes visible before the tool returns.** Use `refresh=wait_for` on writes from agent
+  tools, return the new id, and prefer get-by-id over search when the agent already knows the id. Monitor
+  duplicate-creation rate and "searched for own write, got nothing" events in traces.
 - **Reindex behind an alias after analyzer changes.** Create a new index with the new analyzer, copy data
-  with the `_reindex` API, then switch the read alias atomically. Monitor document counts in old and new
-  indexes before the swap, so no partially re-analyzed index serves traffic.
+  with the `_reindex` API, then switch the read alias atomically, so the agent's tool never points at a
+  half-built index. Monitor document counts in old and new indexes before the swap.
 - **Wait for refresh in tests, not sleep.** Index test documents with `refresh=wait_for` (or call
-  `_refresh`) so integration tests see their writes deterministically. Monitor flaky-test rate in CI.
+  `_refresh`) so agent integration tests and evals see their writes deterministically. Monitor flaky-test
+  rate in CI.
 - **Pause refresh during bulk loads.** Set `refresh_interval` to `-1` for a large backfill and restore it
   afterwards, which avoids many tiny segments. Monitor segment count and merge time after the load.
-- **Watch deleted-document bloat.** On high-churn indexes track the deleted-docs count (the `_cat/indices`
-  API shows it) and run a force merge with `only_expunge_deletes` in a quiet window if merges lag.
+- **Watch deleted-document bloat.** On high-churn indexes (agent memory, ticket state) track the
+  deleted-docs count (the `_cat/indices` API shows it) and run a force merge with `only_expunge_deletes`
+  in a quiet window if merges lag. Keep top-k cheap: leave `track_total_hits` at its bounded default.
   Monitor index size and p99 latency over weeks.
-- **Keep top-k cheap.** Leave `track_total_hits` at its bounded default rather than demanding exact
-  counts, and avoid leading wildcards on large dictionaries. Monitor p99 latency against posting-list
-  length of the query terms.
 
 ## Trade-offs
 - **Postings make queries cost matching documents, not corpus size,** but indexing becomes the expensive,
@@ -239,6 +292,9 @@ PUT /products
 - **Immutable segments give lock-free reads and crash safety,** at the price of refresh latency and merge
   I/O; a tighter refresh interval for near-real-time search trades CPU and more small segments for
   freshness.
+- **Per-write `wait_for` vs a fast global refresh.** Waiting on agent writes gives read-after-write where
+  it matters without a cluster-wide refresh cost; a very short global interval helps everyone but creates
+  many small segments.
 - **Heavier analysis (stemming, synonyms, decompounding)** raises recall on natural-language queries but
   lowers precision on identifiers and names; which side wins depends on the query mix, so measure per
   query type.
@@ -247,11 +303,13 @@ PUT /products
 - **Partial re-index after an analyzer change.** Old segments hold tokens from the old rules. Symptom: a
   query matches a document indexed last month but not its identical twin indexed today.
 - **Expecting writes to be searchable immediately.** Symptom: flaky integration tests that pass only with
-  a sleep, caused by the refresh interval and segment flush.
+  a sleep, or an agent that creates duplicates because it cannot find what it just wrote, caused by the
+  refresh interval and segment flush.
 - **Ignoring deleted-document bloat.** Symptom: index size never shrinks and query latency slowly rises
   until a forced merge.
 - **Wildcard or leading-wildcard queries on large dictionaries.** Symptom: one query pins a CPU, because it
-  expands to thousands of terms and thousands of posting-list reads.
+  expands to thousands of terms and thousands of posting-list reads. Agents given a raw query-string tool
+  can emit these; constrain the tool's query syntax.
 - **Reading per-shard scores as globally comparable.** Symptom: the same document scores differently after
   a reshard, because document frequency was computed per shard.
 - **Learned sparse vectors (SPLADE-style) in an engine tuned for BM25.** Expanded queries have many terms
@@ -260,7 +318,7 @@ PUT /products
 
 ## When to use
 - **Use whenever** text must be found by the terms it contains: lexical search, BM25, keyword filters, log
-  search, and the sparse half of hybrid retrieval.
+  search, and the sparse half of hybrid retrieval behind an agent's tools.
 - **Prefer it over scanning** once the corpus is more than a few thousand documents or queries are
   frequent; **over a vector index** whenever exact matching, filtering and explainability dominate.
 - **Know its limits:** no meaning without an analyzer or a learned sparse model, and a re-index when the
@@ -298,9 +356,15 @@ bounds still prune most of the common list for a top-10 result.
 - **Why it is fast:** a five-term query reads five lists, so cost tracks how many documents contain the
   query terms rather than how many documents exist; a forward-index scan is O(total tokens) per query.
 
+### Your agent creates a record, then searches for it and finds nothing, so it creates a duplicate. What is going on and how do you fix it?
+- **Cause:** the write sits in an in-memory buffer until a refresh flushes it into a segment, and the
+  agent's next step ran inside that window (`1s` by default in the snippet above).
+- **Fix:** index agent writes with `refresh=wait_for`, return the new id from the write tool, and read by
+  id when the id is known; add an idempotency key so a retry cannot create a second record.
+
 ### Integration tests that index a document and immediately search for it are flaky. Why, and what is the fix?
-- **Cause:** new documents sit in an in-memory buffer and become searchable only when a refresh flushes
-  them into a segment, after the refresh interval (`1s` in the snippet above).
+- **Cause:** new documents become searchable only when a refresh flushes them into a segment, after the
+  refresh interval.
 - **Fix:** index test documents with `refresh=wait_for` or call `_refresh`, instead of adding sleeps that
   pass on a fast laptop and fail on a busy CI runner.
 
@@ -309,7 +373,7 @@ bounds still prune most of the common list for a top-10 result.
   threshold θ exceeds the common term's bound, documents containing only that term cannot qualify.
 - **MaxScore or WAND** then iterate the rare list and probe the common list through skip data, and
   block-max impacts skip low-scoring blocks; the result is exact, not approximate.
-- **Exact total hit counts defeat this,** because every match must be counted.
+- **Exact total hit counts defeat this,** so an agent tool should not ask for them.
 
 ### When would you turn off positions on a field, and what do you lose?
 - **Turn them off** on fields only ever filtered or scored as a bag of words, because positions

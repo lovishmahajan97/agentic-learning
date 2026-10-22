@@ -5,7 +5,8 @@ name: Model serving
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - serving-inference/engines
   - serving-inference/prefill-vs-decode
@@ -22,20 +23,32 @@ sources:
 ---
 
 ## TL;DR
-Model serving is everything between a trained checkpoint and an HTTP response. For LLMs each request is a
-stateful loop of unknown length whose KV cache grows while it runs, so the scheduler, not the model,
-decides what the hardware delivers.
+Model serving is everything between a checkpoint and the response your agent loop waits on. Each LLM
+call is a stateful loop of unknown length whose KV cache grows while it runs, so the scheduler, not the
+model, decides how fast every agent step returns.
+
+## For agent builders
+- **Why it matters for agents.** One agent task is 5 to 50 sequential model calls, each blocked on the
+  previous one. Task latency is the sum of every step's queueing, prefill and decode, so serving behaviour
+  multiplies across the loop instead of showing up once.
+- **Where it shows up in your stack.** The base URL your agent framework points at: a provider API, or a
+  self-hosted engine (vLLM, SGLang, TGI) behind an OpenAI-compatible endpoint, plus the gateway, router
+  and autoscaler in front of it.
+- **What you control.** Per-step `max_tokens`, prompt size, streaming and cancellation, session-affine
+  routing by agent run id, and, when self-hosting, the engine's memory and concurrency flags.
+- **What you can skip.** Kernel internals and CUDA graphs. Know the five layers, the request lifecycle
+  and the memory arithmetic; that is enough to debug a slow agent fleet.
 
 ## Why it exists
 - **A checkpoint answers nothing.** Someone must put weights on a device, tokenize, run the forward pass,
-  sample, detokenize and stream back, for hundreds of users at once, without one user's 20k-token
+  sample, detokenize and stream back, for hundreds of users or agents at once, without one 20k-token
   document starving everyone else. That set of responsibilities is "serving".
 - **An LLM request is a loop, not a pass.** Classic ML serving (one request, one forward pass, scale
   horizontally) works because a classifier's cost is fixed. An LLM runs one forward pass per generated
-  token, and a one-word answer and a 2,000-word essay arrive looking identical.
+  token, and a one-word tool call and a 2,000-word report arrive looking identical.
 - **The loop is stateful.** Each step needs the KV cache of every earlier token, so the state lives on the
   GPU for the life of the request and grows every step. Memory, not compute, usually caps how many
-  requests a card can hold.
+  requests (and so how many concurrent agents) a card can hold.
 - **GPUs are efficient only when busy with large matmuls.** A single decode request reads all weights per
   token: for an 8B model in fp16 that is ~16 GB per token, so ~3 TB/s of bandwidth caps it near 200
   tokens/s no matter how many FLOPs the GPU has, with the arithmetic units almost idle. Put 32 requests in
@@ -46,26 +59,29 @@ decides what the hardware delivers.
 
 ## How it works
 ### The layers of a serving stack
-From the outside in:
+From the outside in, as your agent's request travels:
 
 | # | Layer | What it owns |
 |---|---|---|
-| 1 | **API layer** | HTTP server with a chat/completions protocol (most self-hosted engines expose an OpenAI-compatible endpoint): auth, rate limits, validation, SSE streaming, cancellation on client disconnect |
-| 2 | **Router** | Picks a replica. Round-robin works until you care about prefix-cache locality or model-per-tenant isolation; then routing becomes content-aware |
+| 1 | **API layer** | HTTP server with a chat/completions protocol (most self-hosted engines expose an OpenAI-compatible endpoint, which is what agent frameworks expect): auth, rate limits, validation, SSE streaming, cancellation on client disconnect |
+| 2 | **Router** | Picks a replica. Round-robin works until you care about prefix-cache locality (an agent's growing transcript) or model-per-tenant isolation; then routing becomes content-aware |
 | 3 | **Engine** | Owns the GPU(s): vLLM, SGLang, TGI, TensorRT-LLM, llama.cpp and others. Loads weights (optionally quantized, optionally sharded with tensor parallelism), owns the KV-cache pool, runs the scheduler |
 | 4 | **Scheduler** | Each iteration decides which waiting requests get prefill and which running ones get a decode step, under a token budget and free KV memory. The heart of the system: continuous batching and paged memory live here |
 | 5 | **Model executor and kernels** | The forward pass: attention kernels reading the paged cache, fused matmuls, CUDA graphs to cut launch overhead, on-device sampling |
 
-### The request lifecycle
-1. **Arrive and queue.** The request is tokenized and waits in a queue.
+### The request lifecycle (one agent step)
+1. **Arrive and queue.** The request (system prompt, tool schemas, transcript so far) is tokenized and
+   waits in a queue.
 2. **Prefill.** When admitted, the prompt runs in one compute-heavy pass that populates the KV cache. The
-   first token comes out of it; that time is the **time to first token (TTFT)**.
+   first token comes out of it; that time is the **time to first token (TTFT)**. For an agent with a long
+   transcript, prefill is often most of the step.
 3. **Decode.** The request joins the running batch and gets one step per iteration alongside every other
    running request. The spacing between its tokens is the **time per output token (TPOT)**.
 4. **Leave.** It exits on an end-of-sequence token, on hitting `max_tokens`, or on client cancel, and its
-   cache blocks are freed for the next request.
+   cache blocks are freed for the next request. Your agent then runs the tool and sends the next step.
 - **Why this keeps the GPU full:** requests join and leave at iteration granularity rather than waiting
-  for a whole batch to finish. That is continuous batching.
+  for a whole batch to finish. That is continuous batching, and it is why hundreds of agents interleave
+  on one replica.
 
 ### Why memory arithmetic comes first
 - **Weights are fixed; the cache is variable.** An 8B-parameter model in fp16 is about 16 GB of weights.
@@ -73,8 +89,9 @@ From the outside in:
 - **The pool is what is left.** The engine reserves a fraction of VRAM (vLLM's default is 90%) and gives
   what remains after weights to the cache pool.
 - **The real concurrency limit** is free cache tokens divided by typical sequence length. That is why "how
-  many users can one H100 serve" has no answer until you know sequence lengths. The KV-cache memory
-  estimation lesson does this arithmetic in full.
+  many users (or agents) can one H100 serve" has no answer until you know sequence lengths. Agents are the
+  hard case because their transcripts grow every step. The KV-cache memory estimation lesson does this
+  arithmetic in full.
 
 ### Where the trade-offs live
 Every serving knob trades latency against throughput:
@@ -82,8 +99,8 @@ Every serving knob trades latency against throughput:
 | Knob | Gain | Cost |
 |---|---|---|
 | Bigger batch | More tokens/s for the whole GPU | Longer TPOT per user, because each decode step reads more cache |
-| Larger `max_model_len` | Admits longer documents | Fewer requests fit |
-| Quantized weights or cache | Frees memory and bandwidth | A quality cost you must measure |
+| Larger `max_model_len` | Admits longer documents and agent transcripts | Fewer requests fit |
+| Quantized weights or cache | Frees memory and bandwidth | A quality cost you must measure on your agent evals |
 | Speculative decoding | Lower per-token latency | Extra compute |
 
 The rest of this module makes each of those trades deliberate.
@@ -100,18 +117,19 @@ The rest of this module makes each of those trades deliberate.
 
 ### Managed API versus self-hosting
 - **A provider API is serving outsourced.** The same machinery runs on their side; pricing, rate limits
-  and prompt-caching rules are its visible surface.
-- **Self-hosting buys control** (data residency, custom models, predictable cost at high utilization) at
-  the price of owning everything above.
+  and prompt-caching rules are its visible surface, and they shape agent design just as engine flags do.
+- **Self-hosting buys control** (data residency, custom or fine-tuned agent models, predictable cost at
+  high utilization) at the price of owning everything above.
 - **The mechanics are identical,** so understanding them makes you better at both. The decision itself is
   covered in the infrastructure and economics module.
 
 ## Diagram
-Follow one request from the API to the GPU and back; the scheduler loop is where TTFT and TPOT are made.
+Follow one agent step from the API to the GPU and back; the scheduler loop is where TTFT and TPOT are
+made, and the agent repeats this trip once per step.
 
 ```mermaid
 flowchart TD
-    C["Client"] -->|"POST chat/completions"| API["API layer: auth, limits, SSE"]
+    C["Agent loop"] -->|"POST chat/completions"| API["API layer: auth, limits, SSE"]
     API --> R["Router picks replica"]
     R --> Q["Engine queue"]
     Q --> S["Scheduler: token budget, free KV"]
@@ -121,7 +139,7 @@ flowchart TD
     D --> KV[("Paged KV cache pool")]
     D -->|"EOS, max_tokens, cancel"| F["Free cache blocks"]
     F --> S
-    D -.->|"stream chunks"| API
+    D -.->|"stream chunks or tool call"| API
 ```
 
 ## Examples
@@ -163,6 +181,42 @@ print(f"TTFT={first*1000:.0f} ms, chunks={n}, "
 # and the server's tokens/sec roughly doubles — the signature of a batched decode loop.
 ```
 
+### Agent scenario: timing every step of a tool-calling loop
+Point the same client at the engine from an agent loop and log per-step latency and token counts. Tool
+calling on a self-hosted engine needs the server started with its tool-call parsing options enabled (see
+your engine's docs for the parser that matches your model).
+
+```python
+import time, json
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
+tools = [{"type": "function", "function": {
+    "name": "search_docs", "description": "Search internal docs",
+    "parameters": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}}]
+
+def search_docs(q):                       # stand-in tool
+    return f"3 results for {q!r}"
+
+messages = [{"role": "system", "content": "You are a support agent. Use tools."},
+            {"role": "user", "content": "How do I rotate an API key?"}]
+for step in range(8):                     # hard cap on agent steps
+    t0 = time.perf_counter()
+    r = client.chat.completions.create(model=MODEL, messages=messages, tools=tools,
+                                       max_tokens=300)   # per-step cap, not per task
+    dt = (time.perf_counter() - t0) * 1000
+    msg = r.choices[0].message
+    print(f"step {step}: {dt:.0f} ms, prompt={r.usage.prompt_tokens}, out={r.usage.completion_tokens}")
+    messages.append(msg.model_dump(exclude_none=True))   # append-only transcript
+    if not msg.tool_calls:
+        break
+    for call in msg.tool_calls:
+        args = json.loads(call.function.arguments)
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": search_docs(**args)})
+# Watch prompt_tokens climb each step: that growth is what fills the KV pool.
+```
+
 ### Worked scenario: how many users does that one GPU hold?
 Same 8B GQA model, one 80 GB GPU, the flags above. Illustrative arithmetic, ignoring activation and
 CUDA-graph memory, which take a few more GB in practice.
@@ -175,9 +229,12 @@ CUDA-graph memory, which take a few more GB in practice.
 | Pool in tokens | 56 GB ÷ 128 KB ≈ 427,000 tokens |
 | Every request at the 8,192-token cap | ≈ 52 concurrent |
 | Typical request of 2,000 tokens | ≈ 213 fit, but `--max-num-seqs 128` caps it at 128 |
+| Agent steps averaging a 20,000-token transcript (needs a larger `max_model_len`) | ≈ 21 concurrent steps |
 
 - **Read it as:** the binding limit moves between the sequence cap and the memory pool depending on the
   length mix, so you cannot quote a user count without the length distribution.
+- **For agents:** late steps of a long run are the expensive ones. The same GPU that holds 128 short chats
+  holds about 21 agent steps at 20k tokens, so size from transcript length at step *n*, not step 1.
 
 ```python
 pool_tokens = (0.9 * 80e9 - 16e9) / (2 * 32 * 8 * 128 * 2)
@@ -189,36 +246,42 @@ for avg_len in (8192, 2000):
 - **Instrument before tuning.** On day one, scrape the engine's Prometheus `/metrics` endpoint (vLLM
   exposes request queue depth, running requests, KV-cache usage, preemptions, TTFT and TPOT histograms)
   and build a dashboard of TTFT, TPOT, tokens/s per GPU and cache utilization. Alert on p99 TTFT, not
-  averages.
-- **Cap per-endpoint lengths at the gateway.** Enforce a maximum prompt size and a default `max_tokens`
-  per route before requests reach the engine, so one runaway generation cannot hold cache blocks for
-  minutes. Monitor requests rejected or truncated per route.
-- **Cache-aware routing for multi-turn traffic.** Route by a session or conversation id (consistent
-  hashing) so turn *n* lands on the replica that prefilled turns 1 to *n−1*. Monitor fleet-wide prefix-cache
-  hit rate against a single replica's.
+  averages, and add end-to-end agent task latency next to them.
+- **Cap per-step lengths at the gateway.** Enforce a maximum prompt size and a default `max_tokens` per
+  route (and per agent step) before requests reach the engine, so one runaway generation cannot hold
+  cache blocks for minutes. Pair it with a maximum step count per agent run. Monitor requests rejected or
+  truncated per route.
+- **Session-affine routing for agent runs.** Route by a session, conversation or agent run id
+  (consistent hashing) so step *n* lands on the replica that prefilled steps 1 to *n−1*. Monitor
+  fleet-wide prefix-cache hit rate against a single replica's.
 - **Warm floor plus queue-based autoscaling.** Keep enough warm replicas for normal peak, pre-stage
   weights on local NVMe or in the image, and scale on queue depth or KV-cache utilization. Monitor time
   from scale-up decision to first served token.
-- **Propagate client disconnects.** Stream with SSE and make sure the proxy and API layer abort the
-  engine request when the client goes away. Monitor generated tokens versus tokens delivered to clients.
+- **Propagate cancellation through the agent.** Stream with SSE and make sure the proxy and API layer
+  abort the engine request when the client goes away, and that an aborted agent run cancels its in-flight
+  model call. Monitor generated tokens versus tokens delivered to clients or consumed by the agent.
+- **Separate interactive agents from batch agents.** Offline eval runs and backfills go to their own
+  deployment or a lower-priority queue, so a 1,000-task eval sweep cannot push live users' TTFT over
+  budget.
 
 ## Trade-offs
 - **Bigger batches vs per-token latency.** Batching more requests per step raises GPU throughput but
   lengthens each request's per-token latency. Flips toward smaller batches when the product is
-  interactive and TPOT is the user-visible metric.
-- **Long `max_model_len` vs concurrency.** Long limits serve document workloads but shrink concurrency,
-  because every admitted request may claim that much cache. Flips when p99 prompt length is far below the
-  cap and admission uses actual lengths.
+  interactive and TPOT is the user-visible metric; an agent pays it on every step.
+- **Long `max_model_len` vs concurrency.** Long limits serve document workloads and long agent
+  transcripts but shrink concurrency, because every admitted request may claim that much cache. Flips
+  when p99 prompt length is far below the cap and admission uses actual lengths.
 - **Self-hosting vs managed API.** Self-hosting gives data control and a lower cost per token at high,
   steady utilization. A managed API wins when traffic is bursty or small, because idle GPUs cost the same
   as busy ones.
 - **Streaming vs simplicity.** Streaming tokens improves perceived latency and lets clients cancel early,
   but complicates proxies, retries and observability. It stops being worth it for short structured
-  outputs consumed by machines.
+  outputs consumed by machines, such as an agent's intermediate tool calls.
 
 ## Pitfalls
 - **Capacity-planning from weight size alone.** Symptom: the engine admits far fewer concurrent requests
-  than expected, or preempts them mid-generation under load. Fix: add the cache to the plan.
+  than expected, or preempts them mid-generation under load. Fix: add the cache to the plan, sized at a
+  late agent step.
 - **Measuring latency with a single request and shipping.** Symptom: TPOT doubles the first time real
   concurrency arrives, because decode steps now read many caches per iteration. Fix: load-test at the
   expected concurrency and length mix before quoting latency.
@@ -231,20 +294,23 @@ for avg_len in (8192, 2000):
   throughput that does not translate into completed requests. Fix: abort the engine request on disconnect.
 - **The wrong chat template.** Serving an instruct model with a template other than the one it was trained
   with (often a hand-built prompt string) raises no error. Symptom: answers that ramble, ignore the system
-  prompt or fail to stop, because the model never sees the role markers it expects. Fix: send messages to
-  the chat endpoint so the engine applies the model's own template.
+  prompt, fail to stop, or emit malformed tool calls, because the model never sees the role markers it
+  expects. Fix: send messages to the chat endpoint so the engine applies the model's own template.
 - **Autoscaling on CPU utilization or request count.** Symptom: new replicas become ready minutes after
   the queue already blew through the TTFT budget, then idle after the spike. Fix: scale on queue depth or
   KV-cache utilization, above a warm floor.
 
 ## When to use
-You meet serving the moment a model leaves a notebook. Use this lesson as the map.
+You meet serving the moment a model leaves a notebook, and every agent you ship sits on top of it. Use
+this lesson as the map.
 - **Find the layer:** when a question is about *why* a number looks the way it does, place it in API,
   router, scheduler, memory or kernels, then go deep: prefill vs decode for the latency split, KV-cache
   memory estimation for capacity, continuous batching and paging for scheduling, engines for which
   software to run.
 - **Measure from day one:** TTFT, TPOT, tokens per second per GPU and cache utilization, because every
-  later decision is made against those four.
+  later decision is made against those four. For agents, add steps per task and latency per step.
+- **Avoid when:** you call a managed API at low volume; then the provider owns these layers and you
+  control only prompt size, `max_tokens`, streaming and retries.
 - **Interviews:** explain the request lifecycle end to end and name which resource (memory, bandwidth,
   compute) binds at each phase.
 
@@ -278,6 +344,14 @@ and if cache utilization is pinned at 100%, either lower concurrency, quantize t
 - **It must be batched.** Single-request decode leaves the GPU's arithmetic idle, so the engine batches
   many live loops per step, which needs an iteration-level scheduler.
 
+### Your agent takes 40 seconds per task on a self-hosted model. How do you find where the time goes?
+- **Break it down per step:** log steps per task, prompt and completion tokens, TTFT and total time for
+  every model call, plus tool time. Agent latency is a sum, so find the largest terms.
+- **Long prompts, short outputs** mean prefill dominates: check prefix-cache hit rate and session-affine
+  routing so each step only prefills the new tool result.
+- **High queue time** means admission: check KV-cache utilization and preemptions, then cap
+  concurrency, add replicas or move batch evals elsewhere.
+
 ### Users say the chatbot "types slowly" at peak but dashboards show record tokens/s. What is going on?
 - **That is the throughput-latency trade.** Larger batches raise aggregate tokens/s, but each decode step
   reads more KV cache, so every user's TPOT grows.
@@ -285,13 +359,13 @@ and if cache utilization is pinned at 100%, either lower concurrency, quantize t
 - **Fix by product goal:** lower the maximum concurrent sequences per replica and add replicas, or split
   interactive and batch traffic onto separate deployments with different limits.
 
-### When would you not self-host, even with a capable platform team?
+### When would you not self-host your agent's model, even with a capable platform team?
 - **Bursty or small traffic.** Idle GPUs cost the same as busy ones, so low or spiky utilization makes a
   managed API cheaper per useful token.
 - **Cold starts you cannot hide.** Replicas take tens of seconds to minutes to warm, so spiky demand needs
   a paid warm floor anyway.
-- **Self-host when** data residency, custom or fine-tuned models, or high steady utilization make control
-  and unit cost win.
+- **Self-host when** data residency, custom or fine-tuned agent models, or high steady utilization make
+  control and unit cost win.
 
 ### How would you capacity-plan one 80 GB GPU for an 8B model?
 - **Start from the pool:** 90% of 80 GB minus 16 GB of fp16 weights leaves about 56 GB for cache.
@@ -300,13 +374,13 @@ and if cache utilization is pinned at 100%, either lower concurrency, quantize t
 - **Divide by the real length mix,** not the cap: ~52 requests at 8k tokens each, far more at 2k, then
   check which limit (memory or the sequence cap) binds and leave headroom for activations.
 
-### Why do LLM replicas autoscale badly, and what do you do about it?
+### Why do LLM replicas autoscale badly, and what do you do about it for an agent fleet?
 - **Startup is slow:** loading weights, profiling the cache pool and capturing CUDA graphs take tens of
   seconds to minutes.
 - **CPU and request count mislead:** they lag the real pressure, which shows first as queue depth and
   KV-cache utilization.
 - **So** keep a warm floor for normal peak, pre-stage weights on local NVMe or in the image, and scale on
-  leading signals.
+  leading signals; agent runs in flight also make draining slow, so scale down gently.
 
 ## Quiz
 ### Q: Why is serving an LLM fundamentally different from serving a classification model?

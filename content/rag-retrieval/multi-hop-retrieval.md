@@ -5,7 +5,8 @@ name: Multi-hop retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/agentic-rag
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Some answers need a second fact that is only findable once you know the first. Multi-hop retrieval
-interleaves retrieving and reading: retrieve, extract the bridging fact, form the next query, repeat under
-a hop limit, then answer.
+Some answers need a second fact that is only findable once you know the first. Multi-hop retrieval is
+an agent loop with a search tool: retrieve, read the bridging fact, write the next query, repeat under a
+hop limit, then answer with citations.
+
+## For agent builders
+- **Why it matters for agents.** This is the core reason agents beat fixed RAG pipelines: the next query
+  comes from what the last tool call returned. It is also where agents burn cost, loop on the same query
+  and invent the second fact.
+- **Where it shows up in your stack.** A ReAct-style loop over a `search` tool in any provider SDK, a
+  LangGraph graph with a conditional edge back to the search node (bounded by its `recursion_limit`
+  setting), LlamaIndex agents, and the per-step traces you read in LangSmith or similar.
+- **What you control.** The hop or tool-call cap, the no-progress rule, what each tool result returns
+  (full passages or short notes), reranking per hop, and the cite-or-refuse rule on the final answer.
+- **What you can skip.** Training multi-hop dense retrievers (Xiong et al.). Prompted loops over an
+  off-the-shelf retriever are what agent teams ship.
 
 ## Why it exists
 - **The second query does not exist yet.** "Who manages the author of the report for incident 4812?" needs
@@ -118,15 +131,30 @@ P(chain succeeds) = r1 × r2 × ...      # r2 is hop-two success *given* a corre
 - **Final answer, hop-count distribution and cost per question.**
 - **Final-answer accuracy alone hides where chains die.**
 
+### Mapping the loop onto an agent harness
+| Loop element | Where it lives in a tool-calling agent |
+|---|---|
+| Plan the next query | the model's tool call; its `query` argument is the bridge query |
+| Planner "done" signal | the model replies without a tool call |
+| Hop cap | a max-steps or max-tool-calls limit in your loop (LangGraph's `recursion_limit` plays this role) |
+| No-progress detection | the tool executor: repeated query or zero new passage ids |
+| Accumulate evidence | tool results appended to the transcript |
+| Answer with citations | the final model turn, checked by a citation validator |
+
+- **The transcript is the evidence store.** Every hop's result stays in context, so result size per hop
+  sets how many hops fit before cost or the window bites.
+- **The stop conditions belong in code, not only the prompt.** A prompt asking the model to stop is a
+  signal; a counter in the harness is a guarantee.
+
 ## Diagram
-Follow one bridge question through the loop: each hop's query comes from the evidence, and three
+Follow one bridge question through the agent loop: each hop's query comes from the evidence, and three
 independent stop conditions guard the exit.
 
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant P as Planner LLM
-    participant R as Retriever plus reranker
+    participant P as Agent model
+    participant R as Search tool, retriever plus reranker
     participant A as Answer LLM
     U->>P: Who manages the author of the INC-4812 report
     P->>R: hop 0 query, INC-4812 incident report author
@@ -212,21 +240,68 @@ print(f"rerank lifts per-hop to 0.95: 3 hops -> {chain_success([0.95] * 3):.2f}"
 - **A beam is linear in width:** three bridge candidates turn 3 retrievals into 7, worth it only when hop
   one is genuinely ambiguous.
 
+### Agent scenario: the same loop as a tool-calling agent with guards in the harness
+`call_model(messages, tools)` returns `.text` and `.tool_calls`, `.as_message()` turns the reply back into
+a transcript entry, and `tool_result(id, content)` builds the provider's result message; all are stubs.
+
+```python
+def run_agent(question, max_steps=4, k=5):
+    messages = [{"role": "user", "content": question}]
+    seen, tried = set(), set()
+    for step in range(max_steps):                          # hop cap, enforced in code
+        reply = call_model(messages, tools=[SEARCH_TOOL])
+        messages.append(reply.as_message())
+        if not reply.tool_calls:
+            return reply.text, step                         # the model's "done" signal
+        for call in reply.tool_calls:
+            q = call["input"]["query"].strip().lower()
+            if q in tried:                                  # no progress: same query again
+                content = {"status": "repeated_query", "hint": "name the entity you still need"}
+            else:
+                tried.add(q)
+                new = [(i, t) for i, t in retrieve(q, k) if i not in seen]
+                seen.update(i for i, _ in new)
+                content = ({"status": "ok", "passages": [{"id": i, "text": t} for i, t in new]}
+                           if new else {"status": "no_new_passages"})
+            messages.append(tool_result(call["id"], content))
+    messages.append({"role": "user", "content": "Search budget reached. Answer only from the passages "
+                     "above, cite their ids for every fact, and say which fact is still missing."})
+    return call_model(messages, tools=[]).text, max_steps   # partial answer, never a silent timeout
+```
+
+Illustrative token flow for the INC-4812 question, with a 2,000-token system prompt and tool schemas and
+~1,500 tokens (5 passages) per search result:
+
+| Step | Model does | Transcript before the call | New tokens appended |
+|---|---|---|---|
+| 1 | search "INC-4812 incident report author" | ~2,000 | ~1,500 |
+| 2 | search "Alice Chen Payments team manager" | ~3,500 | ~1,500 |
+| 3 | answers "Bob Ruiz", citing both passages | ~5,000 | answer |
+| Total input across 3 calls | | ~10,500 | |
+
+- **Each extra hop re-reads everything before it,** so input grows faster than hop count; prefix caching
+  on an append-only transcript recovers most of that cost.
+- **Returning short notes plus ids** instead of five full passages shrinks the per-hop append, at the cost
+  of fetching full passages again for the cited answer.
+
 ## Production patterns
 - **Gate the loop behind hop one.** Run normal single-shot retrieval first and enter the loop only when the
   planner says the evidence is insufficient, so single-hop traffic pays nothing extra. Monitor the share of
   questions that take more than one hop.
-- **Hard ceilings in config.** Set a hop cap (the example uses `max_hops=3`), a per-question token or cost
-  budget and a wall-clock timeout, and answer from partial evidence with an "insufficient" note when any
-  trips. Monitor how often each ceiling fires.
+- **Hard ceilings in the agent harness.** Set a hop cap (the example uses `max_hops=3`; in LangGraph,
+  `recursion_limit`), a per-question token or cost budget and a wall-clock timeout, and answer from
+  partial evidence with an "insufficient" note when any trips. Monitor how often each ceiling fires.
 - **Rerank every hop.** Put the cross-encoder on each hop's candidates, not only the last, because a wrong
   bridge poisons later hops. Monitor per-hop supporting-fact recall on the multi-hop golden slice.
-- **Log the trace.** Persist the `trace` (query, new passages, hop) and the bridging notes per request, so
-  a failed chain shows where it died. Alert on rising no-progress stops, which often mean a missing
-  document type in the index.
+- **Log the trace.** Persist the `trace` (query, new passages, hop) and the bridging notes per request, as
+  one span per tool call in your agent tracing tool, so a failed chain shows where it died. Alert on rising
+  no-progress stops, which often mean a missing document type in the index.
 - **Cite-or-refuse for every hop.** Require a retrieved passage id for each bridging fact in the final
   answer and reject answers whose second fact has no citation. Monitor the uncited-fact rate, the signal
   for parametric-memory shortcuts.
+- **Feed no-progress back as a tool result.** Instead of silently stopping, return a status such as
+  `repeated_query` or `no_new_passages` with a hint, so the agent can name the missing entity or give up
+  cleanly. Monitor how often a hint is followed by a productive next query.
 
 ## Trade-offs
 - **Reach vs latency.** Latency grows with hop count and hops are strictly sequential; gate with a
@@ -242,6 +317,9 @@ print(f"rerank lifts per-hop to 0.95: 3 hops -> {chain_success([0.95] * 3):.2f}"
 - **Bounded cost vs simplicity.** Versus long-context stuffing, cost is bounded per hop rather than per
   corpus; for a corpus that fits comfortably in the window with caching, stuffing is simpler and often
   better.
+- **Open agent loop vs fixed two-hop pipeline.** A free agent loop handles any chain length and
+  recovers by reformulating, but its cost and latency vary per question; when every question has the
+  same shape (incident → service → owner), a fixed two-step pipeline is cheaper and easier to evaluate.
 
 ## Pitfalls
 - **No hop cap or no-progress check.** The symptom is runaway cost and timeouts on questions the corpus
@@ -256,6 +334,9 @@ print(f"rerank lifts per-hop to 0.95: 3 hops -> {chain_success([0.95] * 3):.2f}"
   the second hop.
 - **Running comparison questions as sequential chains.** The symptom is latency double what a parallel
   fan-out would cost.
+- **Stop rules only in the system prompt.** "Stop after three searches" is advice to the model, not a
+  limit; the symptom is the occasional 15-step run. Enforce the cap and the no-progress rule in the
+  harness and end with a forced answer turn.
 
 ## When to use
 - **Use when** questions chain through entities the question does not name: org charts and ownership
@@ -321,10 +402,10 @@ slice.
 - **Keep hops minimal** and, when hop one is ambiguous, keep a small beam of bridge candidates, accepting
   about b times the later retrievals (3 retrievals become 7 at beam 3).
 
-### How do you stop the final answer from inventing the second fact?
+### How do you stop the agent's final answer from inventing the second fact?
 - **Require a citation per bridging fact** and reject answers whose second fact cites no retrieved passage.
 - **Let the answer prompt say "insufficient"** when the chain did not complete, so an empty hop is not
-  filled from parametric memory.
+  filled from parametric memory; the forced answer turn after the cap should say so explicitly.
 - **Monitor the uncited-fact rate,** which shows parametric shortcuts, especially for private entities.
 
 ## Quiz

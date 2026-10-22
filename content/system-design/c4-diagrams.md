@@ -5,7 +5,8 @@ name: C4 diagrams
 kind: practice
 difficulty: intro
 est_minutes: 11
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - system-design/ai-solution-architecture
   - system-design/reference-architectures
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-C4 draws architecture at four nested zoom levels (System Context, Container, Component, Code), with every
-box labelled by name, type, technology and purpose and every arrow by intent. For AI systems it shows
-where the model, customer data and trust boundaries sit.
+C4 draws architecture at four zoom levels with every box and arrow labelled. For an agent system it is how
+you show reviewers where the model provider, tools, sandbox and customer data sit, and what one agent run
+actually touches.
+
+## For agent builders
+- **Why it matters for agents.** The first review question for any agent is "what can it reach, and where
+  does our data go?" A Context view with every tool's external system and the model provider, plus a
+  Dynamic view of one run, answers that in one meeting.
+- **Where it shows up in your stack.** Design reviews, security and procurement reviews for customer
+  pilots, onboarding docs, and an `architecture/` folder of Structurizr DSL or C4-PlantUML next to the
+  agent code.
+- **What you control.** Which tools and MCP servers appear as external systems, which arrows carry
+  prompts or customer documents, where the trust boundary sits, and keeping the files updated in the same
+  pull request that adds a tool.
+- **What you can skip.** Component and Code diagrams of the agent's internals, and formal notations such
+  as UML or ArchiMate. Context, Container, Deployment and one Dynamic view cover nearly every agent review.
 
 ## Why it exists
 - **Ad-hoc diagrams mix abstraction levels.** One picture shows a Kubernetes cluster, a "Users" stick
@@ -35,11 +49,12 @@ where the model, customer data and trust boundaries sit.
   you know which one you hold. C4 fixes four zoom levels and a tiny notation, so a Container box is a
   deployable unit and a Component box is part of one. Tooling, layout and colours stay free.
 - **AI systems raise the stakes.** Security, legal and customer architects first ask "where does our data
-  go, and which parts talk to the model provider?" A diagram that cannot answer at a glance costs a review
-  cycle; C4's labelled technology and flow direction answer it.
+  go, and which parts talk to the model provider?" Agents add "and which systems can it act on?" A
+  diagram that cannot answer at a glance costs a review cycle; C4's labelled technology and flow
+  direction answer it.
 
 ## How it works
-### The four levels
+### Background: the four levels
 | Level | What a box is | Audience | Why it exists |
 |---|---|---|---|
 | **1. System Context** | Your system as one box, plus the people who use it and the external systems it depends on (identity provider, the CRM it reads tickets from, the hosted model provider). No technology inside the box | Executives, customers | Every audience first needs the system's place in the world |
@@ -53,22 +68,18 @@ where the model, customer data and trust boundaries sit.
   necessarily one container.
 - **Draw Component diagrams only** for containers whose internals matter to someone other than their
   authors.
-
-### Supplementary diagrams
-These reuse the same elements:
-- **System Landscape:** several systems side by side.
-- **Dynamic:** numbered arrows telling the story of one use case. A RAG request: resolve tenant, embed
-  query, search, assemble prompt, call gateway, stream, meter.
-- **Deployment:** places containers onto infrastructure (region, VPC, cluster, GPU node pool, the
-  customer's network versus yours). Forward-deployed engineers draw it most, *because* it is where trust
-  boundaries and data residency become visible.
+- **Supplementary diagrams reuse the same elements.** System Landscape shows several systems side by
+  side. Dynamic uses numbered arrows for one use case. Deployment places containers onto infrastructure
+  (region, VPC, cluster, GPU node pool, the customer's network versus yours); forward-deployed engineers
+  draw it most, *because* it is where trust boundaries and data residency become visible.
 
 ### The notation rules that do the work
 Each rule removes one specific ambiguity:
 - **Every element has name, type, technology and a one-line description**, so a reader never guesses
   whether "Gateway" is an API gateway, an LLM gateway or a network device.
 - **Every relationship is a single-direction arrow labelled with intent** and, where useful, protocol
-  ("sends completion requests to, HTTPS/JSON"), so data-flow direction is never inferred.
+  ("sends completion requests to, HTTPS/JSON"), so data-flow direction is never inferred. For a tool,
+  say what it does: "reads tickets from" versus "updates tickets in".
 - **Every diagram has a title stating level and scope**, and a **legend** if colours or shapes carry
   meaning.
 - **Roughly twenty elements per diagram.** Past that, draw a new diagram one level down, not a smaller
@@ -86,25 +97,29 @@ Each rule removes one specific ambiguity:
 - **Text in the repository is the cure for diagram rot.** It changes in pull requests next to the code it
   describes and can be regenerated in CI.
 
-### What to make visible in an AI system
+### What to make visible in an agent system
 - **Model provider as an external system on the Context diagram**, *because* that arrow is a data egress a
   reviewer must see.
-- **Gateway, vector store and evaluation pipeline as containers**, *because* each enforces a decision:
-  routing, isolation, release gating.
+- **Every system a tool reaches as an external system**, with arrows that say read or write, *because* the
+  reviewer is really asking what the agent can change.
+- **Gateway, vector store, memory store, sandbox and evaluation pipeline as containers**, *because* each
+  enforces a decision: routing, isolation, code execution limits, release gating.
 - **On the Deployment view**, draw the boundary between the customer's environment and yours and mark
   which flows carry customer documents or prompts.
-- **Prefer a Dynamic diagram of one request** over a Component diagram of everything; it is usually worth
-  more.
+- **Prefer a Dynamic diagram of one agent run** over a Component diagram of everything. A RAG request:
+  resolve tenant, embed query, search, assemble prompt, call gateway, stream, meter. An agent run adds the
+  loop: model proposes a tool call, the tool runs, the result returns, repeat.
 
 ### Trust boundaries and threat models
 - **C4 has no first-class trust-boundary element** and does not pretend to be a threat model.
 - **Draw boundaries with deployment nodes** (the customer's VPC, your cloud account, the provider's
   region) or named groups, and state in the legend what crossing one means.
 - **A STRIDE-style review still wants a data-flow diagram**; a good Deployment view gives most of it.
+  For agents, add where untrusted content (retrieved pages, tool output) enters the prompt.
 
 ## Diagram
 Each level zooms into one box of the level above; the supplementary views reuse the same elements to
-answer behaviour and placement questions.
+answer behaviour and placement questions, such as one agent run or where data leaves a VPC.
 
 ```mermaid
 flowchart TD
@@ -112,13 +127,61 @@ flowchart TD
     L1 -->|"zoom into system"| L2["Container: deployables and tech"]
     L2 -->|"zoom into one container"| L3["Component: modules inside it"]
     L3 -->|"rarely, generated"| L4["Code: classes"]
-    M --> DY["Dynamic: numbered steps of one request"]
+    M --> DY["Dynamic: numbered steps of one agent run"]
     M --> DP["Deployment: containers on infrastructure"]
     M --> LS["System Landscape: many systems"]
     DP -.->|"shows"| TB["Trust boundaries and data egress"]
 ```
 
 ## Examples
+### Structurizr DSL: an agent with tools, a sandbox and a Dynamic view of one run
+The Context view shows four arrows leaving the system: model provider, CRM (read and write), email and
+the sandbox's package mirror. The Dynamic view numbers one run; Structurizr checks each step against the
+model, so deleting a relationship breaks the build instead of leaving a stale story.
+
+```
+workspace "Refund Agent" "Investigates and resolves refund tickets" {
+    model {
+        rep     = person "Support Rep" "Approves refunds the agent proposes"
+        crm     = softwareSystem "CRM" "Tickets and orders" "External"
+        email   = softwareSystem "Email Service" "Sends customer emails" "External"
+        llm     = softwareSystem "Model Provider" "Hosted LLM API" "External"
+        agentSys = softwareSystem "Refund Agent" "Tool-calling agent" {
+            api     = container "Agent API" "Starts runs, streams progress, approval step" "FastAPI"
+            runner  = container "Run Worker" "Agent loop, step budget, tool dispatch" "Python"
+            sandbox = container "Code Sandbox" "Runs agent-written analysis code" "Isolated container"
+            gateway = container "LLM Gateway" "Routing, quotas, token metering" "Python"
+            store   = container "Run and Memory Store" "Transcripts, checkpoints, memory" "PostgreSQL" "Database"
+        }
+        rep     -> api     "Starts runs and approves actions in" "HTTPS"
+        api     -> store   "Creates runs and reads progress from" "SQL"
+        runner  -> store   "Checkpoints each step to" "SQL"
+        runner  -> gateway "Requests next action from" "HTTPS"
+        gateway -> llm     "Sends transcripts containing ticket text to" "HTTPS"
+        runner  -> crm     "Reads orders from and updates tickets in" "REST, tenant token"
+        runner  -> sandbox "Executes analysis code in" "gRPC"
+        runner  -> email   "Sends approved customer emails via" "REST"
+    }
+    views {
+        systemContext agentSys "Context"    { include * autolayout lr }
+        container     agentSys "Containers" { include * autolayout lr }
+        dynamic agentSys "OneRun" "One refund run" {
+            rep -> api "Starts a run for ticket 4812"
+            runner -> gateway "Asks for the next action"
+            runner -> crm "Reads the order (tool call)"
+            runner -> sandbox "Runs refund eligibility check (tool call)"
+            runner -> store "Checkpoints step and pauses for approval"
+            runner -> email "Sends the approved reply"
+            autolayout lr
+        }
+        styles {
+            element "External" { background #999999 color #ffffff }
+            element "Database" { shape Cylinder }
+        }
+    }
+}
+```
+
 ### Structurizr DSL: one model, three views
 - **Three views, one model:** the Context diagram for stakeholders, the Container diagram for engineers and
   the Dynamic view of one request cannot disagree.
@@ -207,6 +270,7 @@ A customer's security review for that pilot, mapped to the view that answers eac
 | Privacy and legal | Which third parties touch our data? | System Context | Model provider and CRM as external systems |
 | Customer architects | What runs, on what technology? | Container | Every deployable with technology and labelled arrows |
 | Security | Where does data leave our VPC? | Deployment | Trust boundary and flows carrying prompts or documents |
+| Security, for an agent | What can it change, and who approves? | Dynamic of one run | Every write-capable tool call and the approval step |
 | New engineer | What happens on one request? | Dynamic | Numbered steps of a chat request and the ingestion flow |
 
 ## Production patterns
@@ -214,15 +278,17 @@ A customer's security review for that pilot, mapped to the view that answers eac
   Structurizr DSL or C4-PlantUML files next to the code, and have a CI job render them (for example with
   the Structurizr CLI's export command or PlantUML) so a broken model fails the build. Monitor time since
   each diagram file last changed relative to the services it describes.
-- **Same-PR diagram updates.** Use when adding or removing a queue, model server or external dependency.
-  Add a pull-request template checkbox and a code-owner rule on the architecture folder so the architect
-  reviews diagram changes. Monitor containers in the deployment manifests that are missing from the model.
+- **New tool, same-PR diagram update.** Use whenever an agent gains a tool, MCP server, queue, model server
+  or external dependency. Add a pull-request template checkbox and a code-owner rule on the architecture
+  folder so the architect reviews diagram changes. Monitor tools registered in code that are missing from
+  the model.
 - **Per-customer deployment views.** Use for every forward-deployed or VPC install. Keep one deployment
   environment per customer topology in the same workspace, reusing the shared model, so the Container
   view stays common while placement differs. Monitor open review questions per customer.
-- **Tag flows that carry customer data.** Use when privacy reviews are routine. Tag relationships that
-  carry prompts or documents and give that tag a distinct style and a legend entry, so egress is visible
-  without reading every label. Monitor untagged arrows that cross a deployment boundary.
+- **Tag flows that carry customer data and write actions.** Use when privacy and security reviews are
+  routine. Tag relationships that carry prompts or documents, and those where a tool writes to an external
+  system, with distinct styles and legend entries, so egress and blast radius are visible without reading
+  every label. Monitor untagged arrows that cross a deployment boundary.
 - **Element budget per view.** Use in design reviews. Treat roughly twenty elements as the ceiling and
   split into a level-down view or a Dynamic view instead. Monitor views that exceed the budget.
 
@@ -236,8 +302,8 @@ A customer's security review for that pilot, mapped to the view that answers eac
 - **One model, many views: consistency vs an owner.** Consistency is guaranteed only if someone owns the
   model; without that owner, C4-PlantUML files per diagram are easier to keep alive.
 - **Lighter than UML or ArchiMate: learnable vs limited.** C4 is learnable in an afternoon, but says
-  nothing about behaviour beyond numbered arrows or about formal semantics. For enterprise-wide capability
-  mapping or protocol-level design, heavier notations (or sequence diagrams) earn their cost.
+  nothing about behaviour beyond numbered arrows or about formal semantics. A looping agent run is
+  awkward as numbered arrows, so show one representative run and put the loop in a sequence diagram.
 - **Component diagrams: explain internals vs rot.** They rot fastest and are read least; draw them for the
   containers whose structure others depend on and skip the rest.
 
@@ -248,6 +314,8 @@ A customer's security review for that pilot, mapped to the view that answers eac
 - **Unlabelled or double-headed arrows.** Symptom: a security reviewer asks "which direction does
   customer data flow here?" and nobody is sure. Fix: one direction per arrow, labelled with intent and
   protocol.
+- **Drawing the agent's tools as one "Tools" box.** Symptom: a reviewer cannot tell that the agent can
+  send email or update orders. Fix: one external system per tool target, with read or write in the label.
 - **Reading *container* as Docker container.** Symptom: a managed database and a hosted model provider
   are missing because "they are not containers". Fix: draw every runnable unit and data store, and
   every dependency you do not own as an external system.
@@ -265,7 +333,7 @@ A customer's security review for that pilot, mapped to the view that answers eac
 - **Add a Deployment view** the moment the system crosses a trust boundary, which for an AI product is
   usually immediately (a hosted model provider, a customer VPC).
 - **Add Dynamic views** for the two or three request paths reviewers and new engineers ask about most,
-  typically a chat request and the ingestion flow.
+  typically a chat request, the ingestion flow and one representative agent run.
 - **Skip Component and Code diagrams** unless a specific audience needs them.
 - **Test:** can a new engineer, a security reviewer and a customer architect each find the diagram meant
   for them and answer their first question without you in the room?
@@ -301,25 +369,31 @@ three levels, which is exactly what makes reviewers unsure what each box is and 
 - **Why:** each level has one audience and one density of detail, so a reader always knows what a box
   means; mixing levels is what makes ad-hoc diagrams unreadable.
 
-### Sketch the architecture of a RAG assistant using C4. Where do you start?
-- **Start with Context:** users, the system as one box, the identity provider, the document source and
-  the hosted model provider as external systems.
-- **Then Container:** web app, API, ingestion worker, LLM gateway, database with a vector extension, each
-  with technology and labelled arrows.
-- **Then one Dynamic view** of a chat request: resolve tenant, embed, search, assemble prompt, call
-  gateway, stream, meter.
+### Sketch the architecture of a tool-calling agent using C4. Where do you start?
+- **Start with Context:** users, the agent system as one box, the model provider, and one external system
+  per tool target (CRM, email, ticketing), each arrow saying read or write.
+- **Then Container:** agent API, run worker with the loop, LLM gateway, sandbox, run and memory store, with
+  technology and labelled arrows.
+- **Then one Dynamic view** of a representative run: start, model proposes a tool call, tool executes,
+  checkpoint, approval, final action.
+
+### A security reviewer asks what your agent can change in their systems. Which diagram do you show?
+- **The Context view with write arrows tagged**, because every system a tool can modify is an external
+  system with a labelled relationship.
+- **Plus a Dynamic view of one run** showing where the human approval step sits before a write action.
+- **And the Deployment view** if credentials or the sandbox live in their VPC rather than yours.
 
 ### Your diagrams are always out of date. How do you fix that?
 - **Move them to text in the repository** (Structurizr DSL or C4-PlantUML) so they change in the same
   pull requests as the code.
 - **Use one model with several views** so a rename or deletion propagates and inconsistent views fail to
   build.
-- **Render in CI and require diagram updates** in PRs that add or remove containers.
+- **Render in CI and require diagram updates** in PRs that add or remove containers or tools.
 
 ### When would C4 not be enough?
 - **Threat modelling:** C4 has no trust-boundary element; a STRIDE-style review still wants a data-flow
   diagram, though a good Deployment view covers most of it.
-- **Behaviour and protocols:** beyond numbered arrows, use sequence diagrams.
+- **Behaviour and protocols:** beyond numbered arrows, use sequence diagrams, including for an agent loop.
 - **Enterprise capability mapping:** heavier notations such as ArchiMate earn their cost there.
 
 ### A diagram has forty boxes. What do you do?

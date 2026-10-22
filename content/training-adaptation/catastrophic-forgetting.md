@@ -5,7 +5,8 @@ name: Catastrophic forgetting
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/overfitting
   - training-adaptation/supervised-fine-tuning
@@ -23,13 +24,26 @@ sources:
 ---
 
 ## TL;DR
-Fine-tuning gradients see only the new loss, so they overwrite weights behind older capabilities. An LLM
-fine-tune can silently lose instruction following, reasoning or safety. Defend with replay, small or
-isolated updates, pulling back toward the original weights, and a regression gate.
+Fine-tuning gradients see only the new loss, so they overwrite weights behind older skills. For an
+agent that means losing tool-call formatting, system-prompt adherence or refusals. Defend with replay,
+small or isolated updates, averaging back, and a regression gate.
+
+## For agent builders
+- **Why it matters for agents.** Your agent depends on skills you did not train: following the system
+  prompt, emitting valid tool calls, staying in the chat template, refusing unsafe actions. A domain
+  fine-tune that never shows those can erode them, and an agent that takes actions makes the damage costly.
+- **Where it shows up in your stack.** Any fine-tune of the model behind your agent (hosted jobs, LoRA
+  adapters in Hugging Face, TRL or PEFT), the regression suite in CI that gates a new model version, and
+  the choice between fine-tuning and retrieval for adding domain knowledge.
+- **What you control.** A replay share of general, tool-calling and safety examples in the mix, the
+  learning rate and epochs, adapters versus full fine-tuning, and a before/after gate that includes
+  tool-call and refusal evals.
+- **What you can skip.** Elastic weight consolidation and Fisher maths. At LLM scale teams use replay,
+  small updates, adapters, KL terms and interpolation.
 
 ## Why it exists
-- **One shared set of weights.** There is no region for "French", one for "SQL" and one for "refusing
-  dangerous requests"; the same matrices participate in all of them.
+- **One shared set of weights.** There is no region for "French", one for "SQL", one for "tool-call
+  JSON" and one for "refusing dangerous requests"; the same matrices participate in all of them.
 - **The new gradient has no term for old tasks.** Training on a new dataset computes the gradient of the
   new loss alone, so any weight the new task wants to move will move, however important it was to
   something the loss cannot see.
@@ -45,7 +59,23 @@ isolated updates, pulling back toward the original weights, and a regression gat
   that would have caught them was never run.
 
 ## How it works
-### The mechanism in one line
+### What agents usually forget first
+Behaviours rare in the fine-tuning data and sharply defined in the original. Each is invisible to a
+task-only evaluation and obvious to a user, or to the tool executor that rejects a malformed call.
+
+| Training on | Tends to lose |
+|---|---|
+| raw completions | the chat template and system-prompt handling |
+| compliant answers | refusals, including refusing unsafe tool actions |
+| one language | multilingual ability |
+| prose | tool-call formatting |
+| final answers only | multi-step tool use: the model answers directly instead of calling tools |
+
+- **Knowledge versus behaviour.** If the goal is new facts (a product catalogue, policies), retrieval
+  adds them without moving weights; fine-tune for behaviour and format, where the forgetting risk is
+  worth paying.
+
+### Background: the mechanism in one line
 - **Setup.** Let θ* be the weights after pretraining and alignment. Fine-tuning minimises *L_new(θ)*,
   moving θ along directions that reduce *L_new*. Where those directions also raise *L_old*, the old loss
   rises and nothing in the update notices.
@@ -63,9 +93,9 @@ isolated updates, pulling back toward the original weights, and a regression gat
 ### Mitigation families
 1. **Replay (rehearsal).** Mix data representing the old behaviour into the fine-tuning set so the loss
    has a term for it. InstructGPT's PPO-ptx variant is this idea with pretraining data. In practice teams
-   mix a share of general instruction, chat-formatted and safety examples into a task fine-tune, tuning
-   the proportion on the regression suite. Limit: you need representative data, and for a closed base
-   model you only have proxies.
+   mix a share of general instruction, chat-formatted, tool-calling and safety examples into a task
+   fine-tune, tuning the proportion on the regression suite. Limit: you need representative data, and
+   for a closed base model you only have proxies.
 2. **Constrain the move.** A lower learning rate, fewer epochs and early stopping judged on the general
    suite, not only the task, keep the model near θ*. Explicit distance penalties:
    - elastic weight consolidation weights each parameter's displacement by its Fisher importance,
@@ -87,19 +117,9 @@ isolated updates, pulling back toward the original weights, and a regression gat
    merging) recovers much of the old behaviour while keeping most of the task gain. Choose the mixing
    coefficient on the two evaluations; see `training-adaptation/model-merging`.
 5. **Measure it.** None of the above is a guarantee. Run a fixed general-capability suite (instruction
-   following, a reasoning subset, format and chat-template adherence, refusal behaviour on a harmful
-   prompt set) before and after every fine-tune, and block release on regression beyond a tolerance.
-
-### What usually gets forgotten first
-Behaviours rare in the fine-tuning data and sharply defined in the original. Each is invisible to a
-task-only evaluation and obvious to a user.
-
-| Training on | Tends to lose |
-|---|---|
-| raw completions | the chat template and system-prompt handling |
-| compliant answers | refusals |
-| one language | multilingual ability |
-| prose | tool-call formatting |
+   following, a reasoning subset, format and chat-template adherence, held-out tool calls, refusal
+   behaviour on a harmful prompt set) before and after every fine-tune, and block release on regression
+   beyond a tolerance.
 
 ### Continued pretraining forgets more
 - **Bigger displacement.** Continued pretraining on a domain corpus (legal text, a new language, a
@@ -123,12 +143,12 @@ re-running.
 
 ```mermaid
 flowchart TD
-    B["Base model, fixed weights"] --> S0["Run general suite: baseline numbers"]
+    B["Base model, fixed weights"] --> S0["Run general and tool-call suite: baseline"]
     T[("Task data")] --> M["Mixed set: task plus about 25 percent replay, shuffled"]
-    R[("General, chat-template and safety data")] --> M
+    R[("General, tool-calling and safety data")] --> M
     M --> F["Fine-tune from base: LoRA or low LR, few epochs"]
     B --> F
-    F --> E["Evaluate task metric and general suite at each checkpoint"]
+    F --> E["Evaluate task metric and suite at each checkpoint"]
     E --> G{"Any suite metric dropped beyond tolerance?"}
     S0 -.->|"compare against baseline"| G
     G -->|"no"| SH["Promote"]
@@ -139,12 +159,14 @@ flowchart TD
 ```
 
 ## Examples
-### Replay mix plus a regression gate
-A team fine-tunes an instruct model on 5,000 legal-clause extraction examples.
+### Replay mix plus an agent regression gate
+A team fine-tunes the model behind its contracts agent on 5,000 legal-clause extraction examples.
 - **Attempt 1** (full fine-tune, three epochs, task data only) lifts the extraction metric, but the
-  general evaluation shows lower instruction following and a drop in refusal rate on harmful prompts.
-- **Attempt 2** makes general instruction data a quarter of the training mix, shuffled through every part
-  of the run, trains LoRA adapters for two epochs at an ordinary adapter rate, and gates on the suite.
+  general evaluation shows lower instruction following, malformed tool calls and a drop in refusal rate
+  on harmful prompts.
+- **Attempt 2** makes general instruction and tool-calling data a quarter of the training mix, shuffled
+  through every part of the run, trains LoRA adapters for two epochs at an ordinary adapter rate, and
+  gates on the suite.
 - The helpers (`load_jsonl`, `run_suite`, `finetune`) stand in for the team's pipeline functions.
 
 ```python
@@ -152,14 +174,15 @@ import random
 random.seed(0)
 
 task = load_jsonl("legal_clauses.jsonl")            # 5,000 new-task examples
-general = load_jsonl("general_chat_sample.jsonl")   # open instruction/chat data: the replay buffer
+general = load_jsonl("general_chat_and_tool_calls.jsonl")  # chat plus tool-calling traces: the replay buffer
 
 REPLAY = 0.25                                       # general data as a share of the mixed set
 n_replay = int(len(task) * REPLAY / (1 - REPLAY))   # 1,666 rows so general = 25% of the total
 mixed = task + random.sample(general, n_replay)
 random.shuffle(mixed)                               # interleave; never train the sources in blocks
 
-SUITE = ["ifeval_subset", "gsm8k_subset", "chat_template_adherence", "refusal_rate_harmful"]
+SUITE = ["ifeval_subset", "gsm8k_subset", "chat_template_adherence",
+         "tool_call_validity_heldout", "refusal_rate_harmful"]
 
 def gate(before: dict, after: dict, max_drop: float = 0.02):
     regressions = {k: (before[k], after[k]) for k in before if after[k] < before[k] - max_drop}
@@ -175,6 +198,22 @@ gate(before, after)                                 # fails the release if any m
   the suite.
 - **The key design choice:** the suite runs before training too. A drop can only be recognised against
   the base model's own number.
+
+### Worked scenario: the agent that stopped calling tools
+Illustrative numbers. A support agent's model is fine-tuned on 6,000 final-answer examples (no tool
+calls in them) to adopt a house tone, then run against the agent's own held-out evals.
+
+| Eval | Base model | After fine-tune | After replay re-run |
+|---|---|---|---|
+| Tone rubric (task) | 61% | 89% | 86% |
+| Valid tool call when one is needed | 94% | 71% | 92% |
+| End-to-end task success (sandbox) | 78% | 58% | 79% |
+| Refusal of unsafe actions | 0.97 | 0.88 | 0.96 |
+
+- **Reading it.** The task metric rose 28 points while the agent got worse: it now answers from memory
+  instead of calling the order lookup. Only the agent evals saw it.
+- **Fix.** Replay with tool-calling trajectories and safety examples, retrained from base; the re-run
+  keeps most of the tone gain and recovers tool use.
 
 ### Averaging back toward the base
 When a strong task checkpoint has already regressed, interpolate its weights with the base and pick the
@@ -213,16 +252,17 @@ Illustrative sweep (numbers are for shape only, not a benchmark):
   prepared.
 
 ## Production patterns
-- **Before/after regression gate in CI.** Fix a general suite (instruction following, a reasoning subset,
-  chat-template adherence, refusal rate on harmful prompts), record the base model's numbers, and fail
-  promotion when any metric drops beyond a tolerance (the example uses 2 points as a start). Monitor the
-  per-metric deltas for every release.
-- **Replay share in the data mix.** Add general instruction, chat and safety examples to every task
-  fine-tune, shuffled through the whole run, starting around a quarter of the mix and tuning on the suite.
-  Monitor the general-suite score against the task gain as you vary the share.
-- **Train in the serving chat template.** Format all training rows, replay included, with the same
-  template the model is served with (for Hugging Face tokenizers, `apply_chat_template`), including
-  system prompts. Monitor a template-adherence and system-prompt-following eval.
+- **Agent regression gate in CI.** Fix a suite (instruction following, a reasoning subset, chat-template
+  adherence, held-out tool-call validity, end-to-end task success on a sandbox set, refusal rate on
+  harmful prompts), record the base model's numbers, and fail promotion when any metric drops beyond a
+  tolerance (the example uses 2 points as a start). Monitor the per-metric deltas for every release.
+- **Replay share in the data mix.** Add general instruction, tool-calling trajectories and safety examples
+  to every task fine-tune, shuffled through the whole run, starting around a quarter of the mix and tuning
+  on the suite. Monitor the general-suite score against the task gain as you vary the share.
+- **Train in the serving chat template, tools included.** Format all training rows, replay included, with
+  the same template and tool definitions the agent is served with (for Hugging Face tokenizers,
+  `apply_chat_template`), including system prompts. Monitor a template-adherence and
+  system-prompt-following eval.
 - **Retrain from base on the union.** For recurring releases, fine-tune from the base model on all
   versioned data each time instead of chaining from the last release. Monitor scores on each earlier
   batch's held-out set so erosion is visible.
@@ -237,6 +277,9 @@ Illustrative sweep (numbers are for shape only, not a benchmark):
 - **Replay vs cost and coverage.** It costs training tokens and needs data that represents the old
   behaviour; for a closed base model, open instruction sets are a proxy that protects general skills but
   not the vendor's specifics.
+- **Fine-tuning vs retrieval for knowledge.** Retrieval adds facts to an agent without moving weights,
+  so nothing is forgotten; fine-tuning wins when the gap is behaviour or format, at the price of a
+  regression suite.
 - **Small moves vs underfitting.** A lower learning rate and fewer steps reduce forgetting but may
   underfit; the balance tips toward more movement when the task is far from pretraining and old
   capabilities matter less.
@@ -250,6 +293,9 @@ Illustrative sweep (numbers are for shape only, not a benchmark):
 ## Pitfalls
 - **Evaluating only on the task.** Symptom: a model that aces the fine-tuning benchmark and fails users on
   anything adjacent, discovered after release. Fix: a general suite before and after.
+- **Fine-tuning an agent model on data without tool calls.** Symptom: the agent answers from memory
+  instead of calling tools, and tool-call validity drops. Fix: replay tool-calling trajectories and gate
+  on tool-call and end-to-end evals.
 - **Training on raw completions without the chat template.** Symptom: the model ignores system prompts or
   produces malformed turns after the fine-tune. Fix: format every row with the serving template.
 - **Fine-tuning on compliant answers only.** Symptom: a measurable rise in compliance with harmful
@@ -263,8 +309,8 @@ Illustrative sweep (numbers are for shape only, not a benchmark):
   Fix: add replay so the loss has a term for the old behaviour.
 
 ## When to use
-Treat forgetting as a risk to manage on every fine-tune, including small adapter runs.
-- **Before training:** fix the general suite and record the base model's numbers.
+Treat forgetting as a risk to manage on every fine-tune of an agent's model, including small adapter runs.
+- **Before training:** fix the general and agent suite and record the base model's numbers.
 - **During training:** evaluate on both task and suite at the same cadence.
 - **After training:** gate on the suite.
 - **Order of mitigations:** replay first, because it attacks the cause; then a lower learning rate, fewer
@@ -305,13 +351,29 @@ prepared.
   opposite. A small dataset repeated for several epochs at a healthy rate still drags the network toward
   those rows.
 
+### After a domain fine-tune, your agent answers from memory instead of calling its tools. What happened and how do you fix it?
+- **Forgetting by omission:** the training rows held final answers but no tool calls, so nothing in the
+  loss kept the tool-use behaviour, and the fine-tune pushed the model toward answering directly.
+- **Fix the data:** retrain from base with tool-calling trajectories and safety examples as replay,
+  formatted with the serving template and tool definitions.
+- **Gate it:** held-out tool-call validity and end-to-end task success, measured against the base model,
+  block the next release if they drop.
+
 ### How would you design the evaluation for a fine-tune so forgetting cannot reach production?
-- **Fix a general suite first:** instruction following, a reasoning subset, chat-template adherence and
-  refusal rate on a harmful prompt set.
+- **Fix a general suite first:** instruction following, a reasoning subset, chat-template adherence,
+  held-out tool calls and refusal rate on a harmful prompt set.
 - **Run it on the base model before training,** because a drop can only be recognised against the base's
   own numbers, then at every checkpoint alongside the task metric.
 - **Gate promotion** on a per-metric tolerance (2 points is a reasonable starting value) and record the
   deltas for every release.
+
+### Should you fine-tune your agent's model to teach it your product catalogue?
+- **Usually not:** facts that change belong in retrieval, which adds knowledge without moving weights and
+  so without forgetting, and can be updated without a training run.
+- **Fine-tune for behaviour:** tool-use patterns, output format and house style, where retrieval cannot
+  help, and pay for it with replay and a regression gate.
+- **When weights are in play,** start with adapters at a low rate and interpolation back toward the base
+  as the fallback if a strong checkpoint regresses.
 
 ### Does training LoRA adapters instead of the full model prevent forgetting?
 - **It reduces it, it does not prevent it.** The base weights are frozen and the adapter is removable, but
@@ -319,14 +381,6 @@ prepared.
 - **High rank plus many epochs forgets too,** and shows regressions similar to a full fine-tune.
 - **The trade runs both ways:** comparisons on code and maths found LoRA forgets less of the source domain
   and also learns less of the target.
-
-### When would you pick weight interpolation over a replay re-run?
-- **Interpolation is the quick fallback:** when a strong task checkpoint already exists and has regressed,
-  sweep alpha (0.25, 0.5, 0.75) toward the base and ship the largest value that passes the gate.
-- **Replay is the proper fix,** because it attacks the cause by giving the loss a term for the old
-  behaviour; plan it as the next run.
-- **Interpolation needs matching weights:** a full fine-tune of the same architecture, with state dicts
-  that share keys and shapes. For a LoRA adapter, scaling its contribution by alpha does the same job.
 
 ### A customer chains monthly fine-tunes from last month's model. What breaks and what do you recommend?
 - **What breaks:** each hop forgets a little of every earlier batch, so first-month capabilities erode

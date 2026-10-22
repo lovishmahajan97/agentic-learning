@@ -5,7 +5,8 @@ name: Learning-rate schedulers
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/warmup
   - ml-fundamentals/optimizers
@@ -22,19 +23,32 @@ sources:
 ---
 
 ## TL;DR
-A scheduler changes the learning rate over the run: big steps while the loss surface is forgiving, small
-ones when it is not. It is defined over total optimizer steps, so plan it with batch size and run length.
+When you fine-tune a model on agent traces, the scheduler sets the learning rate at every optimizer step.
+A schedule sized in the wrong units is a common reason a tool-calling fine-tune "learned nothing".
+
+## For agent builders
+- **Why it matters for agents.** Fine-tuning a model to emit your tool-call format, follow a router policy
+  or imitate good trajectories is a short run on a few thousand traces. Short runs are where a mis-set
+  horizon or a missing decay silently wastes the whole job.
+- **Where it shows up in your stack.** `lr_scheduler_type`, `warmup_ratio` and `num_training_steps` in the
+  Hugging Face Trainer (and TRL trainers built on it); hosted fine-tuning services usually pick the shape
+  and expose only a learning-rate multiplier and epoch count.
+- **What you control.** The peak rate, warmup length, the horizon in optimizer steps (not traces, not
+  micro-batches), the floor, and whether scheduler state is saved with each checkpoint.
+- **What you can skip.** Pre-training shapes (WSD, SGDR, inverse square root) beyond recognising the
+  names: agent fine-tunes almost always use linear or cosine decay with a short warmup.
 
 ## Why it exists
 - **A fixed learning rate is a compromise.** Large enough to make progress early, it is too noisy to
-  settle into a good minimum late.
+  settle into a good minimum late. On agent traces that shows up as tool-call JSON that is right on most
+  evals but flips formats on others.
 - **Constant-η SGD converges to a region, not a point.** Each mini-batch gradient is the true gradient
   plus noise, and `θ ← θ − η·g` carries that noise into the weights. In a quadratic bowl the iterates
   bounce around the minimum with a spread proportional to `η × noise variance`; halve η and the spread
   shrinks, so η must eventually be small.
 - **A small η from the start is wasteful.** Early gradients are large and consistently pointed and the
-  model is far from any minimum, so small steps need many more iterations to cover the same distance, and a very small rate can leave the model
-  stuck in a poor flat region a bigger step would carry it past.
+  model is far from any minimum, so small steps need many more iterations to cover the same distance. A
+  very small rate can also leave the model stuck in a poor flat region a bigger step would carry it past.
 - **Adam does not remove the tension.** It normalizes step sizes per parameter, but the global scale is
   still η and the same noise-floor argument applies. "Pick a medium η and train longer" pays twice: no
   fast early progress and no low final loss.
@@ -46,64 +60,32 @@ ones when it is not. It is defined over total optimizer steps, so plan it with b
 A scheduler is a function `η(t)` of the optimizer step `t`, given a peak `η_max`, a warmup length and a
 total length `T`. Frameworks apply it as a multiplier on the optimizer's base rate once per optimizer step.
 
-### The common shapes
+### What an agent fine-tune uses
 | Shape | Formula or rule | Needs `T`? | Typical use |
 |---|---|---|---|
-| Step decay | multiply η by a factor (often 0.1) at fixed milestones | milestones | older image classification |
 | Linear decay | `η(t) = η_max × (1 − t/T)` after warmup, zero at exactly `T` | yes | fine-tuning; default in Hugging Face `Trainer` |
-| Cosine decay | `η(t) = η_min + 0.5 × (η_max − η_min) × (1 + cos(π·t/T))` | yes | standard for LLM pre-training |
-| Inverse square root | `η(t) ∝ min(t^−0.5, t·warmup^−1.5)` | no | original Transformer |
-| Warmup–stable–decay (WSD) | hold `η_max`, decay over the final 10–20% of steps | no, until the decay | newer pre-training recipes |
-| Warm restarts / one-cycle | restart the cosine (SGDR); `OneCycleLR` for one cycle | per cycle | smaller vision and tabular models |
-| Reduce on plateau | `ReduceLROnPlateau` cuts η when a validation metric stalls | no | classic supervised training |
+| Cosine decay | `η(t) = η_min + 0.5 × (η_max − η_min) × (1 + cos(π·t/T))` | yes | standard for LLM pre-training; common for SFT |
 
-### Step decay
-- **Why it works:** each plateau lets the model settle at one noise level before the next drop. It is the
-  oldest recipe, from image classification.
-- **Weakness:** milestones are hand-chosen hyperparameters, and the abrupt drops produce visible cliffs in
-  the loss curve that make runs hard to compare.
-
-### Linear decay
-- **Why fine-tuning uses it:** runs are short, the total number of steps is known, and reaching a very
-  small η at the end is what makes the final weights stable.
-
-### Cosine decay
-- **Shape:** spends longer near `η_max` than linear, drops fastest in the middle, flattens again near
-  `η_min`. The smooth tail is why it became the LLM pre-training standard.
+- **Linear decay, because the run is short.** Total steps are known, and reaching a very small η at the end
+  is what makes the final weights stable, which is what you want from a model that must emit valid tool
+  calls every time.
+- **Cosine decay** spends longer near `η_max` than linear, drops fastest in the middle and flattens again
+  near `η_min`. The smooth tail is why it became the LLM pre-training standard.
 - **Floor:** many published recipes decay to about 10% of the peak rather than to zero, so the last phase
   still learns.
 - **Catch:** `T` must be fixed in advance, because the shape is anchored to the end point. Training past
   `T` or stopping early both give a different, usually worse, result than planning the right `T`.
 
-### Inverse square root
-- **Shape:** linear warmup followed by `1/√t` decay. It needs no total length, which is convenient.
-- **Cost:** it decays slowly and never gets small enough for the final-loss benefit of an explicit anneal.
-
-### Warmup–stable–decay (WSD)
-- **Mechanism:** hold `η_max` for most of the run, then decay sharply (linearly or cosine-like) over the
-  final 10–20% of steps.
-- **Why it helps:** the stable phase has no end point baked in, so you can keep training, or branch a
-  stable-phase checkpoint and run a short decay to get a "finished" model at any point.
-- **Evidence:** MiniCPM and related scaling studies showed it matches cosine at the same total steps while
-  removing the need to commit to `T` up front.
-
-### Cyclical and warm restarts
-- **SGDR** restarts the cosine cycle periodically, jumping η back up. The intuition: a jump kicks the model
-  out of a sharp basin into a wider one. The practical benefit: cheap snapshot ensembles, one per cycle.
-- **Where:** rare in LLM work, common in smaller vision and tabular models.
-- **One-cycle (`OneCycleLR`)** is a single cycle for short runs: ramp to a high peak over the first part,
-  then anneal well below the starting value, so a fixed small budget gets both phases.
-
-### Metric-driven: reduce on plateau
-- **Mechanism:** `ReduceLROnPlateau` cuts η by a factor when a monitored validation metric stops improving
-  for a set number of evaluations. It needs no horizon.
-- **Problem:** the schedule now depends on eval cadence and metric noise. A noisy eval triggers early
-  drops, and two identical configs can follow different schedules, which makes them hard to compare.
-- **Where it survives:** classic supervised training with cheap, stable validation. LLM recipes prefer a
-  schedule written as a function of the step, so it is reproducible and known in advance.
+### What the scheduler steps on
+- **Per optimizer step**, not per micro-batch, not per epoch and not per trace.
+- **With gradient accumulation of 8**, one scheduler step happens every 8 forward/backward passes.
+- **If `T` is computed from the number of micro-batches**, the schedule finishes 8× too early and the
+  model trains most of the run at η ≈ 0.
+- **Packed or filtered traces change the count.** Sequence packing and dropping over-length trajectories
+  change how many batches an epoch has, so compute `T` from the final dataloader, not the raw trace count.
 
 ### What happens past `T`
-Implementations disagree, and it matters whenever a run is extended:
+Implementations disagree, and it matters whenever you add more traces and keep training:
 - **Clamped:** a hand-written schedule usually uses `progress = min(1, ...)`, so η stays at the floor
   forever. Hugging Face's linear schedule clamps at zero.
 - **Unclamped:** a cosine written as `cos(π·t/T)` keeps going. Past `T` it climbs back, so η rises
@@ -112,30 +94,73 @@ Implementations disagree, and it matters whenever a run is extended:
 - **Result:** an extended run either learns almost nothing (clamped) or silently re-warms to a high rate
   with no warmup (unclamped). Neither is the plan, and the learning-rate log is the only place it shows.
 
-### What the scheduler steps on
-- **Per optimizer step**, not per micro-batch and not per epoch.
-- **With gradient accumulation of 8**, one scheduler step happens every 8 forward/backward passes.
-- **If `T` is computed from the number of micro-batches**, the schedule finishes 8× too early and the
-  model trains most of the run at η ≈ 0.
+### Background: the other shapes
+You will meet these in papers and base-model cards; recognise them, rarely configure them.
+
+| Shape | Formula or rule | Needs `T`? | Typical use |
+|---|---|---|---|
+| Step decay | multiply η by a factor (often 0.1) at fixed milestones | milestones | older image classification |
+| Inverse square root | `η(t) ∝ min(t^−0.5, t·warmup^−1.5)` | no | original Transformer |
+| Warmup–stable–decay (WSD) | hold `η_max`, decay over the final 10–20% of steps | no, until the decay | newer pre-training recipes |
+| Warm restarts / one-cycle | restart the cosine (SGDR); `OneCycleLR` for one cycle | per cycle | smaller vision and tabular models |
+| Reduce on plateau | `ReduceLROnPlateau` cuts η when a validation metric stalls | no | classic supervised training |
+
+- **Step decay** lets the model settle at one noise level before the next drop. Its milestones are
+  hand-chosen hyperparameters, and the abrupt drops produce visible cliffs that make runs hard to compare.
+- **Inverse square root** is linear warmup followed by `1/√t` decay. It needs no total length, but it
+  decays slowly and never gets small enough for the final-loss benefit of an explicit anneal.
+- **WSD** holds `η_max` for most of the run, then decays sharply (linearly or cosine-like) over the final
+  10–20% of steps. With no end point baked in, you can keep training, or branch a stable-phase checkpoint
+  and run a short decay to get a "finished" model at any point.
+- **WSD evidence:** MiniCPM and related scaling studies showed it matches cosine at the same total steps
+  while removing the need to commit to `T` up front.
+- **SGDR** restarts the cosine cycle periodically, jumping η back up, which may kick the model out of a
+  sharp basin into a wider one and yields cheap snapshot ensembles, one per cycle. Rare in LLM work.
+- **One-cycle (`OneCycleLR`)** ramps to a high peak over the first part, then anneals well below the
+  starting value, so a fixed small budget gets both phases.
+- **`ReduceLROnPlateau`** cuts η when a monitored validation metric stops improving for a set number of
+  evaluations. The schedule then depends on eval cadence and metric noise: a noisy eval triggers early
+  drops, and two identical configs can follow different schedules.
+- **Why LLM recipes avoid it:** they prefer a schedule written as a function of the step, so it is
+  reproducible and known in advance. It survives in classic supervised training with cheap, stable
+  validation.
 
 ## Diagram
 Read it top to bottom: the shape is chosen from whether the run length is known, and every optimizer step
-(not micro-batch) advances the schedule.
+(not micro-batch, not trace) advances the schedule.
 
 ```mermaid
 flowchart TD
     A["Plan: peak, warmup, total T"] --> B{"Is total length fixed?"}
-    B -->|"yes, fine-tune"| C["Linear or cosine decay"]
+    B -->|"yes, agent fine-tune"| C["Linear or cosine decay"]
     B -->|"no, may extend"| D["WSD: warmup, stable, decay"]
     C --> E["Optimizer step"]
     D --> E
     E -->|"every accumulated step"| F["scheduler.step: new eta"]
     F -->|"t below T"| E
     F -->|"t reaches T"| G["Floor: clamp or re-plan"]
-    G -.->|"extend run"| H["New schedule, not resume"]
+    G -.->|"more traces arrive"| H["New schedule, not resume"]
 ```
 
 ## Examples
+### Sizing the schedule for a tool-calling SFT run
+Compute the horizon from what the optimizer actually sees, then check the rate at known points.
+
+```python
+import math
+
+def plan(n_traces, per_device_batch, n_gpus, grad_accum, epochs, warmup_ratio=0.03):
+    micro_batches_per_epoch = math.ceil(n_traces / (per_device_batch * n_gpus))
+    opt_steps = (micro_batches_per_epoch // grad_accum) * epochs   # what the scheduler counts
+    warmup = round(opt_steps * warmup_ratio)
+    return dict(micro_batches=micro_batches_per_epoch * epochs, num_training_steps=opt_steps,
+                warmup_steps=warmup, check_at=[0, warmup, warmup + (opt_steps - warmup) // 2, opt_steps])
+
+print(plan(n_traces=12_000, per_device_batch=4, n_gpus=1, grad_accum=8, epochs=3))
+# micro_batches 9000, num_training_steps 1125, warmup_steps 34, check_at [0, 34, 579, 1125]
+# Sizing T as 9000 (micro-batches) would leave the last ~88% of the run at the floor.
+```
+
 ### Warmup plus cosine to a 10% floor, checked by eye
 Linear warmup then cosine decay to 10% of peak, written as a plain `LambdaLR` so the arithmetic is
 visible. The printout checks known points: step 0 is near zero, the end of warmup is the peak, and halfway
@@ -190,29 +215,33 @@ is still at the peak at 0.75.
   1.5T and at 1.0 by 2T: the rate re-warms with no warmup.
 
 ## Production patterns
-- **Print the plan before launch.** Before any long run, evaluate the schedule at step 0, end of warmup,
-  midpoint and `T`, and assert they match the plan. Then log the rate each step (PyTorch
+- **Print the plan before launch.** Before any fine-tune on agent traces, evaluate the schedule at step 0,
+  end of warmup, midpoint and `T`, and assert they match the plan. Then log the rate each step (PyTorch
   `scheduler.get_last_lr()`) next to the loss so a bad curve can be attributed.
 - **Derive the horizon from optimizer steps.** Compute `num_training_steps` as micro-batches per epoch ÷
-  accumulation steps × epochs, and set warmup from it (for example the Trainer's `warmup_ratio`). Monitor
-  the logged rate at the final step; it should sit at the planned floor.
-- **Checkpoint scheduler state with the model.** Save `scheduler.state_dict()` alongside optimizer and
-  weights, and load it on resume, so warmup does not restart. Watch for a loss jump at the resume step.
-- **WSD for extendable pre-training.** When the token budget may change, hold the peak and keep
+  accumulation steps × epochs, after packing and filtering traces, and set warmup from it (for example the
+  Trainer's `warmup_ratio`). The logged rate at the final step should sit at the planned floor.
+- **Checkpoint scheduler state with the adapter.** Save `scheduler.state_dict()` alongside optimizer and
+  weights (or LoRA adapter), and load it on resume, so warmup does not restart. Watch for a loss jump at
+  the resume step.
+- **Gate the checkpoint on agent evals, not loss.** Evaluate tool-call validity and task success on a held-
+  out set of trajectories at a few points along the decay; the lowest-loss checkpoint is not always the
+  one that calls tools best.
+- **WSD for extendable training.** When the trace or token budget may change, hold the peak and keep
   stable-phase checkpoints; branch one and run a short decay (for example with `get_wsd_schedule`) to
-  produce a releasable model. Track eval loss of each decayed branch against its stable parent.
+  produce a releasable model. Track eval of each decayed branch against its stable parent.
 - **Tune the peak before the shape.** Run a short sweep over the peak by a factor of 2–3 with a fixed
-  shape, pick the best, and only then compare linear vs cosine. Monitor early-step loss spikes as the
-  sign the peak is too high.
+  shape, pick the best on agent evals, and only then compare linear vs cosine. Early-step loss spikes are
+  the sign the peak is too high.
 
 ## Trade-offs
 - **Lowest final loss vs fixed horizon.** Cosine and linear decay give the lowest final loss for a fixed
-  budget but require knowing the total step count in advance; when length is uncertain, WSD or a
-  constant-then-cooldown schedule is the better trade.
+  budget but require knowing the total step count in advance; when length is uncertain (traces keep
+  arriving), WSD or a constant-then-cooldown schedule is the better trade.
 - **Higher floor vs clean anneal.** Decaying to 10% rather than 0 keeps the model learning to the end and
-  makes continued pre-training easier, at the cost of a slightly noisier final checkpoint.
+  makes continued training easier, at the cost of a slightly noisier final checkpoint.
 - **Restarts vs short budgets.** Warm restarts and cyclical schedules buy ensemble diversity and sometimes
-  escape sharp minima, but each restart costs a temporary loss increase a short fine-tuning run cannot
+  escape sharp minima, but each restart costs a temporary loss increase a short agent fine-tune cannot
   afford.
 - **No horizon vs slow tail.** Inverse-square-root is robust to running longer, but its slow tail leaves
   loss on the table compared with an explicit decay phase of the same length.
@@ -221,15 +250,15 @@ is still at the peak at 0.75.
 - **Stepping at the wrong cadence.** Calling `scheduler.step()` once per epoch with a per-step schedule
   (or vice versa). Symptom: a rate stuck at the warmup value, or collapsing to near zero within the first
   epoch. Fix: step once per optimizer step.
-- **Sizing the schedule in micro-batches.** Computing `num_training_steps` from micro-batches with
-  gradient accumulation on, so the schedule finishes early and the second half trains near zero. Fix:
-  divide the micro-batch count by the accumulation steps before building the scheduler.
+- **Sizing the schedule in micro-batches or traces.** Computing `num_training_steps` from micro-batches
+  with gradient accumulation on, so the schedule finishes early and the second half trains near zero.
+  Fix: divide the micro-batch count by the accumulation steps before building the scheduler.
 - **Resuming without scheduler state.** Warmup restarts or the decay resets; the loss curve shows a jump
   at the resume point that was not there before. Fix: restore the scheduler with the optimizer.
 - **Extending a cosine run without re-planning.** Clamped, the extra steps run at the floor and barely
-  move the model ("more data did not help"); unclamped, the rate climbs back towards the peak and the
-  loss rises. Either way the logged learning rate shows it. Fix: re-plan `T` for the full length, or build
-  a new short re-warm and decay for the extra steps.
+  move the model ("the new traces did not help"); unclamped, the rate climbs back towards the peak and the
+  loss rises. The logged learning rate shows either. Fix: re-plan `T` for the full length, or build a new
+  short re-warm and decay for the extra steps.
 - **Reading the decay-phase drop as insight.** The sharp loss drop during decay is the noise floor
   shrinking as η falls, not the model suddenly "getting it"; it appears in every well-scheduled run.
 
@@ -237,10 +266,13 @@ is still at the peak at 0.75.
 Every real training run has a schedule; the decision is which one, and it is smaller than the peak value.
 - **Tune the peak first:** among reasonable decaying shapes, a well-tuned peak matters more than linear vs
   cosine, so sweep the peak over a factor of 2–3 and choose the shape second.
-- **Fine-tuning:** linear or cosine decay with a short warmup, ending at a small rate, because total steps
-  are known and stability of the final weights matters more than the last fraction of loss.
+- **Agent fine-tuning (SFT, LoRA on traces):** linear or cosine decay with a short warmup, ending at a small
+  rate, because total steps are known and stability of the final weights matters more than the last
+  fraction of loss.
 - **Pre-training or long continued pre-training:** prefer WSD or constant with a planned cooldown when the
   budget may change, so checkpoints stay useful at any point.
+- **Avoid when:** you only prompt hosted models; then the provider owns the schedule and your levers are
+  epochs and a rate multiplier.
 - **Measure:** print the rate at steps 0, end of warmup, midpoint and end before launching; log it with
   loss so a bad curve can be attributed.
 - **Interviews:** explain *why* decay lowers final loss (noise floor), why the schedule is tied to
@@ -277,11 +309,25 @@ changing the schedule.
   drops sharply during the decay phase of every well-scheduled run.
 - **Adam too:** per-parameter normalization does not change the global scale η, so the argument holds.
 
+### You LoRA-tuned a model on tool-call traces and the agent eval barely moved. What do you check first?
+- **The logged learning rate:** if it sat near zero for most of the run, the horizon was sized in
+  micro-batches or traces instead of optimizer steps.
+- **The peak and warmup:** a peak too low for an adapter, or a warmup that covers most of a short run,
+  leaves the format unlearned.
+- **Then the data:** only after the schedule checks out, inspect trace quality and the eval itself.
+
 ### A loss curve shows a sudden jump exactly where a job resumed. How do you debug it?
 - **Suspect scheduler state first:** if the scheduler was rebuilt instead of restored, warmup restarts or
   the decay resets, so the rate at the resume step differs from the rate before it.
 - **Confirm from the log:** compare the logged learning rate on both sides of the resume step.
 - **Fix:** save and load `scheduler.state_dict()` with optimizer and model state, and add a resume test.
+
+### Your team collects 4,000 more agent trajectories each month. How do you schedule retraining?
+- **Do not resume a finished cosine run:** it either stays at the floor or re-warms with no warmup.
+- **Retrain or re-plan:** retrain from the base on all traces with a fresh `T`, or keep a stable-phase
+  checkpoint (WSD-style) and run a short decay on the combined data.
+- **Gate on agent evals:** compare tool-call validity and task success against the current model before
+  shipping.
 
 ### When would you not use cosine decay for a pre-training run?
 - **When the horizon is uncertain:** cosine is anchored to `T`, so extending or stopping early gives a
@@ -295,13 +341,6 @@ changing the schedule.
 - **Warmup:** a `warmup_ratio` of 0.03 gives 90 warmup steps.
 - **Verify:** print the rate at steps 0, 90, 1,545 and 3,000 and check the final value equals the planned
   floor before launching.
-
-### Why do LLM recipes avoid ReduceLROnPlateau?
-- **Not reproducible:** the drops depend on eval cadence and validation noise, so identical configs can
-  follow different schedules and become hard to compare.
-- **Unknown in advance:** a step-based schedule is known before launch, which matters for budgeting long
-  runs and for branching checkpoints.
-- **Where it still fits:** classic supervised training with cheap, stable validation.
 
 ## Quiz
 ### Q: Why does decaying the learning rate late in training usually lower the final loss?

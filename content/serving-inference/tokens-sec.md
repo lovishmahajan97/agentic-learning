@@ -5,7 +5,8 @@ name: Tokens per second
 kind: metric
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - serving-inference/tpot
   - serving-inference/throughput-vs-latency
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-"Tokens per second" names two numbers that move in opposite directions with concurrency: one stream's
-decode speed (what a user sees) and a server's aggregate output (what you pay for). A figure means
-nothing without tokens counted, concurrency, lengths, hardware, precision and tokenizer.
+"Tokens per second" names two numbers that move oppositely with concurrency: one stream's decode speed
+and a server's aggregate output. For agents, convert either into seconds and dollars per completed task,
+because a run is many short, prompt-heavy calls.
+
+## For agent builders
+- **Why it matters for agents.** Agent calls are prompt-heavy and output-light: a 10-step run might send
+  80k input tokens and emit 1.5k output tokens. Output tokens/s alone hides the prefill load that
+  actually fills your GPUs.
+- **Where it shows up in your stack.** Provider usage fields (`usage.completion_tokens` and input-token
+  counts) in agent traces, vendor speed claims when picking the agent's model, and `vllm bench serve`
+  when sizing self-hosted replicas.
+- **What you control.** Which model serves which step, concurrency on your own replicas, and how many
+  input tokens each step re-sends (prefix caching and trimmed tool results).
+- **What you can skip.** Closed- versus open-loop benchmark design, if you only call hosted APIs; you
+  still need per-stream versus aggregate and the tokenizer caveat.
 
 ## Why it exists
 - **Serving is selling tokens per GPU-second.** The business, the capacity plan and the user experience
@@ -116,9 +129,17 @@ Cost per million output tokens on self-hosted hardware is
 - **That spread is the entire economics of batching**, and why the concurrency you choose is a pricing
   decision.
 
+### Agent traffic changes the shape
+- **Short outputs, long prompts.** Tool-call steps emit tens of tokens over prompts of thousands, so the
+  short-answer row of the Little's law table is the agent's normal case.
+- **Input tokens/s is the binding number.** Each step re-sends the transcript, so input volume can be
+  tens of times output volume; track it separately or the GPU looks idle while prefill is saturated.
+- **The unit is the task.** Users and budgets care about seconds and dollars per completed agent run,
+  which is tokens per step × steps, divided by the rates above.
+
 ## Diagram
-Before trusting any tokens/s figure, walk it down this path; each question changes the number, and only
-the last two predict capacity and cost.
+Before trusting any tokens/s figure for your agent's model, walk it down this path; each question
+changes the number, and only the last two predict capacity and cost per agent run.
 
 ```mermaid
 flowchart TD
@@ -207,7 +228,39 @@ print(f"${cost_per_million(3.0, 200):.2f} per million at c=1 (200 tok/s)")
 # $4.17 per million at c=1 (200 tok/s)
 ```
 
+### Agent scenario: sizing a replica for agent runs
+Illustrative: 50 agent runs per minute, 10 steps each, 8k input and 150 output tokens per step, on a
+replica with 64 in flight, TTFT 500 ms and TPOT 25 ms.
+
+```python
+import math
+
+def aggregate_tok_s(concurrency, n_out, ttft_s, tpot_s):
+    return concurrency * n_out / (ttft_s + (n_out - 1) * tpot_s)
+
+runs_per_min, steps, inp, out = 50, 10, 8_000, 150
+need_out = runs_per_min * steps * out / 60          # output tok/s the agents need
+need_in = runs_per_min * steps * inp / 60           # input tok/s re-sent by the agents
+agg = aggregate_tok_s(64, out, 0.5, 0.025)          # short agent outputs: ~2,272 tok/s
+print(f"need {need_out:,.0f} out tok/s and {need_in:,.0f} in tok/s ({need_in / need_out:.0f}x)")
+print(f"replica gives {agg:,.0f} out tok/s -> {math.ceil(need_out / agg)} replica by output alone")
+# need 1,250 out tok/s and 66,667 in tok/s (53x)
+# replica gives 2,272 out tok/s -> 1 replica by output alone
+```
+
+| Question | Answer | Lesson |
+|---|---|---|
+| Is output capacity enough? | Yes, about 1,250 of ~2,272 tok/s | Output tokens/s says "one replica" |
+| What else is needed? | ~66,667 input tok/s, 53× the output | Measure prefill load before trusting that |
+| Cheapest lever | Prefix caching, so each step prefills only its new tokens | Cuts the input term, not the output one |
+
 ## Production patterns
+- **Report cost and time per agent run.** Sum input and output tokens per run from usage fields and
+  convert to dollars and seconds per completed task, with failed runs counted. Monitor both per agent
+  version, since a prompt change can double input tokens without changing output.
+- **Load-test with agent-shaped traffic.** Replay real agent traces (long prompts, short outputs,
+  sequential calls per run) instead of chat-shaped prompts when benchmarking a replica. Monitor input
+  tokens/s and TTFT next to output tokens/s.
 - **Benchmark with your length mix, open-loop.** Run the engine's serving benchmark (vLLM's ships with
   it; `vllm bench serve` in recent versions) with your real prompt and output length distribution and
   a fixed request rate, not only fixed concurrency. Record TTFT and TPOT percentiles next to tokens/s.
@@ -258,6 +311,7 @@ print(f"${cost_per_million(3.0, 200):.2f} per million at c=1 (200 tok/s)")
   whether a quantised model pays for itself, whether a vendor's claim covers your workload.
 - **Always state which of the four numbers** you mean and the conditions behind it.
 - **Use TPOT and TTFT instead** when the question is how one request feels.
+- **Use per-run time and cost** when the question is how an agent performs; tokens/s is an input to it.
 - **Day to day** it appears in capacity reviews, vendor comparisons and pricing models.
 - **Interviews:** refuse to answer "how many tokens/s does it do" until concurrency, lengths, hardware
   and which tokens are specified, then connect the number to cost per million tokens.
@@ -291,13 +345,6 @@ turn a slogan into a point on a curve I can place my workload on.
 - **They diverge with concurrency** because the weight read is shared: aggregate rises while each
   stream slows.
 
-### Why can a replica produce fewer tokens per second on short answers than on long ones?
-- **Little's law:** aggregate ≈ concurrency × output length / (TTFT + (n − 1) × TPOT).
-- **Short answers** spend a larger share of each slot's life in queue and prefill: with 64 in flight,
-  TTFT 500 ms and TPOT 25 ms, 50-token answers give about 1,900 tokens/s versus about 2,500 for
-  1,000-token answers.
-- **So** output length distribution belongs in every capacity estimate.
-
 ### You need to size a fleet for launch. How do you benchmark?
 - **Open-loop at realistic lengths:** fixed arrival rates with the production prompt and output mix,
   after warm-up, counting tokens from usage.
@@ -305,11 +352,25 @@ turn a slogan into a point on a curve I can place my workload on.
   and timeouts.
 - **Divide peak demand by goodput per replica**, then add headroom for redundancy and bursts.
 
+### How would you size self-hosted capacity for an agent product?
+- **Start from runs:** runs per minute × steps × input and output tokens per step gives input and output
+  tokens/s needed.
+- **Check both terms:** agent traffic can need tens of times more input tokens/s than output, so a
+  replica that has output headroom may still be prefill-saturated.
+- **Benchmark with replayed traces** and take goodput at the TTFT and TPOT SLO, then add headroom.
+
 ### What does batching do to cost per token? Give numbers.
 - **Formula:** GPU hourly cost / (aggregate output tokens/s × 3600) × 1e6.
 - **Illustrative:** at an assumed $3 per GPU-hour, 3,000 tokens/s is about $0.28 per million; the same
   GPU at concurrency 1 and 200 tokens/s is $4.17 per million.
 - **So** the concurrency limit is a pricing decision, constrained by the latency SLO.
+
+### You are choosing between two models for an agent. Model A posts higher tokens/s. Is it faster?
+- **Not necessarily.** Agent steps are short outputs on long prompts, so TTFT and input handling can
+  matter more than decode rate.
+- **Tokenizers differ,** so higher tokens/s may mean more tokens for the same text.
+- **Measure the agent:** run your eval task set on both and compare seconds, dollars and success rate
+  per completed run.
 
 ### When is a tokens-per-second comparison between two models misleading?
 - **Different tokenizers:** a coarser vocabulary emits fewer tokens for the same text, so the slower

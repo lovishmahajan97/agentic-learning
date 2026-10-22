@@ -5,7 +5,8 @@ name: Knowledge distillation
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/synthetic-data-generation
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Knowledge distillation trains a small student to match a large teacher's outputs (soft probability
-distributions or generated text) instead of one-hot labels. Each example carries far more signal, so the
-student usually beats the same architecture trained on labels alone.
+Distillation turns an expensive frontier agent into a cheap one: a small student learns to match the
+teacher's outputs (soft distributions or generated trajectories) instead of one-hot labels, so routers,
+tool selectors and whole agent steps run on a model you can afford.
+
+## For agent builders
+- **Why it matters for agents.** Agents make many LLM calls per task, so per-call cost and latency
+  multiply. Distilling the high-volume, narrow steps (routing, query rewriting, tool selection,
+  summarising tool output) from a frontier teacher into a small model is the usual way to cut an agent's
+  bill without rewriting it.
+- **Where it shows up in your stack.** Black-box distillation is just SFT on teacher trajectories (TRL,
+  Axolotl, a provider's fine-tuning API); white-box needs both models' logits and a shared tokenizer, so
+  it is mostly for teams training their own open-model families.
+- **What you control.** Which steps to distil, the prompt set (real agent traffic), the verifier that
+  filters teacher trajectories, the general-data mix, and the teacher-fallback rule in serving.
+- **What you can skip.** Feature distillation and divergence choices unless you train base models. Know
+  dark knowledge, the *T²* factor, sequence-level distillation as filtered SFT, and exposure bias.
 
 ## Why it exists
 - **The best model is the one you cannot afford to serve.** A 70B-class model costs roughly ten times the
@@ -42,7 +56,19 @@ student usually beats the same architecture trained on labels alone.
   combines with both: prune a big model, then distil from the original to repair it.
 
 ## How it works
-### Classic logit distillation
+### Distilling an agent, step by step
+1. **Log the teacher agent on real traffic.** Every call: the rendered prompt (system, tools, history),
+   the tool call or answer it produced, and the task outcome.
+2. **Filter by outcome, not by look.** Keep trajectories whose task verifier passed (tests green, ticket
+   resolved, schema-valid tool calls); this is rejection sampling at the trajectory level.
+3. **Split into per-step SFT examples.** Each assistant turn becomes (context so far → teacher's next
+   action), with loss on that action only.
+4. **Distil the narrow, high-volume steps first** (router, rewriter, summariser), keep hard planning on
+   the teacher, and add a fallback when the student's output fails validation.
+5. **Evaluate the whole agent**, because a student that matches 95% of single steps can still drift on
+   long trajectories (exposure bias, below).
+
+### Background: classic logit distillation
 Teacher and student each produce logits **z** over the vocabulary (or classes). Soften both with a
 temperature *T*:
 
@@ -206,6 +232,48 @@ for T in (1, 2, 4, 20):
 # T=20: p=[0.385, 0.315, 0.3]  tail mass=61.5%  p2/p3=1.05    <- near uniform, ranking washes out
 ```
 
+### Worked scenario: distilling the cheap steps of a research agent
+A research agent makes 12 LLM calls per task. Costs are in illustrative units, with the student at
+roughly one tenth of the teacher per call, as for a 7B versus a 70B-class model.
+
+| Call type | Calls per task | All on teacher | Router, rewrites and summaries on student |
+|---|---|---|---|
+| Route the request | 1 | 10 | 1 |
+| Rewrite search queries | 3 | 30 | 3 |
+| Summarise tool results | 6 | 60 | 6 |
+| Plan next step | 1 | 10 | 10 (teacher) |
+| Final answer | 1 | 10 | 10 (teacher) |
+| Total per task | 12 | 120 | 30 |
+
+A 4× cheaper task, provided the end-to-end success rate on held-out tasks stays within your tolerance
+and the fallback rate (student output fails validation, teacher retries) stays low.
+
+### Building per-step SFT data from verified teacher trajectories
+Pure Python. Only trajectories whose task passed survive, and each teacher action becomes one example.
+
+```python
+def per_step_examples(trajectories, steps_to_distil={"route", "rewrite", "summarise"}):
+    out = []
+    for traj in trajectories:
+        if not traj["task_passed"]:                    # verifier: tests, resolution, schema checks
+            continue
+        history = []
+        for turn in traj["turns"]:
+            if turn["role"] == "assistant" and turn["step"] in steps_to_distil:
+                out.append({"messages": history + [turn], "loss_on": "last_assistant_turn"})
+            history = history + [turn]
+    return out
+
+trajs = [{"task_passed": True, "turns": [
+            {"role": "user", "content": "compare two vector stores"},
+            {"role": "assistant", "step": "route", "content": "research"},
+            {"role": "assistant", "step": "rewrite", "content": "pgvector vs qdrant recall"},
+            {"role": "tool", "content": "...search results..."},
+            {"role": "assistant", "step": "summarise", "content": "Both support HNSW..."}]},
+         {"task_passed": False, "turns": []}]
+print(len(per_step_examples(trajs)))   # 3 examples from the passing trajectory, 0 from the failed one
+```
+
 ### Worked scenario: why teams cache top-k logits
 Storage for teacher targets over 100M training tokens with a 128k-entry vocabulary (illustrative sizing):
 
@@ -218,20 +286,24 @@ Top-64 is about 670× smaller and fits on one disk, at the cost of dropping the 
 which is why the kept entries are renormalised.
 
 ## Production patterns
+- **Distil per agent step, keep a teacher fallback.** Train separate students (or adapters) for the
+  router, rewriter and summariser; in serving, validate each student output (schema, allowed tool name,
+  confidence) and retry on the teacher when it fails. Monitor fallback rate per step and end-to-end task
+  success.
 - **Offline teacher pass with cached targets.** When the tokenizer is shared, run the teacher once over
   the prompt corpus and write top-*k* indices and log-probs to sharded files keyed by example id, so
   student runs never wait on the teacher. Monitor the probability mass the top-*k* captures per position.
 - **Rejection-sample before sequence-level SFT.** Generate several teacher samples per prompt and keep
   only those that pass a verifier (unit tests, schema check, ground-truth label match). Track pass rate
   per prompt category so thin categories are visible.
-- **Student-first cascade with teacher fallback.** Serve the student and escalate to the teacher when a
-  confidence signal or a validator fails. Monitor escalation rate and task metric on escalated versus
-  non-escalated traffic.
 - **Mix general data into the student's training set.** Keep a slice of general instruction data so the
   narrow capability does not erode other skills. Run the same general benchmark before and after every
   distillation run.
 - **Teacher licence register.** Record for every teacher model or API whether its terms permit training
   other models on its outputs, and block pipelines that use unapproved teachers.
+- **Refresh the student when the agent changes.** New tools, prompts or policies make old teacher
+  trajectories stale; re-run the teacher on recent traffic and retrain on a schedule. Monitor the
+  student's fallback rate as the drift signal.
 
 ## Trade-offs
 - **Accuracy per parameter vs teacher compute.** You pay a teacher forward pass over the whole training
@@ -261,6 +333,9 @@ which is why the kept entries are renormalised.
 - **Choosing the biggest teacher regardless of the gap.** A student far smaller than its teacher can
   learn *less* from it than from a mid-sized intermediate (the teacher-assistant effect). Symptom: a larger
   teacher produces a worse student.
+- **Evaluating per step only.** Each distilled step matches the teacher, but errors compound across a
+  long trajectory. Symptom: per-step agreement is high while end-to-end task success drops. Fix: replay
+  full tasks, and consider an on-policy pass on the student's own trajectories.
 - **Forgetting general data in the mix.** Distilling a narrow capability into a small instruct model
   erodes other skills. Symptom: a drop on a general benchmark run before and after.
 
@@ -268,11 +343,12 @@ which is why the kept entries are renormalised.
 - **Use when:** a strong model is too slow or costly for deployment, you have many prompts (labelled or
   not) representing real usage, and the target surface is narrower than the teacher's.
 - **Right tool for:** turning a frontier model's behaviour on *your* task into a small model on one GPU,
-  and building reasoning-capable small models from a reasoning-capable large one.
+  moving an agent's high-volume narrow steps off the frontier model, and building reasoning-capable small
+  models from a reasoning-capable large one.
 - **Avoid when:** the product needs the teacher's full breadth, or you cannot evaluate the student on
   real held-out data.
-- **Measure:** student versus teacher on your task metric, latency and cost per thousand requests, and a
-  general benchmark for collateral damage.
+- **Measure:** student versus teacher on your task metric and on end-to-end agent success, latency and
+  cost per thousand requests (or per task), fallback rate, and a general benchmark for collateral damage.
 - **Interviews:** explain dark knowledge and the *T²* factor, say when sequence-level distillation is
   just SFT on synthetic data, and argue why on-policy distillation exists.
 
@@ -313,20 +389,28 @@ least rejection sampling with the teacher as judge.
 - **The pipeline:** log the soft and hard terms separately to confirm the soft term is non-zero and
   weighted in, and that only padded positions are masked out of it.
 
-### Forward or reverse KL for a small student: which, and why?
-- **Forward KL(teacher ‖ student)** is mode-covering: it punishes near-zero mass anywhere the teacher is
-  plausible, so a low-capacity student spreads thin and samples look hedged.
-- **Reverse KL(student ‖ teacher)** is mode-seeking: the student commits to the teacher's dominant modes,
-  which usually suits a much smaller model (MiniLLM's choice).
-- **Treat it as a tunable:** generalised-KD interpolates between them, and either way the teacher caps
-  the student on the covered distribution.
-
 ### Why do teams cache only the teacher's top-k logits? Give rough numbers.
 - **Full distributions are huge:** a 128k-entry vocabulary in fp16 is 256 KB per token, about 25.6 TB for
   100M training tokens.
 - **Top-64 is about 670× smaller:** 64 × (int32 index + fp16 value) = 384 bytes per token, about 38.4 GB.
 - **The cost:** the tail beyond rank 64 is dropped, so the kept entries are renormalised; track how much
   probability mass the top-*k* captures.
+
+### Your agent makes 12 frontier calls per task and costs too much. How would you use distillation?
+- **Profile first:** count calls by type; routing, query rewriting and tool-result summaries are usually
+  high volume and narrow, while planning is rare and hard.
+- **Distil the narrow steps:** run the teacher agent on real traffic, keep only trajectories whose task
+  passed, and SFT a small student per step with loss on the teacher's action.
+- **Serve safely:** validate each student output and fall back to the teacher on failure; judge it by
+  end-to-end task success, fallback rate and cost per task.
+
+### Your distilled tool-selection model agrees with the teacher 97% per step, but full tasks fail more often. Why?
+- **Errors compound:** a long trajectory has many steps, so small per-step error rates multiply into a
+  noticeably lower task success rate.
+- **Exposure bias:** the student trained on teacher-written prefixes and never learned to recover from
+  its own wrong tool call.
+- **Fixes:** evaluate on full replayed tasks, add an on-policy pass where the teacher scores the
+  student's own trajectories, and keep a validator plus teacher fallback in serving.
 
 ### A bigger teacher gave you a worse student. Why might that happen, and when would you not distil?
 - **Capacity gap:** a student far smaller than its teacher can learn less from it than from a mid-sized

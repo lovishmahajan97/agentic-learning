@@ -5,7 +5,8 @@ name: Multi-agent systems
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/multi-agent-patterns
   - agents/task-decomposition
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-A multi-agent system splits a task across model loops with their own instructions, tools and context.
-It helps when one agent's context, tools and privileges stop scaling, but duplicated context,
-compounding errors and harder tracing mean each split must buy a named gain.
+A multi-agent system splits one task across loops with their own instructions, tools and context.
+Build one only when one agent's context, tools or privileges stop scaling: duplicated
+context, compounding errors and harder tracing mean each split must buy a named gain.
+
+## For agent builders
+- **Why it matters for agents.** "Add another agent" is the most common over-design in agent projects.
+  Knowing the topologies and their reliability arithmetic lets you split only for context isolation,
+  privilege isolation, parallelism or specialization, and defend a single agent when none applies.
+- **Where it shows up in your stack.** LangGraph supervisor graphs and subgraphs, hand-offs in the
+  OpenAI Agents SDK, sub-agents in the Claude Agent SDK, conversation-based frameworks such as AutoGen
+  and CrewAI, A2A between vendors, and parent–child spans in LangSmith, Langfuse or OpenTelemetry.
+- **What you control.** The topology, the typed sub-task and result schema at each boundary, each
+  agent's tool allowlist, per-worker budgets, the join rule (all, quorum or best effort) and the
+  single-agent baseline you compare against.
+- **What you can skip.** Agent "societies" and debate research until you have a concrete use. Production
+  systems are mostly supervisor plus workers, or a short pipeline with checks.
 
 ## Why it exists
 - **A single agent degrades as the task grows.** Its context fills with tool definitions, instructions
@@ -51,6 +65,10 @@ compounding errors and harder tracing mean each split must buy a named gain.
 | Parallel fan-out with aggregation | agents on independent partitions (document, region, hypothesis), then merge | breadth-first work | the aggregator's context budget is the limit |
 | Evaluator–optimizer (critic) | one produces, one critiques against explicit criteria, loop | quality is checkable but hard to get right first time | loop until the critic passes or a budget ends |
 | Peer hand-off | agents transfer control by conversation (triage to billing specialist) | conversational routing | each specialist needs its own persona and tools |
+
+- **Frameworks name the same shapes differently.** A supervisor is a LangGraph node that routes to
+  worker subgraphs; a peer hand-off is a hand-off in the OpenAI Agents SDK; fan-out is a parallel branch
+  or several child workflows. Pick the topology first, then the framework feature that expresses it.
 
 ### What crosses the boundary
 - **Send a typed task, not the transcript.** Passing the full transcript is the default in many
@@ -334,6 +352,14 @@ data, five agents will lack it too.
   cheap and easy to test.
 - **Model when sub-tasks must be derived from the task,** accepting a less predictable plan; the common
   mix is code owning fan-out and join while a model owns what each worker does.
+
+### Your multi-agent system costs four times the single agent for the same quality. What do you do?
+- **Attribute tokens per agent.** Child spans show where tokens go; forwarded transcripts and
+  supervisor re-reads of raw worker output are the usual culprits.
+- **Shrink the boundary:** typed sub-tasks in, compact schema results out, large intermediates by
+  reference.
+- **Re-check the gain.** If the sub-tasks are not independent and no privilege boundary exists, fold the
+  workers back into one agent and keep the baseline in the eval suite.
 
 ## Quiz
 ### Q: Which gain does NOT by itself justify splitting one agent into several?

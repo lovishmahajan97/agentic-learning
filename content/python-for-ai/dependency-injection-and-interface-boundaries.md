@@ -5,7 +5,8 @@ name: Dependency injection & interface boundaries
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/protocols-generics-structural-typing
   - python-for-ai/test-doubles-mocks-fixtures
@@ -21,17 +22,32 @@ sources:
 ---
 
 ## TL;DR
-A component receives its dependencies (LLM client, vector store, clock) from outside, typed as a small
-`Protocol` in your own vocabulary. AI code becomes testable without network calls and swappable across
-providers, for the price of one thin layer of indirection.
+An agent loop receives its model client, tools, memory store and clock from outside, typed as small
+`Protocol` ports you own. That lets you test a ten-step tool-calling run with a scripted fake model in
+milliseconds and swap providers in one file.
+
+## For agent builders
+- **Why it matters for agents.** An agent is a loop around the slowest, most expensive and least
+  deterministic dependency you have: the model. Without injection, every test of planning, tool routing
+  or stop conditions needs an API key, costs money and returns different text each run.
+- **Where it shows up in your stack.** LangChain's chat-model interface and LangGraph nodes are already
+  ports you call through; FastAPI `Depends` and a lifespan wire agent services; LangSmith or
+  OpenTelemetry tracing is just another injected collaborator. Your own `Completer`, `Tool` and
+  `MemoryStore` protocols sit on top so business logic does not import any of them.
+- **What you control.** Which ports exist (model, tools, retriever, memory, clock), what types cross
+  them (your `Completion` and tool-call dataclasses, not vendor objects), and the one composition root
+  that picks real implementations per environment.
+- **What you can skip.** DI containers and their decorators. A hand-written root plus constructor
+  injection covers almost every agent service.
 
 ## Why it exists
-- **AI apps are glue around external services.** Those services are slow, expensive, non-deterministic
-  and owned by someone else. The first version is always a module-level `client = OpenAI()` plus a
-  `client.chat.completions.create(...)` call inside whichever function needs an answer.
+- **Agents are glue around external services.** Models, tools, vector stores and memory are slow,
+  expensive, non-deterministic and owned by someone else. The first version is always a module-level
+  `client = OpenAI()` plus a `client.chat.completions.create(...)` call inside whichever function needs
+  an answer.
 - **Testing breaks.** Every unit test of that function needs an API key and a network, costs money,
   takes seconds and returns a different string each run, so the test either hits production or gets
-  skipped.
+  skipped. For an agent that loops ten times, each run multiplies that cost and flakiness.
 - **Swapping and configuration break.** Evaluating Anthropic, a self-hosted vLLM endpoint or a cheaper
   model means vendor shapes scattered through forty files. Reading `OPENAI_API_KEY` at import time makes
   a script that only wanted a helper either crash or silently talk to the wrong environment.
@@ -45,8 +61,9 @@ providers, for the price of one thin layer of indirection.
 
 ## How it works
 ### Move 1: name the dependency as an interface you own
-- **Declare a narrow port.** A `Protocol` with exactly the methods your use case calls:
-  `Completer.complete(system, user, *, max_tokens) -> Completion`.
+- **Declare a narrow port.** A `Protocol` with exactly the methods your agent calls:
+  `Completer.complete(system, user, *, max_tokens) -> Completion`, or a `Tool` with a name, a JSON
+  schema and `run(args)`.
 - **`typing.Protocol`, not an ABC,** *because* protocols are structural: the vendor adapter and the test fake
   satisfy it by having the right method, without inheriting from your package, and mypy checks the
   match statically.
@@ -54,22 +71,24 @@ providers, for the price of one thin layer of indirection.
   code, never the other way round.
 
 ### Move 2: translate at the edge
-- **The adapter returns your own `Completion` dataclass** (text, token counts, finish reason). If
-  `openai.types.chat.ChatCompletion` objects flow through your services, the vendor is still a
+- **The adapter returns your own `Completion` dataclass** (text, tool calls, token counts, finish
+  reason). If `openai.types.chat.ChatCompletion` objects flow through your services, the vendor is still a
   dependency of everything that touches them, and a provider switch becomes a rewrite.
-- **The boundary is only as strong as the types that cross it.**
+- **The boundary is only as strong as the types that cross it.** Tool-call formats differ by provider,
+  so normalize them into one `ToolCall(name, args)` type in the adapter.
 - **One file per vendor imports the SDK.** It handles the SDK's exception types and maps status codes
   into your error hierarchy: `openai.RateLimitError` becomes your `ProviderRateLimited`, so the upstream
   retry policy is written once and works for every vendor.
-- **This is dependency inversion in practice:** high-level policy and the low-level SDK both depend on an
-  abstraction the high-level side owns.
+- **This is dependency inversion in practice:** high-level policy (the agent loop) and the low-level SDK
+  both depend on an abstraction the high-level side owns.
 
 ### Move 3: inject at construction, wire at the root
-1. **Constructor injection** (`Summarizer(completer)`) is the Python default *because* the dependency is
-   in the signature: readers, type checkers and test authors all see it.
+1. **Constructor injection** (`Summarizer(completer)`, `Agent(completer, tools, memory)`) is the Python
+   default *because* the dependency is in the signature: readers, type checkers and test authors all
+   see it.
 2. **The composition root** (`main()`, an app factory, a FastAPI lifespan) is the single place that reads
    settings, instantiates real clients and connects them.
-3. **Tests build the same graph with fakes.**
+3. **Tests and evals build the same graph with fakes** or with recorded responses.
 4. **Nothing else reads environment variables or creates network clients,** which removes import-time
    side effects.
 
@@ -77,7 +96,7 @@ providers, for the price of one thin layer of indirection.
 - **Inject a callable for a single operation:**
   `def __init__(self, now: Callable[[], datetime] = datetime.now)` or
   `embed: Callable[[list[str]], list[list[float]]]`. Still DI, *because* the caller decides what runs;
-  it is the smallest possible interface.
+  it is the smallest possible interface. Many agent tools are exactly this: a typed function.
 - **Promote to a Protocol** when a second method appears or the call needs named, typed options.
 - **Default-argument trap.** A default is evaluated once, when the `def` runs at import time, so
   `completer: Completer = OpenAICompleter(OpenAI())` quietly reintroduces an import-time client. Defaults
@@ -91,7 +110,8 @@ providers, for the price of one thin layer of indirection.
 
 - `def complete(...)` returns a `Completion`; `async def complete(...)` returns a coroutine. They are
   different interfaces, so decide at the port.
-- **Need both?** Define two ports (`Completer`, `AsyncCompleter`), not one that tries to be both.
+- **Need both?** Define two ports (`Completer`, `AsyncCompleter`), not one that tries to be both. Agents
+  that run tools in parallel almost always want the async port.
 
 ### Why Python rarely needs a container
 - **Java-style containers** reflect on constructors to auto-wire graphs.
@@ -102,45 +122,49 @@ providers, for the price of one thin layer of indirection.
   lifetimes (singleton HTTP clients and loaded models vs per-request sessions) and a hand-written root
   that has become the hardest file to read.
 
-### Where to draw boundaries
-- **At I/O and non-determinism:** LLM and embedding providers, vector stores, databases, HTTP,
-  filesystem, the clock, randomness.
-- **Not around pure logic:** a `PromptBuilder` that renders a dataclass into a string needs no
-  interface, just a direct test.
-- **Working rule:** if you would replace it in a test or at deployment time, it is a port; otherwise it
-  is just code.
+### Where to draw boundaries in an agent
+- **At I/O and non-determinism:** LLM and embedding providers, vector stores, memory stores, tool
+  backends (HTTP, databases, filesystem, sandboxes), the clock, randomness.
+- **Not around pure logic:** a `PromptBuilder` that renders a dataclass into a string, or a function that
+  trims a transcript to a token budget, needs no interface, just a direct test.
+- **Working rule:** if you would replace it in a test, an eval run or at deployment time, it is a port;
+  otherwise it is just code.
 - **Keep ports narrow, widen deliberately** (add `stream()` when a use case streams). A port mirroring the
   SDK's fifteen methods is the SDK with extra steps, and nobody can write a fake for it.
 
 ### Lifetimes
 - **Shared, created once at the root:** an `httpx.AsyncClient` with its connection pool, a loaded
-  sentence-transformer.
-- **Per-request, created by the handler:** a bound logger with `request_id`, a DB session.
+  sentence-transformer, the model client.
+- **Per-request or per-run, created by the handler:** a bound logger with `request_id`, a DB session,
+  the agent's scratchpad memory for one conversation.
 - **Constructor injection makes sharing cheap,** because the same instance is simply passed to several
   consumers.
 
 ### Test doubles at the boundary
-- **Hand-written fake:** returns scripted answers and records calls, so business-logic tests are fast
-  and deterministic.
+- **Hand-written fake:** returns scripted answers (including scripted tool calls) and records calls, so
+  agent-logic tests are fast and deterministic.
 - **Contract test for the real adapter:** against the real API or a recorded response, so fake and
   reality cannot drift unnoticed.
 - **Keep fakes dumb:** a fake that re-implements vendor logic will pass tests the real thing fails.
 
 ## Diagram
 The composition root (`main()`, an app factory or a FastAPI lifespan) is the only place that reads settings
-and builds real clients; every adapter's arrow points toward the port your domain code owns, and tests plug
-a fake into the same port.
+and builds real clients; every adapter's arrow points toward the ports your agent owns, and tests plug
+fakes into the same ports.
 
 ```mermaid
 flowchart TD
     S["Settings and env vars"] --> R["Composition root"]
     R -->|"builds"| A1["OpenAICompleter adapter"]
     R -->|"builds"| A2["vLLM or Anthropic adapter"]
-    R -->|"injects via constructor"| D["Summarizer domain service"]
+    R -->|"builds"| T["Tool adapters"]
+    R -->|"injects via constructor"| D["Agent loop"]
     D -->|"calls complete, gets Completion"| P["Completer Protocol"]
+    D -->|"calls run"| TP["Tool Protocol"]
     A1 -->|"implements"| P
     A2 -->|"implements"| P
-    F["FakeCompleter in tests"] -->|"implements"| P
+    T -->|"implements"| TP
+    F["Scripted fakes in tests"] -->|"implements"| P
     A1 -.->|"only file importing the SDK"| V["Vendor SDK and network"]
 ```
 
@@ -195,6 +219,61 @@ def test_summarizer_passes_document_through():
     assert fake.calls[0][1] == "long text" and fake.calls[0][2] == 200
 ```
 
+### Agent scenario: testing a tool-calling loop with a scripted model
+The loop depends on two ports: a model that returns either a tool call or a final answer, and a dict of
+tools. The test scripts a two-step run and checks routing, arguments and the step budget, with no
+network. Standard library only.
+
+```python
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Callable, Protocol
+
+@dataclass(frozen=True)
+class ToolCall:
+    name: str
+    args: dict
+
+@dataclass(frozen=True)
+class Step:                                      # your type: adapters translate vendor tool calls into it
+    text: str = ""
+    tool_call: ToolCall | None = None
+
+class Model(Protocol):
+    def next_step(self, transcript: list[dict]) -> Step: ...
+
+class Agent:
+    def __init__(self, model: Model, tools: dict[str, Callable[..., str]], max_steps: int = 8):
+        self._model, self._tools, self._max = model, tools, max_steps
+    def run(self, task: str) -> str:
+        transcript = [{"role": "user", "content": task}]
+        for _ in range(self._max):
+            step = self._model.next_step(transcript)
+            if step.tool_call is None:
+                return step.text
+            result = self._tools[step.tool_call.name](**step.tool_call.args)
+            transcript.append({"role": "tool", "name": step.tool_call.name, "content": result})
+        raise RuntimeError("step budget exhausted")
+
+@dataclass
+class ScriptedModel:                             # dumb fake: replays steps, records what it saw
+    steps: list[Step]
+    seen: list[int] = field(default_factory=list)
+    def next_step(self, transcript):
+        self.seen.append(len(transcript))
+        return self.steps.pop(0)
+
+calls = []
+def lookup_order(order_id: str) -> str:
+    calls.append(order_id)
+    return "shipped"
+
+model = ScriptedModel([Step(tool_call=ToolCall("lookup_order", {"order_id": "A17"})),
+                       Step(text="Your order A17 has shipped.")])
+assert Agent(model, {"lookup_order": lookup_order}).run("Where is A17?") == "Your order A17 has shipped."
+assert calls == ["A17"] and model.seen == [1, 2]   # the tool result reached the second model call
+```
+
 ### Injecting the clock and translating errors at the edge
 A rate-limited retry wrapper that depends only on your exception and an injected `sleep`, so the test
 runs instantly and works for every vendor adapter. Runnable with the standard library alone.
@@ -231,31 +310,36 @@ c = RetryingCompleter(FlakyFake(failures=2), sleep=slept.append)
 assert c.complete("s", "u", max_tokens=10) == "ok" and slept == [1, 2]
 ```
 
-### Worked scenario: adding a provider, before and after
-A team must add a self-hosted vLLM endpoint for one feature.
+### Worked scenario: adding a provider to a live agent, before and after
+A team must route one agent's planning step to a self-hosted vLLM endpoint while tool calls stay on a
+hosted model.
 
 | Measure | Module-level client | Port + adapters |
 |---|---|---|
 | Files touched | every file that calls `client.chat.completions.create` | one new adapter + the root |
 | Unit tests needing a key | all of them | none (fakes) |
 | Retry logic | per call site, per vendor exception | once, against `ProviderRateLimited` |
+| Tool-call parsing | per call site, per vendor format | once per adapter, into `ToolCall` |
 | Proof the adapter works | manual | one contract test per adapter |
 
 ## Production patterns
-- **One composition root per entry point.** Build the graph in `main()`, an app factory or a FastAPI
-  lifespan, and store shared clients there; handlers receive them via `Depends`. Monitor startup time and
-  that no module creates clients at import (a CLI `--help` should not need credentials).
-- **Provider selected by config, at the root only.** Read a setting such as the provider name once and
-  construct the matching adapter; the service never branches on it. Watch per-provider error rates and
-  latency, tagged by adapter.
+- **One composition root per entry point.** Build the agent graph in `main()`, an app factory or a
+  FastAPI lifespan, and store shared clients there; handlers receive them via `Depends`. Monitor startup
+  time and that no module creates clients at import (a CLI `--help` should not need credentials).
+- **Provider and model selected by config, at the root only.** Read a setting such as the provider name
+  once and construct the matching adapter; the agent loop never branches on it. Watch per-provider error
+  rates, latency and tokens per run, tagged by adapter.
 - **Error translation in every adapter.** Map each SDK's rate-limit, timeout and auth exceptions to your
   own hierarchy so retries, fallbacks and alerts are written once. Monitor counts per translated error
   type.
+- **Scripted-model tests for agent control flow.** Replay a fixed sequence of tool calls and answers to
+  test routing, step budgets, error handling and stop conditions in CI on every commit; keep real-model
+  evals for answer quality. Track how long the unit suite takes; it should stay seconds, not minutes.
 - **Contract tests per adapter.** Run a small suite against the real API (nightly or behind a marker) or
   replay recorded responses, and assert the adapter returns a valid `Completion`. Alert when it fails,
   since that is the drift your fakes cannot see.
 - **Shared resources injected, never re-created.** One `httpx.AsyncClient` and one loaded embedding model
-  per process, passed to every consumer. Monitor open connections and process memory.
+  per process, passed to every consumer, including tools. Monitor open connections and process memory.
 
 ## Trade-offs
 - **Testability and swappability vs an extra file and hop per boundary.** Flips for a 200-line script with
@@ -263,6 +347,9 @@ A team must add a self-hosted vLLM endpoint for one feature.
 - **Vendor independence vs provider features.** A lowest-common-denominator port hides tool-call formats,
   prompt caching controls and logprobs; when you deliberately depend on those, widen the port on purpose
   rather than pretending neutrality.
+- **Your ports vs a framework's.** LangChain or LangGraph interfaces already abstract providers; wrapping
+  them again buys isolation from framework upgrades at the cost of one more layer. Worth it when the
+  framework is likely to change under you; skip it for a prototype.
 - **Fast, deterministic fakes vs drift.** A fake can drift from the real adapter, so keep a thin
   integration or contract test against the real API or a recorded response.
 - **Explicit constructors vs long signatures.** A class taking eight collaborators does too much; split it
@@ -275,7 +362,7 @@ A team must add a self-hosted vLLM endpoint for one feature.
 - **Clients created at import time** (`client = OpenAI()` at the top of a file). Symptom: tests fail on
   import with a missing API key, or a CLI `--help` takes seconds and needs production credentials. Fix:
   build clients in the root.
-- **Vendor objects in domain code.** Symptom: `response.choices[0].message.content` in business logic and
+- **Vendor objects in agent code.** Symptom: `response.choices[0].message.content` in business logic and
   a provider switch touching dozens of files. Fix: translate to your dataclass in the adapter.
 - **Patch-heavy tests** (`@patch("app.services.summarize.openai.OpenAI")` stacked three deep). Symptom:
   thirty tests break when a module is renamed, each re-implementing a slice of the vendor response. Fix:
@@ -291,13 +378,13 @@ A team must add a self-hosted vLLM endpoint for one feature.
   signatures change whenever a setting is added. Fix: inject the configured adapter instead.
 
 ## When to use
-- **Use when:** code meets something slow, paid, non-deterministic or third-party: model providers,
-  embedding services, vector stores, databases, HTTP, time and randomness.
+- **Use when:** agent code meets something slow, paid, non-deterministic or third-party: model providers,
+  embedding services, vector stores, memory stores, tool backends, databases, HTTP, time and randomness.
 - **Avoid when:** the logic is pure; test it directly.
-- **Measure:** can the core use case run in a test with no network and no credentials, and how many files
+- **Measure:** can the agent loop run in a test with no network and no credentials, and how many files
   would a provider switch touch?
-- **Day to day:** the adapter you write when adding a provider, the fake you hand to a test, the one root
-  you edit when configuration changes.
+- **Day to day:** the adapter you write when adding a provider or tool, the fake you hand to a test, the
+  one root you edit when configuration changes.
 - **Interviews:** explain why Protocols beat ABCs here, why the boundary's types must be yours, and why a
   composition root exists at all.
 
@@ -323,13 +410,21 @@ changes. A strong answer also mentions keeping the port narrow and a contract te
 fakes cannot drift from reality.
 
 ## Interview questions
-### What is dependency injection, and why does it matter more in LLM applications than in typical CRUD code?
+### What is dependency injection, and why does it matter more in agents than in typical CRUD code?
 - **Definition:** a component receives its collaborators from outside (usually through its constructor)
   instead of creating or importing them, so the caller decides what actually runs.
-- **Why it matters here:** LLM providers, embedding services and vector stores are slow, paid,
-  non-deterministic and third-party, so unit tests need a fake and deployments need to swap providers.
-- **Result:** business logic runs in a test with no network and no API key, and a provider switch is one
+- **Why it matters here:** an agent loops over LLM providers, tools, vector stores and memory that are
+  slow, paid, non-deterministic and third-party, so unit tests need a fake and deployments need to swap
+  providers.
+- **Result:** agent logic runs in a test with no network and no API key, and a provider switch is one
   new adapter plus a change in the composition root.
+
+### How would you unit-test an agent's tool-routing and stop logic without calling a model?
+- **Inject the model as a port** that returns your own `Step` type: either a tool call or a final answer.
+- **Script a fake** that replays a fixed sequence (call `lookup_order`, then answer) and records the
+  transcript length it saw, so you can assert the tool result was fed back.
+- **Cover the edges:** unknown tool names, a tool raising, and the step budget being exhausted; leave
+  answer quality to real-model evals.
 
 ### Your test suite fails at import with a missing `OPENAI_API_KEY`. How do you debug and fix it?
 - **Find the import-time side effect:** look for a module-level `client = OpenAI()`, a settings object read
@@ -351,10 +446,10 @@ fakes cannot drift from reality.
 - **Single-method needs:** inject a callable such as `now: Callable[[], datetime]` rather than a full
   Protocol class.
 
-### How do you make sure a fake does not drift from the real provider adapter?
+### How do you make sure a fake does not drift from the real provider adapter in a production agent?
 - **Keep fakes dumb:** scripted answers and recorded calls, never logic that parses the prompt.
 - **Add a contract test per adapter:** run it against the real API nightly or behind a marker, or replay
-  recorded responses, and assert it returns a valid `Completion`.
+  recorded responses, and assert it returns a valid `Completion` with correctly parsed tool calls.
 - **Alert on failure,** because a failing contract test is exactly the drift green unit tests cannot see.
 
 ## Quiz

@@ -5,7 +5,8 @@ name: SQLAlchemy / SQLModel
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/async-database-access-and-connection-pooling
   - fastapi-for-ai/alembic-migrations
@@ -19,9 +20,22 @@ sources:
 ---
 
 ## TL;DR
-SQLAlchemy is Python's standard SQL toolkit: Core builds safe parameterised SQL, the ORM maps classes to
-tables with a unit of work. SQLModel makes one class both table and Pydantic schema: use it while
-storage and API shapes agree, plain SQLAlchemy once they diverge.
+Agents persist runs, messages, tool calls, memories and embeddings; SQLAlchemy is how Python stores them.
+Core builds parameterised SQL (safe for agent tools), the ORM maps classes to tables, and SQLModel makes
+one class both table and Pydantic schema.
+
+## For agent builders
+- **Why it matters for agents.** Agent state is relational: conversations, messages with JSON tool-call
+  payloads, run steps, long-term memories, RAG chunks with vectors, eval results. How you load it decides
+  context-building latency, and how you query it decides whether a DB tool is safe to hand to a model.
+- **Where it shows up in your stack.** The models behind your FastAPI agent API, the `Vector(dim)` column
+  from the `pgvector` package for retrieval, DB-backed tools built on Core `select()`, and Alembic
+  migrations generated from the same metadata.
+- **What you control.** Loading strategies when you build the model's context, the Create/Read/table
+  split, bulk paths for RAG ingestion, and bound parameters (never f-strings) for anything a model
+  supplies.
+- **What you can skip.** Advanced mapping (polymorphism, hybrid properties) until your domain needs it,
+  and the legacy `Query` API.
 
 ## Why it exists
 - **AI backends carry a lot of relational state.** Conversations and messages with JSON tool-call
@@ -98,6 +112,21 @@ Two documented sharp edges:
   and convert with `Message.model_validate(payload, update={...})`.
 - **SQLModel tracks SQLAlchemy with some lag.** A feature missing from its surface is usually reachable
   through `sa_column` or `sa_relationship` rather than absent.
+
+### Modelling agent state
+| Table | Typical columns | Loading note |
+|---|---|---|
+| conversation / run | id, user, status, step budget | one row per run |
+| message / step | role, content, `tool_calls` JSON, step number | load all of a run with `selectinload` when building context |
+| memory | user, text, embedding `Vector(dim)`, source run | query by similarity, filter by user first |
+| chunk | document, text, embedding | bulk-insert during ingestion, never one `add()` per row |
+| eval result | run id, grader, score | written by eval jobs, read by dashboards |
+
+- **Context building is a read path.** Rebuilding an agent's transcript every turn touches messages and
+  their tool calls, so an N+1 here adds latency to every single agent step.
+- **Model-supplied values are untrusted input.** A DB tool must compile model arguments into bound
+  parameters with `select().where(...)`, run under a read-only role, and cap rows, because the arguments
+  come from model output that a prompt injection can steer.
 
 ### Choosing between them
 | Choose | When |
@@ -223,6 +252,39 @@ print(queries_for(selectinload(Conversation.messages)))  # 2: one SELECT + one I
 # queries_for(raiseload("*")) raises instead of querying: use it in tests to lock the fix in.
 ```
 
+### A safe DB tool for an agent (Core, bound parameters)
+The model picks the arguments; Core turns them into bound parameters, the schema bounds them, and a row
+cap keeps the tool result small enough for the context window. Runnable against in-memory SQLite.
+
+```python
+from pydantic import BaseModel, Field
+from sqlalchemy import Column, Integer, MetaData, String, Table, create_engine, insert, select
+
+meta = MetaData()
+orders = Table("orders", meta, Column("id", Integer, primary_key=True),
+               Column("customer", String), Column("status", String))
+engine = create_engine("sqlite://")
+meta.create_all(engine)
+with engine.begin() as c:
+    c.execute(insert(orders), [{"customer": "acme", "status": "shipped"},
+                               {"customer": "acme", "status": "pending"}])
+
+class FindOrders(BaseModel):                       # the tool's JSON schema, shown to the model
+    customer: str = Field(max_length=64)
+    status: str | None = Field(default=None, pattern="^(pending|shipped|cancelled)$")
+
+def find_orders(args: dict) -> list[dict]:
+    a = FindOrders.model_validate(args)            # reject malformed model output
+    stmt = select(orders.c.id, orders.c.status).where(orders.c.customer == a.customer)
+    if a.status:
+        stmt = stmt.where(orders.c.status == a.status)
+    with engine.connect() as c:                    # in production: a read-only DB role
+        return [dict(r._mapping) for r in c.execute(stmt.limit(20))]   # cap rows for the context
+
+print(find_orders({"customer": "acme"}))
+print(find_orders({"customer": "acme' OR '1'='1"}))   # [] : a bound value, never SQL
+```
+
 ### Worked scenario: the list endpoint that slowed down in production
 Illustrative timings, 1 ms per round trip to the database.
 
@@ -232,8 +294,15 @@ Illustrative timings, 1 ms per round trip to the database.
 | Production | 500 | 501 | 2 | ~501 ms → ~2 ms plus row transfer |
 
 Same response body, same code path; only the loading strategy changed.
+- **The agent version is worse.** If each agent step rebuilds its context by lazily loading a run's 40
+  steps and their tool calls (illustrative), that is 41 round trips per step, repeated every step of the
+  run; `selectinload` makes it 2.
 
 ## Production patterns
+- **Typed, parameterised DB tools instead of free-form SQL.** Agent teams expose narrow tools (find
+  orders, get account) whose Pydantic argument schema compiles to Core `select()` with bound parameters,
+  run them under a read-only role, and cap rows. Monitor rejected tool arguments and rows returned per
+  call.
 - **Lock loading strategies in tests.** On list and detail endpoints, declare `selectinload`/`joinedload`
   explicitly and run tests with `raiseload("*")` (or `lazy="raise"` on relationships) so a new lazy access
   fails CI. Monitor statements per request in tracing; alert when a route's count grows with data.
@@ -266,6 +335,9 @@ Same response body, same code path; only the loading strategy changed.
   with different return shapes and weaker typing on the legacy half; migrate module by module.
 
 ## Pitfalls
+- **Interpolating model output into SQL text.** Symptom: an agent's DB tool returns rows from other
+  customers, or errors on quotes, after a prompt injection or an odd user name. Fix: bound parameters via
+  Core, a validated argument schema, and a read-only role.
 - **`expire_on_commit` left at its default in async sessions.** Symptom: `MissingGreenlet` on the first
   attribute read after `commit()`.
 - **Lazy relationship access inside a loop.** Symptom: one query plus one per row in the SQL log, and a
@@ -330,7 +402,7 @@ query per conversation). Add `raiseload` in tests so the regression cannot retur
 - **Fix:** reassign the whole value, or declare the column with `MutableDict.as_mutable(JSON)` from
   `sqlalchemy.ext.mutable`, and add a test that mutates, commits and re-reads.
 
-### How would you ingest a million embedding chunks efficiently?
+### How would you ingest a million embedding chunks for your agent's RAG index efficiently?
 - **Skip per-object adds.** Use `session.execute(insert(Chunk), rows)` with a list of dicts in batches,
   or the driver's `COPY`, which are typically several times faster; measure on your own data.
 - **Keep it in the same engine and transaction discipline,** and watch rows per second and transaction
@@ -343,6 +415,13 @@ query per conversation). Add `raiseload` in tests so the regression cannot retur
   instantiated.
 - **Fix:** accept a non-table `XCreate` schema, convert with `model_validate(..., update={...})` for
   server-owned fields, and return `XRead` via `response_model`.
+
+### You want your agent to answer questions from the orders database. How do you give it access safely?
+- **Narrow tools, not raw SQL.** Expose a few typed tools whose Pydantic argument schemas compile to Core
+  `select()` with bound parameters, so model output can never become SQL text.
+- **Limit blast radius:** a read-only database role, row caps sized for the context window, and tenant
+  filters applied by the tool, never chosen by the model.
+- **Measure** rejected arguments and rows per call, and keep eval cases for injection attempts.
 
 ## Quiz
 ### Q: What is the one thing SQLModel adds on top of SQLAlchemy?

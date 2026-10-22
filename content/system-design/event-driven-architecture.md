@@ -5,7 +5,8 @@ name: Event-driven architecture
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - system-design/synchronous-vs-asynchronous-execution
   - system-design/outbox-inbox-patterns
@@ -23,9 +24,23 @@ sources:
 ---
 
 ## TL;DR
-A service records an immutable fact ("DocumentUploaded", "RunCompleted") on a broker and any number of
-consumers react on their own schedule. Producers stop knowing about consumers; the price is eventual
-consistency, at-least-once delivery and no single stack trace.
+Agents both emit and react to immutable facts ("DocumentUploaded", "RunCompleted") on a broker. That lets
+you trigger agents, feed RAG indexes and fan out run telemetry without coupling services; the price is
+eventual consistency, at-least-once delivery and no single stack trace.
+
+## For agent builders
+- **Why it matters for agents.** The pipeline that keeps your RAG index fresh is event-driven, and so is
+  any agent that wakes up on a ticket, an email or a webhook. At-least-once delivery means the same event
+  can start your agent twice, and an agent that sends a refund twice is an incident.
+- **Where it shows up in your stack.** Kafka, SQS or RabbitMQ behind ingestion and agent triggers; run
+  events (run started, tool called, run completed) feeding billing, eval sampling and audit; tracing
+  tools such as LangSmith or an OpenTelemetry backend receive a parallel stream of spans, not your
+  business events.
+- **What you control.** The event envelope and partition key (usually the document, ticket or
+  conversation id), idempotency keys derived from `event_id` for every side-effecting tool call, retry
+  limits and the dead-letter policy, and how many agent runs a consumer group may start at once.
+- **What you can skip.** Broker internals such as replication protocols and log compaction tuning. Know
+  per-partition ordering, at-least-once delivery, the outbox and consumer lag.
 
 ## Why it exists
 The naive design: the ingestion endpoint receives a PDF and, in the same request, calls the parser,
@@ -43,6 +58,9 @@ chunker, embedder, index writer, notification service and analytics API. Three t
   becomes the log. That inversion, not the broker technology, is the idea.
 - **What it buys in AI systems.** You can add a billing meter, an eval sampler and an audit log to an
   agent pipeline without touching the agent.
+- **Why agents make it sharper.** An agent run is slow (seconds to minutes) and expensive (tokens per
+  step), so it cannot sit inside a webhook's request, and duplicate triggers cost real money as well as
+  duplicate side effects.
 
 ## How it works
 ### Events versus commands
@@ -119,14 +137,31 @@ per topic, not by discovery in an incident.
   orchestrator or a very good trace. Multi-step agent workflows with compensation needs usually end up
   orchestrated.
 
+### Agents on the bus
+An agent plays both roles, and each role has its own rule:
+
+| Role | Example | Rule |
+|---|---|---|
+| Consumer (trigger) | `TicketCreated` starts a triage agent | dedupe on `event_id` before starting a run, because a redelivery would start a second paid run |
+| Side-effecting tool | the agent issues a refund or posts a reply | pass an idempotency key derived from `event_id` plus step, so a retried run does not repeat the effect |
+| Producer (telemetry) | `RunCompleted` with tokens, cost, outcome | emit facts, not commands; billing, eval sampling and audit subscribe on their own |
+| Producer (handoff) | `DraftReady` for a human reviewer | key by conversation id so a later `DraftRevised` cannot overtake it |
+
+- **Cap concurrency at the consumer.** A burst of 5,000 events must not become 5,000 simultaneous model
+  calls; the consumer group size and a per-consumer run limit act as the throttle in front of the model
+  provider's rate limits.
+- **Keep the run itself out of the event.** Put ids and pointers in the payload and keep transcripts in
+  a store, because transcripts are large and may hold personal data you do not want retained in a log.
+
 ### Flavours worth naming
 - **Event sourcing** makes the event log the system of record and rebuilds current state by folding events.
 - **CQRS** separates the write model from read models built from events.
 - Both are separate commitments with their own costs; "event-driven" does not require either.
 
 ## Diagram
-The producer's only dependency is the outbox and the broker; each consumer group reads the same
-partitioned log at its own offset, and failures divert to a dead-letter topic instead of blocking it.
+The producer's only dependency is the outbox and the broker; each consumer group, including the agent
+that answers over the index, reads the same partitioned log at its own offset, and failures divert to a
+dead-letter topic instead of blocking it.
 
 ```mermaid
 flowchart TD
@@ -140,6 +175,7 @@ flowchart TD
     E -->|"DocumentIndexed"| T
     E -.->|"after N failures"| DLQ[("Dead-letter topic")]
     E --> V[("Vector store, deterministic ids")]
+    V --> AG["RAG agent retrieves"]
 ```
 
 ## Examples
@@ -217,6 +253,47 @@ def idempotent(events):
 print(naive(deliveries), idempotent(deliveries))   # 13 8
 ```
 
+### Agent scenario: a ticket-triage agent triggered by events
+A support system publishes `TicketCreated`. The triage agent must start once per ticket, even when the
+broker redelivers, and its refund tool must not run twice. `run_agent` stands in for any agent loop
+(a LangGraph graph, an SDK tool-calling loop).
+
+```python
+import json
+
+def on_ticket_created(raw, db, run_agent, refund_api, publish):
+    ev = json.loads(raw)
+    # 1. inbox: one run per event, recorded in the same DB as the run row
+    with db.transaction() as tx:
+        if tx.exists("inbox", event_id=ev["event_id"]):
+            return                                    # redelivery: skip, no second paid run
+        tx.insert("inbox", event_id=ev["event_id"])
+        run_id = tx.insert("agent_runs", ticket_id=ev["aggregate_id"], status="running")
+
+    def refund_tool(order_id, amount_cents, step):
+        # 2. idempotency key from the event, not from a random uuid per attempt
+        key = f'{ev["event_id"]}:refund:{step}'
+        return refund_api.create(order_id=order_id, amount=amount_cents, idempotency_key=key)
+
+    result = run_agent(ticket=ev["payload"], tools={"refund": refund_tool})
+    db.update("agent_runs", run_id, status="done", tokens=result.tokens)
+    # 3. telemetry is a fact; billing, eval sampling and audit subscribe on their own
+    publish(topic="agent-runs", key=ev["aggregate_id"], value=json.dumps(
+        {"type": "RunCompleted", "run_id": run_id, "tokens": result.tokens}))
+```
+
+- **Caveat.** If the process dies mid-run, the inbox row already exists, so the redelivery is skipped
+  and the run is stuck in `running`. A sweeper that resumes or restarts stale runs (or a durable
+  executor with checkpoints) closes that gap; the refund key keeps a restart from paying twice.
+
+| Burst of tickets | Naive consumer (no inbox) | With inbox and run cap of 50 |
+|---|---|---|
+| 2,000 events, 3% redelivered after a rebalance | 2,060 runs, 60 duplicate replies | 2,000 runs, 0 duplicates |
+| Peak concurrent model calls | up to 2,060 | 50 per consumer |
+
+Numbers are illustrative; the point is that duplicates and bursts are normal on a bus, so both the
+dedupe and the throttle belong in the agent's consumer.
+
 ### Worked numbers: synchronous chain vs events
 | Design | What must be up for an upload to succeed | Availability (99.9% each) | Upload latency |
 |---|---|---|---|
@@ -245,6 +322,14 @@ only the six downstream services; counting the producer too gives the 99.3% here
 - **Bounded retries then DLQ.** On SQS set a redrive policy with `maxReceiveCount` (for example 5) to a
   dead-letter queue; on Kafka route to a retry topic after N attempts. Page on DLQ depth above zero for
   topics where order or completeness matters, and keep a replay tool.
+- **Event-triggered agents behind an inbox and a run cap.** When tickets, emails or webhooks start agent
+  runs, dedupe on `event_id` in the same transaction that creates the run row, and cap concurrent runs per
+  consumer so a burst cannot exhaust the model provider's rate limit. Monitor runs started per event
+  (should be 1.0), queue wait time and provider 429s.
+- **Run events as the telemetry spine.** Emit `RunStarted`, `ToolCalled` and `RunCompleted` facts with
+  run id, tokens and cost, and let billing, eval sampling and audit subscribe. Keep detailed traces in
+  your tracing tool (LangSmith, an OpenTelemetry backend) joined by `trace_id`, rather than pushing whole
+  transcripts through the broker.
 
 ## Trade-offs
 - **Producer independence vs the synchronous answer.** The uploader cannot tell the user "indexed, ask
@@ -280,12 +365,19 @@ only the six downstream services; counting the producer too gives the 99.3% here
 - **Retrying a poison message in place forever.** Symptom: lag climbing on one partition while every other
   partition of the group sits at zero, and the same offset looping in the error log. Fix: bounded retries,
   then a DLQ or a parked key, chosen per topic.
+- **One event, two agent runs.** Symptom: customers get two replies or two refunds after a consumer
+  restart or rebalance. Fix: inbox check before starting a run, and idempotency keys derived from
+  `event_id` on every side-effecting tool.
+- **Transcripts in the payload.** Symptom: messages hit the broker's size limit, and personal data sits
+  in a log retained for weeks. Fix: carry ids and pointers; keep transcripts in a store with its own
+  retention policy.
 
 ## When to use
 - **Use when:** more than one party cares about a fact, consumers may be down while producers are up, you
   need to replay history, or the producer's latency budget cannot absorb the consumers' work.
 - **Typical AI uses:** ingestion pipelines (upload, parse, chunk, embed, index); agent run telemetry fanned
-  out to billing, evaluation sampling and audit; model-output moderation that must not block the response.
+  out to billing, evaluation sampling and audit; model-output moderation that must not block the response;
+  background agents woken by tickets, emails or webhooks.
 - **Avoid when:** the caller needs the result now, there is exactly one consumer and the workflow is short,
   or the team has no way to trace a flow across services yet.
 - **Measure:** consumer lag, redelivery rate and dead-letter volume; those three numbers tell you whether
@@ -353,13 +445,21 @@ than making indexing synchronous.
 - **Check for a poison message too.** One partition lagging while the rest are at zero means a retry loop,
   not a capacity problem.
 
-### How do you get an event published reliably when the service also writes to its database?
-- **Name the dual-write problem.** Writing the row and publishing separately can lose the event or publish
-  one for a rolled-back transaction if the process crashes between them.
-- **Use a transactional outbox.** Insert the event into an outbox table in the same transaction as the
-  row, then relay it with a poller or change-data capture.
-- **Expect duplicates downstream.** The relay can publish twice after a crash, so consumers still
-  deduplicate on `event_id`; monitor the age of the oldest unpublished outbox row.
+### A webhook-triggered agent occasionally replies to the same customer twice. Walk through the fix.
+- **Name the cause.** The bus or webhook sender delivers at least once, so a retry or rebalance starts a
+  second run of the agent for the same event.
+- **Dedupe the trigger.** Record `event_id` in an inbox table in the same transaction that creates the
+  run row, and skip if it already exists.
+- **Dedupe the effects.** Give the reply and refund tools idempotency keys built from `event_id` and the
+  step, so even a restarted run cannot repeat them; monitor runs per event and duplicate-key hits.
+
+### How would you fan out agent run data to billing, evals and audit without slowing the agent?
+- **Publish facts, not calls.** The agent emits `RunCompleted` with run id, tokens, cost and outcome;
+  billing, an eval sampler and an audit consumer each subscribe as their own consumer group.
+- **Keep it off the hot path.** Use an outbox or an async publish after the run, so a broker hiccup
+  becomes lag for those consumers rather than latency or errors for users.
+- **Separate traces from events.** Detailed spans go to the tracing tool keyed by `trace_id`; the bus
+  carries small, schema-registered facts that downstream teams can depend on.
 
 ## Quiz
 ### Q: What most clearly distinguishes an event from a command in a message-driven system?

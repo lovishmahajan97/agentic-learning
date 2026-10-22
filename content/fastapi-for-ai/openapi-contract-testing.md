@@ -5,7 +5,8 @@ name: OpenAPI contract testing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/openapi-docs
   - fastapi-for-ai/testclient-plus-pytest-asyncio
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Contract testing treats the generated schema as a promise: a CI snapshot diff fails on breaking changes,
-and schema-driven tests (Schemathesis) check responses match the schema. Unit tests check what you meant;
-contract tests check what clients were told.
+When agents call your API as tools, the OpenAPI schema is a promise to a model as well as to code.
+Contract tests pin it: a CI snapshot diff fails on breaking changes, and schema fuzzing (Schemathesis)
+checks responses match it, with the LLM stubbed.
+
+## For agent builders
+- **Why it matters for agents.** Agents are unusually brittle consumers. Tool definitions are generated
+  from your schema, often cached in prompts or agent configs, and the model learned to call them with the
+  old argument names. Renaming a field or narrowing an enum silently breaks runs that worked yesterday.
+- **Where it shows up in your stack.** A CI job beside your agent service: snapshot `app.openapi()`,
+  classify changes with a breaking-change tool, fuzz with Schemathesis, and replay recorded tool calls
+  from agent traces against the new schema.
+- **What you control.** What counts as breaking (the asymmetric rule below), the release baseline you
+  diff against, the fake LLM client used in the contract suite, and the trace sample you replay.
+- **What you can skip.** Writing your own fuzzer or diff engine. Use the tools; understand the rule they
+  enforce.
 
 ## Why it exists
 - **Unit tests move with the code.** The same people change both: rename `usage.total_tokens` to
@@ -32,7 +45,8 @@ contract tests check what clients were told.
 - **AI response shapes change constantly.** They grow (tool calls, reasoning content, citations), enums
   gain values (`finish_reason`), and fields move as prompt pipelines are refactored.
 - **Accuracy is not stability.** FastAPI's schema updates itself silently with each change, so it
-  documents the break rather than preventing it.
+  documents the break rather than preventing it. An agent importing tools picks up the broken version on
+  its next refresh.
 - **Naive defences miss it.** A reviewer reading a 3,000-line `openapi.json` diff misses that a field
   became required; hand-written "golden response" tests cover only the payloads someone thought of.
 - **What contract testing buys.** The schema becomes an explicit, versioned artifact, the machine
@@ -60,9 +74,10 @@ more* (extra response fields, tighter guarantees) than before, but never accept 
 
 - **Why removing an optional request field is sneaky.** With Pydantic's default `extra="ignore"` the
   request still succeeds and the field is silently dropped. The client believes it set `temperature` when
-  it did not, which is worse than a 422.
+  it did not, which is worse than a 422. An agent gets no error to learn from, so it never adapts.
 - **Why a new enum value is ambiguous.** It is additive, but a client that `switch`es exhaustively over
-  `finish_reason` hits an unhandled case.
+  `finish_reason` hits an unhandled case. Agent loops that branch on a tool result's `status` enum fail
+  the same way.
 
 ### Layer 2: does the implementation honour the schema
 - **A stable schema can still be violated.** A handler returns `None` where the schema says string, or a
@@ -72,13 +87,18 @@ more* (extra response fields, tighter guarantees) than before, but never accept 
 - **For each response it checks:** the status code is one the schema declares, the body validates against
   the declared response schema, and the server did not return a 500.
 - **Where it runs.** Schemathesis runs in-process against the ASGI app, or over HTTP against a deployment.
+- **Why agents care.** A model generates odd but schema-valid arguments far more often than a human
+  client does, so fuzzing is a fair rehearsal for what an agent will send.
 
-### Layer 3: consumer-driven contracts
+### Layer 3: consumer-driven contracts, including the agent
 - **Layers 1 and 2 protect what the provider *declared*.**
 - **Consumer-driven contracts** (Pact is the usual tool) record what each consumer actually *uses*, such
   as "the web app reads `choices[0].message.content`", and replay those expectations against the provider
   in CI.
 - **The question only this answers:** is the field you want to remove used by anyone?
+- **For an agent, traces are the pact.** Recorded tool calls from production traces show which arguments
+  the model really sends; replaying a sample against the new request models answers the same question
+  without asking the model team to write pacts.
 
 ### Why AI endpoints need special handling
 - **Fuzzed inputs must not reach the real model**, because thousands of fuzzed requests would cost money
@@ -88,7 +108,7 @@ more* (extra response fields, tighter guarantees) than before, but never accept 
 
 ## Diagram
 Follow a pull request through the three layers: the schema diff asks whether the promise changed, the
-fuzzer asks whether the code keeps it, and pacts ask whether anyone relies on it.
+fuzzer asks whether the code keeps it, and pacts or replayed agent traces ask whether anyone relies on it.
 
 ```mermaid
 flowchart TD
@@ -101,7 +121,7 @@ flowchart TD
     B -->|"no"| Z["Schemathesis fuzzes app, LLM client stubbed"]
     Z --> V{"Declared status and on-schema body, no 5xx?"}
     V -->|"no"| F3["Fail: fix handler or declare response"]
-    V -->|"yes"| P{"Consumer pacts verified?"}
+    V -->|"yes"| P{"Pacts and agent trace replay pass?"}
     P -->|"no"| F4["Block: a consumer uses what changed"]
     P -->|"yes"| OK["Merge and deploy"]
 ```
@@ -148,6 +168,44 @@ On a pull request that renamed `usage.total_tokens`:
 2. The diff tool flags a removed response property (breaking).
 3. The reviewer must restore the field, add it alongside the new name with a deprecation, or cut a new
    version.
+
+### Agent scenario: replay recorded tool calls against the new request models
+Sample real tool calls from agent traces (exported as JSON Lines) and validate each one against the
+current Pydantic request model. Any call that used to succeed and now fails is a break for the agent.
+
+```python
+# tests/test_agent_tool_replay.py
+import json, pathlib
+from pydantic import BaseModel, ConfigDict, ValidationError
+from app.tools import SearchIn, RefundIn        # the request models behind tool routes
+
+TOOL_MODELS: dict[str, type[BaseModel]] = {"tools_search": SearchIn, "tools_refund": RefundIn}
+TRACES = pathlib.Path(__file__).parent / "agent_tool_calls.sample.jsonl"
+# one line per recorded call: {"tool": "tools_search", "arguments": {...}}
+
+def strict(model: type[BaseModel]) -> type[BaseModel]:
+    """Same fields, but unknown arguments fail instead of being silently ignored."""
+    return type(f"Strict{model.__name__}", (model,), {"model_config": ConfigDict(extra="forbid")})
+
+def test_recorded_agent_calls_still_validate():
+    failures = []
+    for line in TRACES.read_text().splitlines():
+        call = json.loads(line)
+        model = TOOL_MODELS.get(call["tool"])
+        if model is None:
+            failures.append(f"tool {call['tool']} no longer exists")
+            continue
+        try:
+            strict(model).model_validate(call["arguments"])
+        except ValidationError as e:
+            failures.append(f"{call['tool']}: {e.errors()[0]['msg']} at {e.errors()[0]['loc']}")
+    assert not failures, "agent tool calls the new schema rejects:\n" + "\n".join(failures[:20])
+```
+
+- **`extra="forbid"` in the replay only** surfaces the sneaky case: an argument the agent sends that the
+  new model would silently drop with the default `extra="ignore"`.
+- **Refresh the sample** from production traces on a schedule, so it reflects what the current model and
+  prompt actually send.
 
 ### A tiny breaking-change classifier (runnable, stdlib only)
 Not a replacement for oasdiff, but it shows the asymmetric rule as code. Requests must not accept less;
@@ -196,12 +254,17 @@ for line in breaking(old, new, requests=["ChatIn"], responses=["Usage"]):
   the broken schema, so the break is invisible from then on.
 - **Why the release diff does not:** it compares against what clients actually run, so the cumulative
   change keeps showing until it is fixed or released on purpose. That is why Layer 1 step 3 insists on it.
+- **Agents make the release baseline matter more:** a tool list cached in an agent's config is pinned to
+  whatever schema was released when it was built.
 
 ## Production patterns
 - **Snapshot plus release baseline.** Keep `openapi.snapshot.json` for "something changed" and store the
   schema of each release (a git tag or a published artifact) as the baseline for the breaking-change
   report, for example `oasdiff breaking released.json current.json --fail-on ERR` in CI (without
   `--fail-on` it only prints the report and exits 0). Monitor: breaking changes caught before release.
+- **Replay agent traces as a consumer contract.** Agent teams export a sample of real tool calls from
+  their tracing system and validate them against the new request models in CI, as above. Monitor:
+  replay failures per release, and production 422 rates on tool routes after deploy.
 - **Stub the model, keep the wiring.** Override the LLM client with `app.dependency_overrides` in the
   contract suite, as above, and never put real provider keys in that CI job. Monitor: provider spend from
   CI, which should be zero.
@@ -218,13 +281,14 @@ for line in breaking(old, new, requests=["ChatIn"], responses=["Usage"]):
 ## Trade-offs
 - **Strict equality vs noise.** Strict snapshot equality catches every change, but it also fails on
   harmless description edits; that noise is acceptable only because updating the snapshot is a
-  one-command, reviewed step.
+  one-command, reviewed step. For tool routes, a description edit changes the model's prompt, so it
+  deserves review anyway.
 - **Fuzz coverage vs CI time.** Schema fuzzing finds 500s and off-schema responses nobody wrote tests
   for, but it lengthens CI; when the suite gets slow, cap examples per operation on pull requests and run
   the full depth nightly.
 - **Consumer knowledge vs upkeep.** Consumer-driven contracts tell you who uses a field, but every
   consumer team must publish and maintain pacts; for one internal consumer, the schema diff alone is
-  usually enough.
+  usually enough. Trace replay is cheaper for agent consumers but only covers what the sample saw.
 - **Strict enums vs evolution speed.** Treating additive enum values as breaking protects strict clients,
   but it slows evolution; flip to "additive is safe" only when you document that clients must handle
   unknown values.
@@ -242,6 +306,9 @@ for line in breaking(old, new, requests=["ChatIn"], responses=["Usage"]):
 - **Ignoring undocumented status codes the fuzzer reports**, such as 401s or 403s raised by an auth
   dependency (FastAPI documents its own 422 automatically, but not these) or 500s on empty lists. Symptom:
   client SDKs that throw on responses their types say cannot happen.
+- **Treating the agent as a tolerant client.** Symptom: a renamed tool argument passes every contract
+  check because no human consumer used it, and agent success rate drops after deploy. Fix: include
+  replayed agent calls in the gate and re-run the agent eval set when tool schemas change.
 
 ## When to use
 - **Snapshot test:** as soon as any client you do not deploy with (a front end in another repo, a
@@ -280,6 +347,14 @@ run against the last released schema, not the previous commit.
   everything stays green while every client breaks.
 - **Contract tests pin what clients were told:** the committed schema snapshot fails on any change, and a
   breaking-change classifier says whether that change accepts less or promises less.
+
+### Agents call your API as tools. How would you stop a schema change from silently breaking them?
+- **Gate on the schema:** snapshot plus a breaking-change report against the last released schema, since
+  tool lists are generated from it and often cached.
+- **Gate on real usage:** replay a sample of recorded tool calls from agent traces against the new request
+  models with unknown fields forbidden, so dropped arguments fail loudly.
+- **Gate on behaviour:** when a tool's schema or description changes, re-run the agent eval set, because a
+  compatible schema can still change which tool the model picks.
 
 ### You must rename a response field that customers read. How do you ship it without breaking them?
 - **Expand first:** add the new field alongside the old one, both populated, and mark the old one

@@ -5,7 +5,8 @@ name: Lost-in-the-middle
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - model-internals/context-window
   - model-internals/attention-mechanism
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Models use the start and end of a long prompt far more reliably than the middle: a U-shaped curve. In
-RAG, more chunks can hurt even with the evidence present, so retrieve fewer, put the best at the edges and
-the question last.
+Models use the start and end of a long context far more reliably than the middle. In an agent, retrieved
+chunks and old tool results pile up in that middle, so retrieve fewer, place the best at the edges and
+restate the current goal last.
+
+## For agent builders
+- **Why it matters for agents.** An agent's context is a growing middle: system prompt at the top, the
+  newest step at the bottom, and every earlier search result and tool output in between. Facts the agent
+  fetched at step 3 can be present at step 15 and still be ignored.
+- **Where it shows up in your stack.** The prompt builder of your RAG tool, the result formatter of each
+  tool, LangChain's long-context reorder document transformer, and compaction or summarization steps in
+  agent frameworks.
+- **What you control.** How many chunks a search tool returns, their order, how long tool results are,
+  whether the agent restates its goal and plan at the end, and when old turns are compacted.
+- **What you can skip.** Settling which attention mechanism causes the curve. Know its shape, that it is
+  model-specific, and how to run a position sweep on your own model.
 
 ## Why it exists
 - **Raising k is the reflex, and it often backfires.** The retrieval eval says the gold chunk is in the
@@ -50,10 +63,10 @@ the question last.
 - **Trough depth is model-specific.** Models trained since the original study, with long-context training
   data and near-perfect single-fact needle-in-a-haystack scores, show a much shallower trough.
 - **It has not gone away.** Multi-fact questions, reasoning over several passages and very long contexts
-  still show positional sensitivity.
+  still show positional sensitivity. Agent runs are exactly that: many facts, spread across many turns.
 - **Treat it as a quantity to measure** for your model and your chunk size, not as a constant.
 
-### Proposed mechanisms
+### Background: proposed mechanisms
 These are explanations offered in the literature, not settled facts.
 1. **Primacy.** In a causal transformer every later token can attend to the first tokens, and the first
    positions tend to become attention sinks that absorb large attention mass regardless of content, so
@@ -75,6 +88,18 @@ The natural layout is "concatenate chunks in rank order, then the question":
 
 Raising k makes every row worse: more distractors, and the evidence deeper in the trough.
 
+### What it does to an agent transcript
+| Region | Contents | Risk |
+|---|---|---|
+| Top | system prompt, tool definitions, original task | strong, but far from the current step |
+| Middle | earlier tool calls, search results, scratch reasoning | the trough: fetched facts get ignored |
+| Bottom | latest tool result and the model's next move | strongest, dominates the decision |
+
+- **Symptoms:** the agent re-searches for something it already found, forgets a constraint from the
+  original task, or contradicts an earlier tool result.
+- **Each tool result adds to the middle**, so verbose tools (raw HTML, full documents, 50 search hits)
+  deepen the trough for every later step.
+
 ### Mitigations and why each works
 1. **Retrieve fewer, better.** Rerank with a cross-encoder, then cut to a small k (5 to 8 is a common
    operating point; measure yours). Each removed distractor returns attention mass to the evidence and
@@ -85,7 +110,8 @@ Raising k makes every row worse: more distractors, and the evidence deeper in th
 3. **Question last.** Long documents first, then the question and instructions, and repeat the key
    instruction at the end. Anthropic's long-context guidance recommends exactly this layout. The question
    sits in the recency window right before generation, and the document prefix is stable, which is also
-   what prompt caching wants.
+   what prompt caching wants. In an agent, the equivalent is restating the goal and remaining plan near
+   the end of the context.
 4. **Optionally sandwich the question.** In a causal model, document tokens are encoded before the model
    has seen a question placed after them, so only the final positions read the documents "with the
    question in mind". Stating the question briefly *before* the documents too (query-aware
@@ -96,32 +122,34 @@ Raising k makes every row worse: more distractors, and the evidence deeper in th
    quote the relevant sentences before answering. The quotes land at the end of the prompt, right before
    the answer, turning "find it in the middle" into "read what you just wrote".
 6. **Compress.** Extract only the relevant sentences from each chunk (an LLM or a small extractive model)
-   before the final prompt, so the middle is short.
+   before the final prompt, so the middle is short. For agents, trim tool results to what the step needs
+   and compact old turns into a short notes block.
 7. **Map-reduce.** When a question genuinely needs many passages, answer per passage or per small group and
-   combine, so no single prompt has a long middle.
+   combine, so no single prompt has a long middle. Sub-agents with their own small contexts are the agent
+   form of this.
 8. **Measure.** Run a position sweep on your model with your chunk size before and after changes.
 
 ## Diagram
-The prompt-builder path that counters the U-shaped curve: retrieve wide, rerank, cut, reorder for the
-edges, then put the question last, with error triage deciding whether layout or retrieval is the fix.
+The context-builder path for an agent step: retrieve wide, rerank, cut, reorder for the edges, then end
+with the goal and question, with error triage deciding whether layout or retrieval is the fix.
 
 ```mermaid
 flowchart TD
-    Q["Question"] --> W["Retrieve wide, for example top-50"]
+    Q["Agent step needs evidence"] --> W["Search tool: retrieve wide, top-50"]
     W --> RR["Cross-encoder rerank"]
     RR --> C["Cut to small k, 5 to 8 or a token budget"]
     C --> E["Edge reorder: rank 1 first, rank 2 last"]
-    E --> P["Prompt: tagged docs first, question and instructions last"]
-    P --> G["Model quotes evidence, then answers"]
-    G --> T{"Wrong answer: was gold chunk in context?"}
-    T -->|"yes, present but unused"| L["Fix layout: smaller k, compress, map-reduce"]
+    E --> P["Context: tagged docs, then goal and question last"]
+    P --> G["Model quotes evidence, then acts"]
+    G --> T{"Wrong step: was gold chunk in context?"}
+    T -->|"yes, present but unused"| L["Fix layout: smaller k, compact, sub-agent"]
     T -->|"no, missing"| R["Fix retrieval: decomposition, recall"]
 ```
 
 ## Examples
-### Edge reordering and a position-sweep harness
-`position_sweep` builds k-document prompts with the gold chunk at every position among random distractors
-and records accuracy per position, which is the curve you tune against.
+### Agent context builder: trimmed results, edge order, goal restated last
+Each step's context ends with the task and the agent's current plan, so the recency window holds what the
+next decision depends on. `position_sweep` measures how much middle your model tolerates.
 
 ```python
 import random
@@ -135,12 +163,20 @@ def reorder_for_edges(ranked):
 
 print(reorder_for_edges([1, 2, 3, 4, 5, 6, 7]))        # [1, 3, 5, 7, 6, 4, 2]
 
-def build_prompt(docs, question):
-    body = "\n\n".join(f'<doc id="{i + 1}">\n{d}\n</doc>' for i, d in enumerate(docs))
-    return (f"{body}\n\nUsing only the documents above, quote the sentences that answer the question, "
-            f"then answer.\nQuestion: {question}")             # documents first, question last
+def format_search_result(ranked_chunks, k=6):
+    docs = reorder_for_edges(ranked_chunks[:k])        # reranked upstream; cut, then edge order
+    return "\n\n".join(f'<doc id="{c["id"]}" source="{c["source"]}">\n{c["text"]}\n</doc>' for c in docs)
 
-def position_sweep(llm, gold, distractors, question, grader, k=20, trials=30):
+def build_step_context(task, notes, recent_turns, plan):
+    return [
+        {"role": "user", "content": f"Task: {task}"},
+        {"role": "user", "content": f"Notes from earlier steps (compacted):\n{notes}"},
+        *recent_turns,                                   # last few tool calls and results, verbatim
+        {"role": "user", "content": f"Reminder - task: {task}\nRemaining plan: {plan}\n"
+                                    "Quote the evidence you rely on, then choose the next action."},
+    ]
+
+def position_sweep(llm, build_prompt, gold, distractors, question, grader, k=20, trials=30):
     """Accuracy as a function of where the gold chunk sits among k-1 distractors."""
     acc = {}
     for pos in range(k):
@@ -163,8 +199,20 @@ def position_sweep(llm, gold, distractors, question, grader, k=20, trials=30):
 | Plus edge reordering | 2,400 tokens | second block from the start |
 | Reranker promotes it to rank 1 or 2 | 2,400 tokens | at one of the two edges |
 
+### Worked scenario: a research agent that forgets what it found
+A research agent makes one search per step and appends 20 chunks of 400 tokens (8,000 tokens) each time.
+Figures are illustrative.
+
+| Step | Context | Where the key fact from step 2 sits | Behaviour |
+|---|---|---|---|
+| 2 | ~18k tokens | near the bottom | used correctly |
+| 6 | ~50k tokens | deep in the middle | agent searches for it again |
+| 10 | ~82k tokens | deeper still | final answer contradicts it |
+| Fix: k = 6 after rerank, notes block, goal restated last | ~25k at step 10 | in the notes block near the end | used, no repeat searches |
+
 ### Error triage: evidence present but unused
-Before touching k, split failures by whether retrieval found the gold chunk. Pure Python over eval rows.
+Before touching k, split failures by whether retrieval found the gold chunk. Pure Python over eval rows,
+or over agent traces where you log which chunks were in context at the failing step.
 
 ```python
 def triage(rows):
@@ -182,15 +230,18 @@ print(triage(rows))   # 39 wrong: 33 with evidence present, 6 missing -> fix lay
 ```
 
 ## Production patterns
-- **Rerank then cut by budget.** Retrieve wide (for example top-50), rerank with a cross-encoder, and keep
-  the top 5 to 8 or a fixed token budget per model. Monitor end-to-end accuracy against k on the eval set;
-  it usually peaks and then declines.
-- **Edge reorder in the prompt builder.** Apply `reorder_for_edges` (or LangChain's long-context reorder
+- **Rerank then cut by budget inside the search tool.** Retrieve wide (for example top-50), rerank with a
+  cross-encoder, and return the top 5 to 8 or a fixed token budget per model to the agent. Monitor
+  end-to-end accuracy against k on the eval set; it usually peaks and then declines.
+- **Edge reorder in the result formatter.** Apply `reorder_for_edges` (or LangChain's long-context reorder
   document transformer) after reranking, except where order carries meaning. Monitor accuracy by
   gold-chunk position in sampled traces.
-- **Documents-first, question-last template.** Keep the document block as a stable prefix, put the
-  question and the key instruction at the end, and ask for quotes before the answer. Monitor prompt-cache
-  hit rate alongside dropped-constraint errors.
+- **Goal and plan restated at the end.** Keep the stable prefix (system prompt, tool schemas, documents)
+  first, and end each step's context with the task, key constraints and remaining plan. Monitor
+  dropped-constraint errors and prompt-cache hit rate together.
+- **Compact old turns at a boundary.** When the transcript passes a token threshold, summarize old tool
+  results into a short notes block that keeps ids and key facts. Monitor repeat searches for the same
+  query within a run; they signal facts lost in the middle.
 - **Position sweep on every model change.** Run the sweep per question type before switching models or
   deployments, and store the curve with the model version. Alert when the trough deepens beyond the
   previous model's.
@@ -209,6 +260,9 @@ print(triage(rows))   # 39 wrong: 33 with evidence present, 6 missing -> fix lay
   contract).
 - **Quote-then-answer: evidence use vs tokens.** Better evidence use and checkable quotes, at the price of
   output tokens and latency; vendor citation features can recover some of that cost.
+- **Compaction: short middle vs lost detail.** Summarizing old turns keeps the context short, but a
+  summary can drop the one fact a later step needs and costs a prefix-cache miss. Keep ids so the agent
+  can re-fetch.
 - **Newer long-context model: no engineering vs fragility.** It shrinks the trough, but the effect is
   model-dependent and silently returns when a customer swaps models.
 
@@ -223,12 +277,14 @@ print(triage(rows))   # 39 wrong: 33 with evidence present, 6 missing -> fix lay
   in the middle behind weaker ones.
 - **Full parent sections at a high k.** Symptom: context overflow and a quality collapse that looks like a
   model regression but is a layout problem.
+- **Verbose tool results in a long agent loop.** Symptom: the agent repeats searches and contradicts
+  earlier findings after ten or so steps. Fix: trim results, compact old turns, restate the goal last.
 - **Treating the effect as fixed.** Symptom: a pipeline tuned for one model regresses silently after a
   model upgrade or a customer's choice of a different deployment.
 
 ## When to use
-- **Use when** a prompt carries more than a handful of retrieved passages, and every time someone
-  proposes raising k.
+- **Use when** a prompt carries more than a handful of retrieved passages, every time someone proposes
+  raising k, and whenever an agent run grows past a few tool calls.
 - **Measure:** the evidence-present-but-unused rate in error analysis (retrieval found the gold chunk, the
   answer is still wrong), because that gap, not recall, is what this effect produces. Then run a position
   sweep and track answer accuracy against k, which usually peaks and then declines.
@@ -267,6 +323,13 @@ a bigger k.
   training favour nearby tokens (recency), and similar retrieved chunks dilute attention in between.
   These are explanations from the literature, not settled facts.
 
+### Your agent re-runs searches for facts it already retrieved earlier in the run. What is happening and what do you change?
+- **Diagnosis:** the earlier results are still in context but now sit in the middle of a long
+  transcript, behind many later tool outputs, so the model does not use them.
+- **Changes:** return fewer, reranked chunks per search; trim tool results; compact old turns into a
+  notes block with ids; restate the task and plan at the end of each step's context.
+- **Verify** with repeat-search counts per run and the evidence-present-but-unused rate on replayed traces.
+
 ### Why can increasing k make a RAG system worse even though recall goes up?
 - **Each extra chunk is a distractor.** Retrieved chunks are similar to each other and to the question, so
   they split a fixed budget of attention among lookalikes.
@@ -286,9 +349,10 @@ a bigger k.
 - **When k is already tiny**, there is little middle to escape, so reranking and a question-last
   template do most of the work.
 
-### Newer models score near-perfect on needle-in-a-haystack. Can you drop these mitigations?
+### Newer models score near-perfect on needle-in-a-haystack. Can you drop these mitigations in your agent?
 - **Not safely.** Single-fact needle tests show a much shallower trough, but multi-fact questions,
-  multi-passage reasoning and very long contexts still show positional sensitivity.
+  multi-passage reasoning and very long contexts still show positional sensitivity, and long agent runs
+  are all three.
 - **Keep them cheap and measured:** rerank-and-cut and question-last cost little, and they protect you
   when a customer swaps to a different model or deployment.
 

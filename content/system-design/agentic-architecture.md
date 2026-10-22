@@ -5,7 +5,8 @@ name: Agentic architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-loop
   - agents/workflows-vs-agents
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-An agentic architecture lets a model choose the next action at runtime, observe, and repeat. The system
-wraps that loop in boundaries it cannot control: least-privilege typed tools, external state, budgets,
-approval gates and tracing. The model owns judgment; the architecture owns guarantees.
+An agentic architecture lets the model choose the next tool call at runtime, observe, and repeat, while
+code you own wraps the loop: least-privilege typed tools, external state, budgets, approval gates and
+tracing. The model owns judgment; the architecture owns guarantees.
+
+## For agent builders
+- **Why it matters for agents.** This is the blueprint of every production agent you will ship. The loop
+  is twenty lines; the layers around it (runtime, gateway, tool layer, state, events) are where resumes,
+  refunds that do not double, and debuggable incidents come from.
+- **Where it shows up in your stack.** LangGraph (graph nodes, a checkpointer per thread, interrupts for
+  approvals), vendor agent SDKs (OpenAI Agents SDK, Claude Agent SDK), durable engines such as Temporal,
+  an LLM gateway such as LiteLLM, MCP servers for tools, and tracing in LangSmith, Langfuse or
+  OpenTelemetry.
+- **What you control.** The tool list and each tool's side-effect class, the step, cost and time
+  budgets, where state is checkpointed, which calls need approval, and the terminal states you alert on.
+- **What you can skip.** Framework-specific syntax until you need it. Every framework maps onto the six
+  layers below, so learn the layers and read any framework's docs as answers to them.
 
 ## Why it exists
 - **Some tasks have no fixed path.** "Resolve this support ticket", "find out why this deploy failed",
@@ -103,6 +117,18 @@ That near-quadratic growth (illustrative numbers) is why the architecture:
 6. **Observability and audit.** Every step emits a structured event: model input hash, tool name,
    arguments, result size, latency, cost, under a run id and tenant id. This makes trajectory evaluation
    and incident review possible.
+
+### Where the layers land in a typical stack
+| Layer | Hand-rolled | Typical framework or tool |
+|---|---|---|
+| Orchestration / runtime | a `while` loop plus a checkpoint table | LangGraph graph with a checkpointer, Temporal workflow, vendor agent SDK runner |
+| Model gateway | one client module | LiteLLM or a provider gateway |
+| Tool layer | adapters with JSON Schema | framework tool decorators, MCP servers |
+| State and memory | Postgres rows keyed by run id | LangGraph checkpointer and store, Redis, an object store for artifacts |
+| Observability | structured logs | LangSmith, Langfuse, Arize Phoenix, OpenTelemetry |
+
+- **Frameworks give you the plumbing, not the policy.** None of them knows your refund threshold or which
+  tools are consequential; you still write those predicates in the tool layer.
 
 ### Where control flow should be code, and where model
 - **Model for judgment about content:** "which document is relevant".
@@ -251,6 +277,9 @@ for label, growth in [("raw output in context", 1.0), ("artifacts by reference",
 - **Cache-friendly stable prefix.** Put instructions and tool definitions first and keep them
   byte-identical across steps, so provider prompt caching can discount them. Monitor the cached-token
   share of input tokens that the provider reports in usage data.
+- **Trajectory traces as the eval dataset.** Export every run's step events (tool, arguments, result
+  size, terminal state) to a tracing tool such as LangSmith or Langfuse, label failed runs, and replay
+  them as regression cases on each prompt, tool or model change. Monitor completion rate per task type.
 
 ## Trade-offs
 - **Flexibility vs predictability.** Flexibility on unknown task paths costs predictability and
@@ -264,12 +293,16 @@ for label, growth in [("raw output in context", 1.0), ("artifacts by reference",
   tool-selection accuracy and inflating context. Narrow tool sets per task, or sub-agents, win once the
   list grows large (the threshold is model-dependent, so measure tool-selection accuracy rather than
   assume a number).
+- **Framework vs hand-rolled runtime.** A framework such as LangGraph gives checkpointing, interrupts
+  and streaming on day one, but adds abstractions and version churn you must debug through. A small
+  hand-rolled loop is easier to read until you need resume, approval and replay, which is when it flips.
 - **Async with streamed events vs client complexity.** Fits long runs and survives restarts, but clients
   must handle partial results, resumption and cancellation.
 
 ## Pitfalls
 - **Keeping run state in process memory.** Symptom: runs vanish on deploys or autoscale events, and
-  users who retry double the side effects. Fix: checkpoint by run id after every step.
+  users who retry double the side effects. The same happens with a framework's in-memory checkpointer
+  left on from the tutorial. Fix: checkpoint by run id after every step to a durable store.
 - **No budget or step cap.** Symptom: a single stuck run consumes a day's token budget while repeating
   the same failing tool call. Fix: all four terminators plus distinct terminal states.
 - **Trusting the model to enforce permissions** ("only refund if the policy allows"). Symptom: a
@@ -353,6 +386,14 @@ disappearing runs become visible as "interrupted at step n" instead of silence.
   without all four the failure is an unbounded run, not a wrong answer.
 - **Distinct states** (`done`, `budget_exhausted`, `stuck`, `awaiting_approval`, `cancelled`) map to
   different follow-ups: a retry, a human, or a bug report, and their rates are what you alert on.
+
+### After a release, more runs end `budget_exhausted`. How do you debug it?
+- **Slice first.** Compare the terminal-state rate per task type and per tool before and after the
+  release; a jump in one task type points at one tool or prompt change.
+- **Read trajectories.** Pull a sample of failed runs from the traces and look for repeated identical
+  tool calls (a stuck loop), validation errors the model keeps retrying, or tool outputs that grew large.
+- **Fix at the right layer:** a broken tool contract, a missing stuck detector, or a prompt regression,
+  then add the failed runs to the regression set.
 
 ## Quiz
 ### Q: Why should agent run state be persisted outside the process after every step?

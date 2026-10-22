@@ -5,7 +5,8 @@ name: httpx
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-await
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-httpx is a requests-style Python HTTP client for sync and `async`/`await` code, with streaming, pooling,
-optional HTTP/2 and mockable transports. The OpenAI and Anthropic Python SDKs are built on it, so its
-timeout and pooling behaviour is your SDK's behaviour.
+An agent is mostly HTTP: model calls, tool APIs, vector stores. httpx is the sync and `async`/`await`
+client underneath the OpenAI and Anthropic Python SDKs, so its timeouts, pooling and streaming decide how
+your agent waits, fans out and fails.
+
+## For agent builders
+- **Why it matters for agents.** One agent step can stream a completion and then run three tool calls
+  in parallel. Whether that step takes 2 s or hangs for ten minutes is decided by connection pools,
+  per-phase timeouts and an outer deadline, all httpx settings.
+- **Where it shows up in your stack.** Inside provider SDKs (`AsyncOpenAI(http_client=...)`), in your
+  own tool functions that call internal APIs, in streaming from self-hosted model servers, and in tests
+  through `MockTransport`.
+- **What you control.** One shared `AsyncClient` per upstream, `httpx.Timeout` per phase,
+  `httpx.Limits` sized for your concurrency, a total deadline per tool call, and where retries live.
+- **What you can skip.** HTTP/2 internals and transport plumbing beyond the three transports below.
+  Know that a read timeout is not a deadline and that the pool is your concurrency limit.
 
 ## Why it exists
 - **`requests` is synchronous.** It defined the ergonomic Python HTTP API, but an AI service fanning out
@@ -42,7 +55,8 @@ timeout and pooling behaviour is your SDK's behaviour.
 ### Clients own connection pools
 - **`httpx.get(...)` is a convenience** that opens and discards a connection.
 - **A `Client`/`AsyncClient` keeps a pool of keep-alive connections,** so repeated calls to the same host
-  skip TCP and TLS handshakes, often the largest part of a short request's latency.
+  skip TCP and TLS handshakes, often the largest part of a short request's latency, and an agent makes
+  many short tool calls.
 - **So create one client per process (or per upstream) and reuse it,** closing it on shutdown with a
   context manager or `aclose()`.
 - **Pool size:** `httpx.Limits(max_connections=..., max_keepalive_connections=...)`, defaults 100 and 20.
@@ -65,7 +79,14 @@ timeout and pooling behaviour is your SDK's behaviour.
   even if it runs for ten minutes.
 - **Slow first bytes trip it at once.** A reasoning model that thinks for 30 s before its first byte fails
   immediately.
-- **For a total deadline,** wrap the call in `asyncio.timeout(...)` (or anyio's equivalent).
+- **For a total deadline,** wrap the call in `asyncio.timeout(...)` (or anyio's equivalent). In an
+  agent, give each tool call its own deadline and the whole run a larger one.
+
+### Parallel tool calls
+- **Models can request several tool calls in one turn.** Run them concurrently with `asyncio.gather`
+  over one shared `AsyncClient`, so the step costs the slowest call, not the sum.
+- **Each call needs its own deadline and error capture,** so one hung tool does not stall the step and
+  one failure becomes a tool result the model can read instead of an exception that kills the run.
 
 ### Streaming
 1. `client.stream("POST", url, json=...)` is a context manager that returns once headers arrive.
@@ -85,7 +106,7 @@ Every client sends through a transport.
 | Transport | What it does |
 |---|---|
 | `httpx.HTTPTransport(retries=n)` (`AsyncHTTPTransport` for an `AsyncClient`) | Retries only failures to establish a connection, not HTTP 429 or 5xx |
-| `httpx.MockTransport(handler)` | Routes requests to a Python function: fast, deterministic tests, no network |
+| `httpx.MockTransport(handler)` | Routes requests to a Python function: fast, deterministic agent tests, no network |
 | `httpx.ASGITransport(app=app)` | Sends requests straight into an ASGI app such as FastAPI, in-process |
 
 - **Application retries with backoff remain your job** (Tenacity, or the SDK's built-in retries).
@@ -102,8 +123,8 @@ Every client sends through a transport.
   assuming httpx's 5 s default is in force.
 
 ## Diagram
-Each phase of one streamed request has its own timeout; only the outer `asyncio.timeout` bounds the
-whole call.
+Each phase of one streamed model or tool request has its own timeout; only the outer `asyncio.timeout`
+bounds the whole call.
 
 ```mermaid
 flowchart TD
@@ -120,6 +141,51 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: parallel tool calls with deadlines
+A tool executor for one agent step. It runs every tool call the model requested concurrently on a shared
+client, gives each a deadline, and turns failures into text the model can read.
+
+```python
+import asyncio, httpx
+
+http = httpx.AsyncClient(base_url="https://tools.internal",
+                         timeout=httpx.Timeout(connect=2.0, read=10.0, write=5.0, pool=1.0),
+                         limits=httpx.Limits(max_connections=50, max_keepalive_connections=20))
+
+async def call_tool(name: str, args: dict, deadline_s: float = 8.0) -> str:
+    try:
+        async with asyncio.timeout(deadline_s):          # total budget for this tool call
+            r = await http.post(f"/tools/{name}", json=args)
+            r.raise_for_status()
+            return r.text
+    except TimeoutError:
+        return f"ERROR: {name} took longer than {deadline_s}s; try a narrower query"
+    except httpx.HTTPStatusError as e:
+        return f"ERROR: {name} returned {e.response.status_code}: {e.response.text[:200]}"
+    except httpx.RequestError as e:
+        return f"ERROR: {name} unreachable ({type(e).__name__}); try another tool"
+
+async def run_step(tool_calls: list[tuple[str, dict]]) -> list[str]:
+    return await asyncio.gather(*(call_tool(n, a) for n, a in tool_calls))   # cost = slowest call
+```
+
+- **Errors become tool results,** so the model can retry with different arguments or pick another tool
+  instead of the run crashing.
+- **The shared client** keeps connections warm across all steps of all runs in this process.
+
+### Worked scenario: one agent step, sequential versus parallel
+Illustrative latencies for a step where the model asked for three tools.
+
+| Tool | Latency |
+|---|---|
+| `search_docs` | 1.2 s |
+| `get_customer` | 0.8 s |
+| `get_invoices` | 2.0 s |
+| Sequential step | 1.2 + 0.8 + 2.0 = 4.0 s |
+| Parallel step with `gather` | max = 2.0 s |
+| Parallel, `get_invoices` hangs, no deadline | until the read timeout, or forever on a trickle |
+| Parallel, 8 s deadline per call | at most 8 s, with an error result the model can act on |
+
 ### Streaming with limits, a deadline and a mock
 Streaming an OpenAI-compatible completion with deliberate limits, a total deadline and a mock for tests.
 
@@ -157,7 +223,8 @@ asyncio.run(main())
 Drop the `transport=` argument and the same code talks to a real server.
 
 ### Worked scenario: a burst against the pool
-200 concurrent calls whose streams last about 8 s each hit the client above.
+200 concurrent calls whose streams last about 8 s each hit the client above, for example 200 agent runs
+starting together.
 
 | Quantity | Value |
 |---|---|
@@ -200,27 +267,34 @@ llm = AsyncOpenAI(http_client=http, timeout=120.0, max_retries=2)   # SDK settin
 
 ## Production patterns
 - **One client per upstream, owned by the app lifespan.** Create the `AsyncClient` at startup (for
-  example in a FastAPI lifespan), share it, and `await client.aclose()` on shutdown. Monitor open sockets
-  and TLS handshakes per second, which should stay low and flat.
-- **Separate pools for streaming and short calls.** Give long LLM streams their own client and `Limits`
-  sized by Little's law, so they cannot starve fast tool or vector-store calls. Monitor `PoolTimeout`
-  count and pool wait time per client.
-- **Per-phase timeouts plus an outer deadline.** Set read to cover worst-case time to first token, keep
-  connect short, and wrap each call in `asyncio.timeout(...)`. Monitor time to first byte and total
-  duration per upstream.
+  example in a FastAPI lifespan), share it across agent runs, and `await client.aclose()` on shutdown.
+  Monitor open sockets and TLS handshakes per second, which should stay low and flat.
+- **Separate pools for model streams and tool calls.** Give long LLM streams their own client and
+  `Limits` sized by Little's law, so they cannot starve fast tool or vector-store calls. Monitor
+  `PoolTimeout` count and pool wait time per client.
+- **Per-phase timeouts plus layered deadlines.** Set read to cover worst-case time to first token, keep
+  connect short, wrap each tool call in `asyncio.timeout(...)`, and give the whole agent run a larger
+  budget. Monitor time to first byte and total duration per upstream and per tool.
 - **Retry status codes in application code.** Retry 429 and 5xx with backoff (Tenacity, or the SDK's
-  `max_retries`) and honour `Retry-After`; transport retries only cover connects. Monitor retries per
-  request and rate-limit errors reaching users.
-- **Test with `MockTransport`, not patching.** Inject the transport into the same client factory used in
-  production, so tests exercise real timeout, header and streaming code paths with no network.
+  `max_retries`) and honour `Retry-After`; transport retries only cover connects. Retry only idempotent
+  tool calls automatically. Monitor retries per request and rate-limit errors reaching users.
+- **Test agents with `MockTransport`, not patching.** Inject the transport into the same client factory
+  used in production, so agent tests replay fixed model and tool responses through real timeout, header
+  and streaming code paths with no network.
+- **Trace every upstream call.** Add a run or trace ID header in a request hook so tool and model calls
+  from one agent run can be joined in your tracing tool.
 
 ## Trade-offs
 - **One API for sync and async vs async discipline.** Scripts, services and tests share code, but async
-  only helps if every other call on the path is async too; one blocking call still stalls the loop.
+  only helps if every other call on the path is async too; one blocking call still stalls the loop and
+  every agent run sharing it.
 - **Shared long-lived client vs lifecycle management.** Pooling lowers latency, at the cost of creating it
   at startup, closing it at shutdown, and not sharing it across event loops or forked processes.
 - **Per-phase timeouts vs a total budget.** They allow slow first tokens while failing fast on dead hosts,
-  but never express a total budget; long streams need an outer deadline as well.
+  but never express a total budget; long streams and tool calls need an outer deadline as well.
+- **Parallel tool calls vs upstream load.** Running a step's calls concurrently cuts latency to the
+  slowest call, but many agents doing it at once multiply load on shared tools; cap with `Limits` or a
+  semaphore.
 - **HTTP/2 multiplexing vs load concentration.** It helps with many small calls to one host, but adds a
   dependency and can concentrate load on one backend behind a connection-level load balancer.
 
@@ -228,12 +302,14 @@ llm = AsyncOpenAI(http_client=http, timeout=120.0, max_retries=2)   # SDK settin
 - **Sizing `max_connections` for short calls, then routing long streams through it.** With the same short
   pool timeout, the symptom is bursts of `PoolTimeout` during spikes while the upstream reports normal
   latency. Fix: a separate client for streams, sized by Little's law.
-- **A new `AsyncClient` per request.** Every call repeats the TLS handshake. Symptom: higher latency plus
-  "too many open files" or ephemeral-port exhaustion under load. Fix: one shared client per upstream.
+- **A new `AsyncClient` per request or per tool call.** Every call repeats the TLS handshake. Symptom:
+  higher latency plus "too many open files" or ephemeral-port exhaustion under load. Fix: one shared
+  client per upstream.
 - **Keeping the 5 s default read timeout for LLM calls.** Long prompts or reasoning models delay the first
-  byte. Symptom: `ReadTimeout` only on big inputs while small ones succeed.
+  byte. Symptom: `ReadTimeout` only on big inputs (late agent steps with long transcripts) while small
+  ones succeed.
 - **Assuming the read timeout caps total duration.** A slowly trickling stream runs far past your budget.
-  Symptom: requests hanging for minutes without any timeout firing.
+  Symptom: requests or agent steps hanging for minutes without any timeout firing.
 - **Expecting `HTTPTransport(retries=3)` to retry 429 or 503.** It only retries connection failures.
   Symptom: rate-limit errors surfacing straight to users.
 - **Abandoning a `client.send(request, stream=True)` response without `aclose()`.** For example on an
@@ -245,9 +321,9 @@ llm = AsyncOpenAI(http_client=http, timeout=120.0, max_retries=2)   # SDK settin
   webhooks, and as the `http_client` you pass to provider SDKs to control proxies, timeouts and limits.
 - **Sync or async:** `AsyncClient` inside async frameworks and agents; the sync client is fine for scripts
   and batch jobs. Prefer `requests` only in legacy synchronous code where nothing else changes.
-- **Measure:** p50/p99 latency per upstream, time to first byte, timeout counts per phase, and pool wait
-  time. Pool wait rising while upstream latency is flat means your connection limit, not the provider, is
-  the bottleneck.
+- **Measure:** p50/p99 latency per upstream and per tool, time to first byte, timeout counts per phase,
+  and pool wait time. Pool wait rising while upstream latency is flat means your connection limit, not
+  the provider, is the bottleneck.
 - **Interviews:** expect questions on why a read timeout is not a deadline and why clients must be shared.
 
 ## Role lens
@@ -277,6 +353,14 @@ byte and total duration per request.
 - **Provider SDKs are built on it,** so passing your own `http_client` controls proxies, limits and hooks
   for every SDK call.
 
+### An agent step sometimes hangs for minutes when one tool is slow. How do you design the tool executor?
+- **Run the step's calls concurrently** with `asyncio.gather` on one shared `AsyncClient`, so the step
+  costs the slowest call rather than the sum.
+- **Give each call an `asyncio.timeout` deadline,** because a read timeout resets per chunk and never caps
+  a trickling response.
+- **Return failures as tool results,** catching `TimeoutError`, `httpx.HTTPStatusError` and
+  `httpx.RequestError`, so the model can choose another action instead of the run dying.
+
 ### A service sees bursts of `PoolTimeout` while the LLM provider reports normal latency. What is happening?
 - **Your pool is the bottleneck, not the provider.** By Little's law, 50 connections holding 8-second
   streams carry about 6 requests per second, so a burst of 200 queues in the pool.
@@ -297,9 +381,9 @@ byte and total duration per request.
   `Retry-After`.
 - **Watch the interaction:** the SDK's own timeout and retry settings apply on top of your httpx client.
 
-### How do you test code that calls an LLM over HTTP without the network?
+### How do you test an agent that calls an LLM and tools over HTTP without the network?
 - **Inject `httpx.MockTransport(handler)`** into the same client factory used in production, so real
-  timeout, header and streaming code paths run.
+  timeout, header and streaming code paths run while the handler replays fixed model and tool replies.
 - **For your own FastAPI app,** `httpx.ASGITransport(app=app)` sends requests straight into it in-process.
 - **This beats patching,** because tests exercise the actual client configuration rather than a stub.
 

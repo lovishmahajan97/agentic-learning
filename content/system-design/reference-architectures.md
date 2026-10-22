@@ -5,7 +5,8 @@ name: Reference architectures
 kind: pattern
 difficulty: intro
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - system-design/ai-solution-architecture
   - system-design/rag-architecture
@@ -21,15 +22,29 @@ sources:
 ---
 
 ## TL;DR
-A reference architecture is a validated, reusable blueprint for a recurring system shape (RAG assistant,
-extraction pipeline, agent, workflow, gateway). Starting from the matching one means you deviate
-deliberately instead of rediscovering missing pieces after launch.
+Reference architectures are reusable blueprints for recurring shapes: RAG assistant, extraction
+pipeline, tool-using agent, workflow, memory assistant, gateway. Before building an agent, match the
+problem to a shape, often a workflow, and deviate deliberately instead of rediscovering missing pieces.
+
+## For agent builders
+- **Why it matters for agents.** The most expensive agent mistake is building one when a workflow would
+  do. The six-question walk below tells you whether the steps are enumerable (workflow) or genuinely
+  depend on what the model observes (agent with step budgets and approval gates).
+- **Where it shows up in your stack.** A workflow maps to a fixed graph in your orchestration engine or
+  framework; an agent maps to a tool-calling loop; retrieval, memory and the gateway are the shared
+  services both call. Most real agent products are compositions of these.
+- **What you control.** Which shape each job gets, which cross-cutting boxes (eval set, tracing, prompt
+  and model registry, control layer) are in the production gate, and which deviations are written down
+  as ADRs.
+- **What you can skip.** Vendor reference diagrams with their product in every box, and enterprise
+  catalogue tooling. One page per shape in the repo, next to the ADRs, is enough.
 
 ## Why it exists
-- **Every first team leaves out the same boxes.** The first document assistant omits evaluation,
-  tracing, access control on retrieval, a gateway with version pinning and output validation, and finds
-  out in production, one incident at a time. The second team repeats it with different names, so the
-  two systems cannot share a review checklist, a monitoring dashboard or an engineer.
+- **Every first team leaves out the same boxes.** The first document assistant or agent omits
+  evaluation, tracing, access control on retrieval, a gateway with version pinning and output
+  validation, and finds out in production, one incident at a time. The second team repeats it with
+  different names, so the two systems cannot share a review checklist, a monitoring dashboard or an
+  engineer.
 - **It solves three problems at once.** It is a **memory** of which components a shape needs and why,
   including ones invisible in a demo; a **vocabulary** ("where is your control layer" points at the
   diagram); and a **baseline for deviation**: a team that omits the reranker or approval gate must say
@@ -45,8 +60,8 @@ deliberately instead of rediscovering missing pieces after launch.
 More than a diagram. A useful one states:
 - **Problem shape** it fits: interaction pattern, latency class, risk class.
 - **Components** with one-line responsibilities.
-- **Data flows**, including what reaches the model and what is stored.
-- **Default NFRs**: typical latency budget, cost driver, availability target.
+- **Data flows**, including what reaches the model, which tools it can call, and what is stored.
+- **Default NFRs**: typical latency budget, cost driver, availability target, step budget for agents.
 - **Variation points** where legitimate choices exist.
 - **Anti-patterns** seen in the wild.
 
@@ -89,14 +104,18 @@ design document, not a reference.
 - **Agents need a justification.** The agent shape is justified only when the steps cannot be
   enumerated up front; the Anthropic guidance on building effective agents is the standard argument for
   starting with the simplest shape that works.
+- **Agents usually sit inside a workflow.** A common composition is a fixed workflow with one bounded
+  agent node (for example "investigate this failure") whose output is validated before the next fixed
+  step.
 
 ### Cross-cutting components every shape shares
 - **Evaluation harness and golden set,** because every shape's output is probabilistic and quality
-  is only visible over a dataset.
-- **Tracing with cost per call,** so failures and spend can be attributed to a route and a version.
+  is only visible over a dataset; for agents the set scores whole runs.
+- **Tracing with cost per call,** so failures and spend can be attributed to a route, a step and a
+  version.
 - **A prompt and model registry,** so what is running in production is versioned, not folklore.
-- **A control layer** for validation and policy, because every shape's output reaches something
-  downstream.
+- **A control layer** for validation and policy, because every shape's output, including every agent
+  tool call, reaches something downstream.
 
 They are drawn once in each reference so that no team can claim they were optional.
 
@@ -108,14 +127,15 @@ Ask these in order, *because* each one removes shapes the later ones would other
    retrieval nodes. No → agent (shape 3), with step budgets.
 3. **Is the input a stream of items or a person waiting?** Items → batch extraction (shape 2) with a
    review queue. A person → interactive, so a latency budget and streaming.
-4. **Must answers be grounded in a corpus the model has not seen?** Yes → retrieval (shape 1).
+4. **Must answers be grounded in a corpus the model has not seen?** Yes → retrieval (shape 1), which an
+   agent usually gets as a search tool.
 5. **Does state persist across sessions?** Yes → add memory (shape 5).
 6. **Is more than one team or product calling models?** Yes → the platform layer (shape 6) belongs
    underneath all of them.
 
 ### Compose, deviate, record, revisit
 - **Real systems are compositions.** Most production assistants are a workflow whose nodes include a
-  retrieval step and an extraction step, behind the platform layer.
+  retrieval step, an extraction step and sometimes one bounded agent, behind the platform layer.
 - **Vendor references are inputs, not answers.** Cloud providers and vendors publish reference
   architectures, but they tend to put the vendor's product in every box; extract the shape and keep
   component names abstract.
@@ -128,7 +148,7 @@ Ask these in order, *because* each one removes shapes the later ones would other
 
 ## Diagram
 The six questions as a decision path: each answer adds a shape or a component, and the result is a
-composition, not a single box.
+composition, not a single box. The agent branch is taken only when the steps are not known in advance.
 
 ```mermaid
 flowchart TD
@@ -152,7 +172,8 @@ flowchart TD
 
 ## Examples
 ### Worked scenario: "AI to handle inbound supplier emails"
-A logistics company asks for this. Discovery shows two distinct jobs:
+A logistics company asks for this, framed as "an agent that handles supplier email". Discovery shows two
+distinct jobs, and neither needs a free-roaming agent:
 - **(a)** classify each email (invoice, delay notice, dispute, other) and extract fields such as PO
   number and new delivery date into the ERP;
 - **(b)** let a coordinator ask questions like "which suppliers have slipped twice this quarter" over the
@@ -184,9 +205,10 @@ A logistics company asks for this. Discovery shows two distinct jobs:
 **Shared:** both jobs sit behind the same gateway and tracing stack; each has its own golden set: 300
 labelled emails for (a), 80 question-answer pairs for (b).
 
-### Job (a)'s confidence check as code
+### Job (a)'s confidence check as a validation node
 Every independent check must agree before a write; anything else goes to review with its reasons. The
-PO format is illustrative.
+same function works as the control-layer check on an agent's "write to ERP" tool call. The PO format is
+illustrative.
 
 ```python
 import re
@@ -218,8 +240,10 @@ print(route({"po_number": "PO-123465", "new_delivery_date": date(2026, 11, 3)},
 # ('review', ['po_not_in_erp', 'po_not_in_raw_text', 'supplier_mismatch']): a transposed digit is caught
 ```
 
-### The six questions as a shape matcher
-A runnable sketch of "How to apply one", fed the support-ticket refund case from Check yourself.
+### The six questions as a shape matcher: workflow or agent?
+A runnable sketch of "How to apply one". The first call is the support-ticket refund case from Check
+yourself; the second is an IT-ops copilot that investigates failing deploys, where the next step depends
+on what each log query returns.
 
 ```python
 def match_shapes(acts, steps_known, person_waiting, needs_corpus, persistent_state, many_teams):
@@ -238,37 +262,50 @@ def match_shapes(acts, steps_known, person_waiting, needs_corpus, persistent_sta
         plan.append("platform layer (6) underneath")
     return plan
 
-for line in match_shapes(acts=True, steps_known=True, person_waiting=False,
-                         needs_corpus=True, persistent_state=False, many_teams=True):
-    print("-", line)
-# - approval gate + validation contract on the action path
-# - workflow (4)
-# - batch extraction (2) + review queue
-# - retrieval (1)
-# - platform layer (6) underneath
+refunds = match_shapes(acts=True, steps_known=True, person_waiting=False,
+                       needs_corpus=True, persistent_state=False, many_teams=True)
+ops_copilot = match_shapes(acts=True, steps_known=False, person_waiting=True,
+                           needs_corpus=True, persistent_state=True, many_teams=True)
+for name, plan in (("refunds", refunds), ("ops copilot", ops_copilot)):
+    print(name, "->", "; ".join(plan))
+# refunds -> approval gate ...; workflow (4); batch extraction (2) + review queue; retrieval (1); platform layer (6) underneath
+# ops copilot -> approval gate ...; agent (3) with step budgets; interactive: latency budget + streaming;
+#                retrieval (1); memory (5); platform layer (6) underneath
 ```
+
+For the ops copilot the composition becomes concrete: read-only tools (log search, runbook retrieval)
+run freely; "restart service" and "roll back" pass an approval gate; the run has a step cap and a token
+budget recorded in its ADR; the eval set is a few dozen past incidents with their known root cause.
 
 ## Production patterns
 - **One-page catalogue entry.** When a shape has been built twice. Keep a template in the repo next to
   the ADRs with fixed headings: problem shape, components, data flows, default NFRs, variation points,
   anti-patterns. Monitor how often reviews find missing cross-cutting components; it should trend to zero.
+- **Agent shape needs a written justification.** At design review for any new agent. The ADR states why
+  the steps cannot be enumerated, the step budget, which tools are read-only versus gated, and the
+  eval set. Monitor steps per run and the share of runs that follow the same path, which signals the
+  agent should become a workflow.
 - **Deviation requires an ADR link.** At every architecture review. The checklist lists each blueprint
   component; an omitted one needs a linked ADR with the reason or the review fails. Monitor deviations
   without ADRs, and the same unblessed deviation recurring across teams (the signal for a new entry).
-- **Review everything, then sample.** For extraction pipelines that write to a system of record. Start
-  with 100% of items routed to human review, lower the rate step by step only while measured precision
-  on reviewed items stays above the bar. Monitor sampled precision, review queue depth and age.
+- **Review everything, then sample.** For extraction pipelines and agents that write to a system of
+  record. Start with 100% of items or actions routed to human review, lower the rate step by step only
+  while measured precision on reviewed items stays above the bar. Monitor sampled precision, review
+  queue depth and age.
 - **Exploration variant versus production gate.** For prototypes. Allow a lighter variant (stubbed
   guardrails, no reranker) during exploration, and enforce the full shape, including eval set, tracing
   and gateway, as the production gate. Monitor how many prototypes reach users without passing the gate.
-- **Platform layer as a shared dependency.** Once several products call models. Put one gateway
-  underneath all of them and treat it as tier-0 infrastructure with its own SLO. Monitor added latency
-  per call, gateway availability and per-product cost attribution.
+- **Platform layer as a shared dependency.** Once several products or agents call models. Put one
+  gateway underneath all of them and treat it as tier-0 infrastructure with its own SLO. Monitor added
+  latency per call, gateway availability and per-product cost attribution.
 
 ## Trade-offs
 - **Shared blueprint vs novelty.** It speeds design and review but biases teams toward the known shape;
   a genuinely new problem may need a new reference, and forcing it into an old one hides the novelty.
   The signal for a new entry is the same unblessed deviation recurring across teams.
+- **Agent flexibility vs predictability.** The agent shape handles paths nobody enumerated, but pays in
+  variable latency, cost and debuggability. It flips to a workflow as soon as traces show most runs take
+  the same few paths.
 - **Rich mandatory components vs prototype cost.** Many mandatory components raise the quality floor
   but also the cost of a prototype. Keep a lighter "exploration" variant and insist on the full shape
   only at the production gate.
@@ -281,26 +318,29 @@ for line in match_shapes(acts=True, steps_known=True, person_waiting=False,
 
 ## Pitfalls
 - **Agent shape for known steps.** Symptom: unpredictable latency and cost, and debugging sessions that
-  end in "the model decided to". Fix: a workflow with contracted nodes.
+  end in "the model decided to". Fix: a workflow with contracted nodes, keeping an agent only for the
+  one step that truly varies.
 - **Dropping the cross-cutting boxes** because "we will add evals later". Symptom: the first model
   upgrade is a coin flip and nobody can say whether quality moved. Fix: the eval set, tracing and
   gateway are part of the production gate, not a follow-up.
 - **Treating the reference as mandatory in every detail.** Symptom: a 400-document corpus gets a
   reranker, a query rewriter and a multi-hop planner, and the simplest question takes eight seconds.
   Fix: treat variation points as choices and record each omission as an ADR.
-- **Reference describes a vendor's product, not a shape.** Symptom: switching a component requires
-  rewriting the architecture document, and the exit cost is discovered at renewal. Fix: keep component
-  names abstract and map vendors onto them per system.
+- **Reference describes a vendor's product, not a shape.** Symptom: switching a component or agent
+  framework requires rewriting the architecture document, and the exit cost is discovered at renewal.
+  Fix: keep component names abstract and map vendors onto them per system.
 - **Never recording deviations.** Symptom: six months later nobody knows whether the missing approval
-  gate was a decision or an oversight. Fix: a review that fails any omitted component without an ADR.
+  gate on an agent's write tool was a decision or an oversight. Fix: a review that fails any omitted
+  component without an ADR.
 
 ## When to use
-- **Use when:** starting any design, during an architecture review, and when onboarding an engineer to
-  an existing system. The first question is always "which shape is this, and where does it deviate".
+- **Use when:** starting any design, deciding whether a request needs an agent at all, during an
+  architecture review, and when onboarding an engineer to an existing system. The first question is
+  always "which shape is this, and where does it deviate".
 - **Avoid when:** you would use it as a substitute for discovery. The shape follows from the
   interaction pattern and risk class, which only requirements work can establish.
-- **Measure:** how often reviews find missing cross-cutting components (should trend to zero) and how
-  long design takes for a standard shape.
+- **Measure:** how often reviews find missing cross-cutting components (should trend to zero), how long
+  design takes for a standard shape, and for agents the share of runs on a repeated path.
 - **Interviews:** naming the shape, its components and its default risks in the first two minutes of a
   system-design question separates practised candidates from those who start with a box labelled "LLM".
 
@@ -335,12 +375,12 @@ tracing and an evaluation set built from historical tickets with their resolutio
 - **It also gives a shared vocabulary and a baseline,** so a review discusses deliberate deviations
   instead of rediscovering missing boxes.
 
-### A customer asks for "AI to process inbound supplier emails". How do you pick the shape?
+### A customer asks for "an agent to process inbound supplier emails". How do you pick the shape?
 - **Split the request into jobs first.** Classifying emails and writing fields to the ERP is the
   extraction pipeline; answering coordinators' questions over that data is retrieval plus a
   structured-data tool.
 - **Walk the six questions for each job:** acts or informs, enumerable steps, items or a person
-  waiting, corpus, state, number of teams.
+  waiting, corpus, state, number of teams. Neither job has unknown steps, so neither needs an agent.
 - **Put the human at the action boundary:** a review queue for low-confidence extractions, which also
   becomes the labelling pipeline.
 
@@ -351,6 +391,14 @@ tracing and an evaluation set built from historical tickets with their resolutio
   "the model decided to".
 - **The agent is justified only when the path genuinely depends on what the model observes,** and then
   it comes with step budgets, approval gates and a sandbox.
+
+### You are reviewing a design for an IT-ops agent that can restart services. What must the blueprint show before you approve it?
+- **A justification for the agent shape:** why the investigation steps cannot be enumerated, plus a
+  step cap and token budget per run.
+- **Tool classes:** read-only tools (logs, metrics, runbooks) run freely; restarts and rollbacks pass a
+  typed contract and an approval gate, and run in a sandbox or with scoped credentials.
+- **The cross-cutting boxes:** an eval set of past incidents scored per run, tracing per tool call, a
+  pinned model behind the gateway, and an ADR for every omitted component.
 
 ### Which components must exist in every shape, and how do you enforce that in practice?
 - **Cross-cutting boxes:** an evaluation harness with a golden set, tracing with cost per call, a prompt

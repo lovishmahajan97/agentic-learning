@@ -5,7 +5,8 @@ name: Timeouts
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/streaming
   - serving-inference/cancellation
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-LLM call duration depends on unknown output length plus queueing, so one flat timeout kills good work
-or lets hung calls hold resources. Layer connect, first-token, idle and total timers, derive the total
-from `max_tokens × TPOT`, propagate the budget, and cancel on every expiry.
+An agent run chains LLM and tool calls of unpredictable length, so per-call constants either kill good
+work or let one hung step eat the run. Give the run one deadline, layer connect, first-token, idle,
+total timers per call, and cancel on expiry.
+
+## For agent builders
+- **Why it matters for agents.** A run is a chain: six model calls and three tools under one user SLO.
+  If each call gets the full budget, every call "succeeds within timeout" and the run still misses it;
+  one hung tool can stall the whole loop.
+- **Where it shows up in your stack.** The SDK client's `timeout` and `max_retries`, `httpx.Timeout`
+  inside it, `asyncio.timeout` around tool calls, your framework's per-run step or time limits, and the
+  60 s idle timers on proxies in front of your agent server.
+- **What you control.** One absolute run deadline passed to every step, per-call budgets from
+  `max_tokens` and measured TPOT, per-tool timeouts from tool latency percentiles, and what the agent
+  returns when time runs out.
+- **What you can skip.** Memorising every proxy's default; audit the hops in your own path and stream
+  with heartbeats.
 
 ## Why it exists
 - **Legitimate durations vary by 100×.** Ordinary HTTP timeouts assume tens of milliseconds. An LLM
@@ -87,6 +101,16 @@ A single call crosses several layers, each with its own timer:
 4. **Carry it on the wire.** gRPC carries deadlines natively; over HTTP pass it as a header or in your
    own context object.
 
+### Timeouts inside an agent loop
+- **Tools need timers too.** A web fetch, SQL query or code sandbox can hang as easily as a model call;
+  wrap each in a timeout from its own latency percentiles, inside the run deadline.
+- **A timed-out tool is information for the model.** Return a short "tool timed out" result to the next
+  step so the agent can try another tool or answer with what it has, rather than crashing the run.
+- **Step limits are the loop's total timer.** A max-steps cap bounds runs that loop without progress,
+  which no per-call timeout catches.
+- **Side-effecting tools need care.** A timed-out write may have happened; retry only with an
+  idempotency key, or check state first.
+
 ### What happens when a timer fires
 - **Nothing stops upstream unless you make it.** A client-side timeout that merely raises leaves the
   engine decoding, the provider billing, and the connection half-open until the server's own timers
@@ -108,12 +132,12 @@ A single call crosses several layers, each with its own timer:
 - **Expose queue wait as a metric**, so you can see the budget being spent before clients time out.
 
 ## Diagram
-Each phase of a streaming call has its own timer, and every expiry routes through cancellation before
-any fallback or retry.
+One model call inside an agent run: each phase has its own timer, all capped by the run's remaining
+budget, and every expiry routes through cancellation before any fallback or retry.
 
 ```mermaid
 flowchart TD
-    S["Start: check remaining budget"] --> C["Connect"]
+    S["Check run budget left"] --> C["Connect"]
     C -->|"connected"| F["Wait for first token"]
     F -->|"first content"| R["Read stream"]
     R -->|"chunk or heartbeat resets idle"| R
@@ -208,6 +232,33 @@ print(asyncio.run(agent()))
 # (['plan', 'search', 'draft'], 'partial (skipped review: only 0.1s left)')
 ```
 
+### Agent scenario: a tool timeout returned to the model
+A hung tool becomes a tool result, so the agent continues within the run deadline instead of failing.
+
+```python
+import asyncio
+
+async def slow_search(q):          # stand-in for a tool whose upstream hangs
+    await asyncio.sleep(10); return "results"
+
+async def call_tool(fn, args, remaining_s, tool_timeout_s=3.0):
+    try:
+        return await asyncio.wait_for(fn(**args), timeout=min(tool_timeout_s, remaining_s))
+    except asyncio.TimeoutError:
+        return {"error": "tool_timeout", "tool": fn.__name__,
+                "hint": "try another source or answer with what you have"}
+
+print(asyncio.run(call_tool(slow_search, {"q": "refund policy"}, remaining_s=20)))
+# {'error': 'tool_timeout', 'tool': 'slow_search', 'hint': 'try another source or answer with what you have'}
+```
+
+| Budget item (60 s run SLO, illustrative) | Allocation |
+|---|---|
+| 6 LLM calls, `max_tokens` 300, TTFT p99 2 s, TPOT 30 ms | about 6 × (2 + 9) = 66 s at worst, so cap tokens or steps |
+| Same with `max_tokens` 150 | about 6 × (2 + 4.5) = 39 s |
+| 3 tools at 3 s timeout each | 9 s |
+| Remaining margin | about 12 s for queueing and the final answer |
+
 ### Worked scenario: the 60-second wall
 A non-streaming endpoint behind a load balancer with the default 60 s idle timeout, TTFT p99 8 s, TPOT
 30 ms (illustrative).
@@ -222,6 +273,12 @@ Fixes, cheapest first: cap `max_tokens`, stream with heartbeats so the idle time
 call, then raise the idle timeout on hops you own.
 
 ## Production patterns
+- **One run deadline, many child budgets.** Create the deadline when the agent run starts, store it on
+  the run context, and give every model and tool call `min(own budget, remaining)`. Monitor which step
+  type consumes the budget in traces.
+- **Per-tool timeouts with structured timeout results.** Wrap each tool with its own timeout and return
+  a typed timeout result to the model instead of raising. Monitor tool timeout rate per tool and how
+  often the agent recovers after one.
 - **Configure SDK timeouts and retries explicitly.** Construct the client with a timeout and retry count
   you chose (the OpenAI Python SDK accepts `timeout`, including an `httpx.Timeout`, and `max_retries`,
   and `client.with_options(...)` overrides them per call). Monitor timeout counts per call site.
@@ -302,12 +359,19 @@ upstream stops. Measure which step consumes the budget in practice and shrink `m
 work earlier accordingly.
 
 ## Interview questions
-### Why is a single flat timeout wrong for LLM calls?
+### A tool in your agent loop sometimes hangs for minutes. How do you handle it?
+- **Wrap the tool in its own timeout** from its latency percentiles, capped by the run's remaining
+  deadline.
+- **Return the timeout to the model** as a structured tool result so it can pick another tool or answer
+  with what it has, instead of failing the run.
+- **Cancel the underlying work** and, for side-effecting tools, retry only with an idempotency key.
+
+### Why is a single flat timeout wrong for LLM calls, especially inside agents?
 - **Legitimate durations span 100×:** queueing, prefill and an unknown output length mean a healthy call
   can take under a second or several minutes.
 - **A short constant** fails long outputs; **a long one** lets dead upstreams pin workers and pool slots.
-- **Layered timers** separate "unreachable" (connect), "stuck in queue" (first token), "stalled" (idle)
-  and "too slow overall" (total), each with its own response.
+- **Agents chain calls,** so per-call constants add up past the run SLO; layered timers inside one run
+  deadline fix both.
 
 ### What is your effective timeout if the SDK says 10 minutes and nginx sits in front?
 - **The shortest timer wins:** nginx `proxy_read_timeout` defaults to 60 s, so a non-streaming call that
@@ -336,6 +400,8 @@ work earlier accordingly.
   at stalled streams or missing heartbeats; total timeouts at longer outputs or slower decode.
 - **Correlate** with engine queue wait, prompt-length percentiles and any infrastructure change (a new
   proxy or gateway with a 60 s default).
+- **For agents,** also split by step index and tool: growing transcripts lengthen late-step TTFT, and
+  one degraded tool can account for most run timeouts.
 
 ## Quiz
 ### Q: What is the most useful liveness signal for a streaming LLM response?

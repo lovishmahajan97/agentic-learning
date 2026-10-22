@@ -5,7 +5,8 @@ name: Multi-tenancy
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - system-design/tenant-isolation
   - reliability/tenant-level-quotas-and-noisy-neighbor-isolation
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Multi-tenancy is one running system serving many customers while keeping each one's data, configuration,
-quotas and bill separate. A tenant identity set at the edge reaches every layer (index, prompt, caches,
-token meter), and each resource is deliberately pooled, bridged or siloed.
+A multi-tenant agent platform runs every customer's agents on one system while keeping their data, tools,
+memory, quotas and bill separate. A tenant identity set at the edge reaches every agent step: retrieval,
+prompt, memory, tool credentials, caches and the token meter.
+
+## For agent builders
+- **Why it matters for agents.** An agent touches more tenant-scoped state than a chat endpoint: it
+  retrieves, reads and writes memory, calls tools with a customer's OAuth tokens, and runs in the
+  background for minutes. Every one of those is a place the tenant can be lost.
+- **Where it shows up in your stack.** The auth dependency that resolves the tenant, the vector-store
+  filter, memory and checkpoint namespaces, the connector or secrets vault holding per-tenant tool
+  tokens, the queue message that starts a background run, and the token meter.
+- **What you control.** Pool, bridge or silo per resource; a tenant config record (model, prompt
+  version, enabled tools, step and token budgets); per-tenant concurrency caps on agent runs; and the
+  offboarding workflow that reaches every store.
+- **What you can skip.** Cell-based routing details until you run many independent stacks. Know the
+  three sharing models, the tenant directory and the AI-specific places the tenant must reach.
 
 ## Why it exists
 - **One deployment per customer does not scale.** Fine for three customers; for three hundred it means
@@ -34,10 +48,11 @@ token meter), and each resource is deliberately pooled, bridged or siloed.
   large customers, but cannot be the product's default shape.
 - **"Add a `customer_id` column" fails twice.** The filter is a convention, so one forgotten `WHERE`
   clause returns another customer's records; in an LLM product that record lands in a prompt and is
-  paraphrased back to the wrong user.
+  paraphrased back to the wrong user, or an agent acts on it.
 - **A column only separates data.** Tenants also need separate configuration (model, system prompt,
-  features), performance envelopes (one tenant's bulk ingestion must not starve another's chat), cost
-  accounting (who used which tokens) and sometimes jurisdictions (EU data stays in the EU).
+  features, tools), performance envelopes (one tenant's bulk ingestion or batch of agent runs must not
+  starve another's chat), cost accounting (who used which tokens) and sometimes jurisdictions (EU data
+  stays in the EU).
 - **What the discipline buys.** All of those answered with one identity and a few explicit sharing
   decisions, rather than rediscovered one by one in incidents.
 
@@ -45,14 +60,15 @@ token meter), and each resource is deliberately pooled, bridged or siloed.
 ### Tenant identity, established once and carried everywhere
 1. **Credential in.** Every request carries a JWT from the identity provider, an API key or an SSO
    assertion.
-2. **Resolve at the edge.** The tenant comes from that credential, never from a request body or query
-   parameter, *because* anything the caller can type is something the caller can change.
+2. **Resolve at the edge.** The tenant comes from that credential, never from a request body, query
+   parameter or anything the model produced, *because* anything the caller (or a prompt injection) can
+   type is something it can change.
 3. **Carry it with the work:**
    - in a request-scoped context variable inside the process;
-   - as a header or message attribute when work crosses into a queue;
-   - as a field on every log line, trace span and metric.
+   - as a header or message attribute when work crosses into a queue, such as a background agent run;
+   - as a field on every log line, trace span and metric, including each agent step.
 4. **Never re-derive it.** No layer may need to work out the tenant from data, *because* re-derivation is
-   where mistakes hide.
+   where mistakes hide. Tools receive the tenant from the run context, not from model arguments.
 
 ### Three sharing models, chosen per resource
 The AWS SaaS Lens vocabulary names the options precisely:
@@ -87,7 +103,7 @@ The AWS SaaS Lens vocabulary names the options precisely:
 ### Tenant is a boundary, not an authorisation model
 - **Outer boundary only.** Inside a tenant, users still have roles and documents still have ACLs.
 - **Necessary, not sufficient.** Scoping retrieval by tenant does not stop an intern and the CFO of the
-  same tenant retrieving the same board minutes.
+  same tenant retrieving the same board minutes, or an agent acting for the intern doing so.
 - **Pick the isolation level early** (reseller, organisation, workspace), *because* it is the key every
   store is partitioned by, and changing it later means re-keying everything.
 
@@ -95,28 +111,29 @@ The AWS SaaS Lens vocabulary names the options precisely:
 - **Onboarding is one idempotent workflow** that creates the directory entry, configuration, keys and any
   dedicated resources, so a half-failed signup can simply be retried.
 - **Offboarding is where audits find gaps.** Deletion must reach the primary database, vector index,
-  object storage, caches, queues, logs and traces, evaluation samples, fine-tuned adapters and, on their
-  retention schedule, backups.
+  object storage, caches, queues, logs and traces, agent memory and checkpoints, stored tool tokens,
+  evaluation samples, fine-tuned adapters and, on their retention schedule, backups.
 - **Silo vs pool.** In a silo this is "drop the stack"; in a pool it is a delete keyed by tenant across
   every store, which only works if every store carries the key.
 - **Crypto-shredding.** Per-tenant encryption keys turn the backup problem into deleting one key.
 
 ### Tenant-aware configuration
 - **The tenant record carries:** allowed model (or model tier), system prompt and prompt version, enabled
-  features and tools, rate and token quotas, retention period, data-residency region, allowed connectors.
+  features and tools, rate and token quotas, max agent steps, retention period, data-residency region,
+  allowed connectors.
 - **Load once per request and pass explicitly**, rather than sprinkling `if tenant == "acme"` through the
   code, *because* that is what keeps a hundred tenants from becoming a hundred code paths.
 
 ### Fairness and noisy neighbours
 Pooled resources need fair-share mechanisms *because* the model-serving queue and the database do not
 know tenants exist:
-- **Per-tenant rate limits and concurrency caps** at the gateway.
-- **Per-tenant queues or weighted scheduling** for background work.
+- **Per-tenant rate limits and concurrency caps** at the gateway, including a cap on concurrent agent runs.
+- **Per-tenant queues or weighted scheduling** for background work and background agent runs.
 - **Token budgets per billing period**, so one tenant's batch job does not become everyone's latency
-  incident.
+  incident. Agents make this sharper: one run can make 10-20 model calls.
 
 ### Metering and cost allocation
-- **Record per LLM call:** input tokens, output tokens, model and tenant.
+- **Record per LLM call:** input tokens, output tokens, model and tenant (plus run ID for agents).
 - **Why:** token spend is the dominant variable cost of an AI product and is invisible without per-tenant
   attribution.
 - **What it feeds:** billing, quota enforcement, and the margin analysis that decides which tier a
@@ -136,7 +153,7 @@ Tenant identity must reach places a classic SaaS never had:
 
 ## Diagram
 Follow the tenant ID from the verified credential: it is resolved once, then every store, cache, meter and
-queue message receives it explicitly.
+queued agent run receives it explicitly.
 
 ```mermaid
 flowchart TD
@@ -148,7 +165,7 @@ flowchart TD
     CF --> V[("Vector search filtered by tenant")]
     V --> L["LLM call, cache key has tenant"]
     L --> M["Meter tokens per tenant"]
-    C -->|"explicit field"| Q["Queue message for background work"]
+    C -->|"explicit field"| Q["Queue message for agent run"]
 ```
 
 ## Examples
@@ -196,9 +213,41 @@ async def enqueue_ingestion(doc_id: str):
     await queue.send({"tenant_id": tenant_ctx.get(), "doc_id": doc_id})
 ```
 
-### Runnable: a per-tenant fair queue for ingestion
+### Background agent run: tenant in the job, not in the model's arguments
+A queued run rebuilds its tenant scope from the message, then every step uses it: tools get the tenant's
+own connector token, memory is namespaced, and the step and token budget come from tenant config.
+`vault`, `memory`, `meter` and `llm` are your application's own clients.
+
+```python
+async def run_agent_job(msg: dict):
+    tenant_id, run_id = msg["tenant_id"], msg["run_id"]     # set by the API from the verified token
+    if not tenant_id:
+        raise RuntimeError("no tenant: refuse to run")        # fail closed
+    cfg = await tenant_config.load(tenant_id)
+    mem = memory.namespace(f"{tenant_id}:{msg['user_id']}")   # memory never shared across tenants
+    messages = [{"role": "system", "content": cfg.system_prompt},
+                *await mem.recall(msg["task"]),
+                {"role": "user", "content": msg["task"]}]
+    for step in range(cfg.max_steps):
+        await quotas.check_tokens(tenant_id)                   # stop a runaway run mid-loop
+        reply = await llm.complete(model=cfg.model, messages=messages,
+                                   tools=[t for t in TOOLS if t.name in cfg.enabled_tools])
+        await meter.record(tenant_id, run_id=run_id, model=cfg.model,
+                           input_tokens=reply.usage.input_tokens,
+                           output_tokens=reply.usage.output_tokens)
+        if not reply.tool_calls:
+            await mem.save(msg["task"], reply.text)
+            return reply.text
+        for call in reply.tool_calls:
+            token = await vault.get(tenant_id, connector=call.name)   # this tenant's OAuth token only
+            out = await TOOLS_BY_NAME[call.name].run(call.args, token=token, tenant_id=tenant_id)
+            messages.append({"role": "tool", "tool_call_id": call.id, "content": out})
+    return "stopped: step budget reached"
+```
+
+### Runnable: a per-tenant fair queue for ingestion and agent runs
 A FIFO queue puts a bulk upload in front of everyone. Round-robin across tenants means a small tenant
-waits at most one turn per active tenant, not behind 1,000 queued chunks.
+waits at most one turn per active tenant, not behind 1,000 queued chunks or agent runs.
 
 ```python
 from collections import deque, defaultdict
@@ -232,6 +281,19 @@ print([q.get()[0] for _ in range(6)])
 
 Weighted fair scheduling generalises this by giving paying tiers more turns per round.
 
+### Worked scenario: one tenant launches 500 background agent runs
+A pooled worker fleet has 200 concurrent run slots. One tenant submits 500 research runs at once; each
+takes about 15 steps. Figures are illustrative.
+
+| Policy | Slots the big tenant holds | Slots left for 399 other tenants | Effect |
+|---|---|---|---|
+| FIFO, no cap | 200 | 0 until its runs drain | every other tenant's agents queue for the duration |
+| Per-tenant cap of 20 concurrent runs | 20 | 180 | big tenant's batch takes longer; nobody else notices |
+| Cap plus weighted fair queue | 20 | 180, served round-robin | small tenants wait at most one turn per active tenant |
+
+The cap and the step budget both live in the tenant config, so raising them is an enterprise-tier
+decision, not a code change.
+
 ### Worked scenario: promoting a tenant from pool to silo
 An enterprise customer's contract now requires a dedicated database. The directory makes it a runbook,
 not a code change.
@@ -250,16 +312,20 @@ not a code change.
   with `SET LOCAL` from the verified tenant. The table owner bypasses policies unless row security is
   forced, and superusers or `BYPASSRLS` roles always do, so the app must not connect as either. Monitor
   queries that run without the setting.
-- **Tenant on every signal.** Use from day one. Add the tenant ID as a structured log field and a trace
-  span attribute on every request and job, and as a metric label while tenant count stays modest
-  (thousands of label values strain most metrics backends). Monitor per-tenant p95 latency, errors and
-  token spend.
-- **Gateway quotas per tenant.** Use for any pooled API. Keep a token-bucket or sliding-window counter
-  keyed by tenant (for example in Redis) for requests and for LLM tokens, returning 429 with a retry
-  hint. Monitor 429 rate per tenant and the share of tokens used by the top tenant.
-- **Two-tenant isolation tests in CI.** Use for every endpoint and background job. Seed two tenants with
-  look-alike data, run each flow as tenant A, and assert nothing from tenant B appears in responses,
-  caches or retrieved passages. Monitor coverage of endpoints by this suite.
+- **Tenant on every signal, including every agent step.** Use from day one. Add the tenant ID as a
+  structured log field and a trace span attribute on every request, job and agent step, and as a metric
+  label while tenant count stays modest (thousands of label values strain most metrics backends). Monitor
+  per-tenant p95 latency, errors and token spend.
+- **Gateway quotas and run caps per tenant.** Use for any pooled API. Keep a token-bucket or
+  sliding-window counter keyed by tenant (for example in Redis) for requests, LLM tokens and concurrent
+  agent runs, returning 429 with a retry hint. Monitor 429 rate per tenant and the share of tokens used by
+  the top tenant.
+- **Per-tenant tool credentials in a vault.** Store each tenant's connector OAuth tokens keyed by tenant
+  and connector, fetch them inside the tool from the run's tenant, and never put them in the prompt.
+  Monitor token fetches whose tenant differs from the run's tenant (should be zero).
+- **Two-tenant isolation tests in CI.** Use for every endpoint, background job and agent tool. Seed two
+  tenants with look-alike data, run each flow as tenant A, and assert nothing from tenant B appears in
+  responses, caches, memory or retrieved passages. Monitor coverage of endpoints by this suite.
 - **Per-tenant data keys for deletion.** Use when offboarding must reach backups. Encrypt each tenant's
   data with its own key held in a KMS, record the key ID in the tenant directory, and delete the key at
   offboarding. Monitor time from offboarding request to verified deletion across all stores.
@@ -271,48 +337,49 @@ not a code change.
 - **Siloing: strongest isolation vs linear cost.** It gives the strongest isolation and simplest
   per-tenant customisation, but cost grows with tenant count and upgrades become fleets. Sustainable only
   for a small, high-value tier.
-- **Per-tenant configuration: cheap customisation vs test matrix.** Every knob multiplies the test matrix.
-  It pays off when tenants differ in policy (model, prompt, tools) rather than in code.
+- **Per-tenant configuration: cheap customisation vs test matrix.** Every knob (model, prompt, enabled
+  tools, step budget) multiplies the test matrix. It pays off when tenants differ in policy rather than in
+  code.
 - **Carrying tenant identity everywhere: plumbing vs forensics.** It costs discipline and a little
   plumbing, but is far cheaper than the forensic work of finding which code path lost it after a leak.
 - **Shared model-serving fleet: amortised GPUs vs KV-cache contention.** One tenant's long-context
-  traffic can dominate the KV cache. Dedicated capacity becomes worth it when a tenant's load is both
-  large and latency-sensitive.
+  traffic, such as long agent transcripts, can dominate the KV cache. Dedicated capacity becomes worth it
+  when a tenant's load is both large and latency-sensitive.
 
 ## Pitfalls
-- **Accepting `tenant_id` from a request body or query string.** Symptom: a penetration test, or a
-  curious customer, reads another tenant's conversations by editing one field. Fix: derive it from the
-  verified credential at the edge.
+- **Accepting `tenant_id` from a request body, query string or tool argument.** Symptom: a penetration
+  test, a curious customer or a prompt injection reads another tenant's conversations by editing one
+  field. Fix: derive it from the verified credential at the edge and pass it to tools from the run context.
 - **Forgetting the tenant key on the vector search or a semantic cache.** Symptom: an answer cites a
   document the user's organisation never uploaded. Fix: enforce the filter in the index and put the
   tenant in every cache key.
 - **Letting tenant context evaporate at a process or thread boundary.** Queues, cron jobs, thread pools,
-  or a sync FastAPI dependency that sets a `ContextVar` in a worker thread. Symptom: background jobs or
-  handlers run as "no tenant" and either fail or write into the wrong partition. Fix: put the tenant
-  explicitly on every message and job, use `async def` for context-setting dependencies, and fail closed
-  when no tenant is set.
+  or a sync FastAPI dependency that sets a `ContextVar` in a worker thread. Symptom: background jobs,
+  agent runs or handlers run as "no tenant" and either fail or write into the wrong partition. Fix: put
+  the tenant explicitly on every message and job, use `async def` for context-setting dependencies, and
+  fail closed when no tenant is set.
 - **Hard-coding exceptions for a big customer.** Symptom: a release breaks only for them, discovered in
   production because the test suite has no such tenant. Fix: express the difference as tenant
   configuration.
 - **Offboarding by deleting database rows only.** Symptom: a departed customer's document resurfaces
-  from the vector index or a cached answer, or a deletion audit finds it in traces and eval samples.
-  Fix: one offboarding workflow that deletes by tenant key in every store, plus crypto-shredding for
-  backups.
+  from the vector index, agent memory or a cached answer, or a deletion audit finds it in traces and eval
+  samples. Fix: one offboarding workflow that deletes by tenant key in every store, plus crypto-shredding
+  for backups.
 - **Measuring cost per model but not per tenant.** Symptom: a tenant on a flat plan quietly consumes most
-  of the token budget with no alarm until the invoice. Fix: meter tokens per tenant at the call site and
-  alert on spend against plan.
+  of the token budget with long agent runs, with no alarm until the invoice. Fix: meter tokens per tenant
+  at the call site and alert on spend against plan.
 
 ## When to use
-- **Design for it from the first commit** of any product that will serve more than a handful of
-  customers, *because* retrofitting tenant identity into an existing schema, index and prompt pipeline is
-  one of the most expensive migrations there is.
+- **Design for it from the first commit** of any agent product that will serve more than a handful of
+  customers, *because* retrofitting tenant identity into an existing schema, index, memory store and
+  prompt pipeline is one of the most expensive migrations there is.
 - **Choose the sharing model per resource:** start pooled for compute and bridge or pooled for data, and
   write down what promotes a tenant to a dedicated tier.
 - **Keep single-tenant deployment as an explicit product option** for regulated buyers, not an accident.
-- **Measure:** per-tenant latency percentiles, error rates, token spend and quota hits. If you cannot
-  break a dashboard down by tenant, you cannot run the product.
-- **Interviews:** expect to be asked how the tenant ID reaches the vector store and the cache, and what
-  happens when one tenant uploads a million documents at once.
+- **Measure:** per-tenant latency percentiles, error rates, token spend, agent runs in flight and quota
+  hits. If you cannot break a dashboard down by tenant, you cannot run the product.
+- **Interviews:** expect to be asked how the tenant ID reaches the vector store, the cache and a tool
+  call, and what happens when one tenant uploads a million documents or launches hundreds of runs at once.
 
 ## Role lens
 - **Engineer:** Threads the tenant through request context, queue messages, retrieval filters, cache
@@ -343,18 +410,26 @@ latency per tenant so this is seen before the tickets.
 - **Why per resource:** compute, data and indexes have different isolation and cost needs, so a typical
   system pools compute, bridges or pools data, and silos only the tier that pays for it.
 
-### How does the tenant ID reach the vector store, the cache and a background job?
+### How does the tenant ID reach the vector store, agent memory, a tool call and a background run?
 - **Edge:** resolved from the verified token, then set in a request-scoped context variable.
-- **Stores and caches:** passed as an index-enforced filter on every vector query and included in every
-  semantic or prompt cache key.
-- **Jobs:** written as an explicit field on the queue message, because context variables do not cross
-  process boundaries.
+- **Stores and caches:** passed as an index-enforced filter on every vector query, a namespace on memory,
+  and included in every semantic or prompt cache key.
+- **Tools and jobs:** tools receive it from the run context (never from model arguments) to fetch that
+  tenant's credentials; queued runs carry it as an explicit message field, because context variables do
+  not cross process boundaries.
+
+### One tenant's batch of agent runs is slowing every other tenant. What do you put in place?
+- **Per-tenant concurrency cap on runs** at the gateway or scheduler, from tenant config, so one tenant
+  holds at most a fixed share of worker slots.
+- **Weighted fair queueing** for queued runs, and a step and token budget per run checked inside the loop.
+- **Watch** runs in flight, queue wait and token share per tenant, and alert before latency tickets arrive.
 
 ### A customer reports an answer citing a document they never uploaded. How do you debug it?
 - **Treat it as a leak first:** find the request's trace, the retrieved passage IDs and their owning
   tenant.
 - **Check the usual paths:** a vector search without the tenant filter, a cache key without the tenant,
-  a background job that ran with no tenant context, or a few-shot example drawn from another tenant.
+  a background job that ran with no tenant context, shared agent memory, or a few-shot example drawn from
+  another tenant.
 - **Then close the class of bug:** add a two-tenant test for that path and a database or index-level
   backstop.
 
@@ -366,9 +441,9 @@ latency per tenant so this is seen before the tickets.
   silo tier drifts back toward per-customer operations.
 
 ### How would you allocate LLM cost to tenants on a pooled serving fleet?
-- **Meter every call:** input tokens, output tokens, model and tenant, recorded at the call site.
+- **Meter every call:** input tokens, output tokens, model, tenant and run, recorded at the call site.
 - **Price by model:** multiply token counts by each model's per-token price to get spend per tenant per
-  period.
+  period, and per agent run.
 - **Act on it:** feed billing and quotas, and compare spend with plan revenue to decide tier moves before
   a flat-plan tenant erodes margin.
 

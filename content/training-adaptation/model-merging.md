@@ -5,7 +5,8 @@ name: Model merging
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/peft
   - training-adaptation/supervised-fine-tuning
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Model merging combines fine-tunes of one base into one set of weights by parameter arithmetic (averaging,
-task vectors, trimming and sign-voting), with no training. You get several skills at one model's serving
-cost, paying with task interference nothing corrects.
+Model merging combines fine-tunes of one base, such as a tool-calling tune and a chat tune, into one
+agent model by weight arithmetic (averaging, task vectors, trimming, sign-voting) with no training. One
+model's serving cost, but interference nothing corrects.
+
+## For agent builders
+- **Why it matters for agents.** A self-hosted agent often needs several skills in one model: reliable
+  tool-call formatting, your domain, and good conversation. Merging a tool-use fine-tune with an instruct
+  tune can give one model all three without routing every step or retraining on data you do not have.
+- **Where it shows up in your stack.** mergekit YAML configs for full checkpoints, adapter-combination
+  helpers in PEFT for LoRA adapters, and many community "merged" models on model hubs that you might be
+  tempted to put behind an agent.
+- **What you control.** Which parents (same base revision only), the method and density, λ, and the eval
+  gate: tool-call validity, task success, chat-template behaviour and refusals, scored against each
+  parent.
+- **What you can skip.** Linear mode connectivity theory and DARE's proof. Know task vectors, why TIES
+  elects a sign, and that a merge is unverified until your agent suite passes.
 
 ## Why it exists
 - **Serving several fine-tunes is costly.** Three fine-tunes of one 8B base (support domain, tool-call
@@ -131,9 +145,22 @@ Four-parameter walkthrough (trim to top 50%, two entries each):
 - **Nothing is trained, so nothing is verified.** Every merge needs the full eval suite, including chat
   template, end-of-turn behaviour and safety checks, before anyone calls it a model.
 
+### What it means for an agent model
+- **Tool-call formatting is a fragile skill.** It lives in exact token patterns around the tool-call
+  markers, so a parent whose template differs, or a merge whose weights lean toward the chat parent, can
+  silently stop emitting parseable calls.
+- **Keep the tool-use parent's template.** Serve the merge with the chat template and tool-call format the
+  tool-use parent was trained on, and test that end-of-turn and tool-call tokens still appear.
+- **Merging adapters is the cheap path.** A tool-format adapter and a tenant-tone adapter on one base
+  can be combined into one adapter with the same TIES/DARE choices, then evaluated per tenant.
+- **Score per skill, then end to end.** Measure tool-call validity, conversation quality and refusals
+  separately against each parent, then replay full agent tasks, because a merge that wins on chat but
+  loses a few points of valid calls fails more multi-step tasks.
+
 ## Diagram
-Follow one tensor through a TIES or dare_ties merge: deltas are taken against the shared base, sparsified,
-sign-voted, averaged among agreeing tasks, then added back and gated by evals.
+Follow one tensor through a TIES or dare_ties merge of, say, a tool-use tune and a chat tune: deltas are
+taken against the shared base, sparsified, sign-voted, averaged among agreeing tasks, then added back and
+gated by agent evals before the merge replaces routed specialists.
 
 ```mermaid
 flowchart TD
@@ -145,7 +172,7 @@ flowchart TD
     EL --> DM["Disjoint merge: average only agreeing entries"]
     DM --> M["theta = base + lambda times tau_merged"]
     B --> M
-    M --> G["Per-task evals, template smoke test, safety suite"]
+    M --> G["Agent evals: tool calls, tasks, template, safety"]
     G -->|"fails"| R["Fall back to routed specialists"]
 ```
 
@@ -232,7 +259,26 @@ parameters:
 dtype: bfloat16
 ```
 
+### Worked scenario: one agent model instead of a router
+A team self-hosts an agent on an 8B base with two fine-tunes: a tool-use SFT (trained on agent traces) and
+a community instruct tune with better conversation. Today a router sends every agent step to one of
+them. Scores below are illustrative, to show how the decision is made.
+
+| Candidate | Valid tool calls | Agent task success (20-step suite) | Chat quality | Refusals kept | GPUs |
+|---|---|---|---|---|---|
+| Router over both parents | 97% | 81% | 8.1 | yes | 2 copies |
+| Linear average 0.5/0.5 | 91% | 70% | 7.9 | yes | 1 |
+| TIES, density 0.2, λ near 1 | 96% | 79% | 8.0 | yes | 1 |
+| TIES, chat weight raised | 89% | 66% | 8.3 | partly | 1 |
+
+- **The decision:** ship the TIES candidate only if a 1-point drop in valid calls and 2 points of task
+  success are inside your tolerance; otherwise keep the router.
+- **Why task success moves more than call validity:** a per-step loss compounds over a 20-step task.
+
 ## Production patterns
+- **Merge agent skills with a tool-call gate.** When combining a tool-use tune with a chat or domain tune,
+  score every candidate on schema-valid tool calls, full replayed agent tasks and refusals, against each
+  parent. Monitor tool-call parse failures per model version after rollout.
 - **Merge recipes as code.** Keep each merge as a versioned config (method, parent revisions, density,
   weights, λ) next to its eval report, so any registered model can be rebuilt exactly. Monitor that parent
   revisions in the config match the registry.
@@ -275,12 +321,18 @@ dtype: bfloat16
   Symptom: tops a public board, underperforms its parents on your tasks.
 - **Skipping the safety regression.** Merging can quietly undo refusal training. Symptom: complies with
   requests every parent refused, discovered by a user rather than a test.
+- **Judging an agent merge on chat benchmarks.** Conversation scores rise while tool-call formatting
+  erodes. Symptom: more parse failures, retries and stalled agent loops after the swap. Fix: gate on
+  schema-valid calls and full replayed tasks.
 
 ## When to use
 - **Use when:** you have several fine-tunes of the same base and need one artifact; you want a community
   tune's conversational quality for your domain model without its data; you are averaging checkpoints or
   seeds from your own run; or you want a fast experiment before a multi-task training job.
-- **Avoid when:** you own the data, so training is the better substitute.
+- **Agent use:** one self-hosted model that must both call tools reliably and converse well, when the
+  router over specialists costs too many GPUs.
+- **Avoid when:** you own the data, so training is the better substitute; also when your agent runs on a
+  hosted API, where there are no weights to merge.
 - **Never ship** a merge without per-task evals, a general benchmark, a template smoke test and the
   safety suite.
 - **Measure:** each parent's task metric before and after; treat any drop as the merge's cost, not noise.
@@ -323,13 +375,21 @@ conversational gain is measurable; otherwise fall back to routing.
 - **Check the template:** a mixture of parents' chat templates shows up as leaked role tags and never
   emitting end-of-turn.
 
-### SLERP or TIES: when would you pick each?
-- **SLERP** for exactly two closely related tunes: it moves along the arc between them, preserving norms
-  that a straight-line midpoint would shrink.
-- **TIES** for three or more parents or conflicting deltas: trimming removes noise and sign election stops
-  disagreeing updates from cancelling.
-- **Plain averaging or soups** when the models learned the same thing differently, such as different seeds
-  or learning rates on the same data.
+### Each tenant's agent has a tone LoRA, and all share a tool-format LoRA on one base. Would you merge the adapters?
+- **Adapters are task vectors:** the B_iA_i products can be combined with weights and the same TIES or
+  DARE options, so one combined adapter per tenant replaces stacking two at request time.
+- **Interference risk:** a tone adapter can override weights the tool-call format depends on, so the
+  tool-format adapter needs enough weight; SLERP is an option only for two at a time.
+- **Gate per tenant:** schema-valid tool calls, replayed agent tasks and refusals against the unmerged
+  pair; keep serving them separately if the combined adapter regresses.
+
+### After deploying a merged model, your agent retries tool calls far more often. What happened?
+- **Formatting eroded:** the chat parent's delta overrode weights the tool-call format depended on, or
+  the merge mixed two chat templates so tool-call markers are emitted inconsistently.
+- **Diagnose:** compare parse-failure rate per model version, and diff the served template against the
+  tool-use parent's template.
+- **Fix:** raise the tool-use parent's weight or lower density, use the tool-use template, and gate the
+  next candidate on tool-call validity and full tasks, or fall back to routing.
 
 ### When would you not merge, and what would you do instead?
 - **When you own the data and compute:** multi-task SFT is more reliable, because merging has no

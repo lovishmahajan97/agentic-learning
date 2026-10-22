@@ -5,7 +5,8 @@ name: Synthetic data generation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - training-adaptation/data-curation
   - training-adaptation/knowledge-distillation
@@ -23,9 +24,23 @@ sources:
 ---
 
 ## TL;DR
-Synthetic data generation uses a model, program or simulator to manufacture training or eval examples.
-Its value is decided by verification: examples are only as good as the filter choosing survivors, and
-recursive training on unfiltered output collapses the distribution.
+Agent builders use a model, program or simulator to manufacture tool-call training data, agent tasks and
+simulated users for evals. Its value is decided by verification: examples are only as good as the filter
+choosing survivors, and unfiltered recursion collapses.
+
+## For agent builders
+- **Why it matters for agents.** Before launch you have no agent traffic, and after launch the failures
+  you care about are rare. Synthetic tasks, tool-call examples and simulated users are how most teams
+  get an agent eval suite at all, and how they teach a small model a tool-call format.
+- **Where it shows up in your stack.** A generation script calling your provider, tool schemas as the
+  source of labels, a sandbox or mock tool backend that executes calls, an LLM judge or end-state
+  checker, and the eval harness that replays the tasks against every agent version.
+- **What you control.** The specification (tools, task types, personas, difficulty), the verifier
+  (executed end state beats judge), the mix with real traces, dedup and diversity gates, and which sets
+  stay walled off as evals.
+- **What you can skip.** Pretraining-scale synthetic corpora and the model-collapse theory beyond its
+  defences. Know construction-first generation, execution verification, judge calibration and
+  decontamination.
 
 ## Why it exists
 - **Real data is scarce where you need it most.** The long tail of odd inputs that break a product
@@ -98,6 +113,22 @@ Mode collapse is the default behaviour of a sampled generator, so diversity must
   outside a restricted environment.
 - **Distillation:** the same machinery with a specific aim; see the knowledge distillation lesson.
 
+### Synthetic data for agents
+Three shapes cover most agent work:
+1. **Tool-call examples by construction.** Sample a valid call (tool name plus arguments) from the
+   schema, have a model write the user request that needs it, then check the agent recovers the same
+   call. The label is right before any model touches it.
+2. **Synthetic tasks with an executable end state.** Seed a sandbox (a test database, a repository, a
+   mock CRM), state a goal, and verify by inspecting the end state after the agent runs: the row
+   exists, the tests pass, the refund was not issued twice.
+3. **Simulated users.** A second model plays a user with a persona, a goal and hidden facts it reveals
+   only when asked, so multi-turn agents get tested on clarifying questions and recovery, not just
+   one-shot requests.
+
+- **Verification order still holds:** an executed end state beats a judge reading the transcript.
+- **Walls still hold:** tasks used for training never appear in the eval suite, and the simulator's model
+  should differ from the agent's.
+
 ### Model collapse and how to avoid it
 **Mechanism:** training on its own (or a predecessor's) unfiltered output, generation after generation,
 shrinks the tails first, then the whole distribution. Rare phrasings vanish, variance falls, errors
@@ -117,8 +148,9 @@ compound, and each generation is a blurrier copy. The defences follow from the m
   and some open-weight licences attach conditions to derived models.
 
 ## Diagram
-The generate-verify loop: verification decides what survives, real held-out data decides whether it
-worked, and failures flow back into the specification rather than into more generation.
+The generate-verify loop, as used for agent tool-call data and eval tasks: verification (ideally an
+executed end state) decides what survives, real held-out agent traffic decides whether it worked, and
+failures flow back into the specification rather than into more generation.
 
 ```mermaid
 flowchart TD
@@ -177,6 +209,52 @@ print(f"kept {len(kept)}/{len(examples)}")
 # and have a human read 50 kept and 50 rejected examples before trusting the pass rate.
 ```
 
+### Construction-first tool-call data for an agent
+The call is sampled from the tool schema first, so the label is correct; the model only writes the
+request. The round-trip check asks an independent, stronger checker model (not the model you will train)
+to produce the call and keeps exact matches.
+
+`llm` is the same provider stub as above; `checker_call` is a tool-call request to that checker.
+
+```python
+import json, random
+
+TOOLS = {"search_orders": {"customer_email": ["ana@example.com", "li@example.com"],
+                           "status": ["open", "shipped", "refunded"]},
+         "create_refund": {"order_id": ["A-1001", "B-2002"], "reason": ["damaged", "late", "wrong_item"]}}
+PERSONAS = ["impatient customer on mobile", "polite non-native speaker", "support agent forwarding a case"]
+
+def sample_call(rng):
+    name = rng.choice(list(TOOLS))
+    return {"name": name, "arguments": {k: rng.choice(v) for k, v in TOOLS[name].items()}}
+
+def make_tool_example(rng, checker_call):
+    call = sample_call(rng)                                     # label first: valid by construction
+    request = llm(f"As a {rng.choice(PERSONAS)}, write one message that requires exactly this action "
+                  f"and states every argument value, without naming the tool: {json.dumps(call)}")
+    predicted = checker_call(request, tools=list(TOOLS))        # round trip: did the request keep every fact?
+    return {"input": request, "label": call, "verified": predicted == call,
+            "provenance": {"generator": "<model id>", "prompt": "toolcall-v1"}}
+
+# Keep verified rows for training; read rejects, because some are hard-but-valid requests the checker
+# missed, which belong in the eval suite rather than the bin.
+```
+
+### Worked scenario: bootstrapping an agent eval suite before launch
+A refunds agent has 4 tools and no traffic yet. Illustrative funnel for synthetic tasks in a sandbox
+seeded with test orders:
+
+| Stage | Count | Notes |
+|---|---|---|
+| Task specs generated (persona × goal × edge case) | 2,000 | goals include partial refunds and duplicate requests |
+| After dedup by embedding similarity | 1,300 | many near-identical "refund my late order" tasks |
+| End-state checker written and passing on a reference run | 900 | tasks whose expected end state could be stated exactly |
+| SME review of a 100-task sample | 87 of 100 accepted | rejects were unrealistic policies |
+| Final suite, walled off from training | ~780 | about 87% of 900 |
+
+The suite now gates every prompt, model and tool change; once real traffic exists, real failures are
+added and synthetic tasks are retired where real ones cover the same case.
+
 ### Execution verifier for generated code
 Pure Python, runnable. Keeps only candidates whose unit tests pass in a separate process with a timeout.
 `subprocess` isolation is not a security sandbox; run untrusted generations in a locked-down container.
@@ -227,6 +305,10 @@ print(f"varied    distinct-2 = {distinct_n(varied):.2f}")      # 1.00
 ```
 
 ## Production patterns
+- **Sandboxed agent tasks with end-state checks.** Build eval and training tasks against a seeded sandbox
+  or mock tool backend, and verify by inspecting its state after the run rather than by judging the
+  transcript. Monitor per-task pass rate across agent versions and flag tasks that every version fails
+  (often a broken task, not a weak agent).
 - **Construction-first for structured tasks.** For extraction, classification and tool calls, sample
   the label programmatically and generate only the surface text, with a round-trip extraction at
   temperature 0. Monitor round-trip pass rate per type, and read rejects to catch a checker that discards
@@ -235,7 +317,8 @@ print(f"varied    distinct-2 = {distinct_n(varied):.2f}")      # 1.00
   template version, seed, sampling settings and verifier verdicts, so a bad behaviour traces to one batch
   and you regenerate that batch, not everything.
 - **Batch gates on verification and diversity.** Reject a batch whose pass rate or distinct-n falls
-  outside the range of previous accepted batches; also track length and topic distributions per version.
+  outside the range of previous accepted batches; also track length, topic and per-tool distributions
+  per version.
 - **Judge calibration before scale.** Before an LLM judge filters a full run, score a few hundred
   human-labelled items and measure agreement; recalibrate whenever the judge model or rubric changes.
 - **Real data as the anchor, walled-off evals.** Accumulate real curated data across versions and add
@@ -276,6 +359,11 @@ print(f"varied    distinct-2 = {distinct_n(varied):.2f}")      # 1.00
   behaviour, so the fix becomes "regenerate everything".
 - **Ignoring terms of service or licence until launch review.** Symptom: a legal block on a model that
   already works.
+- **Simulated users that are too cooperative.** The simulator volunteers every fact up front and never
+  changes its mind. Symptom: high eval pass rate, while real users trigger clarifying-question failures.
+  Fix: give the simulator hidden facts, a persona and permission to be vague or wrong.
+- **Judging agent tasks from the transcript alone.** A judge accepts a confident "refund issued" message.
+  Symptom: passing evals while the sandbox shows no refund or two. Fix: check the end state.
 
 ## When to use
 - **Use when:** real labelled data is scarce, private or missing rare cases; you need behaviours nobody
@@ -285,6 +373,8 @@ print(f"varied    distinct-2 = {distinct_n(varied):.2f}")      # 1.00
   analysis.
 - **Measure:** verification pass rate per batch, diversity across versions, the eval delta on *real*
   held-out data, and agreement between fast verifiers and a human-labelled sample.
+- **Agents before launch:** synthetic tasks in a sandbox and simulated users are often the only way to
+  get an eval suite; retire them as real failures arrive.
 - **Day to day:** a generation pipeline with provenance on every row.
 - **Interviews:** how you would prevent collapse, and why you would generate the label before the input.
 
@@ -343,13 +433,23 @@ pipeline's error bar, not noise.
 - **Recalibrate on change:** whenever the judge model or rubric changes, rerun the agreement check, and
   spend human effort calibrating verifiers rather than labelling everything.
 
-### Design the verifier for a synthetic code-generation dataset. What do you monitor?
-- **Execution:** run each candidate with its unit tests in a separate process with a timeout, counting
-  infinite loops as failures, and keep only clean exits.
-- **Isolation:** `subprocess` is not a security sandbox, so run untrusted generations in a locked-down
-  container.
-- **Monitor:** pass rate and distinct-n per batch against previous accepted batches, plus per-row
-  provenance so a bad batch can be regenerated alone.
+### You are launching a refunds agent with no traffic. How do you build its eval suite?
+- **Synthetic tasks in a sandbox:** seed test orders, generate task specs across personas, goals and
+  edge cases (partial refunds, duplicates), and write an end-state check per task.
+- **Simulated users:** a different model plays the customer with hidden facts, so multi-turn behaviour
+  and clarifying questions get tested.
+- **Trust it:** dedup by embedding similarity, have SMEs review a sample, wall the suite off from any
+  training data, and replace synthetic tasks with real failures once traffic arrives.
+
+### How would you generate training data to teach a small model your tool-call format?
+- **Construction-first:** sample valid calls from the tool schemas, have a strong model write the user
+  request that needs each one, with personas for diversity.
+- **Verify:** an independent checker must recover the exact call from the request, and rejects are read
+  by hand, because some are hard-but-valid cases that belong in the eval suite.
+- **Gate batches:** distinct-n, per-tool balance and round-trip pass rate per tool, then evaluate the
+  trained model on real held-out requests, not synthetic ones. For generated code, the same idea is
+  execution: unit tests in a separate process with a timeout, and `subprocess` is not a security
+  sandbox.
 
 ## Quiz
 ### Q: What most determines the quality of a synthetic training set?

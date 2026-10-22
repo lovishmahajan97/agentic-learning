@@ -5,7 +5,8 @@ name: Rate limiting (slowapi)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/api-keys-oauth2-jwt
   - fastapi-for-ai/concurrency-limits
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Rate limiting caps how fast each caller consumes paid LLM work. slowapi gives FastAPI decorator limits
-like `"10/minute"` per client, counted in memory or Redis, returning 429. It counts *requests*; AI
-services also need a *token* budget built beside it.
+One agent request fans out into many paid LLM and tool calls, so limits must cap runs and tokens per
+caller, not just HTTP requests. slowapi gives FastAPI decorator limits like `"10/minute"` in memory or
+Redis, returning 429; build token budgets beside it.
+
+## For agent builders
+- **Why it matters for agents.** A single `POST /runs` can trigger 10-30 model calls and as many tool
+  calls, so "30 requests per minute" says nothing about spend. One looping agent can drain the shared
+  provider quota for every tenant.
+- **Where it shows up in your stack.** slowapi or a gateway in front of your agent API, a Redis-backed
+  token budget per tenant, the provider's own RPM/TPM limits your agent hits mid-run, and third-party
+  tool APIs with their own quotas.
+- **What you control.** Admission per run (runs per minute and concurrent runs per tenant), a token budget
+  reserved per model step, and how the loop reacts to an upstream 429: wait for `Retry-After` inside the
+  run budget, or stop and report.
+- **What you can skip.** Choosing between fine-grained window algorithms on day one; a fixed window for
+  run admission plus a token budget covers most agent products.
 
 ## Why it exists
 - **Upstream capacity is fixed.** The provider grants your organisation a requests-per-minute and
@@ -119,6 +133,22 @@ limits while Redis is down). For a paid LLM route, per-process fallback is usual
 - **Build it as a dependency.** slowapi's decorator runs before the handler and doesn't know the cost, so
   token budgets are usually a small custom dependency on the same Redis.
 
+### Limits for agent runs
+An agent route is one HTTP request that becomes many upstream calls, so limits live at three levels:
+
+| Level | What to limit | Where it runs |
+|---|---|---|
+| **Run admission** | runs started per minute, concurrent runs per tenant | slowapi on `POST /runs`, or a Redis counter |
+| **Per model step** | tokens reserved before each LLM call against the tenant's TPM | a budget check inside the loop, same Redis |
+| **Per tool** | calls to a third-party API that has its own quota | a bucket per tool key inside the tool executor |
+
+- **Check the budget at every step, not only at admission.** A run admitted with budget left can still
+  spend 200k tokens over 20 steps; the in-loop check stops it at the step that would overspend.
+- **Upstream 429s are expected mid-run.** Honour the provider's `Retry-After` if it fits the remaining run
+  deadline; otherwise end the step with an error the model or the user can see, instead of a tight retry.
+- **A rejected tool call is an observation.** Return "rate limited, retry after 20 s" as the tool result
+  so the model can pick another tool or answer, rather than crashing the run.
+
 ### Alternatives
 - **Edge limits** (nginx `limit_req`, Envoy, an API gateway, a cloud WAF) run before Python and are
   cheaper per rejected request, but rarely know tenant or token cost.
@@ -126,7 +156,8 @@ limits while Redis is down). For a paid LLM route, per-process fallback is usual
 - **Common combination:** a coarse edge limit (IP, DDoS) plus slowapi or custom limits per tenant in the app.
 
 ## Diagram
-Where each limit sits on an LLM request: cheap coarse checks first, then per-caller request and token
+Where each limit sits on an LLM request, which for an agent repeats at every model step: cheap coarse
+checks first, then per-caller request and token
 budgets in shared Redis, all before the paid upstream call. This is the intended order; with the
 decorator in the example below, the token dependency actually runs first (see the ordering detail).
 
@@ -203,6 +234,51 @@ async def chat(request: Request, response: Response, body: dict,
   it. Stash the reservation on `request.state` and release it in the `RateLimitExceeded` handler, or run
   both checks as dependencies in a fixed order.
 
+### Agent run: admission limit plus a per-step token budget
+Run admission uses slowapi; every model step inside the loop reserves tokens on the same Redis. `llm`
+and `estimate_tokens` are your own functions; `r` and `caller` are from the example above.
+
+```python
+TENANT_TPM = 200_000
+
+async def reserve(tenant: str, est: int) -> bool:
+    key = f"tpm:{tenant}:{int(time.time() // 60)}"
+    used = await r.incrby(key, est)
+    await r.expire(key, 120)
+    if used > TENANT_TPM:
+        await r.decrby(key, est)                       # release: this step will not run
+        return False
+    return True
+
+@app.post("/v1/agent/runs")
+@limiter.limit("5/minute")                             # runs, not model calls
+async def start_run(request: Request, response: Response, body: dict):
+    tenant, messages = caller(request), body["messages"]
+    for step in range(12):
+        est = estimate_tokens(messages) + 1024         # prompt so far plus max_tokens for this step
+        if not await reserve(tenant, est):
+            return {"status": "paused", "reason": "token budget", "step": step}
+        reply, usage = await llm(messages, max_tokens=1024)
+        await r.incrby(f"tpm:{tenant}:{int(time.time() // 60)}", usage["total"] - est)  # reconcile
+        messages.append(reply)
+        if not reply.get("tool_calls"):
+            return {"status": "done", "answer": reply["content"]}
+        # ... run tools, append results ...
+    return {"status": "stopped", "reason": "step cap"}
+```
+
+Illustrative numbers: the transcript grows, so each step reserves more than the last.
+
+| Step | Prompt tokens | Reserved (prompt + 1,024) | Tenant total this minute |
+|---|---|---|---|
+| 1 | 6,000 | 7,024 | 7,024 |
+| 5 | 14,000 | 15,024 | ~55k |
+| 10 | 24,000 | 25,024 | ~160k |
+| 12 | 28,000 | 29,024 | would reach ~216k: over 200k, reservation released, run paused |
+
+Assumes ~2k tokens added per step, all within one minute window. Five runs per minute passed slowapi;
+one run alone exhausted the tenant's minute of tokens.
+
 ### Token bucket with token cost (runnable, pure Python)
 The same 40,000-tokens-per-minute budget as a bucket, so bursts are allowed and refill is continuous
 instead of resetting on the minute.
@@ -257,9 +333,10 @@ reason counters do: every worker must see one value.
 - **Tenant limits that sum under the upstream quota** — when many tenants share one provider org. Keep
   the sum of tenant TPM limits at or below the organisation's TPM, or add a global bucket checked after
   the tenant one. Monitor upstream provider 429s; they should be near zero if your limiter rejects first.
-- **Edge limit plus app limit** — when abuse volume is high. Use nginx `limit_req` or a WAF for per-IP
-  floods and slowapi for per-tenant fairness. Monitor rejected-request CPU in the app; if it is high,
-  push more filtering to the edge.
+- **Run-level admission plus in-loop budgets for agents** — on every agent route. Limit runs started and
+  concurrent runs per tenant at the route, and reserve tokens before each model step inside the loop, so
+  a long run pauses at the step that would overspend. Monitor tokens per run (p50, p95) and runs paused by
+  budget, alongside nginx `limit_req` or WAF rejects at the edge for per-IP floods.
 
 ## Trade-offs
 - **In-memory vs Redis storage.** In-memory needs no infrastructure and adds no latency, but is only
@@ -271,6 +348,9 @@ reason counters do: every worker must see one value.
 - **IP vs credential keys.** Keying by IP works for anonymous endpoints but punishes shared NATs and is
   easy to evade. Keying by API key or tenant is fair and harder to evade, but requires authentication to
   run first.
+- **Pause vs fail a run over budget.** Pausing (return status and step, resume later) keeps the agent's
+  work, but needs persisted run state and a resume path. Failing is simple but wastes every token already
+  spent. Pausing wins once runs are long or expensive.
 - **App vs edge limits.** App-level limits know tenant and token cost but spend Python cycles on each
   rejected request. Edge limits are cheaper under attack but coarser. Use both when abuse volume is high.
 
@@ -286,6 +366,10 @@ reason counters do: every worker must see one value.
 - **429 without `Retry-After`, or CORS inside the limiter.** No header is slowapi's default unless
   `headers_enabled=True`. Symptom: clients retry instantly in a tight loop, or browsers report a CORS
   error instead of the 429.
+- **Limiting agent runs only at the door.** Symptom: run admission rates look healthy while a few runs
+  with 20+ steps consume most of the tenant's TPM. Fix: reserve tokens per model step inside the loop.
+- **Tight retries on upstream 429 inside the loop.** Symptom: provider 429 counts spike with each incident
+  and runs fail anyway. Fix: honour `Retry-After` within the run deadline, otherwise stop the step.
 - **Tenant limits set independently of the upstream quota.** Symptom: every tenant is within its own
   limit while the provider still returns 429s at peak, because the limits sum to more than the
   organisation's TPM.
@@ -336,11 +420,12 @@ one bucket. Key by API key or tenant, and if IPs are needed, put the ALB's range
 - **Token bucket** allows bursts up to *b* and a sustained rate *r*, and its cost can be a token estimate,
   which makes it the natural fit for TPM on chat traffic.
 
-### Your Redis instance backing the limiter goes down. What should happen?
-- **Fail closed** rejects everything, so your limiter causes an outage.
-- **Fail open** serves unlimited traffic and exposes spend.
-- **Per-process fallback** (slowapi's in-memory fallback) keeps limits, loosened by the worker count;
-  for a paid LLM route it is usually the right middle.
+### How would you rate-limit an agent API where one request makes a dozen model calls?
+- **Limit runs, not just requests**: runs started per minute and concurrent runs per tenant at the route.
+- **Reserve tokens per model step** inside the loop against the tenant's TPM, because the transcript grows
+  and later steps cost more than early ones.
+- **Treat upstream 429s as normal**: wait for `Retry-After` within the run deadline, otherwise pause the
+  run or return an error the model or user can act on.
 
 ### How would you build a tokens-per-minute budget, given that you don't know the cost until the call finishes?
 - **Reserve an estimate up front**: prompt tokens counted with the tokenizer plus `max_tokens`, and reject

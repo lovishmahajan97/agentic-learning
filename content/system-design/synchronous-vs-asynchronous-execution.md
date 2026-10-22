@@ -5,7 +5,8 @@ name: Synchronous vs asynchronous execution
 kind: decision
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - system-design/event-driven-architecture
   - fastapi-for-ai/job-queues-and-durable-workers
@@ -23,9 +24,23 @@ sources:
 ---
 
 ## TL;DR
-Synchronous: the caller holds a connection until the result arrives. Asynchronous: it gets a job id and
-the result later. LLM calls take seconds and agent runs minutes, longer than proxies and people wait, so
-most AI work goes async, or streams when someone watches.
+Every agent endpoint picks a shape: synchronous (caller holds the connection), streaming (partial results
+while someone watches) or an asynchronous run (a run id now, the result later). Agent runs take minutes,
+longer than proxies and people wait, so most go async or stream.
+
+## For agent builders
+- **Why it matters for agents.** A tool-calling loop of 10 to 30 steps easily outlives a 30 or 60 second
+  gateway timeout. Hold it synchronously and the client retries while the agent is still working, so you
+  pay for the run twice and its tools act twice.
+- **Where it shows up in your stack.** A `POST /runs` that returns `202` with a run id, a worker pool
+  that executes the agent loop, SSE for token and tool-progress streaming, and a durable executor or
+  framework checkpointer (for example LangGraph's checkpointing, or Temporal) so a restarted worker resumes
+  a run instead of losing it.
+- **What you control.** The shape per route (chat UI streams, background agents go async), idempotency
+  keys on submit and on side-effecting tools, worker leases, where the loop checks for cancellation, the
+  queue bound and the result retention window.
+- **What you can skip.** Event-loop internals and HTTP/2 framing. Know Little's law, the three shapes, and
+  that an error means "not delivered", not "not done".
 
 ## Why it exists
 - **AI work outlives connections.** A classic web request completes in tens of milliseconds, so holding
@@ -39,8 +54,9 @@ most AI work goes async, or streams when someone watches.
 - **Capacity scales with run time, not work.** By Little's law, in-flight requests ≈ arrival rate × time
   in system. At 10 requests per second averaging 30 seconds, the fleet holds about 300 open connections,
   each with a goroutine, thread or coroutine, buffers and partial state. Double the run time and the count
-  doubles though useful work is unchanged. Scale-out is then driven by connection count, not useful work,
-  and a deploy that restarts an instance drops every run it held.
+  doubles though useful work is unchanged.
+- **Connections, not work, then drive scale-out.** A deploy that restarts an instance drops every run it
+  held.
 - **Synchronous work is lost on restart.** If the process restarts mid-request the run vanishes; the client
   only learns the socket closed. There is no record the work existed, so nothing to resume.
 - **"Raise every timeout to ten minutes" only hides it.** Long-lived connections pile up, one deploy drops
@@ -112,6 +128,20 @@ most AI work goes async, or streams when someone watches.
 - Many APIs accept a `wait` budget. If the job finishes within, say, 20 seconds, the result returns inline;
   otherwise the job id does.
 - Client code handles both outcomes. Short requests stay simple; long ones are not fragile.
+
+### Mapping agent workloads to shapes
+| Agent workload | Typical shape | Why |
+|---|---|---|
+| Single-turn chat answer, no tools | stream | a person watches; first token in about a second matters more than total time |
+| Interactive agent with a few tool calls | stream tokens and tool-progress events | the user sees "searching orders..." instead of a frozen spinner |
+| Background agent (triage, research, report) | async run plus webhook or poll | no one watches, runs take minutes, must survive deploys |
+| Agent waiting on human approval | async run, paused durably | the wait can be hours, far beyond any connection |
+| Guardrail or router call inside a request | synchronous with a tight timeout | the next step needs the answer and it finishes in under a second or two |
+
+- **One run, two views.** A common design runs every agent as an async job and offers an optional event
+  stream on top of it, so a reconnecting UI re-attaches to the same run instead of starting a new one.
+- **Durable step state.** Persist after each model or tool step (a checkpoint) so a reclaimed run resumes
+  at step 12 instead of re-paying for steps 1 to 11.
 
 ### Backpressure
 - An asynchronous front door accepts work faster than workers drain it, so the queue is where overload
@@ -230,6 +260,42 @@ print(shape(120, 30, False))                   # async job
 ```
 The thresholds (half the timeout, 5 seconds) are illustrative defaults to tune, not standards.
 
+### Agent scenario: a run worker with checkpoints, cancel points and progress events
+The worker executes the tool-calling loop one step at a time, checkpoints after each step, checks the
+cancel flag between steps and appends numbered events that an SSE endpoint can replay from
+`Last-Event-ID`. `store`, `llm_step` and `call_tool` stand in for your database, model client and tools.
+
+```python
+def run_agent_job(run_id, store, llm_step, call_tool, max_steps=25):
+    state = store.load_checkpoint(run_id) or {"messages": store.load_input(run_id), "step": 0}
+    while state["step"] < max_steps:
+        if store.cancel_requested(run_id):              # safe point: between steps, never mid-tool
+            store.finish(run_id, "cancelled", completed_steps=state["step"])
+            return
+        store.extend_lease(run_id, seconds=60)          # heartbeat so a dead worker's run is reclaimed
+        action = llm_step(state["messages"])
+        if action.kind == "final":
+            store.append_event(run_id, {"type": "final", "text": action.text})
+            store.finish(run_id, "succeeded", result=action.text)
+            return
+        key = f"{run_id}:{state['step']}"               # idempotency key per tool step
+        result = call_tool(action.tool, action.args, idempotency_key=key)
+        state["messages"] += [action.as_message(), result.as_message()]
+        state["step"] += 1
+        store.save_checkpoint(run_id, state)            # resume here after a crash
+        store.append_event(run_id, {"type": "tool", "name": action.tool, "step": state["step"]})
+    store.finish(run_id, "failed", error="step budget exhausted")
+```
+
+| What happens | Without checkpoints and keys | With them |
+|---|---|---|
+| Worker killed at step 12 of 20 by a deploy | run lost, or restarted from step 1, paying for 12 steps again | lease expires, another worker resumes at step 12 |
+| Tool at step 12 had already created a ticket | restart creates a second ticket | same key, so the ticket API returns the first one |
+| User closes the tab at step 5 | run continues, and the UI loses it | run continues, and the reopened UI replays events after the last id |
+
+Step counts are illustrative; the caveat is that the tool APIs must honour the idempotency key for the
+second row to hold.
+
 ### Production snippet: claiming a job with a lease in Postgres
 ```sql
 UPDATE jobs
@@ -266,6 +332,13 @@ extends `lease_until` as a heartbeat while it runs.
   delivery failure rate per receiver.
 - **Bounded queue with load shedding.** Reject with `429` or `503` when queue depth or estimated wait
   exceeds the budget. Track queue depth, oldest-job age and estimated wait as first-class metrics.
+- **Agent runs as durable jobs with a stream on top.** Every agent run gets a run id and a checkpoint
+  per step (a framework checkpointer, a durable workflow engine, or your own table); the chat UI subscribes
+  to the run's event stream rather than owning the run. Monitor resumed-run count, steps re-executed after
+  resume and run duration p99 per agent.
+- **Step and cost budgets per run.** Cap steps, wall-clock time and tokens per run in the worker, and end
+  the run as `failed` with a reason when a cap is hit, because an async run nobody watches can loop for an
+  hour. Alert on runs ending at the cap.
 
 ## Trade-offs
 - **Simplicity vs timeout ceiling.** Synchronous calls are simple to build, test and reason about, but
@@ -298,6 +371,9 @@ extends `lease_until` as a heartbeat while it runs.
 - **Treating a disconnect or cancel as "the work stopped".** Symptom: tickets or emails produced by runs
   the UI reports as cancelled, because the worker never checked the cancel flag or the effect had already
   happened.
+- **The chat UI owns the agent run.** Symptom: closing the tab or a dropped SSE connection kills or
+  orphans the run, and a refresh starts a new paid run. Fix: run as a job with an id; the stream only
+  observes it and resumes from the last event id.
 
 ## When to use
 Decide from the p99 of the work, not the median, against the smallest timeout in the path and how long a
@@ -371,6 +447,14 @@ an SSE stream keyed by run id rather than lengthening the gateway timeout.
   everything after the last id instead of starting a new, paid generation.
 - **Measure** reconnect rate and duplicate-generation count; a rising duplicate count means resume is not
   working.
+
+### A user cancels an agent run that has already called three tools. What should your system do and report?
+- **Set a flag, stop at a safe point.** Mark `cancel_requested`; the worker checks it between steps and
+  stops before the next model or tool call, never in the middle of a tool.
+- **Effects already made stay made.** The three tool calls happened; decide per tool whether to compensate
+  (cancel the draft order) or leave it, which is a saga decision.
+- **Report precisely.** The final status is `cancelled` with the list of completed steps and any
+  compensations, so the user is not told "nothing happened" when a ticket exists.
 
 ## Quiz
 ### Q: Why does raising the load balancer timeout from 60 s to 600 s not fix an endpoint whose agent runs take up to five minutes?

@@ -5,7 +5,8 @@ name: Decorators
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/tenacity
   - python-for-ai/async-await
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-A decorator takes a function and returns a replacement, applied with `@name`. Retries, tracing, caching
-and tool or route registration are written once and attached declaratively. Watch three edges: missing
-`functools.wraps`, sync wrappers on async functions, and stacking order.
+A decorator takes a function and returns a replacement, applied with `@name`. Agents use them to register
+tools, trace, retry and guard calls. Watch three edges: missing `functools.wraps` (broken tool schemas),
+sync wrappers on async tools, and stacking order.
+
+## For agent builders
+- **Why it matters for agents.** The model only sees your tools through a schema built from name,
+  signature and docstring, and every tool call needs the same wrapping: retries, timeouts, tracing,
+  permission checks, error-to-result conversion. Decorators attach all of that at the definition.
+- **Where it shows up in your stack.** `@mcp.tool()` in the MCP SDK, `@tool` in LangChain, LangSmith's
+  `@traceable` for tracing, tenacity's `@retry`, FastAPI's `@app.post(...)`, and `functools.cache` for
+  loading tokenizers or prompt templates once.
+- **What you control.** Whether wrappers keep metadata (`wraps`), whether they are async-aware, the
+  stacking order (registration on top, retry versus timeout and tracing), and which tools are retryable
+  or need approval.
+- **What you can skip.** Writing class-based decorators with `__get__` and elaborate generic typing unless
+  you maintain a library. Know the desugaring, the factory pattern and the three edges.
 
 ## Why it exists
 - **Every model and tool call needs the same wrapping:** retry on 429 and timeouts with backoff, record
@@ -107,16 +121,16 @@ def call(): ...
 
 ## Diagram
 Two phases for the stacked `@tool` over `@timed` example below: decorators run bottom-up once at import,
-then every call enters the outermost wrapper first.
+then every tool call from the agent enters the outermost wrapper first.
 
 ```mermaid
 flowchart TD
-    subgraph IMPORT["Definition time, runs once at import"]
+    subgraph IMPORT["Definition time, once at import"]
         D["def search_docs(query, k)"] --> T["timed(fn) returns async_wrapper"]
-        T -->|"functools.wraps copies name, doc, __wrapped__"| R["tool(async_wrapper) records schema"]
-        R --> N["Name search_docs bound to async_wrapper"]
+        T -->|"wraps copies name, doc, __wrapped__"| R["tool(async_wrapper) records schema"]
+        R --> N["search_docs bound to async_wrapper"]
     end
-    subgraph CALL["Call time, every invocation"]
+    subgraph CALL["Call time, every tool call"]
         C["await search_docs(q)"] --> W["async_wrapper: start timer"]
         W --> O["await original search_docs"]
         O -->|"return or raise"| F["finally: report elapsed ms"]
@@ -125,6 +139,65 @@ flowchart TD
 ```
 
 ## Examples
+### A guarded agent tool: approval, timeout and errors as results
+One decorator factory gives every tool the same contract: side-effecting tools need an approval flag, each
+call has a timeout, and failures come back as a string the model can read instead of crashing the loop.
+
+```python
+import asyncio, functools, inspect
+
+class NeedsApproval(Exception): ...
+
+def agent_tool(timeout: float = 10.0, side_effect: bool = False):
+    def decorator(fn):
+        if not inspect.iscoroutinefunction(fn):
+            raise TypeError("agent_tool expects async def tools")
+
+        @functools.wraps(fn)                     # keep name, docstring and signature for the schema
+        async def wrapper(*args, approved: bool = False, **kwargs):
+            if side_effect and not approved:
+                raise NeedsApproval(f"{fn.__name__} needs human approval")   # loop pauses for a human
+            try:
+                async with asyncio.timeout(timeout):
+                    return await fn(*args, **kwargs)
+            except TimeoutError:
+                return f"error: {fn.__name__} timed out after {timeout}s"
+            except Exception as e:                # CancelledError is BaseException, so it still propagates
+                return f"error: {type(e).__name__}: {e}"
+        wrapper.side_effect = side_effect          # metadata the agent loop can read
+        return wrapper
+    return decorator
+
+@agent_tool(timeout=2.0)
+async def get_weather(city: str) -> str:
+    """Current weather for a city."""
+    if city == "Atlantis":
+        raise KeyError("unknown city")
+    await asyncio.sleep(0.1); return f"{city}: 18C, cloudy"
+
+@agent_tool(side_effect=True)
+async def send_email(to: str, body: str) -> str:
+    """Send an email to a customer."""
+    await asyncio.sleep(0.1); return f"sent to {to}"
+
+async def main():
+    print(get_weather.__name__, inspect.signature(get_weather))   # get_weather (city: str) -> str
+    print(await get_weather("Paris"))                             # Paris: 18C, cloudy
+    print(await get_weather("Atlantis"))                          # error: KeyError: 'unknown city'
+    try:
+        await send_email("a@b.c", "hi")
+    except NeedsApproval as e:
+        print("paused:", e)
+    print(await send_email("a@b.c", "hi", approved=True))         # sent to a@b.c
+
+asyncio.run(main())
+```
+
+- **`inspect.signature` follows `__wrapped__`**, so the schema still shows `(city: str)`; the extra
+  `approved` keyword lives only on the wrapper and is never exposed to the model.
+- **Errors as results** let the model retry with different arguments or explain the failure, which is
+  usually better than aborting the whole run.
+
 ### An async retry decorator with backoff and jitter
 ```python
 import asyncio, functools, inspect, random, time
@@ -175,7 +248,8 @@ print(asyncio.run(complete("hi")))
 | A call that never succeeds | gives up after roughly 0.7 s of backoff plus four call durations (0.2 s here) |
 | Probability all four attempts fail | 0.5⁴ = 1/16, so about 6% of calls still raise |
 
-- **Retries change the error rate; they do not remove it.**
+- **Retries change the error rate; they do not remove it.** In a 10-step agent run where every step makes
+  one such call, a 6% per-call failure rate compounds, which is why tool errors should come back as results.
 - **What ran when:** `retry(...)` executed once at import and returned `decorator`; `decorator(complete)`
   also ran once at import and rebound the name `complete` to `wrapper`; only `wrapper`'s body runs per call.
 - **Why jitter:** many clients failing on the same 429 would otherwise retry in lockstep and hit the
@@ -233,6 +307,9 @@ asyncio.run(search_docs("refund policy"))        # search_docs took 120 ms (abou
 ```
 
 ## Production patterns
+- **One house tool decorator.** Give every agent tool the same wrapper (timeout, errors returned as
+  results, tracing span, approval for side effects) and put the framework's registration decorator above
+  it. Monitor tool error rate and timeout rate per tool name.
 - **Retries via tenacity, scoped to transient errors.** Use
   `@retry(stop=stop_after_attempt(4), wait=wait_random_exponential(multiplier=0.5, max=10), retry=retry_if_exception_type(...))`
   listing only rate-limit, timeout and 5xx errors, with `before_sleep=before_sleep_log(logger, logging.WARNING)`.
@@ -245,16 +322,15 @@ asyncio.run(search_docs("refund policy"))        # search_docs took 120 ms (abou
 - **Check library decorators handle async.** Before adopting a tracing or metrics decorator, decorate an
   `async def` and assert the recorded duration includes the awaited work, because a sync wrapper inside a
   library has the same microsecond-latency bug.
-- **Bounded caches with visibility.** Use `functools.lru_cache(maxsize=...)` only for pure functions on hashable
-  arguments (prompt templates, tokenizer loading), and export `fn.cache_info()` hits and misses. Use a TTL
-  cache elsewhere.
-- **Test the generated schema.** Add a unit test that every registered tool has a docstring and no
-  `args`/`kwargs` parameters, which catches a missing `wraps` or a misplaced registration decorator.
+- **Test the generated schema and caches.** Add a unit test that every registered tool has a docstring and
+  no `args`/`kwargs` parameters, which catches a missing `wraps` or a misplaced registration decorator. Use
+  `functools.lru_cache(maxsize=...)` only for pure functions on hashable arguments (prompt templates,
+  tokenizer loading) and export `fn.cache_info()` hits and misses; use a TTL cache elsewhere.
 
 ## Trade-offs
 - **Less duplication vs hidden control flow.** Decorators remove duplicated cross-cutting code and make it
-  visible at the definition, but hide control flow. When behaviour depends on per-call context, an explicit
-  wrapper or context manager is clearer.
+  visible at the definition, but hide control flow. When behaviour depends on per-call context (which user,
+  which run), an explicit wrapper or context manager is clearer.
 - **Concise registration vs import-time effects.** Registration decorators make tool and route definitions
   concise but run at import time, so import order and module side effects start to matter, which bites in
   large packages and test setups.
@@ -284,8 +360,8 @@ asyncio.run(search_docs("refund policy"))        # search_docs took 120 ms (abou
   the side effect happened shows up as duplicate emails or rows.
 
 ## When to use
-- **Use when** the same behaviour wraps many functions and does not depend on their internals: retries,
-  timeouts, tracing spans, metrics, auth checks, caching, framework registration.
+- **Use when** the same behaviour wraps many functions and does not depend on their internals: tool
+  registration, retries, timeouts, tracing spans, metrics, auth and approval checks, caching.
 - **Prefer established libraries:** tenacity for retries, OpenTelemetry or your tracing SDK's decorator,
   `functools.cache`, over hand-rolled versions.
 - **Avoid** decorators for logic that varies per call or that the reader must see to understand the function.
@@ -321,6 +397,15 @@ that awaits the call, decorated with `functools.wraps(fn)` so name, docstring an
 - **So expensive work in the decorator body** slows startup or freezes a value that should be read per
   call.
 
+### How would you give every tool in an agent the same timeout, error handling and approval rules?
+- **One decorator factory** such as `agent_tool(timeout=..., side_effect=...)` that wraps each async tool,
+  enforces `asyncio.timeout`, returns failures as model-readable strings and refuses side-effecting calls
+  without approval.
+- **Keep `functools.wraps`** so the schema the model sees is the original name, docstring and parameters,
+  and put the framework's registration decorator on top.
+- **Let `CancelledError` through** (it is a `BaseException`), and test that each registered tool has a
+  docstring and no `args`/`kwargs` parameters.
+
 ### Write a decorator that takes arguments, such as retry(attempts=3). Why three levels?
 - **Factory, decorator, wrapper.** `retry(attempts=3)` is called first and returns the real decorator,
   which receives the function and returns the wrapper.
@@ -328,7 +413,7 @@ that awaits the call, decorated with `functools.wraps(fn)` so name, docstring an
 - **For async targets** the wrapper must be `async def` and await the call, and `ParamSpec` (PEP 612,
   3.10+) keeps parameter types visible to mypy and the IDE.
 
-### Traces show one span covering three retry attempts, but you wanted a span per attempt. What happened?
+### Traces show one span covering three retry attempts of a tool call, but you wanted a span per attempt. What happened?
 - **Stacking order.** Decorators apply bottom-up, so `@traced` above `@retry(...)` makes the span wrap
   all attempts.
 - **Swap them** so `@retry` is outermost and each attempt gets its own span; the same reasoning puts

@@ -5,7 +5,8 @@ name: A100 / H100 / L4 selection
 kind: decision
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - infra-capacity-economics/gpu-sizing
   - infra-capacity-economics/gpu-utilization-and-memory-bandwidth
@@ -20,9 +21,20 @@ sources:
 ---
 
 ## TL;DR
-Pick the card by the first binding constraint: fit (memory), per-stream decode (bandwidth), then cost
-per token at real load. L4: cheap 24 GB. A100: 40/80 GB, no FP8. H100: 80 GB, ~3.35 TB/s, FP8,
-cheapest per token when busy.
+Pick each card in an agent stack by its first binding constraint: fit (long agent contexts), per-step
+decode (bandwidth), then cost per token at real load. L4: cheap 24 GB. A100: 40/80 GB, no FP8. H100:
+80 GB, ~3.35 TB/s, FP8.
+
+## For agent builders
+- **Why it matters for agents.** A self-hosted agent stack has several GPU jobs with different
+  constraints: the agent model needs bandwidth (many sequential steps) and memory (long transcripts);
+  embedders and rerankers need little of either; offline eval judges need cheap throughput.
+- **Where it shows up in your stack.** Node pools per card tier, the `nvidia.com/gpu.product` label in
+  pod specs, cloud instance families, and the decision of self-hosting versus calling a hosted API.
+- **What you control.** Which workload lands on which tier, the precision (fp8 needs H100 or L4), and
+  whether small models share a card through MIG.
+- **What you can skip.** SM counts and architecture marketing. Memory, bandwidth, price and expected load
+  decide it.
 
 ## Why it exists
 - **Price and speed differ by an order of magnitude.** Three cards from the same vendor can differ that
@@ -113,9 +125,21 @@ Cloud families to look for (check the current catalogue before planning):
 
 Newer generations exist and follow the same procedure with their own datasheet numbers.
 
+### Mapping an agent stack onto card tiers
+| Agent component | Binding constraint | Usual tier |
+|---|---|---|
+| Agent (tool-calling) model | Per-step decode × step count, KV room for long transcripts | A100 or H100 80 GB |
+| Embedder for RAG | Throughput on short inputs, small weights | L4, or a MIG slice |
+| Reranker | Latency per retrieval call, small weights | L4, or a MIG slice |
+| Offline eval judge or trace labelling | Cost per token on batch jobs, no latency SLO | Whatever is cheapest per token when fully batched |
+
+- **Run the procedure once per component,** because one card rarely fits all four well.
+- **Agent context changes the fit gate:** a session that peaks at 32k tokens on an 8B model needs
+  ~4 GB of cache alone, so a 24 GB L4 holds about one such session next to the weights.
+
 ## Diagram
-The procedure as a decision path: each gate can eliminate a card before price is even considered, and
-only the survivors are compared on cost per token at your load.
+The procedure as a decision path, run once per component of the agent stack: each gate can eliminate a
+card before price is even considered, and only the survivors are compared on cost per token at your load.
 
 ```mermaid
 flowchart TD
@@ -173,6 +197,23 @@ In scenario B the batch-1 bandwidth ratio is ~11×; at these batch sizes the per
   is higher, the L4 is out at any demand and the comparison is H100 against A100.
 - **Bursty demand:** read the serverless lesson before buying either.
 
+### Worked scenario: which card for a 20-step agent on an 8B model?
+Each step emits a ~150-token tool call. Batch-1 decode floors from step 2 of the procedure (upper bounds;
+prefill and tool time come on top).
+
+| Card | Single-stream ceiling | Decode per step | Decode per 20-step run | 32k-token sessions that fit |
+|---|---|---|---|---|
+| L4 | ≤19 tokens/s | ≈ 7.9 s | ≈ 160 s | about 1 |
+| A100 80 GB | ≤125 tokens/s | ≈ 1.2 s | ≈ 24 s | about 12 |
+| H100 80 GB | ≤200 tokens/s | ≈ 0.75 s | ≈ 15 s | about 12 |
+
+- **The L4 fails the latency gate for interactive agents** even though the weights fit: almost three
+  minutes of decode per run, before any batching slows it further.
+- **The L4 still earns its place** in the same stack as the embedder and reranker, where inputs are short
+  and the weights are small.
+- **A100 versus H100** then comes down to cost per token at your agent traffic, exactly as in the
+  comparison above.
+
 ### Card planner: cards, cost and utilisation for a demand figure
 Reproduces the worked comparison with the bandwidth-bound ceiling and a two-replica minimum. Prices and
 batch limits are the illustrative figures above; swap in your own quotes and sizing results.
@@ -213,9 +254,14 @@ bandwidth ceiling is not realistic, which strengthens the case for the H100 in s
 - **One node pool per card tier.** Use when more than one card type serves production. Create a pool per
   card and steer workloads with the `nvidia.com/gpu.product` label from GPU feature discovery, so a
   model cannot silently land on the wrong tier. Monitor pods per tier against the card-tier matrix.
+- **Split the agent stack across tiers.** Use when you self-host more than the agent model. Put the
+  agent model on 80 GB bandwidth-heavy cards, and embedders and rerankers on L4s or MIG slices, each in
+  its own deployment so retrieval load cannot steal decode bandwidth. Monitor step latency broken down by
+  component in agent traces.
 - **Benchmark the shortlist at real batch and context.** Use before any reservation or purchase. Run the
   engine's serving benchmark with your prompt and output lengths at target concurrency on each candidate,
-  and record tokens/s per dollar. Monitor measured throughput against the bandwidth ceiling.
+  and record tokens/s per dollar; for agents, replay real multi-step traces rather than single prompts.
+  Monitor measured throughput against the bandwidth ceiling.
 - **Reserve the baseline, burst elsewhere.** Use when traffic has a steady floor and peaks. Commit to
   reserved capacity for the floor on the card that is cheapest per token when busy, and absorb peaks with
   on-demand or serverless capacity. Monitor reserved-card utilisation; idle reservations are sunk cost.
@@ -237,6 +283,9 @@ bandwidth ceiling is not realistic, which strengthens the case for the H100 in s
   "cannot do it" at roughly 8B–13B.
 - **SXM/NVLink vs flexibility.** NVLink makes tensor parallelism efficient for 70B-class models, at the
   cost of buying eight-card blocks; PCIe cards are flexible but make multi-card sharding slow.
+- **One card type for the whole agent stack vs per-component tiers.** A single tier simplifies
+  scheduling and spares capacity, but puts embedders on expensive bandwidth or the agent model on a card
+  too slow for multi-step runs. It flips once the stack has enough load per component to fill a tier.
 
 ## Pitfalls
 - **Choosing by hourly price alone.** Symptom: a fleet of L4s that cannot meet a per-user tokens/s SLO or
@@ -249,12 +298,15 @@ bandwidth ceiling is not realistic, which strengthens the case for the H100 in s
   and serves one request at a time. Fix: use the sizing arithmetic.
 - **Ignoring quota and region availability.** Symptom: an architecture built around H100s that cannot be
   launched where the data must stay. Fix: confirm quota per region before design sign-off.
+- **Picking the agent model's card from a single-chat benchmark.** Symptom: a card that "felt fast" in a
+  demo makes 20-step runs take minutes. Fix: multiply the per-step decode floor by the step count and
+  output length before choosing.
 
 ## When to use
 - **Run the five-step procedure when:** a new model, SLO or traffic forecast arrives, and re-run it when
   prices or quotas change.
 - **Reach for the L4 for:** embeddings, rerankers, vision models, small LLMs and anything with sparse
-  traffic.
+  traffic; not for an interactive agent's main model beyond a few billion parameters.
 - **Reach for the A100 when:** a 7B–30B model needs real concurrency at the best price, or when H100
   quota is unavailable.
 - **Reach for the H100 for:** 70B-class serving, fp8, training, or any service whose sustained load would
@@ -294,7 +346,7 @@ or fp8 becomes necessary.
   on an H100 at ~3.35 TB/s.
 - **TFLOPs matter** for prefill-heavy and training workloads, which is why the answer depends on the workload.
 
-### A team wants to standardise every workload on H100s. When would you push back?
+### An agent platform team wants every workload (agent model, embedder, eval judge) on H100s. When would you push back?
 - **Sparse traffic:** an 8B internal tool at 0.3 requests/s keeps an H100 under 2% busy, so its hourly
   price buys idle throughput while an L4 suffices.
 - **Small models with real concurrency:** an A100 often gives the best value under 30B, at 60% of the H100's
@@ -315,6 +367,13 @@ or fp8 becomes necessary.
   offers them, which save memory and bandwidth but not compute.
 - **Re-evaluate** quality and speed on the A100 with the new kernels before committing, and recheck fit
   and KV headroom at the new precision.
+
+### You self-host a RAG agent: an 8B tool-calling model, an embedder and a reranker. Which cards do you pick?
+- **Agent model:** an 80 GB A100 or H100, because 20-step runs multiply per-step decode (≈ 7.9 s per
+  150-token step on an L4 versus ≈ 0.75 s on an H100) and long transcripts need KV room.
+- **Embedder and reranker:** L4s or MIG slices, since weights are small and inputs short.
+- **Then cost:** choose A100 versus H100 by cost per token at the agent's sustained load, and keep each
+  component in its own deployment.
 
 ### Which card would you pick for a 70B model serving a public product, and why?
 - **Fit:** 70B needs two or four 80 GB cards in fp8 or bf16, or one 80 GB card in int4 with a quality cost.

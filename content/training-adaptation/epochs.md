@@ -5,7 +5,8 @@ name: Epochs
 kind: concept
 difficulty: intro
 est_minutes: 11
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/learning-rate
   - training-adaptation/overfitting
@@ -22,20 +23,33 @@ sources:
 ---
 
 ## TL;DR
-An epoch is one full pass of the optimiser over the training set, the natural unit for reshuffling,
-evaluating and stopping. More epochs help a small fine-tuning set until the model starts memorising;
-pretraining counts tokens and rarely completes one pass.
+An epoch is one full pass over the training set. Fine-tuning on a few thousand agent trajectories,
+the epoch count decides whether the model learns your tool-calling pattern or memorises the traces; held-out
+agent evals decide when to stop.
+
+## For agent builders
+- **Why it matters for agents.** Agent fine-tuning sets are small (hundreds to a few thousand
+  trajectories), so they are seen several times. Too few passes and the model still mangles tool
+  arguments; too many and it replays training traces verbatim and breaks on new tasks.
+- **Where it shows up in your stack.** The epoch setting of a hosted fine-tuning job (OpenAI's API calls
+  it `n_epochs`), `num_train_epochs` or `max_steps` in Hugging Face and TRL trainers, and the eval
+  cadence that decides which checkpoint you deploy behind the agent.
+- **What you control.** The epoch cap, packing, how often you run held-out tool-call and task evals,
+  and early stopping with patience so the cap is an upper bound.
+- **What you can skip.** Data-constrained pretraining scaling laws. Know that pretraining counts tokens
+  and rarely completes one pass; fine-tuning counts epochs.
 
 ## Why it exists
 - **Minibatches consume data piecewise.** Gradient descent updates on minibatches of *B* examples, so
   after `ceil(N / B)` steps every one of the *N* training examples has contributed once. "Every example
   seen once" is the natural unit for reshuffling, evaluating and stopping.
 - **One pass is not enough on small sets.** With a small learning rate each example nudges the weights
-  only slightly, so for a few thousand rows one pass leaves the model far from the best fit. Repeating
-  passes extracts more gradient signal from data you cannot get more of.
+  only slightly, so for a few thousand rows (or trajectories) one pass leaves the model far from the best
+  fit. Repeating passes extracts more gradient signal from data you cannot get more of.
 - **Repetition eventually fits the particulars.** After the shared pattern is learned, only label noise,
-  phrasing and field order are left to fit. The epoch count is a knob on how much to trust these exact
-  examples versus the model's prior.
+  phrasing and field order are left to fit. For agent traces that means the exact order of tool calls
+  and the literal argument values. The epoch count is a knob on how much to trust these exact examples
+  versus the model's prior.
 - **Naive stopping rules fail.** "Until training loss stops falling" never stops, because loss on repeated
   data falls all the way to memorisation. "Always one epoch" leaves small sets underfit; "always ten"
   overfits most. The honest control is the validation curve: train while it improves, stop when it turns.
@@ -60,6 +74,16 @@ total_optimizer_steps = epochs × optimizer_steps_per_epoch
   `max_steps` is set explicitly, in which case it wins.
 - **So different epoch counts are different schedules,** not "the same run for longer".
 
+### What "an example" means for agent traces and packing
+- **One trajectory is one example,** however many tool calls it holds: system prompt, tool schemas, user
+  turn, each call and result, final answer. Trajectories run to thousands of tokens, so rows say little
+  about compute.
+- **Packing** puts several short examples into one fixed-length sequence to avoid padding waste.
+- **An epoch is still one pass over the examples,** but steps per epoch follow from total tokens divided
+  by tokens per batch, not from `N / B`.
+- **Same rows, different steps.** Many short examples and a few long ones can share a row count but
+  differ widely in step count, so compute steps from tokens when packing is on.
+
 ### Reshuffling every epoch
 - **Order sets batch composition.** A fixed order makes the gradient noise identical in every pass, and
   the same examples are always freshest at the end of the epoch when you evaluate.
@@ -74,6 +98,10 @@ total_optimizer_steps = epochs × optimizer_steps_per_epoch
 | ~125 steps | at each epoch boundary | every example has been seen an equal number of times |
 | hours long | every *n* steps | the model can overfit or diverge mid-epoch, and an end-of-epoch check would miss the best checkpoint |
 | a handful of steps (200 fine-tuning examples) | per epoch | it is the only granularity that is not noise |
+
+- **For agent fine-tunes, evaluate behaviour, not only loss.** Per checkpoint, run held-out trajectories
+  and score tool-name accuracy, argument validity against the schema and, on a small sandbox set,
+  end-to-end task success.
 
 ### Why the number matters so much in fine-tuning
 - **Each pass moves away from the prior.** A pretrained model is a strong prior; each pass over a small
@@ -96,26 +124,17 @@ total_optimizer_steps = epochs × optimizer_steps_per_epoch
    stop after *p* evaluations without improvement. The configured epoch count becomes an upper bound,
    not a commitment.
 
-### What "an example" means with packing
-- **Packing** puts several short examples into one fixed-length sequence to avoid padding waste.
-- **An epoch is still one pass over the examples,** but steps per epoch follow from total tokens divided
-  by tokens per batch, not from `N / B`.
-- **Same rows, different steps.** Many short examples and a few long ones can share a row count but
-  differ widely in step count, so compute steps from tokens when packing is on.
-
-### Pretraining counts tokens
+### Background: pretraining counts tokens
 - **No meaningful epoch.** A corpus of trillions of tokens with a budget covering a fraction of it has its
   schedule, warmup and evaluation cadence defined in tokens or steps.
 - **Reuse is a choice.** Partial reuse of data is made under data constraints, not a default.
-
-### Which unit to compare on
-- **Same dataset:** compare by epochs.
-- **Different dataset sizes:** compare by optimizer steps or tokens seen. "Two epochs on 10,000
-  examples" and "two epochs on 1,000" differ by 10× in updates.
+- **Which unit to compare on.** Same dataset: compare by epochs. Different dataset sizes: compare by
+  optimizer steps or tokens seen, because "two epochs on 10,000 examples" and "two epochs on 1,000"
+  differ by 10× in updates.
 
 ## Diagram
 One fine-tuning run with early stopping: each epoch reshuffles, updates and evaluates, and the epoch
-count only caps the loop while the validation curve decides when it ends.
+count only caps the loop while the held-out evals decide when it ends.
 
 ```mermaid
 flowchart TD
@@ -124,7 +143,7 @@ flowchart TD
     B -->|"every A micro-batches"| O["Optimizer step, scheduler step"]
     O --> E{"Eval point reached?"}
     E -->|"no"| D{"Epoch finished?"}
-    E -->|"yes"| V["Validation loss and task metric"]
+    E -->|"yes"| V["Val loss, tool-call accuracy, task success"]
     V --> I{"Improved on best?"}
     I -->|"yes"| C[("Save best checkpoint")]
     I -->|"no, patience used up"| X["Stop, load best checkpoint"]
@@ -137,6 +156,66 @@ flowchart TD
 ```
 
 ## Examples
+### Planning an agent fine-tune from token counts
+A team distils its production agent into a smaller model using 1,500 successful trajectories. Rows mean
+little here, so the plan is computed from tokens per trajectory after the chat template (system prompt,
+tool schemas, calls and results), packed into 8,192-token sequences.
+
+```python
+import math, random
+
+def plan_run(token_counts, seq_len=8192, batch=8, epochs=3, warmup_ratio=0.03, evals_per_epoch=4):
+    """Turn a trajectory dataset into optimizer steps when sequences are packed."""
+    total_tokens = sum(token_counts)
+    seqs_per_epoch = math.ceil(total_tokens / seq_len)        # packed sequences, not rows
+    steps_per_epoch = math.ceil(seqs_per_epoch / batch)
+    total = epochs * steps_per_epoch
+    return {"trajectories": len(token_counts), "tokens": total_tokens,
+            "steps_per_epoch": steps_per_epoch, "total_steps": total,
+            "warmup_steps": max(1, round(warmup_ratio * total)),
+            "eval_every": max(1, steps_per_epoch // evals_per_epoch)}
+
+random.seed(0)
+# Tokens per trajectory after the chat template: system prompt, tool schemas, calls and results.
+agent_traces = [random.randint(1000, 5000) for _ in range(1500)]
+print(plan_run(agent_traces))
+# {'trajectories': 1500, 'tokens': 4456124, 'steps_per_epoch': 68, 'total_steps': 204,
+#  'warmup_steps': 6, 'eval_every': 17}
+```
+
+- **Reading it.** Three epochs are only about 204 optimizer steps, so a warmup or eval cadence copied from
+  a config sized in thousands of steps would be badly wrong.
+- **Eval every 17 steps** gives four checkpoints per epoch to score on held-out tool-call accuracy, so
+  the best one is not lost between epoch boundaries.
+
+### Worked scenario: converting configs to optimizer steps
+Before judging a config, turn it into steps. Packing assumes 2,048-token sequences unless noted.
+
+| Config | Steps per epoch | Total steps |
+|---|---|---|
+| 1,000 examples, batch 8, no accumulation, 3 epochs | 125 | 375 (3% warmup ≈ 11) |
+| same, accumulation 4 | 125 micro-batches → 31.25 updates | 94 with the final flush |
+| 10,000 examples, batch 8, 2 epochs | 1,250 | 2,500 |
+| 10,000 examples × ~200 tokens, packed, batch 8, 2 epochs | 2,000,000 tokens ÷ 2,048 ≈ 977 sequences → 123 | 246 |
+| 1,500 agent trajectories, ~4.5M tokens, packed at 8,192, batch 8, 3 epochs | 68 | 204 |
+
+- **Reading it.** The packed run has the same rows as the unpacked 10,000-example run but about a tenth
+  of its steps, so its schedule and warmup must be sized on 246 steps, not 2,500.
+
+### Worked scenario: an agent fine-tune past its best epoch
+Illustrative numbers for a 1,500-trajectory tool-calling fine-tune evaluated on 200 held-out
+trajectories after each epoch.
+
+| Epoch | Train loss | Val loss | Tool-call accuracy (held-out) |
+|---|---|---|---|
+| 1 | 0.62 | 0.58 | 81% |
+| 2 | 0.41 | 0.49 | 88% |
+| 3 | 0.30 | 0.50 | 88% |
+| 5 | 0.12 | 0.61 | 84% |
+
+- **Reading it.** Training loss falls with a staircase at each boundary, but held-out accuracy peaks at
+  epoch 2 or 3. By epoch 5 the model reproduces training argument values on new tasks. Ship epoch 2.
+
 ### A training loop with explicit accounting
 Epochs, micro-batches, accumulation, a per-epoch reseeded sampler, and a linear schedule defined over
 optimizer steps. The printed step counts show why the schedule length depends on the epoch count.
@@ -184,22 +263,10 @@ The leftover micro-batches are the kind of accounting detail epochs hide:
 - **With accumulation that does not divide an epoch,** gradients from the last batches of one epoch land
   in the first update of the next.
 
-### Worked scenario: converting configs to optimizer steps
-Before judging a config, turn it into steps. Packing assumes 2,048-token sequences.
-
-| Config | Steps per epoch | Total steps |
-|---|---|---|
-| 1,000 examples, batch 8, no accumulation, 3 epochs | 125 | 375 (3% warmup ≈ 11) |
-| same, accumulation 4 | 125 micro-batches → 31.25 updates | 94 with the final flush |
-| 10,000 examples, batch 8, 2 epochs | 1,250 | 2,500 |
-| 10,000 examples × ~200 tokens, packed, batch 8, 2 epochs | 2,000,000 tokens ÷ 2,048 ≈ 977 sequences → 123 | 246 |
-
-- **Reading it.** The packed run has the same rows as the unpacked 10,000-example run but about a tenth
-  of its steps, so its schedule and warmup must be sized on 246 steps, not 2,500.
-
 ### Production snippet: epochs as an upper bound
 Hugging Face `Trainer` with step-based evaluation and early stopping, so the epoch count caps the run
-rather than fixing it.
+rather than fixing it. For an agent model, point `metric_for_best_model` at a held-out tool-call metric
+computed in your eval function once it is trustworthy.
 
 ```python
 from transformers import Trainer, TrainingArguments, EarlyStoppingCallback
@@ -222,10 +289,13 @@ trainer.train()
 ```
 
 ## Production patterns
-- **Epoch cap plus early stopping.** For any fine-tune, set the epoch count as a ceiling and attach
-  early stopping with patience (for example `EarlyStoppingCallback(early_stopping_patience=3)` with
-  `load_best_model_at_end=True`). Monitor validation loss and the task metric per evaluation, and the
-  step at which the best checkpoint was taken.
+- **Epoch cap plus early stopping on agent evals.** For any agent fine-tune, set the epoch count as a
+  ceiling and attach early stopping with patience (for example `EarlyStoppingCallback(early_stopping_patience=3)`
+  with `load_best_model_at_end=True`). Monitor validation loss, held-out tool-call accuracy and the step
+  at which the best checkpoint was taken.
+- **Score every hosted-job checkpoint, not just the last.** When a hosted fine-tuning job exposes
+  intermediate checkpoints, run your agent eval suite on each and deploy the best, not the final one.
+  Monitor how often the best is an earlier epoch; if it usually is, lower the epoch count.
 - **Step-based evaluation for long epochs.** When an epoch takes hours, evaluate and save every fixed
   number of steps (`eval_strategy="steps"`, matching `save_steps`). Monitor whether the best checkpoint
   falls mid-epoch; if it often does, epoch-boundary evaluation would have lost it.
@@ -241,19 +311,23 @@ trainer.train()
 
 ## Trade-offs
 - **More epochs vs memorisation.** They lower training loss and improve the fit on small sets, but each
-  extra pass fits more of the rows' particulars; the balance flips where the validation curve turns
-  upward.
+  extra pass fits more of the rows' particulars, such as literal tool arguments; the balance flips where
+  the held-out curve turns.
 - **Repeated vs new data.** Repeating data is free while new data costs money, but unique tokens are worth
   more per token, so repetition is a fallback for data-constrained regimes, not a substitute for
-  collection.
+  collecting more diverse trajectories.
 - **Per-epoch vs step-based evaluation.** Per-epoch is cheap and conventional but coarse for long epochs;
-  step-based evaluation finds the best checkpoint at the cost of extra evaluation compute.
+  step-based evaluation finds the best checkpoint at the cost of extra evaluation compute, which is high
+  when each eval runs agent tasks.
 - **Dropping the last partial batch.** It keeps tensor shapes uniform but leaves a few examples unseen
   each pass; irrelevant at scale, measurable with a few hundred examples.
 
 ## Pitfalls
 - **Copying a fixed epoch count from a tutorial.** Symptom: held-out loss rising through the second half
   of the run while training loss keeps falling. Fix: early stopping on the validation curve.
+- **Judging an agent fine-tune on training loss.** Symptom: loss near zero after a few epochs, then the
+  model calls tools with argument values copied from training traces. Fix: select on held-out tool-call
+  accuracy and task success.
 - **Changing epochs without noticing the LR schedule changed.** Symptom: runs that are "longer" but
   incomparable, with different LR at the same step. Fix: log the LR per step and re-derive warmup and
   decay for the new step count.
@@ -271,10 +345,10 @@ trainer.train()
   two evaluations and is never saved. Fix: step-based evaluation and saving.
 
 ## When to use
-- **Think in epochs when:** the dataset is fixed and small enough to be seen several times: supervised
-  fine-tuning, reward-model training, classifier heads. Start low, evaluate at least once per epoch, and
-  save a checkpoint at each evaluation so the best can be recovered.
-- **Let the curve decide:** the validation curve, not a convention, decides when to stop.
+- **Think in epochs when:** the dataset is fixed and small enough to be seen several times: agent
+  trajectory fine-tuning, supervised fine-tuning, reward-model training, classifier heads. Start low,
+  evaluate at least once per epoch, and save a checkpoint at each evaluation so the best can be recovered.
+- **Let the curve decide:** the held-out agent evals, not a convention, decide when to stop.
 - **Think in steps or tokens when:** data streams or is far larger than the budget: pretraining and
   continued pretraining.
 - **Reading someone else's config:** convert epochs into optimizer steps before judging it, and check
@@ -310,6 +384,21 @@ loss after many passes often comes with memorised phrasing and brittleness on pa
 - **Pretraining:** the corpus is larger than the compute budget, so the run ends before one pass and
   schedules, warmup and evaluation are defined in tokens or steps.
 
+### You are fine-tuning a small model on 1,500 tool-calling trajectories. How do you choose the number of epochs?
+- **Do not pick a number, bound it.** Set a cap of a few epochs and evaluate several times per epoch on
+  held-out trajectories: tool-name accuracy, schema-valid arguments, and task success on a sandbox subset.
+- **Size the schedule from tokens:** trajectories are long, so with packing three epochs may be only about
+  200 optimizer steps; warmup and eval cadence follow from that.
+- **Keep the best checkpoint,** stop with patience, and check the deployed agent end to end before rollout.
+
+### A hosted fine-tune of your agent model shows training loss near zero by epoch 3. What do you check before deploying?
+- **Held-out behaviour, not training loss:** loss on repeated traces always falls, so compare held-out
+  tool-call accuracy and task success per epoch checkpoint.
+- **Signs of memorisation:** argument values or tool sequences copied from training traces onto new
+  tasks, and brittleness when the user phrases a request differently.
+- **Act:** deploy the best earlier checkpoint if one is available, and rerun with fewer epochs or more
+  diverse trajectories.
+
 ### Your training loss drops sharply at each epoch boundary. What is happening and what do you do?
 - **The staircase signals memorisation starting.** The model now sees examples it has already seen and
   predicts them better than the unseen remainder of the first pass.
@@ -329,12 +418,6 @@ loss after many passes often comes with memorised phrasing and brittleness on pa
 - **Example:** 10,000 examples of about 200 tokens packed into 2,048-token sequences at batch 8 give about
   977 sequences, 123 steps per epoch, so two epochs are 246 steps rather than 2,500.
 - **Why it matters:** warmup, decay and evaluation cadence sized for 2,500 steps would be badly wrong.
-
-### When would you not evaluate at epoch boundaries?
-- **When an epoch takes hours.** The model can overfit or diverge mid-epoch, and the best checkpoint can
-  sit between two end-of-epoch evaluations and never be saved.
-- **Instead evaluate every *n* steps** and save at the same cadence so the best can be loaded at the end,
-  paying extra evaluation compute for it.
 
 ## Quiz
 ### Q: 4,000 examples, micro-batch 16, gradient accumulation 2, three epochs. How many optimizer steps?

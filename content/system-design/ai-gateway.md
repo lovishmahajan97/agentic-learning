@@ -5,7 +5,8 @@ name: AI gateway (LiteLLM proxy, Portkey)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/litellm
   - system-design/model-fallback-strategies
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-An AI gateway is a proxy every model call passes through: one OpenAI-style API over many providers,
-handling keys, budgets, limits, routing, fallbacks, caching and logging once. It buys control and
-visibility for an extra hop and a new single point of failure.
+An AI gateway is the proxy every agent's model calls pass through: one OpenAI-style API over many
+providers, handling keys, budgets, limits, routing, fallbacks, caching and logging once. It buys control
+for an extra hop and a new single point of failure.
+
+## For agent builders
+- **Why it matters for agents.** An agent makes many calls per task, often in parallel, so it is the first
+  thing to hit shared rate limits and blow a budget when it loops. The gateway is where you see cost per
+  agent and per step, and where a runaway agent's key gets cut off without touching anything else.
+- **Where it shows up in your stack.** You point your OpenAI SDK, LangChain `ChatOpenAI` (via its
+  `base_url`) or LlamaIndex client at the LiteLLM proxy or Portkey, call aliases like `fast` and `strong`,
+  and attach run and step tags as metadata so traces and spend line up.
+- **What you control.** A virtual key per agent or feature with its own budget and limits, aliases per
+  agent role, which retries happen in the gateway versus your agent loop, and verifying tool calls and
+  streaming pass through intact.
+- **What you can skip.** Operating the gateway itself if a platform team owns it. You still need per-run
+  step and cost caps in the agent, because gateway budgets are per key, not per task.
 
 ## Why it exists
 - **Without one, every team re-implements the same plumbing.** The second team copies the first team's
@@ -38,20 +52,23 @@ visibility for an extra hop and a new single point of failure.
   needs shared state a library does not have.
 - **It is the API gateway idea with model concerns added:** token accounting, model aliasing, provider
   translation, streaming passthrough, prompt logging and guardrails.
-- **Policy moves to a network boundary,** where it applies to every caller whether or not they remembered.
+- **Policy moves to a network boundary,** where it applies to every caller (every agent, every step)
+  whether or not they remembered.
 
 ## How it works
 ### The request path
-1. A client sends an OpenAI-compatible request (`/v1/chat/completions`, embeddings and so on) with a
-   *virtual* key.
+1. A client (an agent step) sends an OpenAI-compatible request (`/v1/chat/completions`, embeddings and so
+   on) with a *virtual* key.
 2. The gateway authenticates the key.
 3. It resolves the requested model alias to one or more deployments.
 4. It applies policy: budget remaining, requests and tokens per minute, guardrails.
 5. It picks a deployment by its routing strategy.
-6. It translates to the provider's native API and streams the response back.
+6. It translates to the provider's native API (including tool definitions and tool calls) and streams the
+   response back.
 7. It records usage (tokens, computed cost, latency, key, tags) for logging and export.
 
-The API is OpenAI-shaped *because* most SDKs already speak it, so adoption is changing a base URL and a key.
+The API is OpenAI-shaped *because* most SDKs and agent frameworks already speak it, so adoption is changing
+a base URL and a key.
 
 ### LiteLLM proxy vs Portkey
 | | LiteLLM proxy | Portkey |
@@ -83,9 +100,17 @@ not known until it finishes: the model decides the output length.
 
 Two consequences:
 - **Budgets overshoot by whatever is in flight** when they run out, so a hard cap needs headroom or a
-  per-request ceiling enforced through `max_tokens`.
+  per-request ceiling enforced through `max_tokens`. Parallel agent steps put more in flight.
 - **Counters must live in Redis or similar** with several replicas, not in each process. Otherwise every
   replica enforces the full limit on its own and the effective limit is multiplied by the replica count.
+
+### What the gateway cannot see about agents
+- **It sees calls, not tasks.** A key budget cannot stop one agent run from taking 200 steps; only a
+  per-run step and cost cap in the agent loop can.
+- **Retries stack.** Gateway retries plus SDK retries plus the agent's own retry-on-error can multiply
+  attempts; choose one layer per failure type.
+- **Tool-call fidelity is a passthrough question.** Translating tool definitions and parallel tool calls
+  between providers is where unified APIs most often differ; test your tools through the gateway.
 
 ### Routing among deployments
 - **Strategies:** LiteLLM offers simple shuffle, least-busy, latency-based and usage-based routing, among
@@ -93,7 +118,7 @@ Two consequences:
 - **Cooldowns:** a deployment that fails repeatedly is skipped for a period: a circuit breaker under another
   name.
 - **Blind to quality:** these strategies only see what the gateway sees, latency and errors, never answer
-  quality.
+  quality or whether the agent's task succeeded.
 
 ### Alternatives
 - **API-gateway vendors with AI plugins** (Kong AI Gateway).
@@ -108,49 +133,91 @@ Two consequences:
 
 ### What it centralises
 - Key custody.
-- Budgets and quotas per team or customer.
+- Budgets and quotas per team, agent or customer.
 - Rate-limit coordination.
 - Retries and fallbacks.
 - Caching.
 - PII redaction and guardrails.
 - Logging and cost attribution via tags.
-- **Model aliases:** applications call `fast` or `strong` while the platform team decides what those
-  resolve to, so migrations and deprecations become configuration changes rather than code changes.
+- **Model aliases:** agents call `fast` or `strong` while the platform team decides what those resolve to,
+  so migrations and deprecations become configuration changes rather than code changes.
 
 ### Sharp edges
 - **Lowest-common-denominator API.** Provider-specific features (prompt-cache controls, extended reasoning
   parameters, tool-call nuances, vision input formats) lag or are dropped unless passthrough is verified.
 - **A new single point of failure and a new hop.** Run several replicas per region and keep it close to
-  callers.
+  callers; an agent pays the hop on every step.
 - **Decide the database failure mode.** When its Postgres or Redis is unavailable: fail open on budget
   checks, or fail closed and take every AI feature down with the database.
 - **Streaming must be forwarded without buffering,** or time-to-first-token suffers.
 - **Token counts across tokenisers are approximations.**
-- **Gateway logs contain prompts,** so they need a retention policy.
+- **Gateway logs contain prompts** (and every tool result the agent saw), so they need a retention policy.
 - **Someone must own the config,** or aliases rot and fallbacks go untested.
 
 ## Diagram
-Follow one request: policy checks happen before the provider call using an estimate, and actual usage is
+Follow one agent step: policy checks happen before the provider call using an estimate, and actual usage is
 charged only after the response completes, which is why budgets can overshoot by what is in flight.
 
 ```mermaid
 sequenceDiagram
-    participant App as Application
+    participant App as Agent step
     participant GW as AI gateway
     participant ST as Postgres and Redis
     participant P as Provider deployment
-    App->>GW: POST /v1/chat/completions, model fast, virtual key
+    App->>GW: POST /v1/chat/completions, model fast, virtual key, run tags
     GW->>ST: authenticate key, check budget, RPM and TPM estimate
     ST-->>GW: allowed
     Note over GW: resolve alias fast to deployments, pick one by routing strategy
-    GW->>P: translated native request
-    P-->>GW: streamed tokens
+    GW->>P: translated native request with tools
+    P-->>GW: streamed tokens or tool call
     GW-->>App: stream forwarded without buffering
     GW->>ST: charge actual tokens and cost, with tags
     Note over GW,P: on errors, retry, cool down the deployment, then fall back to strong
 ```
 
 ## Examples
+### Agent steps through the gateway with run tags and a per-run cap
+The gateway enforces the key's budget; the agent enforces the per-run cap the gateway cannot see. Tags
+carry run id and step name so spend and traces join up. The `metadata` tags field follows LiteLLM's
+convention; check your gateway's docs for the exact shape.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://litellm.internal:4000/v1", api_key="sk-<research-agent-virtual-key>")
+MAX_STEPS, MAX_RUN_TOKENS = 25, 400_000          # per-run guards, owned by the agent
+
+def run_agent(run_id, messages, tools, execute_tool):
+    used = 0
+    for step in range(MAX_STEPS):
+        r = client.chat.completions.create(
+            model="strong", messages=messages, tools=tools,
+            extra_body={"metadata": {"tags": ["research-agent", f"run:{run_id}", f"step:{step}"]}})
+        used += r.usage.total_tokens
+        if used > MAX_RUN_TOKENS:
+            return {"status": "stopped", "reason": "run token cap", "tokens": used}
+        msg = r.choices[0].message
+        messages.append(msg)
+        if not msg.tool_calls:
+            return {"status": "done", "answer": msg.content, "tokens": used}
+        for tc in msg.tool_calls:
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": execute_tool(tc)})
+    return {"status": "stopped", "reason": "step cap", "tokens": used}
+```
+
+- **The same pattern in LangChain:** construct `ChatOpenAI` with the gateway's `base_url`, a virtual key and
+  an alias as the model name; the gateway sees an ordinary OpenAI client.
+
+### Worked scenario: a looping agent drains a shared key
+Illustrative: a bug makes 20 concurrent agent runs loop; each step sends ~30k input tokens at $3 per 1M,
+about $0.09 per step, roughly 6 steps a minute per run.
+
+| Setup | Arithmetic | Effect |
+|---|---|---|
+| All features share one key with a $100 daily budget | 20 × 6 × $0.09 ≈ $10.80 per minute | Budget gone in about 9 minutes; every feature on that key is blocked |
+| One virtual key per agent, $100 budget | Same burn, isolated | Only the research agent stops; support and search keep working |
+| Plus per-run caps of 25 steps | 20 runs × 25 × $0.09 = $45 worst case | The loop never reaches the key budget at all |
+
 ### LiteLLM config and the application call
 Two deployments behind one alias, a stronger fallback, caching and logging. The application only needs the
 OpenAI SDK pointed at the proxy. Replace the model ids with current ones for your providers.
@@ -224,23 +291,27 @@ Illustrative numbers for one team key.
 | Same, counters in Redis | One shared counter | Effective limit 600, as configured |
 
 ## Production patterns
-- **A virtual key per team or feature.** When more than one team calls models, issue each its own key
-  through the gateway's key API with a budget, a budget period and RPM/TPM limits (LiteLLM's key
-  generation accepts `max_budget`, `budget_duration`, `rpm_limit` and `tpm_limit`). Monitor spend and
-  429s per key; a leaked key is revoked alone.
+- **A virtual key per agent or feature.** When more than one team or agent calls models, issue each its own
+  key through the gateway's key API with a budget, a budget period and RPM/TPM limits (LiteLLM's key
+  generation accepts `max_budget`, `budget_duration`, `rpm_limit` and `tpm_limit`). Monitor spend and 429s
+  per key; a looping agent or a leaked key is cut off alone.
+- **Run and step tags on every call.** Attach agent name, run id and step name as request metadata so the
+  gateway's spend joins your traces (LangSmith, Langfuse or OpenTelemetry). Monitor cost per successful run
+  and the step count distribution; a long tail of steps is the early sign of loops.
 - **Shared state for every replica.** Before running more than one LiteLLM replica, point the router at
-  Redis (`redis_host`, `redis_port`, `redis_password` in `router_settings`) so limits, cooldowns and
-  cache are shared. Monitor gateway-side limit hits against provider 429s; a gap means counters are not
-  shared.
-- **Cooldowns tuned to the provider.** Set how many failures put a deployment into cooldown and for how
-  long (`allowed_fails` and `cooldown_time` in LiteLLM's `router_settings`). Monitor deployments in
-  cooldown and the share of traffic each alias actually sends to each deployment.
+  Redis (`redis_host`, `redis_port`, `redis_password` in `router_settings`) so limits, cooldowns and cache
+  are shared. Monitor gateway-side limit hits against provider 429s; a gap means counters are not shared.
+- **Cooldowns tuned to the provider, one retry layer.** Set how many failures put a deployment into
+  cooldown and for how long (`allowed_fails` and `cooldown_time` in LiteLLM's `router_settings`), and turn
+  off duplicate retries in the SDK or agent loop for the same errors. Monitor deployments in cooldown and
+  attempts per agent step.
 - **Fail open on soft budgets.** Decide explicitly what happens when Postgres is down; for internal
   traffic, let requests through and reconcile spend later (LiteLLM documents a general setting for
   allowing requests when the database is unavailable). Monitor database health and unreconciled spend.
-- **Streaming and health in CI.** After every gateway upgrade, compare time-to-first-token through the
-  gateway with a direct call, and wire the proxy's liveness and readiness endpoints into the load
-  balancer. Monitor added latency at p50 and p99 and gateway availability.
+- **Streaming, tool calls and health in CI.** After every gateway upgrade, compare time-to-first-token
+  through the gateway with a direct call, replay a tool-calling eval through it, and wire the proxy's
+  liveness and readiness endpoints into the load balancer. Monitor added latency at p50 and p99, tool-call
+  parse failures and availability.
 - **Prompt-log retention.** Treat gateway logs as sensitive data: set a retention period, redact or omit
   message content where policy requires, and scope cache keys per tenant. Monitor log volume, retention
   jobs and cache hit rate per tenant.
@@ -248,10 +319,10 @@ Illustrative numbers for one team key.
 ## Trade-offs
 - **Central control vs an extra hop.** One place for keys, budgets and logs, against one more network hop
   and a shared failure point; the balance tips badly with a single replica or a different region from
-  callers.
+  callers, and an agent pays the hop on every step.
 - **Cheap migrations vs lagging features.** Aliases make provider migrations cheap, but the unified API
-  lags provider features; it flips when a provider-specific capability such as cache controls is core to
-  your product and is not passed through.
+  lags provider features; it flips when a provider-specific capability such as cache controls or a tool
+  feature is core to your agent and is not passed through.
 - **Hosted vs self-hosted.** A hosted gateway removes operations and gives dashboards on day one; a
   self-hosted LiteLLM keeps prompts in your VPC but makes you run Postgres, Redis and upgrades. Compliance
   usually decides.
@@ -264,12 +335,14 @@ Illustrative numbers for one team key.
 ## Pitfalls
 - **A fail-closed dependency on the gateway's database.** Symptom: every AI feature in the company goes down
   when Postgres restarts for maintenance.
+- **Relying on key budgets to stop a looping agent.** Symptom: one buggy agent drains a shared key and
+  blocks unrelated features. Fix: per-agent keys plus per-run step and token caps in the loop.
 - **Buffering streamed responses in the proxy.** Symptom: time-to-first-token jumps from hundreds of
   milliseconds to seconds right after adoption.
 - **A shared cache without tenant scoping.** Symptom: a cached answer containing one customer's data served
   to another, which is an incident, not a bug.
-- **Assuming feature parity across providers.** Symptom: provider-specific parameters silently dropped and
-  cost or quality regressing after a migration that "worked".
+- **Assuming feature parity across providers.** Symptom: provider-specific parameters silently dropped, or
+  tool calls translated differently, and cost or quality regressing after a migration that "worked".
 - **One master key shared by all applications.** Symptom: zero cost attribution and an unbounded blast
   radius when the key leaks.
 - **Nobody owning the configuration.** Symptom: dozens of aliases, half pointing at deprecated models, with
@@ -278,15 +351,18 @@ Illustrative numbers for one team key.
   overruns while the gateway's own limits never trip, worsening each time a replica is added.
 
 ## When to use
-- **Adopt a gateway** once more than one team or more than one provider is involved, or as soon as finance
-  or compliance asks for spend by team and a list of what is sent where.
-- **Skip it for a single application:** an in-process router (LiteLLM's SDK or a thin client) is lighter.
+- **Adopt a gateway** once more than one team, agent or provider is involved, or as soon as finance or
+  compliance asks for spend by team and a list of what is sent where.
+- **Skip it for a single agent or application:** an in-process router (LiteLLM's SDK or a thin client) is
+  lighter.
 - **Choose the LiteLLM proxy** when you want an open-source component inside your own network and can
   operate a small Python service with Postgres and Redis.
 - **Choose Portkey** when hosted observability and declarative configs matter more and your data rules
   allow a processor.
-- **Measure:** added latency at p50 and p99, gateway availability, cache hit rate and spend per key.
-- **Interviews:** say what a gateway centralises and what it cannot do, which is make outputs correct.
+- **Measure:** added latency at p50 and p99, gateway availability, cache hit rate and spend per key and per
+  agent run.
+- **Interviews:** say what a gateway centralises and what it cannot do, which is make outputs correct or
+  stop an agent from looping.
 
 ## Role lens
 - **Engineer:** Points the SDK at the gateway, calls aliases rather than model ids, tags requests for
@@ -318,6 +394,12 @@ gateway is the right idea; the single-instance, fail-closed shape is what needs 
 - **A network boundary applies policy to every caller,** whether or not they remembered: key custody,
   budgets, logging and model aliases in one place.
 
+### How do you stop one runaway agent from taking down every AI feature that shares a gateway?
+- **Isolate keys:** one virtual key per agent or feature with its own budget and RPM/TPM limits, so a loop
+  only exhausts its own key.
+- **Cap in the loop:** per-run step and token caps in the agent, because the gateway sees calls, not tasks.
+- **Detect early:** tag calls with run id and step, and alert on step-count tails and spend per run.
+
 ### Provider 429s keep appearing but the gateway's own rate limits never trip. What is wrong?
 - **Most likely per-replica counters:** with 3 replicas each enforcing 600 requests per minute in process,
   the effective limit is 1,800.
@@ -326,13 +408,12 @@ gateway is the right idea; the single-instance, fail-closed shape is what needs 
 - **Verify:** gateway-side limit hits should now rise as provider 429s fall; the gap between them is the
   signal.
 
-### When would you not put a gateway in front of model calls?
-- **For a single application,** where an in-process router such as the LiteLLM SDK's `Router` gives routing
-  and fallbacks with no extra hop.
-- **When a provider-specific feature is core** (prompt-cache controls, extended reasoning parameters) and the
-  unified API does not pass it through intact.
-- **When you cannot operate it well:** a single replica in another region adds latency and a company-wide
-  single point of failure.
+### Your agent works against the provider directly but its tool calls break through the gateway. How do you debug it?
+- **Compare raw requests and responses:** tool definitions, parallel tool calls and argument encoding are
+  where provider translation most often differs.
+- **Check passthrough settings** for provider-specific parameters, and pin the gateway version that passed
+  your tool-calling eval.
+- **Add the eval to CI** so every gateway upgrade replays real agent tool calls before it ships.
 
 ### How do you make a budget cap actually hard when cost is unknown until the response ends?
 - **Check before, charge after:** pre-check using prompt tokens plus `max_tokens`, then charge actual usage
@@ -347,7 +428,8 @@ gateway is the right idea; the single-instance, fail-closed shape is what needs 
   Portkey is a third-party processor unless you deploy its gateway in your own environment.
 - **Who operates it:** LiteLLM means running Postgres, Redis and upgrades yourself; Portkey gives dashboards
   and declarative configs on day one.
-- **Check passthrough** of the provider features the product depends on before committing to either.
+- **Check passthrough** of the provider features the product depends on before committing to either. An
+  in-process `Router` is the lighter choice for a single application.
 
 ## Quiz
 ### Q: Which concern is an AI gateway least able to solve?

@@ -5,7 +5,8 @@ name: Document parsing (OCR, layout, tables)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - multimodal/ocr
   - multimodal/document-understanding
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-Parsing turns PDFs, scans and office files into clean, ordered, structured text before chunking: OCR for
-image pages, layout analysis for reading order and header removal, and tables that keep cells tied to
-their headers. Retrieval cannot find text the parser garbled, reordered or flattened.
+Everything an agent's search or read tool returns from a PDF, scan or office file was produced by a
+parser: OCR, reading order, header removal and tables tied to their headers. The agent cannot find or
+read text the parser garbled, reordered or flattened.
+
+## For agent builders
+- **Why it matters for agents.** Agents act on numbers they read: a refund window, a price, a limit. A
+  table flattened or a digit misread by OCR becomes a wrong tool call or a wrong commitment to a customer,
+  and the agent's trace shows the "right" document cited, so nobody suspects the parser.
+- **Where it shows up in your stack.** Ingestion for the agent's knowledge base (LangChain document loaders
+  such as `PyPDFLoader`, LlamaIndex readers, Unstructured, Docling, LlamaParse or a managed service), and
+  at runtime when a user uploads a file and the agent calls a `read_document`-style tool on it.
+- **What you control.** Per-page OCR routing, table serialisation, which metadata (page, `source`, OCR
+  confidence) travels into chunks and tool results, and a parser golden set in CI.
+- **What you can skip.** OCR model internals and layout-model training. Pick tools by measuring them on
+  your ugliest pages.
 
 ## Why it exists
 - **A PDF is drawing instructions, not text.** Place these glyphs at these coordinates, draw this line.
@@ -126,6 +139,19 @@ their headers. Retrieval cannot find text the parser garbled, reordered or flatt
 
 - **They differ mainly in layout and table quality on *your* documents**, so compare them on a sample of
   your hardest pages.
+- **Agent frameworks wrap these, they do not replace them.** LangChain and LlamaIndex loaders call one of
+  the libraries or services above; the default loader is often plain text-layer extraction, so check what
+  yours does on scans and tables.
+
+### 9. Parsing inside an agent
+- **Runtime parsing is a tool.** When a user attaches a file mid-conversation, the agent calls a read tool
+  that parses it on the spot, so parse latency and cost land inside the agent's step budget.
+- **Return structure, not a blob.** Pages as Markdown with page numbers, tables as Markdown plus header-tagged
+  rows, so the agent can cite "page 4" and read the right cell.
+- **Pass parse quality to the model.** Mark OCR pages and low-confidence numeric tokens in the tool result,
+  so the agent can say "the scan is unclear" or call a verification tool instead of stating a guess.
+- **Bound the output.** A 300-page upload cannot be returned whole; return a page index and let the agent
+  request page ranges, or index the file and expose it through the search tool.
 
 ## Diagram
 Each page is triaged on its own, then text from either path goes through the same cleaning, layout and
@@ -147,6 +173,44 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: a read tool that flags shaky digits
+The tool the agent calls on an uploaded PDF. It returns per-page text with `source`, and for OCR pages it
+lists low-confidence words containing digits, so the agent can hedge or verify instead of quoting them.
+
+```python
+import pdfplumber, pytesseract
+from pytesseract import Output
+
+def read_document(path: str, pages: list[int] | None = None, min_conf: float = 80.0) -> dict:
+    """Tool: read pages of an uploaded PDF. Returns text per page plus parse-quality flags."""
+    out = []
+    with pdfplumber.open(path) as pdf:
+        wanted = pages or list(range(1, min(len(pdf.pages), 10) + 1))   # never dump 300 pages at once
+        for n in wanted:
+            page = pdf.pages[n - 1]
+            text, source, shaky = page.extract_text() or "", "text-layer", []
+            if len(text.strip()) < 50:                                   # scanned page: OCR it
+                img = page.to_image(resolution=300).original
+                d = pytesseract.image_to_data(img, output_type=Output.DICT)
+                words = [(w, float(c)) for w, c in zip(d["text"], d["conf"]) if w.strip()]
+                text, source = " ".join(w for w, _ in words), "ocr"
+                shaky = [w for w, c in words if c < min_conf and any(ch.isdigit() for ch in w)]
+            out.append({"page": n, "source": source, "text": text[:4000], "low_conf_numbers": shaky})
+    return {"total_pages": len(pdf.pages), "pages": out}
+
+# Tool description shown to the model (plain words):
+# "Reads pages of the uploaded PDF. If low_conf_numbers is non-empty, do not state those values as
+#  fact: say the scan is unclear or ask the user to confirm."
+```
+
+| Uploaded 12-page scanned lease (illustrative) | Without flags | With flags |
+|---|---|---|
+| OCR reads the deposit as "3,5O0" | agent quotes a garbled or guessed figure | `low_conf_numbers: ["3,5O0"]`, agent asks the user to confirm |
+| Pages returned on first call | all 12, about 40k tokens | first 10, capped at 4,000 characters each |
+| Citation | "the lease says" | "page 3 (scanned, unclear)" |
+
+The threshold `min_conf=80.0` and the page cap are illustrative; tune them on pages you have labelled.
+
 ### Per-page parser with OCR fallback and row-wise tables
 Use the text layer when present, fall back to OCR, and serialise tables row by row with their headers.
 
@@ -248,6 +312,9 @@ have labelled by eye.
 - **Strip repeated headers and footers by position.** Compare the top and bottom bands of each page across
   the document and drop text that recurs at the same position on most pages, keeping the page number as
   metadata for citations. Monitor how many chunks match the company name or "Confidential".
+- **Parse metadata into agent tool results.** Store `page`, `source` and an OCR-confidence flag on every
+  chunk at ingestion and return them from the agent's search tool, so answers cite pages and the agent can
+  hedge on scanned content. Monitor how often agents cite OCR-sourced chunks for numeric answers.
 
 ## Trade-offs
 - **Text layer vs OCR.** Text-layer extraction is exact, fast and cheap when the font encoding is sound,
@@ -260,7 +327,10 @@ have labelled by eye.
   layouts are simple.
 - **Row-wise serialisation vs index size.** Rows become retrievable on their own, at the cost of more
   chunks and repetition. For large analytical tables, loading them into SQL is cheaper and more accurate
-  than embedding.
+  than embedding, and an agent can then answer with a `sql_query` tool instead of reading cells.
+- **Offline ingestion vs runtime parsing in the agent.** Parsing at ingestion can use slow, expensive
+  pipelines and a golden set; parsing a user's upload at runtime must fit the step's latency budget. Flip
+  to background indexing when uploads are large or reused across sessions.
 
 ## Pitfalls
 - **Using one `extract_text()` call for everything.** Symptom: scanned documents produce empty chunks, so
@@ -277,6 +347,12 @@ have labelled by eye.
   wrong or missing answers for rows that fall on its continuation.
 - **Never evaluating the parser.** Problems surface only as downstream wrong answers, whereas a sample of
   pages compared against hand transcriptions would show them immediately.
+- **Trusting the framework's default loader.** Symptom: an agent built on a tutorial loader says "the
+  document does not mention it" for scanned uploads. Fix: check which library the loader uses, add per-page
+  OCR routing, and test it on scans before launch.
+- **Returning a whole parsed document as one tool result.** Symptom: one upload fills the context window,
+  the agent loses earlier instructions, or the call fails. Fix: page ranges, a page index, or indexing the
+  upload behind the search tool.
 
 ## When to use
 - **Verify parsing first** on any new corpus, before choosing chunk sizes or embedding models.
@@ -285,6 +361,8 @@ have labelled by eye.
 - **Measure:** character error rate on OCR pages and cell accuracy on tables.
 - **Use plain text-layer extraction** when documents are clean and born-digital; add OCR, layout models or
   VLMs only where the sample shows failures.
+- **For agents that take uploads:** add a runtime read tool with page ranges and parse-quality flags, and
+  include scanned and table-heavy uploads in the agent eval set.
 - **Interviews:** "I would look at the parsed text first" often separates experienced RAG builders from
   tutorial-level ones.
 
@@ -316,7 +394,9 @@ VLM transcription for numbers unless outputs are cross-checked.
 - **So fix it at the source:** parsing errors are among the most common root causes in RAG failure analysis
   and cheapest to fix where they happen.
 
-### Whole contracts are missing from search but ingestion logged no errors. How do you debug it?
+### Your agent says a contract "does not mention" a clause that is in it, and ingestion logged no errors. How do you debug it?
+- **Check the trace first:** did the search tool return chunks from that contract at all? If none exist,
+  the loss is at parsing, not in the agent's query.
 - **Suspect empty text layers:** scanned pages make `extract_text()` return empty strings, so documents
   silently vanish; check chunk counts and character counts per page for those files.
 - **Suspect broken font maps:** a non-empty layer full of `(cid:42)` placeholders or mojibake embeds to
@@ -347,6 +427,14 @@ VLM transcription for numbers unless outputs are cross-checked.
 - **Score what breaks answers:** CER, digit CER and table cell accuracy, not a single overall score.
 - **Then weigh the constraints:** cost per page, latency, and data residency, since a managed service sends
   pages outside your boundary; keep the golden set in CI to catch regressions on upgrades.
+
+### Users upload PDFs mid-conversation and your agent must answer from them. How do you design the read tool?
+- **Parse per page with OCR fallback** and return Markdown text, tables with headers, page numbers and
+  `source`, so the agent can cite and read cells correctly.
+- **Bound the output:** return a page index and let the agent request page ranges, or index large uploads
+  in the background and expose them through the search tool, because one 300-page result would flood the context.
+- **Surface parse quality:** flag OCR pages and low-confidence digits in the result and instruct the agent
+  not to state flagged values as fact; add scanned uploads to the agent eval set.
 
 ## Quiz
 ### Q: Why should OCR fallback be decided per page rather than per file?

@@ -5,7 +5,8 @@ name: UploadFile
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/request-size-limits-and-upload-security
   - fastapi-for-ai/backgroundtasks
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-`UploadFile` is FastAPI's type for `multipart/form-data` files (PDFs, images, audio): a spooled temp
-file, in memory while small and on disk when large, with filename, content type and async read/seek.
-Prefer it to `bytes = File()`; it does no safety checks.
+When users attach PDFs, images or audio to an agent chat, `UploadFile` receives them: a spooled
+multipart temp file, in memory while small and on disk when large. Persist it, hand the agent a storage
+key, and add your own safety checks.
+
+## For agent builders
+- **Why it matters for agents.** Attachments are how users give agents documents to read, screenshots to
+  look at and recordings to transcribe. The agent run and its tools outlive the upload request, so the
+  file must be in durable storage before the run starts.
+- **Where it shows up in your stack.** The `POST /chat` or `POST /documents` route of your agent API,
+  the RAG ingestion job that parses and embeds the file, and tools like `read_document(key)` or a vision
+  call that loads the bytes by key.
+- **What you control.** `UploadFile` versus `bytes = File()`, chunked copy to object storage, content
+  hashing for dedup, and passing a key (never the `UploadFile` object) into the agent's run context.
+- **What you can skip.** Multipart parsing internals; know that the whole body is parsed before your
+  handler runs, and that the temp file dies with the request.
 
 ## Why it exists
 - **Files arrive as multipart.** Browsers and HTTP clients send a body split into parts by a boundary
@@ -95,6 +108,21 @@ The whole multipart body is parsed **before** your handler runs. By the time you
 - **Since FastAPI 0.113** you can also bind a Pydantic model to the form fields themselves
   (`meta: Annotated[Meta, Form()]`), which suits flat options.
 
+### Attachments in an agent run
+1. **The chat route receives message plus files** as multipart: the message in a `Form()` field, the
+   files as `list[UploadFile]`.
+2. **The handler persists each file** to object storage under a generated key and records it against the
+   conversation, with its hash, size and sniffed type.
+3. **The agent gets references, not bytes.** The run context lists `{key, name, type}`; the system prompt
+   or a tool description tells the model it can call `read_document(key)`.
+4. **Tools load by key.** A document tool returns parsed text (from the ingestion job's output), a vision
+   tool loads the image bytes and sends them to the model provider.
+
+- **Why references:** a 20 MB PDF inlined into the prompt costs tokens on every step; a key costs a few
+  tokens, and the model reads only the pages it asks for.
+- **Base64 again at the provider.** Images sent to a vision model usually travel base64-encoded in JSON,
+  so they grow by a third on that hop; resize before sending.
+
 ### Alternatives
 | Option | Use when |
 |---|---|
@@ -104,7 +132,8 @@ The whole multipart body is parsed **before** your handler runs. By the time you
 
 ## Diagram
 The key timing point: Starlette receives and spools the entire multipart body before your handler
-runs, and the temp file dies with the request, so only a storage key may travel onward.
+runs, and the temp file dies with the request, so only a storage key may travel onward to the ingestion
+job or the agent run that reads the attachment.
 
 ```mermaid
 sequenceDiagram
@@ -160,6 +189,42 @@ async def transcribe(audio: UploadFile, meta: str = Form("{}")):
 ```
 
 A client sends it with `curl -F "audio=@call.m4a;type=audio/mp4" -F 'meta={"language":"de"}'`.
+
+### Chat message with attachments that starts an agent run
+Files are persisted in the handler; the run receives keys. `store_upload` and `start_agent_run` are
+your own functions (object storage put, and enqueueing the run).
+
+```python
+import hashlib, uuid
+from fastapi import FastAPI, Form, HTTPException, UploadFile
+
+app = FastAPI()
+CHUNK, MAX_FILE = 1 << 20, 50 * (1 << 20)
+
+async def persist(f: UploadFile) -> dict:
+    key, digest, size, chunks = f"att/{uuid.uuid4()}", hashlib.sha256(), 0, []
+    while chunk := await f.read(CHUNK):
+        size += len(chunk)
+        if size > MAX_FILE:
+            raise HTTPException(413, f"{f.filename} too large")
+        digest.update(chunk); chunks.append(chunk)       # real code streams to a multipart upload
+    await store_upload(key, b"".join(chunks))
+    return {"key": key, "name": f.filename, "type": f.content_type,
+            "bytes": size, "sha256": digest.hexdigest()}
+
+@app.post("/v1/chat", status_code=202)
+async def chat(message: str = Form(), files: list[UploadFile] | None = None):
+    attachments = [await persist(f) for f in files or []]  # durable before the run starts
+    run_id = await start_agent_run(message=message, attachments=attachments)  # keys, not objects
+    return {"run_id": run_id, "attachments": [a["key"] for a in attachments]}
+```
+
+| Attachment | Inline into the prompt | Pass a key, agent calls `read_document` |
+|---|---|---|
+| 40-page PDF, ~20k tokens of text | ~20k tokens re-sent on every one of 8 steps: ~160k | ~30 tokens per step for the reference, plus the pages actually read once |
+| 4 MB screenshot | ~5.3 MB of base64 in every request that carries it | loaded once by a vision tool, resized first |
+
+Illustrative numbers; prefix caching on the provider side can reduce the inline cost but not remove it.
 
 ### Worked trace: the bytes of a 150 MiB recording
 | Stage | Where the bytes are | Peak memory for the part |
@@ -221,6 +286,10 @@ shutil.rmtree(STORE)
 - **Raw-stream route for single large files** — for audio or video from trusted clients. Accept
   `application/octet-stream` and `async for chunk in request.stream()` straight into a multipart
   object-storage upload, skipping the temp file. Monitor upload throughput and incomplete uploads.
+- **Attachments as keys in the agent's run context** — for every agent chat that accepts files. Persist
+  before starting the run, list `{key, name, type}` in the run context, and expose `read_document(key)`
+  or a vision tool that loads by key and checks the caller's tenant. Monitor tokens per step for runs
+  with attachments; a jump means someone inlined file content.
 - **Upload concurrency budget** — when `def` handlers do the copying. Size the thread pool and worker
   memory for peak concurrent uploads, and cap concurrent uploads per tenant. Monitor thread-pool
   saturation, upload latency and worker memory.
@@ -234,6 +303,9 @@ shutil.rmtree(STORE)
   presigned uploads win once files are large or uploads are frequent.
 - **Many files per request vs one.** `list[UploadFile]` is convenient for "upload a folder", but one bad
   file fails the whole request. Per-file requests or per-file job status give clearer partial failures.
+- **Inline attachment vs key plus tool.** Inlining a small file's text into the first prompt saves a
+  tool round trip and works with any model, but every later step re-sends it. A key plus a read tool
+  keeps steps cheap at the cost of one extra model turn; it flips once files exceed a few thousand tokens.
 - **Validating in the handler vs before it.** In-handler checks are easy to write, but the bytes have
   already been received. They protect downstream systems, not the API's own memory, disk and bandwidth.
 
@@ -243,6 +315,9 @@ shutil.rmtree(STORE)
 - **Passing the `UploadFile` to a background task or another thread.** Symptom: "I/O operation on closed
   file" errors only in the background job, or code that works until a FastAPI upgrade changes when upload
   files are closed, or until the work moves to a queue.
+- **Handing the `UploadFile` to the agent run.** Symptom: the first tool call that reads the attachment
+  fails with a closed-file error, or works locally and fails once runs move to a worker. Fix: persist in
+  the handler and pass keys.
 - **Writing to disk at `audio.filename`.** Symptom: files land outside the intended directory or
   overwrite each other, a path-traversal vulnerability.
 - **Sync `audio.file.read()` on a large spooled file in an `async def` handler.** Symptom: the event loop
@@ -259,7 +334,7 @@ shutil.rmtree(STORE)
 - **Switch to raw `request.stream()` or presigned uploads for** large media, high upload volume, or bytes
   going straight to object storage without a temp file.
 - **Pair it with** size limits outside the handler and content checks inside it, and pass storage keys
-  rather than file objects to async work.
+  rather than file objects to async work, including agent runs and their tools.
 - **Measure:** temp-disk usage, upload latency and worker memory.
 - **Interviews:** know the spooled-file behaviour and that parsing completes before the handler runs.
 
@@ -291,12 +366,20 @@ on a properly sized volume.
   can OOM-kill a pod.
 - **Neither one validates** size, type or filename; that is your job.
 
-### A background job that processes uploads fails with "I/O operation on closed file". What happened and how do you fix it?
-- **The `UploadFile` was passed to the job.** It is request-scoped, and some FastAPI versions close it
-  when the endpoint returns, before `BackgroundTasks` run.
+### An agent run or ingestion job that reads an attachment fails with "I/O operation on closed file". What happened and how do you fix it?
+- **The `UploadFile` was passed to the run or job.** It is request-scoped, and some FastAPI versions close
+  it when the endpoint returns, before `BackgroundTasks` run; an agent run outlives the request anyway.
 - **Fix:** inside the handler, copy the bytes to durable storage (or read them), then pass a path or
   object key to the job.
 - **That also makes it queue-safe**, since an object in one process can never reach a worker in another.
+
+### Users attach PDFs and screenshots to an agent chat. How does the file get from the request to the agent's tools?
+- **Persist in the handler**: copy each `UploadFile` in chunks to object storage under a generated key,
+  with hash, size and sniffed type, before the run starts.
+- **Give the run references**: `{key, name, type}` in the run context, and tools like
+  `read_document(key)` or a vision tool that load by key and check the tenant.
+- **Why not inline**: file text re-sent on every step multiplies tokens, and the `UploadFile` is gone
+  once the request ends.
 
 ### Should an upload handler be `async def` or plain `def`?
 - **`async def`** with awaited `read`/`seek`, which run disk operations in a thread pool so the event loop

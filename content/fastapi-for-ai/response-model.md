@@ -5,7 +5,8 @@ name: response_model
 kind: concept
 difficulty: core
 est_minutes: 11
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/pydantic-request-response-models
   - python-for-ai/pydantic
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-`response_model` (or the return annotation) declares the exact shape a route may return. FastAPI
-validates output against it, serialises only declared fields, and publishes it in OpenAPI: the cheapest
-guarantee that internal fields never reach clients.
+An agent's final state carries the system prompt, scratchpad, raw tool outputs and costs. `response_model`
+declares the exact shape a route may return, validates it and drops everything undeclared: the cheapest
+guarantee internals never reach users.
+
+## For agent builders
+- **Why it matters for agents.** Agent frameworks hand you a big state object at the end of a run:
+  message history, intermediate reasoning, tool results that may contain other users' or internal data,
+  token counts, cost. Returning it directly is the easiest leak in an agent API.
+- **Where it shows up in your stack.** The `response_model` on your `/agent/run` route, the final state
+  dict a LangGraph graph returns from `ainvoke`, and every SSE step event, which bypasses
+  `response_model` entirely because a `StreamingResponse` is sent as-is.
+- **What you control.** A public `*Out` model per agent route, an explicit event model for each streamed
+  step type, exclude options, and contract tests that pin the exact key set.
+- **What you can skip.** The serialisation fast-path details. Know the allow-list behaviour, the
+  `Response` escape hatch and the exclude options.
 
 ## Why it exists
 - **Return values drift.** A handler returns whatever its last line built: someone attaches the raw
@@ -106,6 +119,67 @@ flowchart TD
 ```
 
 ## Examples
+### Agent run: return the final state, publish only the answer
+The agent loop returns its full state as a dict (as graph frameworks typically do). The route returns it
+unchanged; `response_model` keeps only `answer`, `citations` and `steps`. The streaming route cannot rely
+on that, so each event is built from an explicit model in a discriminated union.
+
+```python
+from typing import Annotated, Literal, Union
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+class RunOut(BaseModel):                       # the public contract
+    answer: str
+    citations: list[str] = []
+    steps: int
+
+async def run_agent(task: str) -> dict:        # stand-in for an agent framework's final state
+    return {"answer": "Use GQA.", "citations": ["doc-12"], "steps": 4,
+            "messages": [{"role": "system", "content": "internal system prompt"}],
+            "scratchpad": "user seems junior...", "tool_outputs": [{"crm_row": {"email": "x@y.z"}}],
+            "cost_usd": 0.042}
+
+class ToolEvent(BaseModel):
+    type: Literal["tool"]
+    name: str                                  # tool name only, never raw tool output
+class TokenEvent(BaseModel):
+    type: Literal["token"]
+    text: str
+class DoneEvent(BaseModel):
+    type: Literal["done"]
+    steps: int
+Event = Annotated[Union[ToolEvent, TokenEvent, DoneEvent], Field(discriminator="type")]
+
+app = FastAPI()
+
+@app.post("/agent/run", response_model=RunOut)
+async def run(body: dict) -> RunOut:
+    return await run_agent(body["task"])       # messages, scratchpad, tool_outputs, cost_usd dropped
+
+@app.post("/agent/stream", response_model=None)  # Response: no filtering, so build every event
+async def stream(body: dict):
+    async def events():
+        for ev in (ToolEvent(type="tool", name="search_docs"), TokenEvent(type="token", text="Use GQA."),
+                   DoneEvent(type="done", steps=4)):
+            yield f"data: {ev.model_dump_json()}\n\n"
+    return StreamingResponse(events(), media_type="text/event-stream")
+```
+
+### Worked scenario: what one leaked agent state exposes
+A team returned the framework's final state directly for two weeks (illustrative sizes).
+
+| Field in final state | Size per response | Risk |
+|---|---|---|
+| `messages` (system prompt and all turns) | ~6,000 tokens | prompt and guardrail logic copied by anyone |
+| `scratchpad` | ~800 tokens | model's private notes about the user |
+| `tool_outputs` | up to 20 KB | raw CRM rows, including fields the user may not see |
+| `cost_usd` | 1 number | pricing and margin visible to customers |
+| `answer`, `citations`, `steps` | under 1 KB | the only fields the UI used |
+
+With `response_model=RunOut`, responses shrink to the last row and nothing else ships.
+
 ### Internal superset in, public shape out
 A public model, an internal subclass with fields that must never leave the process, and a handler that
 returns the internal object unchanged.
@@ -180,6 +254,10 @@ with `cost_usd`.
 to clients.
 
 ## Production patterns
+- **Never return framework state directly.** Use on every agent route: declare a `RunOut` model and
+  return the final state through it, so new state keys added by a framework upgrade or a new node stay
+  internal. Add an exact-key contract test on a recorded run and monitor response size per route; a jump
+  means something new is shipping.
 - **Audit routes for missing contracts at startup.** Use in every service: in a test, iterate
   `app.routes`, and for each `fastapi.routing.APIRoute` fail if `route.response_model` is `None` or `dict`
   unless the path is on an explicit allow-list (streaming, downloads). This catches `-> dict` and
@@ -216,6 +294,10 @@ to clients.
   "randomly" missing from responses depending on which code path set them.
 - **Reusing the request model as the response model to save a class.** Symptom: clients must send fields
   that only make sense in output, and output exposes fields that only make sense in input.
+- **Streaming raw tool results as step events.** The stream bypasses `response_model`, so a step event
+  built from `tool_outputs` ships whatever the tool returned. Symptom: internal records visible in the
+  browser's network tab only on the streaming route. Fix: an event model per step type that carries tool
+  names and summaries, not raw output.
 - **Treating a `ResponseValidationError` 500 as a library bug and disabling response validation.**
   Symptom: a handler branch returns the wrong shape and ships for months.
 - **`extra="forbid"` on response models**, often via a shared base class copied from request models. The
@@ -266,6 +348,14 @@ and misleads readers. The fix is to build stream chunks from an explicit chunk m
   `provider_raw` never reaches the client even when the handler returns a superset.
 - **Documentation that cannot drift**, because the same declaration becomes the `200` schema in OpenAPI.
 
+### Your agent endpoint returns the framework's final state. What can go wrong, and how do you design the output instead?
+- **Everything in state ships:** system prompt, message history, scratchpad, raw tool outputs and cost,
+  and every key a future node or framework upgrade adds.
+- **Design:** a public `RunOut` with only what the client needs (answer, citations, step count) declared
+  as `response_model`; FastAPI drops the rest on every return path.
+- **Streams too:** the SSE route bypasses the response model, so build each event from an explicit
+  discriminated-union model and pin both routes with exact-key contract tests.
+
 ### After a deploy, one route starts returning 500s with `extra_forbidden` in the logs. What happened?
 - **A response model forbids extras**, usually inherited from a shared base class copied from request
   models with `extra="forbid"`.
@@ -282,6 +372,13 @@ and misleads readers. The fix is to build stream chunks from an explicit chunk m
 - **Either way, cover the gap** with another output check: chunks built from an explicit model, and a
   contract test on the parsed output.
 
+### A security review finds raw CRM rows in your agent's streamed events, though `/agent/run` is clean. Why?
+- **`StreamingResponse` is a `Response`**, so FastAPI sends it as-is; the `response_model` on the
+  streaming route documents a shape it does not enforce.
+- **The events were built from tool output**, so whatever the CRM tool returned reached the browser.
+- **Fix:** an explicit event model per step type (tool name, short summary, tokens, done), set
+  `response_model=None` with a comment, and a contract test that parses every event of a recorded run.
+
 ### Clients report fields that "randomly" disappear from responses. How do you investigate?
 - **Check the route's exclude options.** `response_model_exclude_unset=True` emits only fields the handler
   set, so the result depends on which code path ran; `response_model_exclude_none=True` drops `None`.
@@ -289,14 +386,6 @@ and misleads readers. The fix is to build stream chunks from an explicit chunk m
   under `exclude_unset`.
 - **Decide as an API change:** either remove the option or document the field as optional, because each
   exclude option changes what clients must handle.
-
-### How would you make sure no route in a large service ships without an output contract?
-- **Audit in a test:** iterate `app.routes`, and for each `APIRoute` fail if `route.response_model` is
-  `None` or `dict` unless the path is on an explicit allow-list.
-- **Pin public shapes:** assert `set(body) == {...}` per public route and check the OpenAPI schema for
-  internal names.
-- **Monitor in production:** a handler for `ResponseValidationError` that logs `exc.errors()` and counts
-  them, alerting on any non-zero rate after a deploy.
 
 ## Quiz
 ### Q: A handler declared with `response_model=Out` returns a dict containing every `Out` field plus `cost_usd`. What does the client receive?

@@ -5,7 +5,8 @@ name: Task decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/planning
   - agents/multi-agent-patterns
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-Task decomposition splits a large job into subtasks that each fit one model call, can be verified alone
-and expose a small interface. Planning decides order; decomposition decides shape. Done well it buys
-parallelism and isolated failures; done badly, coordination overhead.
+Task decomposition splits an agent's job into subtasks that each fit one model call, can be verified
+alone and expose a small interface. Planning decides order; decomposition decides shape. Done well it
+buys parallelism and isolated failures; done badly, coordination overhead.
+
+## For agent builders
+- **Why it matters for agents.** It is the design step behind every research, migration or extraction
+  agent: which pieces run as their own model call or sub-agent, what each returns, and where a verifier
+  sits. Chains of unverified steps are the most common reason an agent's end-to-end success is far below
+  its per-step success.
+- **Where it shows up in your stack.** LangGraph graphs (nodes, edges, subgraphs, and the `Send` API for
+  map-reduce fan-out), sub-agents in coding agents, agents-as-tools in the OpenAI Agents SDK, CrewAI
+  tasks that declare other tasks as context, and typed subtask contracts with Pydantic or structured
+  outputs.
+- **What you control.** Granularity, the dependency graph, the output schema at each seam, what crosses
+  each edge (summaries and references, not transcripts), concurrency limits and per-subtask verifiers.
+- **What you can skip.** The benchmark details of least-to-most and decomposed prompting; keep the
+  lesson that solvable sub-problems beat one monolithic ask, and do the seam arithmetic for your graph.
 
 ## Why it exists
 - **One call has fixed attention and context.** Ask for "a competitive analysis of five vendors with
@@ -227,6 +242,9 @@ failure; latency rows assume about 20 seconds per subtask.
   retries and reruns skip finished, unchanged pieces. Monitor cache hit rate and stale-result complaints.
 - **Pass references for raw data.** Put source ids or document chunk ids in the structured result, so the
   merge step can fetch raw text when a detail matters. Monitor how often the merge step fetches.
+- **Trace each subtask as its own span.** Give every subtask a span with its type, input hash, tokens
+  and verifier result in your tracing tool (LangSmith or OpenTelemetry), and build an eval dataset per
+  subtask type from those traces. Monitor per-subtask pass rate over time; it tells you which seam to fix.
 
 ## Trade-offs
 - **Per-piece accuracy vs overhead.** Smaller subtasks improve accuracy and verifiability per piece, but
@@ -319,6 +337,14 @@ raw text when needed. Measure recall per clause type before and after, and token
   dependencies and independent modules run as a bounded-concurrency fan-out.
 - **Contract and merge:** each subtask returns a diff plus its test result; a final step runs the full
   suite and resolves conflicts in shared files. Measure per-module pass rate and tokens per file.
+
+### How would you implement a fan-out plus merge in an agent framework, and what do you watch in production?
+- **Fan-out:** in LangGraph, a routing function returns one `Send` per subtask to a worker node, and a
+  reducer on the state key collects the structured results for the merge node; other frameworks do the
+  same with parallel tool calls or a task group.
+- **Bound it:** cap the number of subtasks, limit concurrency to your rate limits, and validate each
+  result against its schema before the merge reads it.
+- **Watch:** per-subtask failure and retry rates, tokens per edge, and the critical-path latency per run.
 
 ## Quiz
 ### Q: Which boundary is the best place to cut a task into subtasks?

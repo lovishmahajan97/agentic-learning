@@ -5,7 +5,8 @@ name: Recall vs precision trade-off
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - ml-fundamentals/precision-recall-f1
   - rag-retrieval/reranking
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Recall is the share of answer-bearing passages you retrieved; precision is the share of retrieved passages
-that bear the answer. Widening top-k trades one for the other, so stage retrieval: wide and cheap for
-recall, then narrow and expensive for precision.
+Every time an agent calls its search tool, recall decides whether the evidence arrived and precision
+decides how much noise lands in its transcript. Stage retrieval inside the tool: wide and cheap for
+recall, then a reranker and token budget for precision.
+
+## For agent builders
+- **Why it matters for agents.** A search tool's output is appended to the agent's context and re-read on
+  every later step. Low recall makes the agent answer from memory or search again; low precision fills
+  the transcript with distractors that steer the next tool call wrong.
+- **Where it shows up in your stack.** The retriever behind your search tool (a LangChain or LlamaIndex
+  retriever, a vector store query), its `k`, a reranker step, and the eval harness (LangSmith datasets,
+  or your own golden set script) that scores it.
+- **What you control.** Candidate depth k, the reranker, how many tokens one tool result may return, a
+  relevance threshold, and an explicit "no evidence" result the agent can act on.
+- **What you can skip.** The formal IR theory of F-beta. Know recall@k, precision@k, nDCG and the
+  difference between hit rate and full recall; that is enough to tune and debug an agent's retrieval.
 
 ## Why it exists
 - **You must cut a ranked list somewhere.** Cut early (top-3) and the list is clean but incomplete: an
@@ -104,13 +117,24 @@ When end-to-end accuracy drops, these per-stage numbers tell you which stage bro
 | Metadata filters | destroyed if the filter is wrong | up (smaller pool) | filter correctness |
 | Score thresholds | down for some queries | up | scores are not calibrated across queries, so a fixed threshold silently returns nothing for some |
 
+### Inside an agent's search tool
+- **The funnel lives behind the tool boundary.** The agent writes a query; the tool runs stage 1, stage 2
+  and selection, and returns only the budgeted top-n. The model never sees the 50–200 candidates.
+- **Precision costs compound across steps.** In single-shot RAG a noisy context is paid once. In an agent,
+  each tool result stays in the transcript, so noise from step 2 is re-read at steps 3, 4 and onward.
+- **Recall failures change behaviour, not just answers.** An agent that gets nothing useful tends to
+  search again with a drifting query or answer from pretraining. A clear "no evidence" result gives it a
+  correct next move instead.
+- **The agent can partly repair recall.** Unlike a fixed pipeline, it can reformulate and search again,
+  but each retry is another sequential step, so stage-1 recall still sets latency and cost.
+
 ## Diagram
-Follow the funnel: each stage is measured by the metric it is good at, and the threshold decides between
-an answer and an honest "no evidence".
+Follow one tool call through the funnel: each stage is measured by the metric it is good at, and the
+threshold decides whether the agent receives passages or an honest "no evidence" result.
 
 ```mermaid
 flowchart TD
-    Q["User query"] --> S1["Stage 1: hybrid retrieval, BM25 plus dense"]
+    Q["Agent tool call: search_docs"] --> S1["Stage 1: hybrid retrieval, BM25 plus dense"]
     S1 -->|"50 to 200 candidates"| C["Candidate list"]
     C -.->|"measure recall at k"| M1["Did the evidence make the list?"]
     C --> S2["Stage 2: cross-encoder rerank"]
@@ -118,8 +142,8 @@ flowchart TD
     R -.->|"measure nDCG or precision at n"| M2["Is the evidence at the top?"]
     R --> T{"Reranker score above tuned threshold?"}
     T -->|"yes, fill token budget"| P["Top-n chunks in prompt"]
-    T -->|"no chunk passes"| N["No evidence answer"]
-    P --> G["Generator"]
+    T -->|"no chunk passes"| N["Tool result: no evidence"]
+    P --> G["Agent reads tool result, next step"]
 ```
 
 ## Examples
@@ -200,21 +224,70 @@ for k in (3, 5, 10, 50):
 Hit rate and MRR are 1.0 at every k, yet the exclusions clause only arrives at rank 7: an "all-of" question
 needs recall, not hit rate.
 
+### Agent search tool with a budget and a "no evidence" result
+The tool schema uses the Anthropic-style `input_schema` shape; other providers take the same JSON Schema
+under a different key. `search_hybrid` and `rerank_scored` are stubs for your retriever and reranker.
+
+```python
+SEARCH_TOOL = {
+    "name": "search_docs",
+    "description": ("Search the policy knowledge base. Returns a few passages that passed a relevance "
+                    "check, or status 'no_evidence'. On no_evidence, rephrase once, then tell the user "
+                    "you could not find it. Never answer policy questions from memory."),
+    "input_schema": {"type": "object",
+                     "properties": {"query": {"type": "string"}},
+                     "required": ["query"]},
+}
+
+def search_docs(query, k_candidates=50, budget_tokens=1500, min_score=0.0):
+    # min_score: tune on reranker scores against the golden set, never a global cosine value
+    cands = search_hybrid(query)[:k_candidates]            # stage 1: wide, for recall
+    ranked = rerank_scored(query, cands)                   # stage 2: [(score, chunk)], best first
+    out, used = [], 0
+    for score, chunk in ranked:
+        if score < min_score:
+            break                                          # below threshold: stop, do not pad
+        if used + chunk.tokens > budget_tokens:
+            continue                                       # budget in tokens, not chunks
+        out.append({"id": chunk.id, "text": chunk.text}); used += chunk.tokens
+    if not out:
+        return {"status": "no_evidence", "passages": []}   # a next move the agent can act on
+    return {"status": "ok", "passages": out}
+```
+
+### Worked scenario: what k does to an agent's transcript
+A policy agent makes 4 search calls per task; chunks are ~300 tokens and every tool result stays in the
+transcript for the rest of the run.
+
+| Tool design | Tokens per result | Tool-result tokens after 4 calls | Noise per result |
+|---|---|---|---|
+| Raw top-5 | 1,500 | 6,000 | ~3 of 5 passages (precision 0.4), and an "all-of" piece missing |
+| Raw top-50 | 15,000 | 60,000 | ~47 of 50 passages (precision 0.06) |
+| Rerank 50, keep 5 within budget | 1,500 | 6,000 | ~2 of 5 passages (precision 0.6), recall 1.0 |
+
+- **Top-50 multiplies the transcript by 10.** Every later step re-reads those 60,000 tokens, and the
+  distractors sit next to the evidence for the next tool-call decision.
+- **The reranked tool matches top-5 on size** while carrying the evidence top-5 missed.
+
 ## Production patterns
-- **Wide-then-narrow retrieval.** When the corpus is large, fetch 50–200 hybrid candidates and rerank with a
-  cross-encoder down to the 5–10 that fit the context budget. Monitor recall@50 on the golden set and the
-  reranker's p95 latency separately.
+- **Wide-then-narrow inside the tool.** When the corpus is large, the search tool fetches 50–200 hybrid
+  candidates and reranks with a cross-encoder down to the 5–10 that fit a per-call budget, so the agent
+  only sees the short list. Monitor recall@50 on the golden set and the reranker's p95 latency separately,
+  since tool latency adds to every agent step.
 - **Pick k at the knee, on a schedule.** In the nightly or CI eval, sweep k over values such as 5, 10, 20,
   50, 100, plot recall@k, and set candidate depth just past the knee. Re-run whenever the embedding model,
   chunker or corpus changes, since the knee moves.
 - **Per-stage dashboards and gates.** Track recall@k (candidates) and nDCG@n (final list) as separate
-  series, and fail a retrieval change in CI when either drops beyond a tolerance you set on the golden set.
-- **Budget the context in tokens, not chunks.** Select reranked chunks until a token budget is filled
-  rather than a fixed n, so long chunks cannot blow up cost. Monitor prompt tokens per call and the share
-  of calls hitting the cap.
-- **Threshold with an explicit "no evidence" path.** If you drop low-relevance chunks, tune the cut-off on
-  the reranker's scores against the golden set (not a global cosine value) and route empty contexts to a
-  "cannot find this" answer. Monitor the empty-context rate per route.
+  series, plus agent-level answer accuracy, and fail a retrieval change in CI when either drops beyond a
+  tolerance you set on the golden set. Trace tools such as LangSmith let you score the retriever span and
+  the final answer of the same run separately.
+- **Budget tool results in tokens, not chunks.** Select reranked chunks until a per-call token budget is
+  filled rather than a fixed n, so long chunks cannot blow up the transcript. Monitor tool-result tokens
+  per call, total transcript tokens per run, and the share of calls hitting the cap.
+- **Return "no evidence" as a first-class tool result.** Tune the cut-off on the reranker's scores against
+  the golden set (not a global cosine value) and return an explicit status the tool description tells the
+  agent how to handle. Monitor the empty-result rate per route and how often the agent still answers
+  after one.
 
 ## Trade-offs
 - **Larger k vs tokens, latency and position.** Raises recall, but stops paying once the recall curve has
@@ -228,6 +301,9 @@ needs recall, not hit rate.
 - **Smaller chunks vs multi-part answers.** Raise precision per hit and sharpen embeddings, but a
   multi-part answer then needs several hits, so recall at fixed k drops; the balance depends on how
   self-contained the corpus units are.
+- **Agent retries vs stage-1 recall.** An agent can recover a missed passage by searching again, which
+  lets you run a cheaper first stage, but each retry is a sequential model call plus a search; once
+  retries per task exceed one or two, buying recall in the tool is cheaper.
 
 ## Pitfalls
 - **Measuring only end-to-end accuracy.** Failures cannot be attributed to recall (never retrieved) or
@@ -244,9 +320,13 @@ needs recall, not hit rate.
   answers to table or multi-condition questions are still incomplete.
 - **Trusting incomplete relevance labels.** The symptom is a retriever change that "lowers precision" where
   manual inspection shows the new top results are unlabelled duplicates of the answer.
+- **Returning an empty list with no status.** The agent cannot tell "nothing relevant" from "tool broke";
+  the symptom is loops of near-identical searches or a confident answer from memory. Return an explicit
+  `no_evidence` status and say in the tool description what to do with it.
 
 ## When to use
-- **Always, as a lens.** Not an optional technique: apply it whenever a RAG system is designed or debugged.
+- **Always, as a lens.** Not an optional technique: apply it whenever a RAG system or an agent's search
+  tool is designed or debugged.
 - **Default to two stages** when the corpus is large enough that stage 1 cannot be precise on its own,
   which is almost always.
 - **Decide k and n from data.** Pick k at the knee of recall@k on a golden set; pick n (what reaches the
@@ -308,13 +388,21 @@ in the candidate set.
 - **So the average mostly measures** how many relevant chunks each question has, not ranking quality.
 - **Use nDCG@n or MRR** to judge ranking, and read precision@k as the fraction of the prompt that is noise.
 
-### How do you choose candidate depth k and final n for a production pipeline?
+### How do you choose candidate depth k and final n for a search tool an agent calls several times per task?
 - **k from the recall curve:** sweep k (for example 5, 10, 20, 50, 100) on the golden set and set it just
   past the knee, where extra candidates stop buying recall.
-- **n from the context budget:** fill reranked chunks up to a token budget, checked against measured
-  precision after reranking.
+- **n from the transcript budget:** fill reranked chunks up to a per-call token budget, and multiply by
+  calls per task, because every result stays in context (4 calls at 15,000 tokens is 60,000).
 - **Re-run on change:** the knee moves when the embedding model, chunker or corpus changes, so keep the
   sweep in a scheduled eval.
+
+### Your agent gets nothing useful from search and answers from memory anyway. How do you fix it?
+- **Give the tool a real "no evidence" result:** an explicit status, decided by a reranker-score threshold
+  tuned on the golden set, instead of an empty or padded list.
+- **Tell the agent what to do with it:** the tool description says rephrase once, then say it could not
+  find the answer; never answer that topic from memory.
+- **Measure both sides:** recall@k of the tool on the golden set, and how often the agent answers after a
+  `no_evidence` result, scored as a faithfulness failure in the agent eval.
 
 ## Quiz
 ### Q: Why does a two-stage retrieve-then-rerank pipeline exist instead of a single better retriever?

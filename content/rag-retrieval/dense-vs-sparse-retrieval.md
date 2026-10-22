@@ -5,7 +5,8 @@ name: Dense vs sparse retrieval
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/bm25-internals
   - rag-retrieval/inverted-indexes
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Sparse retrieval (BM25 over an inverted index) is exact about terms and blind to meaning; dense
-retrieval (learned vectors plus similarity search) is fluent about meaning and unreliable on exact
-terms. Neither dominates, so production systems usually run both and fuse.
+An agent's search tool is either sparse (BM25: exact about terms, blind to meaning), dense (embeddings:
+fluent about meaning, unreliable on exact terms), or both. Agents search for IDs and paraphrases alike, so
+production agents usually run both and fuse.
+
+## For agent builders
+- **Why it matters for agents.** Agents write their own queries. Some are exact identifiers copied from a
+  tool result (ticket ids, error codes, function names); others are paraphrased questions. Each family
+  fails on one of those, and the agent cannot tell a retrieval miss from "the answer does not exist".
+- **Where it shows up in your stack.** Vector stores for the dense arm; Elasticsearch, OpenSearch or
+  LangChain's `BM25Retriever` for the sparse arm; `EnsembleRetriever` or a store's built-in hybrid mode
+  to combine them; a LangGraph retrieval node or tool that wraps the result.
+- **What you control.** Whether the agent gets one fused search tool or separate keyword and semantic
+  tools, the analyzer that tokenizes identifiers, the embedding model, and the eval slices you track.
+- **What you can skip.** The training details of SPLADE and ColBERT. Know what each adds and when it is
+  worth an extra index.
 
 ## Why it exists
 - **Term matching set the baseline for decades.** A query word appears in a document or not, and ranking
@@ -35,7 +48,7 @@ terms. Neither dominates, so production systems usually run both and fuse.
   pairs maps a query near the passage that answers it regardless of shared words, even across languages.
 - **"Embeddings make keywords obsolete" fails, reason 1.** A fixed vector loses rare, high-information
   tokens (part numbers, error codes, clause ids, names), because the model saw them rarely and its
-  tokenizer splits them into meaningless pieces.
+  tokenizer splits them into meaningless pieces. Agents pass exactly these tokens between tools.
 - **Reason 2: domain shift.** Dense models degrade when the corpus looks unlike their training data;
   zero-shot benchmarks across heterogeneous domains have repeatedly shown BM25 beating many dense
   retrievers out of domain. Knowing each family's failure mode is what makes the combination work.
@@ -53,7 +66,7 @@ terms. Neither dominates, so production systems usually run both and fuse.
 That is why sparse retrieval runs comfortably on CPU with millisecond latency over tens of millions of
 documents. Three properties follow:
 - **Exact:** a term matches or not, so "ERR-4012" finds "ERR-4012".
-- **Interpretable:** you can read off why a document scored.
+- **Interpretable:** you can read off why a document scored, which helps when debugging an agent trace.
 - **Static:** weights depend only on counts (tf, df, length), never on order or meaning, so "bank
   account" and "river bank" share the term "bank".
 
@@ -84,6 +97,14 @@ The properties invert:
 | Vocabulary mismatch | morphology the stemmer misses, synonyms, cross-language queries |
 | Short, abstract queries | "why is this slow" shares only stopwords with relevant documents |
 | No relevance beyond term statistics | a document mentioning all query words in passing can outrank the one that answers |
+
+### What changes when an agent writes the query
+- **Agent queries are often keyword-dense.** Models tend to compress a goal into a few nouns and any ids
+  they saw in earlier tool results, which suits the sparse arm.
+- **They also paraphrase.** A planning step rewrites the user's words, so the document's wording rarely
+  survives, which suits the dense arm.
+- **Retries need a different arm.** If the agent re-queries after a miss with near-identical words, the
+  same arm misses again; a second arm or a reformulation gives the retry a real chance.
 
 ### The same score, different dimensions
 Both rank by an inner product between query and document vectors. What differs is who defines the
@@ -125,13 +146,18 @@ dimensions:
 | Exact tokens | Strong | Weak |
 | Paraphrase | Weak | Strong |
 
+- **Freshness matters more for agents.** An agent that writes a document or ticket and then searches for
+  it in the next step needs the write visible; sparse indexes refresh in seconds, while the dense arm
+  waits on an embedding call.
+
 ## Diagram
-Trace one query down both paths: the sparse arm reads only the query terms' posting lists, the dense arm
-embeds the query and searches a vector index, and the two ranked lists meet at fusion.
+Trace one agent tool query down both paths: the sparse arm reads only the query terms' posting lists, the
+dense arm embeds the query and searches a vector index, and the two ranked lists meet at fusion before
+the results go back into the agent's context.
 
 ```mermaid
-flowchart LR
-    Q["User query"] --> AN["Analyzer: tokenize, lowercase, stem"]
+flowchart TD
+    Q["Agent tool call: query"] --> AN["Analyzer: tokenize, lowercase, stem"]
     Q --> EN["Bi-encoder: embed query"]
     AN --> PL[("Inverted index: posting lists")]
     PL -->|"BM25 over query terms only"| S["Sparse ranking: exact terms"]
@@ -139,10 +165,46 @@ flowchart LR
     VX -->|"cosine or dot product"| D["Dense ranking: meaning"]
     S --> F["Fusion, optional reranker"]
     D --> F
-    F --> K["Top k to the LLM"]
+    F --> K["Top k into agent context"]
 ```
 
 ## Examples
+### One fused search tool vs two tools for the agent
+Two ways to expose retrieval. Separate tools let the model pick, but models often pick the wrong one;
+a single tool that runs both arms and fuses is the safer default. The routing regex mirrors the
+identifier detector below.
+
+```python
+import re
+
+ID = re.compile(r"\b(?:[A-Za-z]{1,5}-?\d{2,}|\d{4,})\b")   # identifier-style tokens
+
+# Option A: two tools, the model chooses (descriptions carry the routing rule)
+TOOLS = [
+    {"name": "keyword_search",
+     "description": "Exact-term search. Use for error codes, ticket ids, SKUs, names.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+                      "required": ["query"]}},
+    {"name": "semantic_search",
+     "description": "Meaning-based search. Use for natural-language questions.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+                      "required": ["query"]}},
+]
+
+# Option B: one tool, both arms always run, fused by reciprocal rank
+def search(query, bm25_search, dense_search, k=5, rrf_k=60):
+    sparse, dense = bm25_search(query, 50), dense_search(query, 50)   # lists of doc ids
+    w_sparse = 2.0 if ID.search(query) else 1.0                       # lean on exact terms for ids
+    scores = {}
+    for w, ranked in ((w_sparse, sparse), (1.0, dense)):
+        for rank, doc in enumerate(ranked, start=1):
+            scores[doc] = scores.get(doc, 0.0) + w / (rrf_k + rank)
+    return sorted(scores, key=scores.get, reverse=True)[:k]
+```
+
+- **Log which arm contributed** each returned chunk; the trace is how you later see that a wrong answer
+  came from a dense-only miss on an identifier.
+
 ### BM25 vs a bi-encoder on two query types
 Five support passages, two queries: an exact error code that dense retrieval tends to blur, and a
 paraphrase that BM25 cannot bridge.
@@ -182,8 +244,9 @@ for q in queries:
 - **Margins depend on the model,** which is the point: the behavior is structural, the numbers are not.
 
 ### Per-retriever ablation: which queries does each arm win?
-The decision number is the overlap. Record each retriever's top-k per labeled query, then compare the
-sets of queries each one gets right (toy data; plug in your own runs).
+The decision number is the overlap. Record each retriever's top-k per labeled query (for an agent, the
+queries the agent actually issued, pulled from traces), then compare the sets each one gets right (toy
+data; plug in your own runs).
 
 ```python
 import re
@@ -218,25 +281,28 @@ arm is worth its cost here; if one set were a subset of the other, it would not 
 
 ## Production patterns
 - **Run the ablation on every model or analyzer change.** Keep a labeled query set tagged by slice
-  (identifier-style vs natural language) and report recall@k for sparse, dense and their union per slice.
-  Monitor the "only BM25" and "only dense" lists; a shrinking union gain means the second arm is cost
-  without benefit.
-- **Classify query traffic from logs.** Tag queries that look like identifiers (a regex like the one
-  above, tuned to your SKU and ticket formats) and track their share. Use it to weight the sparse arm or
-  route those queries; monitor zero-result and reformulation rate per class.
+  (identifier-style vs natural language), seeded from real agent tool calls, and report recall@k for
+  sparse, dense and their union per slice. Monitor the "only BM25" and "only dense" lists; a shrinking
+  union gain means the second arm is cost without benefit.
+- **Classify agent query traffic from traces.** Tag tool queries that look like identifiers (a regex like
+  the one above, tuned to your SKU and ticket formats) and track their share in LangSmith or your own
+  tracing. Use it to weight the sparse arm or route those queries; monitor zero-result and re-query rate
+  per class.
 - **Make the analyzer preserve identifiers.** Index hyphenated codes both whole and split (in
   Elasticsearch, a `word_delimiter_graph` filter with `preserve_original` enabled) and use the same
   analyzer at query time. Monitor exact-identifier queries whose top result does not contain the identifier.
 - **Refresh both indexes from one change stream.** Write each document update to sparse and dense indexes
-  from the same event, carrying a version or timestamp. Monitor the lag between the two; alert when a
-  document is visible in one but not the other beyond your freshness target.
+  from the same event, carrying a version or timestamp, so an agent that just wrote a record can find it.
+  Monitor the lag between the two; alert when a document is visible in one but not the other beyond your
+  freshness target.
 - **Pin and version the embedding model.** Store the model name with the dense index and re-embed into a
-  new index on any change, switching reads only after the ablation passes. Monitor recall on in-domain
-  jargon slices, where off-the-shelf models fail first.
+  new index on any change, switching the agent's tool only after the ablation passes. Monitor recall on
+  in-domain jargon slices, where off-the-shelf models fail first.
 
 ## Trade-offs
 - **Sparse: cheap, incremental, exact on identifiers.** It stalls on paraphrase; the balance flips toward
-  dense as soon as users phrase questions differently from how documents are written.
+  dense as soon as users or the agent's planner phrase questions differently from how documents are
+  written.
 - **Dense: generalizes across wording and languages.** It costs an embedding pass per chunk and per query
   and a full re-index on every model change; it flips back toward sparse when the corpus is huge, churns
   constantly, or the GPU budget is tight.
@@ -245,10 +311,13 @@ arm is worth its cost here; if one set were a subset of the other, it would not 
   paraphrase tasks.
 - **In-domain dense fine-tuning: can overtake BM25 decisively.** It needs labeled query–passage pairs;
   without them an off-the-shelf model on jargon-heavy text may lose to BM25, which needs no labels at all.
+- **Two tools vs one fused tool.** Separate tools give the model control and cheaper calls, but the model
+  misroutes some queries; one fused tool costs both arms on every call and removes that failure.
 
 ## Pitfalls
 - **Shipping dense-only because the demo paraphrases worked.** Symptom: tickets like "I searched the
-  exact ticket number and got unrelated results". Fix: add a sparse arm.
+  exact ticket number and got unrelated results", or an agent that cannot find a record by the id another
+  tool just returned. Fix: add a sparse arm.
 - **Shipping sparse-only with the default analyzer.** Symptom: zero-result or wrong-result queries
   whenever users use synonyms, plurals the stemmer misses, or another language.
 - **Evaluating a dense model on the vendor's benchmark, not your corpus.** Symptom: recall collapses on
@@ -259,9 +328,9 @@ arm is worth its cost here; if one set were a subset of the other, it would not 
   not semantic results (or vice versa) for hours after an update.
 
 ## When to use
-Start from the queries.
-- **Sparse as backbone** when users search by identifiers, codes, names and exact phrases, or the corpus
-  is technical and churns fast; dense is an add-on.
+Start from the queries, including the ones the agent writes.
+- **Sparse as backbone** when users or agents search by identifiers, codes, names and exact phrases, or
+  the corpus is technical and churns fast; dense is an add-on.
 - **Dense as backbone** when users ask natural-language questions against prose and wording varies;
   sparse protects the exact-match cases.
 - **Default to hybrid** with fusion, because most real workloads contain both kinds of queries (covered in
@@ -301,19 +370,25 @@ those queries.
 - **So sparse is exact and interpretable** but blind to synonyms, while dense matches paraphrases but blurs
   rare tokens and needs re-embedding on every model change.
 
+### Would you give your agent one search tool or separate keyword and semantic tools?
+- **Default to one fused tool:** both arms run on every call and fusion handles the mix, so the model
+  cannot misroute an identifier query to the dense arm.
+- **Split them when evals justify it:** separate tools are cheaper per call and let a capable model choose,
+  but measure misrouting on traced agent queries before trusting the tool descriptions to do the routing.
+
 ### Why does BM25 still beat many dense retrievers out of domain?
 - **Dense models only know their training distribution.** Medical, legal or internal jargon looks like
   noise to a web-QA encoder, so recall can fall below BM25 without fine-tuning.
 - **BM25 needs no labels or training,** and exact term matching transfers to any corpus; zero-shot
   benchmarks such as BEIR have repeatedly shown this.
 
-### Users say exact ticket-number searches return unrelated results. Walk through the diagnosis.
+### Your agent cannot find a ticket by the id another tool just returned. Walk through the diagnosis.
 - **Classify the failing queries:** identifier-style queries (codes, SKUs, ticket ids) are the classic
   dense failure, because the tokenizer splits them into subword pieces shared with unrelated strings.
-- **Measure per slice:** recall@k for dense, BM25 and their union on labeled identifier and
-  natural-language queries.
-- **Fix:** add a sparse arm with an analyzer that keeps codes whole, fuse, and refresh both indexes from
-  one change stream.
+- **Check freshness:** if the ticket was just created, the dense arm may not have embedded it yet.
+- **Measure per slice and fix:** recall@k for dense, BM25 and their union on labeled identifier and
+  natural-language queries; then add a sparse arm with an analyzer that keeps codes whole, fuse, and
+  refresh both indexes from one change stream.
 
 ### When would you skip the dense arm entirely?
 - **When queries are mostly identifiers, codes and exact phrases**, the corpus churns fast, and there is

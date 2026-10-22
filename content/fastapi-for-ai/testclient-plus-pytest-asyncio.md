@@ -5,7 +5,8 @@ name: TestClient + pytest-asyncio
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/pytest
   - python-for-ai/pytest-asyncio
@@ -22,14 +23,26 @@ sources:
 ---
 
 ## TL;DR
-FastAPI apps are ASGI callables, so tests call them in-process. `TestClient` serves synchronous tests on
-a helper-thread loop; `httpx.AsyncClient` with `ASGITransport` serves `async def` tests on their own loop.
-Pick by whether the test awaits, and fake the LLM via dependency override.
+Test an agent endpoint in-process with a scripted fake LLM: `TestClient` for synchronous tests,
+`httpx.AsyncClient` with `ASGITransport` for `async def` tests. You prove the tool loop, error mapping and
+streaming without paying for or waiting on a model.
+
+## For agent builders
+- **Why it matters for agents.** Most agent bugs are in your code, not the model: a tool result never
+  appended, a loop that does not stop, a provider error turned into a 500, a malformed final stream event.
+  A fake LLM that returns scripted tool calls reproduces each one deterministically in milliseconds.
+- **Where it shows up in your stack.** `app.dependency_overrides` swapping the LLM client and tool
+  registry, `TestClient` for request and streaming tests, `ASGITransport` plus pytest-asyncio when the
+  test awaits shared async state such as an agent memory store.
+- **What you control.** The seam (inject the model and tools through `Depends`), the scripted responses,
+  which loop each test runs on, and when to clear overrides.
+- **What you can skip.** anyio portal internals. Know the lifespan-under-`with` rule, the one-loop rule
+  and the exact-callable override rule; that prevents almost every agent-test flake.
 
 ## Why it exists
 - **The behaviour worth testing is mostly not the model.** Request validation, auth, how a provider error
   becomes a status code, whether a streaming endpoint emits a well-formed final event, whether a cached
-  path skips the model.
+  path skips the model, whether the agent loop executes a tool call and stops.
 - **Starting Uvicorn and sending real HTTP is the wrong tool.** It is slow, needs free ports and makes
   failures hard to debug.
 - **Calling the endpoint function directly skips what breaks.** Dependency resolution, Pydantic
@@ -50,13 +63,15 @@ Pick by whether the test awaits, and fake the LLM via dependency override.
 Two details matter:
 - **Lifespan runs only under `with`.** Startup and shutdown run only when the client is used as a context
   manager (`with TestClient(app) as client:`), *because* constructing the client alone does not start the
-  app. Without it, anything created in the lifespan (a shared httpx client, a Redis pool) is missing and
-  endpoints fail with `AttributeError` on `app.state`.
-- **Streaming works.** Consume streaming endpoints with `client.stream(...)` and `iter_lines()`.
+  app. Without it, anything created in the lifespan (a shared httpx client, a Redis pool, the agent's tool
+  registry) is missing and endpoints fail with `AttributeError` on `app.state`.
+- **Streaming works.** Consume streaming endpoints with `client.stream(...)` and `iter_lines()`, which is
+  how you assert an agent's token and tool-call events arrive in order.
 
 ### httpx.AsyncClient + ASGITransport
 - **Construct** `httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")`.
-- **Same loop as the test,** so the test can await other async code before and after.
+- **Same loop as the test,** so the test can await other async code before and after, such as reading
+  what the agent wrote to an async memory store.
 - **No lifespan.** `ASGITransport` does not run lifespan events, so wrap the app with a lifespan manager
   (for example the `asgi-lifespan` package) or enter the app's lifespan yourself.
 
@@ -79,6 +94,9 @@ Two details matter:
 
 - **Override at the dependency boundary,** *because* that is where the app already expects an injectable
   object.
+- **Script the fake for agents.** Give it a list of responses (a tool call, then a final answer) and
+  record every prompt it receives, so the test can assert the tool result was appended before the second
+  model call.
 - **Clear overrides after each test,** or one test's fake leaks into the next.
 - **The key is the exact callable in `Depends(...)`.** FastAPI looks up each dependency function in
   `dependency_overrides` while resolving the request. Overriding a lookalike silently does nothing and
@@ -101,7 +119,7 @@ pytest-asyncio). Streaming latency needs a real server either way.
 
 ```mermaid
 flowchart TD
-    T["New endpoint test"] --> L{"Measuring time to first chunk?"}
+    T["New agent endpoint test"] --> L{"Measuring time to first chunk?"}
     L -->|"yes"| SRV["Real running server, not in-process"]
     L -->|"no"| F["Override the LLM dependency with a fake"]
     F --> Q{"Test awaits objects shared with the app?"}
@@ -169,9 +187,59 @@ async def test_async_skips_model_on_empty(fake):
   of mocking the HTTP layer would show as clearly.
 - **Real-model behaviour** belongs in a separate, smaller suite.
 
+### Testing an agent's tool loop with a scripted fake
+The fake returns a tool call on the first turn and a final answer on the second. The test asserts the
+tool ran once, its result reached the model, and the loop stopped. The message shapes are this app's own,
+not a provider's.
+
+```python
+from fastapi import Depends, FastAPI
+from fastapi.testclient import TestClient
+
+agent_app = FastAPI()
+
+def get_agent_llm(): raise NotImplementedError        # real client injected in production
+def get_tools(): raise NotImplementedError
+
+@agent_app.post("/agent")
+async def run_agent(body: dict, llm=Depends(get_agent_llm), tools=Depends(get_tools)):
+    messages = [{"role": "user", "content": body["q"]}]
+    for _ in range(5):                                # hard step cap
+        out = await llm.step(messages)
+        if out["type"] == "final":
+            return {"answer": out["text"], "steps": len(messages)}
+        result = await tools[out["name"]](**out["args"])
+        messages += [{"role": "assistant", "tool": out["name"]},
+                     {"role": "tool", "content": result}]
+    return {"answer": None, "error": "step_limit"}
+
+class ScriptedLLM:
+    def __init__(self, script): self.script, self.seen = list(script), []
+    async def step(self, messages):
+        self.seen.append(list(messages)); return self.script.pop(0)
+
+def test_tool_result_reaches_model_and_loop_stops():
+    calls = []
+    async def weather(city): calls.append(city); return "18C"
+    llm = ScriptedLLM([{"type": "tool", "name": "weather", "args": {"city": "Oslo"}},
+                       {"type": "final", "text": "It is 18C in Oslo."}])
+    agent_app.dependency_overrides[get_agent_llm] = lambda: llm
+    agent_app.dependency_overrides[get_tools] = lambda: {"weather": weather}
+    try:
+        with TestClient(agent_app) as client:
+            r = client.post("/agent", json={"q": "Weather in Oslo?"})
+        assert r.json()["answer"] == "It is 18C in Oslo." and calls == ["Oslo"]
+        assert llm.seen[1][-1] == {"role": "tool", "content": "18C"}   # appended before turn 2
+    finally:
+        agent_app.dependency_overrides.clear()
+```
+
+- **Add a second script** that only ever returns tool calls and assert `error == "step_limit"`, which
+  proves the runaway-loop guard works without spending a token.
+
 ### Failure paths: mapped errors and unhandled bugs
 The same fake pattern extends to failures. A `FailingLLM` raises your provider-error type, and the test
-asserts the endpoint maps it to, say, 502 with your error body. Builds on the app above.
+asserts the endpoint maps it to, say, 502 with your error body. Builds on the first app above.
 
 ```python
 from fastapi import Request
@@ -212,6 +280,7 @@ def test_unhandled_bug_is_500_for_clients():
 | Test needs | Use | Lifespan |
 |---|---|---|
 | Validation, auth, error mapping, response shape | `TestClient` | `with TestClient(app)` |
+| Agent tool loop with a scripted fake | `TestClient` | `with TestClient(app)` |
 | Streaming format | `TestClient` with `client.stream(...)` | `with TestClient(app)` |
 | Await an async fixture shared with the app | `AsyncClient` + `ASGITransport` | lifespan manager |
 | Time to first chunk | A real running server | real startup |
@@ -220,6 +289,9 @@ def test_unhandled_bug_is_500_for_clients():
 - **One `conftest.py` client fixture per style.** When a suite grows past a handful of files, define a
   sync `client` fixture (`with TestClient(app) as c: yield c`) and an async one, so no test constructs
   clients by hand and forgets lifespan. Monitor suite runtime per fixture.
+- **Scripted-fake regression tests for agent incidents.** When an agent misbehaves in production, copy
+  the model outputs from the trace into a scripted fake and add a test that replays them, so the loop,
+  parsing or tool bug stays fixed. Monitor how many incidents ship with a replay test.
 - **Async client with lifespan via `asgi-lifespan`.** When async tests need lifespan-created state, wrap
   the app: `async with LifespanManager(app) as m:` then build the `AsyncClient` on
   `ASGITransport(app=m.app)`. Monitor "attached to a different loop" errors, which mean a fixture's loop
@@ -232,8 +304,8 @@ def test_unhandled_bug_is_500_for_clients():
   `respx`, and return recorded provider payloads, including error bodies. Monitor that no test needs
   network by running the suite with outbound network blocked in CI.
 - **A separate, small real-model suite.** Keep fakes for the fast suite and mark real-provider tests with
-  a custom marker (for example `@pytest.mark.live`) run on a schedule, not per commit. Monitor its cost
-  per run and its flake rate.
+  a custom marker (for example `@pytest.mark.live`) run on a schedule, not per commit; agent quality
+  belongs in evals, not here. Monitor its cost per run and its flake rate.
 
 ## Trade-offs
 - **`TestClient` simplicity vs loop isolation.** It keeps tests synchronous and simple, but runs the app on
@@ -241,8 +313,9 @@ def test_unhandled_bug_is_500_for_clients():
   then use `ASGITransport`.
 - **`ASGITransport` one-loop power vs setup.** It runs everything on one loop and allows awaiting in the
   test, at the cost of async fixtures, a pytest plugin and manual lifespan handling.
-- **Fakes vs realism.** Overriding dependencies with fakes gives fast, deterministic tests of your logic,
-  but proves nothing about the real provider's behaviour, which needs contract or integration tests.
+- **Fakes vs realism.** Overriding dependencies with fakes gives fast, deterministic tests of your agent
+  logic, but proves nothing about whether the real model picks the right tool, which needs evals,
+  contract or integration tests.
 - **Function vs session loop scope.** Function-scoped event loops isolate tests well; session-scoped loops
   make expensive async fixtures reusable, but state leaks between tests become possible and must be
   cleaned up explicitly.
@@ -257,6 +330,9 @@ def test_unhandled_bug_is_500_for_clients():
 - **Overriding a different function object from the one in `Depends(...)`.** Symptom: a test that passes
   slowly, needs network, or fails with an authentication error from the real provider. Fix: override the
   exact function object, and block outbound network in CI so the mistake fails fast.
+- **A fake that always returns the final answer.** Symptom: the tool-calling branch of the agent loop has
+  no coverage and breaks in production first. Fix: script at least one tool call, one tool error and one
+  step-limit run.
 - **Expecting a 500 from an unhandled error with default `TestClient` settings.** The test errors with the
   app's exception instead of seeing the status code. Fix: `raise_server_exceptions=False`.
 - **Missing the asyncio marker in strict mode.** The coroutine is never awaited; depending on the pytest
@@ -265,12 +341,12 @@ def test_unhandled_bug_is_500_for_clients():
   server and proxy, so streaming latency must be measured against a running server.
 
 ## When to use
-- **Use `TestClient` as the default** for endpoint tests: validation, auth, error mapping, response shape
-  and streaming format, with the model replaced by a fake.
+- **Use `TestClient` as the default** for agent endpoint tests: validation, auth, error mapping, the tool
+  loop, response shape and streaming format, with the model replaced by a fake.
 - **Switch to `AsyncClient` plus `ASGITransport`** under pytest-asyncio when the test must await other
   async work or share async fixtures with the app.
-- **Neither replaces** integration tests against real databases or a recorded provider, nor load tests
-  against a real server.
+- **Neither replaces** integration tests against real databases or a recorded provider, agent evals, nor
+  load tests against a real server.
 - **Measure** suite runtime and flakiness.
 - **Interviews:** expect questions on lifespan in tests, dependency overrides, and why loop mismatches
   happen.
@@ -302,6 +378,14 @@ synchronous and let the app create its own engine in the lifespan.
 - **An in-process client** sends ASGI messages straight into the app, so you get the full HTTP path in
   milliseconds with no network.
 
+### How would you test an agent endpoint's tool-calling loop without calling a real model?
+- **Inject the model and tools through dependencies,** then override them with a scripted fake LLM that
+  returns a tool call, then a final answer, and a fake tool that records its arguments.
+- **Assert the mechanics:** the tool ran once with the right arguments, its result was appended before the
+  second model call, and the loop stopped on the final answer.
+- **Add scripts for the bad paths:** a tool error the agent must handle and an endless tool-call script that
+  must hit the step limit.
+
 ### A test overrides get_llm with a fake, but the suite is slow and fails with an auth error from the real provider. What happened?
 - **The override key is not the callable in `Depends(...)`.** FastAPI looks up each dependency function
   in `dependency_overrides`, so overriding a wrapper or a re-imported lookalike silently does nothing.
@@ -318,6 +402,14 @@ synchronous and let the app create its own engine in the lifespan.
 - **Its cost:** a pytest plugin, async fixtures and manual lifespan handling, since `ASGITransport` does
   not run lifespan events.
 
+### An agent bug was reported from production. How do you turn the trace into a regression test?
+- **Copy the model outputs from the trace** (tool calls and final text, in order) into a scripted fake, and
+  the tool results into fake tools, so the run replays deterministically.
+- **Assert what went wrong is now right:** for example the malformed tool arguments are rejected with a
+  tool error, or the loop stops instead of repeating.
+- **Keep it in the fast suite,** because it costs no tokens; judging whether the model now chooses better
+  belongs in the eval set.
+
 ### How do you test that an unhandled bug in an endpoint returns 500 to clients?
 - **By default the exception is re-raised into the test** (`raise_server_exceptions=True`), so the test
   errors with the traceback instead of seeing a status code.
@@ -325,14 +417,6 @@ synchronous and let the app create its own engine in the lifespan.
   `ASGITransport` has the equivalent `raise_app_exceptions`.
 - **Handled errors need no flag:** an `HTTPException` or a registered handler mapping `ProviderError` to 502
   is a normal response.
-
-### Your async test suite passes locally but some tests never actually assert anything in CI. What do you check?
-- **The asyncio marker in strict mode,** the default: an `async def` test without `@pytest.mark.asyncio` is
-  never awaited, and depending on the pytest version it is skipped with a warning or fails.
-- **Fix it once:** set `asyncio_mode = "auto"` or add the marker consistently, and use
-  `@pytest_asyncio.fixture` for async fixtures in strict mode.
-- **Then check loop scope** for session-scoped async fixtures, following the docs for your installed
-  pytest-asyncio version, because that API has changed across releases.
 
 ## Quiz
 ### Q: Why do endpoints that read `app.state.http` fail with `AttributeError` in a test using `client = TestClient(app)`?

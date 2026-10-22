@@ -5,7 +5,8 @@ name: Train/test leakage
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - training-adaptation/train-val-test-split
   - training-adaptation/overfitting
@@ -22,9 +23,20 @@ sources:
 ---
 
 ## TL;DR
-Leakage is any path by which information unavailable at prediction time, or belonging to the evaluation
-set, reaches the model or metric. It always flatters offline numbers, so you ship something that collapses
-in production, and it looks like a "surprisingly predictive" feature, not a bug.
+Leakage is any path by which eval answers, or information unavailable at decision time, reach your agent
+or its metric: few-shots, memory, the retrieval corpus, fine-tune traces, prompt tuning. It always
+flatters offline scores, so the agent collapses on real users.
+
+## For agent builders
+- **Why it matters for agents.** Agent evals are small, hand-built and reused for months, and agents have
+  many side doors to the answers: few-shot examples, long-term memory, the RAG index, cached tool results
+  and fine-tuning traces. One leak turns a 60% agent into a "92%" agent.
+- **Where it shows up in your stack.** Your golden task set, eval harness fixtures, vector store, memory
+  store, prompt templates and any fine-tuning file built from production traces.
+- **What you control.** Who writes eval tasks, a dev/test split for prompt iteration, splitting traces by
+  conversation or customer, and a CI check that dedupes eval items against every artifact the agent reads.
+- **What you can skip.** Purging and embargo details for finance-style time series, unless your agent
+  forecasts; keep the rule "leave a gap of one label horizon".
 
 ## Why it exists
 - **A held-out set simulates the future.** Data the model has never seen, scored once, gives an unbiased
@@ -105,19 +117,34 @@ Two refinements matter in practice:
 - **Prompt overfitting:** iterating the prompt against the full golden set is selection leakage with a
   text box instead of a hyperparameter grid.
 
+### Agent-specific doors
+| Door | How the answer leaks | Check |
+|---|---|---|
+| Few-shot examples | an eval task, or its gold trajectory, sits in the system prompt | dedupe eval items against prompt templates |
+| Long-term memory | eval runs write facts or past answers to memory, and later runs read them back | reset or namespace memory per eval run |
+| Retrieval corpus | gold answers or the eval spreadsheet itself were indexed | dedupe eval items against the index |
+| Tool fixtures | mocked tool results contain the final answer the agent should derive | review fixtures for answer strings |
+| Fine-tune traces | production conversations later used as eval tasks were also trained on | split traces by conversation or customer |
+| Trajectory splits | turns of one conversation land on both sides | split on conversation id, never on turn |
+
+- **The memory door is new.** Stateful agents learn across runs, so running the eval twice can score
+  higher the second time without any code change; that rise is leakage, not improvement.
+
 ### Detection checklist
 Suspect leakage when:
 - a metric beats the published state of the art or human agreement on first try;
 - one feature dominates importance;
 - random-split and time-split results diverge;
 - a model trained on noise still scores above chance;
-- production metrics fall far below offline ones with no distribution shift to blame.
+- production metrics fall far below offline ones with no distribution shift to blame;
+- an agent's eval score rises on a rerun with no change to code, prompt or model.
 
 Then audit provenance feature by feature: where was this column computed, from what snapshot, at what
 time relative to the label?
 
 ## Diagram
-Information reaches the test score through three doors; each audit question closes one.
+Information reaches the test score through three doors; each audit question closes one. For an agent,
+read "feature" as anything in the context window and "fit" as any prompt, memory or index built from data.
 
 ```mermaid
 flowchart TD
@@ -185,8 +212,9 @@ print(f"random-row CV: {by_row:.2f}   patient-grouped CV: {by_patient:.2f}")
 # noisy because there are only 40 independent units, not 400.
 ```
 
-### Cross-split duplicate check for an eval set
-Before reporting a metric, check test items against training data, few-shots and the retrieval corpus.
+### Cross-split duplicate check for an agent eval set
+Before reporting an agent metric, check eval tasks against fine-tuning traces, few-shots, memory entries
+and the retrieval corpus.
 Standard library only; swap the shingle scan for a MinHash index at corpus scale.
 
 ```python
@@ -222,6 +250,21 @@ for t in test:
 Pick the near-duplicate threshold by reading flagged pairs; the right value depends on how templated
 your text is.
 
+### Agent scenario: a support agent's eval that leaked three ways
+A support agent is scored on 150 golden tasks (illustrative numbers). The audit removes one leak at a time.
+
+| Change | Task success | Leak it removed |
+|---|---|---|
+| As reported | 92% | none |
+| Remove 12 eval tasks copied into few-shots | 84% | few-shot bleed |
+| Clear the memory store between eval runs | 77% | answers remembered from earlier runs |
+| Rewrite tasks from real tickets, not model-generated from indexed docs | 68% | lexical overlap with the corpus |
+| Measured on live traffic the next week | 66% | close: the eval is honest now |
+
+- **Each leak was "small".** Together they inflated the number by 26 points.
+- **The fix is structural:** a frozen test split, memory isolation per run and a CI dedupe step, not a
+  one-off cleanup.
+
 ### Worked scenario: a 30-day churn label and the missing gap
 Daily snapshots, label "churns within 30 days", training data through 31 March.
 
@@ -252,6 +295,9 @@ day, sort by date and cut on date boundaries yourself, because `TimeSeriesSplit`
 - **Contamination checks in CI.** Hash and shingle every eval item against few-shot prompts, fine-tuning
   files and the retrieval corpus on each change; fail the build above a reviewed similarity threshold.
   Monitor the count of flagged items per release.
+- **Isolated state per agent eval run.** Give every eval run a fresh memory namespace, an empty
+  conversation store and recorded tool fixtures reviewed for answer strings, so no run can read what an
+  earlier one wrote. Monitor score drift across identical reruns; it should stay within run-to-run noise.
 
 ## Trade-offs
 - **Honest estimates vs variance.** Group- and time-based splits give honest estimates but higher variance
@@ -281,6 +327,8 @@ day, sort by date and cut on date boundaries yourself, because `TimeSeriesSplit`
   number that improves every sprint while user-reported quality does not. Fix: a dev set for iteration.
 - **A RAG golden set generated by the model from indexed chunks.** Symptom: near-perfect retrieval recall
   offline and frequent retrieval misses on real queries. Fix: questions from real logs or experts.
+- **Agent memory that survives between eval runs.** Symptom: the second run of an unchanged agent scores
+  higher than the first. Fix: reset or namespace memory per run and per task.
 - **Few-shot examples or fine-tuning data that overlap the eval set.** Symptom: the model reproduces gold
   answers verbatim, sometimes including their formatting quirks. Fix: dedupe eval items against both.
 
@@ -290,6 +338,8 @@ Not a technique you adopt but a discipline you apply to every evaluation.
   have a `fit` and do they all live inside the fold; how many times has this test set influenced a decision.
 - **For LLM systems, also ask:** did any eval item appear in a prompt, a fine-tuning file or the retrieval
   corpus, and who wrote the eval questions.
+- **For agents, also ask:** does the agent's memory, cache or tool fixtures carry anything from earlier
+  eval runs, and were fine-tuning traces split by conversation.
 - **Measure:** the gap between random and group/time splits; keep a log of test-set evaluations; dedupe
   across splits with both exact and near-duplicate checks.
 - **Interviews:** the strong answer to "your model has 0.99 AUC, what do you do" is "look for the leak
@@ -339,7 +389,7 @@ fine-tuning data; and report the test number alongside the number of times it ha
 - **Trade-off:** both cost variance and folds compared with random splits; pick the one matching the
   deployment question, and combine them when both new entities and the future matter.
 
-### How do you keep an LLM eval set from leaking into the system it measures?
+### How do you keep an agent's eval set from leaking into the system it measures?
 - **Separate roles:** a development set for prompt iteration and a frozen test set evaluated only at release
   points, with each run logged.
 - **Dedupe across artifacts:** hash and near-duplicate check eval items against few-shots, fine-tuning data
@@ -353,6 +403,12 @@ fine-tuning data; and report the test number alongside the number of times it ha
 - **Fix:** cluster near-duplicates with MinHash or embedding similarity, treat each cluster as a group, and
   split with `GroupKFold`.
 - **Watch the threshold:** too aggressive and you remove legitimate recurring patterns the model must learn.
+
+### Your stateful agent scores 10 points higher on the second eval run with no code change. What happened?
+- **Suspect memory leakage:** the first run wrote facts, answers or summaries into long-term memory or a
+  cache, and the second run retrieved them, so it is reading its own earlier answers.
+- **Confirm:** rerun with a fresh memory namespace; if the score falls back, the rise was leakage.
+- **Prevent:** isolate state per run and per task, and alert when identical reruns drift beyond noise.
 
 ## Quiz
 ### Q: Why does fitting a StandardScaler on the full dataset before splitting count as leakage, even though the labels are never used?

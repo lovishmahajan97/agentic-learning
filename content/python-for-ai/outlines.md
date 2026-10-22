@@ -5,7 +5,8 @@ name: Outlines
 kind: tool
 difficulty: advanced
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/instructor
   - python-for-ai/pydantic
@@ -20,16 +21,28 @@ sources:
 ---
 
 ## TL;DR
-Outlines makes model output match a regex, JSON Schema, choice list or grammar *by construction*, by
-masking tokens that would break the pattern before sampling, so invalid output is impossible. It needs
-logit access: self-run models or engines integrating it, not closed hosted APIs.
+For agents on self-hosted models, Outlines makes every tool call, route and label match a JSON Schema,
+regex or choice list *by construction*, by masking invalid tokens before sampling. It needs logit
+access, so closed hosted APIs are out.
+
+## For agent builders
+- **Why it matters for agents.** A small self-hosted model drives an agent only if its tool arguments
+  parse every step. One malformed call per few dozen steps breaks a meaningful share of multi-step runs;
+  constrained decoding removes that failure class entirely.
+- **Where it shows up in your stack.** Inside serving engines rather than your app: vLLM's guided
+  decoding has offered an Outlines backend, reached through the OpenAI-compatible `response_format`.
+  Directly, it wraps Transformers, llama.cpp or MLX for local agents and offline batch steps.
+- **What you control.** The schema (bounded strings, field order, `Literal` labels), the prompt that
+  describes the format, the chat template, and whether you constrain at all for a given step.
+- **What you can skip.** Building FSM indexes by hand and grammar internals. Know that the constraint
+  fixes syntax, never correctness, and that compile cost lands on the first request per schema.
 
 ## Why it exists
 - **Sampling knows nothing about your format.** A model samples one token at a time over its whole
   vocabulary; nothing in that process knows you wanted a JSON object with an integer `age`. Prompting
   raises the odds of valid output but never makes it certain.
 - **Small open models break formats most.** The ones you can afford to self-host break formats far more
-  often than frontier APIs.
+  often than frontier APIs, and an agent multiplies that risk by every step it takes.
 - **Parse-and-retry has two costs.** Each retry is another full generation, so tail latency multiplies.
   And retries do not converge on hard inputs: a model that keeps writing `"age": "about 40"` will keep
   doing it.
@@ -51,7 +64,7 @@ logit access: self-run models or engines integrating it, not closed hosted APIs.
    character by character; if the walk never falls off the automaton, the token is allowed there, and you
    record where it lands. Result: a map `state -> {allowed token -> next state}`.
 4. **Build once, cache.** The index is built once per (pattern, tokenizer) pair *because* it is
-   expensive, then reused across every request with the same schema.
+   expensive, then reused across every request with the same schema, such as every call of one tool.
 5. **Generate.** Each step: look up the current state's allowed set, mask all other logits, sample
    (greedy, temperature, whatever you configured) from the survivors, follow the transition. Per-step
    overhead is a lookup and a mask, not a vocabulary scan.
@@ -71,6 +84,15 @@ index build cost ≈ (number of FSM states) × (vocabulary size) × (average tok
   `name` moves the FSM four characters forward in one step, and the index also records tokens valid only
   because they straddle a boundary, such as `":"`.
 
+### Constraining an agent's tool call
+- **One schema per tool, or one union schema per step.** Give each tool's argument model its own
+  compiled index, or compile a single schema whose `tool` field is a `Literal` of tool names with
+  matching argument objects.
+- **The engine applies it per request.** With vLLM you send the schema in `response_format` and the
+  engine masks tokens for that request only, so different agent steps can use different schemas.
+- **Decide "call a tool or answer" first.** A tiny choice constraint (for example `call` or `answer`)
+  routes the step, then a second constrained call fills the arguments; or fold both into one schema.
+
 ### Grammars
 - **Regexes cannot describe arbitrary nesting.** Recursive JSON schemas, or code, need a context-free
   grammar, which requires a pushdown automaton (a state plus a stack).
@@ -82,7 +104,7 @@ index build cost ≈ (number of FSM states) × (vocabulary size) × (average tok
 ### Where it runs
 - **Local runtimes:** Outlines wraps Hugging Face Transformers, llama.cpp, MLX and others.
 - **Serving engines:** its core FSM logic is used inside them; vLLM's guided decoding has offered an
-  Outlines backend.
+  Outlines backend. This is where most agent teams meet it.
 - **The API changed between major versions.** Older code uses `outlines.generate.json(model, Schema)`;
   the 1.x API passes the output type when calling the model. Check the version you install.
 
@@ -94,20 +116,22 @@ Two mechanisms make this worse than it sounds:
   "is this a good continuation?". If the model's mass sits on prose like `Sure! {"intent"...`, the mask
   removes `Sure` and renormalizes into a state the model was not planning for.
 - **Fix: describe the format in the prompt** (or show an example). The model's own preference then
-  aligns with the mask, so little probability is removed.
+  aligns with the mask, so little probability is removed. For tool calls, list the tools and their
+  arguments in the system prompt as you would without constraints.
 - **Non-canonical tokenization.** The index allows any token sequence that spells a valid string,
   including splits the tokenizer would never produce (for example `"` + `int` + `ent` where training data
   always had `"intent`). The model has rarely seen these, so later predictions degrade.
 - **Still measure accuracy, not just parse rate.** Mature implementations handle forced boundaries
-  carefully, but constraints guarantee syntax, never correctness.
+  carefully, but constraints guarantee syntax, never correctness: a valid call to the wrong tool is
+  still a wrong step.
 
 ## Diagram
-The top half (pattern to index) runs once per (pattern, tokenizer) pair; the loop below it runs every
-token and only does a lookup and a mask.
+The top half (pattern to index) runs once per (pattern, tokenizer) pair, for example once per tool
+schema; the loop below it runs every token and only does a lookup and a mask.
 
 ```mermaid
 flowchart TD
-    S["Regex, JSON Schema or choice list"] --> R["Compile to regex"]
+    S["Tool schema, regex or choice list"] --> R["Compile to regex"]
     R --> F["Character-level FSM"]
     F --> I[("Index: state to allowed tokens and next state")]
     T["Tokenizer vocabulary"] --> I
@@ -116,10 +140,65 @@ flowchart TD
     L --> K
     K --> P["Sample from survivors"]
     P -->|"follow transition"| L
-    P --> O["Output valid by construction"]
+    P --> O["Tool call valid by construction"]
 ```
 
 ## Examples
+### Agent scenario: constrained tool calls on a self-hosted model
+A support agent on a self-hosted model served by vLLM. Each step asks for one of two tool calls; the
+engine constrains decoding so the reply always parses.
+
+```python
+import json
+from typing import Literal, Union
+from openai import OpenAI
+from pydantic import BaseModel, Field
+
+class SearchDocs(BaseModel):
+    tool: Literal["search_docs"]
+    query: str = Field(max_length=200)          # bounded: no runaway strings
+
+class GetTicket(BaseModel):
+    tool: Literal["get_ticket"]
+    ticket_id: int
+
+class Step(BaseModel):
+    reasoning: str = Field(max_length=400)      # reason first, then act
+    call: Union[SearchDocs, GetTicket]
+
+llm = OpenAI(base_url="http://vllm.internal:8000/v1", api_key="unused")
+resp = llm.chat.completions.create(
+    model="my-7b-instruct",
+    messages=[{"role": "system", "content": "Tools: search_docs(query), get_ticket(ticket_id). "
+                                            "Reply with JSON: reasoning, then call."},
+              {"role": "user", "content": "What is the status of ticket 42?"}],
+    response_format={"type": "json_schema",
+                     "json_schema": {"name": "step", "schema": Step.model_json_schema()}},
+    max_tokens=300,                             # above the longest valid output
+)
+step = Step.model_validate_json(resp.choices[0].message.content)   # parses; may still be the wrong tool
+print(step.call)
+```
+
+- **The schema is the tool registry.** `Literal` tool names plus per-tool argument models mean the model
+  cannot invent a tool or an argument type.
+- **Bounded strings** (`max_length` becomes `maxLength`) stop a looping model from filling the window.
+- **Which backend masks tokens** (Outlines or another) is an engine setting whose name varies by version.
+
+### Worked scenario: parse failures across a multi-step run
+A self-hosted 7B agent averages 6 tool-calling steps per run. Suppose 4% of unconstrained steps fail to
+parse (illustrative; measure your own).
+
+| | Unconstrained plus retry | Constrained |
+|---|---|---|
+| Runs with at least one bad step | 1 − 0.96^6 ≈ 22% | 0% from parsing |
+| Extra generations | One or more retries on those steps | None |
+| p99 run latency | Extra steps' worth of generation | One generation per step |
+| What can still go wrong | Wrong tool, wrong arguments | Wrong tool, wrong arguments |
+
+The constraint removes the format failures; the remaining errors are decision errors your agent evals
+must catch.
+
 ### Toy FSM index and one masked step (pure Python)
 A choice constraint, a tiny vocabulary, the precomputed index, and one renormalized sampling step.
 
@@ -150,7 +229,7 @@ favourite token is gone and its mass is spread over paths it ranked lower.
 
 ### Ticket classifier on a self-hosted model
 Classifying 50,000 support tickets on a self-hosted 7B model into
-`{"intent": one of 6 labels, "urgent": true|false}`.
+`{"intent": one of 6 labels, "urgent": true|false}`, the routing step in front of a support agent.
 
 | | Parse-and-retry | Outlines |
 |---|---|---|
@@ -186,30 +265,30 @@ print(Ticket.model_validate_json(raw))   # always parses; may still be the wrong
 ```
 
 ## Production patterns
-- **Compile at startup, cache by schema.** For fixed schemas, build the generator once when the worker
-  starts so no request pays compile latency; for dynamic schemas, cache by a hash of the schema plus
-  tokenizer. Monitor compile time and cache hit rate.
-- **Constrain in the serving engine.** When serving with vLLM or a similar engine, request structured
-  output per call through its OpenAI-compatible API (`response_format` with `"type": "json_schema"`)
-  instead of embedding Outlines in app code; which decoding backend runs is an engine setting whose name
-  varies by version. Monitor per-token latency with and
-  without constraints.
+- **Constrain tool calls in the serving engine.** When agents run on vLLM or a similar engine, request
+  structured output per call through its OpenAI-compatible API (`response_format` with
+  `"type": "json_schema"`) instead of embedding Outlines in app code; which decoding backend runs is an
+  engine setting whose name varies by version. Monitor per-token latency with and without constraints.
+- **Compile at startup, cache by schema.** Keep a fixed set of tool schemas so each compiles once; build
+  generators when the worker starts so no agent step pays compile latency, and for dynamic schemas cache
+  by a hash of the schema plus tokenizer. Monitor compile time and cache hit rate.
 - **Bound every free-text field.** Use `Field(max_length=...)` (JSON Schema `maxLength`) on strings and
   set `max_new_tokens` above the longest valid output. Monitor how often generation stops at the token
   limit; it should be near zero.
 - **Prompt for the format and use the chat template.** Build the prompt with
-  `tokenizer.apply_chat_template(..., add_generation_prompt=True)` and describe the JSON in it, so the
-  mask removes little probability. Watch for degenerate values on easy inputs.
-- **Gate on accuracy, not parse rate.** Before rollout, run the labelled set constrained and unconstrained
-  and keep the better configuration. Track task accuracy per release, since parse rate will read 100%.
+  `tokenizer.apply_chat_template(..., add_generation_prompt=True)` and describe the JSON and tools in it,
+  so the mask removes little probability. Watch for degenerate values on easy inputs.
+- **Gate on task success, not parse rate.** Before rollout, run the agent eval set constrained and
+  unconstrained and keep the better configuration. Track tool-selection accuracy and run success per
+  release, since parse rate will read 100%.
 
 ## Trade-offs
 - **Guaranteed validity vs owning the stack.** Validity is guaranteed on the first pass and retries
   vanish, but only when you own the inference stack; on hosted APIs you rely on the provider's structured
   output or on validate-and-retry tools.
 - **One-time compile vs dynamic schemas.** Index construction is paid once per schema and tokenizer; for a
-  few fixed schemas it amortizes to nothing, but per-request dynamic schemas pay compile latency each time
-  unless cached.
+  few fixed tool schemas it amortizes to nothing, but per-request dynamic schemas (tools generated per
+  user) pay compile latency each time unless cached.
 - **No format errors vs content quality.** Hard constraints can lower content quality when the mask fights
   the model's preferences; a looser pattern plus validation sometimes scores better on accuracy evals.
 - **Regex speed vs grammar reach.** Regex-based JSON is fast and robust for flat or bounded schemas;
@@ -221,9 +300,10 @@ print(Ticket.model_validate_json(raw))   # always parses; may still be the wrong
   Symptom: outputs truncated at the limit, which then fail to parse despite the constraint. Fix: bound
   strings with `maxLength`.
 - **Assuming constrained output is correct output.** Symptom: a perfect parse rate alongside poor accuracy
-  on a labelled set, because format and truth are different properties.
-- **Answer field before any reasoning field.** The label is committed first. Symptom: lower accuracy than
-  the same model achieves in free-form chain-of-thought. Fix: put a bounded `reasoning` field first.
+  on a labelled set or failing agent runs, because format and truth are different properties.
+- **Answer field before any reasoning field.** The label or tool is committed first. Symptom: lower
+  accuracy than the same model achieves in free-form chain-of-thought. Fix: put a bounded `reasoning`
+  field first.
 - **Copying tutorial code across major versions.** The `outlines.generate.*` functions and the old
   `outlines.models.transformers(...)` loader are pre-1.0 idioms. Symptom: `AttributeError` or `TypeError`
   on those calls after an upgrade.
@@ -235,11 +315,12 @@ print(Ticket.model_validate_json(raw))   # always parses; may still be the wrong
 ## When to use
 - **Use when:** you self-host open models and need structured output at volume: classification,
   extraction, routing, agent tool arguments on a small model.
-- **Most valuable when:** retries are expensive or latency-bound, and small models break formats often.
+- **Most valuable when:** retries are expensive or latency-bound, small models break formats often, and
+  agent runs chain many structured steps.
 - **Avoid when:** you use closed APIs, which do not expose logits; use their native structured output or a
   validate-and-retry library like Instructor.
-- **Measure:** parse rate (should become 100%), task accuracy with and without the constraint, and compile
-  latency for new schemas.
+- **Measure:** parse rate (should become 100%), task accuracy and agent run success with and without the
+  constraint, and compile latency for new schemas.
 - **Interviews:** explain the FSM index and why constraining fixes syntax but not semantics.
 
 ## Role lens
@@ -268,6 +349,14 @@ cache indexes and avoid generating schemas on the fly.
 - **Prompting only shifts probabilities.** The sampler knows nothing about your format, so a prompt raises
   the odds of valid JSON but never makes it certain, especially on small self-hosted models.
 
+### Your self-hosted agent fails about one run in five on malformed tool calls. How would you fix it?
+- **Compute the run-level effect.** With six steps and an illustrative 4% per-step parse failure,
+  1 − 0.96^6 ≈ 22% of runs hit at least one bad call, which matches the symptom.
+- **Constrain in the engine.** Send each step's schema (a `Literal` of tool names plus argument models)
+  as `response_format` with `"type": "json_schema"`, so every call parses on the first pass.
+- **Then measure decisions.** Parse failures go to zero; track tool-selection accuracy and run success on
+  the agent eval set, since wrong-but-valid calls remain.
+
 ### Your constrained classifier parses 100% of outputs, but accuracy dropped versus free-form output. What do you check?
 - **The prompt.** If it does not describe the JSON, the model's mass sits on prose like `Sure!`, and the
   greedy mask pushes it onto paths it ranked low.
@@ -280,16 +369,17 @@ cache indexes and avoid generating schemas on the fly.
 ### When would you not use Outlines?
 - **On closed hosted APIs,** because masking needs the logits before sampling; use native structured output
   or a validate-and-retry library like Instructor.
-- **For per-request dynamic schemas you cannot cache,** because each new schema pays index compile time.
+- **For per-request dynamic schemas you cannot cache,** such as tools generated per user, because each new
+  schema pays index compile time.
 - **For deeply recursive structures,** which need grammar mode; it costs more per step and is less mature
   than the regex path.
 
-### Where does the cost of constrained decoding go, and how do you keep it off the request path?
+### Where does the cost of constrained decoding go, and how do you keep it off an agent's request path?
 - **Into the index build.** Roughly FSM states × vocabulary size × average token length character steps,
   so long enums and many optional fields compile visibly slower.
 - **Per token it is a lookup and a mask,** not a scan of tens or hundreds of thousands of tokens.
-- **So** compile fixed schemas at worker startup, cache dynamic ones by a hash of schema plus tokenizer,
-  and monitor compile time and cache hit rate.
+- **So** keep a fixed set of tool schemas, compile them at worker startup, cache dynamic ones by a hash of
+  schema plus tokenizer, and monitor compile time and cache hit rate.
 
 ### Why do unbounded string fields cause truncated output even under a constraint?
 - **Any length is valid.** A looping model keeps emitting legal characters until `max_new_tokens`, leaving

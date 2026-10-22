@@ -5,7 +5,8 @@ name: Parent-document retrieval
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/retrieval-granularity
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Small chunks match best because they embed as sharp keys; sections answer best because they hold the
-definitions, table headers and caveats. Parent-document retrieval searches small children and hands the
-generator their parents: small-chunk recall with big-chunk context, paid for in tokens.
+Parent-document retrieval searches small, sharp child chunks and returns their larger parent sections.
+For an agent it decides what a search tool returns: whole sections up front, or matched snippets with a
+second tool to read the section.
+
+## For agent builders
+- **Why it matters for agents.** "Right passage, wrong details" is a common agent failure: the tool
+  returned the sentence but not the table header, plan name or caveat. Parents fix that, but every
+  parent costs ~1,200 tokens that stay in the transcript for the rest of the run.
+- **Where it shows up in your stack.** LangChain's `ParentDocumentRetriever`, LlamaIndex's sentence-window
+  and auto-merging retrievers, a vector store for children plus a key-value or document store for
+  parents, and the tool schemas your agent sees.
+- **What you control.** Child and parent sizes, the score aggregation, the token budget per tool result,
+  and whether the agent gets parents directly or snippets plus a `read_section` tool.
+- **What you can skip.** Building a multi-level auto-merging hierarchy by hand. Two levels plus a
+  heading path on each child cover most agent knowledge bases.
 
 ## Why it exists
 - **One chunk size is wrong in both directions.** "The limit is 50 requests per minute." alone is an
@@ -99,9 +112,21 @@ Pick by question type, and measure: the rules rank parents differently on the sa
 - **Stronger remedy:** contextual retrieval, which writes a chunk-specific context with an LLM.
 - **They compose:** contextualised children for matching, parents for answering.
 
+### Two ways to expose it to an agent
+| Tool design | What one search returns | When it wins |
+|---|---|---|
+| **Parents up front** | the top parents, each with matched spans | few searches per task, answers that need the whole section |
+| **Snippets plus `read_section`** | matched child spans with `parent_id` and heading path; a second tool returns the parent by id | many searches per task, where most hits are only glanced at |
+
+- **The second design is progressive disclosure.** The agent reads cheap snippets, then pays for a
+  parent only when a snippet looks like the answer, so transcript growth tracks what it actually reads.
+- **It costs a step.** Each `read_section` is another sequential model call, so it loses when nearly
+  every hit needs its section anyway.
+
 ## Diagram
-Two stores, one join: children are searched, hits are grouped and scored per parent (max, count or
-fraction), parents are fetched by id, and citations point back at the matched child spans.
+Two stores, one join behind the search tool: children are searched, hits are grouped and scored per
+parent (max, count or fraction), parents are fetched by id, and citations point back at the matched
+child spans.
 
 ```mermaid
 flowchart TD
@@ -109,11 +134,11 @@ flowchart TD
     P -->|"split into small chunks"| C["Children with heading path"]
     C -->|"embed children only"| V[("Vector index of children")]
     P -->|"store by parent_id, not embedded"| KV[("Parent store")]
-    Q["Query"] -->|"over-fetch, k about 20"| V
+    Q["Agent search tool call"] -->|"over-fetch, k about 20"| V
     V --> G["Group hits by parent_id and score"]
     G --> B["Dedupe, fill token budget"]
     B -->|"look up parent_id"| KV
-    KV --> GEN["Generator gets parent text"]
+    KV --> GEN["Tool result: parent text"]
     G -.->|"matched child spans"| CIT["Citations and highlights"]
 ```
 
@@ -192,12 +217,55 @@ Illustrative, using the manual above with a 6,000-token evidence budget:
 | Parent-document | ~1,200-token parent | 5 (after dedup) | 5 coherent sections |
 | Whole document as parent | ~25k-token manual | 0 | overflow |
 
+### Agent scenario: snippets first, sections on demand
+Two tools over the same two stores; `index`, `embed` and `parents` are as in the ingestion example.
+
+```python
+TOOLS = [
+    {"name": "search_manual",
+     "description": "Search the product manuals. Returns short matched snippets with a section id and "
+                    "heading path. Call read_section before answering from a snippet that lacks the plan, "
+                    "endpoint, table header or exceptions.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+                      "required": ["query"]}},
+    {"name": "read_section",
+     "description": "Return the full text of one manual section by its section id.",
+     "input_schema": {"type": "object", "properties": {"section_id": {"type": "string"}},
+                      "required": ["section_id"]}},
+]
+
+def search_manual(query, k_children=20, max_snippets=8):
+    hits = index.search(embed(query, kind="query"), k_children)          # [(score, meta)]
+    return [{"section_id": m["parent_id"], "heading": m.get("heading", ""),
+             "snippet": m["child_text"]} for _, m in hits[:max_snippets]]
+
+def read_section(section_id):
+    p = parents.get(section_id)
+    if p is None:                                    # store drift: say so, never return empty text
+        return {"status": "not_found", "section_id": section_id}
+    return {"status": "ok", "section_id": section_id, "text": p["text"]}
+```
+
+Illustrative transcript cost for a task with 4 searches, using ~200-token children and ~1,200-token
+parents:
+
+| Tool design | Per search | Section reads | Tool-result tokens per task |
+|---|---|---|---|
+| Parents up front, 4 per search | 4 × 1,200 = 4,800 | 0 | 19,200 |
+| Snippets (8 × 200) plus 2 `read_section` calls | 1,600 | 2 × 1,200 = 2,400 | 8,800 |
+
+The snippet design uses less than half the context but adds 2 sequential steps.
+
 ## Production patterns
 - **Use the framework retriever when it fits.** LangChain's `ParentDocumentRetriever` takes a child
   splitter, an optional parent splitter, a vector store for children and a document store for parents;
   LlamaIndex offers `SentenceWindowNodeParser` (paired with a metadata-replacement postprocessor that
   swaps in the window) and `AutoMergingRetriever`. Monitor unique parents per query and
   tokens per request after adopting either.
+- **Snippet-then-read tools for multi-search agents.** When an agent searches several times per task,
+  return matched child spans with `parent_id` and offer a `read_section` tool, as in the agent scenario.
+  Monitor section reads per task, tool-result tokens per run, and answers given from a snippet whose
+  section was never read.
 - **Heading-path children.** Embed `heading path + child` and store the bare child for citation, as in
   `ingest` above. Measure child recall@k on queries that name a product or plan, the slice this fixes.
 - **Over-fetch, group, budget.** Fetch roughly 4–5 children per parent you plan to return (20 for 4 in the
@@ -205,7 +273,7 @@ Illustrative, using the manual above with a 6,000-token evidence budget:
   budget truncates the last parent.
 - **Keep the stores consistent.** Re-index by document: delete every child whose `doc_id` matches and
   replace the parents in one job, then verify each child's `parent_id` resolves. Alert on parent-lookup
-  misses, which otherwise silently produce empty contexts.
+  misses, which otherwise silently produce empty contexts (or, in an agent, a `not_found` tool result).
 - **Cite the matched span.** Return `matched_spans` with offsets to the UI and highlight them inside the
   parent. Track citation-verification complaints or reviewer disagreement as the signal.
 
@@ -220,6 +288,9 @@ Illustrative, using the manual above with a 6,000-token evidence budget:
   sentence windows.
 - **Structural vs fixed-size parents.** By heading they are coherent but vary wildly in size; fixed-size
   parents are predictable but cut mid-topic; the right choice follows the corpus's formatting discipline.
+- **Parents up front vs snippets plus a read tool.** Parents up front answer in fewer agent steps but
+  fill the transcript with sections the agent only glanced at; snippets plus `read_section` keep context
+  small at the cost of extra sequential calls, and flip to worse when nearly every hit needs its section.
 
 ## Pitfalls
 - **The whole document as parent for long documents.** The symptom is context overflow, lost-in-the-middle
@@ -236,6 +307,9 @@ Illustrative, using the manual above with a 6,000-token evidence budget:
   sentences that carry no information.
 - **Assuming parents fix matching.** The symptom is queries naming the product or plan still missing a
   section whose children never mention it, until heading paths or contexts are prepended to children.
+- **Agent answers from the snippet without reading the section.** The symptom is the old "right passage,
+  wrong details" failure coming back after switching to snippets. Say in the tool description when to
+  call `read_section`, and score answers that cite unread sections in the agent eval.
 
 ## When to use
 - **Use for** long, structured documents where answers depend on surrounding context: manuals, contracts,
@@ -245,7 +319,8 @@ Illustrative, using the manual above with a 6,000-token evidence budget:
 - **First change to try** when answers are "right passage, wrong details" because the generator lacked the
   surrounding section.
 - **Measure:** child-level recall@k against a single-chunk-size baseline, then answer faithfulness and
-  tokens per request, since the gain in context is paid for in budget.
+  tokens per request (tool-result tokens per run, for agents), since the gain in context is paid for in
+  budget.
 - **Interviews:** appears as "small-to-big" retrieval; the strong answer covers the join, the score
   aggregation and the citation granularity.
 
@@ -278,11 +353,12 @@ single-size baseline.
 - **It decouples the units:** the retrieval unit is chosen for matching and the generation unit for
   answering, like a lookup on small keys joined to large values.
 
-### Users say the bot cites a whole section they cannot check, and some answers come back with empty context. How do you debug?
+### Users say the agent cites a whole section they cannot check, and some answers come back with empty context. How do you debug?
 - **Citation granularity:** return the matched child spans with offsets and highlight them inside the
   parent instead of citing the 2k-token section.
-- **Empty contexts:** check for `parent_id` lookups that miss, the sign that the parent store and child
-  index drifted apart after a re-index or deletion.
+- **Empty contexts:** check the tool spans in the trace for `parent_id` lookups that miss (empty text or
+  `not_found` results), the sign that the parent store and child index drifted apart after a re-index or
+  deletion.
 - **Fix the sync:** re-index per document (delete all children for the `doc_id`, replace its parents in one
   job) and alert on lookup misses.
 
@@ -292,6 +368,14 @@ single-size baseline.
   to land hits than a 4-child one.
 - **Fraction** removes the size bias but over-rewards a tiny parent with one lucky hit; pick by question
   type and measure on the golden set.
+
+### Your agent searches four times per task and its context fills with manual sections. What do you change?
+- **Measure first:** at 4 parents of ~1,200 tokens per search, four searches add 19,200 tokens of tool
+  results, most of which the agent never cites.
+- **Switch to snippets plus `read_section`:** return matched child spans with section ids and let the
+  agent read only the sections it needs (about 8,800 tokens for two reads in the same task).
+- **Watch the new failure:** answers from unread snippets, so state in the tool description when to read,
+  and check it in the agent eval.
 
 ### When would you not use parent-document retrieval?
 - **Short self-contained records** such as tickets, FAQ entries and product listings, where the record is

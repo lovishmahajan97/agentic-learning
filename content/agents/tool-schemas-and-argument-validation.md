@@ -5,7 +5,8 @@ name: Tool schemas & argument validation
 kind: practice
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/tool-calling
   - agents/typed-tool-contracts
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-The input schema is the model's whole specification of a tool's arguments; harness validation catches
-its mistakes before they become side effects. Keep schemas small and explicit, validate shape, meaning,
-then permission, and return fixable error results.
+The input schema is your agent's whole specification of a tool's arguments; harness validation catches
+the model's mistakes before they become side effects. Keep schemas small and explicit, validate shape,
+meaning, then permission, and return fixable error results.
+
+## For agent builders
+- **Why it matters for agents.** The model reads nothing about your tool except its name, description
+  and schema, and validation is the last gate before an argument becomes a refund, an email or a
+  deleted row. Most "the agent did something dumb" incidents trace back to one of the two.
+- **Where it shows up in your stack.** Pydantic models (`model_json_schema()`) or Zod in TypeScript,
+  provider strict modes, LangChain's `@tool` (schema from type hints, or a Pydantic `args_schema`),
+  Pydantic AI (validation errors sent back to the model as a retry), and Instructor for validated
+  structured outputs.
+- **What you control.** Field types, enums, required fields, descriptions with units and formats, the
+  meaning and permission checks no schema can express, and the cap on validation retries.
+- **What you can skip.** The full JSON Schema specification. Provider strict modes accept only a subset,
+  and flat, enum-heavy schemas are what models fill well anyway.
 
 ## Why it exists
 - **Model-generated arguments are plausible, not correct.** They fail in three distinct ways:
@@ -314,6 +328,13 @@ corrects itself. Then watch the distribution of amounts in traces to confirm the
 - **Report every error in one result,** as Pydantic does, so three bad fields cost one retry, not three.
 - **Cap retries at two or three per call,** then tell the model to ask the user.
 - **Watch retries per rejected call;** a rise after a change points to an ambiguous description.
+
+### A framework validates arguments for you and retries on failure. Is that enough?
+- **It covers shape only.** Pydantic AI or a LangChain `args_schema` rejects wrong types and missing
+  fields, but cannot know that an order belongs to another tenant or that a date is in the past.
+- **Keep meaning and permission checks in the handler,** with scope taken from the session, and an
+  approval gate for destructive calls.
+- **Check the retry setting** so a framework's automatic retries stay inside your step budget.
 
 ## Quiz
 ### Q: What does strict or constrained schema mode guarantee about a tool call's arguments?

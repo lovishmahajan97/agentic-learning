@@ -5,7 +5,8 @@ name: Property-based testing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/property-based-testing
   - evals/metamorphic-testing
@@ -21,8 +22,22 @@ sources:
 
 ## TL;DR
 Property-based testing generates hundreds of random inputs, asserts a property for each, and shrinks any
-failure to the smallest failing input. In AI systems it finds silent bugs in chunkers, renderers, parsers
-and validators; model-output properties cost one call per example.
+failure to the smallest one. In agents it finds silent bugs in tool-argument parsers, memory trimmers,
+chunkers and prompt renderers; model-output properties cost one call per example.
+
+## For agent builders
+- **Why it matters for agents.** The deterministic code around the model is where agents crash: the
+  parser that turns model JSON into tool arguments, the history trimmer that keeps the context under
+  budget, the step and cost counters. Model output is an adversarial input generator, so example tests
+  written by hand miss what it emits.
+- **Where it shows up in your stack.** Hypothesis with pytest for Python agents, typically on Pydantic
+  or dataclass tool-argument models, memory and scratchpad managers, RAG chunkers and prompt templates,
+  with stateful tests for anything that changes across turns.
+- **What you control.** The strategies (shaped like real model JSON and real user text), the properties
+  (round trip, typed errors only, budget invariants), the CI and nightly profiles and the pinned
+  counterexamples.
+- **What you can skip.** QuickCheck history and advanced shrinking internals; generators, properties,
+  shrinking and `RuleBasedStateMachine` cover agent plumbing.
 
 ## Why it exists
 - **Example tests encode what their author imagined.** The chunker is tested on a three-paragraph
@@ -163,7 +178,7 @@ def test_chunk_properties(text, p):
     assert (len(chunks) == 0) == (text == "")
 ```
 
-### Stateful test that catches a history trimmer dropping the user's turn
+### Agent scenario: stateful test that catches a memory trimmer dropping the user's turn
 Runnable with `pip install hypothesis pytest`. The naive trimmer drops the oldest non-system turn until
 the history fits, which can delete the only user turn.
 
@@ -223,7 +238,10 @@ TestHistory = HistoryMachine.TestCase
 The fix (never evict the latest user turn, summarise tool results instead) is now tested by the same
 invariant forever.
 
-### Round trip and typed errors for a tool-argument parser
+### Agent scenario: round trip and typed errors for a tool-argument parser
+A typed error matters to the agent loop: it can be returned to the model as a tool error so the model
+retries with fixed arguments, while a stray `KeyError` crashes the run.
+
 Runnable with Hypothesis. Any JSON-shaped input either parses into the typed object or raises
 `ToolArgError`; any other exception fails the test.
 
@@ -288,12 +306,16 @@ kind of input a Unicode-aware generator eventually produces.
   count, no deadline), cache responses by model, parameters and prompt, and report the failure rate in
   the eval harness. Monitor the rate per model version.
 - **Strategies from real data.** Build strategies from the customer's document formats, identifier
-  patterns and logged model JSON (for example `st.sampled_from(real_examples)` combined with mutations).
-  Monitor production parser errors that the strategies did not generate.
+  patterns and logged model JSON (for example `st.sampled_from(real_examples)` combined with mutations),
+  including tool arguments that failed validation in production agent traces. Monitor production parser
+  errors that the strategies did not generate, and tool-validation error rate per model version.
 - **Contract-boundary requirement.** Every tool schema, prompt template and chunking library ships with a
   round-trip or invariant property, enforced in code review. Monitor the share of boundary modules with
   at least one property.
-
+- **Agent-loop budget machine.** Model the loop's bookkeeping (step counter, token and cost budget,
+  retry limit per tool) as a stateful test whose rules are "model calls tool", "tool errors", "tool
+  times out", with invariants that the loop always terminates within the step limit and spend never goes
+  negative or past the cap. Monitor production runs that hit the step limit.
 ## Trade-offs
 - **Coverage vs determinism.** Hundreds of inputs per property give coverage no example suite reaches,
   but runs are slower and vary in what they explore, so CI relies on the example database and pinned
@@ -368,7 +390,15 @@ and keep any model-calling property out of the PR gate with caching and a low ex
 - **Overlap:** each chunk starts with the previous chunk's overlap region; plus Unicode safety, with the
   default text alphabet rather than ASCII.
 
-### A conversation-history bug appears only after long sessions. How would you test for it?
+### Your agent crashes a few times a day inside a tool with a KeyError on model-produced arguments. How do you make that class of bug impossible?
+- **Typed boundary:** parse every tool's arguments into a typed object that either validates or raises
+  one typed error the loop returns to the model as a tool error, so it can retry.
+- **Property test it:** a round trip from generated typed objects, plus "only typed errors" over
+  arbitrary JSON-shaped input, including numbers as strings and missing keys.
+- **Seed from traces:** add the arguments that crashed in production to the strategy and pin them with
+  `@example(...)`.
+
+### An agent's memory bug appears only after long sessions. How would you test for it?
 - **Stateful testing:** a `RuleBasedStateMachine` with rules for user turns, tool results and trimming,
   and invariants checked after every step.
 - **Invariants:** system prompt first, total under budget, latest user turn kept.

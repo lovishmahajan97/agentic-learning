@@ -5,7 +5,8 @@ name: Open-weight vs proprietary
 kind: decision
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - system-design/self-host-vs-api
   - system-design/build-vs-buy
@@ -20,19 +21,34 @@ sources:
 ---
 
 ## TL;DR
-Open-weight models publish parameters you can run, inspect and fine-tune under a licence; proprietary
-weights stay with the provider. It decides lifecycle control, data flow, customisation and cost shape,
-separately from self-host versus API: open weights can be rented, proprietary reached privately.
+Open-weight models publish parameters you can run, pin and fine-tune under a licence; proprietary
+weights stay with the provider. For agents it decides tool-calling quality, data flow of tool results,
+lifecycle control and cost shape, separately from self-host versus API.
+
+## For agent builders
+- **Why it matters for agents.** Agents send tool results, often internal data, to the model on every
+  step, and depend on reliable tool-call formatting. The proprietary frontier usually leads on long
+  multi-step tool use; open weights win when tool results cannot leave, behaviour must stay frozen, or
+  a narrow agent step is worth fine-tuning.
+- **Where it shows up in your stack.** A proprietary API, or open weights behind an OpenAI-compatible
+  server (vLLM, SGLang, Ollama) or a hosting provider. The serving engine's tool-call parsing and
+  structured-output support decide whether your agent loop works unchanged.
+- **What you control.** Which agent roles use which weights, the pinned revision or version, the
+  licence check, the guardrails you add when leaving an API, and the agent eval both candidates must
+  pass.
+- **What you can skip.** Licence law details (legal reviews them) and training-data provenance debates.
+  Know the eight dimensions, the deployment combinations and the supply-chain gate.
 
 ## Why it exists
 - **The real question is why anyone runs open weights.** The proprietary frontier usually leads on raw
   capability and an API is the lowest-effort way to use it. But an API bundles conditions you may not be
   able to accept.
-- **What the API bundles.** Data leaves your environment (mitigable by contract, not architecture). The
-  provider retires versions on its own schedule, taking the behaviour your prompts and evals were tuned
-  to. You cannot see or change weights, tokenizer, sampling internals or more than a sliver of the
-  logits. Fine-tuning is what the provider offers. Price is per token, forever, set by someone else. Your
-  core capability is a dependency you cannot fork.
+- **What the API bundles.** Data, including every tool result your agent sees, leaves your environment
+  (mitigable by contract, not architecture). The provider retires versions on its own schedule, taking
+  the behaviour your prompts and evals were tuned to. You cannot see or change weights, tokenizer,
+  sampling internals or more than a sliver of the logits.
+- **And the commercial side.** Fine-tuning is what the provider offers. Price is per token, forever,
+  set by someone else. Your core capability is a dependency you cannot fork.
 - **Open weights invert each point.** The weights are a file you keep: the same bytes in five years. Data
   never has to leave. You can fully fine-tune, quantize, distil, prune, inspect and constrain decoding.
   Cost is hardware and people, not tokens. In exchange you own serving, safety tuning, upgrades and
@@ -48,8 +64,8 @@ separately from self-host versus API: open weights can be rented, proprietary re
 ### The dimensions, and why each one matters
 1. **Control and lifecycle.** An open-weight model is an immutable artefact you pin by content hash; a
    proprietary model is a versioned API with deprecations typically announced months ahead. This matters
-   *because* an LLM system's behaviour is tuned to one model; when it changes, the prompts, evals and
-   parsers were written against something that no longer exists.
+   *because* an LLM system's behaviour is tuned to one model; when it changes, the prompts, tool
+   descriptions, evals and parsers were written against something that no longer exists.
 2. **Data governance.** Open weights on hosts you control mean data physically never leaves.
    Proprietary access relies on data-processing agreements, zero-retention options and regional
    endpoints. The deciding question: is the constraint legal (a contract and a network path can satisfy
@@ -59,9 +75,9 @@ separately from self-host versus API: open weights can be rented, proprietary re
    your own draft model, and tokenizer work. Proprietary models offer prompting, structured output
    features and sometimes a fine-tuning API. The gap matters most for narrow, high-volume tasks, where
    deep customisation pays.
-4. **Capability.** The proprietary frontier generally leads; the best open models trail by a margin that
-   varies by task and shifts with every release. It is contested, so measure it on your own evaluation,
-   not a leaderboard.
+4. **Capability.** The proprietary frontier generally leads, most visibly on long multi-step tool use;
+   the best open models trail by a margin that varies by task and shifts with every release. It is
+   contested, so measure it on your own agent evaluation, not a leaderboard.
 5. **Cost structure.** Proprietary is per-token operating cost that scales with usage. Self-hosted open
    weights are fixed cost per GPU-hour, so economics hinge on utilisation (the self-host versus API lesson
    works the break-even). Open weights served by a hosting provider turn back into per-token cost, often
@@ -71,18 +87,19 @@ separately from self-host versus API: open weights can be rented, proprietary re
    models with outputs, and thresholds for very large deployments. The licence decides whether you can
    ship on-device, redistribute fine-tunes, or embed the model in a product you sell.
 7. **Ecosystem and supply chain.** Mature serving engines, quantization formats and fine-tuning tooling
-   are a large part of open weights' practical value. The risk: hub weights can be tampered with,
-   pickle-format checkpoints can execute code on load, and a popular fine-tune may carry behaviour nobody
-   audited. Pin revisions, prefer safetensors, verify hashes, read the model card.
+   are a large part of open weights' practical value; for agents, the engine's tool-call parsing and
+   structured-output support matter most. The risk: hub weights can be tampered with, pickle-format
+   checkpoints can execute code on load, and a popular fine-tune may carry behaviour nobody audited.
+   Pin revisions, prefer safetensors, verify hashes, read the model card.
 8. **Safety and support.** A proprietary API includes the provider's safety tuning, moderation layers,
-   SLAs and someone to call. With open weights you own safety behaviour and guardrails, and outages are
-   your outages.
+   SLAs and someone to call. With open weights you own safety behaviour and guardrails, including
+   resistance to prompt injection arriving through tool results, and outages are your outages.
 
 ### The governance middle ground
 - **What it is.** A proprietary model offered as a managed service by the cloud provider you already use,
   reached over private networking in your region.
-- **What it gives.** Traffic never crosses the public internet, and the processor is one you have already
-  contracted.
+- **What it gives.** Traffic, including agent tool results, never crosses the public internet, and the
+  processor is one you have already contracted.
 - **What it does not.** Inference still runs on the provider's infrastructure, not on hosts you operate.
 
 ### Decoupling the axis from deployment
@@ -100,26 +117,26 @@ run GPUs, and choosing "proprietary" does not force data onto the public interne
 ### How the decision runs
 1. **Constraints first:** isolation requirements, licence compatibility with how you ship, and the
    customisation the task needs.
-2. **Capability** on your eval.
+2. **Capability** on your eval, scored on whole agent runs where the model drives a loop.
 3. **Cost** at your real utilisation.
 4. **Lifecycle risk and exit cost.**
 
-The common outcome is a portfolio: proprietary frontier for the hardest and lowest-volume work, open
-weights (hosted or self-hosted, often fine-tuned) for high-volume narrow tasks, both behind a gateway so
-the split can move as the models do.
+The common outcome is a portfolio: proprietary frontier for the hardest and lowest-volume work, such as
+agent planning, and open weights (hosted or self-hosted, often fine-tuned) for high-volume narrow tasks,
+both behind a gateway so the split can move as the models do.
 
 ## Diagram
 The decision runs constraints first (isolation, customisation, licence), then capability, cost and
-lifecycle for every surviving candidate. Note that the isolation question picks a deployment, not just
-a weight type, and the licence check applies to every open-weight path.
+lifecycle for every surviving candidate. The isolation question picks a deployment, not just a weight
+type, and the licence check applies to every open-weight path.
 
 ```mermaid
 flowchart TD
-    S["Task family"] --> I{"Isolation: legal or architectural?"}
+    S["Task family or agent role"] --> I{"Isolation: legal or architectural?"}
     I -->|"architectural: only hosts you operate"| OW["Open weights, self-hosted, pinned by hash"]
     I -->|"legal: contract and network path suffice"| L{"Deep customisation or on-device?"}
     L -->|"yes"| OWH["Open weights, self-hosted or hosted API"]
-    L -->|"no, prompting suffices"| CAP["Measure candidates on your eval"]
+    L -->|"no, prompting suffices"| CAP["Measure candidates on your agent eval"]
     OW --> LIC{"Licence fits how you ship?"}
     OWH --> LIC
     LIC -->|"yes"| CAP
@@ -132,10 +149,48 @@ flowchart TD
 ```
 
 ## Examples
+### Same agent loop, two backends: tool-call validity check
+Open-weight models served by an OpenAI-compatible server (for example vLLM with tool calling enabled
+for that model family) can be called with the same client code as a proprietary API, so one eval
+compares them. URLs and model names are placeholders.
+
+```python
+import json
+from openai import OpenAI
+
+BACKENDS = {
+    "proprietary": OpenAI(),                                              # key from the environment
+    "open_weight": OpenAI(base_url="http://vllm.internal:8000/v1", api_key="unused"),
+}
+MODELS = {"proprietary": "<pinned dated model id>", "open_weight": "<served model name>"}
+TOOLS = [{"type": "function", "function": {
+    "name": "lookup_order", "description": "Fetch an order by id",
+    "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                   "required": ["order_id"]}}}]
+
+def tool_call_ok(backend, prompt, expected_tool):
+    resp = BACKENDS[backend].chat.completions.create(
+        model=MODELS[backend], messages=[{"role": "user", "content": prompt}], tools=TOOLS)
+    calls = resp.choices[0].message.tool_calls or []
+    if not calls or calls[0].function.name != expected_tool:
+        return False
+    try:
+        args = json.loads(calls[0].function.arguments)   # malformed JSON counts as a failure
+    except json.JSONDecodeError:
+        return False
+    return "order_id" in args
+
+# for b in BACKENDS: print(b, sum(tool_call_ok(b, c["prompt"], c["tool"]) for c in cases) / len(cases))
+```
+
+A single-step check like this is the cheap first gate; the decision still rests on whole-run success
+on your agent tasks, with tool results and errors in the loop.
+
 ### Pinned bytes and the full next-token distribution
 Three things an open-weight artefact allows that an API-only model does not: pin the exact bytes, read
 the full next-token distribution, and constrain the decision to an allowed set without generating text.
-The restricted softmax yields a per-class score that a cascade can route on.
+The restricted softmax yields a per-class score a cascade can route on, such as an agent's first
+routing step.
 
 ```python
 import torch
@@ -204,13 +259,17 @@ Illustrative; each row applies "How the decision runs" in order.
 
 | Task family | Binding constraint | Outcome |
 |---|---|---|
-| Complex contract analysis, low volume | capability on the eval | proprietary frontier via public API, pinned version |
+| Complex contract analysis agent, low volume | capability on the agent eval | proprietary frontier via public API, pinned version |
 | Patient-record extraction, high volume | legal residency: in-region, existing processor only | cloud provider's managed proprietary model over a private endpoint; a third-party open-weight host is excluded (new processor), self-hosted open weights only if volume keeps the GPUs busy |
 | On-device intent classifier in a shipped product | licence must allow embedding and redistribution; behaviour frozen for years | permissively licensed open weights, fine-tuned, pinned by hash |
 
 All three sit behind one gateway and one eval harness, so a row can change when the models do.
 
 ## Production patterns
+- **One client interface for both weight types.** For any agent that may switch backends. Call open
+  weights through an OpenAI-compatible server and proprietary models through their API behind the same
+  gateway route, so a switch is configuration. Monitor tool-call parse failures per backend; engines
+  differ in how they parse tool calls for each model family.
 - **Revision pin plus hash manifest.** For every open-weight artefact. Pin the model repository commit,
   download only safetensors, and fail CI and deployment if file hashes differ from the reviewed manifest.
   Monitor manifest changes; each one needs a review and an eval run.
@@ -221,10 +280,10 @@ All three sit behind one gateway and one eval harness, so a row can change when 
 - **Isolation requirement classified in writing.** At the start of any regulated engagement. Get the
   customer to state whether the constraint is legal (contract and network path suffice) or architectural
   (only hosts they operate). Monitor that the chosen deployment still matches it after any vendor change.
-- **Explicit guardrails when leaving an API.** When migrating a workload to open weights. Add input and
-  output moderation and policy checks that the API model provided implicitly, and run a red-team and
-  jailbreak eval before cutover. Monitor policy-violation and jailbreak success rates against the API
-  baseline.
+- **Explicit guardrails when leaving an API.** When migrating a workload or agent to open weights. Add
+  input and output moderation, tool-result injection checks and policy checks that the API model
+  provided implicitly, and run a red-team and jailbreak eval before cutover. Monitor policy-violation and
+  jailbreak success rates against the API baseline.
 - **Deprecation calendar for proprietary models.** For every pinned API version. Track announced
   retirement dates, and open the migration eval the day a notice arrives. Monitor days of runway left
   versus the time your last migration took.
@@ -236,6 +295,9 @@ All three sit behind one gateway and one eval harness, so a row can change when 
 - **Proprietary: capability vs lifecycle.** Frontier capability with no infrastructure, but the behaviour
   you tuned to can be retired on the provider's schedule; it flips when behaviour must stay fixed for
   years, as in regulated workflows or embedded devices.
+- **Agent planner on open weights vs run success.** Keeping every step inside your environment removes
+  the data-flow question, but long multi-step tool use is where the gap to the frontier usually shows;
+  it flips when isolation is architectural or the agent is narrow enough to fine-tune.
 - **Deep customisation vs re-certification.** It buys quality on narrow tasks but creates artefacts you
   must retrain and re-certify when the base changes; it flips when the task is broad and prompting
   suffices.
@@ -248,6 +310,9 @@ All three sit behind one gateway and one eval harness, so a row can change when 
 ## Pitfalls
 - **Reading "open weights" as "open source" and skipping legal review.** Symptom: an acceptable-use or
   scale clause surfaces during a customer's due diligence or an acquisition.
+- **Assuming the agent loop ports unchanged.** Symptom: after switching to an open-weight model the
+  agent emits tool calls as plain text or malformed JSON. Fix: confirm the serving engine supports tool
+  calling for that model family, use structured-output constraints, and re-run the agent eval.
 - **Loading weights from an unverified source or in pickle format.** Symptom: code execution on load, or
   a fine-tune that behaves differently from its model card.
 - **Assuming open weights are cheaper without a utilisation model.** Symptom: a GPU running at a small
@@ -261,13 +326,13 @@ All three sit behind one gateway and one eval harness, so a row can change when 
 
 ## When to use
 - **Choose open weights when:** data isolation must be architectural rather than contractual; behaviour
-  must be frozen for years; high-volume narrow tasks where fine-tuning pays; on-device or edge
-  deployment; you need logits or custom decoding; or vendor exit is a board-level requirement.
-- **Choose proprietary when:** you need frontier capability now, volume is low or spiky, the team is
-  small, and the provider's terms satisfy your governance.
+  must be frozen for years; high-volume narrow tasks or agent steps where fine-tuning pays; on-device or
+  edge deployment; you need logits or custom decoding; or vendor exit is a board-level requirement.
+- **Choose proprietary when:** you need frontier capability now (often the agent planner), volume is low
+  or spiky, the team is small, and the provider's terms satisfy your governance.
 - **Most organisations run both** through a portfolio.
-- **Measure:** the eval delta between candidates, GPU utilisation if self-hosting, cost per successful
-  task, and time to migrate after a deprecation notice.
+- **Measure:** the eval delta between candidates, tool-call validity and run success for agents, GPU
+  utilisation if self-hosting, cost per successful task, and time to migrate after a deprecation notice.
 - **Interviews:** separate this axis from deployment, name the licence question, and make the lifecycle
   argument concretely.
 
@@ -312,6 +377,14 @@ gateway so the decision stays reversible.
 - **So "no data leaves" is a deployment requirement first.** Classify it as legal or architectural
   before picking a weight type.
 
+### Your agent must run air-gapped on open weights. What do you check before trusting it with tools?
+- **Tool-call reliability on your tasks:** valid tool names and JSON arguments per step, then whole-run
+  success, served through an engine that supports tool calling for that model family.
+- **Constrain what you can:** structured-output constraints on tool arguments, a small tool set per
+  role, and a step cap, because open models usually trail the frontier on long tool use.
+- **Replace the implicit safety layer:** input, output and tool-result injection checks, plus a
+  red-team eval, since the API provider's moderation is gone.
+
 ### You migrated a workload from a proprietary API to an open-weight model and jailbreak success rose. What happened?
 - **The API's safety tuning, moderation layers and policy checks were implicit,** and they did not come
   with the weights.
@@ -326,7 +399,8 @@ gateway so the decision stays reversible.
   model card; a popular fine-tune may carry behaviour nobody audited.
 
 ### When does proprietary win even for a company that wants vendor independence?
-- **When frontier capability is needed now** and the open-weight gap on your own eval is material.
+- **When frontier capability is needed now** and the open-weight gap on your own eval is material, as it
+  often is for an agent's planner.
 - **When volume is low or spiky and the team is small,** because self-hosted GPUs at a small fraction of
   capacity cost more per task than the API.
 - **Contain the dependency instead:** pin versions, keep a deprecation calendar, and put the model

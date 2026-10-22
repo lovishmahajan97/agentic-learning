@@ -5,7 +5,8 @@ name: Frameworks (LangGraph, LangChain, LlamaIndex, Pydantic AI, DSPy)
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -23,10 +24,23 @@ sources:
 ---
 
 ## TL;DR
-Agent frameworks package the plumbing. LangChain integrates, LangGraph runs typed resumable state
-machines, LlamaIndex handles data and retrieval, Pydantic AI is small and type-first, DSPy compiles
-prompts against a metric. Each trades speed for abstraction you must understand, so choose by your
-plumbing problem.
+Agent frameworks package your agent's plumbing: LangChain integrates, LangGraph runs resumable state
+machines, LangSmith traces and evaluates, LlamaIndex retrieves, Pydantic AI types, DSPy compiles prompts.
+Pick the thinnest layer that solves your agent's hard part.
+
+## For agent builders
+- **Why it matters for agents.** Almost every agent job posting and codebase names a stack: LangChain
+  and LangGraph for orchestration, LangSmith for tracing and evals, LlamaIndex for retrieval, plus a
+  vendor agent SDK. You need to know which layer each one owns, so you adopt one deliberately.
+- **Where it shows up in your stack.** Orchestration (LangGraph, Pydantic AI, vendor SDKs such as the
+  OpenAI Agents SDK, Claude Agent SDK and Google ADK), retrieval (LlamaIndex, LangChain retrievers),
+  tracing and evals (LangSmith, Langfuse, Logfire), durable execution (checkpointers, Temporal), and
+  tool protocols (MCP).
+- **What you control.** Which layer you take from a framework and which you keep in your own code:
+  tools, state types and evals should stay framework-neutral, so a framework swap touches one module.
+- **What you can skip.** Memorising every class name. Each framework gets its own deep-dive lesson in
+  the Agent frameworks & tooling module (LangChain, LangGraph, LangSmith, LlamaIndex, OpenAI Agents SDK,
+  Claude Agent SDK, Pydantic AI, CrewAI, AutoGen, ADK, DSPy, Mastra); this lesson is the map.
 
 ## Why it exists
 - **A production agent is mostly not model calls.** It is the loop, tool schemas and dispatch, argument
@@ -126,6 +140,31 @@ Answering those three tells you most of what a framework will be like to debug.
   you re-optimize when the model changes.
 - **Sharp edges:** you need a metric and labelled examples before you get value, optimization costs model
   calls, and the resulting prompts are less legible than hand-written ones.
+
+### LangSmith and the tracing layer
+- **LangSmith is not a framework,** it is LangChain's hosted platform for tracing agent runs, building
+  datasets, running evaluators and managing prompts. It works with LangChain and LangGraph out of the
+  box and with plain code through its SDK's `traceable` decorator.
+- **Why agents need it:** a 15-step run fails at step 11, and only a trace of every model call, tool
+  call, input and output shows why. The same traces become eval datasets.
+- **Alternatives:** Langfuse (open source, self-hostable), Pydantic Logfire and Arize Phoenix, most built
+  on or exporting OpenTelemetry. Choosing one is separate from choosing an orchestration framework.
+
+### The wider agent stack
+| Layer | Common choices | What it owns in your agent |
+|---|---|---|
+| Orchestration | LangGraph, Pydantic AI, LlamaIndex Workflows, hand-rolled loop | control flow, state, interrupts |
+| Vendor agent SDKs | OpenAI Agents SDK, Claude Agent SDK, Google ADK | the loop, tools and handoffs for one provider's models |
+| Multi-agent libraries | CrewAI, AutoGen / AG2, LangGraph subgraphs | roles, delegation, agent-to-agent messages |
+| Integrations | LangChain, LiteLLM-style gateways | provider and vector-store adapters |
+| Retrieval | LlamaIndex, LangChain retrievers, a vector database | ingestion, chunking, search |
+| Tools | MCP servers, typed function tools | what the agent can touch |
+| Tracing and evals | LangSmith, Langfuse, Logfire, Phoenix | traces, datasets, scores |
+| Durability | LangGraph checkpointers, Temporal | resume after crash or a human pause |
+| Prompt optimization | DSPy | compiled prompts against a metric |
+
+The rows combine freely: a typical production agent is one orchestrator, one tracing tool, a vector
+store and MCP or typed tools, with the rest hand-written.
 
 ### Comparing them
 | Your plumbing problem | Fit |
@@ -280,7 +319,24 @@ print(run_agent(fake_model, {"account_plan": lambda account_id: {"42": "enterpri
 # billing, priority 2 (plan: enterprise)
 ```
 
+### Worked scenario: choosing a stack for a refund agent
+A support team builds an agent that reads 2,000 policy pages, looks up orders, and issues refunds over
+$100 only after a human approves.
+
+| Need | Layer chosen | Why not more |
+|---|---|---|
+| Policy lookup | LlamaIndex retriever exposed as a tool | the agent layer stays thin |
+| Pause for approval, resume next day | LangGraph with a Postgres checkpointer | needs persisted state |
+| Typed refund arguments | Pydantic models on the tool | no extra framework needed |
+| See why step 7 chose the wrong order | LangSmith or Langfuse tracing | one tracing tool, not two |
+| Prompt optimization | none yet | no metric or labelled set exists |
+
+Four layers, each answering a named need; DSPy waits until there are labels.
+
 ## Production patterns
+- **Trace every agent run from day one.** Before the first user. Wire LangSmith, Langfuse or Logfire so
+  every model call, tool call and checkpoint is one trace per run, and tag traces with a run or thread id.
+  Monitor steps per run, tool error rate and cost per run, and turn failed traces into eval cases.
 - **Durable LangGraph checkpointer.** Whenever a graph uses interrupts or must survive redeploys. Use the
   Postgres checkpointer (`PostgresSaver` from the `langgraph-checkpoint-postgres` package), keep
   `InMemorySaver` for tests, and pass a stable `thread_id` per run. Monitor resume success after
@@ -406,6 +462,13 @@ may fit.
 - **Control flow:** if drafts need approval and resume, LangGraph with a durable checkpointer, or Pydantic
   AI with typed outputs if the flow is simple; expose the retrievers as tools.
 - **Keep evals framework-neutral** so either layer can be swapped later.
+
+### Where do LangChain, LangGraph and LangSmith each fit in an agent you ship?
+- **LangChain** is the integration layer: model, embedding and vector-store adapters you call from
+  nodes or tools.
+- **LangGraph** owns control flow: the state graph, checkpointer, interrupts and resume.
+- **LangSmith** owns visibility: traces of every run, datasets built from them and evaluators that score
+  new versions. It works without the other two, and Langfuse or Logfire can replace it.
 
 ## Quiz
 ### Q: Which framework's core abstraction is a typed shared state updated by nodes in a graph, persisted by checkpointers?

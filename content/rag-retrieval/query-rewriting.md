@@ -5,7 +5,8 @@ name: Query rewriting
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/query-decomposition
   - rag-retrieval/hyde
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Query rewriting puts a small LLM step between the user and the retriever that turns raw, conversational
-input into retrieval-friendly queries, because fixing the key at query time is far cheaper than
-re-indexing the corpus for every way a human might ask.
+Query rewriting turns raw conversational input into retrieval-friendly search strings. In a tool-calling
+agent the model already does it when it writes the search tool's `query` argument; your job is to steer
+that rewrite and guard it.
+
+## For agent builders
+- **Why it matters for agents.** Every search tool call is a rewrite: the agent condenses the
+  conversation into a query string. Bad queries (dropped references, "fixed" error codes, invented
+  entities) are the most common reason an agent's retrieval step fails.
+- **Where it shows up in your stack.** The tool's `description` and parameter descriptions (your rewriter
+  prompt), LangChain's `create_history_aware_retriever` and `MultiQueryRetriever` in pipeline-style RAG,
+  LlamaIndex query transforms, and the traces (LangSmith or similar) where you read the queries agents wrote.
+- **What you control.** What the tool description asks the query to look like, which filters the agent may
+  set, server-side guards on literals and filters, and whether the original user text is also searched.
+- **What you can skip.** Training a rewriter with downstream feedback (Ma et al.). Prompted rewriting plus
+  a guard and an eval covers almost every agent.
 
 ## Why it exists
 - **Retrievers assume the query looks like the passage.** BM25 needs shared terms; dense retrieval needs
@@ -86,9 +99,24 @@ re-indexing the corpus for every way a human might ask.
 - **Treat the input as untrusted.** The rewriter is an LLM reading user text; a query containing
   instructions can hijack it, so constrain the output format and validate it.
 
+### In a tool-calling agent, the model is the rewriter
+| Concern | Pipeline RAG | Tool-calling agent |
+|---|---|---|
+| Who rewrites | a separate small rewriter call before retrieval | the agent model, when it writes the `query` argument |
+| Extra latency | one sequential call per turn | none: the query comes out of the call that decided to search |
+| "Needs retrieval?" | a `needs_retrieval` flag | the agent simply does not call the tool |
+| Where you steer it | the rewriter prompt | the tool and parameter descriptions |
+| What still needs code | validation, literal guard, fusion | the same: guard and fuse inside the tool |
+
+- **Condensing comes free, drift does not.** The agent sees the whole conversation, so "and on Android?"
+  usually becomes a standalone query. But it can still drop a literal, invent a product or over-specify.
+- **Keep a dedicated rewriter only for specific forms.** Multi-query expansion, step-back or keyword
+  extraction from a huge paste can run inside the tool, where they cost no extra agent step.
+
 ## Diagram
-Trace one follow-up turn: the rewriter decides whether to retrieve at all, both the original and the
-rewrites are searched, and the generator still answers the user's own words.
+Trace one follow-up turn: the rewriter (a pipeline step, or the agent writing its tool call) decides
+whether to retrieve at all, both the original and the rewrites are searched, and the answer still
+addresses the user's own words.
 
 ```mermaid
 flowchart TD
@@ -190,7 +218,44 @@ Illustrative review of a support bot's 40 worst retrievals, grouped by cause:
 | 200-line stack trace with `ERR_4012` | boilerplate matches | keyword extraction | the error-code reference page |
 | "why did key K-7 get 429?" | incident threads only | step-back | rate-limit rules plus the original's hits |
 
+### Agent scenario: steer the agent's query, then guard it in the tool
+The tool description is the rewriter prompt; the tool body re-adds the raw user text when the agent's
+query lost a literal. `retrieve(query, k, filters)` is a stub; `rrf` is the function above.
+
+```python
+import re
+
+SEARCH_TOOL = {
+    "name": "search_docs",
+    "description": ("Search the product documentation. Write `query` as a standalone search string: "
+                    "resolve references to earlier turns, use the docs' terms (plan, seat, workspace), "
+                    "and copy error codes, version strings and quoted text exactly as the user wrote them."),
+    "input_schema": {"type": "object",
+                     "properties": {"query": {"type": "string"},
+                                    "product": {"type": "string", "enum": ["web", "ios", "android"]}},
+                     "required": ["query"]},
+}
+
+LITERAL = re.compile(r'"[^"]+"|\b[A-Z]+_\d+\b|\b\d+(?:\.\d+)+\b')   # quotes, ERR_4012, 2.3.1
+ALLOWED_PRODUCTS = {"web", "ios", "android"}                         # never trust the enum alone
+
+def run_search_docs(tool_input, user_message, k=8):
+    q = str(tool_input.get("query", ""))[:300]                       # validate type and length
+    lost = [m for m in LITERAL.findall(user_message) if m not in q]
+    queries, weights = [q], [1.0]
+    if lost:                                                          # literal guard: search raw text too
+        queries.append(user_message); weights.append(1.0)
+    product = tool_input.get("product")
+    filters = {"product": product} if product in ALLOWED_PRODUCTS else {}
+    return rrf([retrieve(x, 20, filters) for x in queries], weights)[:k], {"query": q, "lost": lost}
+# Log the second return value on the tool span: it is how you audit the agent's rewrites later.
+```
+
 ## Production patterns
+- **Steer the agent's rewrite through the tool description.** In an agent, put the rewriting rules
+  (standalone, docs vocabulary, copy literals) in the search tool's description, and read a weekly sample
+  of agent-written queries from traces next to the user turns. Monitor recall@k on follow-up turns
+  measured from the agent's actual queries.
 - **Retrieve only what each turn needs, and hide the latency.** Have the rewriter return `standalone` and
   `needs_retrieval` flags; skip retrieval entirely for small talk, and start the original query's
   retrieval in parallel with the rewrite call so only the rewrites' retrieval waits on the LLM. Monitor the
@@ -201,11 +266,12 @@ Illustrative review of a support bot's 40 worst retrievals, grouped by cause:
 - **Cache keyed on history plus query.** Hash the truncated recent history and the message (as in
   `rewrite` above) and store the plan in an in-process or shared cache with a TTL. Monitor hit rate; a drop
   after a prompt change is expected, a drop otherwise means history formatting changed.
-- **Version and log rewrites.** Store prompt version, original, rewrites and fused ids per request, so a
-  bad answer can be traced to the rewrite or the index. Review a weekly sample of rewrites that
-  introduced entities absent from the history.
+- **Version and log rewrites.** Store prompt or tool-description version, original, rewrites and fused ids
+  per request (as attributes on the tool span in an agent trace), so a bad answer can be traced to the
+  rewrite or the index. Review a weekly sample of rewrites that introduced entities absent from the history.
 - **Gate prompt changes on a multi-turn golden set.** Compare recall@k with and without the rewriter, and
-  across prompt versions, before shipping. Monitor recall@k on follow-up turns separately from first turns.
+  across prompt and tool-description versions, before shipping. Monitor recall@k on follow-up turns
+  separately from first turns.
 
 ## Trade-offs
 - **Better retrieval vs an extra sequential call.** Adds latency and cost per request; worth it for
@@ -217,6 +283,9 @@ Illustrative review of a support bot's 40 worst retrievals, grouped by cause:
 - **One standalone question vs nuance.** Condensing loses detail from long conversations, such as a
   constraint the user corrected earlier; including the last few turns verbatim in the rewriter prompt
   limits this.
+- **Agent-written queries vs a dedicated rewriter.** Letting the agent write the query costs no extra
+  call and uses the full conversation, but you steer it only through descriptions; a dedicated rewriter
+  inside the tool is more controllable and testable, at one more model call per search.
 
 ## Pitfalls
 - **The rewriter invents specifics.** "the API" becomes a named third-party API; the symptom is fluent
@@ -233,10 +302,13 @@ Illustrative review of a support bot's 40 worst retrievals, grouped by cause:
   the symptom is a launch with no metric that moved.
 - **Letting user text steer the rewriter.** The symptom is rewrites containing instructions or filters the
   user should not be able to set, a prompt-injection path into the retrieval layer.
+- **Stacking a pipeline rewriter in front of an agent's tool.** The agent already condensed the query, so
+  the symptom is two rewrites in series, extra latency and compounding drift. Rewrite once: either the
+  agent or the tool, not both for the same form.
 
 ## When to use
 - **Use condensing** the moment the interface is conversational; without it, follow-up questions retrieve
-  garbage.
+  garbage. In an agent, the tool description that asks for standalone queries is the condensing step.
 - **Add normalisation and keyword extraction** when failure analysis shows vocabulary mismatch or long
   pasted inputs; add multi-query or step-back expansion when recall@k is the measured bottleneck and
   retrieval is cheap.
@@ -300,11 +372,21 @@ and after.
 - **Keep equal weight** when the turn is standalone, because then the original is a good query in its own
   right.
 
-### How do you keep the rewriter from becoming a prompt-injection path?
-- **Treat user text as untrusted:** constrain the output to a JSON schema and validate types and lengths
-  before use.
-- **Never let it set access-control filters** freely; allow-list the filter fields and values it may emit.
-- **Monitor:** sample rewrites containing instructions or filters absent from the conversation.
+### How do you keep the rewriter, or an agent's search arguments, from becoming a prompt-injection path?
+- **Treat user text as untrusted:** constrain the output (or the tool's input schema) to JSON and validate
+  types and lengths in code before use.
+- **Never let it set access-control filters** freely; allow-list the filter fields and values it may emit,
+  and take tenant or user scope from the session, never from model-written arguments.
+- **Monitor:** sample rewrites and tool calls containing instructions or filters absent from the
+  conversation.
+
+### Your agent already sees the whole conversation. Do you still need a query rewriter?
+- **Usually not as a separate call:** the agent condenses when it writes the tool's `query` argument, so a
+  pipeline rewriter in front adds latency and a second chance to drift.
+- **You still need the rest of the pattern:** a tool description that asks for standalone queries in the
+  docs vocabulary, a literal guard in the tool, and fusion with the raw user text when literals were lost.
+- **Keep a dedicated step for specific forms** such as multi-query or step-back expansion, run inside the
+  tool, and justify it with recall@k on the agent's logged queries.
 
 ## Quiz
 ### Q: Why should the original user query still be retrieved for after rewriting?

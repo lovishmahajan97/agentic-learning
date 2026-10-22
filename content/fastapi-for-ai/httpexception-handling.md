@@ -5,7 +5,8 @@ name: HTTPException handling
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/middleware-ordering
   - fastapi-for-ai/pydantic-request-response-models
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-`raise HTTPException(status_code, detail)` aborts a request from anywhere in the call stack and becomes
-an error response. Do it well: map domain and LLM failures to meaningful codes, one error shape, no
-leaked internals, and check everything before a stream starts.
+`raise HTTPException(status_code, detail)` aborts a request from anywhere and becomes an error response.
+For agent APIs and tool servers: map LLM and tool failures to meaningful codes, one error shape, no
+leaked internals, checks before streams start, tool errors as observations.
+
+## For agent builders
+- **Why it matters for agents.** Agents are API clients that read errors. A tool server that answers
+  with a clear status, a `retryable` flag and a short fix lets the model or the executor recover; a bare
+  500 or leaked stack trace gives it nothing, or worse, puts internals into the transcript.
+- **Where it shows up in your stack.** Exception handlers on your agent API (`POST /runs`), on tool
+  servers your agent calls over HTTP, the provider-error wrapper around your LLM client, and the in-band
+  error events of a streamed run.
+- **What you control.** The mapping table (provider 429 to 503, timeout to 504), the envelope and its
+  `retryable` field, which errors end the run and which become tool results, and what reaches the model.
+- **What you can skip.** Starlette's internal middleware details beyond one rule: raising from your own
+  middleware gives a 500, so middleware returns responses.
 
 ## Why it exists
 - **AI endpoints fail in many distinct ways.** Invalid input, an unauthorised or over-quota caller, a
@@ -105,9 +118,25 @@ Starlette builds the stack outside in: `ServerErrorMiddleware` (outermost), then
   returning the response.
 - **After that, emit failures as an in-band error event** the client knows how to render.
 
+### Inside the agent loop versus at its edge
+An agent run has two error boundaries, and each needs a different treatment:
+
+| Failure | Inside the loop (executor) | At the run's edge (HTTP) |
+|---|---|---|
+| Tool returns 404, 422 or a domain error | append an error tool result; the model can fix arguments or try another tool | nothing: the run continues |
+| Tool returns 503 with `Retry-After` | executor retries once within the run budget, then an error result | nothing |
+| LLM provider 429 or timeout on a model step | retry within budget, else stop the run | 503 or 504 before streaming; an in-band error event after |
+| Bug in your own code | not shown to the model | logged 500 with `request_id` |
+
+- **Errors the model sees are prompt content.** Keep tool error messages short, actionable and free of
+  hostnames, SQL or stack traces, because they land in the transcript, the trace store and eval datasets.
+- **Tool servers should speak the same envelope.** Problem Details with a `code` and `retryable` lets one
+  executor handle every tool without per-tool parsing.
+
 ## Diagram
-Follow a raised exception outward: `ExceptionMiddleware` converts what it has handlers for, and anything
-that escapes it, or is raised in your own middleware, ends up as a 500 at `ServerErrorMiddleware`.
+Follow an exception raised in an agent API or tool server outward: `ExceptionMiddleware` converts what
+it has handlers for, and anything that escapes it, or is raised in your own middleware, ends up as a 500
+at `ServerErrorMiddleware`, which an agent executor can only treat as "tool unavailable".
 
 ```mermaid
 flowchart TD
@@ -223,6 +252,38 @@ async def generate(client: httpx.AsyncClient, payload: dict) -> dict:
 | read or connect timeout | `UpstreamTimeout` | 504 |
 | 400 (we sent a bad request) | unmapped `HTTPStatusError` | generic 500 with `request_id`, full detail in logs |
 
+### Agent executor turning tool-server errors into observations
+The tool servers return the Problem Details envelope above; the executor decides what the model sees.
+`http` is your shared `httpx.AsyncClient`.
+
+```python
+import asyncio, httpx
+
+async def call_tool(http: httpx.AsyncClient, url: str, args: dict, budget_left: float) -> dict:
+    for attempt in range(2):
+        try:
+            r = await http.post(url, json=args, timeout=min(10.0, budget_left))
+        except httpx.TimeoutException:
+            return {"error": "tool timed out", "retryable": True}
+        if r.status_code < 400:
+            return r.json()
+        p = r.json() if r.headers.get("content-type", "").endswith("json") else {}
+        retry_after = r.headers.get("retry-after", "")
+        if r.status_code == 503 and attempt == 0 and retry_after.isdigit() \
+                and int(retry_after) < budget_left / 2:
+            await asyncio.sleep(int(retry_after)); continue    # one retry inside the run budget
+        if 400 <= r.status_code < 500:                          # model can fix its arguments
+            return {"error": p.get("detail", "invalid request"), "code": p.get("code", "invalid")}
+        return {"error": "tool unavailable", "retryable": True}  # 5xx: no internals to the model
+    return {"error": "tool busy", "retryable": True}
+```
+
+| Tool server answers | Model sees | Run outcome |
+|---|---|---|
+| 422 `{"code": "invalid_date", "detail": "date must be YYYY-MM-DD"}` | that exact fix | model re-calls with `2026-10-22` |
+| 503 with `Retry-After: 2`, 20 s budget left | the result after one retry | continues |
+| 500 with a stack trace in the body | `tool unavailable` | model answers without that tool |
+
 ### What the defaults and the middleware trap look like (runnable with TestClient)
 Requires `fastapi` and `httpx`. Shows routing errors sharing the envelope, middleware that raises versus
 returns, and the default 422 echoing input.
@@ -281,9 +342,11 @@ print(c.get("/v1/docs/abc").json()["detail"][0]["input"])                  # abc
   unknown route, a wrong method, an invalid body and a forced exception all return
   `application/problem+json` with a `request_id`. Monitor nothing at runtime; the test fails the build
   when someone adds a handler that bypasses the envelope.
-- **Errors documented in OpenAPI** — for public APIs. Declare error bodies on routes with FastAPI's
-  `responses=` parameter (for example `responses={503: {"model": Problem}}` with a Pydantic `Problem`
-  model), so generated SDKs know the shape and which codes are retryable.
+- **Model-readable tool errors, documented in OpenAPI** — for every tool server agents call. Return
+  Problem Details with a stable `code`, a `retryable` flag and a one-line fix in `detail`, and declare it
+  with FastAPI's `responses=` parameter (for example `responses={503: {"model": Problem}}` with a
+  Pydantic `Problem` model) so SDKs and tool wrappers know the shape. Monitor tool errors by `code` and
+  how often the run recovers after one.
 
 ## Trade-offs
 - **Central mapping vs indirection.** A central mapping keeps the contract consistent and the domain
@@ -295,6 +358,9 @@ print(c.get("/v1/docs/abc").json()["detail"][0]["input"])                  # abc
 - **Refusal as 200 vs as an error.** Treating safety refusals as 200 with a refusal field keeps "the
   system worked" separate from "the system failed", but naive clients may show refusals as answers. Use
   an error code if your consumers are automated and must branch.
+- **Show the model the error vs hide it.** Passing a tool's 4xx detail to the model lets it fix its own
+  arguments, but every word becomes prompt content and can carry injected text from a third-party
+  service. Pass details from your own tool servers; summarise or genericise errors from external ones.
 - **Standard vs compatible envelope.** Standard Problem Details helps third-party clients and tooling. A
   custom envelope may match an existing SDK or provider-compatible API, and compatibility wins when you
   mimic another provider's API.
@@ -311,6 +377,9 @@ print(c.get("/v1/docs/abc").json()["detail"][0]["input"])                  # abc
 - **Returning Pydantic's raw validation errors on a prompt endpoint.** Pydantic v2 errors carry the
   offending `input`, so the symptom is 422 bodies that echo a 100k-token prompt (or a pasted secret)
   back to the client and into any logging proxy. Keep `loc`, `msg` and `type`, drop or truncate `input`.
+- **Letting a tool error abort the whole agent run.** Symptom: one tool's 404 turns into a 500 for the
+  user's request, though the model could have recovered. Fix: convert tool errors to tool results in the
+  executor; only budget, provider or internal failures end the run.
 - **Mapping every upstream failure to 500.** Symptom: client SDKs that never retry transient provider
   outages, or retry permanent errors forever, because the codes carry no meaning.
 
@@ -321,6 +390,8 @@ print(c.get("/v1/docs/abc").json()["detail"][0]["input"])                  # abc
 - **Raise `HTTPException` directly** in thin, HTTP-specific code (auth dependencies, routers). Raise
   domain errors from services.
 - **For AI endpoints**, write the upstream mapping table deliberately and document which codes are retryable.
+- **For agents**, decide per failure whether it ends the run (HTTP status or in-band event) or becomes a
+  tool result the model sees, and give tool servers the same envelope.
 - **Measure** error rates by code and by route, and alert on 5xx separately from 4xx, since a 4xx spike
   means a client problem and a 5xx spike means yours.
 - **Interviews:** explain the difference between 502, 503 and 504, and the streamed-response limitation.
@@ -375,7 +446,15 @@ HTTP status, so dashboards reflect mid-stream failures.
 - **The risk** is naive clients rendering the refusal as if it were the answer.
 - **Use a specific, documented error code** when consumers are automated pipelines that must branch.
 
-### Your 5xx rate doubles but the 4xx rate is flat. What do you look at first?
+### A tool your agent calls fails. When should that end the run, and when should the model see it?
+- **The model sees it** when it can act: a 4xx with a clear fix (bad argument, not found), or a
+  retryable 503 after the executor's one retry, so it can change arguments, pick another tool or answer.
+- **The run ends** on failures the model cannot fix: exhausted run budget, LLM provider down, or a bug in
+  your own code, mapped to 503, 504 or a logged 500 (or an in-band error event once streaming).
+- **Never show internals**: tool 5xx bodies are replaced with a generic message before entering the
+  transcript.
+
+### Your agent API's 5xx rate doubles but the 4xx rate is flat. What do you look at first?
 - **Split 5xx by envelope `code` and route**: a jump in `model_busy` or `model_timeout` points at the
   provider, while a jump in `internal` points at your own code.
 - **Pull traces by `request_id`** from a sample of failing responses to see the original exception.

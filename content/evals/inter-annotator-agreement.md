@@ -5,7 +5,8 @@ name: Inter-annotator agreement
 kind: metric
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - evals/golden-dataset
   - evals/rubrics
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Inter-annotator agreement (IAA) measures how consistently independent humans label the same items.
-Labels are the ground truth every eval and judge is scored against, so their noise is in every score.
-Use chance-corrected κ or α, not raw agreement.
+Inter-annotator agreement (IAA) measures how consistently independent humans label the same agent
+traces. Those labels score your agent evals and its judges, so their noise is in every score. Use
+chance-corrected κ or α, not raw agreement.
+
+## For agent builders
+- **Why it matters for agents.** Before a judge may gate an agent release, you need human labels on
+  traces and proof they are consistent. Criteria such as "should it have asked a clarifying question?"
+  split reviewers far more than "was the ticket resolved?", and IAA shows which.
+- **Where it shows up in your stack.** Annotation queues where reviewers label agent traces (in eval
+  tools such as LangSmith or Braintrust, or a labeling tool), the export script that computes κ per
+  criterion, and the judge calibration report that puts judge–human κ next to human–human κ.
+- **What you control.** The overlap share of traces labeled twice, hiding the first label from the
+  second reviewer, per-criterion guidelines with examples, and the agreement bar a criterion must clear
+  before it can gate.
+- **What you can skip.** Deriving the statistics. Know which one to pick (Cohen's κ for two reviewers,
+  Krippendorff's α for partial overlap) and that raw agreement lies when most runs pass.
 
 ## Why it exists
 - **One labeler cannot separate model error from label error.** A golden set of 500 support answers is
@@ -52,6 +66,17 @@ Use chance-corrected κ or α, not raw agreement.
   as that annotator is right, which is higher than two error-prone annotators agree with each other, so a
   strong judge can land slightly above it.
 - **What the labels cannot do** is *demonstrate* that a judge is better than the people who wrote them.
+
+### What is different about labeling agent traces
+- **Outcome criteria agree well; judgment-call criteria do not.** "Order cancelled?" is visible in the
+  tool results; "was the clarifying question necessary?" or "was the plan reasonable?" depends on how
+  each reviewer would have solved the task.
+- **Reviewers must see the same slice.** One reviewer reading only the final reply and another reading
+  the full trajectory are labeling different things; show tool calls and results to both.
+- **Long traces cause fatigue disagreement.** Agreement on a 40-step trace tends to be lower than on a
+  5-step one (practitioner experience), so segment κ by trace length.
+- **Agent pass rates are skewed.** Most production runs succeed, so raw agreement is high by default and
+  the kappa paradox below is the normal case, not the exception.
 
 ### Choosing the statistic
 | Situation | Statistic | Why |
@@ -125,12 +150,13 @@ Use chance-corrected κ or α, not raw agreement.
    at the human level is another annotator, not a better one.
 
 ## Diagram
-The labeling loop: agreement is measured per criterion before labels can gate anything, low agreement
-sends you back to the guideline, and the same statistic later scores the judge.
+The labeling loop for agent traces: agreement is measured per criterion before labels can gate
+anything, low agreement sends you back to the guideline, and the same statistic later scores the judge
+that grades the agent.
 
 ```mermaid
 flowchart TD
-    G["Guideline and anchors"] --> P["Pilot: 30-50 items, 2-3 annotators"]
+    G["Guideline and anchors"] --> P["Pilot: 30-50 traces, 2-3 annotators"]
     P --> K["Per-criterion kappa or alpha plus CI"]
     K --> Q{"Agreement high enough for this use?"}
     Q -->|"no"| R["Read disagreements, rewrite anchors"]
@@ -230,12 +256,32 @@ Same label mix as pilot 1 (50/30/12/8 per 100), different sizes; 95% bootstrap i
 - **This is why κ = 0.7 on 30 items, then 0.45 on the next batch,** is not evidence the process changed:
   both are inside the 30-item interval.
 
+### Agent scenario: which trace criteria can gate a release?
+Two reviewers independently label 120 support-agent traces (full trajectory shown) on three pass/fail
+criteria. Counts are illustrative; κ is computed with `cohen_kappa` above.
+
+| Criterion | Both pass | Both fail | Only A passes | Only B passes | p_o | p_e | κ |
+|---|---|---|---|---|---|---|---|
+| Task resolved (visible in tool results) | 70 | 38 | 7 | 5 | 0.90 | 0.535 | 0.78 |
+| Reply grounded in tool results | 80 | 18 | 12 | 10 | 0.817 | 0.633 | 0.50 |
+| Asked a clarifying question when needed | 88 | 6 | 14 | 12 | 0.783 | 0.733 | 0.19 |
+
+- **"Task resolved" can gate,** and a judge for it can be calibrated against these labels.
+- **"Clarifying question" cannot yet:** 78% raw agreement looks fine, but κ = 0.19 is near chance, and
+  the two reviewers agreed on only 6 of the 32 runs either of them failed. Rewrite the guideline with
+  examples of ambiguous versus clear requests, then re-pilot.
+- **A judge scored on that criterion today** would be measured against labels that are mostly one
+  reviewer's opinion, so its "agreement" would mean little.
+
 ## Production patterns
 - **Agreement in the labeling export.** Compute per-criterion, per-pair κ on every export, for example
   `sklearn.metrics.cohen_kappa_score(a, b, weights="quadratic")` for ordinal labels, and α for partial
   overlap. Monitor the lowest criterion, not the average.
-- **Standing overlap sample.** Route a fixed fraction of production items to a second annotator without
-  showing the first label. Monitor overlap κ per week and per annotator pair; a drop means drifting
+- **Same trace view for every reviewer.** Render tool calls, results and the reply identically in the
+  annotation queue, and log which view each label came from. Monitor κ by trace length bucket, since
+  long trajectories are where reviewers drift apart.
+- **Standing overlap sample.** Route a fixed fraction of production agent traces to a second annotator
+  without showing the first label. Monitor overlap κ per week and per annotator pair; a drop means drifting
   guidelines or a new annotator who needs calibration.
 - **Adjudication queue with a contested flag.** Send disagreements to a third rater or a review
   discussion, store the final label plus `contested=true`, and report model scores with and without
@@ -243,8 +289,9 @@ Same label mix as pilot 1 (50/30/12/8 per 100), different sizes; 95% bootstrap i
 - **Agreement gate on golden sets.** A golden set may gate releases only after its per-criterion κ, with
   interval, clears the threshold the team set for that use. Monitor that new items added to the set go
   through the same overlap.
-- **Same code for judges.** Score the LLM judge against the adjudicated label with the exact function
-  used for humans, and publish judge–human κ next to human–human κ. Monitor both on every judge or
+- **Same code for the agent's judges.** Score the LLM judge that grades agent traces against the
+  adjudicated label with the exact function used for humans, and publish judge–human κ next to
+  human–human κ. Monitor both on every judge or
   prompt change.
 
 ## Trade-offs
@@ -273,11 +320,15 @@ Same label mix as pilot 1 (50/30/12/8 per 100), different sizes; 95% bootstrap i
 - **Comparing an LLM judge with labels from a single annotator.** Symptom: a judge that "beats humans",
   which often means it matches one person's habits and is unverified against everyone else. Fix: score
   it against an adjudicated or majority label from two or more annotators.
+- **Reviewers seeing different slices of an agent trace.** Symptom: low agreement on "action
+  completed" because one reviewer trusted the final reply and the other read the failed tool result.
+  Fix: one rendered trajectory view for everyone.
 - **Small pilots without intervals.** Symptom: κ = 0.7 on 30 items followed by 0.45 on the next batch
   with no change in process. Fix: bootstrap intervals and a larger pilot.
 
 ## When to use
-- **Measure at the start of every labeling effort,** continuously on an overlap sample during production
+- **Measure before any agent-trace criterion gates a release,** at the start of every labeling effort,
+  continuously on an overlap sample during production
   labeling, and whenever you evaluate an LLM judge against humans.
 - **Compute per criterion and per annotator pair** with bootstrap intervals; a single global number hides
   the one criterion that is broken.
@@ -326,6 +377,13 @@ measured at all.
 - **Rewrite anchors and re-pilot on 30–50 items,** keeping a confidence interval so you know whether the
   new number is actually better.
 
+### Reviewers agree 78% on whether your agent should have asked a clarifying question, yet κ is 0.19. What do you do?
+- **Read κ, not the 78%:** most runs pass, so chance agreement is already about 73%, and the reviewers
+  agree on very few of the runs either of them failed.
+- **Do not gate or calibrate a judge on it yet;** the labels are mostly one reviewer's opinion.
+- **Fix the guideline:** add examples of ambiguous versus clear requests, make sure both reviewers see
+  the same trajectory view, re-pilot on 30–50 traces and re-measure with an interval.
+
 ### Which statistic would you pick for five annotators who each labeled a different subset on a 1–5 scale?
 - **Krippendorff's alpha,** because it tolerates any number of raters and missing ratings.
 - **With an ordinal or interval distance,** so a 4-vs-5 disagreement costs less than 1-vs-5.
@@ -339,12 +397,13 @@ measured at all.
   tightening guidelines until the hard cases disappear.
 - **Not for release gates,** where label noise of 20% swamps a 3-point model difference.
 
-### How much double-labeling would you budget for a 10,000-item labeling project?
+### How much double-labeling would you budget for labeling 10,000 production agent traces?
 - **Pilot first:** 30–50 items fully double- or triple-labeled until per-criterion agreement is stable.
 - **Then a monitoring overlap** of a small fixed fraction, chosen so the weekly overlap sample is large
   enough for a usable interval; around 100 items gives a κ interval roughly ±0.16 wide in the pilot-1
   example above.
-- **Raise the overlap temporarily** when guidelines change or new annotators join.
+- **Raise the overlap temporarily** when guidelines change, new annotators join, or the agent gains a
+  new tool whose traces reviewers have not labeled before.
 
 ## Quiz
 ### Q: Two annotators agree on 92% of items, yet Cohen's kappa is 0.29. What is the most likely explanation?

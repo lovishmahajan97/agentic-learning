@@ -5,7 +5,8 @@ name: pydantic-settings
 kind: tool
 difficulty: core
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/pydantic
   - python-for-ai/python-dotenv
@@ -20,19 +21,30 @@ sources:
 ---
 
 ## TL;DR
-pydantic-settings is a Pydantic model filled from env vars, `.env` files and secret files. Declare
-config once with types, defaults and constraints; the app starts validated or refuses to start
-naming the bad field, turning 2 a.m. runtime failures into deploy-time crashes.
+pydantic-settings fills a typed Pydantic model from env vars, `.env` files and secret files. Declare an
+agent's model, step budget and tool keys once; it starts validated or refuses to, turning 2 a.m.
+mid-run failures into deploy-time crashes.
+
+## For agent builders
+- **Why it matters for agents.** An agent service has many knobs: model name, max steps, per-tool
+  timeouts, which tools are enabled, retrieval `top_k`, tracing on or off, several API keys. A typo in any
+  of them otherwise surfaces deep inside a run, after tokens and tool calls are already spent.
+- **Where it shows up in your stack.** The `Settings` class behind a FastAPI agent server, a LangGraph or
+  plain-Python worker, an eval runner and a background job queue; one class shared by all of them.
+- **What you control.** The prefix, the source order (env vs secret files), nested groups per tool,
+  constraints such as `Field(gt=0)`, and `SecretStr` so a logged config or trace never shows a key.
+- **What you can skip.** Writing custom sources unless you read from a vault; the five built-in sources
+  cover almost every deployment.
 
 ## Why it exists
 - **Everything is a string.** With `os.environ.get` scattered through the code, `TIMEOUT="30"` must be
-  converted at each call site, and `"false"` is truthy.
+  converted at each call site, and `"false"` is truthy, so a disabled tool stays enabled.
 - **Nothing is checked up front.** A missing `VECTOR_DB_URL` or a typo in `RERANK_TOP_K` surfaces only
-  when the first request reaches that code path, possibly hours after deploy.
+  when the first agent run reaches the retrieval step, possibly hours after deploy.
 - **No single list of what the service needs.** A new environment is configured by trial and error.
 - **A hand-written `config.py` hits a wall.** It works until thirty fields, nested groups (retrieval,
-  model, tracing), lists of allowed models and secrets that must stay out of logs; then you are
-  reimplementing a validation library.
+  model, tracing, one per tool), lists of allowed models and secrets that must stay out of logs and
+  traces; then you are reimplementing a validation library.
 - **Pydantic already is one.** pydantic-settings reuses its coercion, constraints and error messages,
   aimed at the process environment. It was split out with Pydantic v2, so it is a separate install
   (`pip install pydantic-settings`).
@@ -47,13 +59,13 @@ Subclass `BaseSettings`, annotate fields as in any Pydantic model, and set behav
 | `env_prefix` | `APP_MODEL` fills `model`, avoiding collisions with other software's variables |
 | `env_file` | One path or a tuple, later files winning |
 | `case_sensitive` | Off by default |
-| `env_nested_delimiter` | Lets one env var set one field of a nested model |
+| `env_nested_delimiter` | Lets one env var set one field of a nested model, such as one tool's timeout |
 | `extra` | What to do with unknown keys from dotenv files |
 
 ### Where values come from, in priority order
 When you instantiate `Settings()`, each field is resolved from the highest-priority source that has it:
 
-1. Keyword arguments passed to the constructor (used by tests).
+1. Keyword arguments passed to the constructor (used by tests and eval variants).
 2. Environment variables.
 3. The dotenv file(s).
 4. Files in `secrets_dir`, one file per field, which is how Docker and Kubernetes secrets are mounted.
@@ -86,42 +98,45 @@ When you instantiate `Settings()`, each field is resolved from the highest-prior
 | `list`, `dict`, nested model | JSON string, e.g. `APP_ALLOWED_MODELS='["a","b"]'` | Parsed list |
 | Nested field with `env_nested_delimiter="__"` | `APP_RETRIEVAL__TOP_K=20` | Sets one field, rest keep defaults |
 
-- **Constraints apply.** `Field(gt=0)` and `Literal["dev","prod"]` are enforced exactly as for API input.
+- **Constraints apply.** `Field(gt=0)` and `Literal["dev","prod"]` are enforced exactly as for API input,
+  so `max_steps=0` or an unknown model name never reaches the loop.
 - **All errors at once.** A failure raises a single `ValidationError` listing every bad field, because one
   deploy should report all problems rather than one per restart.
 
 ### Secrets
 - **Type sensitive fields as `SecretStr`.** The value is masked in `repr`, `str` and default
-  serialization, so `print(settings)` or a crash log shows `**********`.
-- **Unwrap at the point of use** with `.get_secret_value()`.
+  serialization, so `print(settings)`, a crash log or a config dump attached to a trace shows
+  `**********`.
+- **Unwrap at the point of use** with `.get_secret_value()`, when constructing the model or tool client.
 - **No encryption.** It prevents the most common leak, which is logging a config object.
 
 ### Where it lives at runtime
 - **Construct once and share:** a cached `get_settings()` function, or an object built in the FastAPI
-  lifespan and injected as a dependency.
+  lifespan and injected as a dependency into the agent endpoint and tool factories.
 - **Payoff:** one validation at startup and an easy override in tests (construct a `Settings(...)` with
   explicit kwargs and `_env_file=None`).
 
 ## Diagram
 Each source returns a dict; they are merged key by key in priority order, then one validation pass either
-yields a typed object or fails startup with every bad field listed.
+yields a typed agent config or fails startup with every bad field listed.
 
 ```mermaid
 flowchart TD
-    I["Init kwargs (priority 1)"] --> M["Deep-merge dicts, higher priority wins per key"]
-    E["Environment variables (priority 2)"] --> M
-    D["Dotenv files (priority 3)"] --> M
-    S["secrets_dir files (priority 4)"] --> M
+    I["Init kwargs, priority 1"] --> M["Deep-merge, higher priority wins"]
+    E["Environment vars, priority 2"] --> M
+    D["Dotenv files, priority 3"] --> M
+    S["secrets_dir files, priority 4"] --> M
     M --> V["One Pydantic validation pass"]
-    F["Field defaults (priority 5)"] -->|"fill fields no source set"| V
-    V -->|"all fields valid"| OK["Typed Settings, built once and cached"]
-    V -->|"any field invalid"| ERR["One ValidationError listing every bad field"]
-    ERR --> X["Startup fails before serving traffic"]
+    F["Field defaults, priority 5"] -->|"fill unset fields"| V
+    V -->|"all valid"| OK["Typed agent Settings, cached"]
+    V -->|"any invalid"| ERR["One ValidationError, all fields"]
+    ERR --> X["Startup fails before any run"]
 ```
 
 ## Examples
-### Settings for a RAG service
-A settings class for a RAG service, and what happens with real environment values.
+### Settings for a tool-calling RAG agent
+One class holds the model, the loop budget, retrieval knobs and per-tool config. Every agent component
+reads from it.
 
 ```python
 from functools import lru_cache
@@ -133,15 +148,21 @@ class Retrieval(BaseModel):
     top_k: int = Field(8, ge=1, le=100)
     rerank: bool = True
 
+class SearchTool(BaseModel):
+    enabled: bool = True
+    timeout_s: float = Field(10.0, gt=0)
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="APP_", env_file=".env", env_nested_delimiter="__", extra="ignore")
     env: Literal["dev", "staging", "prod"] = "dev"
     openai_api_key: SecretStr                     # required: no default
     model: str = "gpt-4o-mini"
+    max_steps: int = Field(8, ge=1, le=50)        # agent loop budget
     request_timeout_s: float = Field(30.0, gt=0)
     allowed_models: list[str] = ["gpt-4o-mini"]
     retrieval: Retrieval = Retrieval()
+    search: SearchTool = SearchTool()
 
 @lru_cache
 def get_settings() -> Settings:
@@ -150,20 +171,32 @@ def get_settings() -> Settings:
 # Environment:
 #   APP_OPENAI_API_KEY=sk-live-...      APP_ENV=prod
 #   APP_RETRIEVAL__TOP_K=20             APP_ALLOWED_MODELS='["gpt-4o-mini","gpt-4o"]'
+#   APP_SEARCH__ENABLED=false
 s = get_settings()
 print(s.retrieval)          # top_k=20 rerank=True   (nested override, default kept)
+print(s.search.enabled)     # False                  (parsed bool, not the truthy string)
 print(s.openai_api_key)     # **********             (masked)
 client_key = s.openai_api_key.get_secret_value()
+tools = [t for t, on in {"search": s.search.enabled, "retrieve": True}.items() if on]
 
 # In a test, ignore the developer's .env (real env vars still apply, so
 # kwargs or monkeypatch.delenv must cover anything the shell might set):
-t = Settings(_env_file=None, openai_api_key="test", env="dev")
+t = Settings(_env_file=None, openai_api_key="test", env="dev", max_steps=2)
 ```
 
 - **Bad staging values fail loudly.** If staging sets `APP_REQUEST_TIMEOUT_S=thirty` and
   `APP_ENV=production`, startup fails with one `ValidationError` reporting two errors:
   `request_timeout_s` is not a valid number and `env` is not one of `'dev', 'staging', 'prod'`.
-- **Result.** The pod crash-loops visibly instead of serving traffic with a broken timeout.
+- **Result.** The pod crash-loops visibly instead of accepting agent runs with a broken timeout.
+
+### Worked scenario: what a config typo costs at runtime vs at startup
+An agent averages 6 steps per run; the search tool is first called on step 4. Someone sets
+`APP_SEARCH__TIMEOUT_S=ten`.
+
+| Approach | When it fails | Cost before the failure is visible |
+|---|---|---|
+| `float(os.environ[...])` inside the tool | Step 4 of every run | 3 model calls per run wasted, user sees an error |
+| Typed `Settings()` at startup | Deploy | Zero runs; the rollout stops and names the field |
 
 ### Making mounted secret files authoritative
 When a team rotates keys by updating mounted secret files, a leftover env var would silently shadow the
@@ -191,32 +224,38 @@ class Settings(BaseSettings):
 | Neither | Startup fails: required field | Startup fails: required field |
 
 ## Production patterns
-- **Validate config before traffic.** Run a step that only constructs `Settings()` (a CI job against the
-  target environment's variables, or the container's first startup line) so a bad value fails the
-  deploy. Monitor deploy failures and crash-loops that name a field, not request-time `KeyError`s.
+- **Validate config before agent traffic.** Run a step that only constructs `Settings()` (a CI job against
+  the target environment's variables, or the container's first startup line) so a bad value fails the
+  deploy. Monitor deploy failures and crash-loops that name a field, not mid-run `KeyError`s.
 - **One cached settings dependency.** Expose `get_settings()` with `@lru_cache` and inject it with FastAPI
   `Depends(get_settings)`. In tests set `app.dependency_overrides[get_settings]` to return
   `Settings(_env_file=None, ...)`, and call `get_settings.cache_clear()` when env changes.
+- **Eval variants as constructor kwargs.** An eval runner builds `Settings(model="...", max_steps=4)` per
+  variant instead of mutating env vars, so two configs can run in one process. Record the non-secret
+  settings with each eval result.
 - **Prefix everything, alias the fixed names.** Set `env_prefix="APP_"` so fields like `path` cannot pick
   up system variables, and use `validation_alias` only for names others own, such as `OPENAI_API_KEY`.
   Review new fields for collisions.
 - **Secrets as `SecretStr`, delivered by the platform.** Mount them via `secrets_dir` or inject env vars
   from a secrets manager; never put real values in `.env.example`. Log which settings are present at
-  startup, never their values, and grep logs for unmasked keys.
-- **Tolerate shared dotenv files.** Use `extra="ignore"` when the same `.env` feeds other tools, so their
-  keys do not fail validation. Keep a documented `.env.example` that mirrors the `Settings` fields.
+  startup, never their values, and grep logs and traces for unmasked keys.
+- **Tolerate shared dotenv files.** Use `extra="ignore"` when the same `.env` feeds other tools (a tracing
+  SDK, an MCP server), so their keys do not fail validation. Keep a documented `.env.example` that
+  mirrors the `Settings` fields.
 
 ## Trade-offs
 - **Fail fast vs convenience.** Startup validation turns silent misconfiguration into a crash, right for
-  services but annoying for scripts that need one value; there plain `os.environ` is simpler.
+  agent services but annoying for scripts that need one value; there plain `os.environ` is simpler.
 - **One typed object vs coercion surprises.** It documents every setting but couples config to Pydantic's
   coercion rules, so lax coercion (`"1"` to `True`) can surprise; strict mode trades convenience for
   exactness.
 - **JSON-in-env vs quoting pain.** Lists and nested models stay in variables, yet quoting JSON inside
-  shell, YAML and Helm templates is error-prone; past a few nested fields a mounted config file is
-  cleaner.
+  shell, YAML and Helm templates is error-prone; past a few nested fields (a dozen tools each with
+  options) a mounted config file is cleaner.
 - **Masking vs ceremony.** `SecretStr` masks accidental logging but adds `.get_secret_value()` noise, and
   it is no substitute for a secrets manager with rotation; it only governs how the value is printed.
+- **Startup-time config vs per-run config.** Settings fix values for the process lifetime; per-tenant or
+  per-request choices (which model this user gets) belong in request data, not in env vars.
 
 ## Pitfalls
 - **Instantiating `Settings()` at import time in a library module.** Symptom: tests fail to import
@@ -226,17 +265,20 @@ class Settings(BaseSettings):
 - **Leaving `extra` at its default (`"forbid"`) with a shared `.env`.** Symptom: a validation error about
   unexpected keys from the dotenv file (environment variables never trigger it). Fix: `extra="ignore"`.
 - **Expecting a nested override without `env_nested_delimiter`.** Symptom: `APP_RETRIEVAL__TOP_K` is
-  silently ignored and the default used. Fix: set the delimiter.
+  silently ignored and the default used, so the agent retrieves 8 chunks instead of 20. Fix: set the
+  delimiter.
 - **Caching with `lru_cache`, then changing env vars in a test.** Symptom: old values. Fix:
   `get_settings.cache_clear()` or dependency overrides.
+- **Dumping settings into a trace.** Symptom: keys visible in the tracing UI because a field was typed
+  `str`. Fix: type every key as `SecretStr` and export only an allow-listed subset.
 
 ## When to use
-- **Use when:** any long-running service or worker with more than a few settings, anything with secrets,
-  and anything deployed to more than one environment.
+- **Use when:** any long-running agent service or worker with more than a few settings, anything with
+  secrets, and anything deployed to more than one environment.
 - **Default in FastAPI:** settings plug straight into dependency injection.
 - **Avoid when:** throwaway scripts and notebooks; keep plain `os.environ` or python-dotenv.
 - **Measure:** how config failures surface. They should appear as startup errors naming the field, never
-  as request-time `KeyError`s or wrong behaviour.
+  as mid-run `KeyError`s or wrong agent behaviour.
 - **Interviews:** explain the source precedence and why secrets are typed as `SecretStr`.
 
 ## Role lens
@@ -268,6 +310,14 @@ settings without a restart.
   every bad field when `Settings()` is built, instead of a `KeyError` hours after deploy.
 - **Self-documenting:** the class is the list of what a new environment must provide.
 
+### How would you structure configuration for an agent with a dozen tools?
+- **Nested model per tool:** each tool gets a small `BaseModel` (enabled, timeout, limits) on the
+  `Settings` class, and `env_nested_delimiter="__"` lets ops change one field without rewriting JSON.
+- **Keys as `SecretStr`, owned names aliased:** each tool's credential is typed `SecretStr`, with
+  `validation_alias` where the vendor fixes the variable name.
+- **Build tools from settings:** a factory reads the settings once and registers only enabled tools, so a
+  disabled tool never appears in the model's tool list.
+
 ### A field named `path` holds a strange value in production. What happened and how do you fix it?
 - **Likely cause:** there is no `env_prefix`, and matching is case-insensitive by default, so the field
   was filled from the operating system's own `PATH` variable.
@@ -290,9 +340,9 @@ settings without a restart.
 - **Mind the cache:** `get_settings` is wrapped in `lru_cache`, so call `get_settings.cache_clear()`
   after changing environment variables in a test.
 
-### What does `SecretStr` protect against, and what does it not?
+### What does `SecretStr` protect against in an agent that logs traces, and what does it not?
 - **Protects:** accidental logging. The value is masked in `repr`, `str` and default serialization, so
-  `print(settings)` or a crash log shows `**********`.
+  `print(settings)`, a crash log or a config dump in a trace shows `**********`.
 - **Does not:** encrypt, rotate or audit anything. The plaintext is in process memory and returned by
   `.get_secret_value()`, which you call only at the point of use.
 - **So:** pair it with a secrets manager or mounted secret files for delivery and rotation.

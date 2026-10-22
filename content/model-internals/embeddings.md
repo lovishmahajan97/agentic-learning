@@ -5,7 +5,8 @@ name: Embeddings
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - model-internals/tokenization
   - model-internals/transformer
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-An embedding is a learned dense vector standing in for a discrete thing (a token, a sentence). Inside an
-LLM it turns token ids into vectors; an embedding *model* turns whole passages into vectors whose distance
-tracks meaning, which powers semantic search.
+An embedding is a learned dense vector standing in for a token or a text. Embedding *models* power an
+agent's retrieval tool, long-term memory and tool selection: whatever the agent "remembers" or "looks up"
+is found by vector distance.
+
+## For agent builders
+- **Why it matters for agents.** Every RAG step, memory recall and "pick the right tool from 200" lookup is
+  a nearest-neighbour search over embeddings. If the vectors are wrong, the agent reasons perfectly over
+  the wrong context and nothing errors.
+- **Where it shows up in your stack.** The embedding model behind your vector store (pgvector, Qdrant and
+  similar), the retriever object in agent frameworks, and the memory store an agent writes to between
+  sessions. The LLM's own token embedding table you never touch directly.
+- **What you control.** Which embedding model and version, dimension, normalization, chunk size, query
+  and passage prefixes, and whether lexical search runs alongside. Each changes what the agent's search
+  tool returns.
+- **What you can skip.** Training an embedding model from scratch and the details of weight tying. Know
+  that the table exists and what contrastive training buys; spend your time on retrieval evals.
 
 ## Why it exists
 - **A transformer needs vectors, not strings.** It is a stack of matrix multiplications and cannot consume
@@ -47,7 +61,24 @@ tracks meaning, which powers semantic search.
   spelling, determines distance.
 
 ## How it works
-### Token embeddings inside an LLM
+### Where embeddings sit in an agent
+An agent meets embedding models in three places, all the same operation: embed a query, find nearest
+vectors, put the matching text into context.
+
+| Agent capability | What gets embedded | What the query is |
+|---|---|---|
+| **Retrieval tool (RAG)** | document chunks, at index time | the search string the agent writes in its tool call |
+| **Long-term memory** | past facts, summaries, user preferences | the current task or turn |
+| **Tool selection** | each tool's name and description | the user request, when there are too many tools to list them all |
+
+- **The agent writes the query.** In a tool-calling loop the model decides the search string, so query
+  quality depends on the prompt and tool description as much as on the embedder.
+- **Results land in the context window.** Top-k chunks cost tokens on every later step, so k and chunk
+  size are context-budget decisions, not only recall decisions.
+- **The rest of this section explains why the geometry works**, starting with the LLM's own table (as
+  background) and then the embedding models you actually deploy.
+
+### Background: token embeddings inside an LLM
 - **The table.** The model owns a matrix `E` of shape `[V, d_model]`. Looking up token id *i* means taking
   row *i*.
 - **Lookup is a linear layer.** It equals `one_hot(i) · E`, with the multiplication skipped *because* all
@@ -74,7 +105,7 @@ The table is a real fraction of the parameter budget:
 - **Scaling.** The original transformer multiplied the looked-up vector by √d_model to put it on a scale
   comparable to the positional signal; some current models, Gemma among them, keep a similar scaling.
 
-### The unembedding and weight tying
+### Background: the unembedding and weight tying
 1. **Project to the vocabulary.** The final hidden state `h` (dimension `d_model`) becomes a score per
    vocabulary entry: `logits = h · W_Uᵀ` with `W_U` of shape `[V, d_model]`.
 2. **Same shape as `E`.** Some models (GPT-2 among them) **tie** them, using one matrix for both. Tying
@@ -85,7 +116,7 @@ The table is a real fraction of the parameter budget:
 4. **One mechanism, two ends.** Either way the model's output is a dot product between a hidden state and
    every token's output embedding, which is why embeddings and logits are two ends of one mechanism.
 
-### Sentence and document embeddings
+### Sentence and document embeddings (what your retriever uses)
 - **Architecture.** An embedding *model* produces one vector for an entire input: usually a transformer
   encoder plus a pooling step (mean-pool the last hidden states, take a special first-token state, or take
   the last token for decoder-based embedders).
@@ -127,8 +158,9 @@ meaningful.
   version*; re-embedding everything is mandatory when the model changes.
 
 ## Diagram
-Inside the LLM, the same `[V, d_model]` shape appears at both ends; outside it, an embedding model maps
-whole texts into one space that an index searches.
+Inside the LLM, the same `[V, d_model]` shape appears at both ends; outside it, the agent's search tool
+call is embedded by an embedding model, the index returns the nearest passages, and they go back into the
+agent's context.
 
 ```mermaid
 flowchart TD
@@ -138,10 +170,11 @@ flowchart TD
     H --> U["h times W_U transpose"]
     U --> L["Logits per vocab entry"]
     E -.->|"tied in GPT-2"| U
-    D["Query or passage text"] --> M["Encoder plus pooling"]
+    D["Agent search tool call"] --> M["Encoder plus pooling"]
     M --> V["Normalized vector"]
     V --> I[("Vector index, one model")]
     I -->|"cosine top-k"| R["Retrieved passages"]
+    R -->|"tool result"| AC["Agent context"]
 ```
 
 ## Examples
@@ -201,7 +234,67 @@ for dim in (384, 1_536, 3_072):
 | 1,536 dims | ~61 GB | baseline |
 | Matryoshka truncation to 384 | ~15 GB | recall@k drop on your labelled set |
 
+### Agent scenario: a search tool and tool selection from one embedder
+The agent calls `search_docs` as a tool; the same embedder also shortlists which tools to expose when
+the catalog is too big to put every schema in the prompt. The `min_score` value is illustrative and
+must be calibrated per model (see Pitfalls).
+
+```python
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"     # stored with every vector
+st = SentenceTransformer(MODEL_ID)
+
+docs = ["Reset a password from Settings > Security.",
+        "Refunds are issued within 5 business days.",
+        "Error AX-4471 means the license server is unreachable."]
+doc_vecs = st.encode(docs, normalize_embeddings=True)
+
+def search_docs(query: str, k: int = 3, min_score: float = 0.3) -> dict:
+    """Tool the agent calls. Returns scores too, so traces show retrieval quality."""
+    q = st.encode([query], normalize_embeddings=True)[0]
+    scores = doc_vecs @ q                                # cosine, vectors are unit length
+    top = np.argsort(-scores)[:k]
+    hits = [{"text": docs[i], "score": round(float(scores[i]), 3)}
+            for i in top if scores[i] >= min_score]
+    return {"model": MODEL_ID, "hits": hits or "no relevant documents found"}
+
+tools = {"search_docs": "Search the product help center for how-to and policy answers.",
+         "create_ticket": "Open a support ticket for a human agent.",
+         "get_invoice": "Fetch an invoice by id for the signed-in customer."}
+tool_vecs = st.encode(list(tools.values()), normalize_embeddings=True)
+
+def shortlist_tools(user_msg: str, n: int = 2) -> list[str]:
+    s = tool_vecs @ st.encode([user_msg], normalize_embeddings=True)[0]
+    return [list(tools)[i] for i in np.argsort(-s)[:n]]  # only these schemas go in the prompt
+
+print(shortlist_tools("I was charged twice, where is my invoice?"))
+print(search_docs("how long does a refund take"))
+```
+
+### Worked scenario: retrieved text is a context-budget line item
+A support agent averages 6 searches per task. Each search result is appended to the transcript and
+re-read on every later step (illustrative token counts).
+
+| Setting | Tokens per search | Retrieved tokens per task |
+|---|---|---|
+| k = 5, 400-token chunks | 2,000 | 12,000 |
+| k = 3, 300-token chunks | 900 | 5,400 |
+| k = 3, plus reranker dropping hits below threshold | ~600 | ~3,600 |
+
+Cutting k is only safe if recall@k on the agent's own queries holds; measure it before shipping.
+
 ## Production patterns
+- **Evaluate retrieval on the agent's own queries.** Log the search strings the agent writes in its tool
+  calls, label a sample, and compute recall@k on those, not only on human-written questions; agent queries
+  are often terser and keyword-shaped. Monitor recall@k on that set per release of prompt or embedder.
+- **Shortlist tools by embedding when the catalog is large.** Embed each tool's name and description,
+  retrieve the top few per request, and put only those schemas in the prompt. Monitor how often the
+  needed tool was missing from the shortlist (from traces where the agent said it lacked a tool).
+- **Return scores and provenance from the search tool.** Include the score, source id and model id in
+  each tool result so traces show weak retrievals, and so the agent can say "nothing relevant found"
+  instead of answering from a poor hit. Monitor the share of searches returning no hit above threshold.
 - **Store the model id with every vector.** When any index is written, save the embedding model name and
   version as metadata and keep one model per index. Monitor for mixed versions with a periodic count by
   model field; a non-zero second value means a partial migration.
@@ -236,6 +329,13 @@ for dim in (384, 1_536, 3_072):
   re-indexing on every model change.
 
 ## Pitfalls
+- **Trusting the agent's answer when retrieval was weak.** The model writes a fluent answer from whatever
+  the search tool returned. Symptom: confident wrong answers whose traces show low-score hits. Fix: apply a
+  calibrated threshold in the tool, return an explicit "no relevant documents" result, and tell the agent
+  in the system prompt what to do then.
+- **Embedding agent memory with a different model than the query path.** A memory written months ago with
+  an older embedder silently stops being recalled. Fix: the same one-model-per-index rule applies to memory
+  stores, with a re-embedding job when the model changes.
 - **Mixing models or versions in one index.** Symptom: retrieval looks random for part of the corpus,
   exactly the part embedded with the other model. Fix: one model per index, model id stored per vector.
 - **Using raw LLM hidden states as sentence vectors.** Including mean-pooled token embeddings. Symptom:
@@ -258,6 +358,8 @@ for dim in (384, 1_536, 3_072):
   extend a vocabulary (new rows must be initialized and trained), or inspect why two tokens behave alike.
 - **Use sentence embeddings when** the problem is "find things that mean the same as this" at scale:
   semantic search, RAG retrieval, deduplication, clustering, and classification with a light head on top.
+- **In agents, use them for** the retrieval tool, long-term memory recall, and tool shortlisting once the
+  tool catalog is too large to list in every prompt. A handful of tools needs no embedding step.
 - **Avoid them when** exact lexical match matters (IDs, error codes, rare names); BM25 or hybrid search
   wins there.
 - **Measure** with recall@k on a labelled set of query–passage pairs before and after any change of
@@ -300,7 +402,9 @@ set covering old documents, run before the cutover.
 - **Random negatives are too easy.** Hard negatives mined with BM25 or an earlier model look relevant but
   are not, which forces the model to learn fine distinctions; a small temperature penalizes near-misses.
 
-### Users say semantic search misses queries containing product codes like "AX-4471". How do you debug it?
+### Your support agent's search tool misses queries containing product codes like "AX-4471". How do you debug it?
+- **Read the traces.** Check the exact search string the agent wrote in its tool call and what came back;
+  sometimes the agent paraphrased the code away, which is a prompt or tool-description fix.
 - **Check the slice first.** Build a small labelled set of exact-identifier queries and measure recall@k
   on it separately; dense vectors often blur rare strings because they encode meaning, not spelling.
 - **Then fix the retrieval mix.** Add BM25 alongside vector search and fuse by rank, or route
@@ -312,11 +416,14 @@ set covering old documents, run before the cutover.
 - **Benefit is not.** Recall per extra dimension shrinks quickly, so compare recall@k on your own labelled
   pairs. With a Matryoshka model you can test truncation of one embedding run instead of re-embedding.
 
-### When would you tie input and output embeddings, and when not?
-- **Tie in small models.** The table is a large share of parameters (about 38.6M of ~124M in GPT-2 small),
-  so sharing one matrix saves real capacity and keeps recognition and prediction consistent.
-- **Untie in large models.** The table becomes a small fraction of the total, so the saving is minor and
-  separate matrices add flexibility, which is the choice Llama-2 makes.
+### Your agent has 150 tools and keeps picking the wrong one. How would embeddings help, and what would you measure?
+- **Shortlist, then let the model choose.** Embed each tool's name and description, retrieve the top few
+  for each request, and expose only those schemas; fewer, more relevant options are easier for the model
+  and cost fewer prompt tokens.
+- **Measure two things.** Shortlist recall (was the correct tool in the top few, from labelled traces) and
+  end-to-end tool-choice accuracy. Rewrite vague tool descriptions first, since they are what gets embedded.
+- **Background:** tying the LLM's own input and output tables (about 38.6M of ~124M parameters in GPT-2
+  small; untied in Llama-2) is unrelated to this and never something you tune here.
 
 ## Quiz
 ### Q: Why is an embedding lookup mathematically identical to a linear layer applied to a one-hot vector?

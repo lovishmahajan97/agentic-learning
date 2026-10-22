@@ -5,7 +5,8 @@ name: Cancellation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/timeouts
   - serving-inference/streaming
@@ -22,8 +23,21 @@ sources:
 ---
 
 ## TL;DR
-An abandoned generation holds a decode slot, KV memory and token spend until `max_tokens`.
-Cancellation carries "stop" through every hop, browser to engine, so the engine aborts the sequence. Each layer must notice the disconnect and close the next connection; streaming makes that visible.
+A stopped agent run keeps decoding, calling tools and spending until something carries "stop" through
+every hop: browser, agent loop, parallel tools, model stream and engine. Each layer must notice and
+close the next connection, and side-effecting tools must survive being interrupted.
+
+## For agent builders
+- **Why it matters for agents.** Users stop agents that head the wrong way, and agents fan out parallel
+  tools, sub-agents and speculative branches. Each abandoned piece keeps billing, holds capacity and may
+  still fire a side effect unless cancellation reaches it.
+- **Where it shows up in your stack.** `AbortController` in the UI, `task.cancel()` and
+  `asyncio.TaskGroup` in a Python agent loop, `await stream.close()` on provider SDK streams, FastAPI
+  `request.is_disconnected()`, and nginx `proxy_ignore_client_abort`.
+- **What you control.** One cancellable task per run, structured concurrency so tools die with the run,
+  upstream streams closed in `finally`, idempotency keys on write tools, and a "cancelled" run status.
+- **What you can skip.** Engine scheduler internals; it is enough that an aborted sequence is dropped at
+  the next step and its KV blocks are freed.
 
 ## Why it exists
 - **LLM requests are expensive, long and often abandoned.** Users close tabs, hit stop, or send a new
@@ -95,6 +109,16 @@ Cancellation carries "stop" through every hop, browser to engine, so the engine 
 - **So estimate and reconcile.** Keep the text you did receive and tokenize it for an estimate, treat it
   as a lower bound, and reconcile against the provider's usage reports rather than streamed chunk counts.
 
+### Cancelling an agent run
+- **The run is a tree of tasks.** The loop task owns the current model stream, any parallel tool calls
+  and any sub-agents; a stop must reach every leaf, not only the HTTP response.
+- **Structured concurrency does the fan-out.** Start parallel tools inside an `asyncio.TaskGroup` (Python
+  3.11+) so cancelling the run cancels them all, and each tool's `finally` closes its own connection.
+- **Check before each step.** Between steps, check a cancel flag or deadline so the loop does not start
+  a new model call after the user pressed stop.
+- **Persist what finished.** Record completed steps and tool results so a restarted run can resume or
+  show the user what already happened.
+
 ### Patterns built on cancellation
 | Pattern | How it works | Note |
 |---|---|---|
@@ -105,8 +129,8 @@ Cancellation carries "stop" through every hop, browser to engine, so the engine 
 | **Speculative prefetch** | Start a likely-next generation early | Cancel it if the user goes elsewhere |
 
 ## Diagram
-Follow the stop signal from the click to freed KV blocks. Every hop must close the next connection, or
-the engine keeps decoding for nobody.
+Follow the stop signal from the click to freed KV blocks. In an agent the run task and its tools are
+cancelled too; every hop must close the next connection, or the engine keeps decoding for nobody.
 
 ```mermaid
 sequenceDiagram
@@ -117,7 +141,7 @@ sequenceDiagram
     B->>A: POST stream, tokens flowing
     Note over B: user hits stop
     B->>A: controller.abort closes connection
-    Note over A: next write fails, task cancelled
+    Note over A: run task and its tools cancelled
     A->>G: finally closes upstream stream
     G->>E: abort request
     Note over E: drop sequence at next step, free KV blocks
@@ -220,6 +244,46 @@ asyncio.run(handle(0.5))
 # cancelled: upstream closed=True, tokens decoded=45   (roughly 45-50, timing dependent)
 ```
 
+### Agent scenario: stop pressed while parallel tools run
+Runnable on Python 3.11+: the run's parallel tools live in a `TaskGroup`, so cancelling the run cancels
+the slow tool too, while a tool that already finished keeps its result.
+
+```python
+import asyncio
+
+log = []
+
+async def tool(name, secs):
+    try:
+        await asyncio.sleep(secs)                    # stand-in for an HTTP tool call
+        log.append(f"{name}: done")
+    finally:
+        if asyncio.current_task().cancelling():
+            log.append(f"{name}: cancelled, connection closed")
+
+async def agent_run(steps=5):
+    for step in range(steps):
+        log.append(f"step {step}: model call")
+        await asyncio.sleep(0.1)                     # stand-in for a streamed model call
+        async with asyncio.TaskGroup() as tg:        # parallel tool calls share the run's fate
+            tg.create_task(tool(f"search-{step}", 0.3))
+            tg.create_task(tool(f"fetch-{step}", 1.0))
+
+async def main():
+    run = asyncio.create_task(agent_run())
+    await asyncio.sleep(0.6)                         # user presses stop during step 0's tools
+    run.cancel()
+    await asyncio.wait([run])
+    print(*log, sep="\n")
+    print("run cancelled:", run.cancelled())
+
+asyncio.run(main())
+# step 0: model call
+# search-0: done
+# fetch-0: cancelled, connection closed
+# run cancelled: True
+```
+
 ### Worked scenario: what abandonment costs without cancellation
 Decode capacity wasted when abandoned requests run to completion (illustrative; with working
 cancellation the waste shrinks to the detection lag, about one token for streaming handlers).
@@ -234,6 +298,11 @@ The earlier and more often users leave, the larger the share, which is why long 
 users make the problem grow.
 
 ## Production patterns
+- **One cancellable task per agent run.** Keep a handle to the run's task keyed by run id, cancel it from
+  the stop endpoint or on disconnect, and start tools and sub-agents inside a `TaskGroup` so they die
+  with it. Monitor tool calls and model tokens that start after a run was cancelled; it should be zero.
+- **Idempotency keys on side-effecting tools.** Derive a key from run id and step so a retried or resumed
+  run cannot send the same email or order twice. Monitor duplicate side effects per tool.
 - **Wire `AbortController` on every client call.** Create one per request, pass `signal` to `fetch`, and
   call `abort()` on stop, supersede and navigation. Monitor the abandonment rate from client telemetry.
 - **Close upstream in `finally` or a context manager.** Wrap provider streams so cleanup always closes
@@ -293,6 +362,8 @@ users make the problem grow.
 - **Hedging** only for short, latency-critical calls with capacity to spare; **speculative prefetch**
   only when the abandoned cost is clearly less than the latency saved.
 - **Do not tie long batch jobs to a connection** at all.
+- **Cancel the whole agent run,** not just its HTTP response: the loop, in-flight model stream, parallel
+  tools and sub-agents.
 - **Measure** the abandonment rate, time from client disconnect to engine abort, and tokens generated
   after disconnect; check that the provider's reported usage falls when abandonment rises, and if it
   does not, the abort is not reaching them.
@@ -330,19 +401,20 @@ presses; if everything upstream is right and they do not, the serving layer is n
 - **Numbers:** a tenth of requests abandoned halfway through 1,000-token answers wastes about 5 % of
   decode capacity.
 
-### How do you make a non-streaming endpoint stop when the client leaves?
-- **The problem:** a handler awaiting the model never touches the socket, so it never sees the
-  disconnect until the finished answer fails to send.
-- **The fix:** run generation as its own task, race it against a watcher that polls the disconnect
-  state, and cancel the task when the watcher wins.
-- **Then** make sure the task's cleanup closes the upstream response, or the provider keeps decoding.
-
 ### A user hits stop while an agent is mid tool-call. What can go wrong and how do you design for it?
 - **The tool may already have acted:** cancellation lands at an await, so an email or payment may have
   been sent before it arrived.
 - **Design:** idempotency keys or two-phase tools, the run recorded as cancelled, and shielded
   bookkeeping so usage and locks are written even under cancel.
 - **On retry**, the idempotency key prevents a duplicate side effect.
+
+### Users press stop on agents, but runs keep calling tools for a minute afterwards. What is wrong?
+- **The stop only reached the HTTP response,** not the loop: the run task was never cancelled, or the
+  loop does not check for cancellation between steps.
+- **Tools run outside structured concurrency,** for example fire-and-forget tasks, so cancelling the
+  parent does not reach them.
+- **Fix:** one cancellable task per run, tools in a `TaskGroup`, a cancel check before each step, and a
+  metric for work started after cancellation.
 
 ### When is hedging worth it, and what does it cost?
 - **Worth it** for short, latency-critical calls with a bad tail and spare capacity: send a second

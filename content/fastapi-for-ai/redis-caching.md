@@ -5,7 +5,8 @@ name: Redis caching
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - backend-fundamentals/redis
   - serving-inference/caching
@@ -20,23 +21,35 @@ sources:
 ---
 
 ## TL;DR
-Redis caching puts one shared store in front of repeated LLM and embedding calls: hash the normalised
-request into a key, return hits, and on a miss call the model and store with a TTL. Safe only when the
-key captures everything changing the answer.
+Agents repeat expensive calls: the same embedding, retrieval or tool lookup across steps, retries and
+users. A Redis cache keyed on a hash of everything that changes the answer, with a TTL, cuts agent
+spend and step latency safely.
+
+## For agent builders
+- **Why it matters for agents.** One agent run makes many model, embedding and tool calls, and a retried
+  or replayed run repeats most of them. A shared cache turns those repeats into millisecond reads, so a
+  10-step loop costs less and finishes sooner.
+- **Where it shows up in your stack.** A `redis.asyncio` client created in the FastAPI lifespan, wrapped
+  around embedding calls in the RAG step, around pure tool functions (lookups, search, fetch) and, for
+  temperature-0 subtasks such as routing or extraction, around the model call itself.
+- **What you control.** The key (model, prompt version, tool schema, tenant, index version), the TTL per
+  data class, stampede protection, eviction policy and the fail-open path when Redis is down.
+- **What you can skip.** Redis internals and clustering. Know cache-aside, the key recipe, `SET NX` locks
+  and `maxmemory` policies; that is enough to cache an agent backend safely.
 
 ## Why it exists
 - **Model calls are slow and billed.** A hosted model, embedding API or reranker takes hundreds of
   milliseconds to tens of seconds and is billed per token, and a production FastAPI service runs several
   worker processes, often on several hosts, behind a load balancer.
-- **Much of the traffic repeats exactly.** The same FAQ question, the same document embedded on every
-  re-index, the same classification prompt over the same ticket, the same tool lookup inside an agent
-  loop that retries.
+- **Much of an agent's traffic repeats exactly.** The same FAQ question, the same document embedded on
+  every re-index, the same classification prompt over the same ticket, the same tool lookup inside an
+  agent loop that retries.
 - **A module-level dict or `functools.lru_cache` fails three ways.** It is per process, so with eight
   workers the hit rate is split across eight cold caches and a deploy wipes all of them. It shares the
   app's heap, so an unbounded cache is a memory leak ending in an OOM kill. And `lru_cache` on an
   `async def` caches the coroutine object, not its result, so the second await fails.
-- **The provider's prompt cache is a different thing.** It discounts the prefix of a prompt, but you
-  still pay for and wait on the generated output.
+- **The provider's prompt cache is a different thing.** It discounts the prefix of a prompt (the agent's
+  system prompt and tool schemas), but you still pay for and wait on the generated output.
 - **Redis solves sharing and bounding, not correctness.** One store all workers see, with per-key expiry,
   a memory ceiling, an eviction policy and sub-millisecond reads on a local network. Correctness is
   entirely about the key.
@@ -49,8 +62,8 @@ key captures everything changing the answer.
    prompts are long and keys should be bounded, and canonical serialisation makes semantically identical
    requests collide on purpose.
 2. **Read** with `GET`. On a hit, deserialise and return. Record a hit metric.
-3. **On a miss**, call the model, then `SET key value EX ttl`. The TTL is the staleness contract: it
-   bounds how long a wrong or outdated answer can survive, *because* nobody reliably remembers to
+3. **On a miss**, call the model or tool, then `SET key value EX ttl`. The TTL is the staleness contract:
+   it bounds how long a wrong or outdated answer can survive, *because* nobody reliably remembers to
    invalidate model outputs when a prompt or a source document changes.
 4. **Namespace and version** keys, for example `llm:v3:{tenant}:{sha}`. Bumping `v3` to `v4` when the
    prompt or model changes invalidates everything at once without a scan, *because* old keys simply stop
@@ -66,7 +79,7 @@ mean_latency ≈ h·t_r + (1 − h)·(t_r + t_m + t_r)
 - **A miss pays three things:** the failed `GET`, the call and the `SET` (the `SET` can be fired without
   awaiting it).
 - **Latency wins at almost any hit rate,** *because* *t_r* is around a millisecond on a local network and
-  *t_m* is hundreds of milliseconds or more.
+  *t_m* is hundreds of milliseconds or more. In an agent the saving multiplies by steps per run.
 - **Spend saving** is simply *h* × calls × price per call.
 - **The real cost is memory:** `entries × (key + value + per-key overhead)`, and value encoding dominates.
 - **Encoding matters.** A 1,536-dimension float32 embedding is 6,144 bytes as raw bytes, but several times
@@ -74,25 +87,26 @@ mean_latency ≈ h·t_r + (1 − h)·(t_r + t_m + t_r)
 - **Measure *h* per namespace before growing memory.** A namespace with a 2% hit rate is mostly paying to
   store keys nobody reads.
 
-### What is safe to cache
+### What is safe to cache in an agent
 | Workload | Cache it? | Why |
 |---|---|---|
-| Embeddings | Yes | Same model and text give the same vector |
+| Embeddings (RAG ingest and query) | Yes | Same model and text give the same vector |
 | Classification and extraction at temperature 0 | Yes | Near-deterministic |
 | Retrieval results for a fixed index version | Yes | Key includes the index version |
 | Tool lookups | Yes | Usually pure functions of their inputs |
+| Tools with side effects (send, write, pay) | No | A hit would skip the action |
 | Creative generation, temperature above 0 | Product decision | Every user gets the same "random" answer |
 
 - **Temperature 0 is not bit-for-bit deterministic** on most hosted models, so a cache *imposes*
-  consistency rather than preserving it, which is often what you want.
+  consistency rather than preserving it, which is often what you want for agent routing and evals.
 
 ### Wiring it into FastAPI
 - **One client, created in the lifespan.** Create one `redis.asyncio` client, store it on `app.state`,
-  and hand it to endpoints through a dependency.
+  and hand it to endpoints and tool functions through a dependency.
 - **The client owns a connection pool,** *because* opening a TCP connection per request is slower than
   the cache read it serves.
 - **Use the asyncio client, not the sync one,** *because* a sync call inside `async def` blocks the event
-  loop for every request on that worker.
+  loop for every request on that worker, including every streaming agent session.
 
 ### Stampede protection
 When a hot key expires, every concurrent request misses at once and all of them call the model: a cache
@@ -118,21 +132,22 @@ The lock needs three details to be correct, plus one rule that keeps it availabl
 ### Memory and eviction
 - **Set `maxmemory` and an eviction policy.**
 - **Pure cache:** `allkeys-lru` (or `allkeys-lfu`) lets Redis drop cold keys when full.
-- **Shared with state that must not vanish** (rate-limit counters, sessions): use `volatile-*` policies,
-  which only evict keys that have a TTL, or better, a separate instance, *because* a cache filling up
-  should never evict state that something else relies on.
+- **Shared with state that must not vanish** (rate-limit counters, sessions, agent conversation memory):
+  use `volatile-*` policies, which only evict keys that have a TTL, or better, a separate instance,
+  *because* a cache filling up should never evict state that something else relies on.
 
 ### Failure mode
 - **Redis is optional on the read path.** On a connection error or timeout, log, count, and fall through
-  to the model. A cache outage should cost money and latency, not availability.
+  to the model or tool. A cache outage should cost money and latency, not agent availability.
 
 ## Diagram
-Follow a request through cache-aside: a hit returns in about a millisecond, a miss takes the lock (or
-waits for the holder), calls the model and stores with a jittered TTL, and a Redis error falls through.
+Follow one agent step's call through cache-aside: a hit returns in about a millisecond, a miss takes the
+lock (or waits for the holder), calls the model and stores with a jittered TTL, and a Redis error falls
+through.
 
 ```mermaid
 flowchart TD
-    R["Request"] --> K["Build versioned tenant-scoped SHA-256 key"]
+    R["Agent step needs a call"] --> K["Build versioned tenant-scoped SHA-256 key"]
     K --> G{"GET key"}
     G -->|"hit"| H["Return cached value"]
     G -->|"Redis error"| M["Call the model directly"]
@@ -147,7 +162,8 @@ flowchart TD
 
 ## Examples
 ### Cache-aside wrapper for an embedding call
-A canonical key, TTL jitter and fail-open reads. `embed_remote` stands in for the real provider call.
+The RAG step of an agent embeds queries and chunks. A canonical key, TTL jitter and fail-open reads.
+`embed_remote` stands in for the real provider call.
 
 ```python
 import hashlib, json, random
@@ -198,7 +214,7 @@ async def embed(body: dict, r: redis.Redis = Depends(get_redis)):
 
 ### Stampede lock with a safe release
 One worker recomputes a hot key; the others poll briefly, then fall through. The release only deletes a
-lock that still holds this worker's token.
+lock that still holds this worker's token. The same helper wraps a slow, popular agent tool.
 
 ```python
 import asyncio, secrets
@@ -235,6 +251,31 @@ async def get_or_compute(r, key: str, compute, ttl: int, wait_s: float = 5.0):
 - **Redis errors are not caught here,** to keep the lock logic readable; in production wrap these calls
   fail-open as in the first example.
 
+### Caching a read-only agent tool
+Only pure, read-only tools are cached; the key carries the tool name, its schema version and the tenant.
+
+```python
+import hashlib, json
+
+CACHEABLE = {"search_docs": 3600, "get_product": 600}   # tool name -> TTL in seconds
+
+def tool_key(tenant: str, name: str, schema_v: int, args: dict) -> str:
+    blob = json.dumps({"n": name, "v": schema_v, "a": args}, sort_keys=True, separators=(",", ":"))
+    return f"tool:v1:{tenant}:{hashlib.sha256(blob.encode()).hexdigest()}"
+
+async def run_tool(r, tenant: str, name: str, schema_v: int, args: dict, impl):
+    if name not in CACHEABLE:                 # send_email, create_ticket: never cached
+        return await impl(**args)
+    key = tool_key(tenant, name, schema_v, args)
+    hit = await r.get(key)
+    if hit is not None:
+        return json.loads(hit)
+    result = await impl(**args)
+    if not result.get("error"):               # never cache failures
+        await r.set(key, json.dumps(result), ex=CACHEABLE[name])
+    return result
+```
+
 ### Worked numbers: is the cache worth it?
 Illustrative inputs: *t_r* = 1 ms, *t_m* = 800 ms, 1,000,000 calls a month.
 
@@ -245,34 +286,40 @@ Illustrative inputs: *t_r* = 1 ms, *t_m* = 800 ms, 1,000,000 calls a month.
 | 0.6 | 0.6·1 + 0.4·802 ≈ 321 ms | 400,000 |
 
 - **The miss penalty is ~2 ms** on an 800 ms call, which is why even modest hit rates pay off.
+- **Per agent run** the same arithmetic applies to each step: a run with 10 cacheable calls at a 0.6 hit
+  rate saves about 6 × 800 ms ≈ 4.8 s of serial waiting (illustrative, assuming the calls are sequential).
 
 ## Production patterns
-- **Versioned namespaces per data class.** When prompts, models or indexes change, keep the version in
-  the key prefix (`llm:v3:{tenant}:{sha}`) and bump it in the same deploy as the change. Monitor the hit
-  rate of the new namespace climbing back up after a bump.
+- **Versioned namespaces per data class.** When prompts, models, tool schemas or indexes change, keep the
+  version in the key prefix (`llm:v3:{tenant}:{sha}`) and bump it in the same deploy as the change.
+  Monitor the hit rate of the new namespace climbing back up after a bump.
 - **Fail-open client with tight timeouts.** Give the client short read and connect timeouts
   (`socket_timeout=0.2` as in the example, plus `socket_connect_timeout`, which is a separate setting whose
   default is seconds in recent redis-py) and catch `RedisError`, so a slow or unreachable Redis degrades
-  to a miss. Monitor cache error counts and p99 cache latency alongside endpoint latency.
-- **Dedicated cache instance with an LRU policy.** When the cache would share Redis with sessions or
-  rate limits, give it its own instance with `maxmemory` set and `maxmemory-policy allkeys-lru`. Monitor
-  `evicted_keys` and `used_memory` from `INFO`.
-- **Hit-rate metrics per namespace.** Count hits and misses in the app, labelled by namespace, rather
-  than relying only on Redis's global `keyspace_hits` and `keyspace_misses`. Drop or shorten TTLs for
-  namespaces stuck near a 2% hit rate.
-- **Never cache failures.** Store only successful, complete responses (check the finish reason or status
-  before `SET`), so a transient provider error is not replayed for the full TTL. Monitor cached-value
-  size outliers, which often reveal truncated outputs.
+  to a miss. Monitor cache error counts and p99 cache latency alongside agent step latency.
+- **Dedicated cache instance with an LRU policy.** When the cache would share Redis with sessions, agent
+  memory or rate limits, give it its own instance with `maxmemory` set and `maxmemory-policy allkeys-lru`.
+  Monitor `evicted_keys` and `used_memory` from `INFO`.
+- **Hit-rate metrics per namespace.** Count hits and misses in the app, labelled by namespace (embeddings,
+  retrieval, each tool), rather than relying only on Redis's global `keyspace_hits` and `keyspace_misses`.
+  Drop or shorten TTLs for namespaces stuck near a 2% hit rate.
+- **Never cache failures or side effects.** Store only successful, complete responses (check the finish
+  reason or status before `SET`), so a transient provider or tool error is not replayed for the full TTL,
+  and keep an allow-list of read-only tools. Monitor cached-value size outliers, which often reveal
+  truncated outputs.
+- **Pin eval runs with the cache.** Agent teams often run regression evals with model calls cached, so
+  reruns after a non-model change are cheap and deterministic, then bump the namespace to force fresh calls
+  when the model or prompt changes.
 
 ## Trade-offs
 - **Shared cache vs in-process LRU.** Redis raises hit rate across all workers and survives deploys, but
   adds a network hop and a dependency; for tiny, process-local, rarely-changing data an in-process LRU
   is faster and simpler.
 - **Long vs short TTLs.** Long TTLs maximise savings and stability but extend how long a stale or wrong
-  answer is served; short TTLs flip the balance when sources or prompts change often.
+  answer is served; short TTLs flip the balance when sources, prompts or tool backends change often.
 - **Exact-match vs semantic keys.** Exact-match keys are always correct when the key is complete, but
   miss paraphrases; semantic (embedding-similarity) caching catches paraphrases at the risk of returning
-  a near-miss answer.
+  a near-miss answer to an agent that then acts on it.
 - **Caching sampled generations.** Caching temperature-above-zero output cuts cost but removes variety
   users may expect; it pays off for FAQ-style traffic and backfires for creative or personalised output.
 - **One Redis vs several.** One instance for cache, limits and sessions is cheaper to run, but under
@@ -284,6 +331,9 @@ Illustrative inputs: *t_r* = 1 ms, *t_m* = 800 ms, 1,000,000 calls a month.
   generated from another customer's documents, which is a data leak, not a bug. Fix: tenant in every key.
 - **Model ID or prompt version missing from the key.** Symptom: a prompt fix appears to do nothing, and
   old outputs persist after a deploy until TTLs expire. Fix: version the key.
+- **Caching a tool with side effects.** Symptom: the agent reports an email sent or a ticket created, but
+  nothing happened because the call was a cache hit. Fix: cache only an explicit allow-list of read-only
+  tools.
 - **Sync `redis` client inside `async def`.** Symptom: p99 latency climbs for every endpoint on the
   worker, because each cache call blocks the event loop. Fix: use `redis.asyncio`.
 - **No `maxmemory` or no TTL on cache keys.** Symptom: Redis memory grows until the host OOMs or, with
@@ -295,10 +345,11 @@ Illustrative inputs: *t_r* = 1 ms, *t_m* = 800 ms, 1,000,000 calls a month.
   compare-and-delete with your token.
 
 ## When to use
-- **Use when** the same expensive, deterministic-enough call repeats across users or workers:
-  embeddings, temperature-0 classification and extraction, retrieval results, slow tool lookups.
+- **Use when** the same expensive, deterministic-enough call repeats across users, workers or agent
+  steps: embeddings, temperature-0 classification and extraction, retrieval results, slow read-only tool
+  lookups.
 - **Avoid when** it would paper over a missing database index, for personalised or creative generations,
-  or where serving a stale answer is a correctness or compliance problem.
+  for tools with side effects, or where serving a stale answer is a correctness or compliance problem.
 - **Measure** hit rate, latency on hit versus miss, provider spend before and after, and Redis memory and
   evictions.
 - **Interviews:** expect to design the key, choose the TTL, explain stampede protection and say what
@@ -331,6 +382,14 @@ add a hit metric per namespace to confirm savings survive.
 - **On `async def` it caches the coroutine object, not the result,** so the second await of the same key
   fails. Redis gives one shared, bounded store with per-key TTLs that every worker sees.
 
+### Which of your agent's calls would you cache, and which would you never cache?
+- **Cache the pure ones:** query and chunk embeddings, retrieval results keyed on the index version,
+  temperature-0 routing or extraction calls, and read-only tools such as document search or product lookup.
+- **Never cache side effects:** sending email, creating tickets or charging cards, because a hit would make
+  the agent believe an action happened that did not.
+- **Key on the tool schema version and tenant,** so a changed tool contract or another customer's data
+  never returns a stale or foreign result.
+
 ### How would you design the cache key for a temperature-0 extraction endpoint serving many tenants?
 - **Include everything that changes the output:** model ID, prompt template version, rendered messages,
   sampling parameters, tool schema and the tenant ID, because a missing tenant is a cross-customer leak.
@@ -355,10 +414,10 @@ add a hit metric per namespace to confirm savings survive.
 - **When the real problem is elsewhere,** such as a missing database index, or when a namespace's measured
   hit rate stays near 2% and you are paying to store keys nobody reads.
 
-### Redis goes down during peak traffic. What should your FastAPI service do, and what do you monitor?
+### Redis goes down during peak agent traffic. What should your FastAPI service do, and what do you monitor?
 - **Fail open:** short read and connect timeouts (`socket_timeout=0.2` in the example, plus
   `socket_connect_timeout` so reconnect attempts to a dead host do not hang) and a caught `RedisError` turn
-  every cache call into a miss, so users see slower answers, not errors.
+  every cache call into a miss, so users see slower agent runs, not errors.
 - **Expect the cost to move to the provider:** at a 60% hit rate, model calls rise from 400,000 to 1,000,000
   a month in the worked numbers above, which can trip provider rate limits.
 - **Monitor** cache error counts, p99 cache latency, hit rate per namespace, provider spend and, on the

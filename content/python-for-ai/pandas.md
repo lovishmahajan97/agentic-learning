@@ -5,7 +5,8 @@ name: pandas
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/numpy
   - python-for-ai/polars
@@ -20,16 +21,29 @@ sources:
 ---
 
 ## TL;DR
-pandas gives Python an in-memory labelled table, the DataFrame: typed columns plus an index, with
-vectorized math, group-by, joins and readers for most formats. It is the default for eval results and
-logs that fit in RAM; watch alignment, copies and memory.
+pandas is where you read your agent's behaviour: load traces and eval results into a DataFrame and ask
+which tool fails, which step burns tokens, which model passes. It is the default for data that fits in
+RAM; watch alignment, copies and memory.
+
+## For agent builders
+- **Why it matters for agents.** Agent quality is found in the traces: one row per step or per run with
+  tool name, status, latency, tokens and cost. Error analysis ("which tool errors most in the refund
+  category?") is one `groupby`, and model-choice decisions come from the summary table.
+- **Where it shows up in your stack.** Notebooks over trace exports from LangSmith, Langfuse or your own
+  JSONL logs; eval harness outputs; cost reports; scikit-learn inputs. Some agents also expose a
+  DataFrame as a tool, such as LangChain's experimental pandas agent, which executes model-written Python
+  and needs a sandbox.
+- **What you control.** Dtypes at read time, `validate=` on every join (a price or label table), explicit
+  `dropna=False` in reports, and vectorized column math instead of `apply`.
+- **What you can skip.** MultiIndex gymnastics, time-series resampling and most of the API. Reading,
+  joining, grouping and safe assignment cover agent analysis.
 
 ## Why it exists
-- **AI data is mixed-type rows.** An eval run produces a case ID, model name, category string, pass/fail
-  boolean, latency, token counts and a timestamp. NumPy arrays hold one dtype and address data by integer
-  position.
-- **The questions are tabular.** "Pass rate and p95 latency per model per category", join in a price
-  table, filter to failures to read them.
+- **Agent data is mixed-type rows.** An eval run produces a case ID, model name, category string, pass/fail
+  boolean, latency, token counts, steps taken, tools called and a timestamp. NumPy arrays hold one dtype
+  and address data by integer position.
+- **The questions are tabular.** "Pass rate and p95 latency per model per category", "error rate per
+  tool", join in a price table, filter to failures to read them.
 - **The naive tools fail.** Lists of dicts mean hand-written loops for every group-by and join, slow and
   easy to get wrong; raw NumPy means keeping parallel arrays aligned by hand.
 - **SQL is friction here.** Loading data into a database for a ten-minute analysis is overhead, and SQL is
@@ -46,13 +60,13 @@ logs that fit in RAM; watch alignment, copies and memory.
 | Column kind | Storage | Note |
 |---|---|---|
 | Numeric | NumPy array | Compiled speed |
-| Strings, historically | `object`: pointers to Python objects | Slow and memory-hungry |
+| Strings, historically | `object`: pointers to Python objects | Slow and memory-hungry; trace text (prompts, tool outputs) lives here |
 | Strings, newer | Dedicated string dtypes | pandas 3.0 makes a string dtype the default for text |
 | Arrow-backed (since pandas 2.0, optional) | `dtype_backend="pyarrow"` | Arrow's columnar format |
 
 ### Missing values
 - **Float columns use `NaN`,** so an integer column that gains one missing value silently becomes
-  `float64` (a historical compromise).
+  `float64` (a historical compromise), for example `tokens` on a step that timed out.
 - **Nullable dtypes (`Int64`, `boolean`, `string`)** use a separate mask instead, keeping the type.
 
 ### Alignment
@@ -66,7 +80,8 @@ logs that fit in RAM; watch alignment, copies and memory.
 - **Column expressions** such as `df["cost"] = df["tokens"] / 1000 * df["price"]` run as NumPy operations
   over whole columns.
 - **`df.apply(f, axis=1)`** calls a Python function per row, bringing back interpreter speed: a last resort.
-- **String and datetime operations** live under `.str` and `.dt`.
+- **String and datetime operations** live under `.str` and `.dt`, for example
+  `df["tool_output"].str.contains("timeout")` to tag failed steps.
 
 ### Group-by, joins, reshaping
 | Tool | What it does |
@@ -74,14 +89,14 @@ logs that fit in RAM; watch alignment, copies and memory.
 | `groupby` | Split-apply-combine: split rows by key, aggregate per group, combine into a new frame |
 | Named aggregation `agg(pass_rate=("passed", "mean"))` | Keeps output columns explicit |
 | `merge` | SQL-style joins; `validate=` checks cardinality so a duplicate key cannot silently multiply rows |
-| `pivot_table` / `melt` | Switch between wide and long shapes |
+| `pivot_table` / `melt` | Switch between wide and long shapes, e.g. one column per model for a side-by-side eval |
 
 How `groupby` runs:
 1. **Factorize** the key columns: one hash pass maps each distinct key to an integer group code.
 2. **Aggregate.** Built-ins named by string (`"mean"`, `"sum"`, `"size"`) run a compiled loop adding each
    row into its group's accumulator, so cost is roughly linear in rows whatever the number of groups.
 3. **Custom functions are slower.** A lambda is called once per group with a Series: fine for tens of
-   groups, slow for a million.
+   groups, slow for a million (one group per agent run is easily that many).
 
 Two defaults matter: `dropna=True` drops rows whose key is missing, and for categorical keys `observed=`
 decides whether empty categories appear as rows.
@@ -98,30 +113,69 @@ decides whether empty categories appear as rows.
 
 ### Execution model
 - **Eager.** Each operation materializes a full result immediately, mostly on a single core.
-- **RAM rule of thumb.** With intermediates, have several times the dataset's size available.
+- **RAM rule of thumb.** With intermediates, have several times the dataset's size available; traces with
+  full prompts and tool outputs are mostly text and get large fast.
 - **Bigger than memory?** Chunked reading (`chunksize=`), a columnar engine such as Polars or DuckDB, or a
   database.
 
 ## Diagram
-A typical eval-analysis pipeline, with the group-by split shown: built-in aggregations stay in compiled
-code, while a lambda drops back to one Python call per group.
+A typical agent-trace analysis pipeline, with the group-by split shown: built-in aggregations stay in
+compiled code, while a lambda drops back to one Python call per group.
 
 ```mermaid
 flowchart TD
-    R["Read JSONL or CSV with pinned dtypes"] --> J["merge with validate=many_to_one"]
-    J --> C["Vectorized column math, no apply"]
-    C --> G["groupby: factorize keys into integer group codes"]
+    R["Read trace JSONL, pinned dtypes"] --> J["merge, validate=many_to_one"]
+    J --> C["Vectorized column math"]
+    C --> G["groupby: keys to group codes"]
     G --> Q{"Aggregation kind?"}
-    Q -->|"built-in name: mean, sum, size"| F["Compiled loop, roughly linear in rows"]
-    Q -->|"lambda or custom function"| S["One Python call per group"]
+    Q -->|"built-in: mean, sum, size"| F["Compiled loop, linear in rows"]
+    Q -->|"lambda or custom"| S["One Python call per group"]
     F --> O["Summary frame, reset_index"]
     S --> O
-    O --> P[("Parquet hand-off, dtypes preserved")]
+    O --> P[("Parquet hand-off")]
 ```
 
 ## Examples
+### Agent trace analysis: which tool fails, and what does a run cost?
+One row per agent step, as exported from a tracing tool or your own JSONL. Two group-bys answer the
+questions an agent team asks every week.
+
+```python
+import pandas as pd
+
+steps = pd.DataFrame({       # in practice: pd.read_json("traces.jsonl", lines=True)
+    "run_id":   ["r1", "r1", "r1", "r2", "r2", "r3", "r3", "r3", "r3"],
+    "step":     [1, 2, 3, 1, 2, 1, 2, 3, 4],
+    "tool":     ["search", "lookup_order", None, "search", None,
+                 "lookup_order", "lookup_order", "lookup_order", None],
+    "status":   ["ok", "error", "ok", "ok", "ok", "error", "error", "ok", "ok"],
+    "in_tokens":  [3000, 3600, 4100, 2900, 3400, 3100, 3700, 4300, 4900],
+    "out_tokens": [80, 60, 220, 70, 180, 50, 50, 60, 240],
+}).astype({"tool": "string", "status": "category"})
+
+per_tool = (steps.dropna(subset=["tool"])
+                 .groupby("tool")
+                 .agg(calls=("step", "size"),
+                      error_rate=("status", lambda s: (s == "error").mean()))
+                 .reset_index())
+
+per_run = (steps.groupby("run_id")
+                .agg(n_steps=("step", "max"), in_tokens=("in_tokens", "sum"),
+                     out_tokens=("out_tokens", "sum"))
+                .reset_index())
+per_run["cost_usd"] = (per_run["in_tokens"] / 1000 * 0.00015
+                       + per_run["out_tokens"] / 1000 * 0.0006)   # illustrative prices
+print(per_tool, per_run, sep="\n")
+```
+
+| Finding | Number | Action |
+|---|---|---|
+| `lookup_order` error rate | 3 of 4 calls = 0.75 | Read those tool results; likely a bad argument schema |
+| Run `r3` | 4 steps, 16,000 input tokens | Two retries of the same failing tool added two steps of re-sent context |
+| Input tokens per step | grows ~600 per step | The transcript grows each step; see prompt caching |
+
 ### Eval summary per model and category
-Summarising an eval run: pass rate, tail latency and cost per model and category.
+Summarising an agent eval run: pass rate, tail latency and cost per model and category.
 
 ```python
 import pandas as pd
@@ -164,26 +218,11 @@ failures = df.loc[~df["passed"], ["case_id", "model", "category"]]
 That is the shape of a real model-choice discussion: the cheap model fails one category, so route that
 category to the large one.
 
-### Loading a large usage log without exhausting memory
-A token-usage export too big to load with default dtypes. Read only needed columns, pin compact dtypes,
-and aggregate chunk by chunk.
-
-```python
-import pandas as pd
-
-cols = ["ts", "model", "route", "out_tokens", "latency_ms"]
-dtypes = {"model": "category", "route": "category",
-          "out_tokens": "int32", "latency_ms": "float32"}
-
-parts = []
-for chunk in pd.read_csv("usage.csv", usecols=cols, dtype=dtypes,
-                         parse_dates=["ts"], chunksize=1_000_000):
-    parts.append(chunk.groupby(["model", "route"], observed=True)
-                      .agg(calls=("latency_ms", "size"), out_tokens=("out_tokens", "sum")))
-
-usage = pd.concat(parts).groupby(level=["model", "route"], observed=True).sum()  # combine partial sums
-print(usage.sort_values("out_tokens", ascending=False).head())
-```
+### Worked scenario: loading a large usage log without exhausting memory
+A token-usage export from a busy agent fleet is too big to load with default dtypes. Read only needed
+columns (`ts`, `model`, `route`, `out_tokens`, `latency_ms`), pin compact dtypes (`category`, `int32`,
+`float32`), use `parse_dates=["ts"]`, and aggregate with `chunksize=1_000_000`, combining partial sums
+with `groupby(level=["model", "route"], observed=True).sum()`.
 
 Why the dtypes matter, per 10 million rows (bytes are exact for fixed-width types):
 
@@ -196,12 +235,15 @@ Why the dtypes matter, per 10 million rows (bytes are exact for fixed-width type
 Check the real numbers with `df.memory_usage(deep=True)`.
 
 ## Production patterns
+- **Weekly trace error analysis.** Export a sample of production traces, group by tool and by category,
+  read the failing rows, and file fixes against the tool or prompt. Track per-tool error rate and steps
+  per run week over week; a rising step count often means a tool that silently started failing.
 - **Pin dtypes and columns at read time.** Pass `usecols=`/`dtype=` to `read_csv`, or `columns=` to
-  `read_parquet`, and use `category` for repeated strings. Log `df.memory_usage(deep=True).sum()` per
-  stage; a jump means a column fell back to `object` or `float64`.
+  `read_parquet`, and use `category` for repeated strings such as tool and model names. Log
+  `df.memory_usage(deep=True).sum()` per stage; a jump means a column fell back to `object` or `float64`.
 - **Guard every join.** Use `merge(..., validate="many_to_one")` and assert the row count is unchanged
-  after a left join. Monitor rows-before versus rows-after in pipeline logs, since inflated totals are the
-  classic silent failure.
+  after a left join to a price, label or rubric table. Monitor rows-before versus rows-after in pipeline
+  logs, since inflated totals are the classic silent failure.
 - **Nullable IDs everywhere.** Read ID columns as `Int64` or `string` (`dtype={"case_id": "Int64"}`, or
   `df.convert_dtypes()`), so one missing value cannot turn IDs into `1234.0`. Watch join match rates.
 - **Opt into Copy-on-Write before upgrading.** On pandas 2.x set `pd.set_option("mode.copy_on_write",
@@ -209,7 +251,7 @@ Check the real numbers with `df.memory_usage(deep=True)`.
   `SettingWithCopyWarning` counts in CI output; aim for zero.
 - **Hand off as Parquet, not CSV.** Write `df.to_parquet(path, index=False)` so dtypes survive the trip
   to the next notebook or job. Monitor file sizes and read times, and keep `dropna=False` explicit in
-  report group-bys so missing categories stay visible.
+  report group-bys so missing categories (and steps with no tool) stay visible.
 
 ## Trade-offs
 - **Huge API vs consistency.** Most tasks are one line away, but there are many ways to do the same thing
@@ -218,8 +260,12 @@ Check the real numbers with `df.memory_usage(deep=True)`.
   near RAM size, lazy engines such as Polars or DuckDB optimize and stream instead.
 - **Label alignment vs surprise NaNs.** Ideal for time series, but on ad-hoc tables it silently introduces
   NaNs, so many teams treat the index as a plain row number and join explicitly.
-- **`object` flexibility vs cost.** It holds anything and tolerates messy data at the cost of speed and
-  memory; converting to string, categorical or Arrow dtypes flips that once data grows.
+- **`object` flexibility vs cost.** It holds anything and tolerates messy data (nested tool arguments,
+  long outputs) at the cost of speed and memory; converting to string, categorical or Arrow dtypes flips
+  that once data grows.
+- **DataFrame as an agent tool vs safety.** Letting the model write pandas code answers open questions
+  over a table, but it is arbitrary code execution; a fixed set of query tools is safer when the questions
+  are known.
 
 ## Pitfalls
 - **`apply(axis=1)` or `iterrows()` for arithmetic.** Symptom: a cell taking minutes on a few million rows
@@ -234,16 +280,17 @@ Check the real numbers with `df.memory_usage(deep=True)`.
   needed columns, or switch to Parquet; `df.memory_usage(deep=True)` shows which columns (usually `object`
   strings) are responsible.
 - **Grouping a column with missing values under default `dropna=True`.** Symptom: per-group counts sum to
-  fewer rows than the frame, because cases with no category vanished from the report. Fix: pass
-  `dropna=False` or fill the key first.
+  fewer rows than the frame, because cases with no category (or steps with no tool, the final answer)
+  vanished from the report. Fix: pass `dropna=False` or fill the key first.
 
 ## When to use
-- **Use when:** exploratory analysis and reporting on data that fits comfortably in memory: eval results,
-  annotation exports, token and cost logs, small training sets, anything feeding scikit-learn or a plot.
-  It is also the lingua franca for handing tables between libraries.
+- **Use when:** exploratory analysis and reporting on data that fits comfortably in memory: agent traces,
+  eval results, annotation exports, token and cost logs, small training sets, anything feeding
+  scikit-learn or a plot. It is also the lingua franca for handing tables between libraries.
 - **Prefer Polars or DuckDB when:** data approaches RAM size, a pipeline runs repeatedly and speed
   matters, or you want lazy, query-optimized execution.
-- **Prefer a database when:** data is shared, updated concurrently or needs durability.
+- **Prefer a database when:** data is shared, updated concurrently or needs durability, such as live agent
+  state or memory.
 - **Interviews:** expect group-by, joins, vectorization and why chained assignment fails.
 
 ## Role lens
@@ -272,6 +319,14 @@ then `df["cost"] = df["unit"] * df["tokens"]`, both of which operate on whole co
   aligned by hand.
 - **Ecosystem:** scikit-learn, plotting libraries and most readers accept or produce DataFrames.
 
+### Your agent's average cost per run rose 40% this week. How would you use traces to find out why?
+- **Shape the data:** load one row per step with run ID, tool, status and token counts; aggregate per run
+  (steps, input and output tokens, cost) and compare the two weeks' distributions, not just means.
+- **Slice:** group by tool and status to find a tool whose error rate rose, since failing tools cause
+  retries and longer runs; group by route or category to see whether traffic mix changed.
+- **Confirm in rows:** read the failing traces themselves before fixing, then add those cases to the eval
+  set so the regression is caught next time.
+
 ### Cost totals inflated after a join. How do you find and prevent the cause?
 - **Likely cause:** the key is not unique on the side you assumed, so a left join multiplied rows.
 - **Find it:** compare row counts before and after the merge, and check duplicate keys with
@@ -286,18 +341,20 @@ then `df["cost"] = df["unit"] * df["tokens"]`, both of which operate on whole co
   modifies `df` and pandas emits `ChainedAssignmentError` instead.
 - **Fix:** one `.loc[mask, "col"] = x` call; enable `mode.copy_on_write` on 2.x in tests before upgrading.
 
-### A 10-million-row usage CSV exhausts memory. How do you cut it down?
+### Would you give an agent a pandas DataFrame as a tool? What are the risks?
+- **The appeal:** a model writing pandas code can answer open-ended questions over a table without you
+  pre-building every query.
+- **The risk:** it is arbitrary code execution driven by model output (and by any text the model read),
+  so it needs a sandbox with no secrets, no network and resource limits.
+- **The usual alternative:** a few typed tools (filter, aggregate by column, top-n) with validated
+  arguments, which are safer and easier to evaluate when the question types are known.
+
+### A 10-million-row usage CSV exhausts memory. How do you cut it down, and when would you leave pandas?
 - **Read less:** pass `usecols=` for the needed columns and `chunksize=` to aggregate chunk by chunk.
 - **Pin dtypes:** `int32` and `float32` take 40 MB per column instead of 80 MB in int64 or float64, and a
-  repeated string as `category` costs about 1 byte per row instead of a pointer plus a Python string.
-- **Measure, then switch format:** `df.memory_usage(deep=True)` shows the offending columns, usually
-  `object` strings; Parquet keeps the dtypes for the next reader.
-
-### When would you not use pandas?
-- **Near RAM size or in repeated pipelines:** pandas is eager and mostly single-core, needing several
-  times the data size in RAM; Polars or DuckDB optimize lazily and stream.
-- **Shared or concurrently updated data:** a database gives durability and concurrent access.
-- **Keep pandas for:** notebook-scale exploration, eval reports and hand-offs to scikit-learn or plots.
+  repeated string as `category` costs about 1 byte per row; `df.memory_usage(deep=True)` shows offenders.
+- **Leave pandas when:** data nears RAM size or the pipeline repeats (Polars or DuckDB optimize lazily and
+  stream), or data is shared and concurrently updated (a database).
 
 ## Quiz
 ### Q: `a` has index [0, 1, 2] and `b` has index [1, 2, 3]. What does `a + b` return?

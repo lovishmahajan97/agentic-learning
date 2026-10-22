@@ -5,7 +5,8 @@ name: Integration and end-to-end testing
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/pytest
   - python-for-ai/test-doubles-mocks-fixtures
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Integration tests run your code against real dependencies (Postgres with pgvector, Redis, a real HTTP
-stack); end-to-end tests drive the deployed system through its public interface. Keep fewer of each going
-up, because some failures exist only there.
+Integration tests run your agent against real dependencies (Postgres with pgvector, Redis, the real SDK
+over HTTP); end-to-end tests drive the deployed agent through its public interface. Keep fewer of each
+going up, because some failures exist only there.
+
+## For agent builders
+- **Why it matters for agents.** An agent with green unit tests can still retrieve nothing for one
+  tenant, lose a tool result in SDK serialisation, or answer before ingestion finished. Those are
+  disagreements with real systems, and only tests against real systems find them.
+- **Where it shows up in your stack.** Testcontainers for the vector store and memory database, a fake
+  model server behind the real provider SDK (`base_url=`), recorded cassettes, and a few e2e journeys
+  against the deployed agent API.
+- **What you control.** Which boundaries get a real dependency, where the model is faked, replayed or
+  called live, and what an agent e2e test asserts: trajectory and structure (tools called, cited IDs),
+  never exact wording.
+- **What you can skip.** Judging answer quality here. That is the eval suite's job; these tests check the
+  plumbing the model depends on.
 
 ## Why it exists
 - **Unit tests only prove logic given your assumptions.** Doubles check your code against your model of
@@ -86,6 +100,14 @@ integration and e2e tests:
    (valid JSON, cited document IDs exist) rather than exact text.
 - **Judging answer *quality* belongs in the eval suite**, not the test suite.
 
+### What an agent test asserts at each level
+| Level | Model | Assert |
+|---|---|---|
+| Integration | fake model server behind the real SDK | tool results reach the model in the right message format; retries and parsing work |
+| Integration | none (tools tested directly) | each tool against its real backend: SQL, vector search, file system sandbox |
+| End-to-end | fake server, scripted per scenario | trajectory: which tools ran, in what order, within the step budget |
+| End-to-end, scheduled | live | structure and invariants: valid JSON, cited IDs exist, no tool errors |
+
 ### End-to-end tests that are not flaky
 Most e2e flakiness is self-inflicted, and each cause has a mechanical fix:
 - **Starting before the system is ready.** Wait on a readiness endpoint that checks dependencies, not on
@@ -124,6 +146,72 @@ flowchart LR
 ```
 
 ## Examples
+### Agent scenario: real SDK, real HTTP, scripted model
+A local server speaks the chat-completions shape and replays a script: one tool call, then a final
+answer. The real OpenAI SDK, the agent loop and the tool run unmodified, so a tool result dropped or
+mis-shaped in serialisation fails here. Runnable with `pip install openai pytest`.
+
+```python
+import json, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import pytest
+from openai import OpenAI
+
+TOOLS = [{"type": "function", "function": {"name": "search_docs", "parameters": {
+    "type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}]
+SCRIPT = [{"role": "assistant", "content": None, "tool_calls": [{"id": "call_1", "type": "function",
+           "function": {"name": "search_docs", "arguments": '{"query": "refund window"}'}}]},
+          {"role": "assistant", "content": "Refunds take 14 days [d1]."}]
+
+class FakeModel(BaseHTTPRequestHandler):
+    seen = []                                           # every request body the SDK sent
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        FakeModel.seen.append(body)
+        msg = SCRIPT[len(FakeModel.seen) - 1]
+        data = json.dumps({"id": "x", "object": "chat.completion", "created": 0, "model": body["model"],
+            "choices": [{"index": 0, "message": msg,
+                         "finish_reason": "tool_calls" if msg.get("tool_calls") else "stop"}]}).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def log_message(self, *args): pass
+
+@pytest.fixture
+def model_url():
+    srv = HTTPServer(("127.0.0.1", 0), FakeModel)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_port}/v1"
+    srv.shutdown()
+
+def search_docs(query):                                 # in a real suite: the container-backed retriever
+    return [{"doc_id": "d1", "text": "Refunds are issued within 14 days."}]
+
+def run_agent(client, question, max_steps=4):
+    messages, trace = [{"role": "user", "content": question}], []
+    for _ in range(max_steps):
+        msg = client.chat.completions.create(model="any", messages=messages, tools=TOOLS).choices[0].message
+        if not msg.tool_calls:
+            return msg.content, trace
+        messages.append(msg.model_dump(exclude_none=True))
+        for tc in msg.tool_calls:
+            trace.append(tc.function.name)
+            result = search_docs(**json.loads(tc.function.arguments))
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps(result)})
+    raise RuntimeError("step budget exhausted")
+
+def test_agent_trajectory_over_real_http(model_url):
+    client = OpenAI(base_url=model_url, api_key="test", max_retries=0)
+    answer, trace = run_agent(client, "How long do refunds take?")
+    assert trace == ["search_docs"]                                 # trajectory
+    assert "[d1]" in answer                                         # structure, not wording
+    assert FakeModel.seen[1]["messages"][-1]["role"] == "tool"      # result went back to the model
+```
+
+- **What it catches that a unit test cannot:** the assistant message re-sent in the wrong shape, a
+  missing `tool_call_id`, or an SDK upgrade that changes how tool calls parse.
+- **Scale it up** by swapping `search_docs` for the container-backed retriever below and scripting one
+  `SCRIPT` per journey.
+
 ### Integration test: a pgvector retriever against the real extension
 The embedder is a deterministic fake so results are reproducible; everything else (SQL, index,
 migrations, tenant filter) is real. `PgRetriever` and `HashEmbedder` stand for the application's own code.
@@ -248,6 +336,9 @@ Illustrative indexing times on a shared CI runner: about 4 s typically, up to 25
   e2e tests to green, because retries hide real races and timeouts near p99 latency.
 - **Scheduled live-model smoke.** A handful of real calls on a schedule or before release, asserting valid
   JSON and existing cited IDs. Alert on structure failures; track cost and rate-limit errors per run.
+- **Trajectory assertions from traces.** Have the agent service return or log a trace per run (tools
+  called, step count, request IDs) and assert on it in e2e tests: expected tools ran, no tool errored, the
+  step budget held. Monitor step count per journey; a jump means the agent is looping.
 
 ## Trade-offs
 - **Real dependencies vs startup cost.** They catch dialect, index and migration bugs that fakes hide, but
@@ -275,6 +366,9 @@ Illustrative indexing times on a shared CI runner: about 4 s typically, up to 25
   busy CI runners and passes on rerun, while the suite's wall time grows by the sum of every guess.
 - **Retrying flaky e2e tests until green.** Symptom: a real intermittent bug (a race, a timeout too close
   to p99 latency) that the retry hides and production users then hit.
+- **Agent e2e tests against a live model as the default lane.** Symptom: red runs that change with the
+  model's mood, a token bill per pull request, and rate-limit failures. Fix: a scripted fake server in
+  the default lane and a few scheduled live journeys asserting structure only.
 
 ## When to use
 - **Write an integration test at every boundary** where your code meets something you did not write and
@@ -335,6 +429,13 @@ these tests check the plumbing that the model depends on.
 - **Use record and replay** for realistic responses, refreshing cassettes deliberately.
 - **Keep a few scheduled live calls** asserting structure (valid JSON, cited IDs exist), and leave answer
   quality to evals.
+
+### What would an end-to-end test of a tool-using agent assert?
+- **Trajectory, not prose:** which tools ran, in what order, that none returned an error, and that the
+  run finished within its step budget.
+- **Structure of the answer:** cited document IDs exist, output parses, no internal error text leaks.
+- **Make it deterministic** with a fake model server scripted per journey behind the real SDK, and keep
+  a few scheduled live runs for drift; quality stays in evals.
 
 ### Why might a filtered vector search test pass locally but miss a real production bug?
 - **On a near-empty table Postgres may choose an exact sequential scan**, so the HNSW index and its

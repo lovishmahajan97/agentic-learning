@@ -5,7 +5,8 @@ name: Serverless GPUs
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - infra-capacity-economics/keda-autoscaling
   - infra-capacity-economics/break-even-analysis
@@ -21,9 +22,20 @@ sources:
 ---
 
 ## TL;DR
-Serverless GPUs bill per second and scale to zero, so bursty workloads pay only for busy seconds. The
-cost: cold starts of tens of seconds to minutes and a rate above on-demand. Decide on utilisation
-break-even, gated by your latency SLO.
+Serverless GPUs bill per second and scale to zero, so bursty agent workloads (nightly agents, eval
+suites, low-traffic tools) pay only for busy seconds. The cost: cold starts of tens of seconds to minutes
+and a rate above on-demand.
+
+## For agent builders
+- **Why it matters for agents.** Much agent GPU work is bursty: an eval suite that runs on every prompt
+  change, a nightly research agent, an internal agent used in office hours. Paying per second fits that
+  shape, but a cold start can land mid-run when a slow tool call outlasts the idle window.
+- **Where it shows up in your stack.** Platforms such as Modal, RunPod Serverless or Cloud Run with GPUs
+  hosting a self-hosted agent model, embedder or judge; per-token model APIs are the layer above.
+- **What you control.** Scale-down window versus tool-call gaps, per-container concurrency, weights on a
+  cached volume, and a hybrid base for interactive agents.
+- **What you can skip.** How the provider pools its fleet. Measure cold start by stage and run the
+  break-even arithmetic.
 
 ## Why it exists
 - **A dedicated GPU costs the same idle or busy.** It costs the same per hour whether it serves ten
@@ -98,9 +110,18 @@ Each stage has its own mitigation, and the total is the sum:
   option has been CPU-only. Google Cloud Run and Azure Container Apps have added GPU options, with
   constraints that change, so check current support before designing around any of them.
 
+### How agent traffic meets the lifecycle
+- **Gaps come from tools, not users.** Between two model calls an agent may run code, browse or wait on
+  a slow API. If that gap exceeds the scale-down window, the next step pays a full cold start mid-run.
+- **A new container starts with an empty prefix cache,** so the first step on it re-prefills the whole
+  transcript even when the cold start itself is short.
+- **Eval and batch agents are the natural fit:** a suite of agent tasks is a burst of thousands of calls
+  followed by hours of nothing, exactly the shape per-second billing rewards.
+
 ## Diagram
-The request lifecycle on a scale-to-zero platform: the warm path is cheap and fast, the cold path pays
-every start-up stage, and the idle window is billed before each scale-down.
+The lifecycle an agent's model calls see on a scale-to-zero platform: the warm path is cheap and fast,
+the cold path pays every start-up stage, and the idle window is billed before each scale-down. A tool gap
+longer than the window sends the next step down the cold path.
 
 ```mermaid
 stateDiagram-v2
@@ -149,6 +170,22 @@ serverless $1.60 per hour-equivalent, billed per second, a 2× premium. Measured
 - **The right design** is a dedicated card (or Kubernetes replica) for the base load and serverless only
   for bursts above it, where the cold start affects a small tail of requests during ramps. The arithmetic,
   not the branding, picks the layout.
+
+### Worked scenario: an agent eval suite on serverless versus a dedicated card
+A team self-hosts an 8B agent model and runs a 500-task agent eval on every prompt or tool change, about
+twice a day. Each task averages 20 model calls at ~3 GPU-seconds each, at the same illustrative rates.
+
+| Line | Arithmetic | Monthly |
+|---|---|---|
+| GPU-seconds per suite | 500 × 20 × 3 = 30,000 s ≈ 8.3 hours | |
+| Busy hours | 2 suites a day × 30 days × 8.3 h ≈ 500 hours | about $800 at $1.60/h |
+| With 8 concurrent inputs batched per container | GPU time shrinks by several times when the engine batches the suite's calls | well under $800 |
+| Dedicated L4 kept for evals | 730 hours at $0.80 | $584, but every suite queues on one card instead of fanning out |
+
+- **The unbatched line loses to dedicated**, because 500 busy hours is above the 50% break-even; the
+  batched line wins and also finishes each suite faster by fanning out across containers.
+- **Cold starts barely matter here:** one per container per suite, with no user waiting on step one.
+- **Interactive agents are the opposite case:** use the hybrid base-plus-burst layout below.
 
 ### Monthly cost calculator with the idle tail included
 Reproduces workload A and shows the scale-down window as a cost knob. Rates are the illustrative figures
@@ -207,19 +244,22 @@ class Model:
 - **Weights on a cached volume, never in the image or a bucket.** Use on every serverless GPU function.
   Mount the platform's volume or model cache and load from it in a start-up hook. Monitor cold-start time
   by stage; weight load should be seconds, not minutes.
-- **Tune the scale-down window from the idle-tail line.** Use when the bill has more idle than busy hours.
-  Compute cold starts per day times the window, as in the calculator, and shorten the window until cold
-  starts begin to rise. Monitor billed idle seconds and cold-start count together.
+- **Tune the scale-down window from the idle-tail line and tool gaps.** Use when the bill has more idle
+  than busy hours. Compute cold starts per day times the window, as in the calculator, and shorten the
+  window until cold starts begin to rise, but keep it above the p95 gap between an agent's model calls.
+  Monitor billed idle seconds, cold-start count and cold starts per agent run.
 - **Batch inside each container.** Use whenever the engine supports concurrent requests. Set per-container
   concurrency to what the batching lesson and KV room allow (for example eight concurrent inputs), not 1.
   Monitor GPU-seconds per request and per-container queue time.
-- **Hybrid base plus burst.** Use when there is a latency SLO and a steady floor of traffic. Serve the base
+- **Hybrid base plus burst.** Use when there is a latency SLO and a steady floor of traffic, as with
+  interactive agents. Serve the base
   load on a dedicated card or Kubernetes replica and route only overflow to serverless. Monitor the
   fraction of requests that hit a cold start and p95/p99 with cold starts included.
 - **Snapshot after imports.** Use where the platform offers memory snapshots and imports dominate start-up.
   Enable the snapshot after imports and weight loading to CPU, then move to the GPU at restore. Monitor
   cold-start p50 before and after.
-- **Capacity fallback for bursts.** Use for any customer-facing endpoint. Configure a second GPU type or
+- **Capacity fallback for bursts.** Use for any customer-facing endpoint, and for agent loops, which
+  should retry a capacity error on the fallback rather than fail the run. Configure a second GPU type or
   region, or a per-token API, for capacity errors. Monitor capacity or quota errors per GPU type and region.
 
 ## Trade-offs
@@ -234,6 +274,9 @@ class Model:
   price, often decides.
 - **Managed pooling vs control.** It hides nodes, drivers and images, at the cost of vendor-specific SDKs,
   less control over GPU topology and limits on multi-GPU or multi-node models.
+- **Scale-to-zero vs warm prefix caches for agents.** Containers that come and go save idle cost, but each
+  new one loses the cached prefix of every in-flight agent, so the next step re-prefills. It flips toward
+  dedicated replicas once agents run long transcripts at steady volume.
 
 ## Pitfalls
 - **Loading weights from a remote bucket on every start.** Symptom: cold starts of minutes that no
@@ -249,10 +292,13 @@ class Model:
   account's container limit, is exhausted exactly when everyone's traffic peaks. Fix: a fallback.
 - **Promising a tight p95 on a scale-to-zero deployment.** Symptom: an SLO breach on the first request
   after every lull. Fix: hybrid base plus burst.
+- **An idle window shorter than the agent's tool gaps.** Symptom: agent runs with a 45-second stall
+  in the middle, right after a slow tool call, while the first step was fast. Fix: set the window above
+  the p95 tool gap, or keep that agent's model on a warm base.
 
 ## When to use
-- **Use when:** utilisation would be low or bursty (internal tools, nightly batch, prototypes, long-tail
-  models that are rarely hit), latency can absorb a cold start or the warm pool makes it rare, and you
+- **Use when:** utilisation would be low or bursty (internal tools, nightly batch and eval-suite agents,
+  prototypes, long-tail models that are rarely hit), latency can absorb a cold start or the warm pool makes it rare, and you
   want no node operations.
 - **Prefer dedicated capacity or Kubernetes when:** sustained utilisation exceeds the price ratio, tail
   latency is contractual, or the model spans multiple GPUs.
@@ -298,6 +344,14 @@ the base load to dedicated capacity if the utilisation arithmetic says so.
 - **Then** keep weights out of the image, snapshot after imports where offered, and decide whether engine
   warm-up such as CUDA graph capture is worth its tens of seconds.
 
+### Your agent's runs stall for about 45 seconds mid-run on a serverless GPU. What is happening and what do you change?
+- **Diagnosis:** a slow tool call outlasted the scale-down window, so the next model call met a cold
+  start, and the new container also lost the transcript's cached prefix.
+- **Confirm** from traces: stalls follow tool gaps longer than the window, and container start events line
+  up with them.
+- **Fix:** set the window above the p95 tool gap, put interactive agents on a warm dedicated base with
+  serverless for bursts, and keep eval or batch agents on scale-to-zero.
+
 ### At what point would you move a workload off serverless onto dedicated GPUs?
 - **Utilisation:** when busy fraction exceeds the dedicated rate divided by the serverless rate, 50% with a
   2× premium, and lower once cold starts and idle tails are billed.
@@ -305,7 +359,7 @@ the base load to dedicated capacity if the utilisation arithmetic says so.
   serverless.
 - **Shape:** when the model spans multiple GPUs or nodes, which most platforms limit.
 
-### Your serverless bill doubled but request volume did not change. What do you look at?
+### Your agent eval suite's serverless bill doubled but the number of tasks did not change. What do you look at?
 - **Idle tail:** cold starts per day times the scale-down window; a longer window or more frequent gaps can
   make idle seconds the largest line, as in the worked $160 idle versus $40 busy.
 - **Cold-start seconds** are billed too, so a regression in image size or weight loading raises cost.

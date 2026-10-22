@@ -5,7 +5,8 @@ name: Race conditions & synchronization primitives (asyncio.Lock, Semaphore)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -20,17 +21,32 @@ sources:
 ---
 
 ## TL;DR
-Single-threaded asyncio still races whenever an `await` separates reading shared state from writing it.
-`asyncio.Lock` makes check-then-act exclusive; `asyncio.Semaphore` caps concurrent calls to a provider.
-Neither is thread-safe, and a semaphore limits concurrency, not requests per second.
+Parallel tool calls and sub-agents share state (budgets, memory, tokens), and asyncio races whenever an
+`await` separates the read from the write. `asyncio.Lock` makes check-then-act exclusive;
+`asyncio.Semaphore` caps calls in flight, but not requests per second.
+
+## For agent builders
+- **Why it matters for agents.** Once an agent runs tools in parallel, spawns sub-agents or serves many
+  sessions per process, they share mutable state: a per-run token or dollar budget, a scratchpad or memory
+  store, an auth token, a lazily loaded index. Each check-then-act across an `await` is a race.
+- **Where it shows up in your stack.** Budget and step counters in your agent loop, provider client and
+  token caches, lazy loading of embedding models or vector indexes, and the concurrency cap on every model,
+  embedding and tool provider you fan out to.
+- **What you control.** Which state is shared (prefer per-run state over globals), a `Lock` or
+  single-flight task around read-await-write, a `Semaphore` or bounded `Queue` per provider, and a shared
+  rate limiter once you run more than one worker.
+- **What you can skip.** `asyncio.Condition` details and building your own primitives. Know the three
+  ingredients of a race, double-checked locking, single-flight and Little's law for sizing.
 
 ## Why it exists
 - **"Async cannot race" is half true.** Between two awaits a coroutine runs uninterrupted, so
-  `self.count += 1` on its own is safe in asyncio, unlike in threaded code. But real logic spans awaits.
+  `self.count += 1` on its own is safe in asyncio, unlike in threaded code. But real agent logic spans
+  awaits.
 - **Check-then-act across an await races.** "If the auth token is expired, fetch a new one and store it"
   reads, awaits a network call, then writes. Meanwhile a hundred other requests see the same expired
   token and each starts a refresh: a thundering herd on the auth server, and if refreshes invalidate
-  earlier tokens, some requests hold revoked ones.
+  earlier tokens, some requests hold revoked ones. "If budget remains, call the model, then deduct" is the
+  same bug for agents.
 - **Unbounded fan-out exhausts resources.** `gather` over 5,000 prompts starts 5,000 HTTP requests at
   once. The provider answers most with 429s, the connection pool queues the rest, memory fills with
   pending responses, and timeouts fire on requests that never left the process. You need a gate that
@@ -43,10 +59,10 @@ Neither is thread-safe, and a semaphore limits concurrency, not requests per sec
 ## How it works
 ### Where races come from
 An asyncio race needs all three:
-1. **Shared mutable state.**
+1. **Shared mutable state** (an agent's budget, memory, cache).
 2. **A read and a dependent write.**
 3. **An `await` between them**, because every `await` is a point where the loop may run any other ready
-   coroutine.
+   coroutine, such as a sibling tool call.
 
 **Audit question per coroutine:** "what shared state did I read before this await, and do I still rely
 on it after?"
@@ -64,7 +80,8 @@ A: store token_1
 
 - **Not a torn write but a stale decision.** Nothing is corrupted, which is what threads give you.
 - **So it hides from tests.** asyncio races are logic bugs that pass unit tests (which run one coroutine at
-  a time) and appear only under concurrent load.
+  a time) and appear only under concurrent load, or only when the model happens to request tools in
+  parallel.
 
 ### asyncio.Lock
 - **Ownership.** At most one coroutine owns it. `async with lock:` awaits `acquire()`; if held, the
@@ -91,7 +108,8 @@ Two cares:
 ### asyncio.Semaphore
 - **Mechanism.** A counter initialised to N. `acquire()` decrements it, or waits if it is zero;
   `release()` increments it and wakes a waiter.
-- **Effect.** `async with sem:` around an LLM call keeps at most N calls in flight, however many tasks exist.
+- **Effect.** `async with sem:` around an LLM call keeps at most N calls in flight, however many agent
+  sessions and tool tasks exist.
 - **`BoundedSemaphore`** also raises if you release more times than you acquired, catching bookkeeping bugs.
 - **It caps *concurrency*, not rate.** Throughput is concurrency divided by latency (Little's law), so if
   latency rises, the same semaphore yields fewer requests per second.
@@ -107,18 +125,19 @@ N ≈ λ × W        e.g. 20 requests/s × 1.5 s latency ≈ 30 slots
   token bucket, often combined with a semaphore.
 
 ### The other primitives
-| Primitive | What it does | Typical use |
+| Primitive | What it does | Typical agent use |
 |---|---|---|
-| `asyncio.Event` | Many coroutines wait until one sets a flag | "model warmed up", "shutdown started" |
+| `asyncio.Event` | Many coroutines wait until one sets a flag | "model warmed up", "shutdown started", "user pressed Stop" |
 | `asyncio.Condition` | A lock plus wait/notify | More complex predicates |
-| `asyncio.Queue(maxsize=N)` | Bounded producer/consumer queue | Often the best primitive: concurrency limits and backpressure without explicit locking |
+| `asyncio.Queue(maxsize=N)` | Bounded producer/consumer queue | Often the best primitive: concurrency limits and backpressure without explicit locking, for eval runs and ingestion |
 
 ### What they do not cover
 - **One event loop only.** They coordinate coroutines on one loop; they are not thread-safe and do nothing
   across processes or replicas.
 - **Limits multiply per process.** Two Uvicorn workers each holding their own `Semaphore(8)` allow 16
   concurrent calls.
-- **Cross-replica limits** need a shared store such as Redis or a gateway.
+- **Cross-replica limits** need a shared store such as Redis or a gateway. So does agent state that must
+  survive across workers, such as a per-user budget.
 
 ## Diagram
 The token-cache request path: the semaphore caps calls in flight, and the lock plus a second validity
@@ -126,18 +145,64 @@ check makes sure only the first waiter refreshes while the rest reuse its token.
 
 ```mermaid
 flowchart TD
-    R["Request coroutine"] --> S["async with Semaphore(N): wait for a free slot"]
-    S --> V{"Token valid? (fast path, no lock)"}
+    R["Agent step coroutine"] --> S["async with Semaphore(N)"]
+    S --> V{"Token valid? (no lock)"}
     V -->|"yes"| C["Call the LLM"]
-    V -->|"no"| L["async with Lock: park in FIFO queue until owner releases"]
-    L --> V2{"Still invalid? (re-check inside lock)"}
+    V -->|"no"| L["async with Lock: wait in FIFO"]
+    L --> V2{"Still invalid? (re-check)"}
     V2 -->|"no, another waiter refreshed"| C
-    V2 -->|"yes"| F["await refresh() then store token"]
+    V2 -->|"yes"| F["await refresh(), store token"]
     F --> C
     C --> X["Release slot, wake next waiter"]
 ```
 
 ## Examples
+### Agent budget shared by parallel tool calls
+Four parallel tool calls each check the run's remaining budget, await an LLM sub-call, then deduct. Without
+the lock all four pass the check before any deduction lands. Costs are illustrative.
+
+```python
+import asyncio
+
+class RunBudget:
+    def __init__(self, dollars: float) -> None:
+        self.left = dollars
+        self._lock = asyncio.Lock()
+
+    async def spend_racy(self, cost: float) -> bool:
+        if self.left < cost:                 # read
+            return False
+        await asyncio.sleep(0.1)             # model sub-call: other tools run here
+        self.left -= cost                    # write based on a stale read
+        return True
+
+    async def spend_safe(self, cost: float) -> bool:
+        async with self._lock:               # reserve before awaiting
+            if self.left < cost:
+                return False
+            self.left -= cost
+        try:
+            await asyncio.sleep(0.1)         # model sub-call outside the lock
+            return True
+        except BaseException:
+            async with self._lock:
+                self.left += cost            # refund if the call failed or was cancelled
+            raise
+
+async def main() -> None:
+    for name in ("spend_racy", "spend_safe"):
+        b = RunBudget(1.00)
+        ok = await asyncio.gather(*(getattr(b, name)(0.40) for _ in range(4)))
+        print(f"{name}: approved={sum(ok)} left=${b.left:.2f}")
+
+asyncio.run(main())
+# spend_racy: approved=4 left=$-0.60    spend_safe: approved=2 left=$0.20
+```
+
+- **Reserve, then await.** The safe version decides and deducts with no `await` inside the lock, so the
+  lock is held for microseconds rather than the whole model call.
+- **Refund on failure** keeps the budget honest when a tool errors or the turn is cancelled.
+
 ### Token cache plus concurrency cap
 ```python
 import asyncio, time
@@ -185,8 +250,8 @@ asyncio.run(main())
 The bug scales with your concurrency setting, which is why it often appears only under load.
 
 ### Single-flight loader
-Fifty callers, one load. The shield keeps one caller's cancellation from killing the shared work, and the
-callback clears a failed task so the next caller retries.
+Fifty agent sessions, one index load. The shield keeps one caller's cancellation from killing the shared
+work, and the callback clears a failed task so the next caller retries.
 
 ```python
 import asyncio
@@ -230,6 +295,9 @@ asyncio.run(main())
 | `Semaphore(8)` × 2 Uvicorn workers | any | 16 concurrent calls, not 8 |
 
 ## Production patterns
+- **Reserve agent budgets before the call.** Deduct the estimated cost of a model or tool call under a
+  lock (or an atomic decrement in Redis for cross-worker budgets) before awaiting it, then reconcile with
+  actual usage. Monitor runs that exceed budget; any at all means a read-await-write slipped through.
 - **Size per-worker slots from the fleet target.** Compute N ≈ λ × W for the whole fleet, then divide by
   worker count × replicas. Monitor in-flight requests and the time spent waiting to acquire the semaphore.
 - **Shared rate limiter for quotas.** Enforce requests- and tokens-per-minute with a token bucket in a shared
@@ -245,18 +313,19 @@ asyncio.run(main())
 
 ## Trade-offs
 - **Correctness vs serialisation.** A lock makes a critical section correct but serialises it; with a slow
-  await inside, throughput collapses to one call at a time. Keep only the minimum inside the lock.
+  await inside (a model call), throughput collapses to one call at a time. Keep only the minimum inside the
+  lock, as the reserve-then-await budget does.
 - **Protection vs unused capacity.** A tight semaphore protects the provider and your memory but leaves
   capacity unused; when quota is generous and latency high, a larger limit gives more throughput.
 - **Simple vs fleet-wide.** In-process primitives are fast and simple but invisible to other workers and
-  replicas; once you scale horizontally, limits move to a shared store or an API gateway.
+  replicas; once you scale horizontally, limits and budgets move to a shared store or an API gateway.
 - **Queue vs semaphore.** A bounded `asyncio.Queue` with fixed workers is easier to reason about than many
   tasks behind a semaphore, at the cost of more structure. It wins when work arrives continuously rather
   than in batches.
 
 ## Pitfalls
-- **Assuming single-threaded means race-free.** Symptom: duplicate refreshes, duplicate writes or
-  double-spent budgets that only show up under concurrent load.
+- **Assuming single-threaded means race-free.** Symptom: duplicate refreshes, duplicate writes to agent
+  memory or double-spent budgets that only show up under concurrent load or parallel tool calls.
 - **Creating a primitive at import time and using it from different loops**, as tests often do. Since 3.10
   a primitive binds to the loop on which it first has to wait and raises `RuntimeError` ("bound to a
   different event loop") when it must wait on another. The failure appears only under contention and
@@ -264,7 +333,8 @@ asyncio.run(main())
 - **Using a semaphore to enforce a requests-per-minute quota.** Symptom: 429s return when provider latency
   drops, because the same concurrency then produces more requests per minute.
 - **Re-acquiring the same `asyncio.Lock` in a nested call.** The coroutine waits on itself forever and the
-  request hangs with no error. Fix: take the lock once at the outer level and call an unlocked inner helper.
+  agent step hangs with no error. Fix: take the lock once at the outer level and call an unlocked inner
+  helper.
 - **Holding a lock or semaphore across a call with no timeout.** One hung upstream request starves every
   waiter behind it. Fix: `async with asyncio.timeout(...)` inside the gate.
 
@@ -272,7 +342,7 @@ asyncio.run(main())
 - **Lock when** a coroutine reads shared state, awaits, then writes based on what it read: token and
   client caches, lazy model or index loading, per-conversation agent state, budget counters.
 - **Semaphore (or bounded queue) when** you fan out to a dependency with finite capacity: LLM providers,
-  embedding APIs, vector stores, scrapers.
+  embedding APIs, vector stores, scrapers, sandboxed code runners.
 - **Avoid** locks around code with no await inside; it is already atomic with respect to other coroutines.
 - **Measure:** in-flight requests, 429 rate and queue wait time. If wait time dominates latency, the limit
   is too tight or the dependency is saturated.
@@ -305,7 +375,15 @@ by a gateway, with the semaphore kept only to bound memory and connections. Retr
 - **It is a stale decision, not a torn write**, which is why it passes unit tests and appears only
   under concurrent load.
 
-### Fifty concurrent requests all trigger a reload of the same vector index. How would you fix it?
+### Your agent overspent its per-run budget only on turns where the model called tools in parallel. Why, and how do you fix it?
+- **Read-await-write on a shared budget.** Each parallel tool checked the remaining budget, awaited its
+  model sub-call, then deducted, so all of them passed the check before any deduction landed.
+- **Reserve before awaiting:** decide and deduct inside an `asyncio.Lock` with no await in the critical
+  section, then refund on failure or cancellation.
+- **Across workers** the same reservation must be an atomic operation in a shared store such as Redis,
+  because an in-process lock is invisible to other processes.
+
+### Fifty concurrent agent sessions all trigger a reload of the same vector index. How would you fix it?
 - **Single-flight the load.** The first caller on a miss stores `asyncio.create_task(load())`, and
   every caller awaits that same task, so one load serves all fifty.
 - **Shield the shared await** so one caller's cancellation does not cancel the load for the others.
@@ -321,9 +399,9 @@ by a gateway, with the semaphore kept only to bound memory and connections. Retr
   needs thread-safe hand-off such as `loop.call_soon_threadsafe`.
 
 ### When would you use a bounded asyncio.Queue with workers instead of a semaphore around each task?
-- **When work arrives continuously** (an ingest pipeline, a crawler): producers block on `put` once
-  `Queue(maxsize=N)` is full, so memory stays bounded. A semaphore over `gather` still creates every task
-  up front and only gates the call itself.
+- **When work arrives continuously** (an ingest pipeline, a crawler, an eval run streaming cases): producers
+  block on `put` once `Queue(maxsize=N)` is full, so memory stays bounded. A semaphore over `gather` still
+  creates every task up front and only gates the call itself.
 - **When you want a fixed, visible concurrency level:** N worker tasks means N calls in flight, and each
   worker owns its retries and error handling.
 - **Not for a one-off batch of known size**, because the queue costs more structure (worker loops,

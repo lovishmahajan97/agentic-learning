@@ -5,7 +5,8 @@ name: Model portfolio
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - system-design/model-selection
   - system-design/model-routing-cascading
@@ -20,14 +21,26 @@ sources:
 ---
 
 ## TL;DR
-A model portfolio is a small, governed set of models, each with a role, owner, eval baselines, cost
-card, approved data classes and retirement plan. One model everywhere overpays on easy work; per-team
-choices create sprawl nobody can evaluate, secure or exit.
+A model portfolio is the small, governed set of models your agents may call, each with a role, owner,
+eval baselines, cost card, data classes and retirement plan. Agents spend most tokens, so step-level
+routing here cuts the bill most.
+
+## For agent builders
+- **Why it matters for agents.** Agentic tasks are a small share of requests but most of the spend,
+  because each runs several calls over a large context. Routing routine agent steps (summarising tool
+  results, formatting) to a cheaper tier is usually the biggest cost lever you have.
+- **Where it shows up in your stack.** Your agent code names a logical model (`workhorse`,
+  `classifier-small`) per step or role; the gateway's routing table maps it to a pinned vendor model,
+  with a fallback on a second provider.
+- **What you control.** Which tier each agent role uses (planner, tool caller, summariser, guardrail
+  check), when to route per step, and the eval baselines that must pass before a rotation.
+- **What you can skip.** Org-wide procurement and vendor negotiation detail. Know the tiers, the
+  registry record, the entry and exit rules and the concentration metrics.
 
 ## Why it exists
 - **Failure mode 1: one model for everything.** The frontier model classifies support intents at
   frontier prices and latency, cannot be deployed in the region a customer requires, and one provider
-  outage or deprecation hits every product at once.
+  outage or deprecation hits every product and every agent at once.
 - **Failure mode 2: every team picks its own.** Eighteen months later: a dozen models across half a
   dozen providers, a dozen sets of prompt lore, no shared evaluation, a security review and
   data-processing agreement per provider, incompatible data-use terms, no record of which model may see
@@ -45,24 +58,24 @@ choices create sprawl nobody can evaluate, secure or exit.
 ### Roles, and why each exists
 | Role | Used for | Why it exists |
 |---|---|---|
-| **Frontier or reasoning tier** | long-horizon agentic flows, complex code, low-volume high-value analysis | the hardest work; slow and expensive, so used by exception, behind a router or explicit task assignment |
-| **Workhorse tier** | most retrieval-augmented answers, drafting, summarisation | chosen by the model-selection funnel as the cheapest model that clears the bar for typical task families |
-| **Small and fast tier** | classification, routing, schema-bound extraction, PII detection, guardrail checks | most traffic is easy and the price gap between tiers is roughly an order of magnitude per step (illustrative, provider-dependent) |
-| **Embeddings and rerankers** | the retrieval stack | versioned with extra care |
+| **Frontier or reasoning tier** | long-horizon agentic flows, agent planning, complex code, low-volume high-value analysis | the hardest work; slow and expensive, so used by exception, behind a router or explicit task assignment |
+| **Workhorse tier** | most retrieval-augmented answers, drafting, summarisation, routine agent tool steps | chosen by the model-selection funnel as the cheapest model that clears the bar for typical task families |
+| **Small and fast tier** | classification, routing, schema-bound extraction, PII detection, guardrail checks on agent inputs and outputs | most traffic is easy and the price gap between tiers is roughly an order of magnitude per step (illustrative, provider-dependent) |
+| **Embeddings and rerankers** | the retrieval stack and agent memory search | versioned with extra care |
 | **Specialised models** | vision and document understanding, speech-to-text, text-to-speech, code | modalities the text tiers do not cover |
 | **Fine-tuned variants** | a specific high-volume task, derived from a base | owned by the training team but registered centrally so their lifecycle is visible |
 
 - **Small tier specifics.** Often fine-tuned, sometimes self-hosted, expected to answer in well under a
-  second.
+  second, which matters when it runs as a guardrail on every agent step.
 - **Embedding care, because vectors are model-specific.** Changing an embedding model invalidates every
-  stored vector; vectors from two models are not comparable.
+  stored vector, including an agent's long-term memory; vectors from two models are not comparable.
 
 ### The registry entry
 Each model has a record containing:
 - **Identity:** exact pinned version, provider and deployment location.
 - **Data terms:** data-use and retention terms; approved data classifications (may it see customer PII,
-  source code, regulated data?).
-- **Quality:** eval baselines per task family that uses it.
+  source code, regulated data?), which decides whether an agent step holding that data may use it.
+- **Quality:** eval baselines per task family that uses it, including tool-calling tasks.
 - **Cost card:** list price plus measured average tokens per request type; quota and rate limits.
 - **Lifecycle:** owner, announced deprecation date, designated fallback.
 
@@ -86,11 +99,12 @@ requests per month × (cost per request on A − cost per request on B)
 - **Re-run it** when volume grows, prices shift, or an incumbent gets cheaper.
 
 ### Assignment versus routing
-- **Assignment (default).** Configuration says this task family uses `workhorse`; it changes only after
-  an eval. Start here *because* it is cheap and auditable.
-- **Routing.** Chooses a tier per request at run time (by difficulty, confidence or input length) and
-  needs its own evaluation of the router. Add it only for families where tracing shows a clear mix of
-  easy and hard requests, exactly what the agentic slice in the example turns out to be.
+- **Assignment (default).** Configuration says this task family or agent role uses `workhorse`; it
+  changes only after an eval. Start here *because* it is cheap and auditable.
+- **Routing.** Chooses a tier per request or per agent step at run time (by difficulty, confidence,
+  step type or input length) and needs its own evaluation of the router. Add it only for families where
+  tracing shows a clear mix of easy and hard requests, exactly what the agentic slice in the example
+  turns out to be.
 
 ### Entry and exit rules
 - **Entry.** A model enters only if it beats an incumbent on a shared eval for some task family, or
@@ -98,19 +112,19 @@ requests per month × (cost per request on A − cost per request on B)
   This rule is what keeps the set from regrowing.
 - **Exit, as a planned migration:**
   1. Deprecation notice.
-  2. List of consuming tasks from gateway logs.
-  3. Regression evals on each.
+  2. List of consuming tasks and agents from gateway logs.
+  3. Regression evals on each, including agent run-level evals.
   4. Cutover behind the gateway.
   5. Removal.
 - **Routine by necessity.** Provider deprecations are routine, so the process has to be routine too.
 
 ### Enforcement through indirection
-- **Logical names.** Applications reference names such as `workhorse`, `classifier-small` or `embed-v3`;
-  the gateway maps them to the pinned vendor model. Only registered models are routable.
+- **Logical names.** Applications and agents reference names such as `workhorse`, `classifier-small` or
+  `embed-v3`; the gateway maps them to the pinned vendor model. Only registered models are routable.
 - **Why it works.** Fallback, rotation and vendor exit become possible *because* the dependency lives
   in one configuration table rather than in a dozen code bases.
-- **What it does not do.** It does not make prompts magically portable; a rotation still runs
-  regression evals on every consuming task.
+- **What it does not do.** It does not make prompts or tool-calling behaviour magically portable; a
+  rotation still runs regression evals on every consuming task.
 
 ### Diversity and concentration
 - **Second source per critical tier,** on a different provider, for outage resilience and negotiating
@@ -121,14 +135,16 @@ requests per month × (cost per request on A − cost per request on B)
   frontier tier. If the frontier handles a large fraction of volume, routing or task assignment is wrong.
 
 ## Diagram
-Applications only ever name a role (`workhorse`, `classifier-small`, `embed-v3`); the gateway resolves
-it through the registry (pinned version, data classes, baselines, cost card, owner, fallback) to a
-pinned model. Models enter only by beating an incumbent on a shared eval or unlocking a constraint, and
+Applications and agents only ever name a role (`workhorse`, `classifier-small`, `embed-v3`); the gateway
+resolves it through the registry (pinned version, data classes, baselines, cost card, owner, fallback) to
+a pinned model.
+
+Models enter only by beating an incumbent on a shared eval or unlocking a constraint, and
 leave only through the deprecation runbook (consumers from logs, regression evals, cutover).
 
 ```mermaid
 flowchart TD
-    A["Application"] -->|"calls a logical name"| G["Gateway routing table"]
+    A["Agent step or application"] -->|"calls a logical name"| G["Gateway routing table"]
     G -->|"look up name"| R[("Model registry")]
     G --> F["Frontier or reasoning tier"]
     G --> W["Workhorse tier"]
@@ -169,10 +185,18 @@ Daily traffic is 1,000,000 requests:
   obvious 70% of traffic but step-level routing inside the smallest slice. Prefix caching of the shared
   20k context would cut it further.
 
-### The same numbers as a runnable calculator
-Swap in your own traffic mix and price card; the sizing rule is the last function.
+### Step-level routing inside an agent, plus the calculator
+The agent loop picks a logical name per step type; the gateway resolves it. The calculator reproduces
+the table above and the sizing rule. Swap in your own traffic mix and price card.
 
 ```python
+STEP_TIER = {"plan": "frontier", "choose_tool": "frontier",      # hard decisions stay strong
+             "summarise_tool_result": "workhorse", "format_answer": "workhorse",
+             "guardrail_check": "small"}
+
+def model_for(step_type):
+    return STEP_TIER.get(step_type, "frontier")   # unknown step types default to the safe tier
+
 PRICE = {"frontier": (10, 30), "workhorse": (1, 3), "small": (0.1, 0.3)}  # illustrative, per 1M tokens
 
 def daily_cost(slices):
@@ -223,9 +247,14 @@ fallback: classifier-small-secondary
 ```
 
 ## Production patterns
-- **Logical names enforced at the gateway.** As soon as two applications call models. Applications send
-  `workhorse` or `embed-v3`; the gateway's routing table maps each to a pinned vendor model and rejects
-  unregistered names. Monitor requests that bypass the gateway (direct vendor keys found in billing).
+- **Logical names enforced at the gateway.** As soon as two applications or agents call models.
+  Code sends `workhorse` or `embed-v3`; the gateway's routing table maps each to a pinned vendor model
+  and rejects unregistered names. Monitor requests that bypass the gateway (direct vendor keys found in
+  billing).
+- **Step-type routing for agents.** When traces show an agent's steps differ in difficulty. Tag each
+  step with a type (plan, tool choice, summarise, format, guardrail) and map types to logical names;
+  promote a type to a cheaper tier only after its step-level eval holds. Monitor run success and spend
+  per step type.
 - **Registry-driven deprecation runbook.** When any provider announces a retirement. Query gateway logs
   for every consumer of the logical name, run each consumer's regression eval on the replacement, cut
   over in the routing table, then delete the old mapping. Monitor days from notice to completed cutover.
@@ -236,13 +265,17 @@ fallback: classifier-small-secondary
   in a sandbox project with its own keys and budget cap; registration is required before production
   traffic. Monitor sandbox spend and how many sandbox models request registration.
 - **Embedding rotation as a re-index project.** When changing `embed-*` entries. Build a new index with
-  the new model alongside the old, measure retrieval quality on the golden set, then switch the logical
-  name and the index together. Monitor recall on the golden queries before and after.
+  the new model alongside the old, including agent memory stores, measure retrieval quality on the
+  golden set, then switch the logical name and the index together. Monitor recall on the golden queries
+  before and after.
 
 ## Trade-offs
 - **Tiering vs overhead.** Tiering cuts spend, but every tier adds evaluation, prompt and monitoring
   overhead. Once a tier's monthly saving falls below that fixed overhead (the sizing rule), a two-model
   portfolio, one strong and one small, is the right size.
+- **Step-level routing vs agent reliability.** Routing routine steps saves most of the agentic bill,
+  but each hand-off between models is a place where formats or assumptions break. It flips back to one
+  model per agent when run success drops more than the saving is worth.
 - **Central approved list vs experimentation.** It gives governance and purchasing leverage but slows
   experimentation. The usual fix is a sandbox tier for unregistered models on non-sensitive data, with
   registration required before anything reaches production.
@@ -257,29 +290,32 @@ fallback: classifier-small-secondary
 
 ## Pitfalls
 - **Portfolio on paper, vendor IDs in code.** Symptom: a single deprecation notice turns into code
-  changes and releases across a dozen repositories. Fix: logical names enforced at the gateway.
+  changes and releases across a dozen repositories and agent configs. Fix: logical names enforced at
+  the gateway.
 - **Frontier tier carries bulk traffic because "it works".** Symptom: frontier share of spend far exceeds
   the share of tasks that need it, and cost grows linearly with adoption. Fix: assign easy task
-  families to cheaper tiers after an eval, and route inside mixed families.
-- **Rotating the embedding model like any other model.** Symptom: retrieval quality collapses overnight
-  because the index was not rebuilt with the new model's vectors. Fix: rotate as a re-index project.
+  families to cheaper tiers after an eval, and route inside mixed families such as agent runs.
+- **Rotating the embedding model like any other model.** Symptom: retrieval quality and agent memory
+  recall collapse overnight because the index was not rebuilt with the new model's vectors. Fix: rotate
+  as a re-index project.
 - **No per-task eval baselines in the registry.** Symptom: a rotation approved on one team's evaluation
-  silently degrades another team's task. Fix: store a baseline per consuming task family and rerun
+  silently degrades another team's agent. Fix: store a baseline per consuming task family and rerun
   every one before a cutover.
 - **Too many registered models.** Symptom: the task-by-model evaluation matrix is never fully run, so
   the quality of most combinations is unknown. Fix: enforce the entry rule and the sizing rule.
 - **Skipping data-classification approval per model.** Symptom: an audit finds personal data flowing to
-  a model whose terms never permitted it. Fix: approved data classes in each record, checked by the
-  gateway before routing.
+  a model whose terms never permitted it, often via an agent step that carried a tool result. Fix:
+  approved data classes in each record, checked by the gateway before routing.
 
 ## When to use
-- **Use when:** more than one task family or more than one team uses models; even a single product
-  benefits from a small-plus-strong pair with explicit assignment.
+- **Use when:** more than one task family, agent or team uses models; even a single agent product
+  benefits from a small-plus-strong pair with explicit assignment per role.
 - **Avoid when:** it is a lone prototype; it does not need one.
-- **Measure:** spend share per tier and provider, fraction of requests on the frontier tier, number of
-  registered models (should stay roughly flat), time to complete a migration after a deprecation
-  notice, and eval coverage of the task-by-model matrix.
-- **Daily work:** "which model should this new feature use" is answered by the registry, not by habit.
+- **Measure:** spend share per tier and provider, fraction of requests on the frontier tier, spend per
+  agent step type, number of registered models (should stay roughly flat), time to complete a migration
+  after a deprecation notice, and eval coverage of the task-by-model matrix.
+- **Daily work:** "which model should this new feature or agent step use" is answered by the registry,
+  not by habit.
 - **Interviews:** "how would you manage models across an organisation" is looking for tiers, a registry,
   entry and exit rules, logical names behind a gateway, and the concentration metrics.
 
@@ -322,6 +358,14 @@ entry an owner and a retirement date, and publish spend share and frontier-tier 
 - **Route at step level inside that slice;** it took the saving from 12% to 64%, and prefix caching of
   the shared context would cut it further.
 
+### You want to move an agent's tool-result summarisation steps to a cheaper tier. How do you do it safely?
+- **Tag steps by type in traces** so you can evaluate the summarisation step on its own, with real tool
+  results as inputs and the downstream decision as the check.
+- **Promote the step type behind its logical name** only after the step-level eval holds, then re-run
+  the full agent eval, because a worse summary can derail a later tool choice.
+- **Watch run success and spend per step type** after the switch, and keep unknown step types defaulting
+  to the strong tier.
+
 ### A team wants to add a ninth model because it scores slightly better on their task. How do you decide?
 - **Apply the entry rule:** it must beat an incumbent on a shared eval for some task family, or unlock a
   constraint such as a modality, a cheaper tier or residency.
@@ -330,16 +374,16 @@ entry an owner and a retirement date, and publish spend share and frontier-tier 
 - **Offer the sandbox tier** for experimentation on non-sensitive data instead of production
   registration.
 
-### How do you handle a provider deprecation notice across many applications?
+### How do you handle a provider deprecation notice across many applications and agents?
 - **Find consumers from gateway logs,** by logical name, rather than searching repositories.
 - **Run each consumer's regression eval on the replacement,** because prompts and tool-calling
-  behaviour are not fully portable even behind a logical name.
+  behaviour are not fully portable even behind a logical name; agents need run-level evals.
 - **Cut over in the routing table, then remove the old mapping.** Track days from notice to completed
   cutover as the health metric of the process.
 
 ### Why is rotating the embedding model different from rotating any other model?
 - **Vectors are model-specific.** Vectors from two embedding models are not comparable, so changing the
-  model invalidates every stored vector.
+  model invalidates every stored vector, including agent memories.
 - **Treat it as a re-index project:** build a new index alongside the old one, measure recall on the
   golden queries, then switch the logical name and the index together.
 - **The symptom of skipping this** is retrieval quality collapsing overnight with no code change.

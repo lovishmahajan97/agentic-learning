@@ -5,7 +5,8 @@ name: Latency budgets
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - reliability/slas-slos
   - observability/latency-percentiles
@@ -21,18 +22,31 @@ sources:
 ---
 
 ## TL;DR
-A latency budget splits one user-facing target, such as "first token within 2 s at p95", across every
-hop plus a reserve. Without it each team spends the whole budget alone; with it you get timeouts,
-deadline propagation and rules for what to skip.
+A latency budget splits one user-facing target, such as "first token within 2 s at p95" or "task done in
+15 s", across every model call, tool call and hop plus a reserve. For agents it also caps loop steps.
+
+## For agent builders
+- **Why it matters for agents.** An agent's latency is a loop: plan, call a tool, read the result, repeat.
+  The step count is decided at run time, so without a budget one extra tool call or retry silently doubles
+  task time. The budget tells the loop when to stop exploring and answer.
+- **Where it shows up in your stack.** Per-step timeouts on the model client and each tool, a step or
+  recursion limit in the agent framework (LangGraph has a recursion limit per run; most frameworks have a
+  max-iterations setting), deadline headers between services, and spans in LangSmith, Langfuse or
+  OpenTelemetry traces.
+- **What you control.** The task deadline, the maximum number of steps, which tools and steps are optional,
+  whether tool calls run in parallel, prompt length (prefill), and when to stream a partial answer.
+- **What you can skip.** Formal SLO maths. Know that percentiles do not add, that queue wait grows with
+  load, and how to propagate a deadline; that covers most agent latency work.
 
 ## Why it exists
 - **An AI request is a pipeline, not a call.** A RAG answer may pass an edge proxy, auth, input
   moderation, a query rewrite with a small model, embedding, vector search, a reranker, prompt assembly,
-  a model queue, prefill, decode, an output guardrail and a logging hop.
+  a model queue, prefill, decode, an output guardrail and a logging hop. An agent repeats part of that
+  chain once per step.
 - **Each step was "fast enough" alone.** Added together, and at the tail rather than the median, they blow
   through any product target.
 - **One end-to-end timeout gives nobody a number.** A 400 ms reranker gets added without anyone noticing
-  it consumed a fifth of the budget.
+  it consumed a fifth of the budget, and nobody knows how many agent steps the task can afford.
 - **One outer timeout fires too late.** The request has already burned GPU time, and every downstream step
   kept working after the user gave up.
 - **Percentiles do not add.** Ten parallel calls each 1% likely to be slow make the request slow about 10%
@@ -55,6 +69,8 @@ deadline propagation and rules for what to skip.
   by a stuttering stream still feels broken.
 - **They use different levers:** prompt length and queueing for TTFT; batch size and model size for
   per-token time.
+- **Interactive agents need a progress signal too.** Streaming "searching orders..." status events keeps a
+  15 s task feeling alive; the budget still applies to the final answer.
 
 ### 2. Decompose the critical path
 - **Mark sequential versus parallel steps.** Only the critical path consumes budget; parallel branches
@@ -62,6 +78,8 @@ deadline propagation and rules for what to skip.
 - **The biggest wins hide here.** Running moderation in parallel with retrieval instead of before it
   removes its cost from the critical path entirely, at the price of occasionally doing retrieval work for
   a request you then block.
+- **In an agent loop, each iteration is one critical-path unit:** model call (queue, prefill, decode of the
+  tool call) plus tool execution. Parallel tool calls in one turn cost the slowest tool, not the sum.
 
 ### 3. Allocate, with a reserve
 1. **Give each step a number** from measured p95 (or p99) under realistic load.
@@ -69,8 +87,11 @@ deadline propagation and rules for what to skip.
    growth.
 3. **Split the model step** into queue wait, prefill (grows with prompt length) and decode (time per
    output token × tokens).
+4. **For agents, divide what is left by the per-iteration p95** to get the step limit, after setting aside
+   the final answer step.
 - **Prompt length is a latency decision as well as a cost one:** adding 20 retrieved chunks lengthens
-  prefill and TTFT.
+  prefill and TTFT, and an agent transcript lengthens prefill on every later step unless prefix caching
+  absorbs it.
 - **Queue wait is the most load-sensitive line**, because it grows as ρ/(1−ρ) with utilization (see
   queueing theory). An allocation measured at 50% load is valid only up to the utilization you tested,
   so state that utilization alongside the budget.
@@ -82,39 +103,40 @@ deadline propagation and rules for what to skip.
 - **Each step's timeout** is the smaller of its own allocation and what is left minus what later steps
   need.
 - **Why:** a step that started late should get less time, not the same time, and a downstream service
-  should stop working once the caller has given up.
+  (a tool, a sub-agent) should stop working once the caller has given up.
 
 ### 5. Degrade instead of failing
 - **Classify steps as required or optional.** When the remaining budget is short, skip optional ones
-  (query rewrite, reranking, a second retrieval hop) rather than squeezing them into a timeout they will
-  miss.
+  (query rewrite, reranking, a second retrieval hop, one more verification step) rather than squeezing
+  them into a timeout they will miss.
+- **Answer with what you have.** When the loop runs out of budget, force a final model call that answers
+  from the evidence gathered so far, flagged as partial, instead of returning a timeout.
 - **Retry only when the remaining budget exceeds the attempt's p95.** Otherwise the retry has a large
   chance of timing out and adds load exactly when the system is struggling.
 - **Hedged requests** (send a second copy after the p95 delay, take the first response) cut tails for
   idempotent reads at a modest extra cost.
 
 ### 6. Verify end to end
-- **Distributed tracing:** each span reports its duration against its allocation.
+- **Distributed tracing:** each span reports its duration against its allocation; an agent trace shows
+  one span per step, so you can see which step blew the budget.
 - **Alert on the end-to-end percentile**, not on component averages.
 - **Review budgets like any interface contract**, because they drift as features land.
 
 ## Diagram
-The edge sets one deadline; each stage checks the time left before running, and optional stages are
-skipped rather than squeezed.
+The edge sets one task deadline; each agent iteration checks the time left before running, and when an
+iteration no longer fits, the loop jumps to the final answer.
 
 ```mermaid
 flowchart TD
-    E["Edge: deadline = now + 2.0 s"] --> G["Gateway and auth"]
-    G --> M["Input moderation"]
-    G --> R["Embed and vector search"]
-    M --> J["Join: slowest branch"]
-    R --> J
-    J --> C{"Time left covers rerank plus prefill?"}
-    C -->|"yes"| K["Rerank (optional)"]
-    C -->|"no"| F["Skip: top 5 docs"]
-    K --> P["Model queue and prefill"]
-    F --> P
-    P --> T["First token"]
+    E["Edge: task deadline = now + 15 s"] --> L{"Time left covers one more step plus answer?"}
+    L -->|"yes"| M["Model call: pick tool"]
+    M --> T["Tool call with its own timeout"]
+    T --> D{"Model says done?"}
+    D -->|"no"| L
+    D -->|"yes"| A["Final answer step"]
+    L -->|"no"| P["Answer from evidence so far"]
+    P --> A
+    A --> U["Stream answer to user"]
     T -.->|"span vs allocation"| O["Tracing and p95 alert"]
 ```
 
@@ -140,7 +162,60 @@ Illustrative allocation from measured p95s:
 - **Decode is separate.** With 400 output tokens at 25 ms per token the full answer takes another 10 s:
   acceptable streamed, not if an output guardrail must see the whole answer before display.
 
-### Deadline-aware stages in asyncio
+### Worked scenario: how many steps a support agent can afford
+Target: task answered within 15 s at p95. Measured p95s at peak load (illustrative):
+
+| Item | p95 | Budget left |
+|---|---|---|
+| Task deadline | | 15.0 s |
+| Reserve (about 13%) | 2.0 s | 13.0 s |
+| Final answer step (prefill plus streamed TTFT, rest streams after) | 3.0 s | 10.0 s |
+| One loop iteration: model picks tool 1.8 s + tool 0.7 s | 2.5 s | |
+| **Step limit** | 10.0 ÷ 2.5 | **4 iterations** |
+
+- **Parallel tools stretch it.** If the model issues two lookups in one turn and runs them together, one
+  iteration still costs about 2.5 s but gathers twice the evidence.
+- **Sum of p95s is pessimistic** for independent steps (see the simulation below), so this limit is safe;
+  verify the real task p95 with traces.
+
+### Deadline-aware agent loop
+```python
+import asyncio, time
+
+class Deadline:
+    def __init__(self, seconds): self.end = time.monotonic() + seconds
+    def remaining(self): return self.end - time.monotonic()
+
+STEP_P95, ANSWER_P95 = 2.5, 3.0       # measured per-iteration and final-step p95 at peak
+
+async def run_agent(task, remaining_s, call_model, run_tool, max_steps=8):
+    dl = Deadline(remaining_s)         # from the propagated deadline, not a fresh 15 s
+    transcript, partial = [task], False
+    for _ in range(max_steps):
+        if dl.remaining() < STEP_P95 + ANSWER_P95:
+            partial = True             # no room for another step: answer with what we have
+            break
+        step = await asyncio.wait_for(call_model(transcript), dl.remaining() - ANSWER_P95)
+        if step.get("final"):
+            return step["text"], False
+        try:                           # each tool gets at most what the loop can spare
+            out = await asyncio.wait_for(run_tool(step["tool"], step["args"]),
+                                         min(step.get("timeout", 5.0), dl.remaining() - ANSWER_P95))
+        except asyncio.TimeoutError:
+            out = {"error": "tool timed out"}      # tell the model, let it choose another path
+        transcript += [step, out]
+    final = await asyncio.wait_for(call_model(transcript + ["Answer now from the evidence above."]),
+                                   max(0.5, dl.remaining()))
+    return final["text"], partial
+```
+
+- **`remaining_s` comes from the deadline set at the edge**, so upstream delay is already subtracted.
+- **The stop rule** is "time left covers one more step plus the answer", not a fixed step count, so a slow
+  gateway or slow tool automatically leaves fewer iterations.
+- **A timed-out tool becomes an observation** the model can route around, instead of an exception that
+  kills the task.
+
+### Deadline-aware stages in a RAG step
 ```python
 import asyncio, time
 
@@ -171,7 +246,6 @@ async def first_token(query, remaining_s, rewrite, retrieve, rerank, generate):
     return await stage(lambda: generate(q, docs), dl.remaining(), dl)
 ```
 
-- **`remaining_s` comes from the deadline set at the edge**, so upstream delay is already subtracted.
 - **Normal request:** about 1.87 s is left (2.0 s minus 130 ms of edge and gateway) and the rewrite runs.
 - **Slow gateway:** if the queue ate an extra 700 ms, only 1.17 s is left. The rewrite needs its 0.30 s
   plus the 0.95 s kept for retrieval and generation, so it is skipped automatically, and generation's
@@ -204,35 +278,38 @@ for n in (1, 10, 50, 100):          # fan-out: chance at least one call hits its
 
 - **Sequential, independent steps:** the sum of p95s overstates the end-to-end p95, so it is a safe but
   pessimistic budget.
-- **Fan-out:** waiting on the slowest branch makes tails far more common than any one branch's tail.
+- **Fan-out:** waiting on the slowest branch makes tails far more common than any one branch's tail; an
+  agent that fans out to many sub-agents or tools pays this.
 - **Either way, measure the end-to-end percentile** rather than deriving it from components.
 
 ## Production patterns
 - **Propagate deadlines on every hop.** When a request crosses services, set the deadline once at the
   edge and pass it on: gRPC carries it natively; over HTTP use a header holding remaining milliseconds,
-  and have each service subtract its elapsed time. Monitor requests arriving with negative or near-zero
-  remaining budget.
+  and have each service, tool server or sub-agent subtract its elapsed time. Monitor requests arriving
+  with negative or near-zero remaining budget.
+- **Time-aware step limits.** Keep the framework's hard step or recursion limit as a safety net, and add a
+  budget check before each iteration that forces the final answer when time is short. Monitor steps per
+  task, the share of tasks ending on the partial-answer path, and task p95.
 - **Cancel abandoned work.** When the client disconnects or the deadline passes, cancel downstream calls
   and stop decoding; in Starlette or FastAPI check `await request.is_disconnected()` while streaming.
   Monitor tokens generated for requests whose client already left.
-- **Run independent stages concurrently.** Start moderation and retrieval together with
-  `asyncio.gather` and block on the moderation verdict before generation. Monitor how often retrieval
-  work is wasted on blocked requests.
-- **Budget spans in tracing.** Tag each span with its allocation as an attribute, and alert on the
-  end-to-end p95 and p99 rather than on component averages. Monitor the share of requests taking the
-  degraded path.
-- **Hedge only idempotent reads, with a cap.** Send a second copy after the p95 delay for retrieval or
-  cache reads, and limit hedges to a small fraction of traffic. Monitor extra load from hedging and turn
-  it off under saturation.
+- **Run independent stages and tools concurrently.** Start moderation and retrieval together with
+  `asyncio.gather`, and execute parallel tool calls from one model turn together. Block on the moderation
+  verdict before generation. Monitor how often retrieval work is wasted on blocked requests.
+- **Budget spans in tracing.** Tag each span (model step, tool call) with its allocation as an attribute,
+  and alert on the end-to-end p95 and p99 rather than on component averages. Monitor the share of
+  requests taking the degraded path.
 - **Re-budget on every pipeline change.** Treat the budget table as a reviewed artifact, so adding a
-  reranker, a guardrail or more retrieved chunks requires updating the numbers. Monitor TTFT p95 after
-  each "quality" change.
+  reranker, a guardrail, a new tool or more retrieved chunks requires updating the numbers. Monitor TTFT
+  and task p95 after each "quality" change, and hedge only idempotent reads, with a cap.
 
 ## Trade-offs
 - **Tight per-step allocations vs churn.** They make regressions visible early, but over-precise budgets
   become a burden when the pipeline changes weekly and owners spend time renegotiating numbers.
 - **Skipping optional steps vs quality.** It protects latency at the cost of answer quality: right for
   chat, wrong for workflows where a wrong answer costs more than a slow one.
+- **Fewer agent steps vs task success.** A tight step limit keeps p95 low but cuts off tasks that needed one
+  more lookup; measure success rate against the step limit before tightening it.
 - **Hedged requests vs load.** They cut tail latency but add load, roughly the fraction of requests that
   exceed the hedge delay. They backfire on saturated systems or non-idempotent calls.
 - **Streaming vs guardrails.** Streaming hides decode time behind reading time, but forces output
@@ -241,23 +318,26 @@ for n in (1, 10, 50, 100):          # fan-out: chance at least one call hits its
 ## Pitfalls
 - **Adding component p95s or medians and calling it the end-to-end p95.** Symptom: every service is green
   while users report slowness. Fix: measure the end-to-end percentile with tracing.
+- **A fixed step limit with no time check.** Symptom: most tasks are fast but a slow tool makes some run
+  four times the target, still within the step limit. Fix: check remaining time before every iteration.
 - **Retrying inside a budget that cannot afford another attempt.** Symptom: retry counts rising together
   with timeouts, and more GPU work per successful request. Fix: retry only when time left exceeds the
   attempt's p95.
 - **Budgeting the model step from a single-request benchmark.** Under load, queue wait and prefill grow,
   seen as TTFT p95 degrading at peak hours while prompt sizes are unchanged. Fix: measure at peak load.
-- **Enforcing the deadline only at the edge.** The user sees a timeout while the model keeps decoding,
-  visible as GPU or token spend on requests whose clients already left. Fix: propagate and cancel.
+- **Enforcing the deadline only at the edge.** The user sees a timeout while the model keeps decoding and
+  tools keep running, visible as GPU or token spend on requests whose clients already left. Fix: propagate
+  and cancel.
 - **Letting retrieval chunk counts creep up without re-budgeting prefill.** Symptom: TTFT rising after a
   "quality" change that never touched serving. Fix: re-budget prefill with each change.
 
 ## When to use
-- **Use when** a user-facing AI path has more than two hops, and before adding a new step such as a
-  reranker, guardrail or tool call.
-- **Measure** p95 and p99 per span under peak load, the end-to-end percentile, and the share of requests
-  that took a degraded path.
-- **Avoid formal budgets** for offline batch jobs, where throughput and cost per task matter more than
-  per-request latency.
+- **Use when** a user-facing AI path has more than two hops, when an agent loop has an open-ended step
+  count, and before adding a new step such as a reranker, guardrail or tool.
+- **Measure** p95 and p99 per span under peak load, the end-to-end percentile, steps per task, and the
+  share of requests that took a degraded or partial-answer path.
+- **Avoid formal budgets** for offline batch jobs and background agents, where throughput and cost per task
+  matter more than per-request latency; keep only a generous hard timeout.
 - **Interviews:** decompose the target into steps, point out that percentiles do not add, and propose
   deadline propagation with optional-step degradation; that is the expected answer to "make this feel
   fast".
@@ -296,6 +376,14 @@ jitter.
   prefill stays inside it.
 - **Enforce:** an edge deadline propagated to every hop, with optional stages skipped when time is short.
 
+### A tool-calling agent must finish within 15 s at p95. How do you keep it inside that?
+- **Set aside the fixed parts:** a reserve and the final answer step, then divide the rest by the measured
+  per-iteration p95 (model call plus tool) to get the affordable step count.
+- **Check time, not just steps:** before each iteration, continue only if time left covers one more step
+  plus the answer; otherwise answer from the evidence so far and mark it partial.
+- **Shorten iterations:** parallel tool calls, per-tool timeouts, prefix caching for the growing
+  transcript, and a smaller model for routing steps.
+
 ### TTFT p95 degrades every day at peak, but prompt sizes have not changed. Where do you look?
 - **Queue wait first:** it grows as ρ/(1−ρ), so a budget measured at 50% load breaks at peak utilization.
 - **Split the span:** compare queue wait with prefill time; if queue wait dominates, add capacity or
@@ -303,17 +391,19 @@ jitter.
 - **Check retries and hedges:** they raise load exactly at peak.
 
 ### When would you not use hedged requests?
-- **Non-idempotent calls:** a duplicated tool call or write can cause side effects twice.
+- **Non-idempotent calls:** a duplicated tool call or write can cause side effects twice, such as an agent
+  issuing two refunds.
 - **Saturated systems:** hedging adds roughly the fraction of requests that exceed the hedge delay, which
   deepens the queue that caused the tail.
 - **Expensive model calls:** a second GPU-heavy request doubles cost for that tail; prefer hedging cheap
   reads such as retrieval or caches.
 
-### The user closes the tab mid-answer. What should happen, and how do you verify it?
-- **Cancel everything downstream:** stop decoding and abort pending tool or retrieval calls, because the
-  deadline is gone and the work is wasted.
+### The user closes the tab mid-answer while the agent is still working. What should happen?
+- **Cancel everything downstream:** stop decoding and abort pending tool, retrieval and sub-agent calls,
+  because the deadline is gone and the work is wasted.
 - **Implement:** detect disconnect in the streaming handler, cancel the task, and propagate cancellation
-  to the model client.
+  to the model client and tool servers; for durable background agents, decide explicitly whether the run
+  continues.
 - **Verify:** track tokens or GPU time spent on requests whose client already left; it should fall
   toward zero.
 

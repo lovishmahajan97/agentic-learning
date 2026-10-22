@@ -5,7 +5,8 @@ name: logging / structlog
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - observability/logging
   - fastapi-for-ai/structured-logging
@@ -21,9 +22,23 @@ sources:
 ---
 
 ## TL;DR
-Stdlib `logging` routes records through levels, handlers and formatters; structlog makes every line a
-structured event rendered as JSON. Incident questions ("which model, how many tokens, which request, which
-retry?") become queries over fields, not greps over prose.
+Stdlib `logging` routes records; structlog makes each line a structured JSON event. For agents, every
+model and tool call becomes an event bound to `run_id` and step, so "why did this run loop, stall or
+cost $4?" becomes a query.
+
+## For agent builders
+- **Why it matters for agents.** One agent run interleaves many model calls, tool calls and retries, and
+  a service runs hundreds of runs at once. Prose logs cannot tell you which run, step or tool a line
+  belongs to; structured events with bound `run_id`, `step` and `tool` can.
+- **Where it shows up in your stack.** LangSmith, Langfuse or OpenTelemetry-based tracing hold full
+  step-by-step traces with prompts; structlog JSON on stdout holds the cheap, always-on events your
+  dashboards and alerts run on. LangChain, httpx and the vendor SDKs log through stdlib, so route them
+  into the same JSON format.
+- **What you control.** The event vocabulary (`llm_call`, `tool_call`, `retrieval`, `guardrail_block`),
+  which IDs are bound per run and per step, redaction of prompts, tool arguments and secrets, and the
+  trace ID that joins a log line to its trace.
+- **What you can skip.** Custom handler classes and logging-config dict files. One `structlog.configure`
+  call plus stdout is enough for most agent services.
 
 ## Why it exists
 - **Concurrency makes prose logs useless.** `print()` and f-string log lines work until there are many
@@ -136,10 +151,12 @@ def sample_debug(logger, method_name, event_dict):
   `cache_logger_on_first_use=True` avoids rebuilding loggers on every call.
 
 ### Logs vs traces vs metrics
-- **Logs:** discrete events.
+- **Logs:** discrete events, such as one `tool_call` with its tool name, status and latency.
 - **Traces (OpenTelemetry spans):** timing and parent-child structure across services.
 - **Metrics:** cheap aggregates.
 - **Join them:** put the trace ID in every log event, and do not use logs as your only latency metric.
+- **For agents:** a tracing tool (LangSmith, Langfuse, an OpenTelemetry backend) shows one run as a tree of
+  model and tool spans; logs carry the same `run_id` so an alert on fields leads straight to that tree.
 
 ## Diagram
 Follow one `log.info` call: middleware has already called `clear_contextvars()` then `bind_contextvars(...)`,
@@ -238,6 +255,48 @@ async def main():
 asyncio.run(main())
 ```
 
+### Agent scenario: one event per step, bound to the run
+Bind `run_id` once per run and `step` per iteration, so every model call, tool call and retry line can be
+grouped by run. Tool arguments are hashed, not logged. Needs only `pip install structlog`.
+
+```python
+import hashlib, json, logging, time, uuid
+import structlog
+
+structlog.configure(
+    processors=[structlog.contextvars.merge_contextvars, structlog.processors.add_log_level,
+                structlog.processors.TimeStamper(fmt="iso"), structlog.processors.JSONRenderer()],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO))
+log = structlog.get_logger()
+
+def run_agent(task: str, steps: list[tuple[str, dict]]) -> None:
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(run_id=str(uuid.uuid4()), agent="support-v2")
+    for i, (tool, args) in enumerate(steps, start=1):
+        structlog.contextvars.bind_contextvars(step=i)          # later lines carry the step
+        t0 = time.perf_counter()
+        status = "ok" if tool != "refund" else "error"          # stand-in for the real tool call
+        log.info("tool_call", tool=tool, status=status,
+                 args_sha=hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()[:12],
+                 latency_ms=round((time.perf_counter() - t0) * 1000))
+    log.info("run_end", steps=len(steps), outcome="answered")
+
+run_agent("refund A17", [("lookup_order", {"id": "A17"}), ("refund", {"id": "A17"})])
+# {"tool": "lookup_order", "status": "ok", ..., "run_id": "...", "agent": "support-v2", "step": 1, ...}
+```
+
+### Worked scenario: an agent that loops
+Support reports a run that never answered. With `tool_call` events carrying `run_id`, `step`, `tool`,
+`status` and `args_sha`:
+
+| Question | Query over fields | What it showed |
+|---|---|---|
+| How many steps did the run take? | max `step` where `run_id` = the reported ID | it hit the step budget |
+| Was it the same call each time? | count by `tool`, `args_sha` for that run | one tool, one argument hash, repeated |
+| How widespread is it? | runs where one `args_sha` repeats 3+ times, by `agent` | only the new prompt version |
+
+The fix was a guard that stops after repeated identical calls, plus an alert on that repeat count.
+
 ### Worked scenario: one event vocabulary, three incident questions
 With `llm_call` events carrying `model`, `tokens_in`, `tokens_out`, `latency_ms`, `request_id` and `user_id`:
 
@@ -250,6 +309,12 @@ With `llm_call` events carrying `model`, `tokens_in`, `tokens_out`, `latency_ms`
 None of these is possible from `"call failed after 3.2s"`.
 
 ## Production patterns
+- **Bind run and step IDs in the agent loop.** Call `bind_contextvars(run_id=..., agent=...)` at run
+  start and `bind_contextvars(step=i)` each iteration, so tool and retry lines are grouped without
+  passing IDs around. Alert on runs whose max `step` equals the step budget.
+- **Hash tool arguments, log status and latency.** Emit one `tool_call` event per call with tool name,
+  status, `args_sha` and `latency_ms`; keep the arguments themselves in the tracing store with its access
+  controls. Repeated identical hashes in one run are the cheapest loop detector there is.
 - **Bind context in middleware, clear first.** In FastAPI (or any framework) middleware call
   `clear_contextvars()` then `bind_contextvars(request_id=..., user_id=...)` before the handler runs. Monitor
   the share of log lines missing `request_id`; it should be near zero.
@@ -295,8 +360,8 @@ None of these is possible from `"call failed after 3.2s"`.
 
 ## When to use
 - **Use stdlib logging everywhere** as the routing backbone.
-- **Add structlog when:** a service handles concurrent requests or its logs feed a search or analytics
-  backend; that is nearly every deployed AI service.
+- **Add structlog when:** a service handles concurrent requests or agent runs, or its logs feed a search
+  or analytics backend; that is nearly every deployed agent.
 - **Do early:** define a small event vocabulary (`llm_call`, `retrieval`, `tool_call`, `guardrail_block`)
   with consistent field names, because dashboards and alerts are built on them.
 - **Measure:** log volume per request, and that every line carries a request or trace ID.
@@ -343,9 +408,18 @@ concurrent requests and asserts each line's ID matches.
 - **Back it with a test** that logs a fake API key and asserts it never appears in output, and prefer logging
   a prompt hash or version over the prompt itself.
 
-### Would you log full prompts and completions in production?
+### How would you make a misbehaving agent run debuggable from logs alone?
+- **Bind identity:** `run_id`, agent name and prompt version per run, `step` per iteration, via
+  contextvars so every line carries them.
+- **Fix the vocabulary:** one `llm_call` event with model, tokens and latency, and one `tool_call` event
+  with tool, status and an argument hash, per call.
+- **Join to traces:** add the trace ID so a query that finds the bad run jumps to its full trace in
+  LangSmith, Langfuse or your OpenTelemetry backend.
+
+### Would you log full prompts, completions and tool arguments for production agents?
 - **The gain:** debugging is much easier with the exact input and output.
-- **The cost:** user data and secrets land in a system with broad access and long retention.
+- **The cost:** user data, retrieved documents and secrets land in a system with broad access and long
+  retention; tool arguments often carry account numbers or emails.
 - **Middle ground:** redaction, sampling and short retention, or send payloads to a dedicated LLM tracing store
   and keep only a hash, token counts and latency in logs.
 

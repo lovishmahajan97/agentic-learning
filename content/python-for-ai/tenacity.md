@@ -5,7 +5,8 @@ name: tenacity
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/retry-strategies
   - reliability/circuit-breakers
@@ -21,9 +22,23 @@ sources:
 ---
 
 ## TL;DR
-tenacity declares a retry policy: when to stop, how long to wait, what to retry, what to log. LLM APIs
-fail transiently (429s, 5xx, timeouts) and hand-written loops get backoff and jitter wrong; it cannot make
-an unsafe operation safe to repeat.
+tenacity declares a retry policy (stop, wait, what to retry, what to log) for an agent's model and tool
+calls. 429s, 5xx and timeouts are routine in long agent runs; it cannot make an unsafe tool call safe to
+repeat.
+
+## For agent builders
+- **Why it matters for agents.** A 20-step agent run makes dozens of model and tool calls. If 1 in
+  100 calls fails transiently, a 40-call run fails about a third of the time (1 − 0.99^40 ≈ 0.33) unless
+  something retries. Retries in the
+  wrong place multiply load or create duplicate side effects, such as two tickets from one tool call.
+- **Where it shows up in your stack.** Vendor SDKs retry internally via `max_retries`; LangChain runnables
+  offer a retry wrapper and LangGraph lets you attach a retry policy to a node; your own tool adapters use
+  tenacity. Pick one owner per call path, and trace retries in LangSmith or your logs.
+- **What you control.** Which errors are transient (retry) versus permanent (fail or hand back to the
+  model), the time budget per step under the run's deadline, jitter, `Retry-After` handling, and
+  idempotency keys on write tools.
+- **What you can skip.** Writing custom backoff math. `wait_random_exponential` plus a stop budget covers
+  almost every agent call.
 
 ## Why it exists
 - **Remote calls fail transiently, constantly.** A production AI service makes thousands of chat
@@ -125,6 +140,20 @@ def wait_retry_after(state):
   blocking it.
 - **Retry a block, not a function:** `for attempt in Retrying(...): with attempt: ...`.
 
+### Retries inside an agent loop
+An agent has three places a failure can be handled, and each suits a different error class:
+
+| Error class | Handle it | Because |
+|---|---|---|
+| Transient transport error (429, 5xx, timeout) | tenacity around the model or tool adapter | the same request will likely succeed shortly |
+| Permanent tool error (404 order, bad arguments) | return it to the model as the tool result | the model can fix its arguments or choose another tool |
+| Bad model output (invalid JSON, unknown tool) | re-prompt with the validation error | the identical prompt tends to reproduce the same output |
+| Sustained outage | circuit breaker, then a clear failure | retries only multiply load |
+
+- **Budget per step, not per call.** The run has a deadline; give each step a slice of it and set
+  `stop_after_delay` from that slice.
+- **Write tools need idempotency keys** before any retry, because a timeout does not prove the write failed.
+
 ### Alternatives
 | Tool | Scope |
 |---|---|
@@ -222,6 +251,41 @@ def lookup():
 assert lookup() == {"ok": True} and calls["n"] == 3
 ```
 
+### Agent scenario: transient errors retried, permanent errors handed to the model
+The tool adapter retries only transport errors; a permanent error becomes a tool result the model can act
+on, so the loop never burns attempts on a 404. Needs only `pip install tenacity`.
+
+```python
+from tenacity import retry, stop_after_attempt, stop_after_delay, wait_random_exponential
+from tenacity import retry_if_exception_type
+
+class Transient(Exception): ...          # adapters map 429, 5xx, timeouts to this
+class ToolError(Exception): ...          # adapters map 4xx to this: the model should see it
+
+attempts = {"n": 0}
+
+@retry(retry=retry_if_exception_type(Transient),
+       wait=wait_random_exponential(multiplier=0.01, max=0.05),   # tiny for the demo
+       stop=stop_after_attempt(4) | stop_after_delay(10), reraise=True)
+def get_order(order_id: str) -> str:
+    attempts["n"] += 1
+    if attempts["n"] < 3:
+        raise Transient("503 from orders API")
+    if order_id == "Z99":
+        raise ToolError("order Z99 not found")
+    return f"order {order_id}: shipped"
+
+def run_tool(name: str, args: dict) -> dict:
+    try:
+        return {"role": "tool", "name": name, "content": get_order(**args)}
+    except ToolError as e:                # permanent: hand back to the model, no retry
+        return {"role": "tool", "name": name, "content": f"error: {e}", "is_error": True}
+    # Transient that exhausted retries propagates: the step fails, the run can checkpoint and stop
+
+print(run_tool("get_order", {"order_id": "A17"}), attempts)   # succeeded on attempt 3
+print(run_tool("get_order", {"order_id": "Z99"}))             # 1 attempt, error shown to the model
+```
+
 ### Worked scenario: stacked retry layers
 Each layer makes up to 3 attempts: the agent loop re-runs a failed tool up to 3 times, the tool function has
 `@retry(stop=stop_after_attempt(3))`, and the SDK makes up to 3 attempts internally.
@@ -236,6 +300,13 @@ Under a rate limit, those 27 calls make the limit worse. Fix: `max_retries=0` on
 policy, and the agent loop treats the re-raised error as final.
 
 ## Production patterns
+- **Classify failures at the tool adapter.** Map transport errors to one transient type that tenacity
+  retries, and permanent errors to a tool-error result the model sees, so the agent can correct its
+  arguments. Monitor tool error rate by tool and class; a spike in permanent errors usually means a
+  prompt or schema regression, not an outage.
+- **Retry the step, not the run.** Checkpoint agent state after each completed step (LangGraph
+  checkpointers do this) so an exhausted retry fails one step and the run resumes from there instead of
+  repeating paid model calls and side effects. Monitor resumed runs and repeated tool calls per run.
 - **Exactly one retry layer per call path.** Disable SDK retries (`OpenAI(max_retries=0)`) or HTTP-transport
   retries when you add tenacity, and document which layer owns the policy. Monitor upstream calls per user
   action.
@@ -266,6 +337,9 @@ policy, and the agent loop treats the re-raised error as final.
   beyond a few attempts a circuit breaker that fails fast is the better tool.
 
 ## Pitfalls
+- **Retrying a whole agent run on any failure.** Symptom: one flaky tool at step 9 replays eight paid
+  model calls and repeats earlier side effects. Fix: retry at the call, checkpoint each step, and resume
+  the run from the last completed step.
 - **Bare `@retry` with no arguments.** Symptom: a request hangs forever, spinning with no wait, against an
   endpoint returning a permanent error. Fix: always set stop, wait and retry.
 - **Retrying non-idempotent operations** ("send email", "create ticket") without an idempotency key.
@@ -282,7 +356,7 @@ policy, and the agent loop treats the re-raised error as final.
   five paid API calls before surfacing. Fix: an explicit `retry_if_exception_type(...)` list.
 
 ## When to use
-- **Use when:** code calls something remote that fails transiently and the operation is safe to repeat:
+- **Use when:** agent code calls something remote that fails transiently and the operation is safe to repeat:
   LLM and embedding calls, vector-store queries, idempotent tool APIs, downloads.
 - **Prefer SDK retries when:** they already cover your error classes and you only need to tune a count.
 - **Prefer tenacity when:** you need custom classification (retry on a bad *result*, such as invalid JSON),
@@ -338,6 +412,14 @@ client or SDK also retries, so attempts are not multiplied across layers.
 - **Sustained outages:** per-call retries multiply load, so a circuit breaker that fails fast is better.
 - **Deterministic bad results:** retrying invalid JSON with the identical prompt at temperature 0 tends to
   fail identically; feed the validation error back instead.
+
+### In an agent, when should a tool failure be retried and when should it go back to the model?
+- **Retry transient transport errors** (429, 5xx, timeouts) in the adapter with tenacity, because the
+  same request will likely succeed and the model learns nothing from them.
+- **Return permanent errors as the tool result** (not found, invalid arguments), so the model can fix its
+  call or pick another tool instead of the loop wasting attempts.
+- **Never blindly retry write tools:** require an idempotency key first, since a timeout may hide a
+  write that succeeded.
 
 ### How many upstream calls can one user action cause if the SDK, your function and the agent loop each retry 3 times?
 - **Multiply the layers:** 3 × 3 × 3 = 27 calls in the worst case, which makes a rate limit worse.

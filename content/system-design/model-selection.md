@@ -5,7 +5,8 @@ name: Model selection
 kind: decision
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - evals/model-evaluation
   - evals/benchmarking
@@ -21,24 +22,38 @@ sources:
 ---
 
 ## TL;DR
-Model selection is a funnel: filter by hard constraints, then pick per task the cheapest, fastest model
-that clears a quality bar measured on your data, not a public benchmark's. Quality has a threshold;
-cost and latency are paid linearly on every call.
+Picking an agent's model is a funnel: filter by hard constraints (tool calling, context, deployment),
+then choose per role the cheapest, fastest model whose run-level success clears your bar on your own
+tasks. Quality has a threshold; cost is paid every step.
+
+## For agent builders
+- **Why it matters for agents.** Errors compound across steps: a model that picks the right tool 95% of
+  the time finishes an 8-step run only about two times in three. Per-call benchmarks hide this, so you
+  select on whole-run success, tool-call validity and steps per run.
+- **Where it shows up in your stack.** The model identifier in your agent config or gateway route, the
+  eval harness that replays agent tasks, and the provider usage fields you log per step for cost.
+- **What you control.** The task eval set, the bar per agent role (planner, tool caller, summariser),
+  the pinned version, the second source, and whether a cascade escalates hard steps to a stronger
+  model.
+- **What you can skip.** Leaderboard watching and arguing about which frontier model is "smartest". A
+  private eval with intervals and a paired comparison answers the only question that matters.
 
 ## Why it exists
-- **The choice is multiplied by every request.** At any moment dozens of plausible models span one to
-  two orders of magnitude in price per token and several-fold in latency, and the pick is paid for the
-  life of the feature. It deserves a method, and the obvious method is wrong.
+- **The choice is multiplied by every request and every step.** At any moment dozens of plausible
+  models span one to two orders of magnitude in price per token and several-fold in latency, and the
+  pick is paid for the life of the feature. An agent pays it on every step of every run. It deserves a
+  method, and the obvious method is wrong.
 - **"Top of the leaderboard" fails for four reasons.** (1) Benchmarks measure broad ability on public
-  data, not your narrow distribution, vocabulary and failure costs, and may have leaked into training.
-  (2) The quality gap among the top two or three is often smaller than their cost gap, so the ranking is
-  unstable exactly where the money is. (3) Non-quality dimensions decide feasibility. (4) Your prompt
-  was tuned on the starting model, so a naive swap underrates every other candidate.
-- **The feasibility dimensions.** Context length at your p95 prompt size, reliable structured output,
-  tool-calling behaviour, language coverage, rate limits at your peak, data residency and the
-  provider's deprecation cadence.
+  data, not your narrow distribution, tools and failure costs, and may have leaked into
+  training. (2) The quality gap among the top two or three is often smaller than their cost gap, so the
+  ranking is unstable exactly where the money is. (3) Non-quality dimensions decide feasibility. (4) Your
+  prompt was tuned on the starting model, so a naive swap underrates every other candidate.
+- **The feasibility dimensions.** Context length at your p95 prompt size (for agents, the transcript at
+  the last step), reliable structured output, tool-calling behaviour, language coverage, rate limits at
+  your peak, data residency and the provider's deprecation cadence.
 - **"Cheapest and hope" fails on the tail.** A weaker model's errors concentrate in the hard,
-  high-stakes cases, precisely the ones that generate support tickets or compliance findings.
+  high-stakes cases, precisely the ones that generate support tickets, wrong tool actions or compliance
+  findings.
 - **Threshold versus linear.** Below the bar the feature does not work; above it, extra points rarely
   change the outcome, while cost and latency grow with volume. So the optimum is the cheapest model that
   clears the bar with a margin, and only measuring your task tells you which.
@@ -48,22 +63,26 @@ cost and latency are paid linearly on every call.
 Filter before evaluating quality, *because* no quality number rescues a model that cannot run where the
 data is. The usual gates:
 - **Modality:** text, vision, audio.
-- **Context window** versus your *measured* p95 prompt size, not the mean.
-- **Output and tools:** native structured output or JSON-schema support; tool calling; languages.
+- **Context window** versus your *measured* p95 prompt size, not the mean; for an agent, measure the
+  transcript at the step limit, not the first call.
+- **Output and tools:** native structured output or JSON-schema support; tool calling, including
+  parallel calls if your loop uses them; languages.
 - **Deployment:** a region, a VPC, on-prem or air-gapped, which narrows the field to open-weight models
   or private endpoints.
-- **Commercial terms:** licence terms; quota and rate limits at launch peak; version pinning and
-  deprecation policy; data-use and retention terms.
+- **Commercial terms:** licence terms; quota and rate limits at launch peak (an agent makes several calls
+  per user request); version pinning and deprecation policy; data-use and retention terms.
 
 ### Step 2: build the task evaluation before touching candidates
 - **Size and source.** Fifty to a few hundred examples from real or realistic traffic, with expected
-  outputs or a scoring rubric.
+  outputs or a scoring rubric. For agents, each example is a task with a starting state, mocked or
+  sandboxed tools and a success check.
 - **The task's own metric.** Exact or normalised match for extraction and classification; citation
   faithfulness for retrieval-augmented answers; a calibrated LLM-as-judge rubric for free-form
-  generation; pass@k for code.
+  generation; pass@k for code; task success, valid tool calls and steps per run for agents.
 - **First, because of bias.** Otherwise the prompt gets tuned to the first model tried and every later
   comparison favours the incumbent.
-- **Over-sample the hard cases.** Hard and high-cost cases are where candidates differ.
+- **Over-sample the hard cases.** Hard and high-cost cases are where candidates differ: ambiguous tool
+  choice, long transcripts, tool errors the agent must recover from.
 
 ### Step 3: run candidates fairly
 1. **Same examples, same prompt structure,** then a bounded, equal amount of prompt adaptation per
@@ -88,14 +107,14 @@ data is. The usual gates:
 
 ### Step 4: measure cost and latency on real request shapes
 - **Cost per request** = input tokens × input price + output tokens × output price, adjusted for cached
-  prefixes.
+  prefixes; for an agent, sum it over every step of the run.
 - **Measure tokens from the eval runs, don't estimate,** *because* tokenizers differ across families
-  (the same document can be 20–30% more tokens in one than another, and more for non-English text) and
-  output verbosity differs.
+  (the same document can be 20–30% more tokens in one than another, and more for non-English text),
+  output verbosity differs, and weaker models often take more steps.
 - **Reasoning models.** Hidden reasoning tokens are billed as output on most providers and can dominate,
   so price per token alone misleads.
 - **Latency.** Time to first token and total latency at p50 and p95, under realistic concurrency, at
-  the hours you will run.
+  the hours you will run; for agents, end-to-end run latency, since steps are sequential.
 
 The number to compare is not cost per call but:
 
@@ -112,12 +131,13 @@ lose its advantage once the denominator and the extra calls are counted.
 2. **Discard** any model another beats on all three.
 3. **Choose** the cheapest whose *lower* confidence bound clears the bar and whose p95 fits the
    latency budget.
-4. **Consider a cascade** if the cheap model fails only on an identifiable tail: cheap by default,
-   escalating to a stronger one on low confidence or a trigger condition, often cheaper than running
-   the strong model everywhere.
+4. **Consider a cascade or a split by role** if the cheap model fails only on an identifiable tail:
+   cheap by default, escalating to a stronger one on low confidence or a trigger condition, or a strong
+   planner with a cheap model for routine tool steps. Often cheaper than the strong model everywhere.
 
 ### Step 6: operational factors and re-evaluation
-- **Pin an exact model version,** never a floating alias, so quality cannot change under you.
+- **Pin an exact model version,** never a floating alias, so quality and tool-call format cannot change
+  under you.
 - **Have a second source.** A fallback model that also clears the bar, even at higher cost, turns an
   outage or deprecation notice into a configuration change.
 - **Schedule re-selection:** when a deprecation is announced, when a new model could move the frontier,
@@ -125,30 +145,54 @@ lose its advantage once the denominator and the extra calls are counted.
   building it first.
 
 ## Diagram
-The selection funnel: hard constraints (modality, context at p95, deployment, terms) remove candidates
-before any quality work, and the rule at the bottom compares lower confidence bounds with the bar, not
-leaderboard ranks.
+The selection funnel: hard constraints (modality, context at p95, tool calling, deployment, terms) remove
+candidates before any quality work, and the rule at the bottom compares lower confidence bounds of run
+success with the bar, not leaderboard ranks.
 
 ```mermaid
 flowchart TD
     A["All plausible models"] -->|"Step 1"| F["Hard-constraint filter"]
-    F -->|"eligible only, Step 2"| E["Private task eval set"]
+    F -->|"eligible only, Step 2"| E["Private agent task eval"]
     E -->|"Step 3"| R["Fair, paired runs"]
-    R -->|"Step 4"| C["Measured cost and p95"]
+    R -->|"Step 4"| C["Measured cost and p95 per run"]
     C -->|"Step 5"| P["Drop dominated models"]
     P --> Q{"Lower bound clears bar, p95 fits?"}
     Q -->|"yes, cheapest such model"| S["Pin version, second source, ADR"]
     Q -->|"no"| T{"Cheap model fails only on a tail?"}
-    T -->|"yes"| K["Cascade with escalation trigger"]
-    T -->|"no"| N["Prompt, retrieval or fine-tune work"]
+    T -->|"yes"| K["Cascade or split by role"]
+    T -->|"no"| N["Prompt, tools, retrieval or fine-tune"]
     S -.->|"deprecation, release or cadence"| E
 ```
 
 ## Examples
+### Worked scenario: per-step accuracy compounds over an agent run
+Illustrative numbers for an 8-step support agent, assuming step errors are roughly independent (real
+runs can recover from some errors, so treat this as a pessimistic sketch). Cost is normalised to 1.0 per
+strong-model step.
+
+| | Strong model | Cheap model |
+|---|---|---|
+| Correct tool call per step | 0.98 | 0.95 |
+| Steps per run (from traces) | 8 | 10 (more retries and detours) |
+| Run success ≈ per-step accuracy ^ steps | 0.98^8 ≈ 0.85 | 0.95^10 ≈ 0.60 |
+| Cost per run | 8.0 | 10 × 0.3 = 3.0 |
+| Cost per successful run | ≈ 9.4 | ≈ 5.0 |
+| Clears a 0.80 run-success bar? | yes | no |
+
+- **Read it as threshold versus linear.** The cheap model is cheaper per success but fails the bar, so
+  it is not a candidate as the only model.
+- **The fix is often a split.** Keep the strong model as planner and for hard tool choices, route
+  routine steps (formatting, summarising a tool result) to the cheap one, and re-measure run success.
+- **A 3-point per-step gap is big here.** At 0.99 per step, 8 steps give about 0.92; the per-call
+  difference that looks negligible becomes the run-level difference that matters.
+
 ### Selection harness for the quantitative steps
 Each candidate exposes a `call` that returns the text plus the measured token counts; prices are
 placeholders you fill from the provider's current sheet. The rule requires the lower confidence bound,
 not the mean, to clear the bar.
+
+For an agent, `call` runs a whole task in the sandbox and returns the summed tokens, and `score` checks
+the task's end state.
 
 ```python
 import statistics, time
@@ -160,7 +204,7 @@ class Candidate:
     name: str
     price_in: float          # currency per 1M input tokens (fill from current price list)
     price_out: float         # currency per 1M output tokens
-    call: Callable           # prompt -> (text, input_tokens, output_tokens)
+    call: Callable           # task -> (result, input_tokens, output_tokens), summed over agent steps
 
 def evaluate(c: Candidate, golden, score, runs=3):
     per_example, lat, cost = [], [], []
@@ -184,16 +228,17 @@ def select(results, bar, max_p95):
     eligible = [r for r in results if r["lower"] >= bar and r["p95_s"] <= max_p95]
     return min(eligible, key=lambda r: r["cost_per_1k"]) if eligible else None
 
-# results = [evaluate(c, golden_set, exact_match) for c in candidates]
-# print(select(results, bar=0.92, max_p95=2.5))
+# results = [evaluate(c, agent_tasks, task_succeeded) for c in candidates]
+# print(select(results, bar=0.80, max_p95=30.0))   # run-level bar and end-to-end p95 for an agent
 ```
 
 If `select` returns `None`, no candidate clears the bar within budget. The next moves, in roughly that
-order of cost: prompt work, retrieval improvements, a cascade, or fine-tuning a smaller model.
+order of cost: prompt and tool-description work, retrieval improvements, a cascade or role split, or
+fine-tuning a smaller model on agent traces.
 
 ### Is the gap real? Interval width and the paired test
 Runnable, standard library only. It reproduces the noise-floor numbers above and the paired reading
-used in Check yourself.
+used in Check yourself; the same reading applies to two agents run on the same tasks.
 
 ```python
 from math import comb, sqrt
@@ -232,21 +277,24 @@ Illustrative numbers, normalised so the strong model costs 1.0 per call.
 The per-call price says "save 40%"; the per-successful-task number says the swap loses money.
 
 ## Production patterns
-- **Selection ADR with an evidence table.** For every model choice. Record each candidate's eval score
-  with its interval, cost per successful task, p95 latency and failure categories, plus the re-selection
-  triggers. Monitor whether production metrics stay inside the ADR's assumptions.
+- **Selection ADR with an evidence table.** For every model choice, per agent role. Record each
+  candidate's eval score with its interval, cost per successful task, p95 latency, steps per run and
+  failure categories, plus the re-selection triggers. Monitor whether production metrics stay inside the
+  ADR's assumptions.
 - **Pinned version in config, never an alias.** For every production route. Store the dated model
   identifier in configuration behind one model interface, so a change is a reviewed config diff. Monitor
   provider deprecation notices and have a re-selection ticket opened automatically.
-- **Exercised second source.** For any user-facing route. Configure a fallback model that also clears
-  the bar and send a small scheduled share of traffic or a synthetic test through it, so it is not first
-  used during an outage. Monitor 429 and 5xx rates per provider and fallback success rate.
-- **Shadow comparison before a swap.** When a cheaper or newer candidate looks viable offline. Send a
-  sample of production requests to the candidate in parallel without showing its answers, then score
-  both offline. Monitor the paired disagreement rate and which categories the disagreements fall into.
-- **Log provider-reported usage per request.** Always. Store input, output and cached token counts
-  from each response next to the trace, so cost per successful task is computed from data. Monitor
-  forecast-versus-bill error and output-token growth per route.
+- **Exercised second source.** For any user-facing agent. Configure a fallback model that also clears
+  the bar on the agent eval (including tool-call format) and send a small scheduled share of traffic or a
+  synthetic test through it, so it is not first used during an outage. Monitor 429 and 5xx rates per
+  provider and fallback success rate.
+- **Shadow comparison before a swap.** When a cheaper or newer candidate looks viable offline. Replay a
+  sample of production agent tasks against the candidate in a sandbox without acting on its tool calls,
+  then score both offline. Monitor the paired disagreement rate and which categories the disagreements
+  fall into.
+- **Log provider-reported usage per step.** Always. Store input, output and cached token counts from
+  each response next to the trace span for that step, so cost per successful run is computed from data.
+  Monitor forecast-versus-bill error, steps per run and output-token growth per route.
 - **Scheduled re-run of the eval.** On a fixed cadence and on deprecation notices. Run the same
   harness against current candidates and compare lower bounds with the bar. Monitor the frontier, not
   release announcements.
@@ -254,6 +302,9 @@ The per-call price says "save 40%"; the per-successful-task number says the swap
 ## Trade-offs
 - **Cheapest-that-clears vs headroom.** It minimises spend but leaves little margin when traffic drifts
   harder; if your task changes often, buy margin with a stronger model or a cascade.
+- **One model vs a model per agent role.** A single model is simpler to evaluate and debug; splitting
+  planner and worker roles saves cost but doubles eval work and adds hand-off failures. It pays when
+  routine steps dominate token spend.
 - **Private eval set vs effort.** It gives a trustworthy comparison but costs expert time and goes
   stale; a small set has wide intervals, so differences of a few points cannot be acted on.
 - **Per-candidate prompt adaptation vs effort.** It makes the comparison fair but multiplies the work;
@@ -262,32 +313,37 @@ The per-call price says "save 40%"; the per-successful-task number says the swap
   but concentrates deprecation and outage risk; a second source doubles evaluation work and halves the
   blast radius.
 - **Reasoning-heavy models vs cost and variance.** They raise quality on genuinely hard tasks but bring
-  high output-token cost and latency variance; the choice flips as soon as the task is not reasoning-bound.
+  high output-token cost and latency variance, which multiplies across agent steps; the choice flips as
+  soon as the task is not reasoning-bound.
 
 ## Pitfalls
 - **Choosing on public leaderboard rank.** Symptom: the "better" model scores lower on your eval, or wins
   it and then fails on JSON formatting or tool calls in production. Fix: a private task eval that also
   scores format and tool-call compliance.
+- **Judging an agent model on single calls.** Symptom: a candidate wins a per-turn eval but finishes
+  fewer runs, because small per-step errors compound. Fix: score whole runs in a sandbox and track steps
+  per run.
 - **Estimating cost from list price without measuring tokens.** Symptom: the bill differs from the
-  forecast by a large fraction because of tokenizer differences or verbose outputs. Fix: compute cost
-  from token counts measured in the eval runs.
+  forecast by a large fraction because of tokenizer differences, verbose outputs or extra agent steps.
+  Fix: compute cost from token counts measured in the eval runs.
 - **Comparing single runs and treating a 2-point gap as real.** Symptom: the ranking flips when someone
   re-runs the comparison the following week. Fix: report intervals, compare paired, and add examples.
-- **Deploying a floating "latest" alias.** Symptom: quality or format changes overnight with no deploy
-  and no entry in the change log. Fix: pin the dated version in config.
-- **Ignoring quotas and rate limits at peak.** Symptom: 429 errors at launch, and the fallback path has
-  never been exercised. Fix: confirm quota for launch peak and exercise the second source beforehand.
+- **Deploying a floating "latest" alias.** Symptom: quality or tool-call format changes overnight with
+  no deploy and no entry in the change log. Fix: pin the dated version in config.
+- **Ignoring quotas and rate limits at peak.** Symptom: 429 errors at launch, because each user request
+  is several agent calls, and the fallback path has never been exercised. Fix: confirm quota for launch
+  peak and exercise the second source beforehand.
 - **Evaluating in English only for a multilingual product.** Symptom: context overflows and higher cost
   for languages whose tokenization is two to three times less efficient. Fix: include each supported
   language in the eval set and the token measurements.
 
 ## When to use
-- **Run the funnel when:** a new task is introduced, a deprecation notice arrives, a model release
-  plausibly moves the quality-cost frontier, or the latency or cost target changes.
+- **Run the funnel when:** a new task or agent role is introduced, a deprecation notice arrives, a model
+  release plausibly moves the quality-cost frontier, or the latency or cost target changes.
 - **Avoid:** re-selecting on every release announcement. The eval harness makes a scheduled re-run
   cheap, so put it on a cadence instead.
-- **Measure:** eval score with its interval, cost per successful task, p95 latency, and failure rates by
-  category (format, refusal, timeout).
+- **Measure:** eval score with its interval, run success and steps per run for agents, cost per
+  successful task, p95 latency, and failure rates by category (format, tool call, refusal, timeout).
 - **Day to day:** this shows up as "can we move this to the cheaper model", and the honest answer is
   always "the eval says".
 - **Interviews:** articulate the threshold-versus-linear reasoning, the hard-constraint filter, and "I
@@ -328,6 +384,14 @@ land in the costly category.
 - **Pick the cheapest model whose lower confidence bound clears the bar** and whose p95 fits the latency
   budget, then pin the version and keep a second source.
 
+### How does choosing a model for a multi-step agent differ from choosing one for a single call?
+- **Errors compound.** At 0.95 per-step tool accuracy, a 10-step run succeeds about 60% of the time
+  versus about 85% for 0.98 over 8 steps, so you score whole runs, not turns.
+- **Cost and latency are per run.** Weaker models often take more steps, and each step re-sends the
+  transcript, so measure steps per run and summed tokens from the eval traces.
+- **Roles can differ.** A strong planner with a cheaper model for routine tool steps is often the
+  frontier, but it needs its own eval of the hand-offs.
+
 ### Why is "quality is a threshold, cost is linear" the core of the decision?
 - **Below the bar the feature does not work;** above it, extra points rarely change the outcome.
 - **Cost and latency are paid on every call** and grow with volume, for the life of the feature.
@@ -337,17 +401,18 @@ land in the costly category.
 ### Your forecast said the new model would cost 30% less, but the first bill matched the old one. What went wrong?
 - **Tokens were estimated, not measured.** Tokenizers differ across families, so the same document can
   be 20-30% more tokens in one, and more for non-English text.
-- **Output verbosity and hidden reasoning tokens,** which most providers bill as output, can dominate.
+- **Output verbosity and hidden reasoning tokens,** which most providers bill as output, can dominate,
+  and an agent on the new model may take more steps per run.
 - **Retries and escalations were left out of the denominator.** Compare cost per successful task
   computed from provider-reported usage logged per request.
 
-### How do you make a comparison between the incumbent model and a newcomer fair?
-- **Same examples, same prompt structure,** then a bounded, equal amount of prompt adaptation per model,
-  because format sensitivity differs between families and zero adaptation punishes the newcomer.
-- **Fix sampling settings and run several seeds,** reporting a mean with a confidence interval over
-  examples, not over example-times-run.
-- **Keep the set private and over-sample hard cases,** because a model that has seen your examples is
-  not being evaluated and the hard cases are where candidates differ.
+### After a model upgrade your agent's run success dropped but single-turn evals look fine. How do you debug it?
+- **Compare paired runs on the same tasks** and diff the traces at the first step where the two models
+  diverge; that is usually a tool choice or a malformed argument.
+- **Check tool-call format and parse failures per step,** since a pinned-version change can alter how
+  arguments are emitted even when answers read well.
+- **Fix with prompt or tool-description adaptation within a bounded budget,** then re-run the full agent
+  eval; if it still misses the bar, roll back to the pinned previous version.
 
 ### When would you deliberately not pick the cheapest model that clears the bar?
 - **When the task drifts often.** The cheapest-that-clears choice leaves little headroom, so buy margin

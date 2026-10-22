@@ -5,7 +5,8 @@ name: Streaming (SSE)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/ttft
   - serving-inference/tpot
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Streaming sends each token as it is decoded, so users feel time-to-first-token, not total time.
-Server-Sent Events (SSE) is the usual transport: plain one-way HTTP. The price: errors, usage and tool
-calls arrive piecemeal, and no hop may buffer.
+Streaming lets an agent show tokens, tool calls and progress as they happen, so users feel
+time-to-first-token, not a long multi-step run. SSE is the usual transport; the price is piecemeal
+tool-call JSON, in-band errors and no buffering hops.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is several model calls plus tool calls. Without streaming
+  the user stares at a spinner for the whole loop; with it they see "searching…", partial answers and
+  can cancel a run heading the wrong way.
+- **Where it shows up in your stack.** `stream=True` on OpenAI-style SDKs, the Anthropic Messages API
+  event stream (`input_json_delta` for tool arguments), your FastAPI `StreamingResponse`, and every proxy
+  between your agent server and the browser.
+- **What you control.** Which events you forward (tokens, tool start and end, step boundaries), when you
+  parse streamed tool arguments (only at block end), heartbeats during slow tools, and what a run looks
+  like when it ends without a terminal event.
+- **What you can skip.** The full WHATWG parsing algorithm and HTTP/2 framing details; your SDK parses
+  provider streams. Know the event shape, the buffering signature and the error semantics.
 
 ## Why it exists
 - **Total time is long; the first token is early.** Decoding produces one token at a time, so total
@@ -121,27 +135,43 @@ Two consequences follow:
 - **Connection limits bite.** On HTTP/1.1 most browsers allow six connections per origin, which runs
   out if every tab holds a stream open; HTTP/2 multiplexes streams over one connection.
 
+### Streaming an agent run, not just one answer
+An agent server sits between two streams: it *consumes* the provider's stream for each model call and
+*produces* one stream of its own for the whole run.
+1. **Model call streams in.** Text deltas can be forwarded at once; tool-call argument fragments are
+   accumulated, because they only parse at the end of the block.
+2. **Tool step runs.** No model tokens flow while a tool executes, so the server emits its own
+   `tool_start` and `tool_end` events and heartbeats; a slow search can otherwise trip an idle timer.
+3. **Next model call streams in** with the tool result appended, and the loop repeats.
+4. **The run ends** with one terminal `done` or `error` event for the whole run, not per model call.
+
+| Event you emit | Why the UI or caller needs it |
+|---|---|
+| `delta` | Visible text as it is decoded |
+| `tool_start` / `tool_end` | Progress during the silent tool step, and an audit trail |
+| `step` | Step counter, so a runaway loop is visible |
+| `done` / `error` | The only signal that the run finished, since the status is already `200` |
+
 ## Diagram
-The 200 is committed before the first token. After that, tokens, heartbeats and the terminal event
-all travel inside one open response, through every hop.
+The 200 is committed before the first token. After that, model deltas, agent tool events, heartbeats
+and the terminal event all travel inside one open response, through every hop.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant P as Proxy or gateway
-    participant S as API server
-    participant E as Engine
-    C->>P: POST /v1/answer
+    participant S as Agent server
+    participant E as Model API or engine
+    C->>P: POST /v1/agent
     P->>S: forward request
-    S-->>P: 200 text/event-stream plus connected comment
-    P-->>C: headers and comment, passed straight on
-    E->>S: one token per decode step
-    S-->>P: event delta, flushed now
-    P-->>C: event delta, unbuffered
-    S-->>P: keep-alive comment while idle
-    S-->>P: event done or event error
-    P-->>C: terminal event, then close
-    Note over C: no terminal event means partial answer
+    S-->>C: 200 text/event-stream plus connected comment
+    E->>S: tokens and tool-call JSON fragments
+    S-->>C: event delta, flushed and unbuffered
+    S-->>C: event tool_start, then keep-alive while tool runs
+    S->>E: next call with tool result
+    E->>S: final answer tokens
+    S-->>C: event done or event error, then close
+    Note over C: no terminal event means partial run
 ```
 
 ## Examples
@@ -246,7 +276,68 @@ Same 500-token answer at 20 ms per token, TTFT ~300 ms (illustrative).
 The third row is why "all events arrived within the last 100 ms of the response" is the alert to set:
 generation ran at normal speed, but an intermediary held the bytes.
 
+### Agent scenario: assembling a streamed tool call
+The agent forwards text at once but executes a tool only after its argument JSON is complete. The
+events are a hand-written stand-in shaped like the Anthropic Messages API stream.
+
+```python
+import json
+
+events = [  # stand-in for a provider stream; shapes follow the Messages API event types
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text"}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Checking "}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "content_block_start", "index": 1,
+     "content_block": {"type": "tool_use", "id": "tu_1", "name": "search_orders"}},
+    {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": '{"order_'}},
+    {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": 'id": "A-17"}'}},
+    {"type": "content_block_stop", "index": 1},
+    {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 31}},
+]
+
+def run_step(stream, emit):
+    blocks, calls = {}, []
+    for ev in stream:
+        if ev["type"] == "content_block_start":
+            blocks[ev["index"]] = {**ev["content_block"], "buf": ""}
+        elif ev["type"] == "content_block_delta":
+            d = ev["delta"]
+            if d["type"] == "text_delta":
+                emit("delta", {"text": d["text"]})               # forward text immediately
+            else:
+                blocks[ev["index"]]["buf"] += d["partial_json"]   # never parse a fragment
+        elif ev["type"] == "content_block_stop":
+            b = blocks[ev["index"]]
+            if b["type"] == "tool_use":
+                calls.append((b["name"], json.loads(b["buf"])))   # complete JSON only here
+                emit("tool_start", {"name": b["name"]})
+        elif ev["type"] == "message_delta":
+            return ev["delta"]["stop_reason"], calls, ev["usage"]
+
+print(run_step(events, lambda e, d: print("emit", e, d)))
+# emit delta {'text': 'Checking '}
+# emit tool_start {'name': 'search_orders'}
+# ('tool_use', [('search_orders', {'order_id': 'A-17'})], {'output_tokens': 31})
+```
+
+### Worked scenario: a three-step agent with and without streaming
+Illustrative numbers: two tool calls, then a 400-token answer at 20 ms per token.
+
+| Phase | Time | Non-streaming UI | Streaming UI |
+|---|---|---|---|
+| Model call 1 (plans, emits tool call) | 0-1.5 s | spinner | "Looking up order…" at ~0.4 s |
+| Tool 1 (order API) | 1.5-3.5 s | spinner | `tool_start`, heartbeats |
+| Model call 2 plus tool 2 | 3.5-7 s | spinner | second `tool_start` |
+| Final answer | 7-15 s | spinner | text from ~7.3 s |
+| What the user sees first | | everything at ~15 s | progress at ~0.4 s, can cancel at any point |
+
 ## Production patterns
+- **Stream agent events, not only tokens.** Agent teams emit `tool_start`, `tool_end` and step events
+  from the agent server alongside model deltas, so users see progress during silent tool steps. Monitor
+  the longest gap between events per run; it usually points at one slow tool.
+- **Execute tools only on a complete block.** Accumulate `input_json_delta` fragments (or OpenAI-style
+  tool-call argument deltas) and parse at block end, then validate against the tool schema before
+  running anything. Monitor tool-argument parse failures per tool.
 - **Disable buffering per hop, explicitly.** When SSE crosses nginx, set `proxy_buffering off;` in the
   streaming location (or send `X-Accel-Buffering: no` from the app) and exclude `text/event-stream`
   from gzip. Monitor the gap between first and last event arrival against generation time.
@@ -274,6 +365,9 @@ generation ran at normal speed, but an intermediary held the bytes.
   WebSockets or a second request channel.
 - **Coalescing vs smoothness.** Several tokens per event every few tens of milliseconds cuts frame and
   render overhead on busy servers, at the cost of visibly choppier output at low concurrency.
+- **Agent transparency vs noise.** Streaming every tool event makes an agent's work visible and
+  cancellable, but chatty step events clutter the UI and leak internals; forward a curated subset to
+  users and the full stream to traces.
 - **Latency vs validation.** Structured output cannot be validated until the final event, so a
   streaming JSON response either needs an incremental parser or loses the latency benefit for
   machine consumers.
@@ -281,6 +375,8 @@ generation ran at normal speed, but an intermediary held the bytes.
   pushes usage and cost data to the end of the stream where disconnects can lose it.
 
 ## Pitfalls
+- **Parsing tool arguments mid-stream.** Symptom: intermittent `JSONDecodeError` or a tool called with
+  truncated arguments. Fix: accumulate fragments and parse only at the end of the tool-use block.
 - **A proxy or middleware buffers the body.** Symptom: a stream that works on localhost and arrives
   all at once in production after the full generation time. Fix: walk the hops with `curl -N` and
   turn buffering and compression off on each.
@@ -305,6 +401,8 @@ generation ran at normal speed, but an intermediary held the bytes.
 ## When to use
 - **Stream by default** for anything a human reads that is longer than a sentence, and for long-running
   machine calls where early cancellation and liveness matter (agent steps, tool-argument generation).
+- **Stream the whole agent run** to interactive users: one SSE response carrying deltas, tool events and
+  one terminal event, so a multi-step run never looks frozen.
 - **Do not bother** for short classification, extraction or embedding calls, or for batch pipelines
   that validate the complete output anyway.
 - **Measure** TTFT, the distribution of inter-event gaps, stream completion rate and disconnect rate.
@@ -333,14 +431,6 @@ reading the stream reproduces the exact symptom. Verify by sending a `: connecte
 even that arrives late, the problem is an intermediary, not the model.
 
 ## Interview questions
-### Why not just poll a job endpoint or return a chunked plain-text body?
-- **Polling** adds a round trip per poll, gives latency granularity equal to the poll interval and
-  multiplies request volume, so it is both slower and more expensive.
-- **Raw chunked text** gets bytes out early but has no framing: the client cannot separate tokens from
-  a mid-stream error, a tool-argument fragment or the usage record.
-- **SSE adds just enough framing** (named events, a blank-line delimiter, comments for heartbeats) on
-  ordinary HTTP, so it fixes both without a protocol upgrade.
-
 ### Your stream returned 200, sent 300 tokens, then the model failed. How should the system behave?
 - **Server:** the status is already committed, so send an in-band `error` event (or a non-normal
   finish reason) and close the stream.
@@ -370,6 +460,20 @@ even that arrives late, the problem is an intermediary, not the model.
   bound.
 - **Reconcile** against the provider's usage reports, not streamed chunk counts, because servers
   coalesce or split tokens per event.
+
+### You are building a chat agent that calls tools. What do you stream to the user, and when do you run the tool?
+- **Stream text deltas at once** and emit your own `tool_start` and `tool_end` events around each tool,
+  with heartbeats while it runs, so the run never looks frozen.
+- **Run the tool only after the block closes.** Tool-call arguments arrive as JSON fragments; parse and
+  schema-validate them at block end, never mid-stream.
+- **End the run with one terminal event** so the client can tell a finished run from a dropped one.
+
+### An agent's SSE stream drops halfway through a multi-step run. What should the system do?
+- **Treat it as a cancel, not a pause.** SSE streams are not resumable, so stop the agent loop and close
+  the upstream model stream to stop spend.
+- **Check side effects.** Tools already executed (an email sent, a ticket filed) are not undone by the
+  drop, so log them per run and make retries idempotent.
+- **Restart from a checkpoint** if the agent persists step state; otherwise rerun from scratch.
 
 ## Quiz
 ### Q: Why is SSE preferred over WebSockets for streaming LLM tokens to a browser?

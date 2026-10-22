@@ -5,7 +5,8 @@ name: tiktoken
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - model-internals/tokenization
   - model-internals/context-window
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-tiktoken is OpenAI's fast byte-pair-encoding tokenizer (Rust core, Python bindings) that yields exactly
-the token ids OpenAI models see. Use it locally to count, budget, chunk and estimate cost; for other model
-families its counts are only an approximation.
+tiktoken is OpenAI's fast BPE tokenizer (Rust core, Python bindings). Agents use it to budget a growing
+transcript locally: count tool schemas, history and retrieved chunks before each step, and decide what to
+trim. Exact for OpenAI models only; elsewhere an approximation.
+
+## For agent builders
+- **Why it matters for agents.** An agent's context grows every step: system prompt, tool schemas, each
+  tool call and result. Without a local count you find out about overflow from a rejected request on
+  step 30, after paying for steps 1 to 29.
+- **Where it shows up in your stack.** Your context manager and history trimmer, chunkers in RAG
+  pipelines, LangChain's OpenAI token counting and text splitters that can measure length with tiktoken,
+  LiteLLM's cost and token helpers for OpenAI models, and pre-flight cost estimates for batch evals.
+- **What you control.** The encoding (resolve it per model), the output reserve, how much of the window
+  retrieval and tool results may take, when to compact old turns, and how untrusted text with special
+  tokens is handled.
+- **What you can skip.** Training BPE, and the exact regex of each encoding. Know that counts depend on
+  text type, that chat and tool overhead exist, and that `usage` is the ground truth after the call.
 
 ## Why it exists
 - **Every API limit is in tokens.** The context window, maximum output, rate limits (tokens per minute)
@@ -32,12 +46,23 @@ families its counts are only an approximation.
   job whose cost you could not estimate in advance.
 - **"About four characters per token" breaks where it hurts.** It is a fair average for English prose,
   but code, JSON, URLs, numbers and most non-English scripts produce many more tokens per character. A
-  heuristic fine for a blog post overflows on a stack trace or a Japanese contract.
+  heuristic fine for a blog post overflows on a stack trace or a Japanese contract, and agent tool
+  results are mostly JSON and code.
 - **Counting via an API** adds latency and a network dependency to every prompt you assemble.
 - **tiktoken ships the exact vocabulary and merge ranks** for OpenAI encodings and applies them locally,
   fast enough for every request and for whole corpora during chunking.
 
 ## How it works
+### Where tokens go in an agent step
+| Part of the request | Grows? | Budget lever |
+|---|---|---|
+| System prompt | fixed | keep it short and stable |
+| Tool schemas (JSON) | fixed per run, scales with tool count | expose only the tools this step needs |
+| Conversation and tool-call history | every step | compact or summarise old turns |
+| Tool results (JSON, code, pages) | every step, often the largest | truncate or summarise before appending |
+| Retrieved chunks | per search | fixed top-k, token-sized chunks |
+| Reserved output | fixed | the model's answer or next tool call |
+
 ### Byte-level BPE
 1. **Pre-split.** A regular expression splits text into chunks (words, numbers, punctuation, whitespace
    runs) in an encoding-specific way.
@@ -95,11 +120,13 @@ An encoding is the regex plus the merge ranks plus special tokens.
 
 - **Special tokens raise by default.** `encode` errors if text contains a special-token string such as
   `<|endoftext|>`. This is deliberate: silently encoding user text as a real control token would let
-  input inject document boundaries.
+  input inject document boundaries. Tool results (scraped pages, files) are untrusted input too.
 - **Opt in** with `allowed_special`, or treat them as plain text with `disallowed_special=()`.
 
-### Chat overhead
+### Chat and tool overhead
 - **Messages add tokens you did not write:** role markers and separators.
+- **Tool definitions are rendered into the prompt** by the provider in a format you do not see, so
+  counting `json.dumps(tools)` is an estimate of their cost, not the exact number.
 - **Not a stable public contract.** The overhead depends on the model, so treat local content counts as
   close estimates and reconcile against the `usage` field the API returns.
 
@@ -110,11 +137,11 @@ An encoding is the regex plus the merge ranks plus special tokens.
 
 ## Diagram
 How one string becomes token ids, and where the special-token check sits: the regex split and the rank
-table decide the count, and every byte is covered, so nothing falls back to an unknown token.
+table decide the count your agent's context manager budgets with.
 
 ```mermaid
 flowchart TD
-    T["Input text"] --> S{"Contains a special-token string?"}
+    T["Input text or tool result"] --> S{"Contains a special-token string?"}
     S -->|"yes, default encode"| E["Raise error"]
     S -->|"no, or disallowed_special set to empty"| R["Regex pre-split into chunks"]
     R --> B["Each chunk to UTF-8 bytes"]
@@ -122,10 +149,45 @@ flowchart TD
     M --> C{"Any ranked pair left?"}
     C -->|"yes"| M
     C -->|"no"| I["Map pieces to token ids"]
-    I --> N["len(ids) feeds budget, chunking and cost"]
+    I --> N["len(ids) feeds the agent context budget"]
 ```
 
 ## Examples
+### Agent context manager: trim history before each step
+Before every model call, estimate the request and drop the oldest tool results (keeping the system
+prompt, tool schemas and the latest turns) until it fits.
+
+```python
+import json, tiktoken
+
+enc = tiktoken.encoding_for_model("gpt-4o")          # resolves to o200k_base
+WINDOW, RESERVED_OUTPUT, PER_MSG = 128_000, 4_000, 4  # PER_MSG: rough allowance for role markers
+
+def n(s: str) -> int:
+    return len(enc.encode(s, disallowed_special=()))  # tool results are untrusted text
+
+def estimate(messages: list[dict], tools: list[dict]) -> int:
+    body = sum(n(m.get("content") or "") + n(json.dumps(m.get("tool_calls", ""))) + PER_MSG
+               for m in messages)
+    return body + n(json.dumps(tools))                # estimate: provider renders tools its own way
+
+def fit(messages: list[dict], tools: list[dict], keep_last: int = 6) -> list[dict]:
+    msgs = list(messages)
+    budget = WINDOW - RESERVED_OUTPUT
+    while estimate(msgs, tools) > budget:
+        old = [i for i, m in enumerate(msgs[1:-keep_last], 1) if m["role"] == "tool"
+               and m["content"] != "[result elided]"]
+        if not old:
+            raise ValueError("cannot fit: compact history or shrink tool schemas")
+        msgs[old[0]] = {**msgs[old[0]], "content": "[result elided]"}  # keep tool_call_id pairing
+    return msgs
+```
+
+- **Elide, do not delete, tool messages.** Providers require every tool call to have a matching result,
+  so replace the content and keep the message and its id.
+- **Trim at a boundary.** Each edit to earlier turns breaks provider prompt caching from that point, so
+  compact in larger steps rather than a little on every call.
+
 ### Budgeting a RAG prompt so chunks never crowd out the answer
 ```python
 import tiktoken
@@ -198,27 +260,49 @@ Using the constants above, with an illustrative 1,500-token system prompt, a 300
 If those chunks were sized with chars/4 on code or Japanese, each would really cost far more than 800
 tokens and far fewer would fit; count with the real encoder.
 
+### Worked scenario: when does an agent hit the window?
+Illustrative coding agent on a 128,000-token window: 1,500-token system prompt, 3,000 tokens of tool
+schemas, 4,000 reserved for output, and each step appends a tool call plus a result averaging 2,500
+tokens.
+
+| Quantity | Tokens |
+|---|---|
+| Fixed prefix (system + tools) | 4,500 |
+| Available for history: 128,000 − 4,000 − 4,500 | 119,500 |
+| Steps before overflow at 2,500 per step | 47 |
+| Same agent if results are capped at 1,000 tokens | 119 steps |
+
+Capping or summarising tool results is usually a bigger lever than trimming the system prompt.
+
 ## Production patterns
+- **Budget every agent step, not just the first.** Run a `fit`-style check before each model call, with
+  an explicit output reserve. Log local estimate next to the API's reported input tokens per step and
+  alert when the gap grows.
+- **Cap tool results at the tool boundary.** Each tool returns at most a set number of tokens (truncate,
+  paginate or summarise), counted with the real encoder, because one large page or log dump can consume
+  the window. Monitor p95 tool-result tokens per tool.
 - **Count before you send.** Run `pack`-style budgeting on every dynamically assembled prompt and trim or
-  reject before the call. Log local count next to the API's reported input tokens and alert when the gap
-  grows.
+  reject before the call, rather than discovering overflow from an error.
 - **Resolve the encoding, with a deliberate fallback.** Call `tiktoken.encoding_for_model(model)` and
   catch `KeyError` for names it does not know, falling back to an explicitly chosen encoding such as
   `o200k_base`. Log every fallback so new models get checked.
 - **Pre-seed the cache at build time.** Set `TIKTOKEN_CACHE_DIR` in the image and call
   `tiktoken.get_encoding("o200k_base")` during the build, so the rank file ships with the container.
   Monitor first-request failures in offline environments.
-- **Treat user text as plain text.** Pass `disallowed_special=()` (or use `encode_ordinary`) for any
-  untrusted input. Never put `<|endoftext|>` into `allowed_special` for user content.
+- **Treat user text and tool output as plain text.** Pass `disallowed_special=()` (or use
+  `encode_ordinary`) for any untrusted input. Never put `<|endoftext|>` into `allowed_special` for user
+  content.
 - **Batch corpus counting.** Use `enc.encode_batch(texts)` when chunking or costing large corpora, and load
   the encoding once at module level rather than per request. Monitor chunking throughput.
 
 ## Trade-offs
 - **Exact and free vs OpenAI-only.** Local counts are fast and exact for OpenAI models, but only
   estimates for Anthropic, Gemini or open models; use those providers' own token-counting endpoints or
-  tokenizers when exactness matters.
+  tokenizers when exactness matters. A multi-provider agent needs a per-provider counter.
 - **Prevention vs CPU per request.** Counting every prompt prevents context-overflow errors before they
   happen; the CPU cost is negligible for chat, but batch with `encode_batch` over large corpora.
+- **Trim often vs cache hits.** Trimming a little every step keeps context minimal but breaks prompt
+  caching each time; compacting rarely, in larger steps, keeps the prefix stable and cheaper.
 - **Predictable chunk sizes vs sentence integrity.** Token-based chunking fits model limits reliably but
   cuts across sentences unless combined with structural splitting, which can hurt retrieval quality.
 - **Local estimate vs `usage` field.** `usage` is authoritative and free but arrives after the money is
@@ -230,16 +314,19 @@ tokens and far fewer would fit; count with the real encoder.
 - **Hard-coding `cl100k_base` for every model.** Counts drift for newer models on a different encoding.
   Symptom: cost estimates that disagree with billed usage.
 - **`encode` on raw user input without special-token handling.** A document containing `<|endoftext|>`
-  raises an exception and the request fails with a confusing error.
+  raises an exception and the request fails with a confusing error; in an agent, a scraped page can
+  crash the loop mid-task.
 - **Forgetting chat-format and tool-schema overhead.** Requests near the limit fail even though your
   content-only count said they fit, because tool definitions and role markers also consume tokens.
+- **Deleting tool messages to save tokens.** Removing a tool result but keeping its call breaks the
+  provider's call/result pairing and the request is rejected. Fix: elide the content, keep the message.
 - **Deploying without internet access.** The first encode call fails trying to download the encoding
   file, unless the cache directory was pre-populated.
 
 ## When to use
-- **Use when** you assemble prompts dynamically for OpenAI models: packing retrieved context, trimming
-  conversation history, enforcing per-user token limits, chunking documents to a token size, and
-  estimating cost for a batch job before you run it.
+- **Use when** you assemble prompts dynamically for OpenAI models: budgeting each agent step, packing
+  retrieved context, trimming conversation history, capping tool results, enforcing per-user token
+  limits, chunking documents to a token size, and estimating cost for a batch job before you run it.
 - **Other providers:** only as a rough estimate; prefer their official counter, or the Hugging Face
   tokenizer for an open model.
 - **Measure** the gap between your local estimate and the API's reported input count
@@ -274,12 +361,21 @@ with `usage` numbers from a pilot week, because billed input also includes forma
   numbers and many non-English scripts stay in more, smaller pieces.
 - **No unknown token exists**, because every byte is in the base vocabulary.
 
-### A request fails with a context-length error although your local count said it fit. How do you debug it?
+### Your agent fails with a context-length error on step 30 although your per-step count said it fit. How do you debug it?
 - **Check the encoding first:** hard-coded `cl100k_base` on a newer `o200k_base` model, or tiktoken used
   for a non-OpenAI model, gives the wrong count.
 - **Then check what you did not count:** role markers, separators and tool definitions also consume
-  tokens, so content-only counts run low near the limit.
-- **Confirm with data:** log the local count next to the API's reported input tokens and inspect the gap.
+  tokens, so content-only counts run low near the limit; a single large tool result can also jump the
+  total in one step.
+- **Confirm with data:** log the local count next to the API's reported input tokens per step and
+  inspect where the gap opens.
+
+### How would you keep a long-running agent inside its context window?
+- **Reserve and cap:** fix an output reserve, and cap every tool result at the tool boundary with the
+  real encoder, because tool results usually dominate growth.
+- **Compact deliberately:** when the estimate nears the budget, elide or summarise old tool results in
+  one larger step, keeping call/result pairing and the stable prefix so prompt caching still hits.
+- **Measure:** tokens per step, steps per task, and how often compaction fires, alongside task success.
 
 ### When would you not use tiktoken to count tokens?
 - **For Anthropic, Gemini or open models:** tiktoken counts are only an approximation there; use the

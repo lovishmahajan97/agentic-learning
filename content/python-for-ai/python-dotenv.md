@@ -5,7 +5,8 @@ name: python-dotenv
 kind: tool
 difficulty: intro
 est_minutes: 9
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/pydantic-settings
   - backend-fundamentals/secrets-management
@@ -19,19 +20,32 @@ sources:
 ---
 
 ## TL;DR
-python-dotenv copies `KEY=value` lines from a gitignored `.env` file into `os.environ`, so code reads
-environment variables everywhere. It is a dev convenience, not a secrets manager (no typing, validation
-or encryption), and by default never overrides variables already set.
+A local agent needs model, tool and tracing keys; python-dotenv copies `KEY=value` lines from a
+gitignored `.env` into `os.environ` so every SDK finds them. A dev convenience, not a secrets manager; it
+never overrides variables already set.
+
+## For agent builders
+- **Why it matters for agents.** An agent touches more credentials than a chat app: the LLM provider, a
+  search or browser tool, a vector database, a tracing service such as LangSmith or Langfuse. Each SDK
+  reads its own env var, so one `.env` loaded early wires all of them locally.
+- **Where it shows up in your stack.** The OpenAI and Anthropic SDKs, LangChain chat model classes and
+  tracing clients read their keys from the environment on their own; `load_dotenv()` on the first lines of
+  the agent's entry point, notebook or `conftest.py` is how those keys arrive in development.
+- **What you control.** Which file loads, from which path, and the precedence: an already-set variable
+  wins under the default `override=False`, so the platform's injected secret beats any stray file.
+- **What you can skip.** Parser edge cases beyond quoting and `${VAR}` expansion. Know the override
+  default, the one-time copy, and that every value is a string.
 
 ## Why it exists
-- **Config belongs in the environment.** An AI service needs values that differ per environment and must
-  never be committed: the OpenAI or Anthropic API key, a vector-database URL, a Langfuse key, the model
-  you are trialling. Twelve-Factor says read them from env vars, because Docker, Kubernetes, a PaaS and CI
-  all inject them with no code changes.
-- **The friction is the laptop.** Exporting eight variables in every new terminal is tedious.
+- **Config belongs in the environment.** An agent service needs values that differ per environment and
+  must never be committed: the OpenAI or Anthropic API key, a vector-database URL, a Langfuse key, the
+  model you are trialling. Twelve-Factor says read them from env vars, because Docker, Kubernetes, a PaaS
+  and CI all inject them with no code changes.
+- **The friction is the laptop.** Exporting eight variables in every new terminal is tedious, and an
+  agent with five tools easily needs that many.
 - **The workarounds are worse.** Hardcoding the key "just for now" ends in a leaked key in git history;
-  `~/.zshrc` leaks one project's key into every other project and subprocess; a `config.py` with real
-  values gets committed by accident.
+  `~/.zshrc` leaks one project's key into every other project and every subprocess your agent spawns; a
+  `config.py` with real values gets committed by accident.
 - **What people want.** A per-project file that behaves like environment variables, is easy to edit and
   is ignored by git.
 - **python-dotenv is that bridge.** The code path stays `os.environ["OPENAI_API_KEY"]` everywhere; only
@@ -42,8 +56,8 @@ or encryption), and by default never overrides variables already set.
 ### Finding the file
 1. `load_dotenv()` with no arguments calls `find_dotenv()`.
 2. The search starts in the calling module's directory (or the current directory in an interactive
-   session) and walks *up* parent directories to the first `.env`. Upward, because scripts often run
-   from `scripts/` or `notebooks/` while the file sits at the project root.
+   session) and walks *up* parent directories to the first `.env`. Upward, because agent scripts often
+   run from `scripts/`, `evals/` or `notebooks/` while the file sits at the project root.
 3. Alternatives: pass an explicit path, or `find_dotenv(usecwd=True)` to search from the working
    directory.
 4. No file found: `load_dotenv()` returns `False` rather than raising, because "no file" is the normal
@@ -51,7 +65,7 @@ or encryption), and by default never overrides variables already set.
 
 The walk is a convenience with two sharp corners and one fix:
 - **Monorepos.** It stops at the *first* `.env` going up, so a parent directory's file can be picked up by
-  a child project.
+  a child project, for example the agent picking up the web app's keys.
 - **Installed packages.** When the calling code lives under `site-packages`, the walk starts there and
   never reaches your project.
 - **Fix for both.** Pass an explicit path in the entry point.
@@ -67,57 +81,60 @@ The walk is a convenience with two sharp corners and one fix:
 | `${OTHER}` | Expands from earlier lines or the existing environment (interpolation is on by default for `load_dotenv`) |
 | `${VAR:-default}` | Fallback when neither the environment nor the file defines `VAR` |
 
-So `DB_URL=postgres://${DB_USER}@localhost/app` works.
+So `DB_URL=postgres://${DB_USER}@localhost/app` works, and so does a memory-store URL built from parts.
 
 ### The precedence rule
 - **Default is `load_dotenv(override=False)`.** A variable already in the process environment wins over
   the file, because the file is meant to be the laptop's fallback.
 - **Why that matters.** In CI or production the platform-injected value is authoritative, and a stray
-  `.env` baked into an image must not silently replace it.
+  `.env` baked into an agent image must not silently replace it.
 - **`override=True`** only when you deliberately want the file to win.
 - **First source to set a key wins.** With several files, load the most specific first
   (`load_dotenv(".env.local")` then `load_dotenv(".env")`), the opposite of the "later overrides
   earlier" order most config systems use. Interpolation follows the same precedence.
 
 ### Lifecycle
-- **A one-time copy, not a live binding.** Editing `.env` changes nothing in a running process; restart it.
+- **A one-time copy, not a live binding.** Editing `.env` changes nothing in a running agent server;
+  restart it.
 - **Early captures keep stale values.** Anything that read a value before `load_dotenv()` ran (a
-  module-level `client = OpenAI()`, a `settings` object built at import) keeps what it saw, which is why
-  the load belongs on the first lines of the entry point.
+  module-level `client = OpenAI()`, a `settings` object built at import, a tracing client configured at
+  import) keeps what it saw, which is why the load belongs on the first lines of the entry point.
 
 ### Two ways to use the values
 | Call | Effect | Best for |
 |---|---|---|
 | `load_dotenv()` | Mutates `os.environ` | Libraries that read env vars themselves (the OpenAI SDK reads `OPENAI_API_KEY` on its own) and subprocesses you spawn |
 | `dotenv_values(".env")` | Returns a plain dict, touches nothing | Tests and merging files, e.g. `{**dotenv_values(".env.shared"), **dotenv_values(".env.local")}`, because global mutable state is avoided |
-| `dotenv run -- python app.py` | CLI (from the `cli` extra) loads the file then execs the command | Tools you cannot edit |
+| `dotenv run -- python app.py` | CLI (from the `cli` extra) loads the file then execs the command | Tools you cannot edit, such as a third-party MCP server you launch |
 
 ### What it does not do
-- **Every value is a string.** `DEBUG=false` gives the non-empty string `"false"`, which is truthy.
+- **Every value is a string.** `DEBUG=false` gives the non-empty string `"false"`, which is truthy, and
+  `MAX_STEPS=8` is `"8"` until you convert it.
 - **No schema, no required-field check, no secret masking.** That is the job of a settings layer such as
   pydantic-settings, which can itself read `.env` files.
 
 ## Diagram
-Follow one `load_dotenv()` call: the upward file search, then the per-key precedence check that lets an
-already-set variable win unless `override=True`.
+Follow one `load_dotenv()` call at agent startup: the upward file search, then the per-key precedence
+check that lets an already-set variable win unless `override=True`.
 
 ```mermaid
 flowchart TD
-    A["Entry point calls load_dotenv()"] --> B["find_dotenv walks up from the caller directory"]
-    B -->|"no .env found"| N["Return False, environment untouched"]
-    B -->|"first .env found"| P["Parse KEY=value lines and expand references"]
-    P --> K{"Key already set in os.environ?"}
-    K -->|"yes, override=False"| S["Keep the existing value"]
-    K -->|"no, or override=True"| W["Write the file value"]
+    A["Agent entry point calls load_dotenv()"] --> B["find_dotenv walks up from caller"]
+    B -->|"no .env found"| N["Return False, env untouched"]
+    B -->|"first .env found"| P["Parse lines, expand references"]
+    P --> K{"Key already set?"}
+    K -->|"yes, override=False"| S["Keep existing value"]
+    K -->|"no, or override=True"| W["Write file value"]
     S --> E[("os.environ, strings only")]
     W --> E
     N --> E
-    E --> C["App code, SDKs and subprocesses read it"]
+    E --> C["LLM SDK, tool clients, tracing"]
 ```
 
 ## Examples
-### Entry point that loads, then fails fast
-A small entry point that loads local config, then fails fast and explicitly on what is missing.
+### Agent entry point that loads, then fails fast
+Load local config, check every key the agent's tools need, then build clients. Missing keys fail at
+startup, not on step 7 of a run when the search tool is first called.
 
 ```python
 # .env (gitignored)                     .env.example (committed, no real values)
@@ -125,21 +142,27 @@ A small entry point that loads local config, then fails fast and explicitly on w
 #   MODEL=gpt-4o-mini                     MODEL=gpt-4o-mini
 #   MAX_TOKENS=512                        MAX_TOKENS=512
 #   DEBUG=false                           DEBUG=false
+#   SEARCH_API_KEY=local-search           SEARCH_API_KEY=
+#   MAX_STEPS=8                           MAX_STEPS=8
 import os
 from dotenv import load_dotenv, dotenv_values
 
 found = load_dotenv()          # walks up to find .env; existing env vars win
 print("loaded .env:", found)   # False in production, where the platform sets vars
 
-REQUIRED = ["OPENAI_API_KEY", "MODEL"]
+REQUIRED = ["OPENAI_API_KEY", "MODEL", "SEARCH_API_KEY"]   # model + every tool's key
 missing = [k for k in REQUIRED if not os.environ.get(k)]
 if missing:
     raise SystemExit(f"missing config: {missing}; copy .env.example to .env")
 
 model = os.environ["MODEL"]
 max_tokens = int(os.environ.get("MAX_TOKENS", "256"))      # strings only: convert yourself
+max_steps = int(os.environ.get("MAX_STEPS", "8"))          # loop budget for the agent
 debug = os.environ.get("DEBUG", "false").lower() in {"1", "true", "yes"}
-print(model, max_tokens, debug)  # bool("false") would have been True
+print(model, max_tokens, max_steps, debug)  # bool("false") would have been True
+
+from openai import OpenAI      # import clients AFTER load_dotenv
+client = OpenAI()              # reads OPENAI_API_KEY from os.environ itself
 
 # Without touching os.environ (good in tests):
 cfg = dotenv_values(".env.example")
@@ -150,7 +173,7 @@ assert set(REQUIRED) <= cfg.keys(), "example file is out of date"
   before `load_dotenv()` ran and `override` defaults to `False`.
 
 ### Worked scenario: who wins with two files and a shell export
-The shell still has an old `export MODEL=gpt-4o` from yesterday. The entry point runs
+The shell still has an old `export MODEL=gpt-4o` from yesterday's eval run. The agent's entry point runs
 `load_dotenv(".env.local")` then `load_dotenv(".env")`, both with the default `override=False`.
 
 | Key | Shell | `.env.local` | `.env` | Final value | Why |
@@ -159,34 +182,49 @@ The shell still has an old `export MODEL=gpt-4o` from yesterday. The entry point
 | `OPENAI_API_KEY` | unset | `sk-local-dev` | `sk-shared` | `sk-local-dev` | First file to set it wins |
 | `MAX_TOKENS` | unset | unset | `512` | `512` | Only `.env` defines it |
 
-The "I changed the model in .env and nothing happened" bug is the first row; `unset MODEL` or a new
-terminal fixes it.
+The "I changed the model in .env and the agent still behaves the same" bug is the first row; `unset
+MODEL` or a new terminal fixes it. In an eval comparison it is worse: both "variants" silently ran the
+same model, so the scores match for the wrong reason.
+
+### Worked scenario: an agent's tool subprocess sees too much
+An agent runs a code-execution tool as a subprocess. With `load_dotenv()`, `os.environ` holds every key.
+
+| Approach | What the sandboxed tool process can read |
+|---|---|
+| Inherit the parent environment | The model key, the search key, the tracing key: all of them |
+| Pass `env={"PATH": ...}` explicitly to the subprocess | Only what you listed |
+
+The fix is in how you spawn the tool, not in python-dotenv: give tool processes an explicit, minimal
+environment.
 
 ## Production patterns
-- **Fail fast on required keys.** At startup, check a `REQUIRED` list against `os.environ` and exit with
-  the missing names, as in the first example. Monitor crash-loops on deploy, which now name the key
-  instead of surfacing as a `None` API key mid-request.
+- **Fail fast on every tool's key.** At startup, check a `REQUIRED` list covering the model and each
+  enabled tool against `os.environ` and exit with the missing names, as in the first example. Monitor
+  crash-loops on deploy, which now name the key instead of surfacing as a `None` API key mid-run.
 - **Keep `.env.example` honest in CI.** Add a test that loads `dotenv_values(".env.example")` and asserts
-  every key the code requires is present. Watch for that test failing when someone adds a setting without
-  documenting it.
+  every key the code requires is present. Watch for that test failing when someone adds a tool without
+  documenting its key.
 - **Exclude the file from git and images.** List `.env` in both `.gitignore` and `.dockerignore`, and run a
   secret scanner in pre-commit and CI. Monitor scanner hits and provider leaked-key alerts; any hit means
   rotate, because history keeps the value.
-- **Load once, from an explicit path.** In `main` or `conftest.py`, call `load_dotenv()` with the path
-  next to the entry point and log its return value. Never call it in library code, which should read only
-  the environment it is given.
+- **Load once, from an explicit path.** In `main`, the eval runner or `conftest.py`, call `load_dotenv()`
+  with the path next to the entry point and log its return value. Never call it in library code or inside
+  a tool, which should read only the environment it is given.
 - **Treat production as "no file".** Run staging with no `.env` present and variables injected by the
-  platform or a secrets manager. The code should behave identically; a `True` return from `load_dotenv()`
-  in production logs is a red flag.
+  platform or a secrets manager. The agent should behave identically; a `True` return from
+  `load_dotenv()` in production logs is a red flag.
+- **Use separate dev keys with low limits.** Put a low-spend, dev-only provider key in `.env`, so a runaway
+  local agent loop or a leaked laptop file costs little. Monitor spend per key.
 
 ## Trade-offs
 - **One code path vs a second source of truth.** `os.environ` works in every environment, but the file is
   an implicit source that can drift from what production injects; a committed `.env.example` keeps the
   drift visible.
 - **Zero friction vs hand-rolled typing.** Trivial to adopt with no other dependencies, but you write type
-  conversion and required checks yourself. Past a few settings, pydantic-settings pays for itself.
+  conversion and required checks yourself. Past a few settings (model, step budget, timeouts, tool
+  toggles), pydantic-settings pays for itself.
 - **Visibility vs leakage.** Mutating `os.environ` lets third-party SDKs and subprocesses see values, which
-  is convenient until a child process or crash dump exposes a key it never needed; `dotenv_values`
+  is convenient until a tool subprocess or crash dump exposes a key it never needed; `dotenv_values`
   avoids that.
 - **Plaintext file vs secrets manager.** Fine for a dev key with low limits; for production secrets a
   secrets manager with rotation and audit wins regardless of team size.
@@ -198,9 +236,10 @@ terminal fixes it.
   changed", because an old `export` takes precedence under `override=False`. Fix: unset it or open a new
   shell.
 - **Loading after an import that already read `os.environ`.** Symptom: a `None` key even though the file
-  is correct. Fix: load first thing in the entry point.
-- **Treating `"false"` or `"0"` as falsy.** Symptom: debug mode or a feature flag stuck on. Fix: convert
-  explicitly.
+  is correct, or traces missing because the tracing client configured itself at import. Fix: load first
+  thing in the entry point.
+- **Treating `"false"` or `"0"` as falsy.** Symptom: debug mode, verbose tracing or a tool toggle stuck
+  on. Fix: convert explicitly.
 - **Copying `.env` into a Docker image with `COPY . .`.** Symptom: real keys visible in a pulled image
   layer. Fix: `.dockerignore`.
 - **Relying on the upward search in a nested repo or installed package.** Symptom: values from the wrong
@@ -208,9 +247,10 @@ terminal fixes it.
   return value and pass an explicit path.
 
 ## When to use
-- **Use when:** local development, notebooks, demos and small scripts where the alternative is exporting
-  variables by hand. Call it once at the top of the entry point; commit a `.env.example` listing every key.
-- **Avoid in library code:** it should only read the environment it is given.
+- **Use when:** local agent development, notebooks, eval scripts, demos and small scripts where the
+  alternative is exporting variables by hand. Call it once at the top of the entry point; commit a
+  `.env.example` listing every key.
+- **Avoid in library code and tools:** they should only read the environment they are given.
 - **Move on when:** settings need types, validation, nesting or per-environment profiles; switch to
   pydantic-settings, which reads the same file.
 - **Never for production secret delivery:** production gets variables from the platform or a secrets
@@ -244,13 +284,21 @@ required variable is absent, so no silent fallback exists.
 - **Why it still helps:** the code path stays `os.environ[...]` everywhere; only the source of the values
   changes between a laptop and a cluster.
 
-### A developer changed `MODEL` in `.env`, but the app still uses the old model. How do you debug it?
+### A developer changed `MODEL` in `.env`, but the agent still uses the old model. How do you debug it?
 - **Stale shell export:** an earlier `export MODEL=...` is already in the environment, and under the
   default `override=False` the file never replaces it. Check with `echo $MODEL`.
-- **Process not restarted:** loading is a one-time copy, so a running server never sees file edits.
+- **Process not restarted:** loading is a one-time copy, so a running agent server never sees file edits.
 - **Captured too early or wrong file:** a module-level client may have read the value before
   `load_dotenv()` ran, or the upward search found another project's `.env`. Log the return value and
   pass an explicit path.
+
+### Your agent has a code-execution tool that runs as a subprocess. How do you keep it from seeing your API keys?
+- **Know the default:** `load_dotenv()` writes keys into `os.environ`, and a child process inherits the
+  whole environment unless you pass one explicitly.
+- **Pass a minimal environment:** spawn the tool with an explicit env containing only what it needs, or
+  load values with `dotenv_values` into a dict that never touches the process environment.
+- **Defence in depth:** run the tool in a sandbox with no network access to your providers, and keep
+  production keys out of `.env` entirely.
 
 ### Why is `override=False` the default, and when would you set `override=True`?
 - **The environment is authoritative:** in CI and production the platform injects values, and a stray
@@ -267,11 +315,11 @@ required variable is absent, so no silent fallback exists.
 - **Assume a leak is permanent:** if a key was ever committed, rotate it, because removing the file does
   not remove it from history.
 
-### When would you replace python-dotenv with pydantic-settings?
+### When would you replace python-dotenv with pydantic-settings in an agent service?
 - **When settings need types:** python-dotenv yields only strings, so `"false"` is truthy and every call
-  site converts by hand.
+  site converts step budgets, timeouts and toggles by hand.
 - **When you need validation:** pydantic-settings checks required fields and constraints at startup,
-  supports nested models and masks secrets with `SecretStr`.
+  supports nested models (one per tool) and masks secrets with `SecretStr`.
 - **Migration cost is low:** it reads the same `.env` file, so the switch is a new `Settings` class, not a
   new config workflow.
 

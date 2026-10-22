@@ -5,7 +5,8 @@ name: Dataset contamination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - evals/benchmarking
   - evals/golden-dataset
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-Dataset contamination means eval items, paraphrases or solutions sit in a model's training data, so
-scores measure memorization, not capability. Web-crawl training makes it unavoidable, inflation is
+Dataset contamination means eval items or their answers reach the model through training data, prompts
+or, for agents, tools and memory, so scores measure memorization or lookup, not capability. Inflation is
 uneven across models, and your own golden set leaks just as easily.
+
+## For agent builders
+- **Why it matters for agents.** Agents add leak routes plain models lack: a web-search tool can fetch
+  a benchmark's published answer, a sandbox repo can contain the commit that fixed the issue, long-term
+  memory can carry one eval task's answer into the next, and fine-tuning on your own agent traces can
+  absorb golden tasks.
+- **Where it shows up in your stack.** Fine-tuning pipelines on agent traces, few-shot banks in the
+  system prompt, the agent's memory store, search and browse tools during evals, and the model
+  benchmarks you shortlist on.
+- **What you control.** Isolation of the golden set from training files, prompts and memory; a fresh
+  memory and sandbox per eval task; search tools restricted or audited during evals; canaries and
+  overlap checks before every fine-tuning job.
+- **What you can skip.** Running membership-inference research on hosted models. Behavioural probes,
+  cutoff dates and your own leak guards cover what an agent team needs.
 
 ## Why it exists
 - **The split is no longer yours.** In classical ML you held out rows and nothing in training could see
@@ -54,6 +69,7 @@ uneven across models, and your own golden set leaks just as easily.
 | **Transitive** | Training on synthetic data from another model that had seen the benchmark; knowledge moves without any benchmark text moving |
 | **Temporal** | A benchmark published after the training cutoff is clean for that model but may be in its successor's crawl, so cross-generation comparisons are not like for like |
 | **Evaluation-time** | Few-shot examples drawn from the test split, or a golden dataset also used for prompt tuning or fine-tuning; the route teams control and most often get wrong |
+| **Tool-time (agents)** | During the eval the agent searches the web and finds the benchmark item with its answer, reads future commits in a sandbox repo, or recalls an earlier task from shared memory; the score measures lookup, not the capability you meant to test |
 
 ### Detecting it with corpus access
 When you can see the training data (your own fine-tuning set, or an open pretraining corpus):
@@ -114,6 +130,16 @@ Most of the time you have only the model, so detection is behavioural:
   which items to re-examine.
 - **Report cutoffs:** when quoting a public benchmark, say whether the model's cutoff precedes the
   benchmark's publication.
+
+### Preventing it in agent evals
+- **Fresh memory per task.** Start each eval task with an empty or seeded memory store, *because* a
+  shared store lets an answer written during task 12 surface in task 40.
+- **Sandbox repos and data at the task's point in time.** Strip history after the base commit and any
+  file that contains the reference solution, so the agent cannot read the answer from the environment.
+- **Audit or restrict search tools.** Block the benchmark's own hosting sites, or log every fetched
+  page and flag tool results that overlap the item's reference answer.
+- **Keep agent traces from evals out of training data.** Traces of golden tasks carry the task and,
+  after grading, often the correct answer; tag them at creation and exclude them from fine-tuning sets.
 
 ## Diagram
 The detection path splits on one question, whether you can see the training data; both branches end in
@@ -239,6 +265,39 @@ raise SystemExit(1 if hits else 0)                # block the fine-tuning job on
 - **Exact-match guard plus shingles.** This catches copies of whole inputs; the 13-gram check above
   catches partial overlap. Run both; neither catches paraphrases.
 
+### Agent scenario: catching answer lookup in a search-enabled agent's traces
+After an eval run, scan each trace's tool results for the item's reference answer. A hit means the
+agent may have found the answer rather than worked it out. Reuses `shingles` from the first example
+with a shorter n, because answers are short.
+
+```python
+def lookup_flags(runs, items, n=6):
+    """runs: id -> {"pass": bool, "trace": [{"tool": str, "result": str}, ...]}"""
+    flags = {}
+    for it in items:
+        ans = set(shingles(it["answer"], n))
+        if not ans:                                   # answer shorter than n words: exact substring check
+            hit = any(it["answer"].lower() in str(t["result"]).lower() for t in runs[it["id"]]["trace"])
+        else:
+            hit = any(ans & set(shingles(str(t["result"]), n)) for t in runs[it["id"]]["trace"]
+                      if t["tool"] in {"web_search", "fetch_url"})
+        flags[it["id"]] = hit
+    return flags
+
+flags = lookup_flags(runs, eval_items)
+passed = [i for i in flags if runs[i]["pass"]]
+print(f"{sum(flags[i] for i in passed)} of {len(passed)} passes saw the answer in a tool result")
+```
+
+| Illustrative run, 165 research tasks | Count |
+|---|---|
+| Passed | 112 |
+| Passed with the answer present in a fetched page | 31 |
+| Score with those 31 counted as unverified | 81 of 165, about 49% instead of 68% |
+
+- **Reading it:** the 31 lookups came from pages that publish the benchmark itself, so the headline
+  68% partly measures search; report both numbers and block those domains in the next run.
+
 ## Production patterns
 - **Overlap gate in the training pipeline.** Before any fine-tuning job, run the shingle check and the
   exact-match guard between the training file and every eval set, and fail the job on hits. Monitor hit
@@ -255,6 +314,10 @@ raise SystemExit(1 if hits else 0)                # block the fine-tuning job on
   Monitor how many cited scores lack either.
 - **Rolling fresh items.** Add newly written or newly sampled items each month, dated, so there is always
   a slice created after every candidate's cutoff. Monitor the score gap between old and fresh slices.
+- **Hermetic agent eval environments.** Give every eval task a fresh memory store and a sandbox built
+  at the task's point in time, tag all eval traces so the training pipeline can exclude them, and log
+  every page a search tool fetches. Monitor the share of passes whose tool results contained the
+  reference answer.
 
 ## Trade-offs
 - **N-gram overlap vs coverage.** Cheap, scalable and precise about verbatim copies, but misses
@@ -263,6 +326,9 @@ raise SystemExit(1 if hits else 0)                # block the fine-tuning job on
   match the original difficulty distribution is expensive, and the fresh set goes stale once shared.
 - **Private held-out sets vs credibility.** Immune to crawl contamination while private, but results
   cannot be independently reproduced, so they carry less public credibility.
+- **Restricting agent search during evals vs realism.** Blocking benchmark sites keeps the score about
+  reasoning, but production agents will search freely, so a restricted run understates real success.
+  Report the restricted score for capability and an unrestricted one for the product.
 - **Aggressive decontamination vs model quality.** Removing every document that overlaps a benchmark
   protects the eval but also removes legitimate educational content and can reduce model quality.
 
@@ -279,6 +345,8 @@ raise SystemExit(1 if hits else 0)                # block the fine-tuning job on
   answers from memory because the source documents were in its crawl.
 - **Reading a clean-versus-flagged gap as proof without a control.** Symptom: an uncontaminated model
   shows the same "contamination effect", because flagged items were the easier, more widely quoted ones.
+- **Shared memory across agent eval tasks.** Symptom: pass rate rises with item order in the run, and
+  later tasks quote facts only an earlier task's tools returned. Fix: reset memory per task.
 - **Publishing the golden set in a public repository.** Symptom: next year's model aces it and the team
   cannot tell improvement from memorization.
 
@@ -344,9 +412,17 @@ what I would act on.
 - **So a clean result means** "not detectably contaminated", and you pair it with an exact-match guard
   and behavioural probes.
 
-### How would you stop your own golden set from contaminating future evals?
+### Your search-enabled research agent scores far higher on a public benchmark than on your own tasks. What do you check?
+- **Tool-time lookup:** scan each trace's fetched pages for the item's reference answer; pages that
+  publish the benchmark turn the score into a search test.
+- **Environment and memory leaks:** confirm each task started with fresh memory and a sandbox with no
+  answer files or future history.
+- **Then report two numbers:** the raw score and the score with lookup-tainted passes set aside, and
+  block the offending domains in the next run.
+
+### You fine-tune your agent on its own production traces. How do you stop the golden set contaminating future evals?
 - **Gate the training pipeline:** run shingle overlap and an exact-match guard between every fine-tuning
-  file and every eval set, and fail the job on any hit.
+  file and every eval set, and fail the job on any hit; exclude traces tagged as eval runs.
 - **Mark and protect the files:** a unique canary per eval file that leaves the repository, and a private
   held-out split run only through providers whose terms exclude your traffic from training.
 - **Keep a fresh slice:** add dated items monthly so some items always postdate every candidate's

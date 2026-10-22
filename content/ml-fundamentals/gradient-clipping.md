@@ -5,7 +5,8 @@ name: Gradient clipping
 kind: practice
 difficulty: core
 est_minutes: 11
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/backpropagation
   - ml-fundamentals/optimizers
@@ -21,16 +22,29 @@ sources:
 ---
 
 ## TL;DR
-Gradient clipping scales all gradients down by one factor when their global L2 norm exceeds a threshold,
-keeping direction and bounding step length, because one rare batch can undo thousands of good steps or
-corrupt optimizer statistics.
+Gradient clipping scales all gradients down by one factor when their global norm exceeds a threshold.
+When you fine-tune on agent traces, it stops one freak trajectory (a giant tool output, a broken
+transcript) from undoing thousands of good steps.
+
+## For agent builders
+- **Why it matters for agents.** Agent training data is lumpy: most traces are short tool calls, a few
+  carry 20k-token tool results, retry loops or malformed JSON. Those outliers produce the gradient spikes
+  clipping exists for, and the pre-clip norm is how you find them.
+- **Where it shows up in your stack.** `max_grad_norm` in the Hugging Face Trainer (and TRL trainers built
+  on it), `torch.nn.utils.clip_grad_norm_` in a custom loop, `gradient_clipping` in DeepSpeed configs.
+- **What you control.** The threshold, where the call sits relative to loss scaling and accumulation,
+  whether the loss is averaged over tokens, and logging the pre-clip norm with trace ids.
+- **What you can skip.** The RNN history and the convergence theory; know the ordering (accumulate,
+  unscale, clip, step) and how to read the norm curve.
 
 ## Why it exists
 - **Gradients occasionally explode.** Backprop multiplies Jacobians layer by layer; when the products line
   up, the bottom-layer gradient can be orders of magnitude larger than typical. In RNNs this was
   systematic along time, and the 2013 analysis proposed clipping as the fix.
 - **Transformers hit it sporadically.** An unusual batch, a sharp region, a saturating attention pattern
-  or a mixed-precision edge case gives a norm of 50 where the running average is 1.
+  or a mixed-precision edge case gives a norm of 50 where the running average is 1. In agent SFT the
+  unusual batch is often one trajectory unlike the rest: a huge tool result, a looping retry, a corrupted
+  transcript.
 - **One step does outsized damage.** Under SGD the weights jump by `η × 50` instead of `η × 1`, which can
   leave the basin the run spent a day finding.
 - **Adam is not immune.** The raw step is normalized, softening the jump, but the huge gradient enters
@@ -69,6 +83,15 @@ What that means depends on the optimizer:
 - **Usual causes:** a loss summed rather than averaged, a learning rate too high, or a threshold copied
   from a setup with a different parameter count. The global norm sums over every parameter, so its
   typical value depends on model size.
+
+### Where agent traces push the norm
+- **Long trajectories with a summed loss.** If the loss is summed over tokens instead of averaged, a
+  batch holding one 30k-token trace has a far larger norm than a batch of short tool calls, so the clip
+  fires on exactly the batches you most need to learn from in proportion.
+- **Degenerate targets.** Traces with mislabelled roles (tool output trained as assistant text) or
+  truncated JSON put high loss on tokens the model cannot predict, and show up as norm spikes.
+- **Masking matters.** Training only on assistant and tool-call tokens, not on tool results, removes
+  much of that variance before clipping has to.
 
 ### Value clipping
 - **Mechanism:** `clip_grad_value_` clamps each element to `[−c, c]`.
@@ -139,6 +162,35 @@ flowchart TD
 ```
 
 ## Examples
+### Tracing norm spikes back to agent trajectories
+Log the pre-clip norm with the trace ids in each batch, and flag batches far above the rolling median so
+someone can open the offending transcripts.
+
+```python
+import statistics
+from collections import deque
+from torch.nn.utils import clip_grad_norm_
+
+recent = deque(maxlen=200)          # rolling window of healthy norms
+suspects = []                       # (step, norm, trace_ids) for data review
+
+def clip_and_log(model, step, trace_ids, max_norm=1.0, spike_factor=5.0):
+    norm = clip_grad_norm_(model.parameters(), max_norm).item()   # pre-clip norm
+    if len(recent) >= 50 and norm > spike_factor * statistics.median(recent):
+        suspects.append((step, norm, trace_ids))   # e.g. a 25k-token tool dump or a retry loop
+    else:
+        recent.append(norm)
+    return norm
+```
+
+| Step | Pre-clip norm | Rolling median | Trace in the batch | Finding |
+|---|---|---|---|---|
+| 410 | 0.9 | 0.8 | 16 short tool calls | healthy |
+| 411 | 6.3 | 0.8 | one trace with a 25k-token HTML tool result | trained on tool output by mistake |
+| 412 | 0.8 | 0.8 | 16 short tool calls | healthy |
+
+The fix at step 411 was data, not the threshold: mask tool results out of the loss and re-run.
+
 ### A training step in the correct order
 Accumulation, fp16 loss scaling and clipping in order. The function returns the pre-clip norm so it can
 be logged; the comment works one concrete step.
@@ -202,9 +254,12 @@ ignoring `m`).
 - **Rewind on spikes clipping did not stop.** Keep frequent checkpoints; when loss and grad norm spike
   together, roll back to a checkpoint before the spike and skip or reshuffle the batches around it. Record
   the skipped batch indices for data review.
-- **Correlate norm spikes with batches.** Log batch or shard ids with the norm so a spike can be traced to
-  its data. Spikes aligned with loss spikes point at data or numerics; a slow upward drift points at the
-  learning rate.
+- **Correlate norm spikes with traces.** Log batch, shard or agent trace ids with the norm so a spike can
+  be traced to its data. Spikes aligned with loss spikes point at data or numerics; a slow upward drift
+  points at the learning rate.
+- **Clean traces before tuning the clip.** When agent SFT clips often, first check loss masking (train on
+  assistant and tool-call tokens), averaging over tokens, and outlier-length trajectories. Track clip rate
+  per data source, since one tool's verbose outputs often account for most clipped steps.
 
 ## Trade-offs
 - **Outlier protection vs hidden recipe change.** Clipping bounds rare batches at no cost on normal steps,
@@ -232,10 +287,15 @@ ignoring `m`).
   nearly every step, the signal that the root cause is still there.
 - **Not logging the pre-clip norm.** It throws away the best early warning for bad data, numeric issues and
   a learning rate that has outlived its schedule.
+- **Letting the clip absorb bad agent traces.** A clip that quietly shrinks every batch containing a broken
+  transcript hides the data bug. Symptom: clip rate correlates with one data source. Fix: log trace ids
+  with the norm and fix or drop those traces.
 
 ## When to use
-- **Use it on every transformer training run.** `max_norm = 1.0` is a sensible start, and frameworks such
-  as the Hugging Face `Trainer` already apply it.
+- **Use it on every transformer training run,** agent SFT and LoRA included. `max_norm = 1.0` is a sensible
+  start, and frameworks such as the Hugging Face `Trainer` already apply it.
+- **Avoid worrying about it when:** you only prompt hosted models or use a hosted fine-tuning API, which
+  owns the clip; your lever there is trace quality.
 - **Read it, not just enable it:** log the pre-clip norm, note the fraction of steps that clipped, and
   treat sustained clipping as a configuration problem rather than a success.
 - **Revisit the threshold** when changing optimizer, precision or batch size, because all three move the
@@ -275,7 +335,7 @@ the new threshold tells them whether the clip was changing the outcome.
 - **It is a no-op** below the threshold, so normal steps are untouched; that is why it beats simply
   lowering the learning rate to survive the worst batch.
 
-### Your fp16 fine-tune trains but the loss barely moves, and nothing errors. What do you check?
+### Your fp16 fine-tune of a tool-calling model trains but the loss barely moves. What do you check?
 - **Clip placement:** if `clip_grad_norm_` runs before `scaler.unscale_(opt)`, it measures a norm
   inflated by the loss scale (65536 in the example) and clips every step to almost nothing.
 - **Confirm:** the logged pre-clip norm will be enormous and clipping fires on every step.
@@ -295,6 +355,13 @@ the new threshold tells them whether the clip was changing the outcome.
   it, then watch whether the spike recurs.
 - **Investigate:** check whether norm spikes line up with specific data, and whether the norm was trending
   up beforehand, which points at the learning rate.
+
+### Clipping fires on 60% of steps in your agent SFT run, mostly on batches from one tool. What now?
+- **Treat it as a data finding:** that tool's traces are probably long or verbose and either summed into
+  the loss or trained on tool-result tokens.
+- **Fix the data path:** average the loss over tokens and mask tool results so only assistant and
+  tool-call tokens are trained.
+- **Then re-measure:** the clip rate should fall to a minority of steps; only then revisit `max_norm`.
 
 ### How does clipping work under FSDP or ZeRO, and what goes wrong if you ignore it?
 - **Each rank holds a shard**, so the global norm needs a sum of squares across ranks plus a collective.

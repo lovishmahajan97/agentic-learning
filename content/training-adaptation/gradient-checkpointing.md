@@ -5,7 +5,8 @@ name: Gradient checkpointing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - training-adaptation/checkpointing
   - training-adaptation/peft
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Gradient checkpointing is activation recomputation, not saving to disk. It keeps only each block's input
-and rebuilds the internals during backward, paying roughly one extra forward pass to shrink activation
-memory enough for long-context fine-tunes to fit on one GPU.
+Agent trajectories are long, so fine-tuning on them is activation-bound. Gradient checkpointing
+(recomputation, not saving to disk) keeps only each block's input and rebuilds the rest in backward,
+costing one extra forward pass so 8k-16k-token traces fit on one GPU.
+
+## For agent builders
+- **Why it matters for agents.** A tool-calling trace is system prompt plus tool schemas plus every call
+  and result, often 8k-16k tokens. Activations grow with sequence length, so this flag (with
+  FlashAttention) decides whether you can fine-tune on whole trajectories or must truncate them.
+- **Where it shows up in your stack.** One line in a TRL `SFTConfig` or `TrainingArguments`, an Axolotl
+  YAML key, or Unsloth's `use_gradient_checkpointing="unsloth"`. Managed fine-tuning APIs handle it for
+  you.
+- **What you control.** The maximum training sequence length, attention implementation, micro-batch and
+  the reentrant setting. The silent-zero-gradient trap in LoRA runs is the one bug worth memorising.
+- **What you can skip.** It has no effect on serving: inference never stores activations for backward,
+  so your agent's latency and the KV cache are untouched. The √n proof is interview trivia, not
+  something you tune.
 
 ## Why it exists
 - **Training memory has four parts.** Weights, gradients, optimizer state and activations. The first
@@ -35,15 +49,15 @@ memory enough for long-context fine-tunes to fit on one GPU.
   is `xᵀ · dL/dy`, so `x` must be kept; GELU needs its input; softmax needs its output.
 - **All of them are live at once.** Autograd holds every intermediate tensor until backward consumes it,
   and backward runs last-layer-first, so at the end of the forward pass *all* of them are alive. At long
-  sequence lengths they outweigh the weights.
+  sequence lengths, which agent traces always reach, they outweigh the weights.
 - **The naive alternatives fail here.** Gradient accumulation shrinks the micro-batch, but you are already
-  at b = 1. Shortening the sequence changes the task. A bigger GPU is a procurement ladder, not an
-  engineering answer.
+  at b = 1. Shortening the sequence changes the task: a truncated trajectory loses the final answer the
+  agent was supposed to learn. A bigger GPU is a procurement ladder, not an engineering answer.
 - **What it buys.** It trades the one resource GPUs have in abundance, compute, for the one they lack,
   memory.
 
 ## How it works
-### How big activations are
+### Background: how big activations are
 Korthikanti et al. estimate one transformer layer's activations in bf16, without FlashAttention, at
 roughly `s·b·h·(34 + 5·a·s/h)` bytes (s = sequence, b = batch, h = hidden, a = heads).
 
@@ -61,13 +75,11 @@ roughly `s·b·h·(34 + 5·a·s/h)` bytes (s = sequence, b = batch, h = hidden, 
   Llama-style SwiGLU MLP or a dropout-free recipe changes it somewhat, so use the formula for orders of
   magnitude, not for a precise budget.
 
-### The observation
-- A block's internal activations are a deterministic function of its input (dropout aside, which is
-  handled by replaying the RNG state).
-- If you still have the input, you can rebuild the internals whenever you need them, so you only need
-  them during that block's own backward step, not across the whole forward pass.
+### Background: the observation and the algorithm
+- **The observation.** A block's internal activations are a deterministic function of its input (dropout
+  aside, which is handled by replaying the RNG state). With the input kept, you can rebuild the internals
+  during that block's own backward step instead of holding them across the whole forward pass.
 
-### The algorithm
 1. **Partition** the network into segments. In transformers the common choice is one decoder block per
    segment, because block boundaries are where the activation tensor is smallest (just `s·b·h`).
 2. **Forward:** run each segment without recording the autograd graph. Keep only the segment's input
@@ -97,7 +109,8 @@ roughly `s·b·h·(34 + 5·a·s/h)` bytes (s = sequence, b = batch, h = hidden, 
   layer's worth"; FlashAttention then removes the s² term from that one live layer too.
 - **Why the second step matters:** the live block's eager-attention score tensors are `5·a·s²·b` bytes,
   about 2.7 GB for one 7B layer at 4k and ~10.7 GB at 8k. Without FlashAttention that single block sets a
-  memory floor no amount of checkpointing lowers.
+  memory floor no amount of checkpointing lowers. At agent-trace lengths of 16k it is ~43 GB, so eager
+  attention is simply off the table.
 
 ### Framework mechanics and the reentrant trap
 PyTorch exposes `torch.utils.checkpoint.checkpoint(fn, *args, use_reentrant=False)`, with two
@@ -109,12 +122,14 @@ implementations:
 | Non-reentrant (recommended) | Uses saved-tensor hooks | Handles inputs without grad correctly |
 
 - **The LoRA case:** the embedding output does not require grad because the embeddings are frozen. PEFT
-  recipes work around reentrant mode with `model.enable_input_require_grads()`.
+  recipes work around reentrant mode with `model.enable_input_require_grads()`. Most agent fine-tunes are
+  LoRA on tool-call traces, so this is the case you will hit.
 - **In Transformers:**
   `model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})` or
   `TrainingArguments(gradient_checkpointing=True)`.
 - **KV cache off:** Transformers forces `use_cache=False` when checkpointing is on, because the cache
-  generation builds is pointless during training and conflicts with recomputation.
+  generation builds is pointless during training and conflicts with recomputation. Your serving stack
+  keeps its KV cache; this is training-only.
 
 ### Where it sits among the other levers
 | Lever | What it cuts |
@@ -130,7 +145,7 @@ implementations:
 
 ## Diagram
 Forward keeps only each block's input; backward re-runs one block at a time from that input, so only
-one block's internals are ever alive.
+one block's internals are ever alive while training on a long agent trace.
 
 ```mermaid
 flowchart TD
@@ -146,6 +161,53 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: fine-tuning a 7B tool-calling agent on full trajectories
+A team has 2,000 successful agent runs: a 6k-token prefix (system prompt plus tool schemas) and tool
+calls and results that bring the p95 trace to ~16k tokens. Target: QLoRA on one 24 GB card (~4 GB of
+4-bit weights). Activation estimates from the formula, h = 4096, 32 layers, b = 1 (illustrative):
+
+| Setup at s = 16,384 | Activations | Verdict |
+|---|---|---|
+| Eager attention + checkpointing | one live block's scores alone ~43 GB | hopeless |
+| FlashAttention, no checkpointing | ~73 GB (2.3 GB per layer × 32) | OOM |
+| FlashAttention + checkpointing | ~4.3 GB of block inputs + ~2.3 GB live block ≈ 6.6 GB | fits |
+| Truncate to 4k instead | ~1.6 GB with both on | fits, but drops the final tool calls and answer |
+
+- **The decision:** keep whole trajectories and turn both levers on, because truncation trains the model
+  on agents that never finish.
+- **What remains to check:** the logits tensor over the vocabulary also grows with s, so verify the real
+  peak with `torch.cuda.max_memory_allocated()` on the longest trace before the full run.
+
+### Pre-flight: size the run from your agent traces
+Pure Python with a tokenizer, no GPU: measure trace lengths the way the trainer will render them, then
+estimate activations before booking hardware.
+
+```python
+import json
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+
+def act_gb(s, layers=32, h=4096, a=32, flash=True, ckpt=True):
+    per_layer = (34 * s * h + (0 if flash else 5 * a * s * s)) / 1e9   # bf16, b = 1
+    return layers * s * h * 2 / 1e9 + per_layer if ckpt else per_layer * layers
+
+lengths = []
+with open("agent_traces.jsonl") as f:          # rows: {"messages": [...], "tools": [...]}
+    for line in f:
+        row = json.loads(line)
+        ids = tok.apply_chat_template(row["messages"], tools=row.get("tools"), tokenize=True)
+        lengths.append(len(ids))
+
+lengths.sort()
+p95, longest = lengths[int(0.95 * len(lengths))], lengths[-1]
+print(f"p95 {p95} tokens, max {longest} tokens")
+for s in (p95, longest):
+    print(f"s={s}: flash {act_gb(s, ckpt=False):.1f} GB | flash+ckpt {act_gb(s):.1f} GB")
+# Pick max_length at or above p95 so most trajectories keep their final answer, and drop
+# (do not truncate) the few that are longer still.
+```
+
 ### Residual MLP stack with and without checkpointing
 Work the budget out before running it:
 - **Parameters:** each block has 8·d² ≈ 33.5M parameters at d = 2048, so 24 blocks are ~805M: ~3.2 GB of
@@ -196,7 +258,7 @@ for flag in (False, True):
 ```
 
 ### Activation budget calculator for a 7B fine-tune
-Pure Python, no GPU: plug the Korthikanti estimate into a planning script before you book hardware.
+Plug the Korthikanti estimate into a planning script before you book hardware.
 
 ```python
 def act_gb_per_layer(s, b=1, h=4096, a=32, flash=False):
@@ -228,10 +290,15 @@ Reading the output for a QLoRA run on a 24 GB card (~4 GB of 4-bit weights):
 | FlashAttention + checkpointing | ~3.3 GB | fits, with room to raise the micro-batch |
 
 ## Production patterns
-- **Checkpointing plus fused attention as the long-context default.** For any 4k+ fine-tune on one GPU,
-  set `TrainingArguments(gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False})`
+- **Checkpointing plus fused attention as the agent-trace default.** For any 4k+ fine-tune on one GPU,
+  which covers nearly every tool-calling dataset, set
+  `TrainingArguments(gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False})`
   and load the model with `attn_implementation="sdpa"` (or `"flash_attention_2"`). Monitor peak memory per
   step and tokens per second.
+- **Size max length from the trace distribution, not a default.** Agent teams render every trajectory
+  through the chat template with its tool schemas, take the p95 length, and set the training max length
+  at or above it. Drop the rare outliers rather than truncating them, because a cut trace teaches an agent
+  that never answers. Monitor the share of rows dropped.
 - **Re-tune the micro-batch after enabling it.** Raise `per_device_train_batch_size` and lower
   `gradient_accumulation_steps` so the effective batch is unchanged, until memory is nearly full. Compare
   tokens per second and GPU utilisation against the uncheckpointed baseline, not seconds per step.
@@ -239,23 +306,24 @@ Reading the output for a QLoRA run on a 24 GB card (~4 GB of 4-bit weights):
   `prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)`, which also enables input
   gradients. After the first step, assert every trainable parameter has a non-`None` gradient and that the
   logged gradient norm is non-zero.
-- **Wrap blocks inside FSDP units.** With FSDP, apply checkpointing per decoder block (for example
-  PyTorch's `apply_activation_checkpointing` with a `check_fn` matching the block class), so recompute
-  reuses the already-gathered parameters. Monitor step time and all-gather volume for unexpected growth.
-- **Selective recompute at pretraining scale.** In Megatron-LM, prefer `--recompute-granularity selective`
-  (recompute attention internals only) and fall back to `full` only when memory still does not fit.
-  Monitor model FLOPs utilisation, since full recompute costs noticeably more.
-- **Measure before and after in a smoke test.** Run one step each way, log
+- **Wrap blocks inside FSDP units; selective recompute at scale.** With FSDP, apply checkpointing per
+  decoder block (PyTorch's `apply_activation_checkpointing` with a `check_fn` matching the block class) so
+  recompute reuses gathered parameters. In Megatron-LM prefer `--recompute-granularity selective` and fall
+  back to `full` only when memory still does not fit. Monitor step time and model FLOPs utilisation.
+- **Measure before and after in a smoke test.** Run one step each way on the longest agent trace, log
   `torch.cuda.max_memory_allocated()`, and keep the numbers next to the config so regressions show up when
-  sequence length or model changes.
+  sequence length, tool count or model changes.
 
 ## Trade-offs
 - **Compute vs memory.** You pay roughly one extra forward pass per step (20–30% wall-clock,
-  illustrative) for a large cut in activation memory. If you are compute-bound with memory to spare, it
-  is pure loss and should be off.
+  illustrative) for a large cut in activation memory. If you are compute-bound with memory to spare, as
+  with short single-turn classification data, it is pure loss and should be off.
 - **Slower steps vs higher throughput.** The freed memory usually lets you raise the micro-batch, and a
   GPU at micro-batch 1 is badly under-utilised, so tokens/second often goes *up* overall despite the
   recompute. This flips once the batch already saturates the GPU.
+- **Whole trajectories vs truncation.** Checkpointing lets you keep full agent runs, so the model learns
+  how runs end, at the cost of slower steps. Truncating is cheaper but flips the training signal toward
+  half-finished tool loops; only accept it when the final steps are not what you need to teach.
 - **Per-block vs coarser segments.** Per-block is simple and matches FSDP wrapping. Coarser segments store
   fewer boundary inputs but hold a larger live segment during recompute (total recompute is one extra
   forward either way); the √n split that balances the two is rarely worth the engineering.
@@ -267,11 +335,15 @@ Reading the output for a QLoRA run on a 24 GB card (~4 GB of 4-bit weights):
 - **Confusing it with model checkpointing (saving state to disk).** Symptom: someone enables
   "checkpointing" for resumability, loses a multi-day run, and discovers nothing was ever written. Fix:
   configure save checkpoints separately.
-- **Reentrant mode with frozen embeddings in a LoRA run.** Symptom: a flat loss curve and adapter
-  gradients that are `None`. Fix: `enable_input_require_grads()` or `use_reentrant=False`.
+- **Reentrant mode with frozen embeddings in a LoRA run.** Symptom: a flat loss curve on your tool-call
+  traces and adapter gradients that are `None`. Fix: `enable_input_require_grads()` or
+  `use_reentrant=False`.
 - **Still OOM at long context after enabling it.** Symptom: the peak fell a lot but stalls at a floor of
   several GB per live block, because eager attention materialises that block's s² score tensors (~10 GB
   for one 7B layer at 8k) during recompute. Fix: only FlashAttention/SDPA removes them.
+- **Silently truncating trajectories to dodge OOM.** Symptom: the tuned agent calls tools plausibly but
+  rarely stops or answers, because the final turns were cut from most training rows. Fix: checkpointing
+  plus fused attention, and a max length set from the p95 trace.
 - **Switching it off because "steps got slower".** Symptom: lower throughput after reverting. Fix: raise
   the micro-batch to recover utilisation; the right metric is tokens per second, not seconds per step.
 - **Side effects inside a checkpointed function run twice.** Counters, logging, in-place updates and custom
@@ -281,10 +353,11 @@ Reading the output for a QLoRA run on a 24 GB card (~4 GB of 4-bit weights):
 ## When to use
 - **Use when:** activation memory is the thing that does not fit. Diagnose it by computing the `s·b·h·34`
   estimate or by comparing `torch.cuda.max_memory_allocated()` with and without the flag.
-- **Default on:** for any fine-tune at 4k+ context on a single GPU; it is what makes QLoRA on a 24 GB
-  card at 8k realistic.
+- **Default on:** for any fine-tune at 4k+ context on a single GPU, which includes almost every agent
+  trajectory dataset; it is what makes QLoRA on a 24 GB card at 8k realistic.
 - **Avoid when:** small models and short sequences, where the GPU is compute-bound and memory is
   plentiful.
+- **Ignore when:** you only call hosted models or serve your agent; this setting never touches inference.
 - **Always:** pair it with FlashAttention or SDPA, re-tune the micro-batch after enabling it, and judge
   the result by tokens/second.
 - **Interviews:** separate per-parameter memory (weights, gradients, optimizer) from activation memory,
@@ -316,15 +389,24 @@ cuts stored activations to one block input per layer (~67 MB each, ~2 GB total) 
   block's) input and frees the internals; backward re-runs that segment's forward to rebuild them.
 - **Why it saves memory:** autograd otherwise keeps every layer's activations alive until backward, so
   peak memory scales with layers. Checkpointing turns that into "all block inputs plus one live block".
-- **Not to be confused with** saving model state to disk, which is a separate setting.
+- **Not to be confused with** saving model state to disk, which is a separate setting, and it has no
+  effect on how the model serves your agent.
 
-### A LoRA run with checkpointing on shows a flat loss. How do you debug it?
+### You want to fine-tune a 7B agent on 16k-token tool-calling trajectories with one 24 GB GPU. How do you make it fit?
+- **Name the consumer:** at 16k, activations dominate. With FlashAttention but no checkpointing they are
+  ~73 GB; eager attention adds ~43 GB of scores per layer.
+- **Apply both levers:** FlashAttention or SDPA plus non-reentrant checkpointing brings it to ~6.6 GB
+  (block inputs plus one live block) next to ~4 GB of 4-bit weights.
+- **Do not truncate:** cutting traces to 4k drops the final tool calls and answers. Set max length from
+  the p95 trace and verify the peak on the longest row.
+
+### A LoRA run on agent traces with checkpointing on shows a flat loss. How do you debug it?
 - **Check gradients first:** after one step, list trainable parameters whose `.grad` is `None` or whose
   gradient norm is zero. All adapter gradients missing points at the reentrant trap.
 - **Cause:** reentrant mode only records a segment when an input requires grad, and frozen embeddings
   produce inputs that do not.
 - **Fix:** pass `use_reentrant=False`, or call `model.enable_input_require_grads()`, then rerun the
-  one-step assertion before the full run.
+  one-step assertion before the full run on your tool-call data.
 
 ### When would you turn gradient checkpointing off?
 - **When memory is not the constraint:** small models or short sequences where the GPU is compute-bound,

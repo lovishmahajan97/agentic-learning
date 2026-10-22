@@ -5,7 +5,8 @@ name: WebSockets
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/server-sent-events
   - fastapi-for-ai/streamingresponse
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-A WebSocket upgrades one HTTP connection into a persistent two-way channel. Use it when the client must
-talk mid-stream (stop, voice, approvals); you pay in pinned per-connection state, hand-rolled auth and
-resume, and upgrade-aware balancers. One-way streaming: use SSE.
+A WebSocket turns one HTTP connection into a persistent two-way channel. Use it when users talk to a
+running agent (stop, steer, approve tools, voice); you pay with pinned per-connection state, hand-rolled
+auth and resume. One-way agent streams: use SSE.
+
+## For agent builders
+- **Why it matters for agents.** Interactive agents need input while they run: a stop button, a
+  correction mid-plan, a yes or no on a risky tool call, a continuous voice stream. On a WebSocket that
+  input lands in the very process running the agent loop, with no shared cancel store.
+- **Where it shows up in your stack.** FastAPI `@app.websocket` routes for interactive or voice agents,
+  realtime speech model APIs that are themselves WebSocket-based, and the ingress, ping and deploy-drain
+  settings that keep long agent sessions alive.
+- **What you control.** The message protocol (prompt, stop, approve, token, tool_call, done), the reader
+  loop plus agent task shape, auth on the handshake, and session ids for reconnect and resume.
+- **What you can skip.** Frame-level details beyond close codes and ping/pong. Most text agents that only
+  need a stop button are better served by SSE plus a cancel endpoint.
 
 ## Why it exists
 - **HTTP is request then response.** Once the client has sent its body it cannot say anything else on
@@ -102,6 +115,20 @@ FastAPI wraps this:
 - **One sender.** Funnel all outgoing sends through one place (the generation task, or a single sender
   task fed by a queue), so two tasks never interleave frames.
 
+### An agent session over one socket
+| Client message | What the reader loop does to the agent task |
+|---|---|
+| `prompt` | starts an agent run as a task (stopping any previous one first) |
+| `stop` | sets the stop event; the loop checks it between tokens and between tool calls |
+| `steer` | queues a user correction the loop appends to the transcript before its next model call |
+| `approve` / `deny` | resolves the future the loop is awaiting before a side-effecting tool call |
+
+- **Cancellation does not undo tools.** A stop that lands mid-tool cancels the coroutine, but an email
+  already sent or a payment already submitted stays done. Gate side-effecting tools behind approval or
+  make them idempotent.
+- **The session is the agent's short-term memory holder.** If the socket's process dies, so does
+  in-memory transcript state; persist the transcript per session id so a reconnect can resume.
+
 ### Scaling and state
 - **The socket lives in one worker process.** Client messages reach it for free, which is the point.
 - **Everything else needs fan-out.** A job finishing on a worker machine or a message from another user
@@ -122,8 +149,8 @@ FastAPI wraps this:
   Check your implementation before relying on it.
 
 ## Diagram
-After the 101 upgrade, a reader loop and a generation task run side by side in one process, so a stop
-message reaches the generator without any shared store.
+After the 101 upgrade, a reader loop and an agent generation task run side by side in one process, so a
+stop or approval message reaches the agent loop without any shared store.
 
 ```mermaid
 sequenceDiagram
@@ -143,9 +170,10 @@ sequenceDiagram
 ```
 
 ## Examples
-### Interruptible chat socket
-The server streams tokens from a generation task while the reader loop stays free to receive `stop`.
-Auth is a query token because the browser cannot send headers on the upgrade.
+### Interruptible agent socket with tool approval
+The agent task streams tokens and pauses for approval before a side-effecting tool, while the reader
+loop stays free to receive `stop` or `approve`. Auth is a query token because the browser cannot send
+headers on the upgrade.
 
 ```python
 import asyncio
@@ -154,30 +182,39 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, WebSocketException,
 app = FastAPI()
 
 async def model_stream(prompt: str):                 # stand-in for your SDK's async stream
-    for w in "A WebSocket lets the user interrupt this sentence midway.".split():
+    for w in "Refund issued. A WebSocket lets the user interrupt this sentence midway.".split():
         await asyncio.sleep(0.4); yield w + " "
 
-async def generate(ws: WebSocket, prompt: str, stop: asyncio.Event):
+async def run_agent(ws: WebSocket, prompt: str, stop: asyncio.Event, approvals: dict):
+    # 1) the model proposes a side-effecting tool call: ask the human first
+    fut = asyncio.get_running_loop().create_future()
+    approvals["refund-1"] = fut
+    await ws.send_json({"type": "approval_needed", "id": "refund-1", "tool": "issue_refund"})
+    if not await asyncio.wait_for(fut, timeout=120):  # denied: tell the model, do not run the tool
+        await ws.send_json({"type": "done", "note": "refund denied"}); return
+    # 2) tool ran; stream the answer, checking stop between tokens
     async for piece in model_stream(prompt):
         if stop.is_set():
             await ws.send_json({"type": "stopped"}); return
         await ws.send_json({"type": "token", "delta": piece})
     await ws.send_json({"type": "done"})
 
-@app.websocket("/ws/chat")
-async def chat(ws: WebSocket, token: str):           # ?token=... (short-lived); verify before accept
+@app.websocket("/ws/agent")
+async def agent(ws: WebSocket, token: str):          # ?token=... (short-lived); verify before accept
     if token != "demo":
         raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION)
     await ws.accept()
-    stop, task = asyncio.Event(), None
+    stop, task, approvals = asyncio.Event(), None, {}
     try:
-        while True:                                   # reader loop: never blocked by generation
+        while True:                                   # reader loop: never blocked by the agent
             msg = await ws.receive_json()
             if msg["type"] == "prompt":
                 if task and not task.done():
-                    stop.set(); await task             # finish the old answer cleanly first
+                    stop.set(); await task             # finish the old run cleanly first
                 stop = asyncio.Event()
-                task = asyncio.create_task(generate(ws, msg["text"], stop))
+                task = asyncio.create_task(run_agent(ws, msg["text"], stop, approvals))
+            elif msg["type"] in ("approve", "deny") and msg["id"] in approvals:
+                approvals.pop(msg["id"]).set_result(msg["type"] == "approve")
             elif msg["type"] == "stop":
                 stop.set()
     except WebSocketDisconnect:
@@ -228,6 +265,10 @@ Uvicorn defaults, and an illustrative load balancer with a 60 s idle timeout.
 Pings every 20 s also keep a healthy-but-quiet socket under that 60 s idle timeout.
 
 ## Production patterns
+- **Persist agent session state outside the socket.** Interactive agent teams write the transcript,
+  pending approvals and last sequence number per session id to a database or Redis after every step, so a
+  reconnect (or a deploy that closes with 1001) resumes the run instead of losing it. Monitor sessions
+  resumed versus restarted after reconnects.
 - **Choose the rejection point deliberately.** Verify the token in a dependency and raise
   `WebSocketException(code=status.WS_1008_POLICY_VIOLATION)` before `accept()` for unknown clients; for
   expired tokens, accept and close with a 4000-range code the client maps to "refresh". Monitor 1006
@@ -275,6 +316,9 @@ Pings every 20 s also keep a healthy-but-quiet socket under that 60 s idle timeo
 - **Sending from several tasks or fire-and-forget `create_task`.** Symptom: messages in an order no single
   task produced (a `done` before the last token),
   `RuntimeError: Cannot call "send" once a close message has been sent`, or memory growth with slow clients.
+- **Treating stop as an undo for tool calls.** Symptom: a user presses stop, yet the email or refund the
+  agent was executing still happens. Fix: require approval for side-effecting tools, check the stop event
+  before (not only during) each tool call, and make tools idempotent.
 - **Not cancelling the generation task on `WebSocketDisconnect`.** Symptom: model spend continues after
   users close the tab, visible as a gap between tokens billed and tokens delivered.
 - **Skipping the `Origin` check with cookie auth.** Symptom: cross-site WebSocket hijacking found by the
@@ -325,7 +369,7 @@ product also needs voice or continuous client input.
 - **Decide where to reject:** before `accept()` the browser only sees 1006; after `accept()` a 1008 or
   4000-range code tells the client to refresh its token.
 
-### Users press stop, but the answer keeps streaming to the end. What is wrong with the handler?
+### Users press stop on your agent, but the answer keeps streaming to the end. What is wrong with the handler?
 - **It is sequential.** It awaits `receive_json()`, then iterates the model stream, so nothing reads the
   socket while tokens are produced.
 - **Fix:** a reader loop plus a generation task from `asyncio.create_task`, cancelled or signalled via an
@@ -348,6 +392,13 @@ product also needs voice or continuous client input.
   keep `--ws-ping-interval` (default 20 seconds) below it.
 - **Deploys become coordination:** close with 1001, and clients reconnect with backoff using a session id
   and sequence number you designed.
+
+### Design human-in-the-loop tool approval for an agent served over a WebSocket.
+- **Pause on a future, not a loop.** Before a side-effecting tool the agent task sends `approval_needed`
+  with an id and awaits a future that the reader loop resolves on `approve` or `deny`, with a timeout.
+- **Make the pause survive disconnects.** Persist the pending approval and transcript by session id, so a
+  user who reconnects (or approves from another device) resumes the same run.
+- **Check stop before the tool runs,** because cancelling mid-tool cannot undo a side effect.
 
 ## Quiz
 ### Q: Why can a browser not send an Authorization header on the WebSocket handshake?

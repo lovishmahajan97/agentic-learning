@@ -5,7 +5,8 @@ name: Query decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/query-rewriting
   - rag-retrieval/multi-hop-retrieval
@@ -21,10 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Query decomposition has an LLM split a compound question into focused, standalone sub-questions,
-retrieves for each (in parallel when independent) and answers from the merged evidence or from
-per-sub-question answers. Independent parts
-fan out; dependent parts chain, which is multi-hop retrieval.
+Query decomposition splits a compound question into standalone sub-questions and retrieves for each. In
+an agent it is one turn with several parallel search calls: independent parts fan out, dependent parts
+chain, which is multi-hop retrieval.
+
+## For agent builders
+- **Why it matters for agents.** "Compare A and B" is the most common question shape an agent fails with
+  one search. Emitting one search call per facet, in parallel, fixes recall without adding sequential
+  steps; chaining dependent facets is the agent loop doing multi-hop.
+- **Where it shows up in your stack.** Parallel tool calls in the provider APIs (several tool calls in one
+  model response), LlamaIndex's sub-question query engine, fan-out nodes in LangGraph (its `Send` API
+  for map-reduce), and per-call spans in your traces.
+- **What you control.** Whether the agent or a fixed planner splits, the cap on calls per step, the chunk
+  budget per call, the "no evidence" result per facet, and the gate that leaves atomic questions alone.
+- **What you can skip.** The compositionality-gap benchmarks in depth. Know that composing is a separate
+  failure from retrieving, and give the synthesis step every facet's evidence or its absence.
 
 ## Why it exists
 - **A compound question embeds as one blurry point.** "Compare the refund windows of the Standard and
@@ -98,13 +110,28 @@ fan out; dependent parts chain, which is multi-hop retrieval.
   bounded (n retrievals, known latency), whereas an agent loop is sequential and open-ended.
 - **Rule of thumb:** decomposition for breadth, the agent loop for depth.
 
+### Decomposition inside an agent turn
+| Step | Fixed pipeline | Tool-calling agent |
+|---|---|---|
+| Split | planner prompt returns sub-questions | the model emits several search calls in one response |
+| Atomic gate | planner's atomic branch | the model emits one call |
+| Independent facets | `asyncio.gather` over retrievals | your tool executor runs the calls concurrently |
+| Dependent facets | sequential follow-up | the next loop iteration, after reading results |
+| Synthesis | final composing call | the agent's next turn, with every tool result in context |
+
+- **The agent decides the split, your executor enforces the rules.** Cap the calls per step, split the
+  chunk budget across them, and return an explicit "no evidence" result for an empty facet.
+- **Every call needs its own result.** Return one result per tool-call id (most provider APIs expect
+  this), including for calls you skipped, so the agent knows which facets were not searched.
+
 ## Diagram
-Watch the two branches after planning: atomic questions skip the fan-out, independent sub-questions
-retrieve in parallel, and dependent ones become a sequential multi-hop chain.
+Watch the two branches after planning (by a planner prompt or the agent's own tool calls): atomic
+questions skip the fan-out, independent sub-questions retrieve in parallel, and dependent ones become a
+sequential multi-hop chain.
 
 ```mermaid
 flowchart TD
-    Q["Compound question"] --> PL["Planner LLM"]
+    Q["Compound question"] --> PL["Planner LLM or agent turn"]
     PL --> A{"Atomic or compound?"}
     A -->|"atomic"| S["Single retrieval"]
     A -->|"compound"| D{"Sub-questions independent?"}
@@ -207,22 +234,57 @@ Illustrative orders of magnitude for one compound question; plug in your own mea
 
 The planner call is paid by every question, including atomic ones, which is why the gate matters.
 
+### Agent scenario: executing parallel search calls with a shared budget
+The agent emitted several `search_docs` calls in one response. The executor caps them, shares the chunk
+budget, runs them concurrently and returns one result per call id. `retrieve` is a stub.
+
+```python
+import asyncio
+
+MAX_SEARCHES_PER_STEP = 4
+
+async def execute_search_calls(tool_calls, budget_chunks=8):
+    run, skip = tool_calls[:MAX_SEARCHES_PER_STEP], tool_calls[MAX_SEARCHES_PER_STEP:]
+    k_each = max(1, budget_chunks // max(1, len(run)))        # 8 chunks over 3 calls -> 2 each
+    hits = await asyncio.gather(*(asyncio.to_thread(retrieve, c["input"]["query"], k_each)
+                                  for c in run))
+    results = []
+    for call, found in zip(run, hits):
+        content = ({"status": "ok", "passages": [{"id": i, "text": t} for i, t in found]} if found
+                   else {"status": "no_evidence"})            # the agent must say so, not guess
+        results.append({"tool_call_id": call["id"], "content": content})
+    for call in skip:                                          # never drop a call silently
+        results.append({"tool_call_id": call["id"],
+                        "content": {"status": "skipped", "reason": "max 4 searches per step"}})
+    return results
+```
+
+| Design for a 3-facet comparison | Model calls | Searches | Sequential round trips |
+|---|---|---|---|
+| Agent searches one facet per step | 4 (3 steps + answer) | 3 | 3 |
+| Agent emits 3 parallel calls in one step | 2 (1 step + answer) | 3 in parallel | 1 |
+| Fixed planner, merge contexts | 2 (planner + answer) | 3 in parallel | 1 |
+
 ## Production patterns
+- **Let the agent fan out, and cap it in the executor.** When the agent emits several search calls in one
+  response, run them concurrently, cap calls per step (the example caps at 4) and return a "skipped"
+  result for the rest. Monitor calls per step, the share of steps with parallel calls, and p95 step
+  latency, which tracks the slowest call.
 - **Gate before you split.** Run decomposition only when a cheap check fires (the planner's atomic branch,
   or a classifier on length and conjunctions such as "and", "vs", "compare"). Monitor the fraction of
   traffic decomposed and latency for atomic questions before and after launch.
 - **Cap fan-out and budget per facet.** Limit sub-questions (the example caps at 4) and divide a fixed
   chunk budget across them, as `merge` does. Monitor prompt tokens and any truncation of the last facet's
   evidence.
-- **Constraint-carry check.** After planning, verify that shared qualifiers in the original (region, plan,
-  date) appear in every sub-question, and re-plan or fall back to the original if not. Monitor how often
-  the check fires.
+- **Constraint-carry check.** After planning, or on the agent's parallel calls, verify that shared
+  qualifiers in the original (region, plan, date) appear in every sub-question, and re-plan or fall back to
+  the original if not. Monitor how often the check fires.
 - **Per-facet evidence status.** Log for each sub-question whether it retrieved anything above your
   relevance cut-off, and force an explicit "no evidence" line in the answer when it did not. Alert on a
   rising empty-facet rate, which usually means an index gap.
 - **Evaluate on a compound slice.** Keep a golden slice of comparison and multi-facet questions and track
-  per-sub-question recall and final accuracy on it separately from the rest. Monitor its p95 latency, which
-  tracks the slowest branch.
+  per-sub-question recall, final accuracy and (for agents) the number of steps taken on it separately from
+  the rest. Monitor its p95 latency, which tracks the slowest branch.
 
 ## Trade-offs
 - **Facet recall vs call count.** n sub-questions mean n retrievals (and n extra generations if answered
@@ -235,6 +297,9 @@ The planner call is paid by every question, including atomic ones, which is why 
 - **Sharp sub-queries vs shared passages.** They rank facet-specific passages higher but demote a single
   passage covering both facets, such as a plan-comparison table; if it appears under both, tag it with
   both, or the synthesis treats one facet as unsupported.
+- **Agent-driven split vs fixed planner.** The agent splits only when needed and adapts to what it finds,
+  but you cannot test its split in isolation; a fixed planner is predictable and unit-testable, and wins
+  when question shapes are known in advance.
 
 ## Pitfalls
 - **Over-decomposing simple questions.** The symptom is lookups that used to be fast and right becoming
@@ -251,6 +316,9 @@ The planner call is paid by every question, including atomic ones, which is why 
   about a member list the planner made up, which omits real members and can include ones that do not exist.
 - **Treating a dependent chain as independent.** The symptom is a second sub-question like "what is the
   manager's email?" that is vague on its own and retrieves nothing useful.
+- **An agent searching facets one per step.** The symptom is comparison questions taking three or four
+  sequential steps; say in the system prompt or tool description that independent facets should be
+  searched in parallel in one turn, and check the parallel-call share in traces.
 
 ## When to use
 - **Use when** the question shape is "compare", "A and also B", "X before and after Y", or anything naming
@@ -317,7 +385,14 @@ measurement would catch. A third is cost: without a gate, every simple question 
 - **Levers:** gate on a cheap classifier, cap sub-questions, set a timeout per branch, and track the
   compound slice's p95 separately from the rest of traffic.
 
-### How do you size retrieval k when splitting into sub-questions?
+### Your agent answers comparison questions correctly but takes four steps each. How do you speed it up?
+- **It is searching one facet per step:** three sequential model calls plus searches, then the answer.
+- **Make it fan out:** instruct parallel calls for independent facets and let the executor run them
+  concurrently, so it becomes one step with three calls plus the answer.
+- **Guard the fan-out:** cap calls per step, share the chunk budget, return "no evidence" per empty facet,
+  and confirm on the compound slice that accuracy held while steps dropped.
+
+### How do you size retrieval k when splitting into sub-questions, or when an agent emits parallel searches?
 - **Share a fixed chunk budget:** with 8 chunks and 3 sub-questions each facet gets 2 or 3 chunks, so
   per-facet precision matters more than for one query with 8.
 - **Deduplicate across facets** and tag shared chunks (such as a plan-comparison table) with every facet

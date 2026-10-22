@@ -5,7 +5,8 @@ name: Shared httpx AsyncClient
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/httpx
   - fastapi-for-ai/lifespan
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-An AI service is mostly an HTTP client. A per-request `httpx.AsyncClient` discards the connection pool,
-so every call pays DNS, TCP and TLS setup. Create one client per worker in the lifespan, set limits and
-timeouts deliberately, share it, close it on shutdown.
+An agent backend is mostly an HTTP client: model calls, tool APIs, vector stores. A per-request
+`httpx.AsyncClient` discards the connection pool, so every step pays DNS, TCP and TLS setup. Build one
+client per upstream per worker in the lifespan.
+
+## For agent builders
+- **Why it matters for agents.** A single agent run makes many outbound calls in sequence: model, tool,
+  model, tool. Each cold connection adds roughly two round trips of setup, so a 10-step loop can spend
+  about a second just shaking hands before any token is generated.
+- **Where it shows up in your stack.** The OpenAI and Anthropic SDK clients (built on httpx), your own
+  tool calls to search, CRM or internal APIs, vector database HTTP clients, and every `StreamingResponse`
+  that relays model tokens to the user.
+- **What you control.** One client per upstream per worker, `httpx.Limits` sized from the provider's
+  concurrency budget, `httpx.Timeout` per call type (streaming vs non-streaming), and closing streamed
+  responses on every path.
+- **What you can skip.** httpcore internals and HTTP/2 tuning. Know pooling, the four timeouts and the
+  stream-close rule; that covers almost every agent outage this causes.
 
 ## Why it exists
 - **Connection setup is a tax on every cold call.** A request to a hosted LLM over HTTPS starts with a DNS
@@ -51,7 +65,7 @@ timeouts deliberately, share it, close it on shutdown.
   2. otherwise opens a new one if under the limit;
   3. otherwise waits.
 - **After the response is read** the connection returns to the pool, *because* HTTP/1.1 keep-alive lets
-  one socket carry many sequential requests.
+  one socket carry many sequential requests, such as the steps of one agent run.
 - **`max_connections` caps the whole client,** across every origin it talks to, not each origin
   separately.
 
@@ -61,8 +75,8 @@ timeouts deliberately, share it, close it on shutdown.
 - **`async with client.stream("POST", ...) as r:`** closes it when the block exits.
 - **`client.send(req, stream=True)`** hands you a response you must `await r.aclose()` yourself,
   including on error and cancellation paths.
-- **Why it matters most for `StreamingResponse` relays:** a stream abandoned mid-way (the client
-  disconnected, an exception in your generator) and never closed keeps its connection checked out. Leak
+- **Why it matters most for `StreamingResponse` relays:** a stream abandoned mid-way (the user closed the
+  chat tab, an exception in your generator) and never closed keeps its connection checked out. Leak
   `max_connections` of them and every later call waits for a free connection and fails with
   `PoolTimeout`, while the provider is healthy.
 
@@ -73,8 +87,8 @@ timeouts deliberately, share it, close it on shutdown.
 | `max_keepalive_connections` | Idle sockets kept warm | 20 |
 | `keepalive_expiry` | How long an idle one is kept, in seconds | 5.0 |
 
-- **The defaults are modest,** sized for general use, not for a streaming LLM service where each in-flight
-  generation pins a connection for tens of seconds.
+- **The defaults are modest,** sized for general use, not for a streaming agent service where each
+  in-flight generation pins a connection for tens of seconds.
 - **Set `max_connections` from the concurrency you intend per worker,** *because* the pool is then a real
   ceiling: when it is full, callers wait, and that wait is bounded by the pool timeout.
 
@@ -84,7 +98,7 @@ timeouts deliberately, share it, close it on shutdown.
 - **For streaming, `read` is the maximum gap between chunks,** not total duration.
 - **httpx has no overall deadline of its own.** Pair a tight `read` timeout (catches stalled streams) with
   an outer `asyncio.timeout(...)` or `asyncio.wait_for(...)` around the whole call if you need a cap on
-  total generation time.
+  total generation time or on a whole agent step.
 - **`pool` is how long to wait for a free connection.** A `PoolTimeout` under load is your signal that
   concurrency exceeds the pool, not that the provider is down.
 
@@ -98,7 +112,8 @@ timeouts deliberately, share it, close it on shutdown.
 
 ### Provider SDKs
 - **Same rule:** the official OpenAI and Anthropic Python SDKs are built on httpx and keep their own pool
-  per SDK client object, so construct the SDK client once in the lifespan, not per request.
+  per SDK client object, so construct the SDK client once in the lifespan, not per request or per agent
+  run.
 - **Bring your own client:** both accept an `http_client=` argument if you want to supply a configured
   `httpx.AsyncClient` with your own limits, proxies or transport.
 
@@ -109,13 +124,13 @@ timeouts deliberately, share it, close it on shutdown.
   support, so it is not a default.
 
 ## Diagram
-One client lives for the whole worker: the lifespan builds it, every request borrows a pooled
+One client lives for the whole worker: the lifespan builds it, every agent step borrows a pooled
 connection, and a connection goes back to the pool only when its body is read or the response is closed.
 
 ```mermaid
 flowchart TD
     LS["Lifespan builds one AsyncClient"] --> P[("Connection pool per worker")]
-    RQ["Request handler via Depends"] --> Q{"Idle connection to this origin?"}
+    RQ["Agent step via Depends"] --> Q{"Idle connection to this origin?"}
     P --> Q
     Q -->|"yes"| SEND["Send on warm socket, no DNS, TCP or TLS"]
     Q -->|"no, under max_connections"| NEW["Open new socket: DNS, TCP, TLS"]
@@ -170,6 +185,48 @@ async def complete(body: dict, http: httpx.AsyncClient = Depends(get_http)):
 - **In a load-test trace,** the per-request version shows a TLS handshake on every call; the shared
   version shows them only while the pool warms up.
 
+### An agent with one client per upstream
+The model SDK and each tool upstream get their own lifespan-built client, so a slow CRM cannot starve
+model calls. The model name and URLs are placeholders.
+
+```python
+from contextlib import asynccontextmanager
+import httpx
+from anthropic import AsyncAnthropic
+from fastapi import FastAPI
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    llm_http = httpx.AsyncClient(limits=httpx.Limits(max_connections=32),
+                                 timeout=httpx.Timeout(connect=3.0, read=60.0, write=10.0, pool=2.0))
+    app.state.llm = AsyncAnthropic(http_client=llm_http)          # SDK reuses this pool
+    app.state.tools = {
+        "search": httpx.AsyncClient(base_url="https://search.internal.example",
+                                    limits=httpx.Limits(max_connections=16),
+                                    timeout=httpx.Timeout(5.0, pool=1.0)),
+        "crm": httpx.AsyncClient(base_url="https://crm.internal.example",
+                                 limits=httpx.Limits(max_connections=8),
+                                 timeout=httpx.Timeout(10.0, pool=1.0)),
+    }
+    yield
+    for c in app.state.tools.values():
+        await c.aclose()
+    await llm_http.aclose()
+
+async def call_tool(app: FastAPI, name: str, path: str, args: dict) -> dict:
+    try:
+        r = await app.state.tools[name].post(path, json=args)
+        r.raise_for_status()
+        return r.json()
+    except httpx.PoolTimeout:
+        return {"error": f"{name} busy, try again later"}   # the model sees a tool error, not a crash
+    except httpx.HTTPError as e:
+        return {"error": f"{name} failed: {type(e).__name__}"}
+```
+
+- **Tool errors go back to the model as results,** so the agent can retry, pick another tool or tell the
+  user, instead of the whole run failing on one upstream.
+
 ### Relaying a provider stream without leaking connections
 `send(..., stream=True)` keeps the connection checked out until `aclose()`, so the relay closes it in a
 `finally` and on the early error path.
@@ -201,8 +258,8 @@ async def stream(body: dict, http: httpx.AsyncClient = Depends(get_http)):
   disconnect), and alert on connections that stay checked out.
 
 ### Worked numbers: setup tax in an agent loop
-Illustrative 40 ms round trip, TLS 1.3, ten sequential calls per user request; the range covers DNS
-cached (0 ms) or not (one round trip).
+Illustrative 40 ms round trip, TLS 1.3, ten sequential calls per user request (five model calls and five
+tool calls); the range covers DNS cached (0 ms) or not (one round trip).
 
 | Step | Per call | Ten calls |
 |---|---|---|
@@ -213,21 +270,21 @@ cached (0 ms) or not (one round trip).
 | Shared, warm pool | ~0 ms | ~0 ms |
 
 ## Production patterns
-- **One client per upstream per worker.** When a service calls an LLM, a vector store and internal tools,
-  give each its own `AsyncClient` in the lifespan with its own `Limits` and `Timeout`, so a slow upstream
-  cannot starve the others. Monitor `PoolTimeout` counts labelled by upstream.
+- **One client per upstream per worker.** When an agent service calls an LLM, a vector store and internal
+  tools, give each its own `AsyncClient` in the lifespan with its own `Limits` and `Timeout`, so a slow
+  upstream cannot starve the others. Monitor `PoolTimeout` counts labelled by upstream.
 - **Size the pool from the provider budget.** Set `max_connections` to roughly provider concurrency
   limit ÷ (workers × replicas), so `workers × max_connections` stays under it. Monitor 429 rate and
   connection count to each upstream.
 - **Fail fast on pool exhaustion.** Keep `pool` short (2 seconds in the example) and map `PoolTimeout` to
-  503 with `Retry-After`, as above, instead of letting requests queue. Monitor the 503 rate against
-  in-flight requests.
+  503 with `Retry-After` at the edge, or to a tool error inside the agent loop, instead of letting
+  requests queue. Monitor the 503 rate against in-flight requests.
 - **Keep-alive shorter than the path's idle timeout.** Set `keepalive_expiry` below the shortest idle
   timeout of any NAT, proxy or load balancer between you and the upstream, so pooled sockets are retired
   before they are silently dropped. Monitor connection-reset errors on first reuse.
 - **Configure SDKs through `http_client=`.** Pass a lifespan-built `httpx.AsyncClient` to the OpenAI or
   Anthropic SDK client so proxies, CA bundles and limits live in one place. Monitor connect and TLS
-  spans in traces, which should only appear during warm-up.
+  spans in agent traces, which should only appear during warm-up.
 
 ## Trade-offs
 - **Shared pool vs contention.** It removes per-call handshake cost and caps sockets, but becomes a
@@ -239,14 +296,14 @@ cached (0 ms) or not (one round trip).
 - **One client per upstream vs one for everything.** Separate clients isolate pools and timeouts per
   dependency (LLM, vector store, internal tools); one client is simpler but lets a slow upstream starve
   the others.
-- **Long vs short `keepalive_expiry`.** Long expiry keeps connections warm for bursty traffic, but idle
-  sockets can be silently dropped by NATs or load balancers, so the first reuse fails and must be
+- **Long vs short `keepalive_expiry`.** Long expiry keeps connections warm for bursty agent traffic, but
+  idle sockets can be silently dropped by NATs or load balancers, so the first reuse fails and must be
   retried; keeping the expiry below the shortest idle timeout on the path flips the trade towards
   shorter values.
 
 ## Pitfalls
-- **Creating `AsyncClient()` inside the endpoint.** Symptom: traces show a TLS handshake on every call and
-  the host accumulates sockets in `TIME_WAIT` under load. Fix: lifespan client.
+- **Creating `AsyncClient()` inside the endpoint or tool function.** Symptom: traces show a TLS handshake
+  on every agent step and the host accumulates sockets in `TIME_WAIT` under load. Fix: lifespan client.
 - **Never closing the client.** Symptom: shutdown logs warnings about unclosed connections and graceful
   restarts leave sockets half-open. Fix: `aclose()` after `yield`.
 - **Default five-second timeout on a non-streaming completion.** Symptom: long prompts fail with
@@ -296,6 +353,14 @@ example in Redis) if replicas scale dynamically.
   concurrent requests open 500 connections and leave sockets in `TIME_WAIT`.
 - **Lifecycle matters too:** create it in the lifespan, close it with `aclose()` after `yield`.
 
+### Your agent's p50 latency is fine but each run spends about a second before the first model token. Where do you look?
+- **Look at connect and TLS spans per step.** If every model and tool call shows DNS, TCP and TLS, the
+  agent builds a fresh client or SDK client per call or per run.
+- **Fix the lifecycle:** build one SDK client and one client per tool upstream in the lifespan and inject
+  them, so steps after the first reuse warm sockets.
+- **Confirm** handshakes now appear only during warm-up, and that ten sequential calls no longer add
+  roughly 0.8–1.2 s of setup.
+
 ### A streaming relay starts returning PoolTimeout after a burst of cancelled requests, while the provider is healthy. How do you debug it?
 - **Suspect leaked streams.** A response from `client.send(req, stream=True)` keeps its connection checked
   out until `aclose()`, so streams abandoned on disconnect or error never return to the pool.
@@ -303,6 +368,14 @@ example in Redis) if replicas scale dynamically.
   restart.
 - **Fix:** use `async with client.stream(...)`, or close in a `finally` inside the generator and on every
   early error path before raising.
+
+### One slow tool API makes your whole agent service time out, including runs that never call it. Why, and how do you isolate it?
+- **They probably share one client and pool.** Slow tool calls hold connections, the shared
+  `max_connections` fills, and model calls wait on the pool timeout too.
+- **Give each upstream its own client** with its own `Limits` and `Timeout`, so the slow tool exhausts only
+  its own pool.
+- **Return pool and timeout failures to the model as tool errors,** so the agent can carry on, and alert on
+  `PoolTimeout` labelled by upstream.
 
 ### After quiet periods, the first call to the provider sometimes fails with a connection reset. Why?
 - **A pooled idle socket was dropped silently.** A NAT, proxy or load balancer on the path closed it after
@@ -319,14 +392,6 @@ example in Redis) if replicas scale dynamically.
   pause you tolerate between tokens.
 - **httpx has no overall deadline,** so wrap the call in `asyncio.timeout(...)` or `asyncio.wait_for(...)` if
   total generation time needs a cap. Keep `pool` short so exhaustion fails fast.
-
-### Would you enable HTTP/2 to cut socket count to your LLM provider?
-- **It can help:** with the optional `h2` dependency and `http2=True`, many concurrent requests multiplex
-  over one connection per origin, reducing sockets.
-- **But it is not a default,** because a single TCP connection can become the bottleneck and providers
-  differ in support.
-- **So measure it** under realistic streaming load, comparing throughput, tail latency and error rates
-  against an HTTP/1.1 pool before switching.
 
 ## Quiz
 ### Q: What is the main cost of creating a new `httpx.AsyncClient` inside each request handler?

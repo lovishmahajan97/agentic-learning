@@ -5,7 +5,8 @@ name: safetensors
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: crisp-verified
+status: agentic
+agent_relevance: background
 related:
   - python-for-ai/pytorch
   - python-for-ai/hugging-face
@@ -19,9 +20,22 @@ sources:
 ---
 
 ## TL;DR
-safetensors stores tensors as a small JSON header (name, dtype, shape, byte offsets) plus raw bytes.
-It replaced pickle checkpoints on the Hugging Face Hub because loading it runs no code, and its layout
-allows fast, lazy, memory-mapped loading.
+safetensors is the weights format behind the open models and LoRA adapters your agents run: a JSON
+header plus raw bytes. Loading it runs no code, and it memory-maps, so model servers cold-start faster and
+uploaded adapters cannot execute on load.
+
+## For agent builders
+- **Why it matters for agents.** If you self-host an agent model, serve per-tenant LoRA adapters, or let
+  an agent platform pull models from a hub, every load is a supply-chain decision. A pickle checkpoint is
+  a program; a safetensors file is data.
+- **Where it shows up in your stack.** `model.safetensors` and shard index files in every Hub repo,
+  `adapter_model.safetensors` written by PEFT, and the weights vLLM, SGLang and Text Embeddings Inference
+  load when your agent's model server starts or scales out.
+- **What you control.** Requiring safetensors at load (`use_safetensors=True`), rejecting pickle uploads,
+  converting legacy files in a sandbox, stamping provenance metadata, and staging weights on local disk
+  for fast autoscaling.
+- **What you can skip.** The byte layout details and writing loaders yourself. Remember three facts: no
+  code on load, lazy memory-mapped reads, and "safe to load" is not "safe to run".
 
 ## Why it exists
 - **Pickle checkpoints are programs.** `torch.save` uses Python's `pickle`, which is not a data format: it
@@ -54,7 +68,16 @@ pickle.loads(pickle.dumps(Payload()))               # prints: the call happens i
 Nothing in a checkpoint file distinguishes "rebuild a tensor" from "call os.system"; both are calls.
 
 ## How it works
-### File layout
+### What the agent builder does with it
+| Situation | Action |
+|---|---|
+| Serving an open agent model | load only safetensors, staged on local NVMe |
+| Tenants upload LoRA adapters | accept only `adapter_model.safetensors`, audit the header, check shapes match the base |
+| Taking in a legacy `.bin` | convert in a sandbox job, ship only the result |
+| Agent with code execution can download files | never let it `torch.load` an untrusted path; treat it like any untrusted input |
+| Autoscaling model replicas | memory-mapped loads plus local disk keep cold start short |
+
+### Background: file layout
 1. **8 bytes:** an unsigned little-endian 64-bit integer N, the size of the header.
 2. **N bytes:** a UTF-8 JSON object. Each key is a tensor name mapping to
    `{"dtype": "BF16", "shape": [4096, 4096], "data_offsets": [begin, end]}`. An optional `"__metadata__"`
@@ -64,15 +87,13 @@ Nothing in a checkpoint file distinguishes "rebuild a tensor" from "call os.syst
 
 - **Aligned data.** The reference writer pads the header with spaces so the data buffer starts 8-byte
   aligned, letting loaders view tensors in place without an alignment copy.
-
-### Why each choice: "the loader should only ever read"
 - **JSON can only describe data.** The header has no way to name a function or class to call, so parsing
   it cannot run code, unlike a pickle's rebuild instructions.
 - **Validate before touching bytes.** The header is parsed and checked first (offsets in bounds and
   non-overlapping, sizes matching `dtype × shape`), which blocks malformed files that try to trigger
-  out-of-bounds reads.
+  out-of-bounds reads. The design rule: the loader should only ever read.
 
-### Zero-copy and lazy loading
+### Background: zero-copy, lazy loading and sharding
 - **Memory-mapped.** Each tensor sits raw at a known offset, so the OS maps the file into the address space
   and pages in only the bytes actually read.
 - **Slices are pure arithmetic.** For a row-major `[rows, cols]` tensor of element size `b` starting at
@@ -80,15 +101,11 @@ Nothing in a checkpoint file distinguishes "rebuild a tensor" from "call os.syst
 - **`safe_open` handles.** `get_tensor(name)` materialises one tensor and `get_slice(name)[a:b]` reads only
   a slice. That is how tensor-parallel loaders give each GPU just its shard of a weight matrix without
   reading the rest.
-
-### Sharding
-- **Several files plus an index:** `model-00001-of-00004.safetensors`, ... and
-  `model.safetensors.index.json`, which maps each tensor name to its shard.
-- **Loaders read the index**, then open only the shards they need.
-
-### Framework neutrality
-- **Raw bytes plus dtype, not Python objects**, so one file loads into PyTorch, NumPy, JAX/Flax,
-  TensorFlow or Rust code (`safetensors.torch`, `safetensors.numpy`, ...).
+- **Sharding: several files plus an index:** `model-00001-of-00004.safetensors`, ... and
+  `model.safetensors.index.json`, which maps each tensor name to its shard. Loaders read the index, then
+  open only the shards they need.
+- **Framework neutral.** Raw bytes plus dtype, not Python objects, so one file loads into PyTorch, NumPy,
+  JAX/Flax, TensorFlow or Rust code (`safetensors.torch`, `safetensors.numpy`, ...).
 
 ### What it deliberately does not store
 - **No optimizer state objects, no model class, no arbitrary Python.**
@@ -96,12 +113,12 @@ Nothing in a checkpoint file distinguishes "rebuild a tensor" from "call os.syst
   refuses them, while helpers such as `save_model` deduplicate them and rely on the loading code to re-tie.
 
 ## Diagram
-Compare the two load paths: a pickle checkpoint runs an interpreter over the file, while a safetensors
-load only reads, validates and maps bytes, so each rank can page in just its slice.
+Compare the two load paths an agent model server might take: a pickle checkpoint runs an interpreter
+over the file, while a safetensors load only reads, validates and maps bytes.
 
 ```mermaid
 flowchart TD
-    F["Checkpoint file"] --> K{"Format?"}
+    F["Checkpoint or uploaded adapter"] --> K{"Format?"}
     K -->|"pickle .bin or .pt"| P["Unpickler executes rebuild calls"]
     P -.->|"any importable function, even os.system"| X["Code runs during load"]
     K -->|"safetensors"| H["Read 8-byte header size N"]
@@ -114,6 +131,41 @@ flowchart TD
 ```
 
 ## Examples
+### Intake check for a tenant's LoRA adapter
+An agent platform lets each customer upload a LoRA adapter for their agent. Before it reaches the model
+server, audit it as plain data with the standard library: no ML library, no code trusted.
+
+```python
+import json, struct
+
+ALLOWED_DTYPES = {"BF16", "F16", "F32"}
+
+def audit_adapter(path: str, expected_rank: int, max_bytes: int = 500_000_000) -> dict:
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]          # header size
+        if n > 10_000_000:
+            raise ValueError("header too large")
+        header = json.loads(f.read(n))
+    meta = header.pop("__metadata__", {})
+    total = 0
+    for name, t in header.items():
+        if "lora_" not in name:
+            raise ValueError(f"unexpected tensor {name}")   # adapters hold only LoRA matrices
+        if t["dtype"] not in ALLOWED_DTYPES:
+            raise ValueError(f"bad dtype {t['dtype']} for {name}")
+        if expected_rank not in t["shape"]:
+            raise ValueError(f"rank mismatch in {name}: {t['shape']}")
+        begin, end = t["data_offsets"]
+        total += end - begin
+    if total > max_bytes:
+        raise ValueError("adapter larger than policy allows")
+    return {"tensors": len(header), "bytes": total, "metadata": meta}
+```
+
+- **Only `.safetensors` is accepted.** A `.bin` upload is rejected outright, or converted in a sandbox.
+- **Passing the audit is not passing review.** The adapter still runs an eval suite (including safety
+  prompts) before the router sends that tenant's traffic to it.
+
 ### Save, load lazily, and read the header by hand
 ```python
 import json, struct, torch
@@ -164,7 +216,8 @@ save_file(sd, "model.safetensors", metadata={"format": "pt", "source": "pytorch_
 ```
 
 ### Worked scenario: one weight matrix across eight ranks
-A `[4096, 4096]` BF16 projection split row-wise for tensor parallelism:
+A `[4096, 4096]` BF16 projection split row-wise for tensor parallelism, as when an agent model is
+served across 8 GPUs:
 
 | Item | Bytes |
 |---|---|
@@ -175,22 +228,24 @@ A `[4096, 4096]` BF16 projection split row-wise for tensor parallelism:
 
 ## Production patterns
 - **Reject external pickles at the door.** CI or the model registry blocks `.bin`/`.pt`/`.pkl` artifacts
-  from outside sources unless converted in a sandbox (as above). Monitor rejection counts and who tried.
+  from outside sources, including tenant-uploaded adapters, unless converted in a sandbox (as above).
+  Monitor rejection counts and who tried.
 - **Force safetensors at load.** Pass `use_safetensors=True` to `from_pretrained` so Transformers errors
   instead of silently falling back to a pickle file in the repo. Fail CI on any `weights_only=False`
   in the codebase, because that is the usual "fix" for a load error.
 - **Stage weights on local NVMe.** Copy checkpoints from network or object storage to local disk before
-  memory-mapped loading. Monitor cold-start time to first token per storage path.
-- **Stamp provenance in metadata.** Write source repo, revision and training run into `__metadata__`
-  (string-to-string), and read it back with `f.metadata()` at deploy time. Fail the deploy if it is
-  missing.
+  memory-mapped loading, so a new agent-model replica serves quickly during a traffic spike. Monitor
+  cold-start time to first token per storage path.
+- **Stamp provenance in metadata.** Write source repo, revision and training run (for example the
+  agent-trace dataset version) into `__metadata__` (string-to-string), and read it back with
+  `f.metadata()` at deploy time. Fail the deploy if it is missing.
 - **Audit headers before promotion.** Parse the header with `json` and `struct`, and check tensor names,
   dtypes and shapes against the expected config. Flag unexpected tensors or dtypes.
 
 ## Trade-offs
 - **No code on load vs tensors only.** It removes a whole class of supply-chain attacks, but the format
   only holds tensors; tokenizer files, configs and training state need their own (also non-executable)
-  formats.
+  formats, and chat templates in tokenizer configs still shape how your agent's tools are rendered.
 - **Memory-mapped speed vs slow storage.** Loading is fast and lazy on local disk, but on network
   filesystems or object storage mounts page faults can be slow; copying to local NVMe first often wins
   for large models.
@@ -203,7 +258,8 @@ A `[4096, 4096]` BF16 projection split row-wise for tensor parallelism:
 
 ## Pitfalls
 - **Assuming safetensors makes a model trustworthy.** It only guarantees loading runs no code; weights
-  can still be backdoored, and `trust_remote_code` model classes can still execute arbitrary Python.
+  can still be backdoored, and `trust_remote_code` model classes can still execute arbitrary Python. A
+  backdoored agent model could pick harmful tool calls on a trigger phrase, which only evals reveal.
 - **Loading legacy `.bin` files with `weights_only=False` because a load error appeared.** This re-enables
   arbitrary code execution; the symptom you were fixing was the safety check working.
 - **Saving tied weights via `save_file` directly.** It raises an error about shared tensors; naive
@@ -213,12 +269,13 @@ A `[4096, 4096]` BF16 projection split row-wise for tensor parallelism:
   part of the model, and the error names a missing key rather than a missing file.
 
 ## When to use
-- **Use for** any weights you publish, download, mirror or move between teams; convert legacy pickle
-  checkpoints when you take them in.
+- **Use for** any weights you publish, download, mirror or move between teams, including LoRA adapters
+  trained on agent traces; convert legacy pickle checkpoints when you take them in.
 - **Policy:** "no pickle from outside". CI or the model registry rejects `.bin`/`.pt`/`.pkl` artifacts
   from external sources unless converted in a sandbox.
 - **Keep `torch.save` only** for internal training-resume checkpoints holding optimizer state, and never
   load those from untrusted locations.
+- **Skip the details when** your agents only call hosted APIs; the format matters once you hold weights.
 - **Measure** time to first token after a cold start with memory-mapped local files versus network
   storage, when loading time matters.
 - **Interviews:** explain why pickle is unsafe and what memory mapping buys.
@@ -251,6 +308,13 @@ evaluation before deployment.
 - **So there is no interpreter to restrict**, unlike `weights_only=True`, which still parses untrusted
   pickle through an allow-list.
 
+### Your agent platform lets each customer upload a LoRA adapter. How do you make that safe?
+- **Format gate:** accept only safetensors, so loading cannot run code; reject or sandbox-convert pickles.
+- **Header audit:** parse with `json` and `struct`, and check tensor names, dtypes, rank and total size
+  against the base model's expected adapter shapes before the server sees the file.
+- **Behaviour gate:** run the tenant's agent evals and safety prompts on base plus adapter before routing
+  traffic, because a file that loads safely can still behave badly.
+
 ### A load fails on a legacy checkpoint and a teammate proposes `weights_only=False`. What do you do?
 - **Refuse the quick fix:** it re-enables arbitrary code execution, and the error was the safety check
   working.
@@ -272,11 +336,11 @@ evaluation before deployment.
 - **With full loads** they read 268,435,456 bytes and discard 7/8, which is why offsets plus memory
   mapping matter for cold start.
 
-### Cold starts are slow even with safetensors. Where do you look?
+### New agent-model replicas take minutes to serve during traffic spikes, even with safetensors. Where do you look?
 - **Storage path first:** memory-mapped loading pages in bytes on demand, and page faults over network
   filesystems or object storage mounts can be slow.
-- **Fix:** stage checkpoints on local NVMe before loading and compare time to first token per storage
-  path.
+- **Fix:** stage checkpoints on local NVMe before loading (or bake them into the node image) and compare
+  time to first token per storage path.
 - **Also check sharding:** a missing `model.safetensors.index.json` makes loaders fail or load only part
   of the model.
 

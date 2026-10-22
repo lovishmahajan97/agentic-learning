@@ -5,7 +5,8 @@ name: Test doubles, mocks and fixtures
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/pytest
   - python-for-ai/pytest-asyncio
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-A test double (dummy, stub, spy, mock or fake) stands in for an LLM, API or database so tests are fast,
-deterministic and free; fixtures build and tear them down. Pick the kind by what you verify: result
-or interaction.
+An agent touches a model, tools, a vector store and memory; a test double (dummy, stub, spy, mock or
+fake) stands in for each so tests are fast, deterministic and free. Fixtures build them. Pick the kind
+by what you verify: result or interaction.
+
+## For agent builders
+- **Why it matters for agents.** Agent bugs live in the branches a live model rarely takes: a malformed
+  tool call, an empty reply, a timeout on the second attempt, a destructive tool requested without
+  approval. Doubles let you trigger each one on demand, for free, in milliseconds.
+- **Where it shows up in your stack.** A scripted "fake LLM" that emits tool-call messages, fake tools
+  that record their arguments, an in-memory vector store for RAG tests, `AsyncMock` for async SDK
+  clients, and `httpx.MockTransport` or cassettes under the provider SDK.
+- **What you control.** Where the seam sits (your client interface, the HTTP transport or a fake
+  server), whether a test checks the outcome or the call, and whether stub replies look like real model
+  output, mess included.
+- **What you can skip.** Arguing taxonomy. Know the difference between replaying and computing, and
+  between asserting on state and on calls; that decides every test.
 
 ## Why it exists
 - **Real dependencies are unaffordable in unit tests.** A real LLM call costs money, takes hundreds of
@@ -56,6 +70,16 @@ Meszaros's taxonomy, which most of the industry uses loosely:
 - **The "fake LLM" naming caveat.** One that pops scripted replies off a list is strictly a stub that
   records calls (a spy); it has no behaviour of its own. Teams call it a fake anyway. The real question:
   does this double *compute* anything, or only replay what the test told it?
+
+### Doubles in an agent stack
+| Dependency | Usual double | Verify |
+|---|---|---|
+| The model | scripted stub-with-spy emitting tool calls and final answers | the loop's outcome and the transcript it sent |
+| Read-only tools (search, fetch) | fake returning canned results, recording arguments | the result reached the model |
+| Side-effecting tools (send, delete, pay) | spy or autospecced mock | the call happened, or never happened, as required |
+| Vector store | in-memory fake ranking by cosine similarity | retrieved chunks and their order |
+| Memory store | dict-backed fake with the real interface | what was written and read back |
+| Clock, ids, randomness | injected callables | timeouts, retries, stable ids |
 
 ### State vs behaviour verification
 | | Doubles | Test checks | Survives refactoring? |
@@ -114,8 +138,8 @@ Cut as high as the test allows, because higher seams are faster and less brittle
 only for code whose correctness depends on what is below it, such as response parsing.
 
 ## Diagram
-The decision path for one dependency: first ask whether to double it at all, then what you verify, then
-where to cut the seam.
+The decision path for one agent dependency (the model, a tool, a store): first ask whether to double it
+at all, then what you verify, then where to cut the seam.
 
 ```mermaid
 flowchart TD
@@ -133,6 +157,56 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: tool dispatch with a scripted model and recording tools
+The model is a scripted stub; tools are fakes that record what they ran with. State checks cover the
+normal path; a call check covers the one requirement that is an interaction: a destructive tool never
+runs without approval.
+
+```python
+class FakeTool:
+    def __init__(self, result, destructive=False):
+        self.result, self.destructive, self.runs = result, destructive, []
+    def __call__(self, **kwargs):
+        self.runs.append(kwargs)
+        return self.result
+
+class ScriptedLLM:
+    def __init__(self, *actions): self.actions, self.seen = list(actions), []
+    def next_action(self, transcript):
+        self.seen.append(list(transcript))
+        return self.actions.pop(0)
+
+def run_step(llm, tools, transcript, approve):
+    action = llm.next_action(transcript)
+    tool = tools.get(action["tool"])
+    if tool is None:
+        return {"error": f"unknown tool {action['tool']}"}
+    if tool.destructive and not approve(action):
+        return {"error": "denied by approval policy"}
+    return {"result": tool(**action["args"])}
+
+def test_read_tool_result_is_returned():
+    search = FakeTool(["doc-7", "doc-2"])
+    llm = ScriptedLLM({"tool": "search", "args": {"q": "refund policy"}})
+    assert run_step(llm, {"search": search}, [], approve=lambda a: True) == {"result": ["doc-7", "doc-2"]}
+    assert search.runs == [{"q": "refund policy"}]
+
+def test_destructive_tool_never_runs_without_approval():
+    delete = FakeTool("deleted", destructive=True)
+    llm = ScriptedLLM({"tool": "delete_file", "args": {"path": "/data/a.csv"}})
+    out = run_step(llm, {"delete_file": delete}, [], approve=lambda a: False)
+    assert out == {"error": "denied by approval policy"}
+    assert delete.runs == []                 # the interaction is the requirement
+
+def test_hallucinated_tool_is_an_error_result():
+    llm = ScriptedLLM({"tool": "rm_rf", "args": {}})
+    assert run_step(llm, {}, [], approve=lambda a: True) == {"error": "unknown tool rm_rf"}
+```
+
+- **No mocks of the registry or the loop:** the real dispatch code runs, so refactoring it does not
+  break these tests unless behaviour changes.
+- **One behaviour assertion, on purpose:** `delete.runs == []` is the safety property itself.
+
 ### Summarizer: scripted fake, autospec mock, monkeypatch
 A summarizer retries once on empty output and truncates to a limit read from the environment. Three
 doubles: a scripted stub-with-spy (what most teams call a fake LLM) for state checks, an autospecced
@@ -252,6 +326,9 @@ API key despite the patch.
   Add every production parse failure as a new fixture file.
 - **Keep fakes honest.** Run one behaviour suite parametrized over `["fake", "real"]`, with the real
   backend marked `integration` and run nightly. A fake that drifts fails the shared suite.
+- **Turn agent traces into scripts.** When a production run misbehaves, export its model replies and
+  tool results from your tracing tool and feed them to the scripted fake and fake tools, so the exact
+  run replays offline as a regression test. Track how many tests came from traces.
 
 ## Trade-offs
 - **Fakes: readable vs drift.** They make tests readable and refactor-proof, but are code you maintain
@@ -264,6 +341,9 @@ API key despite the patch.
   use wide scope only for objects nothing mutates, and function scope for everything else.
 - **Patching: reach vs hidden dependency.** It lets you test code you cannot restructure but hides the
   dependency; when you own the code, injecting the collaborator removes the need for patching.
+- **Scripted model vs real model judgement.** A scripted fake makes loop and dispatch tests exact, but it
+  cannot tell you whether the model picks the right tool; that question belongs to an eval suite, not
+  a unit test.
 
 ## Pitfalls
 - **Unspecced `MagicMock` as a client.** Symptom: a green test while production raises `AttributeError`
@@ -274,6 +354,9 @@ API key despite the patch.
   no behaviour, so the team learns to update assertions without reading them.
 - **Idealised LLM stubs.** Perfect JSON, no fences, no preamble. Symptom: a parser that passes every test
   and fails on the first real response wrapped in markdown fences.
+- **Hand-typed tool-call messages.** A scripted reply whose shape differs from the provider's real
+  tool-call format (wrong key, arguments as a dict instead of a JSON string). Symptom: dispatch tests pass
+  and production fails to parse the first real call. Fix: build scripted replies from recorded ones.
 - **Mutating a session-scoped fixture.** Symptom: tests that pass alone and fail depending on order, or
   only under parallel runs.
 - **Plain `Mock` for an async client.** Awaiting its result raises
@@ -281,7 +364,8 @@ API key despite the patch.
   silently. Use `AsyncMock` or autospec, which creates async methods for coroutine functions.
 
 ## When to use
-- **Use doubles at the process boundary:** model APIs, HTTP services, databases, clocks and randomness.
+- **Use doubles at the process boundary:** model APIs, tools that call out, HTTP services, databases,
+  clocks and randomness.
 - **Do not double your own code:** call your pure functions and value objects directly.
 - **Default:** fakes and stubs with state assertions; spec'd mocks only when the call is the
   requirement; recorded real model responses as stub data, including their mess.
@@ -330,6 +414,13 @@ destructive tool never running without approval, and spec every remaining mock a
 - **Otherwise prefer state checks**, because asserting on every internal call breaks on refactors that
   change no behaviour, and teams learn to update assertions without reading them.
 - **Spec the mock** with `create_autospec(..., instance=True)` so signature mistakes still fail.
+
+### How do you test that an agent never runs a destructive tool without approval?
+- **Run the real dispatcher** with a scripted model that requests the destructive tool, and an approval
+  callback that denies.
+- **Make the tool a recording fake** and assert it has no recorded runs and the step returned an error
+  result; here the absence of a call is the requirement, so a behaviour check is right.
+- **Add the approved case too**, asserting the arguments reached the tool unchanged.
 
 ### How would you test a parser for LLM output so it survives real responses?
 - **Feed it realistic stub data:** sanitised real outputs with markdown fences, preambles and trailing

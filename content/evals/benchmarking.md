@@ -5,7 +5,8 @@ name: Benchmarking (MMLU, HumanEval, SWE-bench, GPQA)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - evals/model-evaluation
   - evals/dataset-contamination
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-A benchmark is a fixed dataset plus a fixed scoring rule so models can be compared on one task.
-MMLU, HumanEval, SWE-bench and GPQA each measure something narrow, saturate and leak: use leaderboards
-to screen, never as proof your task works.
+A benchmark is a fixed dataset plus a fixed scoring rule so models can be compared on one task. For an
+agent builder, MMLU, HumanEval, SWE-bench and GPQA shortlist the model behind your agent; they
+saturate and leak, and never prove your agent works.
+
+## For agent builders
+- **Why it matters for agents.** Choosing the model that drives your loop is the first big decision,
+  and vendor tables are where that choice starts. Reading them correctly (protocol, interval, scaffold)
+  keeps you from paying for a "leader" that is a tie, or a scaffold effect.
+- **Where it shows up in your stack.** Model-selection memos, vendor announcements, open harnesses
+  (EleutherAI's lm-evaluation-harness, Inspect), and agentic benchmarks such as SWE-bench for coding
+  agents; tool-calling leaderboards such as the Berkeley Function Calling Leaderboard and τ-bench-style
+  customer-service tasks are the same idea for tool use.
+- **What you control.** Which capability you shortlist on, whether you re-run scores under one
+  protocol, and whether you run benchmark tasks through your own scaffold with cost per task logged.
+- **What you can skip.** Memorizing current leaderboard numbers; they change monthly. Know the
+  scoring rules, pass@k and the interval arithmetic, and that agentic scores belong to model plus
+  scaffold.
 
 ## Why it exists
 - **Before benchmarks, nothing was comparable.** Every lab reported results on tasks of its own choosing,
@@ -152,6 +167,18 @@ pass@k = 1 − C(n−c, k) / C(n, k)
 - **Division of labour:** the benchmark answers "is this model capable enough to try"; your eval answers
   "does it work here".
 
+### What agent builders take from this
+| Your agent | Shortlist signal | Then decide on |
+|---|---|---|
+| Coding agent | SWE-bench Verified with scaffold and cost per task | Your repos and tasks through your own loop |
+| Tool-calling support agent | Tool-calling benchmarks, instruction following | Your golden tasks with seeded tools, run several times each |
+| Research or RAG agent | Knowledge and reasoning (MMLU-style, GPQA) | Your documents, retrieval and citation checks |
+
+- **Agentic scores need a cost column.** A higher resolved rate bought with many more steps per task
+  may lose on cost per resolved task, which is what your budget sees.
+- **Reliability is not in the headline.** Most tables report one attempt or a best-of; an agent that
+  must succeed every time for users needs repeated runs on your own tasks.
+
 ## Diagram
 The decision path for a leaderboard number: each check can send the claim back for re-running, and
 even a clean claim only earns a place on the shortlist. "Same protocol" means shots, chain-of-thought,
@@ -209,6 +236,23 @@ for name, n in benchmarks.items():
   single evaluation run, while on MMLU it is not.
 - **Only a paired comparison** on the same items with the same protocol can tighten that.
 
+### Agent scenario: picking the model for a coding agent
+Numbers illustrative. Three candidates run 500 SWE-bench Verified instances through *your* agent loop
+and tools, one attempt each, with token cost logged per task.
+
+| Model | Resolved | 95% interval | Mean cost per task | Cost per resolved issue |
+|---|---|---|---|---|
+| A (vendor reports 70% in its own scaffold) | 58% | ±4.3 points | $1.10 | $1.90 |
+| B | 55% | ±4.4 points | $0.45 | $0.82 |
+| C | 47% | ±4.4 points | $0.30 | $0.64 |
+
+- **A versus B is not settled:** a 3-point gap sits inside the interval; a paired count of instances
+  only one model resolved is the next step.
+- **The vendor's 70% was the scaffold:** in your loop A drops 12 points, which is the system-score
+  effect in numbers.
+- **Decision:** shortlist A and B, then run both on your own repository tasks; B is the default if the
+  paired result is a tie, because it costs less than half per resolved issue.
+
 ### Worked scenario: auditing a vendor's leaderboard claim
 A vendor table (numbers illustrative) shows model A ahead of model B. Walk the checklist before it
 reaches a selection memo.
@@ -239,6 +283,10 @@ reaches a selection memo.
 - **Private look-alike set.** Keep a small unpublished set of items in the style of the public
   benchmark, written in-house. Monitor the gap between public and private scores as a contamination
   signal.
+- **Re-screen on every model release.** When a provider ships a new snapshot, re-run the shortlist
+  benchmarks in your scaffold and then your agent's golden tasks before switching the pinned model id.
+  Monitor steps and cost per task alongside resolved rate, since newer models can change how long
+  they loop.
 
 ## Trade-offs
 - **Comparability vs decay.** Standardized items and scoring make models comparable across labs, but
@@ -266,6 +314,8 @@ reaches a selection memo.
   model on your extraction job because the task needs instruction following, not trivia.
 - **Quoting self-reported scores as independent.** Symptom: a leaderboard entry nobody outside the
   vendor can reproduce.
+- **Choosing an agent model on resolved rate alone.** Symptom: the "best" model doubles the monthly bill
+  because it takes far more steps per task. Fix: report cost per resolved task next to the rate.
 
 ## When to use
 - **Use when:** starting model selection, to shortlist candidates for the capability your task needs;
@@ -324,6 +374,14 @@ nothing more.
   different item sets, and attempts allowed per task change the number.
 - **Fix the comparison:** run SWE-bench Verified instances through your own scaffold and log resolved
   rate together with cost per task.
+
+### How would you pick the model for a new tool-calling support agent?
+- **Shortlist on public signals:** tool-calling and instruction-following benchmarks, read with their
+  protocol and interval, plus price and latency, to get two or three candidates.
+- **Decide on your own tasks:** run each candidate through your agent loop on golden tasks with seeded
+  tools, several runs per task, and compare paired per-task results.
+- **Weigh all axes:** success, hard-constraint violations, steps, cost per task and p95 latency, because
+  a model that wins on success but loops longer can lose overall.
 
 ### When would you not use a public benchmark to choose a model?
 - **For the final decision:** no benchmark contains your documents, prompt or failure modes, so the

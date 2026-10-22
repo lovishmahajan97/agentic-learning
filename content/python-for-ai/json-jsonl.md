@@ -5,7 +5,8 @@ name: JSON / JSONL
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - prompting/structured-outputs-json-mode
   - python-for-ai/pydantic
@@ -22,13 +23,25 @@ sources:
 ---
 
 ## TL;DR
-JSON is the lingua franca of LLM payloads, tool arguments and structured outputs; JSONL puts one JSON
-value per line, making files appendable, streamable and splittable for evals, fine-tuning, batches and
-logs. Watch NaN, big integers and encoding.
+JSON is what an agent speaks: tool schemas, tool-call arguments, tool results and structured outputs.
+JSONL puts one JSON value per line, so agent traces, eval sets, fine-tuning data and batch jobs append,
+stream and survive crashes. Watch NaN, big integers and encoding.
+
+## For agent builders
+- **Why it matters for agents.** Every tool call is a JSON round trip: you send a JSON Schema, the model
+  returns arguments as JSON, your tool returns a result you serialize back. A tool result with a NaN, a
+  `datetime` or a numpy scalar breaks the loop at step 5 instead of at your desk.
+- **Where it shows up in your stack.** OpenAI-style `tool_calls` carry arguments as a JSON *string* you
+  must parse; structured-output modes return JSON; agent traces, eval datasets, fine-tuning files and
+  Batch API inputs and outputs are JSONL.
+- **What you control.** A strict writer (`allow_nan=False`, a `default=` hook), a validating reader with
+  line numbers, one writer per file, and a stable ID per record for resumable eval and batch jobs.
+- **What you can skip.** The RFC's grammar details. Know the six types, what Python emits that is not
+  valid JSON, and why JSONL beats one big array.
 
 ## Why it exists
-- **AI data is nested records.** A chat transcript with a variable number of messages, a tool call with
-  arguments, a model response with metadata.
+- **Agent data is nested records.** A transcript with a variable number of messages, a tool call with
+  arguments, a model response with metadata, a trace with one span per step.
 - **The alternatives fail.** CSV cannot represent nesting without inventing an escaping scheme; binary
   formats need a schema up front and are not readable in a terminal. JSON represents nested objects and
   arrays directly, every language parses it, and LLMs produce it reliably enough that providers expose
@@ -40,7 +53,7 @@ logs. Watch NaN, big integers and encoding.
 - **JSONL's one rule.** Each line is a self-contained JSON value, separated by `\n`. Appending is writing
   a line, reading is iterating lines, splitting is `split -l`, and a crash damages at most the last line.
 - **It costs no expressiveness.** Standard encoders escape newlines inside strings as `\n`, so any JSON
-  value fits on one line.
+  value fits on one line, including a long tool result.
 
 ## How it works
 ### JSON's data model
@@ -58,15 +71,26 @@ RFC 8259 defines six types: object, array, string, number, `true`/`false`, `null
 - **Anything else raises `TypeError` on `dumps`:** datetimes, `Decimal`, sets, most numpy scalars such as
   `np.int64` and `np.float32`. (`np.float64` slips through only because it subclasses Python `float`.)
 - **Convert first:** with a `default=` function, or serialize a Pydantic model with `model_dump_json()`.
+  This matters most in tool results, which often come straight from a database row or a pandas frame.
+
+### Tool calls are JSON in both directions
+1. **You send** each tool's parameters as a JSON Schema (often generated from a Pydantic model).
+2. **The model returns** arguments; in OpenAI-style APIs they arrive as a JSON string you `json.loads`,
+   and the model can produce malformed or schema-violating JSON.
+3. **You validate** the parsed arguments against the same model, and on failure send the error back as
+   the tool result so the model can retry, instead of crashing the loop.
+4. **You return** the tool's result serialized as a string, so it must be valid, compact JSON.
 
 ### The edges where Python's defaults bite
 - **NaN and Infinity.** `json.dumps(float("nan"))` emits `NaN`, which is *not* valid JSON; JavaScript's
   `JSON.parse` and strict parsers reject it. Pass `allow_nan=False` to fail at write time instead.
 - **Big integers.** Python round-trips any integer exactly, but parsers that use IEEE doubles (JavaScript)
-  lose precision above 2^53. IDs from Snowflake-style generators should travel as strings.
+  lose precision above 2^53. IDs from Snowflake-style generators should travel as strings, including
+  order IDs a tool returns to the model.
 - **Non-ASCII.** `ensure_ascii=True` is the default, so `café` is written as `caf\u00e9`: valid, but it
-  inflates files and hurts readability for multilingual data. `ensure_ascii=False` writes UTF-8, which is
-  correct as long as the file is opened with `encoding="utf-8"`.
+  inflates files and hurts readability for multilingual data, and escapes cost extra tokens in a prompt.
+  `ensure_ascii=False` writes UTF-8, which is correct as long as the file is opened with
+  `encoding="utf-8"`.
 - **Duplicate keys.** The RFC leaves them undefined; Python keeps the last one silently.
 
 ### JSONL mechanics
@@ -94,32 +118,65 @@ RFC 8259 defines six types: object, array, string, number, `true`/`false`, `null
 ### Where you meet it
 | Use | Shape |
 |---|---|
-| OpenAI-style fine-tuning data | One `{"messages": [...]}` object per line |
+| OpenAI-style fine-tuning data | One `{"messages": [...]}` object per line, tool calls included for agent traces |
 | OpenAI Batch API | JSONL of requests, each with a `custom_id` so results match back |
 | Eval harnesses | Cases and results as JSONL |
-| Structured logs | Usually one JSON object per line |
+| Agent traces and structured logs | Usually one JSON object per line: one step, one span or one event |
 
 For analytics over millions of rows, JSONL is usually converted to a columnar format such as Parquet,
 since re-parsing text on every query is slow.
 
 ## Diagram
-The write side keeps one record per line; the read side streams line by line, tolerates only a torn
-final line, and pins any other failure to a line number.
+The agent's trace writer keeps one record per line; the reader streams line by line, tolerates only a
+torn final line, and pins any other failure to a line number.
 
 ```mermaid
 flowchart TD
-    R["Record: dict or Pydantic model"] --> W["json.dumps with allow_nan=False, no indent"]
+    R["Agent step: dict or Pydantic model"] --> W["json.dumps, allow_nan=False, no indent"]
     W --> A["Append line plus newline, flush"]
     A --> F[("Shard file per worker")]
-    F --> I["Reader iterates the file line by line"]
-    I --> T{"Line ends with a newline?"}
+    F --> I["Reader iterates line by line"]
+    I --> T{"Line ends with newline?"}
     T -->|"no, last line"| X["Torn tail: drop or truncate"]
-    T -->|"yes"| L["json.loads, then validate the record"]
-    L -->|"valid"| U["Use one record, memory stays flat"]
-    L -->|"invalid"| E["Raise with path and line number"]
+    T -->|"yes"| L["json.loads, then validate"]
+    L -->|"valid"| U["Use one record, flat memory"]
+    L -->|"invalid"| E["Raise with path and line"]
 ```
 
 ## Examples
+### Parse tool-call arguments, run the tool, log the step as JSONL
+The model's arguments are untrusted JSON; validate them, feed errors back to the model, and append each
+step to a trace file.
+
+```python
+import json
+from pydantic import BaseModel, ValidationError
+
+class LookupOrder(BaseModel):
+    order_id: str            # string, not int: IDs above 2^53 break JS consumers
+    include_items: bool = False
+
+def run_tool(raw_args: str) -> str:
+    try:
+        args = LookupOrder.model_validate_json(raw_args)   # parse + validate in one step
+    except ValidationError as e:
+        return json.dumps({"error": e.errors(include_url=False)}, default=str)  # model retries
+    row = {"order_id": args.order_id, "status": "shipped", "total": 42.5}
+    return json.dumps(row, ensure_ascii=False, allow_nan=False)
+
+def log_step(f, step: int, name: str, raw_args: str, result: str) -> None:
+    rec = {"step": step, "tool": name, "args": raw_args, "result": result}
+    f.write(json.dumps(rec, ensure_ascii=False, allow_nan=False) + "\n")
+    f.flush()                                           # a crash loses at most this line
+
+with open("trace.jsonl", "a", encoding="utf-8") as f:
+    for step, raw in enumerate(['{"order_id": "9007199254740993"}', '{"order_id": 5'], 1):
+        log_step(f, step, "lookup_order", raw, run_tool(raw))   # 2nd is malformed JSON
+```
+
+- **The malformed second call** becomes a JSON error string that goes back to the model as the tool
+  result, and the trace still gets a complete line for step 2.
+
 ### Write an eval set safely, read it as a stream
 Writing an eval set safely and reading it back as a stream, with failures pinned to a line.
 
@@ -162,77 +219,56 @@ for case in read_jsonl(p):                             # one record in memory at
   on the second record, at write time, instead of producing a file a TypeScript dashboard later refuses
   to parse.
 
-### Resumable batch output that survives a torn last line
-A worker appends one result per request and can be killed at any time. On restart it drops a torn tail,
-skips finished `custom_id`s and appends the rest.
-
-```python
-import json
-from pathlib import Path
-
-def resume(path: Path) -> set[str]:
-    done, good_bytes = set(), 0
-    if not path.exists():
-        return done
-    with path.open("rb") as f:
-        for raw in f:                          # binary iteration splits on b"\n" only
-            if not raw.endswith(b"\n"):        # torn last line: writer died mid-record
-                break
-            if raw.strip():                    # a bad *complete* line is real corruption: let it raise
-                done.add(json.loads(raw)["custom_id"])
-            good_bytes += len(raw)
-    with path.open("r+b") as f:
-        f.truncate(good_bytes)                 # cut the torn tail before appending again
-    return done
-
-def run(requests, out: Path, call_model):
-    done = resume(out)
-    with out.open("a", encoding="utf-8") as f:
-        for req in requests:
-            if req["custom_id"] in done:
-                continue
-            result = call_model(req)
-            f.write(json.dumps({"custom_id": req["custom_id"], **result}, allow_nan=False) + "\n")
-            f.flush()                          # durability matches progress
-```
+### Worked scenario: a resumable agent eval run that survives a torn last line
+A worker runs the agent on each case, appends one result per `custom_id`, and can be killed at any time.
+On restart, a `resume` step reads the file in binary, stops at a line with no trailing `\n`, truncates
+the file to the last complete line, and returns the finished IDs; the run then skips those and appends.
 
 | Event | Effect on `results.jsonl` |
 |---|---|
 | Pod killed while writing record 1,800,001 | 1,800,000 complete lines plus a partial one |
 | Restart calls `resume` | Partial line truncated; 1,800,000 IDs marked done |
-| Job continues | Only the remaining requests are sent, so it is idempotent |
+| Job continues | Only the remaining cases are sent, so it is idempotent |
+
+- **Why it matters for agent evals:** each case may cost several model and tool calls, so re-running
+  finished cases after a crash multiplies spend. A bad *complete* line anywhere else should raise, since
+  that is real corruption.
 
 ## Production patterns
 - **Strict writer by default.** Wrap `json.dumps` with `allow_nan=False`, an explicit `default=` for
-  datetimes and numpy scalars, and `encoding="utf-8"` on every open. Monitor write-time `ValueError` and
-  `TypeError` counts; they are bugs caught early, not noise to suppress.
-- **Validate every line at the boundary.** Define a Pydantic model per record type and call
-  `Model.model_validate_json(line)` while reading, raising with the file and line number. Track the
-  rejected-line count per dataset version; schema drift shows up there first.
-- **Shard by worker, merge by concatenation.** Each process writes `results-{worker:02d}.jsonl`, never a
-  shared file, and downstream jobs read the shard glob. Watch for shards with no trailing newline, which
-  mark workers that died mid-write.
+  datetimes and numpy scalars, and `encoding="utf-8"` on every open; use it for tool results and traces
+  alike. Monitor write-time `ValueError` and `TypeError` counts; they are bugs caught early.
+- **Validate every tool call and every line at the boundary.** Define a Pydantic model per tool and per
+  record type and call `Model.model_validate_json(line)`, raising with the file and line number (or
+  returning the error to the model). Track rejected-argument rates per tool; schema drift shows up there.
+- **Shard by worker, merge by concatenation.** Each eval or batch process writes
+  `results-{worker:02d}.jsonl`, never a shared file, and downstream jobs read the shard glob. Watch for
+  shards with no trailing newline, which mark workers that died mid-write.
 - **Key every record for idempotent resume.** Carry a stable `custom_id` (strings, not big integers) and
-  resume as in the second example. Monitor duplicate-ID counts after merges.
-- **Promote to Parquet for analytics.** Keep JSONL as the append and interchange format, and convert
-  finished files (for example `pd.read_json(path, lines=True).to_parquet(...)`) before repeated queries.
-  Watch query latency and file size; a gzip-compressed `.jsonl.gz` is the cheaper archive.
+  resume as in the eval scenario. Monitor duplicate-ID counts after merges.
+- **Promote to Parquet for analytics.** Keep JSONL as the append and interchange format for traces and
+  evals, and convert finished files (for example `pd.read_json(path, lines=True).to_parquet(...)`) before
+  repeated queries. Watch query latency and file size; a gzip-compressed `.jsonl.gz` is the cheaper archive.
 
 ## Trade-offs
 - **Streaming vs document guarantees.** JSONL streams and appends record by record but has no enclosing
   schema, so a malformed middle line is only found when a reader reaches it.
 - **Readable vs fast.** Text JSON is human-readable and universal, yet several times larger and slower to
   parse than columnar binary formats; for repeated analytical queries over millions of rows, Parquet wins.
-- **Schemaless vs drift.** Adding fields to eval or log data is easy, but readers drift silently unless a
-  Pydantic model or JSON Schema validates each line at the boundary.
-- **`ensure_ascii=False` vs safety.** Multilingual data stays compact and readable, but a consumer that
-  guesses the wrong encoding mangles it; ASCII escapes are safer when you do not control the reader.
+- **Schemaless vs drift.** Adding fields to eval, trace or log data is easy, but readers drift silently
+  unless a Pydantic model or JSON Schema validates each line at the boundary.
+- **`ensure_ascii=False` vs safety.** Multilingual data stays compact and readable (and cheaper in tokens
+  when the JSON goes back into a prompt), but a consumer that guesses the wrong encoding mangles it; ASCII
+  escapes are safer when you do not control the reader.
 
 ## Pitfalls
 - **`json.dump(obj, f, indent=2)` in a JSONL writer.** Symptom: `JSONDecodeError` on the very first line
   (a lone `{` is not a complete value) because each record spans many lines. Fix: no `indent`.
 - **Serializing NaN from pandas or numpy metrics.** Symptom: a JavaScript or Go consumer rejects the file
   while Python reads it fine. Fix: `allow_nan=False` and map NaN to `null`.
+- **Trusting tool-call arguments.** Symptom: the agent loop crashes with `JSONDecodeError` or `KeyError`
+  when the model emits truncated or off-schema arguments. Fix: validate with a Pydantic model and return
+  the error to the model as the tool result.
 - **`f.readlines()` or `[json.loads(l) for l in f]` on a multi-gigabyte file.** Symptom: memory climbs to
   several times the file size (parsed objects are far larger than their text) and the process is
   OOM-killed. (`json.load` on JSONL fails outright with "Extra data".) Fix: a generator reader.
@@ -241,11 +277,11 @@ def run(requests, out: Path, call_model):
 - **Opening files without `encoding="utf-8"`.** Symptom: `UnicodeDecodeError` or mojibake on Windows or
   in containers with a non-UTF-8 locale.
 - **Passing numpy types into `json.dumps`.** Symptom: `TypeError: Object of type float32 is not JSON
-  serializable` deep inside an eval run. Fix: `.item()`, `.tolist()` or a `default=` hook.
+  serializable` deep inside an eval run or a tool result. Fix: `.item()`, `.tolist()` or a `default=` hook.
 
 ## When to use
-- **JSON for single payloads:** API requests and responses, tool arguments, config documents, a model's
-  structured output.
+- **JSON for single payloads:** API requests and responses, tool schemas and arguments, tool results,
+  config documents, a model's structured output.
 - **JSONL for growing or one-at-a-time collections:** eval datasets, fine-tuning data, batch-inference
   inputs and outputs, agent traces and logs.
 - **Validate at ingestion** with a Pydantic model so bad records fail with a line number.
@@ -280,6 +316,14 @@ results feed analytics, convert the finished JSONL to Parquet.
   splits by line across workers, and a crash damages at most the last line.
 - **Example:** OpenAI-style fine-tuning data is one `{"messages": [...]}` object per line.
 
+### Your agent crashes intermittently when the model calls a tool. How do you make the loop robust?
+- **Treat arguments as untrusted input:** parse the JSON string and validate it with the tool's Pydantic
+  model, because models sometimes emit truncated or off-schema JSON.
+- **Return errors, do not raise:** send the validation error back as the tool result so the model can
+  correct itself, and cap retries per step.
+- **Serialize results strictly:** `allow_nan=False` and a `default=` hook, so a NaN or a `datetime` in a
+  database row cannot break the next model call. Track rejected-argument rate per tool.
+
 ### Python reads your results file fine, but a TypeScript dashboard rejects it. What do you check?
 - **NaN or Infinity first:** Python's `json.dumps` emits `NaN` by default, which is not valid JSON, so
   strict parsers like `JSON.parse` fail. Write with `allow_nan=False` and map NaN to `null`.
@@ -293,7 +337,7 @@ results feed analytics, convert the finished JSONL to Parquet.
 - **Fix:** iterate the file object, which splits only on `\n` and `\r\n`, or split on `"\n"` explicitly.
 - **Prevent it:** keep a regression case containing U+2028 in the reader's tests.
 
-### How should several workers write results without corrupting the output?
+### How should several eval workers write agent results without corrupting the output?
 - **One writer per file:** concurrent appends to one file can interleave bytes for large records or on
   network storage, leaving two half records on one line.
 - **Shard and concatenate:** each worker writes `results-00.jsonl`, `results-01.jsonl` and so on, and

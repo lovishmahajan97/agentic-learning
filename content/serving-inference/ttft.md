@@ -5,7 +5,8 @@ name: TTFT (time to first token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/streaming
@@ -22,9 +23,20 @@ sources:
 ---
 
 ## TL;DR
-Time to first token (TTFT) is the delay from sending a request to the first generated token: queueing
-wait plus prefill over the whole prompt. It grows with prompt length and load, not answer length, and
-is the latency a streaming user feels.
+Time to first token (TTFT) is queueing wait plus prefill over the whole prompt. An agent pays it on
+every step, over a transcript that keeps growing, so it dominates how fast a multi-step agent feels.
+
+## For agent builders
+- **Why it matters for agents.** A 10-step agent makes 10 model calls, and each one waits TTFT before
+  emitting a tool call. Tool-call outputs are short, so per-step latency is mostly TTFT, not decode.
+- **Where it shows up in your stack.** Provider prompt caching and the cached-token fields in usage
+  responses, vLLM `--enable-prefix-caching` and `vllm:num_requests_waiting` when self-hosting, and the
+  first-content-delta timestamp in your agent traces.
+- **What you control.** Transcript size (tool results trimmed or summarised before appending), a stable
+  prefix (system prompt and tool schemas first, byte-identical), retrieval width in RAG steps, and the
+  number of steps.
+- **What you can skip.** Exact FLOP counts per GPU and disaggregated-serving internals unless you run
+  your own fleet; the `2 × N × n_prompt` rule and "queueing shows in p99" are enough.
 
 ## Why it exists
 - **End-to-end latency mixes two phases with different physics.** Prefill processes every prompt token
@@ -97,6 +109,17 @@ From the client's clock, TTFT is the sum of:
    across GPUs does shorten it, unlike decode. Speculative decoding, KV-cache quantisation and
    weight-only quantisation mostly do not; they target the decode phase.
 
+### TTFT in an agent loop
+- **Each step re-sends the transcript.** System prompt, tool schemas, every earlier tool call and
+  result: the prompt grows by one tool round trip per step, so without caching step 20 prefills far more
+  than step 1.
+- **Prefix caching turns that into a delta.** With an append-only transcript, each step prefills only
+  the new tool result; editing earlier turns or putting a timestamp at the top throws that away.
+- **Short outputs make TTFT the step cost.** A tool call is often a few dozen tokens, so for a planning
+  step TTFT can be most of the model time.
+- **Agent latency is a sum.** Run time ≈ Σ over steps of (TTFT + decode + tool time), so a TTFT
+  regression is multiplied by the step count.
+
 ### Measuring it honestly
 - **Stop the clock at the first *non-empty content* delta.** The first SSE frame is often a role-only
   chunk or a `message_start` event and arrives before any prefill has finished.
@@ -108,8 +131,9 @@ From the client's clock, TTFT is the sum of:
   network.
 
 ## Diagram
-Follow a request from send to first visible token. The two boxes that move with load and prompt size,
-the admission queue and prefill, are where almost all of TTFT goes.
+Follow one agent step from send to first visible token. The two boxes that move with load and prompt
+size, the admission queue and prefill, are where almost all of TTFT goes; the dotted loop is why an
+agent pays it again every step.
 
 ```mermaid
 flowchart TD
@@ -122,6 +146,7 @@ flowchart TD
     G --> H["First content delta at client"]
     C -.->|"grows with load"| Q["Queueing tail, p99"]
     E -.->|"grows with prompt length"| R["Linear prefill cost"]
+    H -.->|"tool result appended"| A
 ```
 
 ## Examples
@@ -183,7 +208,37 @@ for label, n, toks in [("8B, chat 500", 8e9, 500), ("8B, RAG 8k", 8e9, 8_000),
 
 Real numbers will be worse once queueing and attention overhead are added; the ratios are the point.
 
+### Agent scenario: TTFT across a 10-step tool loop
+An 8B agent with a 4k-token prefix (system prompt plus tool schemas) appends ~1k tokens per step (tool
+call plus result). Prefill uses the same illustrative 2 × N × tokens ÷ (1e15 × 0.45) rule.
+
+```python
+def prefill_ms(params, tokens, peak=1e15, util=0.45):
+    return 2 * params * tokens / (peak * util) * 1000
+
+prefix, per_step, steps = 4_000, 1_000, 10
+no_cache = sum(prefill_ms(8e9, prefix + per_step * s) for s in range(steps))
+cached = prefill_ms(8e9, prefix) + sum(prefill_ms(8e9, per_step) for s in range(1, steps))
+print(f"no prefix reuse: {no_cache:.0f} ms   append-only + prefix cache: {cached:.0f} ms")
+# no prefix reuse: 3022 ms   append-only + prefix cache: 462 ms
+```
+
+| Step | Prompt tokens | Prefill without reuse | Prefill with prefix cache |
+|---|---|---|---|
+| 1 | 4,000 | ~142 ms | ~142 ms (cache written) |
+| 5 | 8,000 | ~284 ms | ~36 ms (new 1k only) |
+| 10 | 13,000 | ~462 ms | ~36 ms |
+| Total, 10 steps | | ~3.0 s | ~0.46 s |
+
+Queueing adds to every step on top of this, so under load the gap between the two columns widens.
+
 ## Production patterns
+- **Append-only agent transcripts.** Keep system prompt and tool schemas first and fixed, append tool
+  calls and results, and never edit earlier turns mid-run, so each step prefills only its delta. Monitor
+  cached versus uncached input tokens per step from the usage fields.
+- **Trim tool results before they enter context.** Truncate or summarise large tool outputs (search
+  pages, logs, SQL rows) to what the next step needs, because every token is prefilled on every later
+  step. Monitor prompt tokens per step and TTFT per step index.
 - **Stable prefix first, cached.** Put the system prompt, tool schemas and shared documents first and
   byte-identical, with timestamps and user fields after them, and run the engine with automatic prefix
   caching on (vLLM `--enable-prefix-caching`, already the default in the V1 engine). Monitor prefix-cache hit rate and TTFT per route.
@@ -241,7 +296,7 @@ Real numbers will be worse once queueing and attention overhead are added; the r
 - **Budget it as network + queue + prefill** and check which term you can actually control.
 - **Watch it bucketed** by prompt length and by concurrency, to tell a prompt-size regression from a
   capacity problem.
-- **First number to check** when "the assistant feels slow".
+- **First number to check** when "the assistant feels slow", and per step when an agent run is slow.
 - **Interviews:** the expected answer to "latency doubled after we added retrieval" is a decomposition
   of TTFT into prefill arithmetic plus the levers above.
 
@@ -280,11 +335,20 @@ depth rather than GPU utilisation; and move long-context or batch traffic to a s
 - **Then the levers:** fewer or shorter chunks (checked on an eval set), the stable prefix first for
   prefix caching, and chunked prefill if long prompts stall other streams.
 
-### When would you not turn on chunked prefill?
-- **It costs the long prompt.** Splitting its prefill across steps lengthens that request's own TTFT.
-- **So skip it** for prefill-heavy, low-concurrency work such as summarisation batches, where few
-  decodes are running and finishing prefill at full speed matters more.
-- **Use it** when long prompts share replicas with many live streams, because it bounds their stalls.
+### Your agent gets slower with every step even though tool results are small. What do you check?
+- **Cached-token share per step.** It should rise toward the prefix length after step 1; if it stays
+  near zero, something breaks prefix reuse (a timestamp at the top, reordered tool schemas, edited
+  history).
+- **Prompt tokens per step.** A growing transcript with no reuse makes TTFT grow linearly with the step
+  index; trim or summarise old tool results.
+- **Queue depth.** If TTFT rises with concurrency rather than step index, it is capacity, not context.
+
+### How would you set a latency budget for a 10-step agent?
+- **Decompose per step:** TTFT plus decode for the short tool-call output plus tool time, summed over the
+  expected step count.
+- **Spend the budget where it moves:** prefix caching and trimmed tool results cut TTFT on every step;
+  fewer steps (better tools, parallel tool calls) cut all three terms.
+- **Track p95 per step index**, so you see whether later steps are drifting as context grows.
 
 ### Roughly what TTFT should a 70B model have on an 8k-token prompt with no queue?
 - **FLOPs:** 2 × 70e9 × 8e3 ≈ 1.1e15.

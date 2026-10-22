@@ -5,7 +5,8 @@ name: KV-cache memory estimation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - model-internals/kv-cache
   - model-internals/grouped-query-attention
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-KV-cache estimation turns "we have an 80 GB GPU" into "we can serve N requests of length L": 2 × layers ×
-KV heads × head dim × bytes per element, times tokens, times sequences. It prevents OOM surprises and
-half-empty GPUs.
+KV-cache estimation turns "we have an 80 GB GPU" into "we can run N agents whose transcripts reach L
+tokens": 2 × layers × KV heads × head dim × bytes per element, times tokens, times sequences. It prevents
+OOM surprises and half-empty GPUs.
+
+## For agent builders
+- **Why it matters for agents.** Agent transcripts grow every step, so a fleet's cache demand rises over
+  each run. Capacity sized from step 1 (or from chat traffic) collapses into preemption storms once runs
+  reach step 15 or 20.
+- **Where it shows up in your stack.** `max_model_len`, `max_num_seqs`, `gpu_memory_utilization` and
+  `--kv-cache-dtype fp8` on a self-hosted engine such as vLLM; the model's `config.json` fields; the
+  engine's startup log of cache blocks. With a hosted API the provider does this math for you.
+- **What you control.** Prefix size (tool schemas count), tokens appended per step, maximum steps per run,
+  when you compact history, and how many agent runs you allow in flight per replica.
+- **What you can skip.** Exact allocator and CUDA-graph overheads; trust the startup log for those. Learn
+  the formula, the pool arithmetic and how to turn a step count into a transcript length.
 
 ## Why it exists
 - **The cache is the invisible cost.** A team that budgets 16 GB for an 8B fp16 model and calls the
@@ -34,7 +47,8 @@ half-empty GPUs.
   as latency collapse.
 - **"Try it and see" fails.** The answer depends on what you do not observe until production: the
   distribution of prompt lengths, output lengths and concurrency, and how they move together. Synthetic
-  500-token load tests say nothing about the day a customer pastes a 40-page contract.
+  500-token load tests say nothing about the day a customer pastes a 40-page contract, or the day an
+  agent run takes 30 steps instead of 8.
 - **"Pick the biggest GPU" fails** on cost, and often still does not fit: a 70B model's cache at 128k
   context on a modest batch exceeds any single card.
 - **What the estimate buys:** reason forward from a config file and a traffic model to a GPU count before
@@ -98,6 +112,22 @@ Four refinements matter in practice, plus one constraint on the fourth:
    per-GPU cache stops shrinking.
 5. **TP degree must divide the head counts,** which is why deployments use TP 2, 4 or 8, not 3 or 6.
 
+### Turning an agent run into a sequence length
+An agent's "sequence" is its transcript at the current step, so estimate it from the loop's shape:
+
+```
+transcript_tokens(step n) = prefix_tokens + (n − 1) × tokens_appended_per_step + output_tokens
+```
+
+- **Prefix** is the system prompt plus every tool schema; dozens of tools can add thousands of tokens.
+- **Appended per step** is the tool call plus its result; one verbose tool result can dominate it.
+- **Use the step-count distribution:** the p50 step count gives steady-state demand, the p95 or the step
+  cap gives the tail you must fit or preempt. Averaged over a run, each agent holds roughly the cache of
+  its midpoint step.
+- **Idle time between steps matters.** While a tool runs the request has finished, so its blocks are free
+  to reuse, unless prefix caching keeps them resident for the next step (which is the point of caching,
+  and also why cached blocks compete for the pool).
+
 ### Running the numbers for common shapes
 Illustrative, computed from public config values:
 
@@ -115,8 +145,8 @@ Illustrative, computed from public config values:
    tail arrives. That is a policy choice, not an error, but make it consciously.
 
 ## Diagram
-Work from the config down to a concurrency number, then check it against what the engine actually
-allocated.
+Work from the config and the agent loop's shape down to a concurrency number, then check it against what
+the engine actually allocated.
 
 ```mermaid
 flowchart TD
@@ -126,6 +156,7 @@ flowchart TD
     WS["Activation workspace, CUDA graphs"] -->|"subtract"| POOL
     BPT --> TOK["Pool in tokens"]
     POOL --> TOK
+    RUN["Agent prefix plus steps x tokens per step"] -->|"p50 and p95 transcript"| TOK
     TOK -->|"divide by p50 length"| EXP["Expected concurrency"]
     TOK -->|"divide by max_model_len"| GUA["Guaranteed concurrency"]
     TOK -.->|"compare"| LOG["Engine startup log block count"]
@@ -170,6 +201,33 @@ print(capacity(llama3_8b_like, 8, weight_bytes=0.5)["pool_gb"])           # 4-bi
 - **Compare the printed `pool_tokens`** with the block count the engine logs at startup. If they disagree
   by more than ~10%, the workspace estimate is wrong for that engine and model; trust the log.
 
+### Agent scenario: how many research agents fit on that GPU?
+Same 8B GQA model and ~52 GB pool (~396,700 tokens). Each agent has a 6k-token prefix and appends ~1.5k
+tokens per step; runs take 10 steps at p50 and 25 at p95.
+
+| Quantity | Transcript tokens | Agents in flight (fp16 cache) | With fp8 cache |
+|---|---|---|---|
+| Midpoint of a p50 run (averaged over its life) | (6,000 + 19,500) / 2 = 12,750 | ~31 | ~62 |
+| End of a p50 run, step 10 | 6,000 + 9 × 1,500 = 19,500 | ~20 | ~40 |
+| End of a p95 run, step 25 | 6,000 + 24 × 1,500 = 42,000 | ~9 | ~18 |
+
+```python
+def transcript(step, prefix=6000, per_step=1500):
+    return prefix + (step - 1) * per_step
+
+for label, seq in (("mid p50", (6000 + transcript(10)) // 2), ("p50 end", transcript(10)),
+                   ("p95 end", transcript(25))):
+    print(label, seq, capacity(llama3_8b_like, 8, p50_seq=seq)["concurrency_at_p50"],
+          capacity(llama3_8b_like, 8, p50_seq=seq, cache_bytes=1)["concurrency_at_p50"])
+# mid p50 12750 31 62 / p50 end 19500 20 40 / p95 end 42000 9 18
+```
+
+- **Read it as:** the same GPU that holds ~132 chat requests at a 3k p50 holds about 20 agents near the
+  end of a normal run, and `max_model_len` must be at least 42,000 (and within the model's window) for the
+  tail to run at all.
+- **Levers specific to agents:** trim tool results (cuts the 1.5k), lazy-load tool schemas (cuts the
+  prefix), compact history at a step threshold, and cap steps per run.
+
 ### Worked scenario: how far tensor parallelism shrinks a 70B cache
 The 70B-class GQA shape above (80 layers, 8 KV heads, head_dim 128, fp16), per-GPU cache per token as TP
 grows:
@@ -209,6 +267,12 @@ layers).
   utilization and preemption counts per replica.
 - **Quantize the cache before adding GPUs.** Try `--kv-cache-dtype fp8` (vLLM) with a quality eval; it
   roughly doubles token capacity. Monitor eval scores on long-range recall tasks specifically.
+- **Size agent fleets from late-step transcripts.** Log prompt tokens per agent step, take the p50 and
+  p95 at the final step, and size `max_num_seqs` and replica count from those, not from step 1. Monitor
+  prompt tokens by step number and preemptions per replica.
+- **Cap and compact agent context by policy.** Set a maximum step count and a compaction threshold (say,
+  summarize history when the transcript passes a fixed fraction of `max_model_len`) so the tail is bounded
+  by design. Monitor how often runs hit the cap or compact.
 - **Review context-limit requests against the model.** Treat "raise the context window" as a capacity
   change: rerun the estimate at the new p99 and the new guaranteed concurrency before approving. Monitor
   context-length p95 per route after the change.
@@ -222,6 +286,9 @@ layers).
 - **GQA model vs model choice.** A GQA model shrinks the cache several-fold and raises concurrency, but
   constrains model choice; a stronger MHA model may still win when quality per request matters more than
   requests per GPU.
+- **Rich agent context vs agents per GPU.** Keeping every tool result verbatim helps the agent recall
+  details but grows each transcript; compaction and trimming fit two or three times more runs. Flips when
+  task success depends on details from early steps.
 - **`gpu_memory_utilization` toward 1.0 vs headroom.** It enlarges the pool but removes headroom for
   activation spikes and other processes. Dangerous when the GPU is shared or prompts are bursty.
 
@@ -236,6 +303,9 @@ layers).
   count.
 - **Estimating with mean sequence length and promising that concurrency.** Symptom: latency collapse the
   first time a batch of long-context requests arrives together. Fix: promise concurrency at p95/p99 length.
+- **Sizing an agent fleet from its first step.** Symptom: fine at launch, then preemptions and TTFT spikes
+  as runs reach later steps, worst when many runs are long at once. Fix: size on the transcript at the
+  p95 step, and cap steps or compact history.
 - **The standard formula on latent or sliding-window attention.** Symptom: an estimate off by a large
   factor in either direction, because the cache layout is different. Fix: read the architecture and use its
   own cache formula.
@@ -244,6 +314,8 @@ layers).
 - **Do the arithmetic at four moments:** choosing a model and GPU before any code exists; setting
   `max_model_len`, `max_num_seqs` and utilization flags; an OOM or preemption storm in production; and a
   request for a longer context window or a bigger model on the same hardware.
+- **For agents, also redo it** when you add tools (bigger prefix), raise the step cap, or change how much
+  tool output is kept.
 - **Keep the per-token number** for every model you serve in your head or a table; it answers most capacity
   questions in seconds.
 - **Measure** actual cache utilization and preemption counts in production to validate the estimate
@@ -291,23 +363,29 @@ will have higher TPOT because every step reads all 40 caches.
 - **Getting it wrong** makes estimates four or eight times too pessimistic and leads to buying GPUs you do
   not need.
 
-### Production shows preemption storms at only 60% average cache utilization. What is going on?
+### Your agent platform shows preemption storms at only 60% average cache utilization. What is going on?
 - **Averages hide the tail.** Admission was sized on mean length, and bursts of long-context requests
-  arrive together and exhaust the pool.
+  (several agent runs reaching late steps together) arrive together and exhaust the pool.
 - **Check** p95/p99 of prompt + output and the preemption counter over time, not the mean.
 - **Fix:** cap context per route, lower the concurrency cap, quantize the cache, or split long-context
   traffic onto its own replicas.
 
-### When does adding tensor parallelism stop helping cache capacity?
-- **When *T* exceeds the KV-head count.** With 8 KV heads, TP 16 replicates heads, so per-GPU cache per
-  token stays at the TP 8 value.
-- **And *T* must divide the head counts,** so 3 or 6 GPUs are not valid degrees; real steps are 2, 4, 8.
+### How many concurrent agent runs can one replica hold, and how do you estimate it?
+- **Model the transcript:** prefix (system prompt plus tool schemas) plus steps × tokens appended per
+  step, at the p50 and p95 step counts. With a 6k prefix and 1.5k per step, a 10-step run ends near 19.5k
+  tokens.
+- **Divide the pool:** ~396,700 tokens on the 8B example gives ~20 runs at their final step and ~9 at a
+  25-step tail; an fp8 cache roughly doubles both.
+- **Then bound the tail** with a step cap and history compaction rather than buying for the worst run.
 
-### When would you not trust the standard formula?
+### When would you not trust the standard formula, and when does adding tensor parallelism stop helping?
 - **Latent attention** caches one compressed vector per layer (DeepSeek-V3 is ~70 KB per token in bf16), so
   the MHA formula is far too high.
 - **Sliding-window layers** cap at *W* tokens, so the cost per token falls with length, but only if the
   engine frees out-of-window blocks. In both cases read the architecture and the startup log.
+- **TP stops shrinking the cache when *T* exceeds the KV-head count.** With 8 KV heads, TP 16 replicates
+  heads, so per-GPU cache per token stays at the TP 8 value; *T* must divide the head counts, so 3 or 6
+  GPUs are not valid degrees; real steps are 2, 4, 8.
 
 ## Quiz
 ### Q: Which model-config fields do you need to compute KV-cache bytes per token?

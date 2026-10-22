@@ -5,7 +5,8 @@ name: Caching strategy & cache invalidation
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/caching
   - prompting/prompt-caching
@@ -22,16 +23,30 @@ sources:
 ---
 
 ## TL;DR
-Model calls are the slowest, costliest step, and their input largely repeats. Cache at several layers
-(prefix, exact, semantic, embedding, retrieval), each with its own key and way of going stale. The key
-is the design: what must match for a result to stay correct.
+Agents re-send the same prefix and repeat tool calls every step. Cache at several layers (prefix, exact,
+semantic, embedding, tool results), each with its own key and staleness. The key is the design: what must
+match for a result to stay correct.
+
+## For agent builders
+- **Why it matters for agents.** Every step re-sends system prompt, tool schemas and a growing transcript,
+  so prefix caching decides whether a 20-step run costs a few prefixes or twenty. Tool results (a lookup,
+  a search) repeat within and across runs, and caching them cuts latency per step.
+- **Where it shows up in your stack.** Provider prompt caching (`cache_control` on Anthropic, automatic on
+  OpenAI) and vLLM prefix caching for the transcript; Redis for exact and tool-result caches; LangChain's
+  global LLM cache (`set_llm_cache`) for simple exact caching; your vector store for semantic caches.
+- **What you control.** A static-first, append-only prompt layout, which tools are safe to cache (reads,
+  never writes) and their TTLs, what goes in every key (tool schema version, tenant), and whether
+  semantic caching is allowed at all for context-dependent agent turns.
+- **What you can skip.** Semantic caching of agent steps in most designs: a step's correct output depends on
+  the whole transcript, so near-duplicate queries are rarely safe hits. Spend the effort on prefix and
+  tool-result caching first.
 
 ## Why it exists
 - **Hits are nearly free; misses are not.** A hit returns in milliseconds and costs almost nothing; a miss
   takes seconds and bills every token.
 - **Prompts are mostly repeated content.** A system prompt, tool definitions, few-shot examples and
-  retrieved documents can be thousands of tokens identical for every user of a feature. Caching is the
-  biggest lever on cost and latency after model choice.
+  retrieved documents can be thousands of tokens identical for every user of a feature, and for every step
+  of an agent run. Caching is the biggest lever on cost and latency after model choice.
 - **"Hash the prompt and cache the response" fails in AI-specific ways:**
   - Outputs are sampled, so caching only makes sense when you want the same answer, and the key must
     include the sampling parameters.
@@ -63,6 +78,8 @@ is the design: what must match for a result to stay correct.
   it, because each cached key and value depends on all earlier positions.
 - **Layout rule:** static content first (system prompt, tools, few-shot, long documents), dynamic content
   last, stable ordering, and never a timestamp or the user's name near the top.
+- **Agent rule:** keep the transcript append-only. Rewriting or trimming earlier turns, or reordering tool
+  schemas between steps, breaks the prefix from that point; compact deliberately at a boundary instead.
 - **Pricing (vendor- and model-specific, and it changes):** cached input tokens bill at a lower rate with
   short time-to-live windows; some providers charge a premium for the cache *write*; most enforce a
   minimum cacheable prefix of roughly a thousand tokens or more, so a short system prompt alone may never
@@ -77,8 +94,8 @@ is the design: what must match for a result to stay correct.
 - **Value** = the response plus its usage.
 - **Only for deterministic intent:** temperature 0, or a product that accepts identical answers to
   identical requests.
-- **Hit rates:** low in open-ended chat; high in form-like, classification and extraction features, where
-  identical inputs recur.
+- **Hit rates:** low in open-ended chat and mid-run agent steps; high in form-like, classification and
+  extraction features (and agent sub-steps like those), where identical inputs recur.
 
 ### Layer 3: semantic cache
 1. Embed the query.
@@ -90,6 +107,8 @@ is the design: what must match for a result to stay correct.
 - **Mitigations:** a high threshold; scope keys; excluding or entity-keying queries with numbers, dates,
   names or negations; a cheap verifier on borderline hits ("does this cached answer address this
   query?"); a sampled false-hit audit.
+- **Agents:** use it, if at all, on the first user turn of FAQ-like traffic, never on a mid-run step whose
+  correct output depends on earlier tool results.
 - **Economics:**
 
 ```
@@ -101,7 +120,7 @@ The last two terms are what people forget.
 ### Layer 4: embedding cache
 - **Key** = hash of embedding model id plus normalised text.
 - **Cheap and high-value** in ingestion (unchanged chunks are not re-embedded on re-index) and for repeated
-  queries.
+  queries, including an agent's repeated retrieval and memory lookups.
 - **A new embedding model invalidates everything,** which is fine *because* you must re-embed the whole
   index anyway; version the index.
 
@@ -110,6 +129,10 @@ The last two terms are what people forget.
 - **External tool results** with a TTL set by data volatility (exchange rates seconds, a product catalogue
   hours).
 - **Memoised agent steps** keyed by tool name and arguments.
+- **Only read-only tools.** A cached `send_email` or `create_ticket` is a skipped side effect, not a
+  saving; writes need idempotency keys instead, which is a different mechanism.
+- **Include the tool's schema or implementation version and the caller's scope** in the key, because the
+  same arguments under a new tool version, or for another tenant, can mean a different result.
 
 ### Read and write patterns
 | Pattern | How | Trade-off |
@@ -138,7 +161,7 @@ The last two terms are what people forget.
 4. **Scope isolation.** Tenant and user in the key wherever the prompt carries private context; a shared
    cache across trust boundaries is a leak, not an optimisation.
 5. **Do not cache failures.** Errors, refusals, truncated streams and low-judge-score answers are not
-   cached, or an outage gets remembered after it ends.
+   cached, or an outage gets remembered after it ends. The same goes for failed tool calls.
 6. **Stampede control.** Single-flight locking or request coalescing on popular keys, so a thousand
    simultaneous misses produce one model call.
 
@@ -146,6 +169,7 @@ The last two terms are what people forget.
 - **Prefix caching:** in the provider or engine.
 - **Exact and semantic caches:** in a gateway (convenient but context-blind) or in the application (knows
   tenants and document versions; usually the better place).
+- **Tool-result caches:** in the tool layer of the agent, where read/write and TTL are known.
 - **Observe per layer:** hit rate, cost saved and latency saved, sampled false-hit rate, and the age of
   served entries.
 
@@ -169,6 +193,54 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: prompt caching across a 10-step agent run
+Illustrative: a 10k-token static prefix (system prompt plus tool schemas), ~2k tokens appended per step,
+$3 per 1M input tokens. Cache multipliers follow Anthropic's published pricing for its short-lived cache
+at the time of writing (write 1.25×, read 0.1× the base input price); check current docs. Assumes every
+step lands inside the cache TTL.
+
+| Strategy | Input billed (base-price equivalent) | Cost per run |
+|---|---|---|
+| No caching | 10 × 10k + 2k × (0 + 1 + … + 9) = 190k | ~$0.57 |
+| Cache only the static prefix | 12.5k write + 9 × 1k reads + 90k uncached transcript = 111.5k | ~$0.33 |
+| Cache breakpoint at the end of each step (append-only) | 12.5k + 16.2k reads + 9 × 2.5k writes = 51.2k | ~$0.15 |
+
+- **Lesson:** an append-only transcript with a moving cache point cuts this run's input cost about 3.7×;
+  any edit to earlier turns throws that away from the edit onward.
+
+### Tool-result cache for read-only agent tools
+Read-only tools declare a TTL; write tools are never cached. The key carries tool name, tool version,
+tenant and canonical arguments; failures are not stored.
+
+```python
+import functools, hashlib, json, redis
+r = redis.Redis()
+
+def cached_tool(name, version, ttl_s, read_only=True):
+    def wrap(fn):
+        if not read_only:
+            return fn                                   # writes are never cached: use idempotency keys
+        @functools.wraps(fn)
+        def inner(tenant, **args):
+            raw = json.dumps({"t": name, "v": version, "tenant": tenant, "a": args},
+                             sort_keys=True, separators=(",", ":"))
+            k = "tool:" + hashlib.sha256(raw.encode()).hexdigest()
+            if (hit := r.get(k)) is not None:
+                return json.loads(hit) | {"_cache": "hit"}
+            out = fn(tenant, **args)
+            if out.get("ok"):                           # never cache a failed tool call
+                r.set(k, json.dumps(out), ex=ttl_s)
+            return out
+        return inner
+    return wrap
+
+@cached_tool("get_exchange_rate", version="v2", ttl_s=30)        # volatile data: seconds
+def get_exchange_rate(tenant, base, quote): ...
+
+@cached_tool("search_catalogue", version="v5", ttl_s=4 * 3600)   # catalogue: hours
+def search_catalogue(tenant, query, limit=10): ...
+```
+
 ### Exact-match cache in Redis
 Versioned, tenant-scoped keys, single-flight on misses, a rule against caching partial or refused answers,
 and a reverse index so the ingestion pipeline can purge every cached answer that used a changed document.
@@ -282,13 +354,18 @@ for threshold, hit, false_hit in ((0.97, 0.30, 0.003), (0.92, 0.45, 0.012)):
 | 0.92 (loose) | 45% | 1.2% | −$156: more hits, but wrong answers cost more than the tokens saved |
 
 ## Production patterns
-- **Static-first prompts with explicit cache points.** Put system prompt, tools and long documents first;
-  on Anthropic mark the end of the static part with `cache_control: {"type": "ephemeral"}`, while OpenAI
-  caches long shared prefixes automatically. Monitor `cache_read_input_tokens` (Anthropic) or
-  `prompt_tokens_details.cached_tokens` (OpenAI) as a share of input after every prompt change.
+- **Static-first, append-only agent prompts with explicit cache points.** Put system prompt, tools and long
+  documents first and only append tool calls and results; on Anthropic mark the end of the static part
+  (and optionally the latest turn) with `cache_control: {"type": "ephemeral"}`, while OpenAI caches long
+  shared prefixes automatically. Monitor `cache_read_input_tokens` (Anthropic) or
+  `prompt_tokens_details.cached_tokens` (OpenAI) as a share of input per agent step.
 - **Prefix caching on self-hosted engines.** Turn on vLLM's automatic prefix caching (the
   `enable_prefix_caching` engine option; recent releases enable it by default) and keep shared prefixes
-  byte-identical across requests. Monitor the engine's prefix-cache hit rate and time to first token.
+  byte-identical across requests and steps. Monitor the engine's prefix-cache hit rate and time to first
+  token.
+- **TTL-tagged read-only tool cache.** Declare per tool whether it is read-only and how volatile its data
+  is, cache only reads, and include tool version and tenant in the key. Monitor tool-cache hit rate, the
+  age of served results and any incident traced to a stale tool result.
 - **Version bump plus warm-up replay.** Put every dependency version in the key, and after a deploy replay
   the most frequent recent queries against the new version before shifting traffic. Monitor hit rate in
   the first hour after deploy and p95 latency during the cold window.
@@ -297,21 +374,20 @@ for threshold, hit, false_hit in ((0.97, 0.30, 0.003), (0.92, 0.45, 0.012)):
   purge counts per erasure request and any hit whose source document no longer exists.
 - **Sampled false-hit audit.** Send a small share of semantic hits (say 1%) to a judge or reviewer that
   asks whether the cached answer addresses the new query. Monitor false-hit rate per threshold and per
-  feature, and tighten the threshold when it rises.
-- **Jittered TTLs per data class.** Set TTL by volatility (seconds for prices, hours for catalogue data)
-  and add random jitter (for example up to 10% of the TTL) so popular keys do not expire together. Monitor
-  latency and cost spikes at TTL multiples and the age of served entries.
+  feature, and tighten the threshold when it rises. Jitter TTLs (for example up to 10% of the TTL) so
+  popular keys do not expire together.
 
 ## Trade-offs
 - **Hit rate vs false hits.** Looser keys and lower similarity thresholds raise both together; the right
   point depends on what a wrong answer costs, which differs between an FAQ bot and a billing assistant.
 - **Savings vs staleness.** Longer TTLs save more and serve staler data; acceptable with event-driven purge
-  for the content that matters, dangerous when TTL is the only invalidation you have.
+  for the content that matters, dangerous when TTL is the only invalidation you have. For agent tools, a
+  stale result can drive a wrong action, not just a wrong sentence.
 - **Simple versioning vs cold starts.** Versioned keys are simple and safe but every deploy cold-starts the
   cache; when the cache is what meets the latency SLO, add a warm-up replay or a brief dual-version window.
-- **Prefix hits vs layout freedom.** Prefix caching needs a static-first layout, which constrains where
-  personalisation can go; it flips only in the rare design where per-user content must precede the shared
-  instructions.
+- **Prefix hits vs layout freedom.** Prefix caching needs a static-first, append-only layout, which
+  constrains where personalisation can go and how you compact history; it flips only in the rare design
+  where per-user content must precede the shared instructions.
 - **Global vs per-tenant cache.** A global cache maximises hits and is a leak surface; a per-tenant cache is
   safer with a lower hit rate. The trust boundary, not the hit rate, decides.
 - **Precise purge vs cheap TTL.** Event-driven purge is precise but requires dependency tracking storage and
@@ -322,6 +398,10 @@ for threshold, hit, false_hit in ((0.97, 0.30, 0.003), (0.92, 0.45, 0.012)):
   security incident rather than a bug.
 - **Dynamic content at the top of the prompt.** Symptom: cached-token share near zero while prompt caching
   is "enabled" and the bill is unchanged.
+- **Editing agent history every step.** Symptom: cached-token share collapses after step 1 because a
+  summariser rewrites earlier turns or tool schemas are re-sorted. Fix: append-only, compact at a boundary.
+- **Caching a write tool.** Symptom: the agent reports "refund issued" from cache while nothing happened.
+  Fix: cache reads only; give writes idempotency keys.
 - **Semantic false hits.** Symptom: confident wrong answers whose logs show a high-similarity hit on a
   question that differed by a negation or a number.
 - **Model or prompt version missing from the key.** Symptom: half of users see the old behaviour for hours
@@ -335,11 +415,13 @@ for threshold, hit, false_hit in ((0.97, 0.30, 0.003), (0.92, 0.45, 0.012)):
   that the index honoured and the cache did not.
 
 ## When to use
-- **Prefix caching:** always worth having; mostly a matter of prompt layout.
+- **Prefix caching:** always worth having, and the first lever for any agent; mostly a matter of prompt
+  layout.
 - **Exact response cache:** pays off for form-like, classification and extraction traffic with
   deterministic settings.
+- **Tool-result cache:** for read-only tools whose data volatility you can state as a TTL.
 - **Semantic cache:** suits high-volume FAQ-like traffic where a measured false-hit rate is tolerable;
-  avoid it for personalised or transactional queries.
+  avoid it for personalised or transactional queries and mid-run agent steps.
 - **Embedding cache:** belongs in every ingestion pipeline.
 - **Measure:** hit rate per layer, cost and latency saved, sampled false-hit rate and the age of served
   entries; treat erasure requests as a cache concern.
@@ -376,11 +458,19 @@ see what the answer was based on.
 - **Prompt template, index and embedding versions, plus tenant or user scope** whenever the prompt carries
   private context, so a deploy cold-starts the cache and no answer crosses a trust boundary.
 
-### Prompt caching is enabled but the bill did not change. How do you debug it?
-- **Read the cached-token share** in usage reports, such as `cache_read_input_tokens` on Anthropic or
-  `prompt_tokens_details.cached_tokens` on OpenAI.
-- **If it is near zero, look at the top of the prompt:** a timestamp, the user's name or unstable ordering
-  changes the prefix, invalidating everything after it.
+### Your agent's cost per run grows with every step. Which caches do you reach for, in what order?
+- **Prefix caching first:** static system prompt and tool schemas at the top, an append-only transcript and
+  a moving cache point; in the illustrative 10-step run that cuts input cost about 3.7×.
+- **Then read-only tool results** with TTLs set by volatility, keyed by tool, version, tenant and arguments.
+- **Not semantic caching of steps,** because a step's correct output depends on the whole transcript; and
+  never cache write tools.
+
+### Prompt caching is enabled for your agent but the bill did not change. How do you debug it?
+- **Read the cached-token share** in usage reports per step, such as `cache_read_input_tokens` on Anthropic
+  or `prompt_tokens_details.cached_tokens` on OpenAI.
+- **If it is near zero, look at the top of the prompt and the history:** a timestamp, the user's name,
+  unstable tool ordering or a summariser rewriting earlier turns changes the prefix, invalidating
+  everything after it.
 - **Check the minimum cacheable prefix:** most providers need roughly a thousand tokens or more, so a short
   system prompt alone may never cache.
 

@@ -5,7 +5,8 @@ name: Offline vs online evaluation
 kind: decision
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/a-b-testing
   - evals/golden-dataset
@@ -20,9 +21,23 @@ sources:
 ---
 
 ## TL;DR
-Offline evaluation scores a fixed dataset before users see a change; online evaluation measures live
-traffic. Offline is fast and safe but proxy-bound; online is outcome truth but slow and noisy. Offline
-gates releases, online validates offline, traces refill it.
+Offline evaluation replays a fixed task set against your agent before users see a change; online
+evaluation measures live traffic. Offline is fast and safe but proxy-bound; online is outcome truth but
+slow and noisy. Offline gates, online validates, traces refill it.
+
+## For agent builders
+- **Why it matters for agents.** Agent quality is an outcome (ticket resolved, order placed, PR merged)
+  reached over many steps and turns, and offline replay with stubbed tools never fully matches
+  production's latencies, index freshness and user follow-ups. You need both rungs and a measured link
+  between them.
+- **Where it shows up in your stack.** Offline experiments over datasets in LangSmith, Braintrust or
+  your own harness; online, trace logging with sampled judging, task-completion events keyed by
+  conversation ID, shadow runs, canary rollouts and feature-flagged A/B splits.
+- **What you control.** Which rungs a change must climb, the primary outcome event, how side-effecting
+  tools behave in shadow (dry-run, never real), the trace sample that refreshes the golden set, and the
+  launch log that tracks offline-online agreement.
+- **What you can skip.** Building a full experimentation platform up front. A launch log, a trace
+  sampler and one outcome event get most of the value.
 
 ## Why it exists
 Offline scores and real outcomes drift apart for four structural reasons:
@@ -73,6 +88,9 @@ Online signal types:
    - *Gives* the real input distribution without user risk, *because* nobody sees the candidate.
    - *Cannot* measure, for the same reason: user reaction, latency under real load, or multi-turn effects
      where the user's next message depends on the candidate's reply.
+   - *Agents need dry-run tools:* a shadow agent must never really refund, email or write. Route its
+     side-effecting tools to recorders that return a plausible stub, and let read-only tools hit
+     production. Compare the intended writes, not only the text.
 4. **Canary** (a small percentage of users): guardrail metrics (error rate, latency, cost, refusal rate,
    safety flags) with automatic rollback. It catches catastrophes, not quality: a few percent watched for
    hours or a day collects far too few conversations to detect a modest quality change.
@@ -142,8 +160,43 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: shadow-running a candidate agent with dry-run write tools
+The candidate sees the same live request as production. Read tools are shared; write tools are swapped
+for recorders, so the comparison covers intended actions without any real side effect.
+
+```python
+import asyncio, json, logging
+
+log = logging.getLogger("shadow")
+WRITE_TOOLS = {"issue_refund", "send_email", "update_address"}     # side effects: never real in shadow
+
+def dry_run_tools(tools: dict, recorded: list) -> dict:
+    def recorder(name):
+        def fake(**args):
+            recorded.append({"tool": name, "args": args})
+            return {"status": "ok", "dry_run": True}            # plausible stub so the loop continues
+        return fake
+    return {n: (recorder(n) if n in WRITE_TOOLS else fn) for n, fn in tools.items()}
+
+async def shadow(request_id: str, msg: str, candidate, tools: dict, prod_actions: list):
+    intended = []
+    try:
+        out = await asyncio.wait_for(candidate(msg, dry_run_tools(tools, intended)), timeout=60)
+        log.info(json.dumps({"request_id": request_id, "text": out["text"],
+                             "intended_writes": intended, "prod_writes": prod_actions}))
+    except Exception as e:                                       # shadow must never affect the user
+        log.warning(json.dumps({"request_id": request_id, "error": repr(e)}))
+
+# In the handler, after production has answered:
+#   asyncio.create_task(shadow(req_id, msg, candidate_agent, TOOLS, prod_trace_writes))
+# A pairwise judge compares texts later; intended_writes vs prod_writes is compared exactly.
+```
+
+- **Read the action diff first:** a candidate that intends a refund where production did not is a
+  policy question no text judge will surface.
+
 ### Worked scenario: offline win, online flat
-Illustrative numbers for a support assistant, chosen to show the failure mode rather than to report any
+Illustrative numbers for a support agent, chosen to show the failure mode rather than to report any
 real system.
 
 | Rung | v1 | v2 | Reading |
@@ -203,8 +256,9 @@ print(n_per_arm(0.60, 0.03), n_per_arm(0.60, 0.01))   # 4126 37511: ~4,000 and ~
 
 ## Production patterns
 - **Shadow traffic mirroring.** Duplicate live requests to the candidate asynchronously, never return its
-  output, and log both responses under the same request ID for a pairwise judge. Monitor shadow
-  preference, candidate latency and cost per request.
+  output, and log both responses under the same request ID for a pairwise judge. For agents, swap write
+  tools for dry-run recorders and log intended actions. Monitor shadow preference, action disagreement,
+  candidate latency and cost per request.
 - **Canary with automatic rollback.** Route a few percent of traffic to the new version and roll back
   automatically when error rate, p95 latency, cost per conversation or refusal rate crosses a threshold.
   Monitor these in short windows; do not read quality from the canary.
@@ -238,6 +292,8 @@ print(n_per_arm(0.60, 0.03), n_per_arm(0.60, 0.01))   # 4126 37511: ~4,000 and ~
 ## Pitfalls
 - **Shipping on an offline gain without online confirmation.** Symptom: higher dashboard scores and
   higher cost or escalation in the field, as in the example. Fix: climb the ladder.
+- **A shadow agent with live write tools.** Symptom: customers receive two emails or a duplicate refund
+  the week shadow mode starts. Fix: dry-run every side-effecting tool in shadow and test that wrapper.
 - **Reading shadow preference as user preference.** Symptom: a candidate that "wins" shadow and loses the
   A/B because its replies are slower or longer. Fix: treat shadow as a distribution check.
 - **Implicit signals as the primary metric.** Symptom: optimising thumbs-up from the vocal few while the
@@ -290,6 +346,14 @@ calls the candidate flat, the evaluation stack is consistent again and the next 
 - **Together:** offline gates what ships, online checks offline measured the right thing, and production
   traces refresh the offline set.
 
+### How would you shadow-test a new version of an agent that can issue refunds and send emails?
+- **Dry-run the write tools:** replace side-effecting tools with recorders that return a stub, keep
+  read-only tools live, and run the candidate asynchronously off the request path.
+- **Compare actions, then text:** diff intended writes against production's actual writes per request ID,
+  then run a pairwise judge on the replies.
+- **Know the limit:** a stubbed result can differ from what the real tool returns, so later steps may
+  diverge; the canary and A/B rungs cover that.
+
 ### What can shadow mode not tell you?
 - **User reaction:** nobody sees the candidate, so there are no thumbs, escalations or retries.
 - **Multi-turn effects:** the user's next message responds to production's reply, not the candidate's.
@@ -302,7 +366,7 @@ calls the candidate flat, the evaluation stack is consistent again and the next 
   rollback.
 - **Quality needs an A/B test** sized in advance for the primary metric.
 
-### Your product gets 2,000 conversations a week. How do you evaluate a prompt change?
+### Your support agent gets 2,000 conversations a week. How do you evaluate a prompt change?
 - **A/B is mostly out of reach:** a 3-point change on a 60% rate needs roughly 4,000 per arm, about a
   month of all traffic.
 - **Lean on the lower rungs:** offline golden set with intervals, shadow mode on live inputs, a canary

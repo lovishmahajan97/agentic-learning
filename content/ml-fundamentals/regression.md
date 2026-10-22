@@ -5,7 +5,8 @@ name: Regression
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/loss-functions
@@ -21,13 +22,26 @@ sources:
 ---
 
 ## TL;DR
-Regression predicts a continuous quantity (latency, cost, a quality score). Choosing squared versus
-absolute error chooses mean versus median and how much outliers steer the fit. It powers reward models,
-cost predictors and judge scores, and fails through extrapolation, leverage and leakage.
+Agents need numbers before they act: predicted run cost, step count, latency, a reward or judge score.
+Regression predicts them, and squared versus absolute versus quantile loss decides whether you get the
+mean, median or tail your budget needs.
+
+## For agent builders
+- **Why it matters for agents.** Agent runs are heavy-tailed: most finish in a few steps and cents, a few
+  loop for dozens of steps and dollars. Budgets, timeouts, model-tier routing and capacity plans all rest
+  on a predicted quantity, and the loss you fit decides whether that prediction is the average, the
+  typical run or the tail.
+- **Where it shows up in your stack.** Cost and latency predictors that pick a model tier before a run,
+  step and token budgets, reward models (an LLM with a scalar head) used in preference tuning, LLM-judge
+  1–5 scores, and token-usage forecasts for capacity.
+- **What you control.** The target transform (log cost), the loss (mean, median or quantile), the feature
+  contract (only what exists before the run starts) and the baseline you must beat.
+- **What you can skip.** The normal-equation algebra and ridge derivations. Know which statistic each
+  loss estimates, why log targets need a bias correction, and how leakage sneaks in.
 
 ## Why it exists
-- **Some questions are "how much", not "which".** How long will this request take, what will this month's
-  token bill be, how good is this response on a scale.
+- **Some questions are "how much", not "which".** How long will this request take, how many steps will
+  this agent run need, what will this month's token bill be, how good is this response on a scale.
 - **Bucketing and classifying throws away order and resolution.** A prediction of "200–500 ms" cannot be
   summed into a capacity plan, and a value just over a bucket edge is treated as a different category from
   one just under it.
@@ -70,7 +84,7 @@ On latencies of 100, 110, 120 and 2,000 ms, MSE wants about 583 ms and MAE anyth
 | **Quantile (pinball)** | a chosen quantile | for a p95 latency target, fit the 0.95 quantile directly rather than predicting the mean and guessing the tail |
 | **MSE on log y** | the geometric mean | for positive, multiplicative quantities (costs, latencies, durations); penalises relative rather than absolute error; evaluate on the original scale |
 
-### Fitting
+### Background: fitting
 - **Closed form for linear + MSE:** the normal equation w = (XᵀX)⁻¹Xᵀy, costing roughly O(d³) in the
   number of features plus O(nd²) to build XᵀX.
 - **Gradient descent** for non-linear models, huge n or huge d.
@@ -78,7 +92,7 @@ On latencies of 100, 110, 120 and 2,000 ms, MSE wants about 583 ms and MAE anyth
   number of XᵀX governs convergence, so standardising features is the first step, not an afterthought
   (see the gradient-descent lesson).
 
-### Regularisation
+### Background: regularisation
 | Penalty | Effect | Note |
 |---|---|---|
 | Ridge, λ\|\|w\|\|² | shrinks coefficients, stabilises collinear fits | closed form (XᵀX + λI)⁻¹Xᵀy |
@@ -100,12 +114,13 @@ On latencies of 100, 110, 120 and 2,000 ms, MSE wants about 583 ms and MAE anyth
 - **Look at the residuals:** a fan shape means the noise grows with the prediction; a curve means the
   model is missing a non-linearity.
 
-### Where it meets AI engineering
+### Where it meets agents
 - **Reward models** output a scalar trained from preference pairs.
-- **LLM judges** emit 1–5 scores that are ordinal rather than truly continuous.
-- **Latency and cost predictors** drive routing between model tiers.
-- **Value functions** in reinforcement learning are regressors.
-- **Token-usage forecasts** feed capacity planning.
+- **LLM judges** emit 1–5 scores that are ordinal rather than truly continuous, so treat them with care.
+- **Latency and cost predictors** drive routing between model tiers before an agent run starts.
+- **Step and time budgets** are tail quantiles of run length, not means.
+- **Value functions** in reinforcement learning are regressors; agent RL on task success uses them.
+- **Token-usage forecasts** feed capacity planning for agent fleets.
 
 ## Diagram
 The loss you pick decides which statistic of y the model learns; follow the question you need answered.
@@ -126,6 +141,43 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: setting a step budget from run logs
+An agent fleet logs steps per completed run (illustrative distribution over 10,000 runs): median 6,
+mean 9.7, p95 22, and a long tail of runs that looped on a failing tool.
+
+| Budget set from | max steps | Runs cut off | What it means |
+|---|---|---|---|
+| Mean | 10 | roughly a third | many legitimate long tasks killed |
+| Median | 6 | about half | half of all users see a truncated answer |
+| p95 (pinball loss at 0.95, or the empirical quantile) | 22 | about 5% | only the tail is stopped, mostly loops |
+
+Fit the tail per task type with a quantile model on request-time features, so a "summarise one file"
+task gets a small budget and a "refactor this repo" task a large one.
+
+### Agent scenario: predicting run cost on a log scale
+Run cost is multiplicative in the number of tools offered, so fit log(cost), then correct the
+back-transformed total, which is biased low.
+
+```python
+import math, random
+random.seed(0)
+runs = []                                         # (tools offered, dollar cost), synthetic
+for _ in range(4000):
+    tools = random.randint(1, 11)
+    runs.append((tools, math.exp(-4 + 0.25 * tools + random.gauss(0, 0.8))))
+
+xs = [t for t, _ in runs]; ys = [math.log(c) for _, c in runs]
+mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+b = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sum((x - mx) ** 2 for x in xs)
+a = my - b * mx                                   # least squares on log(cost)
+smear = sum(math.exp(y - (a + b * x)) for x, y in zip(xs, ys)) / len(xs)   # bias correction factor
+
+actual = sum(c for _, c in runs)
+naive = sum(math.exp(a + b * x) for x in xs)
+print(f"actual ${actual:.0f}  naive ${naive:.0f}  corrected ${naive * smear:.0f}")
+# actual $598  naive $436  corrected $595: without the correction the budget runs ~27% low
+```
+
 ### Latency model: closed form vs gradient descent
 A latency model from serving logs, fitted two ways. The closed form recovers the generating
 coefficients directly; gradient descent recovers them too, but only after the features are scaled,
@@ -184,9 +236,13 @@ print("pinball q=0.95 picks", best(lambda c: pinball(c, 0.95)))  # 2000.0, the t
 | Pinball, q = 0.95 | 2,000 ms | "what latency must the SLO tolerate?" (with four points the tail is a single request) |
 
 ## Production patterns
+- **Budget agent runs from tail quantiles.** Set max steps, token budgets and wall-clock timeouts per task
+  type from the p95 or p99 of logged runs (a quantile model or the empirical quantile), not the mean.
+  Monitor the share of runs hitting the budget and read a sample of them: loops should dominate.
 - **Ship a naive baseline first.** Before any model, log the error of "predict last week's mean" per
   segment. Every candidate must beat it on MAE and RMSE; monitor the gap over time, because drift often
-  erases it.
+  erases it. Report error by model tier, prompt-length bucket, task type and customer, not just overall,
+  because routing and capacity decisions fail in specific segments.
 - **Quantile models for SLOs.** Fit the tail directly, for example scikit-learn
   `GradientBoostingRegressor(loss="quantile", alpha=0.95)`, or `QuantileRegressor` for a linear model.
   Monitor empirical coverage: about 95% of real latencies should fall under the predicted p95.
@@ -197,8 +253,6 @@ print("pinball q=0.95 picks", best(lambda c: pinball(c, 0.95)))  # 2000.0, the t
 - **Request-time feature contract.** Keep a list of features available before the request runs (prompt
   length, tier, tool flags) and fail the training job if any other feature appears. Monitor the
   offline-vs-online error gap, which is the signature of leakage.
-- **Per-segment error dashboards.** Report error by model tier, prompt-length bucket and customer, not
-  just overall, because routing and capacity decisions fail in specific segments.
 
 ## Trade-offs
 - **MSE vs robust losses.** MSE is smooth and estimates the mean, which is what you want when predictions
@@ -222,15 +276,19 @@ print("pinball q=0.95 picks", best(lambda c: pinball(c, 0.95)))  # 2000.0, the t
 - **Optimising MSE and then reporting MAPE or median error.** Symptom: metrics that disagree and a model
   tuned for a quantity nobody reads.
 - **Averaging ordinal judge scores as if 1–5 were a ratio scale.** Symptom: "quality went from 3.2 to 3.4"
-  claims with no idea whether that gap means anything.
+  claims with no idea whether that gap means anything. For agent evals, report pass rates against a
+  rubric threshold or pairwise win rates, and check judge agreement with humans.
 - **Ignoring heteroscedastic noise.** Symptom: a residual plot that fans out and prediction intervals that
   are far too narrow for large requests.
+- **Budgeting agent runs on the mean.** Symptom: a max-steps limit set at the average run length cuts off
+  a large share of legitimate long tasks. Budget from a tail quantile per task type instead.
 - **Collinear features.** Symptom: coefficients that flip sign between retrains while predictions barely
   change, which destroys any story told about feature importance.
 
 ## When to use
 - **Use when** the output is a quantity and the size of the error matters. Day to day it appears in
-  latency and cost predictors for routing, in reward and judge heads, and in usage forecasting.
+  latency and cost predictors for routing, agent step and token budgets, reward and judge heads, and
+  usage forecasting.
 - **Avoid when** the quantity is a probability of an event in disguise (classify, then take an expected
   value), or when you need the whole distribution rather than a point (quantile regression or a
   probabilistic model).
@@ -286,11 +344,20 @@ pays off.
 - **Predictions may be fine,** but any feature-importance story is not.
 - **Fix:** ridge regularisation chosen by cross-validation, or drop or combine the correlated features.
 
-### How would you predict p95 latency per request for autoscaling?
+### How would you set per-run step and time budgets for an agent from logs?
 - **Quantile loss at 0.95,** for example gradient-boosted trees with a quantile objective, using only
-  request-time features.
-- **Do not** add 1.645 residual standard deviations to a mean model; latency residuals are skewed.
-- **Monitor coverage:** about 95% of observed latencies should fall below the prediction, per segment.
+  request-time features (task type, prompt length, tools offered), or the empirical p95 per task type.
+- **Do not** add 1.645 residual standard deviations to a mean model; run lengths and latency residuals
+  are skewed.
+- **Monitor coverage:** about 95% of completed runs should fall below the budget, per segment, and the
+  runs that hit it should mostly be loops.
+
+### You route agent requests to a cheap or expensive model using a predicted cost. How do you build and judge it?
+- **Target:** log(cost) with request-time features only, since output length and step count are unknown
+  before the run.
+- **Correct the back-transform:** summed predictions on the dollar scale run low without a bias factor.
+- **Judge the decision, not the R²:** the share of truly expensive runs sent to the right tier and the
+  cheap traffic misrouted, broken out for the tail.
 
 ## Quiz
 ### Q: Which statement about MSE versus MAE is correct?

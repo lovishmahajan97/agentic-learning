@@ -5,7 +5,8 @@ name: Error analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -22,34 +23,50 @@ sources:
 ---
 
 ## TL;DR
-Error analysis means reading real traces one at a time, noting what went wrong, grouping the notes into
-a failure taxonomy and counting. A score says *that* the system fails; the counts say *why*, *where*
-and which fix buys the most.
+Error analysis means reading agent traces one at a time, noting the first wrong step, grouping notes
+into a failure taxonomy and counting. A score says *that* the agent fails; the counts say *why*, where,
+and which fix buys most.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a chain of planning, tool calls, tool results and a
+  final answer. A wrong final answer can start at any step, so without reading trajectories you patch
+  the system prompt for a failure that was really a bad tool description or a stale data source.
+- **Where it shows up in your stack.** Trace viewers and annotation queues in LangSmith or Langfuse, a
+  sheet exported from your own OpenTelemetry spans, and the flip-diff between two eval-harness runs.
+  The output feeds golden items, graders and CI gates.
+- **What you control.** Which traces get sampled (random plus stratified by tool, route or step count),
+  the stage-prefixed failure codes, the first-failure rule, who annotates, and which stable categories
+  become graders.
+- **What you can skip.** Fancy clustering tooling and inter-annotator statistics on round one. One
+  domain expert, a notes column and an hour of reading move the roadmap more than any dashboard.
 
 ## Why it exists
-- **A pass rate is a summary, and a summary cannot be fixed.** A support assistant scores 71% on the
-  golden set; the product owner asks for 90%. The engineer patches one failure remembered from last
-  week's demo and re-runs: 72%. Nobody knows whether that failure was 1% of failures or 40%.
+- **A pass rate is a summary, and a summary cannot be fixed.** A support agent scores 71% on the golden
+  set; the product owner asks for 90%. The engineer patches one failure remembered from last week's demo
+  and re-runs: 72%. Nobody knows whether that failure was 1% of failures or 40%.
 - **Fixes made by guessing accumulate.** Every fix made without the distribution is a guess, and guessed
-  prompt fixes grow into a two-thousand-token prompt of special cases that nobody dares to delete.
+  prompt fixes grow into a two-thousand-token system prompt of special cases that nobody dares to delete,
+  re-sent on every agent step.
 - **Classical ML already had the answer.** Ng's advice for a misbehaving classifier: read about a hundred
   misclassified dev-set examples by hand, tally the categories, work on the largest one, because an
-  afternoon of counting beats a month of optimizing the wrong thing. For LLM systems too, an afternoon
-  with a few dozen to a hundred traces (illustrative) usually reorders the roadmap.
-- **LLM systems make it more necessary, not less.** Outputs are free text, pipelines have several stages
+  afternoon of counting beats a month of optimizing the wrong thing. For agents too, an afternoon with a
+  few dozen to a hundred traces (illustrative) usually reorders the roadmap.
+- **Agents make it more necessary, not less.** Outputs are free text, pipelines have several stages
   (retrieval, prompt, model, tools, post-processing), and failure modes are open-ended: you cannot define
   a metric for a failure you have not yet seen.
 - **The naive alternatives all skip the reading.** "Trust the judge score" fails because a judge grades
   only the criteria you gave it and cannot see a failure mode you did not name; Shankar et al. found
   people's criteria drift as they read outputs. "Fix what you notice" is whack-a-mole with regressions
   elsewhere. "Collect thumbs-down" is biased toward failures users notice and bother to report.
+
 ## How it works
 ### 1. Sample traces, not just outputs
 - **Pull whole traces:** input, retrieved context, tool calls and results, intermediate steps, final
-  output. Attribution is impossible from the final answer alone.
+  output. Attribution is impossible from the final answer alone, and for an agent the final answer is
+  often the least informative span.
 - **Random sample** from production or the last eval run, for honest prevalence numbers.
-- **Stratified sample** (by feature, user segment, input length, or the items that failed), so rare
-  slices appear at all.
+- **Stratified sample** (by feature, user segment, input length, tool used, step count, or the items that
+  failed), so rare slices such as 15-step runs or a rarely used refund tool appear at all.
 - **Stop at saturation:** keep reading until new traces stop producing new categories (the qualitative
   researchers' term). In practice, dozens to low hundreds of traces per round.
 
@@ -65,13 +82,16 @@ P(seen at least once) = 1 − (1 − p)ⁿ
 | 2% | ≈ 87% chance of seeing it | usually found |
 | 1% | ≈ 63% chance of seeing it | often missed |
 
-Rare-but-severe modes therefore need the stratified sample, not a bigger random one.
+Rare-but-severe modes (an agent issuing a refund it should not) therefore need the stratified sample,
+not a bigger random one.
 
 ### 2. Open coding: write what went wrong, in free text
-- **Per trace:** record pass/fail and a one- or two-sentence note on the **first** thing that went wrong.
+- **Per trace:** record pass/fail and a one- or two-sentence note on the **first** thing that went wrong,
+  plus the step index where it happened.
 - **First-failure rule,** *because* downstream errors are usually consequences. If retrieval returned the
   wrong policy document, the confident wrong answer that followed is not a generation bug, and counting
-  it as one sends you to fix the prompt.
+  it as one sends you to fix the prompt. In an agent, a wrong argument at step 2 explains the five
+  confused steps after it.
 - **No predefined categories yet:** free-form notes stop you forcing observations into the buckets you
   expected.
 - **One domain-competent annotator at first,** *because* a committee negotiates definitions before it has
@@ -86,13 +106,14 @@ Rare-but-severe modes therefore need the stratified sample, not a bigger random 
 - **Merge** categories you cannot tell apart; **split** a category when its members need different fixes.
 - **The behavioural test:** two people given the definition label the same trace the same way, and the
   category implies a specific remediation. "Model did not understand" fails; "answered for the wrong
-  product tier" passes.
+  product tier" or "called `search_orders` without the customer id" passes.
 
 ### 4. Count, then prioritise
 - **Tally and sort:** failures per category, a Pareto chart.
 - **Priority ≈ frequency × severity × fixability.** Severity matters *because* a wrong refund amount at 6%
-  of failures outranks a formatting slip at 20%. Fixability matters *because* a retrieval filter is a
-  day's work while a model-capability gap may need a different model or product decision.
+  of failures outranks a formatting slip at 20%. Fixability matters *because* a retrieval filter or a
+  clearer tool description is a day's work while a model-capability gap may need a different model or
+  product decision.
 - **Ceiling analysis** (Ng's term): fixing a category perfectly raises the pass rate by at most that
   category's share of *all* traces, not of failures. A category with 13 of 100 traces caps the gain at 13
   points; if the target is +20 points, no single fix gets there, and you know it before writing code.
@@ -104,25 +125,28 @@ SE(13 in 100) = √(0.13 × 0.87 / 100) ≈ 3.4 points  →  95% interval ≈ 6�
 
 - **So** two categories at 7 and 9 are effectively tied, and rankings among small categories should not
   drive the roadmap.
-- **Closed label sets:** for classification or extraction, the confusion matrix *is* the count table.
-  The off-diagonal cells are the failure modes; start with the largest.
+- **Closed label sets:** for classification, extraction or tool routing, the confusion matrix *is* the
+  count table. The off-diagonal cells (intended tool vs chosen tool) are the failure modes; start with
+  the largest.
 
 ### 5. Fix one thing and re-measure on the same sample
-1. Change the top-priority component.
+1. Change the top-priority component (a tool schema, the planner prompt, a retrieval filter).
 2. Re-run the same traces plus the eval set.
 3. Confirm the target category shrank and no other category grew.
 4. Confirm on a fresh sample, *because* a fix tuned while staring at these exact traces can overfit them.
 
 - **Why the same sample:** it removes input-sampling noise from the before/after comparison. It does not
-  remove the model's own run-to-run variance, so treat a change of one or two traces as noise.
+  remove the model's own run-to-run variance, which compounds over many agent steps, so treat a change of
+  one or two traces as noise.
 
 ### 6. Promote stable categories into evals
 Each category that survives a couple of rounds becomes:
-- **(a) Golden items:** the failing traces with a corrected expected output or rubric.
+- **(a) Golden items:** the failing traces with a corrected expected output, expected tool sequence or
+  rubric.
 - **(b) A grader:** a deterministic assertion where the failure has an observable signature (cites a
   document id that exists in the retrieved set; contains a handoff when the question asks for account
-  data). Otherwise a binary LLM judge whose rubric is distilled from the annotation notes and calibrated
-  against your labels.
+  data; never calls a write tool before a confirmation step). Otherwise a binary LLM judge whose rubric
+  is distilled from the annotation notes and calibrated against your labels.
 - **Why this matters:** it is how an eval suite stays representative; its metrics are the failure modes
   that actually occurred.
 
@@ -133,17 +157,17 @@ Each category that survives a couple of rounds becomes:
 | Agents | first wrong step: wrong tool, wrong arguments, misread tool result, stopped early, looped | the per-step table shows where a guardrail or better tool description has most leverage |
 
 ### Cadence
-- **Not a launch activity.** Re-run after each significant change and on a schedule against production
-  traffic, *because* the input distribution drifts.
+- **Not a launch activity.** Re-run after each significant change (prompt, tool, model version) and on a
+  schedule against production traffic, *because* the input distribution drifts.
 - **Retire** categories whose count has been zero for several rounds; expect new ones.
 
 ## Diagram
 The loop: notes come before categories, counts come before fixes, and stable categories leave the loop
-as automated evals.
+as automated agent evals.
 
 ```mermaid
 flowchart TD
-    S["Sample traces: random + stratified"] --> O["Open coding: first failure note"]
+    S["Sample agent traces"] --> O["Open coding: first wrong step"]
     O --> A["Axial coding: 5-15 categories"]
     A --> C["Count and prioritise"]
     C -->|"frequency x severity x fixability"| F["Fix one component"]
@@ -155,6 +179,26 @@ flowchart TD
 ```
 
 ## Examples
+### Worked round on a tool-calling support agent
+Illustrative: a support agent with `search_kb`, `get_account`, `issue_refund` and `handoff` tools.
+One hundred random production traces are read; 31 are failures, coded by first wrong step.
+
+| First wrong step (stage-prefixed) | Count | Severity | Fix |
+|---|---|---|---|
+| `tool.wrong_args`: `get_account` called with the email, not the account id | 10 | 2 | tool description plus an argument example |
+| `retrieval.wrong_doc`: `search_kb` top-5 misses the policy | 8 | 2 | hybrid search |
+| `plan.skipped_tool`: answers account questions without calling `get_account` | 6 | 3 | grader plus a rule in the planner prompt |
+| `loop.no_stop`: repeats the same search until the step cap | 4 | 1 | step budget and a repeated-call detector |
+| `action.unconfirmed_refund` | 1 | 3 | confirmation gate before the write tool |
+| Other | 2 | 1 | none yet |
+
+- **Ceiling:** the top two categories hold 18 of 100 traces, so fixing both perfectly buys at most +18
+  points of task success.
+- **Severity reorders the list:** the single unconfirmed refund gets a deterministic gate the same day,
+  because one bad write outweighs ten bad lookups.
+- **The loop category** is cheap to fix and also cuts cost, because each looping run burned the full
+  step budget in tokens.
+
 ### Worked round on a customer-support RAG assistant
 Illustrative: one hundred random production traces are read; 36 are judged failures.
 
@@ -178,8 +222,8 @@ Illustrative: one hundred random production traces are read; 36 are judged failu
   account data" (6). A confirm run on a fresh 100 traces checks the gain was not specific to the traces
   the fix was tuned on.
 
-### Annotation schema and counting
-The schema and the counting are a few lines:
+### Annotation schema for agent traces
+The schema and the counting are a few lines; the stage prefix rolls counts up to the component owner.
 
 ```python
 from collections import Counter
@@ -190,22 +234,25 @@ class Annotation:
     trace_id: str
     passed: bool
     note: str           # free text, written first (open coding)
-    first_failure: str  # category assigned afterwards (axial coding); "" when passed
+    first_failure: str  # "stage.category", assigned afterwards (axial coding); "" when passed
+    step: int           # index of the first wrong step in the trajectory; -1 when passed
     severity: int       # 1 cosmetic, 2 wrong but harmless, 3 wrong facts or wrong action
 
 rows = [
-    Annotation("t-014", False, "top-5 chunks all about SSO; question was about SCIM", "wrong_doc_retrieved", 2),
-    Annotation("t-021", False, "right article in context; answer says 30 days, article says 14", "contradicts_context", 3),
-    Annotation("t-033", False, "asked for last invoice total; bot invented a number", "guessed_account_data", 3),
-    Annotation("t-040", True, "", "", 0),
+    Annotation("t-014", False, "search_kb top-5 all about SSO; question was about SCIM", "retrieval.wrong_doc", 1, 2),
+    Annotation("t-021", False, "get_account called with email instead of account id", "tool.wrong_args", 2, 2),
+    Annotation("t-033", False, "asked for last invoice total; never called get_account, invented a number", "plan.skipped_tool", 1, 3),
+    Annotation("t-040", True, "", "", -1, 0),
     # ... ~100 rows, read in full, in random order
 ]
 
 fails = [a for a in rows if not a.passed]
 counts = Counter(a.first_failure for a in fails)
+by_stage = Counter(a.first_failure.split(".")[0] for a in fails)
 worst = {c: max(a.severity for a in fails if a.first_failure == c) for c in counts}
 for cat, n in counts.most_common():
     print(f"{cat:22s} n={n:3d} share={n/len(fails):5.1%} severity={worst[cat]} priority={n*worst[cat]}")
+print("by stage:", dict(by_stage))
 ```
 
 The point is the two separate fields: `note` is written while reading, `first_failure` is assigned only
@@ -236,16 +283,19 @@ for k in (7, 9):
 ```
 
 ## Production patterns
-- **Weekly reading hour on a shared queue.** When the system has live traffic, push a random plus
+- **Weekly reading hour on a shared queue.** When the agent has live traffic, push a random plus
   stratified sample into an annotation queue (LangSmith and Langfuse both have annotation queues) or a
   sheet with a notes column, and read for one hour a week. Monitor traces read per round and new
   categories per round; when new categories stop appearing you have hit saturation.
-- **Flip-diff on every eval run.** After any change, join the old and new runs on item id and pull the
-  pass→fail and fail→pass items before looking at the aggregate. Read those traces first. Monitor the
-  flip counts per slice, not just the net change in pass rate.
+- **Flip-diff on every eval run.** After any change to a prompt, tool or model, join the old and new runs
+  on item id and pull the pass→fail and fail→pass items before looking at the aggregate. Read those
+  trajectories first. Monitor the flip counts per slice, not just the net change in pass rate.
 - **Stage-tagged failure codes.** Store `first_failure` with a stage prefix (for example
   `retrieval.wrong_doc`, `tool.wrong_args`) so counts roll up by component owner. Monitor the share of
   failures per stage, which tells you whose roadmap the next fix belongs on.
+- **Stratify by trajectory shape.** Over-sample runs that hit the step cap, called a write tool, retried
+  a tool error or ran far longer than the median, because those are where costly agent failures hide.
+  Monitor the failure rate per stratum against the random sample.
 - **Promote with a calibration set.** When a category is stable for two rounds, write its grader and keep
   the human-labelled traces as the grader's test set. Monitor the grader's agreement with human labels
   (true-positive and true-negative rates) before trusting it in CI.
@@ -267,7 +317,8 @@ for k in (7, 9):
   compounding failures. When traces fail in several independent ways, record secondary failures in their
   own field rather than in the primary count.
 - **Fixed taxonomy vs fresh eyes.** A fixed taxonomy makes categories measurable over time but ossifies.
-  Re-open-code every few rounds, or the analysis only ever finds the failures you already know about.
+  Re-open-code every few rounds, or the analysis only ever finds the failures you already know about,
+  which matters most after you add a new tool.
 
 ## Pitfalls
 - **Fixing while reading.** A failure gets patched before the counting is done. Symptom: the prompt grows
@@ -284,7 +335,7 @@ for k in (7, 9):
   playground, and the next round shows the category unchanged or a neighbouring one larger.
 
 ## When to use
-- **Before writing any evals,** to learn which failure modes exist.
+- **Before writing any agent evals,** to learn which failure modes exist.
 - **When the aggregate plateaus** or a change has an effect you cannot explain.
 - **On a cadence against production traffic.** It is never a substitute for automated evals, because its
   output *is* the next set of automated evals.
@@ -330,6 +381,14 @@ and slices, not the aggregate, to the product owner.
   result, stopped early, looped.
 - **Count by step and slice,** then fix the top category and re-measure on the same items before
   confirming on a fresh sample.
+
+### How would you set up error analysis for a new tool-calling agent before launch?
+- **Capture full trajectories** from day one: every tool call, its arguments and result, with a run id,
+  so failures can be attributed to a step rather than to the final answer.
+- **Read 50 to 100 internal or beta runs,** stratified by tool and task type, and code the first wrong
+  step with a stage prefix such as `tool.wrong_args`.
+- **Promote the stable categories** into golden tasks and graders that gate the agent in CI before it
+  sees real users.
 
 ### When would you not record only the first failure in a trace?
 - **When failures are independent:** a trace can retrieve the wrong document and also break the output

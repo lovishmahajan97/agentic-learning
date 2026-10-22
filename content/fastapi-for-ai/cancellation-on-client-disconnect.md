@@ -5,7 +5,8 @@ name: Cancellation on client disconnect
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/streamingresponse
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-When users close tabs or press stop, an unaware server keeps generating tokens, holding slots and
-running tools for nobody. ASGI reports disconnect as an `http.disconnect` message, so detect it,
-cancel the work, clean up in `finally`, and shield side effects that must finish.
+When a user presses stop, an unaware agent keeps generating tokens, holding slots and running tools for
+nobody. ASGI reports disconnect as an `http.disconnect` message, so detect it, cancel the run and its
+children, clean up in `finally`, and shield the accounting.
+
+## For agent builders
+- **Why it matters for agents.** An agent run can last minutes and make dozens of model and tool calls.
+  If "stop" does not reach the loop, the ghost run keeps billing tokens and may still send the email or
+  create the ticket the user meant to stop.
+- **Where it shows up in your stack.** `request.is_disconnected()` checks between agent steps,
+  `StreamingResponse` event streams, `asyncio.TaskGroup` for parallel tool calls, httpx and SDK calls that
+  abort on cancellation, and the proxy in front that must forward the abort.
+- **What you control.** Where the cancel points are (between steps, before side-effecting tools), which
+  work is shielded (usage and audit records), idempotency keys on tool calls, and which runs become
+  durable jobs instead.
+- **What you can skip.** The ASGI receive-channel internals beyond "disconnect is a message". Know how
+  `CancelledError` propagates and why bare `create_task` orphans children.
 
 ## Why it exists
 - **LLM requests are long and expensive.** A chat answer can stream for thirty seconds; an agent run can
@@ -104,8 +118,9 @@ Two watcher designs:
    retry after cancellation cannot duplicate them.
 
 ### When not to cancel
-- **Work the user expects to finish without watching,** such as a long report or a batch ingestion. Move
-  it to a durable job, return a job ID, and let the client reconnect for the result.
+- **Work the user expects to finish without watching,** such as a long report, a deep-research agent run
+  or a batch ingestion. Move it to a durable job, return a job ID, and let the client reconnect for the
+  result.
 
 ### The path in between
 - **Proxies may hide the disconnect.** A proxy or load balancer between client and app may not propagate
@@ -115,14 +130,14 @@ Two watcher designs:
 
 ## Diagram
 Nothing interrupts the handler on its own: the disconnect is only a message until the watcher reads it,
-cancels the task and lets `finally` close upstream and record usage under a bounded shield.
+cancels the agent task and lets `finally` close upstream and record usage under a bounded shield.
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant S as ASGI server
     participant W as Handler with watcher
-    participant T as Model task
+    participant T as Agent task
     participant P as Provider
     T->>P: stream or complete request via httpx
     C->>S: closes connection, tab closed or stop pressed
@@ -182,6 +197,41 @@ Scenario (illustrative):
 | Model time per abandoned request | full 15-second generation | about 3 seconds |
 | Slot held | 15 seconds | about 3 seconds |
 | Effect under a fixed concurrency cap | longer queues for everyone | shorter queues for the users who stayed |
+
+### An agent loop with cancel points and idempotent side effects
+The loop checks for disconnect before every step and before any side-effecting tool, runs parallel tools
+in a `TaskGroup`, and passes an idempotency key built from run ID and step. `llm_step`, `TOOLS`,
+`SIDE_EFFECTS` and `record_usage_run` stand in for your own code.
+
+```python
+import asyncio
+
+class Stopped(Exception): ...
+
+async def run_agent(request, run_id: str, messages: list, max_steps: int = 10):
+    try:
+        for step in range(max_steps):
+            if await request.is_disconnected():          # cancel point between steps
+                raise Stopped
+            out = await llm_step(messages)               # cancellable: httpx aborts on cancel
+            if out["type"] == "final":
+                return out["text"]
+            calls = out["tool_calls"]
+            if any(c["name"] in SIDE_EFFECTS for c in calls) and await request.is_disconnected():
+                raise Stopped                            # never start a side effect for nobody
+            async with asyncio.TaskGroup() as tg:        # children die with the run
+                tasks = [tg.create_task(TOOLS[c["name"]](**c["args"],
+                                        idempotency_key=f"{run_id}:{step}:{i}"))
+                         for i, c in enumerate(calls)]
+            messages += [{"role": "tool", "content": t.result()} for t in tasks]
+        return None
+    finally:
+        # runs on success, Stopped and CancelledError alike; bounded so shutdown cannot hang
+        await asyncio.shield(asyncio.wait_for(record_usage_run(run_id, messages), timeout=2.0))
+```
+
+- **Run it under `run_unless_disconnected`** as well, so a disconnect during a long model call cancels it
+  at that `await` instead of waiting for the next step's check.
 
 ### Streaming relay that stops upstream on disconnect
 The upstream stream is opened with `async with`, so breaking out of the loop (or being cancelled by
@@ -249,9 +299,9 @@ asyncio.run(main())
 - **Count 499s as a first-class metric.** Return or log 499 for every request cancelled by disconnect and
   chart it per route next to latency. A rising 499 rate after a latency regression means users are giving
   up; alert on it.
-- **Track tokens spent after disconnect.** In the shielded usage record, store whether the request was
-  cancelled and the tokens billed, so finance and capacity reviews see the ghost cost. Monitor its share
-  of total spend; it should fall after cancellation ships.
+- **Track tokens spent after disconnect.** In the shielded usage record, store whether the request or
+  agent run was cancelled and the tokens billed, so finance and capacity reviews see the ghost cost.
+  Monitor its share of total spend; it should fall after cancellation ships.
 - **Configure the proxy to forward aborts.** With nginx in front, keep `proxy_ignore_client_abort` off
   (its default) so a client abort closes the upstream connection, and disable `proxy_buffering` on
   streaming routes. Verify with an end-to-end test that the app logs a cancellation within a second or
@@ -259,8 +309,9 @@ asyncio.run(main())
 - **Cancel points plus idempotency keys in agent loops.** Check `is_disconnected()` before each step and
   before any side-effecting tool call, and send an idempotency key derived from run ID and step number.
   Monitor duplicate side effects reported by downstream systems.
-- **Durable jobs for work that must finish.** For reports and batch ingestion, enqueue a job, return 202
-  with a job ID, and let the client poll or reconnect. Monitor job completion rate and age, not 499s.
+- **Durable jobs for work that must finish.** For reports, long research runs and batch ingestion, enqueue
+  a job, return 202 with a job ID, and let the client poll or reconnect. Monitor job completion rate and
+  age, not 499s.
 - **Bounded shields only.** Wrap every shielded step in its own timeout (`asyncio.wait_for(..., 2.0)` in
   the example) so shutdown cannot hang. Monitor shielded-step timeouts and graceful-shutdown duration.
 
@@ -336,6 +387,14 @@ user can see what happened before they stopped it.
   so it closes, and does a buffering proxy hide the disconnect from the app?
 - **Fix and verify:** race the call against a watcher, keep nginx `proxy_ignore_client_abort` off, and run
   an end-to-end test that the app logs a cancellation.
+
+### A user presses stop, then immediately retries the same agent request. How do you avoid duplicate side effects?
+- **The first run may have been cancelled mid-step,** so a tool call might have reached the external system
+  before the cancellation landed.
+- **Give every side-effecting tool call an idempotency key** derived from a client-supplied run ID and the
+  step number, so the downstream system rejects or returns the earlier result for a repeat.
+- **Record each step's outcome in the shielded run record,** so the retry can resume or skip completed
+  side effects instead of redoing them.
 
 ### Should you poll is_disconnected() or await request.receive() in a watcher task?
 - **Polling** reacts within one interval and is always safe; a quarter to half a second is usually ample

@@ -5,7 +5,8 @@ name: A2A protocol (Agent2Agent)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-A2A is an open protocol for one agent to discover another, hand it a task and follow it to completion
-over HTTP without seeing inside. MCP connects agents to tools; A2A connects agents to opaque,
-long-running peer agents.
+A2A lets your agent discover another team's agent, hand it a task and follow it to completion over HTTP
+without seeing inside. Your agent speaks MCP to its tools and A2A to opaque, long-running peer agents.
+
+## For agent builders
+- **Why it matters for agents.** The moment your agent must delegate to an agent you do not own (a
+  partner's booking agent, another team's finance agent), a tool call is the wrong shape: the work is
+  slow, may ask back, and returns several artifacts. A2A gives that delegation a task id and a lifecycle.
+- **Where it shows up in your stack.** The official A2A SDKs (Python among them) for building servers
+  and clients; Google's Agent Development Kit, which can expose and call A2A agents; and any framework
+  agent (LangGraph, OpenAI Agents SDK, CrewAI) wrapped behind an A2A server. Inside one codebase you
+  still use the framework's own handoffs or subgraphs instead.
+- **What you control.** The skills and security schemes your Agent Card advertises, how your client
+  waits (poll, stream or push), where task ids and `contextId` are persisted, and how peer artifacts are
+  fenced off before they reach your model.
+- **What you can skip.** Memorising every method and field name: they shift between revisions, so read
+  `protocolVersion` and the spec you target. Learn the task states and the three groups.
 
 ## Why it exists
 - **Agents need to talk to each other.** Once an organisation has more than one agent, a procurement agent
@@ -122,6 +136,17 @@ Push notifications add a reverse channel with its own risks:
 
 The two are complementary and commonly used together: a single agent typically speaks MCP to its tools
 and A2A to other agents, so the operational skills transfer.
+
+### Where A2A sits next to framework multi-agent features
+| You need | Reach for | Why |
+|---|---|---|
+| Specialists inside one service you own | Framework handoffs or subgraphs (OpenAI Agents SDK handoffs, LangGraph subgraphs or supervisor) | shared process, shared tracing, no HTTP or auth |
+| A deterministic capability with typed inputs | An MCP tool | a schema beats a prose skill description |
+| A reasoning peer owned by another team or company | A2A | opaque, long-running, can ask back, crosses org boundaries |
+
+- **Trace across the boundary yourself.** Your framework's tracing (LangSmith, OpenAI Agents SDK traces)
+  stops at the A2A call, because the peer is opaque; record the remote task id on your span so both
+  sides can join their logs.
 
 ## Diagram
 Read the task lifecycle: active states loop until the agent either needs something from the caller
@@ -353,6 +378,13 @@ differently from `input-required` in the user-facing flow.
 - **A new task in the same `contextId`,** because terminal tasks are immutable records both sides audit.
 - **The `contextId`** carries the conversation thread, so the remote agent still has the earlier context
   while each task's artifacts stay stable.
+
+### Your LangGraph support agent must delegate refunds to a partner's agent. How do you wire it into the graph?
+- **Make delegation a node that owns a task, not a blocking tool call.** The node sends the message,
+  persists task id and `contextId` in graph state, and the graph pauses (a checkpointer plus an
+  interrupt, or an external wait) until a push notification or stream event arrives.
+- **Map interrupted states to the user.** On `input-required`, surface the peer's question, resume the
+  same task with the answer, and fence the peer's artifacts as data before the model reads them.
 
 ## Quiz
 ### Q: What primarily distinguishes delegating to an A2A agent from calling an MCP tool?

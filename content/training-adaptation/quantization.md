@@ -5,7 +5,8 @@ name: Quantization (INT8/INT4, GPTQ, AWQ, GGUF)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/peft
   - training-adaptation/pruning
@@ -23,9 +24,23 @@ sources:
 ---
 
 ## TL;DR
-Quantization stores weights (sometimes activations) in INT8, INT4 or small floats instead of 16 bits.
-Decode is limited by bytes read, so models fit cheaper hardware and decode faster. GPTQ and AWQ
-calibrate 4-bit values to minimise output error; GGUF ships them to CPUs.
+Quantization stores a self-hosted agent model's weights in INT8, INT4 or FP8 instead of 16 bits, so it
+fits cheaper GPUs, decodes faster and leaves room for long agent transcripts. GPTQ and AWQ calibrate
+4-bit weights; GGUF runs local agents on CPUs.
+
+## For agent builders
+- **Why it matters for agents.** Agent quality hinges on brittle outputs: valid JSON tool calls, exact
+  argument names, many reasoning steps in a row. Those regress under quantization before chat quality
+  does, so a quant that "looks fine" can break your agent.
+- **Where it shows up in your stack.** Pre-quantized AWQ, GPTQ or FP8 checkpoints served by vLLM, SGLang
+  or TensorRT-LLM; GGUF files run by llama.cpp or tools built on it for local and edge agents; and FP8
+  KV caches for long transcripts.
+- **What you control.** Precision per deployment target, calibration data (use agent traces with tool
+  schemas), KV-cache precision, and the eval gate: tool-call validity and task success against the bf16
+  parent.
+- **What you can skip.** The GPTQ Hessian derivation and AWQ's grid search. Know bits per weight,
+  weight-only versus W8A8, and why decode speeds up but prefill does not. Hosted APIs make this choice
+  for you.
 
 ## Why it exists
 - **Memory.** A 70B-parameter model in bf16 is 140 GB of weights and does not fit one 80 GB GPU; at 4 bits
@@ -139,9 +154,20 @@ QLoRA sits in between: a frozen 4-bit base with trainable adapters that learn ar
 | `S`/`M`/`L` suffix | mixing recipe: sensitive tensors (attention value/output, parts of MLP) kept higher | varies |
 | I-quants: `IQ2_XXS`…`IQ4_XS` | non-uniform codebooks, optional importance matrix from calibration | below 4 |
 
+### What it changes in an agent
+- **Agent workloads are prefill-heavy.** Each step re-sends system prompt, tool schemas and history, then
+  decodes a short tool call. Weight-only INT4 helps the short decode, not the long prefill, so pair it
+  with prefix caching; FP8 W8A8 helps both.
+- **Memory freed by smaller weights becomes KV cache**, which long agent transcripts need more than chat
+  does, so quantizing weights often buys more concurrent agents than faster tokens.
+- **Errors compound across steps.** A small per-call drop in tool-call validity multiplies over a
+  20-step trajectory, so evaluate whole tasks, not single prompts.
+- **Calibrate on what the agent sees:** rendered agent traces with tool schemas and JSON, not generic
+  web text.
+
 ## Diagram
-Read it as the decision path from deployment target to format; every branch ends at the same eval gate
-against the bf16 parent.
+Read it as the decision path from where the agent model runs to the format; every branch ends at the
+same agent eval gate against the bf16 parent.
 
 ```mermaid
 flowchart TD
@@ -152,8 +178,8 @@ flowchart TD
     C --> A["AWQ: rescale salient channels, then round"]
     G --> I4["INT4 per-group, about 4.16 bits per weight"]
     A --> I4
-    T -->|"laptop, CPU or edge"| U["Convert to GGUF, Q4_K_M or Q5_K_M"]
-    F --> E["Task evals vs bf16 parent, tokens per second at real batch"]
+    T -->|"local agent: laptop, CPU or edge"| U["Convert to GGUF, Q4_K_M or Q5_K_M"]
+    F --> E["Agent evals vs bf16: tool-call validity, task success, tokens per second"]
     I4 --> E
     U --> E
 ```
@@ -237,7 +263,52 @@ benchmark):
 Real decode gains are smaller than the floor suggests, because KV-cache reads and kernel overhead do not
 shrink.
 
+### Worked scenario: how many long-running agents fit on one 80 GB GPU
+A 70B-class agent model (80 layers, 8 KV heads, head dim 128) runs coding agents whose transcripts reach
+32k tokens. KV cache per token in fp16 is 2 × 80 × 8 × 128 × 2 ≈ 0.33 MB, so one agent needs ≈ 10.5 GB.
+
+| Weights | Weight memory | Left for KV (about 90% of the rest) | Agents at 32k, fp16 KV | With FP8 KV |
+|---|---|---|---|---|
+| bf16 | 140 GB | does not fit | 0 | 0 |
+| INT8 per-channel | 70 GB | ~9 GB | 0 | 1 |
+| INT4 g=128 AWQ | 36.4 GB | ~39 GB | 3 | 7 |
+
+Quantizing weights is what makes this deployment possible at all; the eval gate below decides whether
+the INT4 agent still finishes its tasks.
+
+### Agent eval gate: tool-call validity across precisions
+Pure Python harness. `call_model` is whatever client you use (for example an OpenAI-compatible endpoint
+served by vLLM); run it once against the bf16 parent and once against each quantized build.
+
+```python
+import json
+
+def tool_call_validity(call_model, cases, tools):
+    """cases: [{"messages": [...], "expect_tool": "search_orders"}]; tools: {name: required_arg_names}."""
+    ok_json = ok_tool = ok_args = 0
+    for c in cases:
+        raw = call_model(c["messages"])            # returns the model's tool-call text
+        try:
+            call = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        ok_json += 1
+        if call.get("name") == c["expect_tool"]:
+            ok_tool += 1
+            if set(tools[call["name"]]) <= set(call.get("arguments", {})):
+                ok_args += 1
+    n = len(cases)
+    return {"json": ok_json / n, "right_tool": ok_tool / n, "valid_args": ok_args / n}
+
+# Gate: block the quantized build if any rate drops more than your agreed threshold versus bf16,
+# then confirm on full replayed tasks, because per-call drops compound over many steps.
+```
+
 ## Production patterns
+- **Calibrate and gate on agent traces.** Use rendered agent conversations (tool schemas, JSON calls,
+  tool results) as the AWQ or GPTQ calibration set, and gate every quantized build on tool-call validity
+  and end-to-end task success versus the bf16 parent. Monitor schema-validation failures per model
+  version in production.
 - **FP8 first on hardware that supports it.** For throughput serving, enable FP8 weights and KV cache in
   the engine (in vLLM, `--quantization fp8` and `--kv-cache-dtype fp8`), then run task evals. Monitor
   eval deltas, time to first token and tokens per second at real batch size.
@@ -262,7 +333,7 @@ shrink.
   (maths, code, long multi-step reasoning), where it must be measured.
 - **Weight-only INT4 vs W8A8.** INT4 speeds small-batch decode but not prefill, and at high batch its
   dequantization overhead can lose to fp16 or FP8 W8A8. The choice flips with batch size and with
-  prompt-heavy (RAG) versus generation-heavy (chat) workloads.
+  prompt-heavy (RAG, agent steps with long histories) versus generation-heavy (chat) workloads.
 - **Smaller groups vs overhead.** They cut error but add bits per weight and kernel complexity; *g* = 128
   is the usual compromise, and *g* = 32 pays off mainly below 4 bits or on small models.
 - **PTQ vs QAT.** PTQ is cheap and fast but depends on calibration data matching deployment. QAT is more
@@ -284,7 +355,11 @@ shrink.
 - **Re-quantizing an already quantized checkpoint.** GPTQ → GGUF, or a merged QLoRA model, compounds
   errors. Symptom: noticeably worse than the same scheme applied to the bf16 original.
 - **Losing tokenizer or chat-template metadata in GGUF conversion.** Symptom: the model rambles, never
-  emits the end-of-turn token, or ignores the system prompt despite correct weights.
+  emits the end-of-turn token, or ignores the system prompt despite correct weights. For agents the
+  template also carries the tool-call format, so tool calls stop parsing.
+- **Gating an agent model on single-call accuracy.** A 2-point drop in valid tool calls per step looks
+  harmless but compounds over a 20-step task. Symptom: more stalled or looping agents after the switch.
+  Fix: replay full tasks before and after quantizing.
 
 ## When to use
 - **GPU servers:** start with FP8 if the hardware supports it: near-zero quality cost, faster prefill and
@@ -294,6 +369,8 @@ shrink.
 - **GGUF:** for a laptop, CPU box, edge device or developer machine; `Q4_K_M` or `Q5_K_M` are sensible
   defaults, moving up when quality evals demand it.
 - **QLoRA, not a serving format:** when the goal is fine-tuning on a small GPU.
+- **Skip it when:** your agent runs on a hosted API; the provider chooses precision, and your lever is
+  model tier, not bits.
 - **Measure every time:** task evals against the unquantized model, tokens per second at your real batch
   size, and total memory including the KV cache at your context length.
 - **Interviews:** derive bits per weight for a grouped scheme, explain why outliers break per-tensor
@@ -334,12 +411,13 @@ quality drops too far, the honest options are two GPUs with FP8 or a smaller mod
 - **Outlier handling:** LLM.int8() routes outlier columns to an fp16 side-matmul; SmoothQuant moves
   activation range into the weights; AWQ scales salient weight channels up before rounding.
 
-### GPTQ or AWQ for a code model when your calibration set is small? Defend the choice.
-- **GPTQ** minimises layer reconstruction error on the calibration inputs with second-order updates, so it
-  is somewhat sensitive to calibration domain and can overfit a small or mismatched set.
-- **AWQ** uses activation statistics only to pick per-channel scales by a small grid search, with no
-  weight reconstruction, so it overfits calibration less and transfers better across domains.
-- **Either way:** calibrate on in-domain code, and decide on task evals, not perplexity.
+### You moved your agent model to INT4 AWQ, but agent steps got barely faster. Why, and what would you try?
+- **Agent steps are prefill-heavy:** each step re-sends system prompt, tool schemas and a growing history,
+  then decodes a short tool call, and weight-only INT4 does not cut prefill FLOPs.
+- **Levers:** prefix caching so only new tokens are prefilled, FP8 W8A8 on hardware that runs it, and
+  spending the freed memory on more concurrent agents rather than expecting lower step latency.
+- **Calibration check:** AWQ is the safer pick with a small agent-trace calibration set because GPTQ is
+  more calibration-sensitive; confirm tool-call validity did not drop.
 
 ### How much memory do a 7B model's INT4 weights need with group 128? Show the arithmetic.
 - **Bits per weight:** 4 + (16-bit scale + 4-bit zero-point) / 128 = 4 + 20/128 ≈ 4.16.
@@ -348,9 +426,9 @@ quality drops too far, the honest options are two GPUs with FP8 or a smaller mod
 - **Then add** the KV cache at your context length and concurrency, because sizing at a flat 4.0 bits and
   forgetting the cache is a classic OOM.
 
-### Your quantized model passed a perplexity check, but maths and Spanish users complain. What happened?
-- **Perplexity hides it:** it can move by 0.1 while maths, instruction following or a minority language
-  regress sharply, so the gate measured the wrong thing.
+### Your INT4 agent passed a perplexity check, but tool calls fail and maths and Spanish users complain. What happened?
+- **Perplexity hides it:** it can move by 0.1 while maths, instruction following, JSON tool calls or a
+  minority language regress sharply, so the gate measured the wrong thing.
 - **Likely causes:** calibration on English web text instead of in-domain data, or a checkpoint
   re-quantized from another quantized file, which compounds errors.
 - **Fix:** re-quantize from the bf16 master with in-domain calibration, add maths and per-language task

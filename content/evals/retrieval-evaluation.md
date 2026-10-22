@@ -5,7 +5,8 @@ name: Retrieval evaluation (recall@k, MRR, NDCG)
 kind: metric
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/recall-vs-precision-trade-off
   - rag-retrieval/reranking
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-A RAG answer is only as good as its retrieved passages, so the retriever is scored alone: recall@k (did
-evidence get in?), MRR (first hit how high?), NDCG (graded ranking right?). Matching k to the context
-budget and honest judgments matter more than formulas.
+An agent's answer is only as good as what its search or memory tool returns, so score the retriever
+alone: recall@k (did evidence get in?), MRR (first hit how high?), NDCG (graded ranking right?).
+Matching k to the context budget matters more than formulas.
+
+## For agent builders
+- **Why it matters for agents.** When a RAG agent answers wrongly, the first question is whether the
+  evidence ever reached it. Retrieval metrics answer that in seconds without an LLM call, so they run
+  on every change to chunking, embeddings or the search tool.
+- **Where it shows up in your stack.** The search or memory-lookup tool your agent calls (a vector store
+  such as pgvector or Qdrant, hybrid search, a reranker), retriever evaluators in eval tools such as
+  LangSmith, Ragas or Braintrust, and a qrels file versioned next to the index config.
+- **What you control.** Which queries you evaluate (the agent's own logged search-tool arguments, not
+  only user questions), k per tool call, how many search calls a run may make, and how relevance is
+  judged.
+- **What you can skip.** Exotic IR metrics. recall@k at the first stage and NDCG or MRR at the final k,
+  with paired intervals, cover the decisions an agent team makes.
 
 ## Why it exists
 - **A wrong RAG answer has two suspects.** The retriever did not surface the evidence, or the generator
@@ -108,23 +122,39 @@ NDCG@k = DCG@k / IDCG@k        (IDCG = DCG of the ideal ordering of the same jud
 3. **Find the knee:** raising k raises recall but costs tokens and adds distractors, so measure answer
    quality against k.
 
+### When retrieval is a tool the agent calls
+In agentic RAG the model decides when to search, writes the query itself, and may search several
+times per run. That changes what you evaluate.
+
+| Question | Metric | Why |
+|---|---|---|
+| Is the retriever good on the queries it actually gets? | recall@k on logged search-tool arguments | the agent rewrites user questions; its queries are shorter and differ from what a human labeler would type |
+| Did the run as a whole collect the evidence? | run-level recall: relevant items in the union of all search results in the run | a later search can recover what an earlier one missed |
+| Did the agent search when it needed to? | share of evidence-needing tasks with at least one search call | an agent that answers from memory has recall 0 by construction |
+| Is it searching wastefully? | search calls per run and duplicate results across calls | each call costs latency and context tokens |
+
+- **Keep both query sets:** user questions (end-to-end behaviour) and the agent's own queries (the
+  retriever in isolation), so a regression can be attributed to query writing or to the index.
+- **Memory stores are retrievers too.** A long-term memory lookup is scored the same way, with qrels
+  saying which stored memories should come back for a turn.
+
 ### Statistical hygiene
 - **Paired bootstrap over queries:** compare two systems on the same queries and report intervals, because
   means on a few dozen queries move by several points on resampling.
 - **Segment by query type,** because an average of 0.85 can hide a category at 0.3.
 
 ## Diagram
-A two-stage pipeline gets two evaluations against the same qrels: recall at the wide first-stage k, and
-ranking quality at the final k that reaches the generator.
+The agent's search tool is a two-stage pipeline with two evaluations against the same qrels: recall at
+the wide first-stage k, and ranking quality at the final k that reaches the agent's context.
 
 ```mermaid
 flowchart TD
-    Q["Query from real traffic"] --> R1["First-stage retriever, wide k"]
+    Q["Agent search-tool query from logs"] --> R1["First-stage retriever, wide k"]
     R1 --> M1["recall@wide k"]
     R1 --> RR["Reranker"]
     RR --> TK["Final top-k into the prompt"]
     TK --> M2["recall@k, NDCG@k, MRR"]
-    TK --> G["Generator answer"]
+    TK --> G["Agent context and answer"]
     QR[("qrels: judged relevant chunks")] --> M1
     QR --> M2
     M2 --> B["Paired bootstrap per category"]
@@ -204,11 +234,49 @@ print("diff %.3f, 95%% CI (%.3f, %.3f)" % paired_bootstrap(base, hybrid))
 | interval includes 0 | not distinguishable from no change on 40 queries |
 | next step | add queries (or check the category that improved) before switching |
 
+### Agent scenario: per-call versus run-level recall from a trace
+A research agent made three `search_docs` calls in one run. The task's qrels say d1, d4 and d9 are
+needed. Score each call on the agent's own query, then the union the run collected.
+
+```python
+def recall(ids, relevant):
+    return len(set(ids) & relevant) / len(relevant)
+
+relevant = {"d1", "d4", "d9"}
+calls = [  # (query the agent wrote, top-5 ids the tool returned), taken from the trace
+    ("refund policy enterprise",        ["d2", "d1", "d7", "d3", "d5"]),
+    ("enterprise plan refund exception", ["d4", "d8", "d1", "d6", "d2"]),
+    ("refund policy enterprise 2024",   ["d10", "d11", "d1", "d12", "d13"]),
+]
+for q, ids in calls:
+    print(f"{q:34s} recall@5 = {recall(ids, relevant):.2f}")
+seen = [d for _, ids in calls for d in ids]
+print(f"run-level recall = {recall(seen, relevant):.2f}, "
+      f"duplicate share = {1 - len(set(seen)) / len(seen):.2f}")
+# refund policy enterprise           recall@5 = 0.33
+# enterprise plan refund exception   recall@5 = 0.67
+# refund policy enterprise 2024      recall@5 = 0.33
+# run-level recall = 0.67, duplicate share = 0.20
+```
+
+| Reading | Action |
+|---|---|
+| d9 never retrieved by any call | the evidence is missing for this run whatever the agent does next: check indexing and whether d9 matches the agent's phrasing |
+| Call 3 repeats call 1 with a year appended | wasted call; 20% of the results the agent read were duplicates |
+| Run-level recall 0.67 | the answer can at best be partly grounded; faithfulness checks will show the gap |
+
 ## Production patterns
 - **Retrieval eval as a CI gate.** Version the qrels file next to the index config, compute recall at the
   first-stage k and NDCG at the final k on every change to embeddings, chunking, filters or hybrid
   weights, and block the merge when the paired-bootstrap lower bound shows a drop. Monitor per-category
   recall, not just the mean.
+- **Eval queries from the agent's own tool calls.** Export the arguments of logged search-tool calls
+  from production traces, judge their results, and keep them as a second query set beside user
+  questions. Monitor the gap between recall on user questions and on agent queries; a widening gap
+  points at query writing, not the index.
+- **Run-level retrieval metrics on agent traces.** For each eval run, compute recall over the union of
+  all search results and count search calls and duplicate results. Monitor run-level recall and calls
+  per run together, so a fix that adds searches is visible as a cost.
 - **Pool and re-judge on every retriever swap.** Merge the top results of old and new systems, send
   unjudged items to SMEs or an LLM labeler with a human-audited slice, and add them to the qrels. Monitor
   the share of top-k results that are unjudged; a high share means the numbers are unreliable.
@@ -248,14 +316,17 @@ print("diff %.3f, 95%% CI (%.3f, %.3f)" % paired_bootstrap(base, hybrid))
   Fix: segment by query type.
 - **Changing chunk size and comparing recall@k against the old qrels.** Symptom: numbers that are not
   comparable because the unit of relevance changed. Fix: re-map or re-judge.
+- **Evaluating only on user questions when the agent writes its own queries.** Symptom: good offline
+  recall, yet traces show the search tool returning little of use. Fix: add the logged search-tool
+  arguments as an eval query set.
 - **Near-duplicate chunks in the index.** Symptom: a top-k full of copies, recall of distinct relevant
   items stalling while precision looks fine. Fix: deduplicate.
 
 ## When to use
 - **Run it on every change** to the embedding model, chunking, index, hybrid weights, reranker or
   metadata filters.
-- **Reach for it first whenever answers are wrong,** because "was the evidence present?" is the cheapest
-  question to answer.
+- **Reach for it first whenever an agent's answers are wrong,** because "was the evidence present?" is
+  the cheapest question to answer; check the trace's search calls before the prompt.
 - **Track** recall at the first-stage k and NDCG or MRR at the final k, with paired intervals and a
   per-category breakdown.
 - **Build the query set from real traffic,** on the order of a few hundred queries (illustrative),
@@ -297,7 +368,15 @@ queries with a paired bootstrap.
 - **Filters and permissions in production:** metadata or ACL filters active live but not offline remove
   passages before the top-k cut.
 
-### How would you pick k for a RAG system?
+### Your agent calls a search tool several times per run. How do you evaluate retrieval?
+- **Score the tool on the queries it actually gets:** logged search-tool arguments, judged against
+  qrels, at the k the tool returns into context.
+- **Score the run as a whole:** recall over the union of all results in the run, plus whether the agent
+  searched at all on tasks that needed evidence.
+- **Track the cost side:** search calls per run and duplicate results, so a gain in run-level recall
+  bought with twice the calls is visible.
+
+### How would you pick k for a RAG agent's search tool?
 - **Start from the context budget:** k is the number of passages the generator actually receives after
   reranking.
 - **Sweep it:** measure answer quality at several k; recall keeps rising but answer quality flattens or

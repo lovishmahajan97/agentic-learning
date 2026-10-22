@@ -5,7 +5,8 @@ name: ruff
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/mypy
   - python-for-ai/pytest
@@ -19,9 +20,21 @@ sources:
 ---
 
 ## TL;DR
-Ruff is a Rust-written Python linter and formatter that replaces flake8 and its plugins, isort,
-pyupgrade, most of bandit, part of pylint, and Black with one fast binary and one config. It checks style
-and likely bugs, not types.
+Ruff is a fast Rust-written Python linter and formatter replacing flake8 and its plugins, isort,
+pyupgrade, most of bandit, part of pylint, and Black. For agents its value is catching blocking calls,
+lost tasks and unsafe tool code; it checks likely bugs, not types.
+
+## For agent builders
+- **Why it matters for agents.** Agent tools are where model-chosen input meets your process: a shell
+  tool with `shell=True`, a calculator built on `eval`, a sync HTTP call inside an async tool, a memory
+  write fired as an unreferenced task. Ruff flags each by rule code before the model ever reaches it.
+- **Where it shows up in your stack.** One `[tool.ruff.lint]` block in `pyproject.toml`, the editor, a
+  pre-commit hook and CI, all on one pinned version, next to mypy and pytest.
+- **What you control.** The rule families: `ASYNC` for async agent services, `S` for tool code that runs
+  processes, SQL or `eval`, `B` and `RUF` for likely bugs. Also which findings are fixed automatically and
+  which need a design change.
+- **What you can skip.** Style debates and the full rule catalogue; `ruff rule <code>` explains any rule
+  when it appears.
 
 ## Why it exists
 - **The old toolchain was five or six tools.** flake8 for errors and style, several flake8 plugins
@@ -106,6 +119,19 @@ Each rule code's prefix names the tool it re-implements.
 - **Not a type checker:** Ruff does not know that a value may be `None`, which is mypy's or pyright's job,
   so the two run side by side.
 
+### Rules that map to agent incidents
+| Agent incident | Typical code | Rule (family) |
+|---|---|---|
+| One slow tool stalls every concurrent agent run | `requests.get` or `subprocess.run` inside an async tool | `ASYNC210`, `ASYNC221` (`ASYNC`) |
+| A background memory or trace write vanishes | `asyncio.create_task(...)` with no stored reference | `RUF006` (`RUF`) |
+| Prompt injection becomes command execution | shell tool using `shell=True` | `S602` (`S`) |
+| Model-written "math" runs arbitrary code | calculator tool calling `eval` | `S307` (`S`) |
+| Tool failures hidden from the model | `except Exception: return ""` | `BLE001` (`BLE`, not in the baseline below) |
+| Tenant data leaks across agents | SQL tool built with f-strings | `S608` (`S`) |
+
+- **Rules are a floor, not a sandbox.** A lint rule catches `eval` and `shell=True` by name; isolating
+  what a tool can reach is still the sandbox's and permission layer's job.
+
 ## Diagram
 Follow one `ruff check` run: a single parse per file feeds every enabled rule, and each finding ends in a
 safe fix, an opt-in unsafe fix, or a human decision.
@@ -126,6 +152,51 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: linting a tool module
+Four tools an agent can call, linted with the configuration in the next example. Findings below are
+from `ruff check --output-format concise tools.py` on Ruff 0.17.1.
+
+```python
+import asyncio
+import subprocess
+
+import requests
+
+
+async def save_memory(note: str) -> None: ...
+
+
+async def run_shell(command: str) -> str:
+    out = subprocess.run(command, shell=True, capture_output=True, text=True)  # ASYNC221, S602
+    asyncio.create_task(save_memory(command))                                  # RUF006
+    return out.stdout
+
+
+async def fetch_page(url: str) -> str:
+    return requests.get(url, timeout=10).text                                  # ASYNC210
+
+
+def calculator(expression: str) -> float:
+    return eval(expression)                                                    # S307
+
+
+def read_file(path: str) -> str:
+    try:
+        return open(path).read()
+    except Exception:                      # BLE001 only if you add the BLE family
+        return ""
+```
+
+| Finding | Why it matters in an agent | Fix |
+|---|---|---|
+| `S602` | the model chooses `command`, so injected text runs in a shell | argument list without a shell, an allowlist, a sandbox |
+| `ASYNC221`, `ASYNC210` | each call blocks the loop for every concurrent run | `asyncio.create_subprocess_exec`, an async HTTP client |
+| `RUF006` | the memory write can be garbage-collected mid-flight | keep the task in a set or a `TaskGroup` |
+| `S307` | model-written expressions execute as Python | a restricted parser such as `ast.literal_eval` or a math library |
+
+- **Five findings, all design changes:** none has a safe autofix, which is why tool modules deserve the
+  `S` and `ASYNC` families even when the rest of the repo uses a lighter selection.
+
 ### Config and snippet for an async AI service
 A configuration, then a snippet with the findings Ruff reports under it. The comments name the rule
 codes; each is a real defect class, not cosmetics.
@@ -218,6 +289,10 @@ repos:
   so comments are removed as code is fixed. Track the count of `noqa` comments over time.
 - **CI annotations, no writes.** Run `ruff check --output-format github` and `ruff format --check` in the
   pipeline, so findings appear inline on the pull request and nothing is fixed in a throwaway checkout.
+- **Stricter rules for tool code.** Agent tools run on model-chosen input, so give the tools package the
+  full `S`, `ASYNC` and `BLE` families with a nested config in that directory that inherits the root one
+  and uses `extend-select`, and require review of any `noqa` there.
+  Monitor `noqa` comments in the tools package separately from the rest of the repo.
 - **Triage with statistics.** Before enabling a new family, run `ruff check --select ASYNC --statistics`
   to see counts per rule, fix the defect classes first (`ASYNC`, `B006`, `RUF006`, `S608`), then enable
   the family as an error.
@@ -243,6 +318,9 @@ repos:
   including the real bug someone adds to it later.
 - **Different Ruff versions locally, in pre-commit and in CI.** Symptom: findings that appear only in CI or
   fixes that flip back and forth between machines. Fix: pin one version everywhere.
+- **Treating a clean Ruff run as tool safety.** Symptom: a tool that passes lint because it calls a
+  wrapper around `subprocess` defined in another module, which Ruff cannot follow. Fix: sandbox and
+  allowlist tools regardless, and keep dangerous calls inside one reviewed module.
 - **Treating a clean Ruff run as type safety.** Symptom: `None` attribute errors in production in code
   Ruff passed, because Ruff does not reason about types.
 - **A line-length lint rule and the formatter with different limits.** Symptom: findings the formatter can
@@ -291,6 +369,14 @@ tokenising a huge document, is invisible to it. You confirm with asyncio debug m
   that can be garbage-collected (`RUF006`).
 - **`S`:** SQL built from strings (`S608`) and other bandit checks, plus the defaults `E` and `F`, `I` for
   imports and `UP` for current syntax.
+
+### What would Ruff flag in an agent's tool implementations, and what would it miss?
+- **It flags dangerous calls by name:** `S602` for a shell tool with `shell=True`, `S307` for `eval` in a
+  calculator tool, `ASYNC210` and `ASYNC221` for blocking calls in async tools, `RUF006` for
+  unreferenced background tasks.
+- **It misses anything indirect:** a dangerous call behind your own helper in another module, or a tool
+  that is safe in code but has too broad a permission.
+- **So pair it with a sandbox and an allowlist**, and treat its findings in tool code as review blockers.
 
 ### You turn on ASYNC and B in a legacy repo and get 900 findings. How do you roll it out?
 - **Triage first** with `ruff check --statistics`, and fix the defect classes that matter in production

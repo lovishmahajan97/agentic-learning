@@ -5,7 +5,8 @@ name: Adversarial evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/red-teaming
   - prompting/prompt-injection
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Adversarial evaluation turns inputs chosen to make a system fail (jailbreaks, injected instructions,
-perturbations, grader-fooling outputs) into a versioned suite with attack success per class, run every
-release next to over-refusal, because average-case evals miss the worst case.
+Adversarial evaluation turns inputs chosen to make an agent fail (jailbreaks, instructions injected via
+tool results, perturbations, grader-fooling outputs) into a versioned suite with attack success per
+class, run every release beside over-refusal, because average-case evals miss the worst case.
+
+## For agent builders
+- **Why it matters for agents.** An agent reads untrusted text (web pages, emails, tickets, tool
+  results) and holds tools that act. One injected instruction in a retrieved document can trigger
+  `send_email` or a refund, so the worst case is an unauthorised action, not a rude sentence.
+- **Where it shows up in your stack.** A canary-graded attack suite in your eval harness or promptfoo
+  red-team configs, guardrail layers you must measure rather than trust, and the agent's tool-call trace
+  as the grading source.
+- **What you control.** The threat model (channels crossed with goals), canaries planted in payloads,
+  *k* samples per attack, the zero-success gates on critical tool cells, held-out templates and the
+  over-refusal set beside every gate.
+- **What you can skip.** Running gradient attacks yourself. Know GCG suffixes transfer and include
+  published ones; spend your effort on indirect-injection cells against your own tools.
 
 ## Why it exists
 - **Golden sets measure the centre; incidents live in the tail.** The tail is not sampled: someone goes
@@ -263,6 +277,9 @@ Illustrative numbers. A support agent's report averages ASR over technique cells
   time. Fix: worst case per goal.
 - **Testing only the user channel.** Symptom: a clean jailbreak score and an agent obeying instructions
   hidden in a retrieved web page. Fix: indirect-injection cells.
+- **Grading the agent's reply instead of its trace.** Symptom: a polite refusal in the text while the
+  trace shows the injected `send_email` call already ran. Fix: grade tool-goal cells on tool calls,
+  attempted ones included, not on the final message.
 - **Hardening to zero with no benign-edgy set.** Symptom: support tickets about refusals on ordinary
   questions. Fix: an over-refusal ceiling.
 - **Attack cases leaking into prompts or fine-tuning data.** Symptom: zero ASR on the suite and
@@ -323,7 +340,7 @@ last run, and does it run on every prompt and model change with a held-out slice
 - **To claim under 1%** you need roughly 300 clean trials (rule of three: 3/n).
 - **Also check retries:** gate on whether any of *k* samples succeeded, since attackers retry.
 
-### Hardening cut ASR sharply but support complaints rose. What happened and what do you do?
+### Hardening your support agent cut ASR sharply but support complaints rose. What happened and what do you do?
 - **Likely over-refusal:** the cheapest route to low ASR is refusing anything that looks risky.
 - **Measure it:** a benign-but-edgy set (XSTest style) from your domain, reported beside ASR.
 - **Rebalance:** target the cells that were actually broken instead of broad refusals, and gate both

@@ -5,7 +5,8 @@ name: pytest
 kind: tool
 difficulty: intro
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/pytest-asyncio
   - python-for-ai/test-doubles-mocks-fixtures
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-pytest is the de facto Python test runner: informative plain `assert`, fixtures injected by argument
-name, parametrized case tables and a plugin hook system. It makes the cheap way to write tests the
-correct one.
+pytest is how you test the deterministic shell around an agent: tool dispatch, output parsers, prompt
+builders and loop control, with a scripted fake model. Plain `assert`, injected fixtures and
+parametrized case tables make thirty cases as cheap as three.
+
+## For agent builders
+- **Why it matters for agents.** The model is nondeterministic, but everything around it is not: the
+  loop that stops after N steps, the dispatcher that rejects malformed tool arguments, the parser for
+  fenced JSON. Those bugs cause most agent incidents, and pytest pins them down without a single token.
+- **Where it shows up in your stack.** A `fake_llm` fixture in the root `conftest.py`, parametrized
+  tables of model replies, marker lanes (`integration`, `e2e`) that keep real-API tests off pull
+  requests, and offline eval suites that many teams also run under pytest.
+- **What you control.** Fixture scope for costly resources (tokenizer, vector store container), which
+  lane may call a real model, a suite-wide block on network access, and timeouts so a hung model call
+  cannot stall CI.
+- **What you can skip.** Writing plugins and hook functions yourself. Know that plugins exist and change
+  fixture behaviour (xdist, asyncio); you rarely author one.
 
 ## Why it exists
 - **unittest is a JUnit port with ceremony.** Every test lives in a `TestCase` subclass, every assertion
@@ -30,7 +44,7 @@ correct one.
   per class with no way to compose shared resources.
 - **Failures are opaque.** A failing `assertEqual(a, b)` prints `3 != 4` and nothing about where 3 came
   from. A plain `assert a == b` is worse: Python's own `AssertionError` carries no message at all.
-- **AI code needs many cases.** Chunkers with boundary conditions, prompt builders that escape user
+- **Agent code needs many cases.** Chunkers with boundary conditions, prompt builders that escape user
   text, parsers for possibly fenced JSON, tool dispatchers that reject malformed arguments, retry
   wrappers that stop after N attempts. Each needs a table of inputs plus shared, expensive setup.
 - **Friction cuts coverage.** If each table row costs a class and each setup costs a method, people
@@ -40,6 +54,18 @@ correct one.
   as plugins through the same hook mechanism.
 
 ## How it works
+### What to test in an agent repo
+| Layer | Deterministic? | How pytest covers it |
+|---|---|---|
+| Tool functions and their argument validation | yes | plain unit tests, parametrized bad inputs |
+| Dispatcher: tool name to function, errors fed back | yes | scripted fake model replies |
+| Loop control: step budget, stop condition, retries | yes | fake model that never says "final" |
+| Prompt and message assembly | yes | assert on the exact messages sent |
+| The model's judgement | no | eval suites and recorded runs, in a separate lane |
+
+- **Rule of thumb:** the unit lane never calls a model. It feeds scripted replies through the real loop,
+  because that is where the deterministic bugs live.
+
 ### Discovery and collection
 1. `pytest` walks `testpaths` (or the current directory).
 2. It imports files matching `test_*.py` or `*_test.py`.
@@ -53,6 +79,7 @@ correct one.
   package registered with `pytest.register_assert_rewrite`), it rewrites the AST so each `assert expr`
   evaluates sub-expressions, keeps their values and builds a message on failure.
 - **Result:** `assert len(chunks) == n` fails with `assert 4 == 3` and ` +  where 4 = len([...])`.
+  For an agent test, `assert calls[1][-1]["role"] == "tool"` shows the actual message list.
 - **Import time, not tracing**, because tracing would slow every test and could not see inside a single
   expression.
 - **Test modules only**, because changing bytecode in production code would be a surprising side effect.
@@ -62,19 +89,20 @@ correct one.
 A fixture is a function decorated with `@pytest.fixture`. A test that names it as a parameter gets its
 return value; pytest resolves the dependency graph (fixtures can depend on fixtures) per test.
 
-| Scope | Lifetime |
-|---|---|
-| `function` (default) | rebuilt per test |
-| `class` | once per test class |
-| `module` | once per test file |
-| `package` | once per package |
-| `session` | once per run |
+| Scope | Lifetime | Agent example |
+|---|---|---|
+| `function` (default) | rebuilt per test | scripted fake LLM, message history |
+| `class` | once per test class | rarely needed |
+| `module` | once per test file | a seeded in-memory vector index |
+| `package` | once per package | shared fixtures for one tool package |
+| `session` | once per run | loaded tokenizer, vector-DB container |
 
 - **`yield` splits setup from teardown**, and teardown runs even when the test fails.
 - **`conftest.py` sharing.** Fixtures declared there are visible to every test in that directory tree
   without imports; that is how a project shares its `fake_llm` or `db` fixture.
-- **Built-ins:** `tmp_path` (fresh directory), `monkeypatch` (undoable attribute and env-var changes),
-  `capsys` and `caplog` (captured stdout and log records), `request` (introspection of the calling test).
+- **Built-ins:** `tmp_path` (fresh directory, ideal as an agent's scratch workspace), `monkeypatch`
+  (undoable attribute and env-var changes), `capsys` and `caplog` (captured stdout and log records),
+  `request` (introspection of the calling test).
 - **Scope rule.** A higher-scoped fixture cannot depend on a lower-scoped one, because a session-wide
   object cannot be rebuilt once per test; violating it raises `ScopeMismatch` at setup.
 
@@ -90,8 +118,10 @@ Three more rules explain most fixture surprises:
 ### Parametrization
 - **`@pytest.mark.parametrize("raw,expected", cases, ids=[...])`** expands one function into one test
   per row, each with its own id such as `test_parse[fenced-json]`.
-- **Stacking two decorators** yields the Cartesian product.
-- **`pytest.param(..., marks=pytest.mark.xfail)`** marks a single row.
+- **Stacking two decorators** yields the Cartesian product, for example every tool times every malformed
+  argument shape.
+- **`pytest.param(..., marks=pytest.mark.xfail)`** marks a single row, such as a known model-output
+  shape your parser does not handle yet.
 - **Fixtures can be parametrized too** (`params=`): every dependent test runs once per parameter. A
   `store` fixture parametrized over `["memory", "pgvector"]` runs the whole store suite on both backends.
 
@@ -101,7 +131,7 @@ Three more rules explain most fixture surprises:
   with `-m "not e2e"`.
 - **`--strict-markers`** turns a marker typo into an error, because an unregistered marker otherwise
   produces only a `PytestUnknownMarkWarning` that is easy to miss. The misspelled test is then not
-  matched by `-m`, so it runs in the wrong lane.
+  matched by `-m`, so it runs in the wrong lane and may bill real tokens.
 
 | Option | Effect |
 |---|---|
@@ -116,12 +146,12 @@ Three more rules explain most fixture surprises:
 - **Plugins** are ordinary packages that implement `pytest_*` hook functions and register an entry point;
   `conftest.py` can implement the same hooks locally.
 
-| Plugin an AI engineer meets weekly | What it adds |
+| Plugin an agent builder meets weekly | What it adds |
 |---|---|
-| `pytest-asyncio` | coroutine tests |
+| `pytest-asyncio` | coroutine tests, for async agent loops and SDK clients |
 | `pytest-xdist` | `-n auto` distributes tests across one worker process per CPU core |
 | `pytest-cov` | coverage |
-| `pytest-timeout` | kills hung tests |
+| `pytest-timeout` | kills hung tests, such as a stuck model call |
 | `pytest-mock` | the `mocker` fixture |
 | Hypothesis | registers its own settings and database handling |
 
@@ -132,26 +162,84 @@ Three more rules explain most fixture surprises:
 
 ## Diagram
 Follow one run: collection and assertion rewriting happen before any test executes, then each test
-resolves its fixture graph, runs, and tears fixtures down in reverse order.
+resolves its fixture graph (here, the fake model), runs, and tears fixtures down in reverse order.
 
 ```mermaid
 flowchart TD
     S["pytest invoked"] --> C["Collect: walk testpaths, import test_*.py"]
     C -->|"import hook"| R["Rewrite assert statements in test modules"]
     R --> P["Expand parametrize rows into test ids"]
-    P --> F["Select with -k and -m"]
+    P --> F["Select lane with -k and -m"]
     F --> G["Resolve fixture graph by argument name"]
-    G --> CF[("conftest.py fixtures, nearest wins")]
+    G --> CF[("conftest.py: fake_llm, nearest wins")]
     CF --> U["Setup: run fixtures up to yield, honouring scope"]
-    U --> T["Call the test function"]
+    U --> T["Call the test: agent loop with scripted replies"]
     T --> D["Teardown in reverse setup order"]
     D --> O["Report: pass, fail with operand values, skip, xfail"]
     D -->|"next test reuses cached higher-scope fixtures"| G
 ```
 
 ## Examples
+### Agent scenario: testing a tool-calling loop with a scripted model
+Self-contained; save as `test_agent_loop.py` and run `pytest -q`. The fake returns pre-written replies
+and records every request, so tests assert on what the loop sent.
+
+```python
+import json
+import pytest
+
+class ScriptedLLM:
+    def __init__(self, replies):
+        self.replies, self.calls = list(replies), []
+    def complete(self, messages):
+        self.calls.append([dict(m) for m in messages])     # snapshot what the loop sent
+        return self.replies.pop(0)
+
+TOOLS = {"get_weather": lambda city: {"city": city, "temp_c": 18}}
+
+def run_agent(llm, user_msg, max_steps=5):
+    messages = [{"role": "user", "content": user_msg}]
+    for _ in range(max_steps):
+        reply = llm.complete(messages)
+        if reply["type"] == "final":
+            return reply["text"], messages
+        fn = TOOLS.get(reply["name"])
+        result = fn(**reply["args"]) if fn else {"error": f"unknown tool {reply['name']}"}
+        messages.append({"role": "tool", "name": reply["name"], "content": json.dumps(result)})
+    raise RuntimeError("step budget exhausted")
+
+CALL = {"type": "tool", "name": "get_weather", "args": {"city": "Oslo"}}
+FINAL = {"type": "final", "text": "18 C in Oslo"}
+
+@pytest.fixture
+def llm():
+    return ScriptedLLM([CALL, FINAL])
+
+def test_tool_result_reaches_model(llm):
+    text, _ = run_agent(llm, "weather in Oslo?")
+    assert text == "18 C in Oslo"
+    assert json.loads(llm.calls[1][-1]["content"])["temp_c"] == 18
+
+def test_unknown_tool_is_reported_not_raised():
+    llm = ScriptedLLM([{"type": "tool", "name": "rm_rf", "args": {}}, FINAL])
+    run_agent(llm, "clean up")
+    assert "unknown tool" in llm.calls[1][-1]["content"]
+
+@pytest.mark.parametrize("budget", [1, 3, 5])
+def test_loop_stops_at_budget(budget):
+    llm = ScriptedLLM([CALL] * budget)          # a model that never finishes
+    with pytest.raises(RuntimeError, match="budget"):
+        run_agent(llm, "loop forever", max_steps=budget)
+    assert len(llm.calls) == budget
+```
+
+- **No tokens, no flakiness.** Five tests cover the happy path, the error-feedback path and the runaway
+  loop, which are exactly the behaviours a real model run would hit only occasionally.
+- **Assert on the transcript.** `llm.calls` is the message list the model saw; checking it catches a
+  dropped tool result or a wrong role before a model ever does.
+
 ### Chunker suite: session fixture, parametrized ids, `pytest.raises`
-The chunker counts whitespace tokens so the arithmetic in the ids is checkable by hand.
+The RAG chunker counts whitespace tokens so the arithmetic in the ids is checkable by hand.
 
 ```python
 # tests/conftest.py
@@ -197,7 +285,8 @@ def test_rejects_non_text(chunker, bad):
   `test_overlap_is_shared_tokens`.
 
 ### Runnable: a model-output parser as a case table
-Self-contained; save as `test_parse.py` and run `pytest -q test_parse.py`.
+Self-contained; save as `test_parse.py` and run `pytest -q test_parse.py`. This is the parser between
+the model's reply and your tool dispatcher.
 
 ```python
 import json, re
@@ -234,10 +323,11 @@ def test_parse_rejects(raw, exc):
 
 Five ids such as `test_parse_ok[fenced-json]` show up in the report, so a regression names the input
 shape that broke. `json.JSONDecodeError` is a subclass of `ValueError`, so the "prose" row asserts the
-narrower class on purpose.
+narrower class on purpose. When production logs show a new reply shape, add it as a row.
 
 ### Worked scenario: a session fixture under xdist
-A suite has a session fixture that starts a vector-DB container in ~20 s (illustrative figure).
+An agent's retrieval tests use a session fixture that starts a vector-DB container in ~20 s
+(illustrative figure).
 
 | Run | Workers | Container starts | Fixed setup cost |
 |---|---|---|---|
@@ -256,20 +346,22 @@ The fix that teams use is the xdist docs pattern: guard startup with a file lock
 ## Production patterns
 - **Lane split with strict markers.** Register `integration` and `e2e` under `markers`, set
   `addopts = "-ra --strict-markers"`, run `-m "not integration and not e2e"` on every pull request and
-  the slower lanes nightly or on merge. Monitor PR-lane wall time with `--durations=10`.
+  the slower, model-calling lanes nightly or on merge. Monitor PR-lane wall time with `--durations=10`.
 - **No real network in unit tests.** An `autouse` fixture in the root `conftest.py` uses `monkeypatch` to
   replace `socket.socket.connect` with a function that raises. A test that reaches a real LLM API then
   fails loudly instead of billing tokens. Monitor: any unit test that needs an opt-out marker.
+- **Production failures become case rows.** When an agent trace shows a reply your parser or dispatcher
+  mishandled, paste the raw reply into a parametrized table with a descriptive id. The table grows into
+  a regression suite of real model behaviour. Monitor how many rows came from incidents.
 - **Warnings as errors.** Set `filterwarnings = ["error"]` and whitelist known third-party warnings one
   by one, so deprecations from SDK upgrades fail CI before they become breakages. Review the whitelist on
   each dependency bump.
 - **Hang protection.** With `pytest-timeout`, set a suite-wide `timeout` in config (or `--timeout=60`),
   because a stuck model call or event loop otherwise hangs CI until the job limit. Track which tests hit
   the timeout.
-- **Order-independence check.** Run with `pytest-randomly` so order changes every run; on a failure,
-  replay with the printed `--randomly-seed=<n>`. Monitor the flake rate per test id.
-- **Shared fakes in root `conftest.py`.** Keep `fake_llm`, settings overrides and a temp workspace there,
-  and replace them in `tests/integration/conftest.py` with real clients by shadowing the same name.
+- **Order-independence and shared fakes.** Run with `pytest-randomly` so order changes every run and
+  replay failures with `--randomly-seed=<n>`. Keep `fake_llm`, settings overrides and a temp workspace in
+  the root `conftest.py`, and shadow them in `tests/integration/conftest.py` with real clients.
 
 ## Trade-offs
 - **Concise injection vs hidden wiring.** Fixtures by name are short, but `conftest.py` hides where a
@@ -279,7 +371,10 @@ The fix that teams use is the xdist docs pattern: guard startup with a file lock
   assertions in a non-test package get the plain `AssertionError` unless you register them.
 - **Session scope speed vs isolation.** It saves minutes when the resource is a loaded model or a
   container, but mutable state leaks between tests; the saving flips into flakiness the moment one test
-  writes to the shared object.
+  writes to the shared object, such as an agent memory store.
+- **Scripted fakes vs realism.** A scripted model makes loop tests fast and exact, but it only replays
+  replies you imagined; it cannot tell you the real model emits a new shape. Pair it with a recorded or
+  live lane.
 - **Free plugins vs interactions.** Parallelism, coverage and async support come cheap, but each adds
   configuration interactions (xdist and session fixtures, asyncio loop scopes) you must understand when a
   test passes alone and fails in the suite.
@@ -290,26 +385,29 @@ The fix that teams use is the xdist docs pattern: guard startup with a file lock
 ## Pitfalls
 - **Misspelled marker, wrong lane.** Symptom: an `e2e` test hits a real API on every pull request. Fix:
   `--strict-markers` turns this into a collection error.
-- **Passes alone, fails together.** Usually a shared fixture mutated by an earlier test. `pytest-randomly`
-  shuffles order and prints its seed, `--randomly-seed=<n>` replays it, and running the suspected pair
-  alone confirms the dependence.
+- **Passes alone, fails together.** Usually a shared fixture mutated by an earlier test, such as a
+  session-scoped agent memory. `pytest-randomly` shuffles order and prints its seed,
+  `--randomly-seed=<n>` replays it, and running the suspected pair alone confirms the dependence.
 - **Floats compared with `==`.** Embedding similarities and loss values differ in the last bits across
   BLAS builds. Fix: `pytest.approx(expected, rel=1e-6)`.
 - **Catching too broadly.** `pytest.raises(Exception)` lets a `TypeError` from a typo pass as the intended
   `ValueError`; use the specific class and `match=` on the message.
+- **Fake model drifts from the real one.** Symptom: loop tests pass but production crashes on a reply
+  shape the fake never produced. Fix: build fake replies from recorded real responses, not hand-typed
+  dictionaries.
 - **Lost `print` debugging.** pytest captures stdout and only shows it for failures. `-s` disables
   capture; `capsys` asserts on it.
 
 ## When to use
-- **Use for:** every Python test, including inherited unittest-style classes; no modern Python scenario
-  makes a different runner the better default.
+- **Use for:** every Python test in an agent codebase, including inherited unittest-style classes; no
+  modern Python scenario makes a different runner the better default.
 - **Decide:** which fixtures live in the root `conftest.py` (fake LLM, settings override, temporary
   directory layout) versus a package-local one, which resources deserve session scope, and which markers
   split fast unit tests from integration and model-calling lanes.
 - **Measure:** suite wall time with `--durations`; keep the pull-request lane under a few minutes,
   because a slow suite is one people stop running.
 - **Interviews:** explain assertion rewriting, fixture scopes and the `conftest.py` lookup, and sketch a
-  parametrized test for a parser of model output on the spot.
+  test for an agent loop with a scripted model on the spot.
 
 ## Role lens
 - **Engineer:** Writes parametrized tests for chunkers, prompt builders and output parsers, keeps a
@@ -334,12 +432,20 @@ tests, and a hook system that lets plugins own concerns like async loops and par
 change the economics of writing tests, which is why suites built on pytest have more cases.
 
 ## Interview questions
+### How do you unit test an agent loop when the model is nondeterministic?
+- **Separate the deterministic shell from the model.** The loop, dispatcher, parser and stop conditions
+  are ordinary code; inject the model client so a test can pass a scripted fake.
+- **Script the replies, assert on the transcript.** The fake returns a tool call, then a final answer,
+  and records every message list it received, so the test checks the tool result reached the model.
+- **Cover the rare paths on purpose:** unknown tool, malformed arguments, a model that never finishes,
+  each as a parametrized case.
+
 ### What is a fixture's scope, and how do you choose one?
 - **Definition:** scope sets how often pytest rebuilds the fixture: `function` (default), `class`,
   `module`, `package` or `session`. The value is cached and shared for that lifetime.
 - **Choose by cost and mutability.** Use session scope for expensive, read-only resources such as a loaded
-  tokenizer or a container; keep anything a test mutates at function scope, because shared mutable state
-  leaks between tests.
+  tokenizer or a container; keep anything a test mutates, such as agent memory, at function scope,
+  because shared mutable state leaks between tests.
 - **Constraint:** a wider-scoped fixture cannot depend on a narrower one, or setup raises `ScopeMismatch`.
 
 ### A test passes alone but fails in the full suite. How do you debug it?
@@ -357,12 +463,13 @@ change the economics of writing tests, which is why suites built on pytest have 
   only the first worker starts it.
 - **Isolate data per worker** with the `worker_id` fixture, for example a collection name suffixed with it.
 
-### When would you not use autouse fixtures?
-- **Avoid them for setup only some tests need**, because an autouse fixture is invisible in the test's
-  signature and readers cannot tell where state comes from.
-- **Keep them for suite-wide invariants**, such as blocking real network calls or resetting settings, where
-  forgetting to request the fixture would be the real bug.
-- **Trade-off:** safety by default versus readability; name the fixture explicitly when in doubt.
+### How do you stop agent tests from silently calling a paid model API in CI?
+- **Block the network by default** with an `autouse` fixture in the root `conftest.py` that patches
+  `socket.socket.connect` to raise, so any accidental real call fails loudly.
+- **Put real-model tests in a registered lane** (`integration` or `e2e`) with `--strict-markers`, so a
+  typo cannot move them into the pull-request lane.
+- **Trade-off:** autouse fixtures hide setup, which is acceptable for a suite-wide invariant like this
+  and not for setup only some tests need.
 
 ### How would you keep a pull-request test lane fast as the suite grows to thousands of tests?
 - **Split lanes with registered markers** and `--strict-markers`, running `-m "not integration and not

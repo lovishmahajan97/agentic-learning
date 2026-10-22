@@ -5,7 +5,8 @@ name: Metadata filtering
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/ann-indexes
   - rag-retrieval/vector-databases
@@ -22,16 +23,29 @@ sources:
 ---
 
 ## TL;DR
-Metadata filtering stores structured attributes (tenant, date, type, version) next to each vector and
-applies them as hard predicates *inside* the search. The real question is where the predicate runs:
-before the ANN walk, during it, or after it.
+When your agent calls a search tool with "contracts, last 90 days", metadata filtering turns those
+arguments into hard predicates applied *inside* the vector search. Where the predicate runs (before,
+during or after the ANN walk) decides whether the agent gets ten answers or none.
+
+## For agent builders
+- **Why it matters for agents.** Agents scope their own searches: the model fills `doc_type`, date
+  ranges and language as tool arguments. A filter that silently returns zero hits makes the agent retry,
+  rephrase or hallucinate, so filter behaviour shows up as wasted steps and wrong answers.
+- **Where it shows up in your stack.** The filter argument of your retriever tool (LangChain and
+  LlamaIndex retrievers accept metadata filters), Qdrant payload filters, pgvector `WHERE` clauses and
+  Weaviate filters behind them, and the self-query pattern that turns natural language into predicates.
+- **What you control.** Which fields the tool schema exposes as enums, the code that validates the
+  model's arguments, the tenant and ACL predicates injected from the authenticated session (never from
+  the model), and the fallback when a filtered search comes back empty.
+- **What you can skip.** The internals of how each engine repairs filtered HNSW graphs. Know the k·s
+  arithmetic, the selectivity bands and that you must measure filtered recall; that is enough.
 
 ## Why it exists
 - **Embeddings encode topic, not ownership.** A vector says what a chunk is about, not which tenant owns
   it, when it was written or which product version it describes.
 - **Similarity is soft; real constraints are hard.** "Only the 2025 travel policy", "only this customer's
   tickets", "only contracts, not emails", "only French". The 2024 and 2025 versions are near-duplicates,
-  so they are each other's nearest neighbours; the top-k fills with the wrong year and the model
+  so they are each other's nearest neighbours; the top-k fills with the wrong year and the agent
   confidently answers from stale rules.
 - **Writing the attribute into the text fails.** "Year: 2025. Tenant: acme." barely moves a vector that
   compresses hundreds of tokens, so the "filter" is probabilistic at best. It cannot express ranges,
@@ -41,6 +55,16 @@ before the ANN walk, during it, or after it.
   vector databases ship payload indexes and filtered graph traversal instead of leaving it to the caller.
 
 ## How it works
+### The agent's view: filters are tool arguments
+1. **The tool schema exposes filter fields.** Typed and enumerated (`doc_type`, `language`, a
+   `created_at` range), so the model picks from a fixed set instead of inventing values.
+2. **The model fills them** from the user's request, or from its own plan ("check last quarter only").
+3. **Your handler validates** each argument against an allowlist and drops unknown fields.
+4. **Your handler injects security predicates** (`tenant_id`, principals) from the session.
+5. **The engine executes** the combined predicate inside the search, as described below.
+6. **The handler reports back** to the model: results, plus whether the filter was relaxed, so the agent
+   can tell the user rather than loop.
+
 ### Why post-filtering breaks: the k·s arithmetic
 Let *s* be the fraction of the corpus that passes the filter. If the unfiltered top-k is roughly a random
 sample with respect to that attribute, about *k·s* results survive.
@@ -53,6 +77,8 @@ sample with respect to that attribute, about *k·s* results survive.
 - **Over-fetching only half-fixes it.** ANN recall degrades at large k and latency grows.
 - **Survivors are still not the true top-10 among matching rows**, because those may sit outside the
   unfiltered top-1,000 entirely.
+- **For an agent, an empty list is not neutral.** The model reads "no results" as "no such document" and
+  either answers wrongly or spends more tool calls retrying.
 
 ### Representing metadata
 Each vector carries a payload: `tenant_id`, `doc_id`, `source`, `doc_type`, `language`, `created_at`
@@ -70,6 +96,8 @@ allowed principals.
 - **A filterable field needs a payload index** (a bitmap or inverted index keyed by value), exactly as a
   relational column needs an index. Without it the engine scans every candidate's payload and filtered
   latency grows linearly with collection size.
+- **Keyword fields map cleanly to tool-schema enums**, which is the cheapest way to stop the model
+  inventing values like `"doc_type": "agreements"`.
 
 ### Three places the predicate can run
 1. **Pre-filtering.** Evaluate the predicate first with the payload index to get the allowed IDs.
@@ -126,7 +154,8 @@ Each fix costs memory, build time or per-hop work, so none is free and measuring
 | Large (most rows pass) | filtered traversal costs about the same as unfiltered; even post-filtering with modest over-fetch works |
 
 Measure the middle band: run labeled queries with their real filters and compute recall@k per
-selectivity bucket, not just unfiltered.
+selectivity bucket, not just unfiltered. Agent-chosen filters drift toward this band, because models
+stack constraints (type plus date plus language).
 
 ### Multi-tenancy is the most common filter
 | Layout | Gain | Cost |
@@ -135,16 +164,17 @@ selectivity bucket, not just unfiltered.
 | Shared collection + `tenant_id` predicate on every query | one index, cheap | enforcement must live in code the caller cannot bypass |
 | Tenant-aware layout (Qdrant's tenant payload index option, Weaviate's native per-tenant shards) | filtered search touches one region | engine-specific setup |
 
-The tenant predicate is on every request, so it must be the cheapest predicate you have. The ACL-aware
-retrieval lesson covers the security side.
+The tenant predicate is on every request, so it must be the cheapest predicate you have. In an agent the
+"caller" includes the model, so the tenant must never be a tool argument. The ACL-aware retrieval lesson
+covers the security side.
 
 ### Where filter values come from
 - **The UI:** date pickers, product selectors.
 - **The authenticated request:** tenant, principals. Never from the request body or the model.
 - **An LLM parsing natural language** ("last quarter's incident reports") into structured predicates: the
-  self-query pattern from query rewriting. Validate against an allowlist of fields and values, never let
-  it touch security fields, and add a fallback (retry without the filter, or ask), because a misparsed
-  predicate silently returns an empty result set.
+  self-query pattern from query rewriting, or simply the agent filling tool arguments. Validate against
+  an allowlist of fields and values, never let it touch security fields, and add a fallback (retry
+  without the filter, or ask), because a misparsed predicate silently returns an empty result set.
 
 ### Filters and the rest of the pipeline
 - **Same predicate in every arm.** Apply it in BM25 and dense (hybrid search) and before reranking,
@@ -153,23 +183,69 @@ retrieval lesson covers the security side.
   trigger re-computing its vectors.
 
 ## Diagram
-Follow a filtered query: security predicates come from identity, the payload index estimates
-cardinality, and that estimate picks exact brute force or filtered HNSW traversal.
+Follow an agent's filtered search: the model proposes arguments, code validates them and injects the
+tenant from auth, and the payload index estimate picks brute force or filtered HNSW traversal.
 
 ```mermaid
 flowchart TD
-    Q["Query plus user filters"] --> B["Filter builder: allowlist fields, inject tenant from auth"]
+    A["Agent tool call with filter args"] --> B["Handler: allowlist args, inject tenant from auth"]
     B --> P["Payload index: estimate matching rows"]
     P --> S{"Matching set below engine threshold?"}
-    S -->|"yes, small set"| BF["Pre-filter: exact brute force over allowed IDs"]
-    S -->|"no, large set"| FT["Filtered HNSW traversal, predicate checked per candidate"]
+    S -->|"yes, small set"| BF["Pre-filter: exact brute force"]
+    S -->|"no, large set"| FT["Filtered HNSW traversal"]
     BF --> R["Top-k that all pass the predicate"]
     FT --> R
-    R --> H["Same predicate in BM25 arm, then rerank"]
-    FT -.->|"selective filter strands the walk"| L["Recall drop: measure per selectivity bucket"]
+    R --> E{"Empty result?"}
+    E -->|"yes"| X["Relax model filters, keep tenant, flag it"]
+    E -->|"no"| O["Tool result back to the agent"]
+    X --> O
 ```
 
 ## Examples
+### Agent tool: a validated filter builder for model-chosen arguments
+The model proposes filters as tool arguments; code decides which survive. Security fields come only from
+the authenticated session. The filter is a Qdrant-style `must` list; adapt the shape to your engine.
+
+```python
+SEARCH_TOOL = {                                   # schema the agent sees: enums, no tenant field
+    "name": "search_docs",
+    "input_schema": {"type": "object", "properties": {
+        "query": {"type": "string"},
+        "doc_type": {"enum": ["contract", "email", "policy"]},
+        "language": {"enum": ["en", "fr", "de"]},
+        "created_at": {"type": "object", "properties": {"gte": {"type": "integer"}, "lt": {"type": "integer"}}},
+    }, "required": ["query"]},
+}
+ALLOWED = {"doc_type": {"contract", "email", "policy"}, "language": {"en", "fr", "de"}}
+RANGE_FIELDS = {"created_at"}                 # integer epoch seconds, never strings
+SECURITY = {"tenant_id", "allowed", "denied"}
+
+def build_filter(llm_filter, tenant_id):
+    must = [{"key": "tenant_id", "match": {"value": tenant_id}}]   # from auth, never from the model
+    for field, value in llm_filter.items():
+        if field in SECURITY:
+            continue                                               # model may not set security fields
+        if field in ALLOWED and value in ALLOWED[field]:
+            must.append({"key": field, "match": {"value": value}})
+        elif field in RANGE_FIELDS and isinstance(value, dict) and set(value) <= {"gte", "lt"}:
+            must.append({"key": field, "range": {op: int(v) for op, v in value.items()}})
+    return {"must": must}                                          # unknown fields are dropped, not guessed
+
+def handle_search_docs(run, args, session, k=10):                  # called from the agent loop
+    query, llm_filter = args["query"], {f: v for f, v in args.items() if f != "query"}
+    hits = run(query, build_filter(llm_filter, session.tenant_id), k)
+    if not hits and llm_filter:                                    # empty: likely misparse, relax, keep tenant
+        hits = run(query, build_filter({}, session.tenant_id), k)
+        return {"results": hits, "note": f"no match for filters {llm_filter}; showing unfiltered results"}
+    return {"results": hits}
+
+f = build_filter({"doc_type": "contract", "tenant_id": "evil", "year": "2025"}, "acme")
+print(f)  # tenant stays 'acme'; unknown 'year' dropped; doc_type kept
+```
+
+- **The `note` field matters.** It tells the model the filter was relaxed, so it can say "no contracts
+  from that period; here is the closest material" instead of presenting unfiltered hits as matches.
+
 ### Simulation: pre-filter versus post-filter
 200k random unit vectors split across 100 tenants, so any single tenant's filter keeps about 1% of rows.
 `pre_filter` evaluates the predicate first and does an exact search inside it; `post_filter` takes the
@@ -214,37 +290,24 @@ for kf in (10, 100, 1_000, 10_000):
   tenth-nearest row ranked outside the unfiltered top-1,000, so no post-processing of that candidate set
   could have found it.
 
-### Production snippet: a validated filter builder for LLM-parsed constraints
-The model proposes filters; code decides which survive. Security fields come only from the authenticated
-request. The filter is a Qdrant-style `must` list; adapt the shape to your engine.
+### Worked scenario: an agent burning steps on empty filtered searches
+A support agent searches a post-filtering store with `top_k=10`. The user asks about one small
+customer's tickets; that customer is about 1% of the corpus. Figures are illustrative.
 
-```python
-ALLOWED = {"doc_type": {"contract", "email", "policy"}, "language": {"en", "fr", "de"}}
-RANGE_FIELDS = {"created_at"}                 # integer epoch seconds, never strings
-SECURITY = {"tenant_id", "allowed", "denied"}
+| Step | What the agent does | Result |
+|---|---|---|
+| 1 | `search_docs(customer filter, top_k=10)` | 0 hits (expected 0.1) |
+| 2 | rephrases the query, same filter | 0 hits |
+| 3 | drops the date range it added | 0 hits |
+| 4 | answers "I could not find any tickets" | wrong: ~2,000 matching chunks exist |
 
-def build_filter(llm_filter, tenant_id):
-    must = [{"key": "tenant_id", "match": {"value": tenant_id}}]   # from auth, never from the model
-    for field, value in llm_filter.items():
-        if field in SECURITY:
-            continue                                               # model may not set security fields
-        if field in ALLOWED and value in ALLOWED[field]:
-            must.append({"key": field, "match": {"value": value}})
-        elif field in RANGE_FIELDS and isinstance(value, dict) and set(value) <= {"gte", "lt"}:
-            must.append({"key": field, "range": {op: int(v) for op, v in value.items()}})
-    return {"must": must}                                          # unknown fields are dropped, not guessed
-
-def search(run, query, llm_filter, tenant_id, k=10):
-    hits = run(query, build_filter(llm_filter, tenant_id), k)
-    if not hits and llm_filter:                                    # empty: likely misparse, relax, keep tenant
-        return run(query, build_filter({}, tenant_id), k), "relaxed"   # log the reason, or ask the user
-    return hits, "filtered"
-
-f = build_filter({"doc_type": "contract", "tenant_id": "evil", "year": "2025"}, "acme")
-print(f)  # tenant stays 'acme'; unknown 'year' dropped; doc_type kept
-```
+Four model calls and a wrong answer, caused by retrieval arithmetic, not by the prompt. With pre-filtering
+or filtered traversal step 1 returns 10 correct hits, and the run ends in two calls.
 
 ## Production patterns
+- **Expose filters as enums in the tool schema.** Give the agent only fields that have payload indexes,
+  with enumerated values where possible, and keep tenant and ACL fields out of the schema. Monitor the rate
+  of dropped or invalid filter arguments per field; a rise means the descriptions or enums need work.
 - **Index every filtered field, and only those.** When adding a filter to the product, create the payload
   index in the same change (for example `create_payload_index` with a keyword schema in Qdrant, a B-tree
   or partial index in pgvector). Monitor filtered p95 latency against collection size; growth means a
@@ -255,11 +318,13 @@ print(f)  # tenant stays 'acme'; unknown 'year' dropped; doc_type kept
 - **Tenant-aware layout for skewed tenants.** When a few tenants are huge and most are tiny, mark the
   tenant field as a tenant index (Qdrant) or use native per-tenant shards (Weaviate). Monitor per-tenant
   recall@k and latency, not the global average.
-- **Self-query with an allowlist and fallback.** Parse natural-language constraints with an LLM, validate
-  fields and values in code, inject security predicates from identity, and relax on empty results with a
-  logged reason. Monitor the relax rate per filter field; spikes point at a parsing regression.
-- **Filtered recall in the eval gate.** Bucket labeled queries by selectivity and block deploys on recall@k
-  drops in the 0.1% to 10% band. Monitor the same buckets in production samples.
+- **Relax with a visible note, not silently.** On an empty filtered result, relax the model-chosen
+  filters (never the tenant), log the reason, and tell the agent in the tool result. Monitor the relax
+  rate per filter field and the number of search calls per agent run; spikes point at a parsing or
+  indexing regression.
+- **Filtered recall in the eval gate.** Bucket labeled queries by selectivity, replay them with the
+  filters your agent actually generated, and block deploys on recall@k drops in the 0.1% to 10% band.
+  Monitor the same buckets in production traces.
 
 ## Trade-offs
 - **Pre-filtering: exact vs scan cost.** Exact with respect to the predicate, but cost scales with the
@@ -273,13 +338,17 @@ print(f)  # tenant stays 'acme'; unknown 'year' dropped; doc_type kept
 - **Collection per tenant: isolation vs overhead.** Isolation and trivially cheap predicates, but thousands
   of small HNSW graphs cost more memory and operations than one shared graph. The flip depends on tenant
   count and size skew.
-- **LLM-derived filters: natural language vs silent empties.** Natural-language constraints work, but every
-  misparse silently empties the result set, so they cost a validation layer and a fallback path.
+- **Agent-chosen filters: precision vs silent empties.** Letting the model scope searches sharpens
+  results, but every misparse silently empties the result set and invites retries, so it costs a
+  validation layer, a fallback path and an eval on generated filters.
+- **Rich filter schema vs model reliability.** More filterable fields let the agent express more, but
+  each extra argument is another place for the model to guess wrong. Expose the few fields users actually
+  scope by.
 
 ## Pitfalls
 - **Post-filtering an ANN top-k.** Symptom: small tenants or rare document types return fewer than k
-  results, or none, while the same query without the filter returns plenty. Fix: pre-filter or filtered
-  traversal.
+  results, or none, while the same query without the filter returns plenty; agents loop on retries. Fix:
+  pre-filter or filtered traversal.
 - **Filtering on a field with no payload index.** Symptom: filtered latency grows with collection size
   while unfiltered queries stay flat. Fix: add the index.
 - **Dates stored as strings in mixed formats.** Range predicates compare lexically; "newest document"
@@ -287,20 +356,24 @@ print(f)  # tenant stays 'acme'; unknown 'year' dropped; doc_type kept
 - **Re-embedding to change metadata.** A status or ACL change is a payload update and should cost
   milliseconds, not an embedding job.
 - **Accepting `tenant_id` or ACL values from the client or the model.** Symptom: cross-tenant leakage the
-  moment someone edits a request body. Fix: derive them from identity.
+  moment someone edits a request body or a prompt injection sets a tool argument. Fix: derive them from
+  identity.
 - **Predicate in only one hybrid arm, or after reranking.** Symptom: results include documents the filter
   should have excluded. Fix: apply it in every arm, before reranking.
 - **Evaluating recall only without filters.** Symptom: a filtered-traversal recall collapse that shows up in
   production for selective filters and never in the eval. Fix: bucket by selectivity.
+- **Silent relaxation.** Symptom: the agent cites unfiltered results as if they matched "last 90 days".
+  Fix: return a note with the tool result saying the filter was relaxed.
 
 ## When to use
 - **Use when** a constraint is a hard predicate rather than a preference: tenant, access control, date
   range, document type, language, product version, publication status.
 - **Avoid when** it is a soft preference such as "prefer recent"; that belongs in score boosting or
   reranking, where it trades off against relevance instead of excluding it.
-- **Measure:** filtered recall@k on labeled queries bucketed by selectivity, p95 latency per bucket, and
-  the rate of queries returning fewer than k results.
-- **Day to day:** the filter builder is where security, UX and retrieval quality meet.
+- **Measure:** filtered recall@k on labeled queries bucketed by selectivity, p95 latency per bucket, the
+  rate of queries returning fewer than k results, and search calls per agent run.
+- **Day to day:** the filter builder behind the agent's search tool is where security, UX and retrieval
+  quality meet.
 - **Interviews:** "what happens in your vector database when a filter matches 0.5% of the rows?" Cover
   pre-, post- and in-traversal filtering, the k·s arithmetic, and the cardinality threshold at which the
   engine should switch to brute force.
@@ -335,6 +408,14 @@ from the client without checking the caller is authorized for it.
 - **It cannot express the predicates you need.** Ranges, negation and list membership have no meaning in
   vector space, so hard constraints belong in typed payload fields with a payload index.
 
+### Your agent's search tool takes filters from the model. How do you design it so it is safe and does not loop?
+- **Schema:** expose only indexed fields, as enums or typed ranges, and leave `tenant_id` and ACL fields
+  out entirely; the handler injects them from the session.
+- **Validation:** drop unknown fields and values in code instead of guessing, so a hallucinated argument
+  cannot widen or break the search.
+- **Fallback:** on an empty result relax the model's filters, keep the tenant, and say so in the tool
+  result, so the agent explains instead of retrying the same empty search.
+
 ### Users report that a "contracts only, last 90 days" search returns 3 results instead of 10. How do you debug it?
 - **Check the strategy first.** If the engine post-filters an ANN top-k, survivors are about k·s, so a
   selective filter returns fewer than k by construction.
@@ -359,11 +440,13 @@ from the client without checking the caller is authorized for it.
 - **Measure** filtered recall@k on labeled queries in that selectivity bucket, p95 latency, and the
   fewer-than-k rate, rather than unfiltered recall.
 
-### Why should metadata changes never trigger re-embedding?
-- **The vector did not change.** A status or ACL change alters payload, not content, so it is a payload
-  write that costs milliseconds.
-- **Re-embedding is slow and risky.** It burns embedding budget, delays the change (bad for ACL revokes)
-  and can introduce version skew if the embedding model has moved on.
+### Agent traces show many runs with three or more consecutive search calls. What do you look for?
+- **Empty or short filtered results.** Group the calls by filter field and selectivity; post-filtering or
+  a missing index makes selective filters return fewer than k, and the model retries.
+- **Invalid arguments.** Count dropped filter values; a model guessing enum values it was not given
+  points at a tool-description problem.
+- **Fix and verify** by switching to pre-filtering or filtered traversal and checking that search calls
+  per run fall on a replayed trace set.
 
 ## Quiz
 ### Q: Why does post-filtering an ANN top-k fail for selective predicates?

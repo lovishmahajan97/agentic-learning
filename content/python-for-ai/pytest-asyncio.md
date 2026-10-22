@@ -5,7 +5,8 @@ name: pytest-asyncio
 kind: tool
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/pytest
   - python-for-ai/asyncio
@@ -19,13 +20,26 @@ sources:
 ---
 
 ## TL;DR
-pytest-asyncio runs `async def` tests and async fixtures on an event loop it owns; markers and config
-choose which tests are async and how long each loop lives. Most sharp edges come from loop lifetime.
+Agent loops are async: parallel tool calls, streamed tokens, timeouts and cancellation. pytest-asyncio
+runs `async def` tests and fixtures on a loop it owns, so you can test those behaviours. Most sharp
+edges come from loop lifetime.
+
+## For agent builders
+- **Why it matters for agents.** A step that runs three tool calls with `asyncio.gather`, a per-tool
+  timeout, a token stream the user can abort: each has bugs that only appear while the loop schedules
+  tasks. A sync test of the same code proves nothing about them.
+- **Where it shows up in your stack.** Async SDK clients (`httpx.AsyncClient` underneath most LLM SDKs),
+  async agent frameworks, FastAPI streaming endpoints, MCP clients and servers. Their tests run under this
+  plugin or anyio's.
+- **What you control.** `asyncio_mode`, the loop scope of each fixture and test, injected delays so retry
+  and backoff tests stay fast, and a guard that fails any test leaving a tool task pending.
+- **What you can skip.** Custom loop policies and the old `event_loop` override. Pin the plugin, set the
+  config keys explicitly and use the defaults.
 
 ## Why it exists
 - **pytest calls tests synchronously.** An `async def` test is just a coroutine object nobody awaits.
-- **AI services are mostly I/O.** A request fans out to an LLM, a vector store, a reranker and a
-  database, usually through `httpx.AsyncClient`, async database drivers and `asyncio.gather`.
+- **Agents are mostly I/O.** One agent step fans out to an LLM, a vector store, a reranker and several
+  tools, usually through `httpx.AsyncClient`, async database drivers and `asyncio.gather`.
 - **The interesting bugs only exist while the loop schedules tasks.** A semaphore that does not cap
   concurrency, a timeout that leaves the request running, a cancelled stream that never closes its
   connection, a retry that swallows `CancelledError`. Calling sync wrappers cannot reveal them.
@@ -62,6 +76,14 @@ Set with `asyncio_mode` in pytest config.
   default-fixture-loop-scope config key (`asyncio_default_fixture_loop_scope`).
 - **Old API:** an overridable `event_loop` fixture, deprecated and since removed. Check the docs for your
   pinned version, because this API changed more than once.
+
+### What an agent test suite needs from it
+| Agent behaviour | What the test asserts | Needs a running loop because |
+|---|---|---|
+| Parallel tool calls in one step | results keep call order, one failure does not sink the rest | `gather` schedules the tools concurrently |
+| Per-tool timeout | slow tool returns an error result and is cancelled | only the loop can cancel a pending await |
+| User aborts a streamed answer | the stream and its HTTP response close | cleanup runs on cancellation |
+| Concurrency cap on model calls | peak in-flight calls never exceed the limit | overlap exists only while tasks interleave |
 
 ### What it does not do
 - **No concurrency between tests.** pytest still runs one test at a time and the plugin runs each
@@ -104,6 +126,50 @@ sequenceDiagram
 ```
 
 ## Examples
+### Agent scenario: parallel tool calls with a per-tool timeout
+The agent runs every tool call the model requested in one step. A slow tool must come back as an error
+result the model can read, not hang the step, and must actually be cancelled.
+
+```python
+import asyncio
+import pytest
+
+async def run_tool_calls(calls, tools, timeout_s):
+    async def one(call):
+        try:
+            async with asyncio.timeout(timeout_s):           # Python 3.11+
+                return {"id": call["id"], "content": await tools[call["name"]](**call["args"])}
+        except TimeoutError:
+            return {"id": call["id"], "error": f"{call['name']} timed out after {timeout_s}s"}
+    return await asyncio.gather(*(one(c) for c in calls))    # keeps call order
+
+def make_tools(state):
+    async def search(q):
+        await asyncio.sleep(0.01)
+        return f"results for {q}"
+    async def browse(url):
+        state["browse_open"] = True
+        try:
+            await asyncio.sleep(10)                          # a hung page load
+        finally:
+            state["browse_open"] = False                     # runs on cancellation
+    return {"search": search, "browse": browse}
+
+@pytest.mark.asyncio
+async def test_slow_tool_becomes_error_result_and_is_cancelled():
+    state = {}
+    calls = [{"id": "c1", "name": "search", "args": {"q": "kv cache"}},
+             {"id": "c2", "name": "browse", "args": {"url": "https://example.com"}}]
+    out = await run_tool_calls(calls, make_tools(state), timeout_s=0.05)
+    assert out[0] == {"id": "c1", "content": "results for kv cache"}
+    assert "timed out" in out[1]["error"]
+    assert state["browse_open"] is False                     # no tool left running
+```
+
+- **Why it matters:** without the timeout one hung tool stalls the whole agent; without cancellation the
+  hung task keeps a connection open after the step has moved on.
+- **Fast:** total runtime is about 0.05 s because the delays are injected, not production-sized.
+
 ### Fan-out limit and timeout cancellation
 A fan-out helper must never exceed a concurrency limit, and a timeout must leave no request in flight.
 Both properties exist only while the loop runs. A fake LLM records peak concurrency; the async fixture
@@ -160,7 +226,8 @@ async def test_timeout_cancels_inner_call(llm):
   shows up as `in_flight == 1`.
 
 ### Streams must close on early stop and on cancel
-A token stream wraps an HTTP response; stopping early or cancelling must run its cleanup.
+A token stream wraps an HTTP response; when the agent stops early (a stop sequence, a guardrail) or the
+user disconnects, its cleanup must run.
 
 ```python
 import asyncio
@@ -226,6 +293,9 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")   # every test in this mo
 ```
 
 ## Production patterns
+- **Every tool call has a timeout under test.** For each async tool, one test runs it with a fake that
+  never returns and asserts the step yields an error result and the task is cancelled. Monitor
+  production tool-timeout rates per tool; a tool with no timeout test is the one that hangs an agent.
 - **Explicit, pinned config.** Pin the plugin version and set `asyncio_mode = "strict"` and
   `asyncio_default_fixture_loop_scope = "function"` in `[tool.pytest.ini_options]`, so behaviour does not
   shift on upgrade. Monitor deprecation warnings from the plugin in CI output after each bump.
@@ -242,8 +312,6 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")   # every test in this mo
 - **Injected delays and clocks.** Pass retry backoff and timeouts as parameters (or a `sleep` callable)
   so tests use 0.01 s where production uses seconds. Track async-lane wall time; a jump usually means a
   real delay crept in.
-- **Per-test hang limit.** Wrap risky awaits in `asyncio.timeout(...)` inside the test, or use
-  `pytest-timeout`, so a never-resolving future fails one test instead of hanging the CI job.
 
 ## Trade-offs
 - **Function-scoped loops: isolation vs rebuild cost.** Every test is isolated from leaked tasks, but
@@ -269,20 +337,23 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")   # every test in this mo
   access or with a "never awaited" warning.
 - **Blocking calls in async tests.** `time.sleep`, sync HTTP or sync DB drivers inside an async test or
   fixture: the test passes but serialises everything, so concurrency assertions are silently meaningless.
-- **Orphaned tasks.** `asyncio.create_task` without awaiting or cancelling. Symptom: "Task was destroyed
+- **Orphaned tasks.** `asyncio.create_task` without awaiting or cancelling, common in agents that start
+  background tool calls or memory writes. Symptom: "Task was destroyed
   but it is pending" warnings and assertions failing in a later, unrelated test.
 - **Stale `event_loop` override.** Copied from an old blog post into a pinned recent version: on 0.2x
   releases it gives a deprecation warning; on 1.x the plugin no longer consults that fixture at all, so
   your custom loop or policy silently stops applying.
 
 ## When to use
-- **Use when:** the unit under test is a coroutine and the property depends on scheduling: concurrency
-  caps, timeouts, cancellation, streaming, ordering of `gather` results, backpressure.
+- **Use when:** the unit under test is a coroutine and the property depends on scheduling: parallel tool
+  calls, concurrency caps, timeouts, cancellation, streaming, ordering of `gather` results, backpressure.
 - **Avoid when:** pure logic merely sits inside async code; extract it into a sync function and test it
   without a loop.
 - **Configure:** pin the plugin and set `asyncio_mode` and the default fixture loop scope explicitly, so
   behaviour does not change on upgrade.
-- **FastAPI apps:** pair it with an async HTTP client against the ASGI app.
+- **Per-test hang limit:** wrap risky awaits in `asyncio.timeout(...)` inside the test, or use
+  `pytest-timeout`, so a never-resolving future fails one test instead of hanging the CI job.
+- **FastAPI apps:** pair it with an async HTTP client against the ASGI app, for streaming agent endpoints.
 - **Interviews:** explaining the "attached to a different loop" error from first principles signals you
   understand both asyncio and pytest fixtures.
 
@@ -324,6 +395,13 @@ the loop they were made on, so fixture lifetime and loop lifetime must match.
 - **Never block in the fake:** `time.sleep` stops task switching, so calls never overlap and the test
   passes even when the limit is broken.
 
+### An agent step runs tool calls in parallel. How do you test that one hung tool cannot stall the agent?
+- **Give each call a timeout** (`asyncio.timeout`) and turn `TimeoutError` into an error result the model
+  can read, so the step completes with partial results.
+- **Test it with a fake tool that sleeps far longer than the timeout** and records cleanup in a
+  `finally`; assert the error result, the order of results, and that the cleanup ran.
+- **Keep the timeout tiny in the test**, such as 0.05 s, so the case costs nothing in CI.
+
 ### When would you choose auto mode over strict mode, and when not?
 - **Auto mode suits an asyncio-only project:** every `async def` test is claimed and plain
   `@pytest.fixture` works on async functions, which removes boilerplate.
@@ -339,11 +417,14 @@ the loop they were made on, so fixture lifetime and loop lifetime must match.
   `asyncio.current_task()` and fails the test that leaked.
 - **Get tracebacks** by running the lane with `PYTHONASYNCIODEBUG=1` or `python -X dev`.
 
-### How do you keep retry and timeout tests fast when production uses multi-second backoff?
-- **The plugin has no fake clock**, so `asyncio.sleep(10)` really waits ten seconds.
-- **Inject the delay or a `sleep` callable** so tests pass 0.01 s where production passes seconds, and use
-  `asyncio.timeout(0.05)` for timeout paths.
-- **Monitor async-lane wall time:** a sudden jump usually means a real delay crept back into a test.
+### A user closes the browser mid-answer. How do you prove the agent stops spending tokens?
+- **Model the disconnect as cancellation** of the task consuming the stream, as a server does when the
+  client goes away.
+- **Test it:** start the consumer with `asyncio.create_task`, cancel it after a few tokens, expect
+  `CancelledError`, and assert the stream's `finally` closed the response.
+- **Also cover early stop** with `aclosing`, since a `break` alone leaves the generator suspended.
+- **Retry tests stay fast** the same way timeouts do: there is no fake clock, so `asyncio.sleep(10)`
+  really waits; inject a `sleep` callable and pass 0.01 s.
 
 ## Quiz
 ### Q: In pytest-asyncio's strict mode, what happens to an unmarked `async def` test?

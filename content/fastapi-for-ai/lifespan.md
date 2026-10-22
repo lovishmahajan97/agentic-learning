@@ -5,7 +5,8 @@ name: Lifespan (load model / client once)
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/request-scoped-vs-application-scoped-resources
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-`lifespan` is an async context manager passed to `FastAPI(lifespan=...)`: code before `yield` runs once
-per worker before serving, code after it at shutdown. Load models, provider clients and DB engines there,
-because they are expensive, shared and need a guaranteed close.
+`lifespan` is where an agent server boots: code before `yield` runs once per worker before serving
+(LLM client, tool clients, checkpoint store, agent definition), code after it at shutdown. Broken config
+fails the deploy, not the first user.
+
+## For agent builders
+- **Why it matters for agents.** An agent service depends on many things at once: provider clients,
+  tool API clients, a vector index, a checkpoint or memory database, maybe a local reranker. Lifespan
+  builds them once, checks them before any run starts, and closes them cleanly at shutdown.
+- **Where it shows up in your stack.** `FastAPI(lifespan=...)` with an `AsyncExitStack`; the same place
+  you open connections to tool servers (for example MCP client sessions), create the checkpointer's
+  connection pool, and build or compile the agent graph once per worker.
+- **What you control.** What fails startup (missing provider key, invalid tool schema) versus what
+  degrades (an optional cache), warm-up before `yield`, and how shutdown treats agent runs still in
+  flight (drain timeout, checkpoint per step).
+- **What you can skip.** The raw ASGI lifespan messages beyond knowing they gate traffic. Know the
+  `yield` shape, the exit stack, per-worker multiplication and what does not run lifespan in tests.
 
 ## Why it exists
 - **Some objects are slow to build and meant to be shared.** A tokenizer and model that take seconds and
@@ -116,6 +130,15 @@ async def lifespan(app):     # setup ... yield ... teardown
 - **Warm up before `yield`.** Run a small warm-up inference so lazy allocations and kernel selection happen
   at startup rather than on the first user's request.
 
+### What an agent server builds in lifespan
+1. **Required config:** provider keys and model names read with `os.environ["..."]`, so a missing one
+   fails startup.
+2. **Clients:** one LLM client, one HTTP client per tool backend, the vector index handle.
+3. **State store:** the checkpointer or memory database pool, because runs must resume across workers.
+4. **Tool registry check:** generate every tool's schema and assert names are unique and schemas valid,
+   so a broken tool fails the deploy instead of the first run that needs it.
+5. **The agent definition:** build or compile it once with no per-run state on it.
+
 ### Things that do not run lifespan
 | Situation | Lifespan runs? |
 |---|---|
@@ -150,6 +173,64 @@ sequenceDiagram
 ```
 
 ## Examples
+### Agent server: clients, tool registry check and a clean close
+Every resource registers its close on the exit stack. A tool with a duplicate name or an empty
+description fails startup, so the deploy stops before any user's run reaches it.
+
+```python
+import os
+from contextlib import AsyncExitStack, asynccontextmanager
+import httpx
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+
+class SearchArgs(BaseModel):
+    query: str
+
+TOOLS = [  # name, description, argument model
+    ("search_docs", "Search internal docs by keyword.", SearchArgs),
+    ("search_web", "Search the public web.", SearchArgs),
+]
+
+def check_tools(tools) -> list[dict]:
+    names = [n for n, _, _ in tools]
+    if len(names) != len(set(names)):
+        raise RuntimeError(f"duplicate tool names: {names}")       # -> lifespan.startup.failed
+    if any(not d.strip() for _, d, _ in tools):
+        raise RuntimeError("every tool needs a description the model can read")
+    return [{"name": n, "description": d, "parameters": m.model_json_schema()} for n, d, m in tools]
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with AsyncExitStack() as stack:
+        llm_key = os.environ["LLM_API_KEY"]                         # missing key: deploy fails
+        app.state.llm_http = await stack.enter_async_context(
+            httpx.AsyncClient(base_url=os.environ["LLM_BASE_URL"],
+                              headers={"Authorization": f"Bearer {llm_key}"}, timeout=60.0))
+        app.state.tools_http = await stack.enter_async_context(httpx.AsyncClient(timeout=15.0))
+        app.state.tool_schemas = check_tools(TOOLS)                 # validated once per worker
+        yield                                                       # serve agent runs
+    # stack closed both clients, also when startup failed halfway
+
+app = FastAPI(lifespan=lifespan)
+
+def get_tool_schemas(request: Request) -> list[dict]:
+    return request.app.state.tool_schemas                           # override in tests
+```
+
+### Worked scenario: rolling deploy with long agent runs in flight
+Runs take 8 steps of ~5 s (about 40 s). Kubernetes' default termination grace period is 30 s
+(illustrative run lengths).
+
+| Setting | What happens to a run at step 3 when SIGTERM arrives |
+|---|---|
+| No `--timeout-graceful-shutdown`, 30 s grace | Uvicorn waits on the run; the platform kills the pod at 30 s; teardown never runs; the run is lost mid-step |
+| `--timeout-graceful-shutdown 20`, 30 s grace | drain stops at 20 s; teardown after `yield` closes clients within the remaining 10 s; the run is cut at about step 7 |
+| Same, plus a checkpoint after every step | the cut run resumes from its last checkpoint on another pod; at most one step is redone |
+
+- **Lifespan's job here:** open the checkpoint store before `yield`, close it after. The checkpoint per
+  step is what makes shutdown safe, because teardown is best-effort.
+
 ### Embedding service: load once, warm up, close everything
 An embedding service that loads a sentence-transformer model once, builds one shared HTTP client for a
 reranking provider, warms the model, and closes everything at shutdown even if startup fails halfway.
@@ -251,6 +332,12 @@ A 3 GB model, four Uvicorn workers, provider calls from every endpoint.
 - **The memory row is the one lifespan does not fix**; past a couple of workers, a model server wins.
 
 ## Production patterns
+- **Validate the agent's tools at startup.** Use on every agent service: generate all tool schemas in
+  lifespan and assert unique names, non-empty descriptions and valid argument models, so a broken tool
+  stops the rollout. Monitor startup failures per release and tool-call errors per tool after deploy.
+- **Checkpoint per step, drain with a bound.** Use when agent runs outlast the termination grace period:
+  open the checkpoint store in lifespan, persist state after each step, and set
+  `--timeout-graceful-shutdown` below the grace period. Monitor runs resumed after a deploy versus runs lost.
 - **Startup probe sized to the load.** Use whenever lifespan loads weights: give the orchestrator a startup
   probe (in Kubernetes, `startupProbe` with `failureThreshold` × `periodSeconds` above the measured load
   time) and keep the liveness check cheap. Monitor startup duration per worker and restart counts during
@@ -299,6 +386,9 @@ A 3 GB model, four Uvicorn workers, provider calls from every endpoint.
 - **Pointing a liveness probe at the app during a long model load.** Symptom: the orchestrator kills the
   container mid-load in a restart loop, because the worker has not finished startup and is not answering
   yet.
+- **Discovering a broken tool on the first run that needs it.** Symptom: deploys look healthy, then a
+  share of agent runs fail at the same step with a schema or auth error from one tool. Fix: build and
+  check every tool schema (and, where cheap, each tool client's credentials) in lifespan.
 - **Storing per-request data on objects created in lifespan.** Symptom: intermittent cross-user leaks under
   concurrent load, because those objects are shared by every in-flight request.
 
@@ -350,6 +440,13 @@ cheap. Also budget memory for one model copy per worker.
 - **Confirm** with startup duration per worker; also check memory, since each worker loads its own copy
   and an OOM kill looks like the same restart loop.
 
+### What would you put in the lifespan of an agent service, and what would you deliberately keep out?
+- **In:** the LLM and tool clients, the vector index handle, the checkpoint or memory store pool, a
+  startup check of every tool schema, and the agent definition built once, all on an `AsyncExitStack`.
+- **Fail fast** on required provider keys and invalid tools; let optional pieces (a cache) degrade.
+- **Out:** anything per run (messages, budget, principal, permitted tools), which belongs in request-scoped
+  dependencies, and memory across turns, which belongs in the external store.
+
 ### Would you use Gunicorn `--preload` to share one model across workers?
 - **Tempting, but it sits outside lifespan** and relies on copy-on-write after fork.
 - **Reference counting dirties the pages**, so CPython gradually copies the "shared" memory anyway.
@@ -363,9 +460,9 @@ cheap. Also budget memory for one model copy per worker.
   `asgi-lifespan` for async tests.
 - **Also check mounts:** a sub-application attached with `app.mount` never runs its own lifespan.
 
-### How do you make shutdown reliable for a streaming service with usage accounting?
+### How do you make shutdown reliable for a streaming agent service with usage accounting?
 - **Bound the drain:** Uvicorn waits indefinitely for in-flight requests unless
-  `--timeout-graceful-shutdown` is set, so long streams can hold shutdown open.
+  `--timeout-graceful-shutdown` is set, so long streams and agent runs can hold shutdown open.
 - **Order the timeouts:** give the platform's grace period more time than the drain, so the code after
   `yield` gets to close clients.
 - **Do not rely on teardown for data:** a forced exit skips it, so write usage records as you go.

@@ -5,7 +5,8 @@ name: Async database access & connection pooling
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/sqlalchemy-sqlmodel
   - fastapi-for-ai/async-endpoints
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-In `async def` endpoints use an async driver behind SQLAlchemy's `AsyncEngine`; blocking drivers belong
-in `def` endpoints. Each process keeps a bounded pool, and `processes × (pool_size + max_overflow)` must fit Postgres's cap.
-AI rule: never hold a pooled connection across a model call.
+Agent backends await model calls, tools and Postgres together, so use an async driver behind
+SQLAlchemy's `AsyncEngine`. Each process keeps a bounded pool; `processes × (pool_size + max_overflow)`
+must fit Postgres's cap. Agent rule: never hold a connection across a model call.
+
+## For agent builders
+- **Why it matters for agents.** An agent run reads history, calls the model, runs DB-backed tools,
+  writes steps and memories, often across many steps. A connection held across those model calls is the
+  classic way an agent service exhausts its pool while Postgres sits idle.
+- **Where it shows up in your stack.** The engine in your FastAPI lifespan, the session dependency, every
+  DB-backed tool (SQL lookups, pgvector retrieval, memory stores), agent checkpoint writes in workers, and
+  PgBouncer once replicas multiply.
+- **What you control.** Session scope (short, per read or write, never per run), pool sizes from Little's
+  law, the fleet-wide connection budget, and how each tool gets its own short session.
+- **What you can skip.** Greenlet internals and Postgres backend-process details. Know `MissingGreenlet`,
+  the pool settings table and the budget arithmetic.
 
 ## Why it exists
 - **Problem 1: blocking.** A sync driver call such as psycopg2's `cursor.execute()` inside an `async def`
@@ -95,6 +108,22 @@ Little's law: connections busy on average = request rate × time each request ho
 Hold time, not query speed or pool size, is the number to measure and attack first: shrinking it
 shrinks the pool you need linearly, while raising the pool only moves the queue from the pool to Postgres.
 
+### Agent loops multiply the hold time
+An agent run is several model calls in a row, so a session opened at the start of the run and closed at
+the end holds its connection for the whole run, not one call.
+
+| Agent run shape (illustrative) | Hold time per run | At 20 runs/s |
+|---|---|---|
+| One session for the run: 6 steps × 4 s model call | ~24 s | ~480 connections busy |
+| Short session per DB read, tool query and step write | tens of ms per step | a handful |
+
+- **Each DB-backed tool opens its own short session.** A SQL lookup tool or a pgvector retrieval tool is
+  a unit of work: check out, query, return the connection, then hand the result to the model.
+- **Step checkpoints are short writes**, one per step, in workers as well as in API processes, and they
+  count against the same budget.
+- **Parallel tool calls need separate sessions.** When the model requests three tools at once and you
+  `gather` them, each needs its own session, so peak connections per run equals parallel tools.
+
 ### Process and loop boundaries
 - **One engine per process and event loop.** Create it in the lifespan handler, not at import time.
 - **Because of forking:** with gunicorn `--preload`, a pool that opened connections before the fork hands
@@ -131,12 +160,12 @@ application pools connect to PgBouncer, which multiplexes them onto a small serv
 - **Run statements sequentially**, or give each task its own session, which also means its own connection.
 
 ## Diagram
-The structural fix: the connection goes back to the pool before the slow model call, so hold time is
-milliseconds of queries instead of seconds of waiting.
+The structural fix: the connection goes back to the pool before each slow model call (in an agent loop,
+before every step's call), so hold time is milliseconds of queries instead of seconds of waiting.
 
 ```mermaid
 sequenceDiagram
-    participant H as Chat handler
+    participant H as Agent handler
     participant P as Pool (pool_size + max_overflow)
     participant D as Postgres
     participant M as Model API
@@ -152,10 +181,10 @@ sequenceDiagram
 ```
 
 ## Examples
-### Lifespan engine and a chat route that releases before the model call
+### Lifespan engine and an agent route that releases before every model call
 Engine and session factory are created in the lifespan; ordinary routes use the per-request dependency;
-the chat endpoint returns its connection before the slow model call and opens a short second session
-for the write.
+the agent endpoint returns its connection before each slow model call, gives the DB-backed tool its own
+short session, and writes the answer in a short final session.
 
 ```python
 from contextlib import asynccontextmanager
@@ -179,21 +208,31 @@ async def get_session(request: Request):      # for ordinary CRUD routes: one se
     async with request.app.state.sessions() as session:
         yield session
 
-@app.post("/chat/{conv_id}")
-async def chat(conv_id: int, body: Ask, request: Request):
+async def lookup_order(sessions, order_id: int) -> str:   # a DB-backed agent tool
+    async with sessions() as s:               # its own short session: milliseconds of hold time
+        order = await s.get(Order, order_id)
+        return f"order {order_id}: {order.status if order else 'not found'}"
+
+@app.post("/agent/{conv_id}")
+async def agent(conv_id: int, body: Ask, request: Request):
     sessions = request.app.state.sessions
     async with sessions() as s:               # session 1: read, then RELEASE the connection
         history = (await s.scalars(select(Message).where(Message.conv_id == conv_id)
                                    .order_by(Message.id))).all()
 
-    answer = await call_model(body.prompt, history)   # seconds; holds no database connection
+    transcript = [*history, body.prompt]
+    for _ in range(6):                        # agent loop: step budget
+        reply = await call_model(transcript)  # seconds; holds no database connection
+        if reply.tool_call is None:
+            break
+        transcript.append(await lookup_order(sessions, reply.tool_call.args["order_id"]))
 
-    async with sessions() as s:               # session 2: short write
-        s.add(Message(conv_id=conv_id, role="assistant", content=answer))
+    async with sessions() as s:               # final session: short write
+        s.add(Message(conv_id=conv_id, role="assistant", content=reply.text))
         await s.commit()
-    return {"answer": answer}
+    return {"answer": reply.text}
 
-# Ask, Message and call_model are the Pydantic model, ORM model and model client from the other lessons.
+# Ask, Message, Order and call_model are the Pydantic model, ORM models and model client from other lessons.
 ```
 
 ### Pool budget calculator
@@ -216,6 +255,7 @@ def budget(tiers: dict[str, tuple[int, int, int]], max_connections=100, reserved
 
 print(pool_needed(200, 0.010))     # 6: 2 busy on average, x3 headroom
 print(pool_needed(200, 4.0))       # 2400: holding a session across a 4 s model call
+print(pool_needed(20, 24.0))       # 1440: one session held across a 6-step agent run
 budget({"api": (4, 10, 5), "arq": (3, 10, 0), "ops": (1, 5, 0)})   # total 95 of 97 -> fits
 budget({"api": (5, 10, 5), "arq": (3, 10, 0), "ops": (1, 5, 0)})   # total 110 of 97 -> OVER
 ```
@@ -239,6 +279,10 @@ engine = create_async_engine(
 - **Two short sessions around every model call.** On any route that calls a model or external API, read
   in session 1, close it, call the model, write in session 2. Monitor connection hold time per route and
   pool checkout wait; hold time should be milliseconds, not seconds.
+- **Tools get sessions from a factory, not from the run.** Agent teams pass the `async_sessionmaker` (or a
+  tool context holding it) to DB-backed tools, so each tool call is its own unit of work and parallel tool
+  calls never share a session. Monitor connections checked out per agent run and pool wait during
+  tool-heavy traffic.
 - **Short `pool_timeout`, loud failure.** Set `pool_timeout` to a few seconds (the example uses 10)
   rather than the 30 default, so exhaustion surfaces as fast errors you can alert on instead of piled-up
   latency. Monitor checked-out connections versus `pool_size + max_overflow` per process.
@@ -269,6 +313,9 @@ engine = create_async_engine(
 ## Pitfalls
 - **Holding a session across a model or HTTP call.** Symptom: `QueuePool limit ... reached` under modest
   traffic while database CPU is near idle.
+- **Passing the request's session into the agent's tools.** Symptom: the connection is held for the whole
+  multi-step run, and parallel tool calls fail with concurrent-operation errors on the shared session.
+  Fix: give tools the session factory and let each open its own short session.
 - **A sync driver inside `async def`.** Symptom: every route, including `/health`, stalls together
   whenever database-heavy traffic arrives.
 - **Lazy loading or `expire_on_commit=True` in async sessions.** Symptom: `MissingGreenlet` raised from
@@ -321,7 +368,7 @@ session-scoped features such as `SET` and advisory locks that transaction poolin
   mix awaited database reads with awaited model calls, which `def` endpoints capped by the 40-thread pool
   handle awkwardly.
 
-### Users see QueuePool timeouts while database CPU is near idle. What do you look for?
+### Your agent service sees QueuePool timeouts while database CPU is near idle. What do you look for?
 - **Connections held across slow awaits.** A session open across an 8-second model call holds its
   connection the whole time; with 15 connections per process that caps throughput near two requests per
   second.
@@ -346,6 +393,14 @@ session-scoped features such as `SET` and advisory locks that transaction poolin
   `commit()`, because the greenlet bridge cannot switch out there.
 - **Fix:** eager-load with `selectinload` or `joinedload` and create sessions with
   `expire_on_commit=False`.
+
+### How should DB-backed tools in a tool-calling agent get their database connections?
+- **From a session factory, one short session per tool call.** The tool checks out, queries, releases,
+  then returns its result to the model, so no connection waits on the next model call.
+- **Parallel tools need parallel sessions,** because one `AsyncSession` cannot run concurrent operations;
+  that also means peak connections per run equal the parallel tool count.
+- **Budget it:** add agent workers' checkpoint writes and tool sessions to the connection table against
+  `max_connections`.
 
 ## Quiz
 ### Q: Why does holding a session open across an awaited model call hurt, even though the code is fully async?

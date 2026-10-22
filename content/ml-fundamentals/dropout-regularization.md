@@ -5,7 +5,8 @@ name: Dropout / regularization
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/optimizers
   - ml-fundamentals/normalization
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Regularization makes a model fit training data worse so it generalizes better: weight penalties, injected
-noise (dropout) or early stopping. Use it when the model can memorize, as in small fine-tunes; usually
-skip dropout for single-epoch pretraining.
+When you fine-tune a model on a few thousand agent traces it can memorize them; regularization (weight
+decay, dropout, early stopping) trades training fit for behaviour that holds on unseen tasks. At
+inference dropout must be off, or your agent turns non-deterministic.
+
+## For agent builders
+- **Why it matters for agents.** Agent fine-tunes are small: hundreds to a few thousand tool-calling
+  traces, several epochs. That is exactly the regime where a model memorizes argument values and
+  phrasing instead of learning when to call which tool.
+- **Where it shows up in your stack.** `lora_dropout` in a PEFT `LoraConfig`, `weight_decay` in the
+  trainer or AdamW, early stopping in the Hugging Face `Trainer`, and `model.eval()` in any self-hosted
+  serving or eval path.
+- **What you control.** Epoch count, a held-out split of whole tasks (not turns), adapter dropout and
+  decay, and which checkpoint you ship, chosen on agent task success rather than training loss.
+- **What you can skip.** Hosted APIs never expose dropout, and pretraining recipes are fixed. If you only
+  prompt hosted models, you need the diagnosis (train/val gap) and the eval-mode rule, not the math.
 
 ## Why it exists
 - **Big networks memorize.** With more parameters than training examples a network can reach zero training
@@ -42,6 +55,17 @@ skip dropout for single-epoch pretraining.
   absent 10–50% of the time, so random deletion breaks those alliances.
 
 ## How it works
+### What it changes in an agent fine-tune
+1. **You fine-tune on traces.** Each example is a transcript: system prompt, user task, tool calls,
+   tool results, final answer. Loss is usually computed on the assistant tokens only.
+2. **Memorization looks like confidence.** The model reproduces exact argument values, IDs and phrasings
+   from training traces, and calls tools in the training order even when the new task needs another.
+3. **Regularization pushes it toward the pattern.** Weight decay keeps adapter weights small, dropout
+   stops any one feature carrying the decision, and early stopping ships the checkpoint before the model
+   starts reciting.
+4. **The judge is a held-out agent eval.** Train/val loss tells you when memorization starts; task
+   success and tool-call accuracy on unseen tasks tell you whether to ship.
+
 ### The dropout mechanism
 During a training forward pass each activation *x* gets an independent Bernoulli mask
 *m* ~ Bernoulli(1−p), and the layer outputs
@@ -123,7 +147,8 @@ Regularization trades fit for generalization, so it only pays when the model can
   buy the most when data is scarce relative to parameters.
 
 ## Diagram
-Start from the train and validation curves; the diagnosis, not the technique, picks the lever.
+For an agent fine-tune, start from the train and validation curves, then confirm on held-out agent tasks;
+the diagnosis, not the technique, picks the lever.
 
 ```mermaid
 flowchart TD
@@ -136,6 +161,7 @@ flowchart TD
     D -->|"single-epoch pretraining"| P["Dropout 0, modest decay"]
     F --> M["Monitor gap per epoch"]
     P --> M
+    M --> E["Ship best checkpoint on agent eval"]
 ```
 
 ## Examples
@@ -214,7 +240,37 @@ training, so dropout is on; val loss is computed in eval mode at the end of each
 If both losses had stayed near 1.2 and close together, the fix would be the opposite: lower dropout or
 raise the adapter rank.
 
+### Agent scenario: a tool-calling fine-tune that memorized its traces
+A team fine-tunes a small open model on 2,000 tool-calling traces for a support agent, holding out 200
+whole tasks (illustrative numbers). The adapter config is the usual PEFT shape:
+
+```python
+from peft import LoraConfig
+
+cfg = LoraConfig(
+    r=16, lora_alpha=32,
+    lora_dropout=0.05,              # adapter dropout: on in training, off after model.eval()
+    target_modules=["q_proj", "v_proj"],
+    task_type="CAUSAL_LM",
+)
+# Pair it with AdamW weight decay in the trainer and pick the checkpoint on the held-out tasks.
+```
+
+| Epoch | Eval loss | Tool-call accuracy (held-out tasks) | Copied a training argument verbatim |
+|---|---|---|---|
+| 1 | 0.92 | 81% | 2% |
+| 2 | 0.84 | 86% | 4% |
+| 3 | 0.88 | 83% | 11% |
+| 4 | 0.97 | 78% | 19% |
+
+- **Ship epoch 2.** Eval loss and task metrics agree that memorization starts after it.
+- **The verbatim-copy column is the agent-specific symptom.** A memorizing agent fills `order_id` or
+  email fields with values it saw in training, a correctness and privacy bug that loss alone hides.
+
 ## Production patterns
+- **Split agent traces by task, not by turn.** Agent teams hold out whole tasks (or whole customers) so
+  the same transcript never contributes turns to both sides; otherwise early stopping triggers on a leak.
+  Monitor near-duplicate rate between splits and pick checkpoints on held-out task success.
 - **Decay groups by parameter shape.** For every AdamW run, put tensors with `ndim < 2` (biases, norm
   gains) in a group with `weight_decay` 0.0, as in the example above. Monitor the weight-norm curve per
   group, and log the group sizes at startup so a refactor cannot silently merge them.
@@ -226,7 +282,7 @@ raise the adapter rank.
 - **Adapter dropout for small fine-tunes.** With PEFT, set `lora_dropout` in `LoraConfig` (values such as
   0.05 or 0.1 are common starting points) and tune it with weight decay on the validation set. Monitor
   the train/val gap per epoch.
-- **Eval-mode guards in serving and tests.** Call `model.eval()` and run under `torch.inference_mode()` in
+- **Eval-mode guards in agent serving and tests.** Call `model.eval()` and run under `torch.inference_mode()` in
   every eval and serving path, and add a unit test that two forward passes on the same input are
   identical (within a tight tolerance on GPU, where some kernels are non-deterministic). Monitor prediction
   variance on repeated canary inputs.
@@ -264,12 +320,18 @@ raise the adapter rank.
   those parameters move to the no-decay group.
 - **Adding dropout to an under-fitting model.** Training and validation loss are both high and close
   together; more noise only widens the capacity shortfall. Fix: lower dropout or add capacity.
+- **Choosing the agent checkpoint on loss alone.** Symptom: the lowest-loss checkpoint calls the right
+  tools on the eval set but copies training argument values on live traffic. Fix: score checkpoints on
+  held-out task success and a verbatim-copy check, then ship the best by those.
 - **Dropout immediately before BatchNorm.** Activation variance differs between train and eval mode, so
   BatchNorm's running statistics are wrong at inference. Fix: put dropout after the last BatchNorm layer.
 
 ## When to use
 - **Diagnose first.** Training loss falling while validation loss rises is overfitting, and regularization
   is the lever. Both losses high and close is under-fitting: remove regularization, add capacity or data.
+- **Use for agent fine-tunes:** tool-calling or routing adapters trained on a few thousand traces for
+  several epochs are the classic memorization regime.
+- **Skip when:** you only prompt hosted models; the provider owns these settings.
 - **Use for fine-tuning:** weight decay through AdamW, dropout (including `lora_dropout` for adapters),
   fewer epochs and early stopping on a clean held-out split.
 - **Pretraining-scale data:** follow the recipe of the model family you are reproducing, which usually means
@@ -310,7 +372,7 @@ trigger on a leak.
 - **Contrast:** the original paper left training activations unscaled and multiplied the weights by (1−p) at
   test time; equivalent in expectation, but it puts a rescaling step into inference code.
 
-### Your fine-tuned model gives different answers to the same prompt in production. How do you debug it?
+### Your self-hosted fine-tuned agent picks different tools for the same prompt. How do you debug it?
 - **First suspect dropout left on:** check that the serving path calls `model.eval()`; noisy,
   non-reproducible outputs with otherwise sane quality are the classic symptom.
 - **Prove it:** run the same input twice with sampling disabled (greedy decoding); if logits differ by more
@@ -330,11 +392,19 @@ trigger on a leak.
 - **Under-fitting runs:** if train and val loss are both high and close, more noise widens the capacity gap.
 - **Right before BatchNorm:** train/eval variance mismatch corrupts running statistics.
 
-### A customer fine-tuned on 300 examples and the model parrots them. What do you change?
-- **Diagnose:** a near-zero train loss with rising validation loss on a held-out set confirms memorization.
+### A customer fine-tuned an agent on 300 traces and it parrots them. What do you change?
+- **Diagnose:** a near-zero train loss with rising validation loss on a held-out set confirms memorization;
+  in an agent it also shows as copied argument values and a fixed tool order on new tasks.
 - **Cheap levers first:** fewer epochs with early stopping, AdamW weight decay and `lora_dropout`.
 - **The real fix is data:** more varied examples and a clean held-out set, rather than exotic regularizers;
   also check validation examples do not duplicate training ones.
+
+### How do you pick which checkpoint of an agent fine-tune to deploy?
+- **Hold out whole tasks:** split traces by task or customer so no transcript appears on both sides.
+- **Score on behaviour:** run each candidate checkpoint through the agent eval (task success, tool-call
+  accuracy, argument validity) in eval mode, not just eval loss.
+- **Prefer the earliest checkpoint that ties:** later epochs that match on metrics but copy more training
+  values verbatim are memorizing, which surfaces later as wrong IDs or leaked data.
 
 ## Quiz
 ### Q: Why does inverted dropout divide the kept activations by 1 − p during training?

@@ -5,7 +5,8 @@ name: Pairwise comparison
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - evals/llm-as-a-judge
   - evals/judge-calibration-and-bias
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Pairwise comparison asks "which of these two answers is better?" instead of "rate this 1–10". It needs
-no shared scale, so verdicts are more consistent; they aggregate into a win rate or a Bradley–Terry
-ranking and also feed preference training.
+Pairwise comparison asks "which of these two agent runs is better?" instead of "rate this 1–10". With
+no shared scale, verdicts are more consistent; they become a win rate against your production agent, a
+Bradley–Terry ranking, or preference data.
+
+## For agent builders
+- **Why it matters for agents.** Choosing between two agent prompts, models or tool sets is a "B or
+  A?" decision. Pairwise judging of replies and trajectories answers it directly, while absolute
+  scores of each version drift and compress.
+- **Where it shows up in your stack.** Side-by-side experiment views and pairwise evaluators in eval
+  tools such as LangSmith or Braintrust, SME review sessions comparing two agent versions, and
+  (prompt, chosen, rejected) data for DPO or reward models on agent traces.
+- **What you control.** The baseline (your production agent), what the judge sees (final reply or the
+  whole trajectory), both-order judging, tie handling, and the rule that outcome checks and gates run
+  before any preference counts.
+- **What you can skip.** Elo and leaderboard machinery unless you rank many variants; for one candidate
+  against production, a win rate with a bootstrap interval is the whole method.
 
 ## Why it exists
 - **Absolute scores drift.** The same annotator gives a 7 on Monday and an 8 on Friday for equivalent
@@ -48,6 +62,20 @@ ranking and also feed preference training.
 - **Record the verdict, the order shown and the judge**, because order matters: LLM judges show position
   bias, so each pair is judged in both orders (or inconsistent pairs are treated as ties). For human
   raters the order is randomised.
+
+### Pairwise for agents: outcome first, preference second
+1. **Replay both agent versions on the same tasks,** each from a fresh sandbox, so differences come from
+   the agent and not the environment.
+2. **Score the outcome with code** (final state, tests). A run that failed its task loses outright; no
+   judge needed.
+3. **Judge preference only where both succeeded,** on the reply (clarity, faithfulness to tool results)
+   or the trajectory (fewer wasted calls), in both orders.
+4. **Report both numbers:** the paired outcome difference and the preference win rate on the
+   both-succeeded subset, because a nicer reply never compensates for a failed task.
+
+- **Judge a rendered trajectory, not raw logs.** Long traces amplify verbosity bias: the run with more
+  tool calls looks more thorough. Show steps compactly and tell the judge that fewer steps to the same
+  outcome is better.
 
 ### Aggregation 1: win rate against a baseline
 1. **Fix a baseline**, usually the production system or a reference model, and compare each candidate to it.
@@ -108,14 +136,18 @@ bootstrapped intervals for this reason.
 - **Consequence:** evaluation and training share a model, so any bias in your pairwise judging (a
   preference for length, say) is learned by the policy. Debiasing the judge is also debiasing the
   training data.
+- **For agents,** pairs of trajectories on the same task (a successful run as chosen, a failed or
+  wasteful one as rejected) are a common source of preference data for fine-tuning a tool-calling
+  model; the same both-order and length checks apply before training.
 
 ## Diagram
-One pair travels through both orders, ties are split, and the verdicts feed two aggregations: a win rate
-against production for a ship decision, or a Bradley–Terry fit for a ranking.
+One pair of agent runs on the same task travels through both orders, ties are split, and the verdicts
+feed two aggregations: a win rate against the production agent for a ship decision, or a Bradley–Terry
+fit for a ranking.
 
 ```mermaid
 flowchart TD
-    P["Prompt plus answers A and B"] --> O1["Judge: A shown first"]
+    P["Task plus runs from agents A and B"] --> O1["Judge: A shown first"]
     P --> O2["Judge: B shown first"]
     O1 --> C{"Same verdict both orders?"}
     O2 --> C
@@ -202,22 +234,45 @@ print(comparisons_needed(0.60, 0.035))                  # 753: halving the inter
 | Comparisons to resolve a five-point difference | ≈ 381 |
 | Cost of halving the interval | about 4× the comparisons, because SE scales with 1/√n |
 
+### Agent scenario: new planner prompt versus the production agent
+Both agent versions replay 300 support tasks from fresh sandboxes. Outcome is checked in code first;
+the pairwise judge sees only tasks both versions solved. Numbers are illustrative.
+
+| Outcome per task | Count |
+|---|---|
+| Both succeeded | 210 |
+| Only the new agent succeeded | 30 |
+| Only production succeeded | 18 |
+| Both failed | 42 |
+
+| Number | Calculation | Reading |
+|---|---|---|
+| Task success | new 240/300 = 80% vs production 228/300 = 76% | the 4-point gain rests on 30 vs 18 discordant tasks; read those 48 traces |
+| Preference on the 210 both-succeeded | new 98, production 82, ties 30 → (98 + 15) / 210 ≈ 0.54 | SE ≈ √(0.54 × 0.46 / 210) ≈ 0.034, so roughly 47–61%: no clear reply-quality win |
+| Mean tool calls per solved task | new 6.1 vs production 4.3 | check whether the judge's wins sit in the longer runs |
+
+- **Decision:** the outcome gain is the real signal; the reply preference is a tie. Confirm the 18
+  production-only tasks are not a safety-relevant category before shipping.
+
 ## Production patterns
-- **Anchor every candidate to production.** Keep a frozen set of prompts with production outputs, and
-  judge each new variant against them in both orders on every pull request. Monitor win rate with its
-  bootstrap interval and the position-consistency rate.
+- **Anchor every candidate to the production agent.** Keep a frozen task set with production runs, and
+  judge each new agent variant against them in both orders on every pull request. Monitor win rate with
+  its bootstrap interval and the position-consistency rate.
+- **Outcome before preference.** Score task success in code on fresh sandboxes for both versions, and
+  send only both-succeeded pairs to the pairwise judge. Monitor the discordant counts (tasks only one
+  version solved) next to the win rate.
 - **Ship rule = interval plus gates.** Require the lower bound of the win-rate interval to exceed 50% and
   the candidate to pass rubric gates on its own. Monitor per-category win rates so a global win cannot
   hide a loss on safety-sensitive prompts.
 - **Adaptive comparison budget.** Run a first round of about 40 comparisons per variant against
   production, drop clear losers, and spend the rest where intervals overlap. Monitor interval width per
   surviving variant.
-- **Length-difference guard.** Log the mean length difference between arms next to every win rate, and
-  compute a length-controlled win rate when it is non-trivial. Monitor whether wins concentrate in the
-  longer arm.
-- **Debias before reusing pairs as training data.** Before turning judged pairs into DPO or reward-model
-  data, keep only position-consistent verdicts and check the chosen-vs-rejected length gap. Monitor
-  output length across training rounds against human preference.
+- **Length and step-count guard.** Log the mean reply-length and tool-call-count difference between
+  arms next to every win rate, and compute a length-controlled win rate when it is non-trivial. Monitor
+  whether wins concentrate in the longer arm or the arm with more tool calls.
+- **Debias before reusing pairs as training data.** Before turning judged pairs or agent trajectories
+  into DPO or reward-model data, keep only position-consistent verdicts and check the chosen-vs-rejected
+  length gap. Monitor output length and steps per task across training rounds against human preference.
 
 ## Trade-offs
 - **Consistency vs absolute bar.** Pairwise verdicts are more consistent than absolute scores but say
@@ -245,12 +300,16 @@ print(comparisons_needed(0.60, 0.035))                  # 753: halving the inter
   category that matters most, such as safety-sensitive requests. Fix: per-category win rates.
 - **Elo on a static dataset.** Symptom: ratings that change when the comparison order is shuffled. Fix:
   batch Bradley–Terry fit.
+- **Letting a nicer reply outvote a failed task.** Symptom: the new agent "wins" 60% of pairwise
+  comparisons while its task success rate fell. Fix: check outcome in code first and judge preference
+  only where both runs succeeded.
 - **Reusing LLM-judged pairs as DPO data without debiasing.** Symptom: a model whose outputs get longer
   every training round while human preference stays flat. Fix: keep only position-consistent verdicts
   and check the chosen-vs-rejected length gap before training.
 
 ## When to use
-- **Use when** comparing variants of one system (prompt A vs B, a model upgrade, a fine-tune), collecting
+- **Use when** comparing variants of one agent or system (prompt A vs B, a model upgrade, a new tool
+  set, a fine-tune), collecting
   preference data for training, or whenever humans judge subjective quality where an absolute scale would
   not hold.
 - **Avoid** using it alone for release gating, or for tasks with an executable check.
@@ -287,12 +346,22 @@ checked. If intervals overlap, buy more comparisons or move to an online A/B tes
 - **It answers the release question directly:** "is B better than A" is what the comparison measures,
   with no subtraction of two noisy averages.
 
-### Your new prompt wins 68% against production, then loses in an online A/B. What went wrong?
-- **Check position and length first:** were both orders judged, and is the new prompt's output longer?
-  Side-by-side presentation amplifies length and style bias.
+### Your new agent prompt wins 68% against production offline, then loses in an online A/B. What went wrong?
+- **Check position and length first:** were both orders judged, and is the new prompt's output longer
+  or its trajectory busier? Side-by-side presentation amplifies length and style bias.
+- **Check outcomes:** if preference was judged on replies alone, the new agent may write nicer replies
+  while completing fewer tasks; compare task success in code on the same tasks.
 - **Check categories:** a global win can hide a loss on the traffic slice that dominates production.
 - **Check the prompt set:** if the offline prompts do not match the live distribution, the win rate
   measured a different product. Rebuild the set from sampled production traffic.
+
+### How would you run a pairwise comparison between two versions of a tool-calling agent?
+- **Replay both on the same frozen task set from fresh sandboxes,** and check task success in code
+  first; a failed run loses without a judge.
+- **Judge preference only on tasks both solved,** in both orders, on a compact rendered trajectory and
+  reply, telling the judge that fewer steps to the same outcome is better.
+- **Report the paired success difference and the win rate with an interval,** plus the tool-call-count
+  difference, so a verbosity or effort bias is visible.
 
 ### When would you not use pairwise comparison?
 - **As the only release gate,** because a high win rate against a weak baseline says nothing about

@@ -5,7 +5,8 @@ name: Workflow orchestration (Temporal, Prefect, Airflow)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - reliability/durable-workflow-execution
   - agent-reliability/durable-execution-and-checkpointing
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Workflow orchestrators run multi-step processes reliably outside a request. Airflow schedules batch DAGs,
-Prefect runs dynamic Python dataflows, Temporal replays durable workflow code. Indexing pipelines fit
-Airflow or Prefect; long-lived agent runs and approval flows fit Temporal-style engines.
+Workflow orchestrators run your agent's multi-step work reliably outside a request. Airflow schedules
+the batch DAGs that feed RAG indexes, Prefect runs dynamic Python dataflows, and Temporal replays durable
+code, which fits long agent runs that wait for approvals.
+
+## For agent builders
+- **Why it matters for agents.** Two parts of an agent system outlive a request: the ingestion pipeline
+  behind its retrieval, and agent runs that take hours, call flaky tools and wait for humans. Both need
+  durable step state and retries, and neither may repeat a refund or an email.
+- **Where it shows up in your stack.** Airflow or Prefect for nightly re-embedding and connector syncs;
+  Temporal (or a similar durable engine) as the executor for long agent runs, with each model call and
+  tool call as an activity; LangGraph's checkpointer covers lighter cases inside one service.
+- **What you control.** Which work is an activity versus deterministic workflow code, retry policies and
+  timeouts per tool, idempotency keys, how big the transcript in history may grow, and versioning when
+  you change a running agent's code.
+- **What you can skip.** Airflow executor internals and Temporal's server operations if you buy a hosted
+  service. Know the three recovery models and the determinism rule.
 
 ## Why it exists
 - **Multi-step processes all need the same machinery.** Remember which steps completed, retry failures
@@ -125,6 +139,19 @@ A worker crashes in the middle of step 3 of a five-step run.
 - **A ten-second chain of three model calls inside a request:** none of them; an in-process orchestrator
   is enough.
 
+### Mapping an agent loop onto a durable engine
+| Agent piece | Where it goes in Temporal | Because |
+|---|---|---|
+| Model call | an activity with a retry policy | non-deterministic, rate-limited, may return 429 or 503 |
+| Tool call | an activity with an idempotency key | side effects must survive retries |
+| Step and cost budget, routing | workflow code | deterministic decisions replay identically |
+| Human approval | a signal plus `wait_condition` with a timeout | waits days without holding a worker |
+| Transcript | workflow state, kept compact | every activity input lands in history |
+
+- **LangGraph versus Temporal is not either-or.** A LangGraph checkpointer resumes a graph inside one
+  service; Temporal adds replay, timers and signals across deploys. Teams sometimes run a LangGraph
+  graph inside a Temporal activity, or write the loop directly as a workflow.
+
 ### What all three give you, and what none of them do
 - **All three give:** persistence of step state, retries, scheduling, a UI and observability.
 - **None make your steps idempotent, and none guarantee exactly-once side effects:** a retry after a
@@ -203,6 +230,55 @@ class DocumentExtraction:
 # Worker(client, task_queue="extraction", workflows=[DocumentExtraction], activities=[extract_fields, write_record])
 ```
 
+### Temporal: an agent loop as a durable workflow
+Model and tool calls are activities; the step budget and the approval gate are deterministic workflow
+code. `CONSEQUENTIAL`, `llm_step` and `tools.execute` stand in for your own tool registry and clients.
+
+```python
+@activity.defn
+async def call_model(messages: list) -> dict:
+    return await llm_step(messages)             # returns {"final": ...} or {"tool", "args", "message"}
+
+@activity.defn
+async def run_tool(name: str, args: dict, idem_key: str) -> dict:
+    return await tools.execute(name, args, idempotency_key=idem_key)   # returns a short summary
+
+@workflow.defn
+class AgentRun:
+    def __init__(self) -> None:
+        self.approved: bool | None = None
+
+    @workflow.signal
+    def approve(self, decision: bool) -> None:
+        self.approved = decision
+
+    @workflow.run
+    async def run(self, task: str) -> str:
+        messages = [{"role": "user", "content": task}]
+        for step in range(12):                                         # step budget: deterministic
+            reply = await workflow.execute_activity(
+                call_model, messages, start_to_close_timeout=timedelta(minutes=2),
+                retry_policy=RetryPolicy(maximum_attempts=3))
+            if reply.get("final"):
+                return reply["final"]
+            if reply["tool"] in CONSEQUENTIAL:                         # approval gate as a durable wait
+                await workflow.wait_condition(lambda: self.approved is not None, timeout=timedelta(days=3))
+                if not self.approved:
+                    return "rejected"
+                self.approved = None
+            key = f"{workflow.info().workflow_id}:{step}"              # same key on every retry
+            result = await workflow.execute_activity(
+                run_tool, args=[reply["tool"], reply["args"], key],
+                start_to_close_timeout=timedelta(minutes=5))
+            messages += [reply["message"], {"role": "tool", "content": result["summary"]}]
+        return "budget_exhausted"
+```
+
+- **History grows with the transcript.** Each `call_model` input carries the whole message list, so keep
+  tool results as short summaries with references, and use continue-as-new for very long runs.
+- **The wait timeout raises `asyncio.TimeoutError`;** catch it as in the extraction example and return a
+  distinct status.
+
 ### Walking one low-confidence document through replay
 The server's history for the run, simplified:
 
@@ -256,6 +332,10 @@ reembed_daily()
   the key from the workflow id and activity id (available from `activity.info()`) and send it to the
   downstream API. Monitor activity attempt counts per type; a rising average means retries, and each
   retry is a duplicate unless keyed.
+- **One activity per model call and per tool call.** Agent teams on Temporal give the model activity a
+  retry policy for provider 429s and 503s and each tool activity its own timeout and idempotency key,
+  while budgets and approval gates stay in workflow code. Monitor activity attempts per tool, approval
+  wait time, and runs ending in each terminal status.
 - **Patch-based versioning for in-flight runs.** Wrap changed workflow logic in `workflow.patched("change-id")`
   so old histories replay the old branch and new runs take the new one; remove the patch once old runs
   finish. Monitor non-determinism errors after each deploy and the count of open runs on old versions.
@@ -296,6 +376,9 @@ reembed_daily()
   exactly the days that were retried or backfilled. Fix: overwrite the interval's partition.
 - **Megabytes of document text or embeddings through task results or workflow history.** Symptom: slow
   UIs, size limits being hit, and failed runs on large documents. Fix: pass references.
+- **Calling the LLM directly from workflow code.** Symptom: on replay the agent "decides" something
+  different from the recorded run, or a non-determinism error. Fix: every model call is an activity, so
+  replay returns the recorded reply.
 - **Deploying changed workflow code with runs in flight and no versioning.** Symptom: those runs fail or
   take a different path on replay than they did originally. Fix: guard the change with
   `workflow.patched`, or let old runs drain on the old code first.
@@ -365,19 +448,22 @@ is the achievable form of exactly-once.
 - **Detect it** by comparing row counts per partition before and after retries or backfills; any growth
   on a re-run is the bug.
 
-### When would you not add a workflow orchestrator at all?
-
+### When would you not put your agent on a workflow orchestrator at all?
 - **Short chains inside a request:** a ten-second chain of three model calls needs only an in-process
   orchestrator with good logging.
 - **The cost of adding one** is an operational component, a learning curve and, for Temporal, a server
   to run or buy plus determinism discipline.
+- **Middle ground:** a framework checkpointer (for example LangGraph with a Postgres checkpointer) when
+  runs must resume but never wait days.
 
-### Why keep document text and embeddings out of workflow history, and how do you bound history?
-
-- **Every activity input and output lands in history,** so megabyte payloads slow UIs, hit size limits
-  and fail runs on large documents; pass references to object storage instead.
-- **Long-lived loops** should call `workflow.continue_as_new(...)` with compact state; monitor history
-  event count and size per workflow against the server's limits.
+### How would you run a tool-calling agent on Temporal, and what goes in history?
+- **Activities for the non-deterministic parts:** each model call and each tool call, with retry
+  policies, timeouts and an idempotency key built from the workflow id and step.
+- **Workflow code for decisions:** the step budget, routing and the approval gate as a signal with a
+  timeout, so replay reproduces them exactly.
+- **History holds every activity input and output,** so megabyte transcripts or documents slow UIs and
+  hit size limits; pass references, keep tool summaries short, and call `workflow.continue_as_new(...)`
+  with compact state for long-lived loops, monitoring history event count and size per workflow.
 
 ## Quiz
 ### Q: Why must Temporal workflow code be deterministic?

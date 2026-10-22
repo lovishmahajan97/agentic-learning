@@ -5,7 +5,8 @@ name: Exactly-once processing limitations
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - system-design/outbox-inbox-patterns
   - system-design/event-driven-architecture
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Exactly-once *delivery* over a lossy network is impossible; exactly-once *effect* is buildable from
-at-least-once delivery plus deduplication committed with the effect. Every "exactly-once" feature, Kafka
-transactions included, stops at that boundary; external APIs and LLM calls are not covered.
+Your agent's tool calls cannot be delivered exactly once over a lossy network; you can only build
+exactly-once *effects* from at-least-once delivery plus deduplication committed with the effect. Every
+"exactly-once" feature stops there; external APIs and LLM calls are outside.
+
+## For agent builders
+- **Why it matters for agents.** Every agent retries: the model call times out, the worker is preempted,
+  the run resumes from a checkpoint. Each retry is a chance to send the email twice, charge twice, or ask
+  the model again and get different tool arguments.
+- **Where it shows up in your stack.** The `idempotency_key` parameter on tool adapters, a `step_results`
+  table or a durable engine's history, and framework resume behaviour: a run that resumes from its last
+  checkpoint re-runs the step that was in flight, so anything inside that step must be safe to repeat.
+- **What you control.** Keys derived from `(run_id, step_id)`, memoising model outputs before acting on
+  them, splitting a step into generate, act and mark phases, dedupe windows, and which tools you accept
+  duplicates from.
+- **What you can skip.** Kafka transaction internals and Flink checkpoint barriers. Know the two generals
+  argument, the boundary test and the memoisation rule.
 
 ## Why it exists
 - **Everyone eventually asks "can you guarantee this runs exactly once?"** The honest answer needs the
@@ -109,6 +123,17 @@ Take at-least-once delivery and make processing idempotent:
   write and an index per message. Exactly-once is paid per message, so apply it only where duplicates hurt.
 - **Human-visible effects.** A duplicate notification cannot be deduplicated after the fact; the dedupe has
   to sit before the send, and the send must be the last thing before the commit, not the first.
+
+### Classify your agent's tools
+Run the boundary test below on every tool before it ships. Typical outcomes:
+
+| Tool | Idempotency class | What you do |
+|---|---|---|
+| `search_docs`, `get_order` | read-only | retry freely; memoise only to save cost or keep replays reproducible |
+| `update_ticket_status` (absolute value) | naturally idempotent | retry freely |
+| `charge_card`, `send_sms` via a provider with keys | idempotent at the receiver | stable key from `(run_id, step_id)`; check the provider's key retention |
+| `add_credits` (delta), `post_to_channel` without keys | none | write a result row first, reconcile by correlation id, or gate behind approval |
+| The model call itself | non-deterministic | memoise the output before any tool acts on it |
 
 ### A boundary test
 For each effect a handler produces, ask: **does the dedupe record commit atomically with this effect?**
@@ -245,6 +270,13 @@ transaction as the effect.
 - **Dedupe window sized to the DLQ.** Set inbox retention or dedupe TTL longer than the maximum time a
   message can sit in a dead-letter queue before replay. Plot the age distribution of redeliveries against
   the window.
+- **Idempotency class in the tool registry.** Every agent tool declares read-only, naturally idempotent,
+  keyed at the receiver, or none; the runtime injects `{run_id}:{step_id}` keys for keyed tools and refuses
+  to auto-retry "none" tools. Add an eval or test that replays each tool call twice and asserts one effect.
+  Monitor duplicate-effect reports per tool.
+- **One side effect per resumable step.** Structure the agent graph so each node or activity performs at
+  most one external effect and checkpoints right after it, because resume re-runs the in-flight step from
+  its start. Monitor steps re-executed after resume.
 
 ## Trade-offs
 - **Idempotent consumers vs broker transactions.** At-least-once with idempotent consumers is cheap,
@@ -276,6 +308,9 @@ transaction as the effect.
   and the downstream saga compensations no longer match what was actually done.
 - **Treating delta updates as idempotent.** `credits -= 1` applied twice is wrong, discovered when customer
   balances drift from the ledger.
+- **Several side effects inside one agent step.** The step posts to Slack and then creates a ticket; a
+  crash after the post resumes the step from its start and posts again. Fix: one external effect per
+  checkpointed step, or keyed effects throughout.
 
 ## When to use
 Decide per effect, not per system. Classify each side effect a handler or agent step produces:
@@ -353,6 +388,14 @@ response round trip plus one write, which is small but not zero.
 - **Temperature zero is not enough;** it is not guaranteed deterministic across runs, and different output
   means different tool arguments and mismatched compensations.
 - **A deliberate regenerate** is a new key and a product decision, not a retry.
+
+### Your agent framework resumes runs from checkpoints after a crash. Which tool calls are still at risk of duplicates?
+- **The step that was in flight.** Resume restarts it from its beginning, so any effect it performed
+  before the crash runs again unless keyed.
+- **Effects outside the checkpoint store.** A Slack post or an email is not rolled back by the checkpoint;
+  only a receiver-side key or a sent marker written immediately after stops the repeat.
+- **Fix:** one external effect per step, keys from `(run_id, step_id)`, and a model output memoised before
+  the step acts on it.
 
 ## Quiz
 ### Q: Why can no protocol over a lossy network guarantee exactly-once delivery?

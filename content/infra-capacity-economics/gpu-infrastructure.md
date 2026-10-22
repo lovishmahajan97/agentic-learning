@@ -5,7 +5,8 @@ name: GPU infrastructure
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - infra-capacity-economics/gpu-sizing
   - infra-capacity-economics/gpu-utilization-and-memory-bandwidth
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-A GPU deployment is a stack, not a card: accelerator, host, driver and CUDA, container runtime,
-scheduler and procurement. Each layer fails differently, and most "the GPU is slow" tickets are really
-host, driver or scheduling problems.
+When you self-host the model, embedder or reranker behind your agents, you run a stack, not a card:
+accelerator, host, driver and CUDA, container runtime, scheduler and procurement. Most "the agent is
+slow" tickets turn out to be host, driver or scheduling problems.
+
+## For agent builders
+- **Why it matters for agents.** An agent run makes many model calls in sequence, so one bad GPU node is
+  hit far more often per run than per single chat. A faulty or cold replica turns into failed tool loops,
+  retries and timeouts that look like agent bugs.
+- **Where it shows up in your stack.** Only when you self-host: a vLLM or SGLang deployment for the
+  agent's model, a GPU embedder for RAG, a reranker. Hosted APIs (OpenAI, Anthropic) hide every layer
+  here behind rate limits and latency.
+- **What you control.** The pod spec (GPU request, node selector, toleration), where weights load from,
+  the driver/image pairing, and the health loop that removes bad cards before agent sessions land on them.
+- **What you can skip.** SM microarchitecture and NCCL tuning. Know the seven layers, their failure
+  signatures, and that ready-time is a storage number.
 
 ## Why it exists
 - **GPUs break CPU-server assumptions.** CPU nodes are interchangeable: any node runs any container, the
@@ -43,7 +56,8 @@ host, driver or scheduling problems.
 
 ## How it works
 Walk the stack bottom-up. Each layer answers one question; sizing, bandwidth, card selection,
-serverless and autoscaling each have their own lesson.
+serverless and autoscaling each have their own lesson. For an agent platform, read the table as "what can
+break an agent run that calls this model twenty times".
 
 | # | Layer | Question it answers | Typical failure |
 |---|---|---|---|
@@ -142,9 +156,18 @@ from another's OOM.
 - **Automated cordon-on-XID** (or the GPU Operator's health checks) is part of the stack, not an optional
   extra.
 
+### What changes when the callers are agents
+- **Calls per run multiply exposure.** A chat turn makes one model call; an agent run makes one per step.
+  A replica that fails 1 call in N is met by most multi-step runs, so per-replica health matters more.
+- **Several GPU services per step.** A RAG agent step may hit an embedder, a reranker and the LLM. Each is
+  its own deployment with its own layers, and the slowest or least healthy one sets step latency.
+- **Long runs outlive pods.** A run that lasts minutes spans scale-downs, node drains and driver rollouts,
+  so the agent loop needs per-call retries and resumable state, not just a healthy cluster.
+
 ## Diagram
-Follow one GPU pod from `kubectl apply` to its first token; each box is a layer that can fail on its own,
-and the dotted edge is the health loop that keeps bad cards out of the pool.
+Follow one GPU pod serving an agent's model from `kubectl apply` to its first agent step; each box is a
+layer that can fail on its own, and the dotted edge is the health loop that keeps bad cards away from
+agent sessions.
 
 ```mermaid
 flowchart TD
@@ -154,14 +177,15 @@ flowchart TD
     D --> E{"Image CUDA runtime supported by driver?"}
     E -->|"no"| F["Crash: driver version is insufficient"]
     E -->|"yes"| G["Load weights from storage"]
-    G --> H["Engine serves first token"]
+    G --> H["Engine serves first agent step"]
     H --> I["DCGM exporter: SM activity, XID errors"]
     I -.->|"XID fault: cordon node"| B
 ```
 
 ## Examples
 ### Deployment that fails fast on a bad node
-Asks for one GPU on a node labelled with a card model and tolerates the GPU taint.
+The embedder behind a RAG agent's retrieval tool asks for one GPU on a node labelled with a card model
+and tolerates the GPU taint.
 - The init container runs `nvidia-smi`, which only succeeds if the toolkit mounted the driver libraries.
 - Official `nvidia/cuda` images set `NVIDIA_REQUIRE_CUDA`, so the toolkit refuses to start the container
   on a driver too old for that CUDA version.
@@ -217,6 +241,21 @@ for volume, mb_s in [("network volume", 100), ("local NVMe (illustrative)", 3000
 # local NVMe (illustrative)      0.8 min
 ```
 
+### Worked scenario: one bad node in an agent fleet
+Ten replicas serve the agent's model behind a round-robin load balancer. One node has a GPU throwing XID
+errors, so about 1 in 10 calls fails. Agent runs average 20 model calls.
+
+| Caller | Calls per unit of work | Chance a unit touches the bad replica |
+|---|---|---|
+| Single-shot chat | 1 | 10% |
+| 5-step agent run | 5 | 1 − 0.9^5 ≈ 41% |
+| 20-step agent run | 20 | 1 − 0.9^20 ≈ 88% |
+
+- **Without a per-call retry** that lands on another replica, most long runs fail somewhere mid-loop,
+  after spending tokens and tool side effects on earlier steps.
+- **With cordon-on-XID**, the bad node leaves the pool and the exposure drops to zero; the retry only has
+  to cover the minutes before the health check fires.
+
 ### Worked triage: "the GPU is slow" ticket, layer by layer
 | Symptom seen | Layer | Check | Fix |
 |---|---|---|---|
@@ -228,22 +267,24 @@ for volume, mb_s in [("network volume", 100), ("local NVMe (illustrative)", 3000
 | Queue grows 20 minutes after scale-up | Procurement | Cloud says "insufficient capacity" | Reservations, quota headroom, fallback region |
 
 ## Production patterns
-- **Fail-fast GPU init container.** Use on every GPU workload. Run `nvidia-smi` from an `nvidia/cuda`
+- **Fail-fast GPU init container.** Use on every GPU workload behind an agent (LLM, embedder, reranker). Run `nvidia-smi` from an `nvidia/cuda`
   base image with the same CUDA version as the server, as in the example above. Monitor init-container
   failure counts per node: a cluster of failures marks a mis-provisioned node pool.
 - **Driver first, image second.** Use whenever you bump a base image. Roll the new driver across every GPU
   node pool, verify, then release the image with the newer CUDA runtime. Monitor driver version per node
   (feature discovery labels or the node image version) and block the rollout while versions are mixed.
-- **Cordon on XID.** Use on any fleet larger than a few nodes. Alert on the DCGM exporter's XID error
-  metric (`DCGM_FI_DEV_XID_ERRORS`) and cordon and drain the node automatically, or enable the GPU
-  Operator's health checks. Monitor how many nodes are cordoned so lost capacity is visible to the
-  autoscaler and on-call.
+- **Cordon on XID, retry in the agent loop.** Use on any fleet larger than a few nodes, because multi-step
+  runs meet a bad replica far more often than single chats. Alert on the DCGM exporter's XID error metric
+  (`DCGM_FI_DEV_XID_ERRORS`) and cordon and drain the node automatically, or enable the GPU Operator's
+  health checks; make the agent retry a failed model call once on another replica. Monitor cordoned
+  nodes and agent-run failure rate per replica.
 - **Taint GPU nodes, select by label.** Use on any shared cluster. Taint GPU nodes with `NoSchedule` on
   the `nvidia.com/gpu` key, add the matching toleration only to GPU workloads, and select the card tier
   with the `nvidia.com/gpu.product` label. Monitor for CPU-only pods on GPU nodes.
-- **Weights on fast local storage.** Use when pod ready-time matters for autoscaling. Mount an NVMe-backed
-  volume or pre-stage weights on the node instead of pulling from object storage at start. Monitor pod
-  ready-time from scheduling to readiness.
+- **Weights on fast local storage.** Use when pod ready-time matters for autoscaling, as it does when
+  agent traffic arrives in bursts. Mount an NVMe-backed volume or pre-stage weights on the node instead of
+  pulling from object storage at start. Monitor pod ready-time from scheduling to readiness, and agent
+  step queue time during scale-up.
 - **Measure SM activity, not GPU-Util.** Dashboard DCGM's SM activity profiling field
   (`DCGM_FI_PROF_SM_ACTIVE`; enable it in the exporter's metric list if it is not on) next to tokens per
   second. Monitor GPU hours used versus purchased.
@@ -259,6 +300,9 @@ for volume, mb_s in [("network volume", 100), ("local NVMe (illustrative)", 3000
 - **Spot vs reliability.** Spot and preemptible capacity is far cheaper but can vanish mid-job. Fine for
   checkpointed training and batch inference, wrong for latency-SLO serving unless on-demand fallback
   exists.
+- **Self-hosting vs a hosted API for the agent's model.** Owning the stack buys data control, fixed
+  per-GPU cost and engine knobs such as prefix caching; it costs every failure mode in this lesson. A
+  hosted API wins until token volume or data rules make the GPU bill and ops team worth it.
 
 ## Pitfalls
 - **Image CUDA runtime newer than the node driver.** Symptom: CrashLoopBackOff on exactly the nodes that
@@ -276,9 +320,14 @@ for volume, mb_s in [("network volume", 100), ("local NVMe (illustrative)", 3000
 - **Treating quota and node lead time as instant.** Symptom: the autoscaler requests a node, the cloud
   answers "insufficient capacity", and the request queue grows for twenty minutes. Fix: plan quota and
   reservations ahead.
+- **Debugging infra failures as agent logic bugs.** Symptom: agent runs fail at random steps with
+  timeouts or malformed outputs, and prompt changes do not help. Fix: tag every model call in traces with
+  the replica or node that served it; failures clustering on one node point to the GPU, not the prompt.
 
 ## When to use
 You do not choose whether to have GPU infrastructure; you choose how many layers to own.
+- **Skip it entirely when:** your agents call a hosted model API and need no self-hosted embedder or
+  reranker; then rate limits and provider latency are your "infrastructure".
 - **Buy the stack when:** the team is small and the workload is standard inference. Managed node pools
   with the GPU Operator, or a serverless GPU platform, come with driver stack, device plugin and metrics
   pre-wired.
@@ -342,12 +391,20 @@ also matters: if half the fleet is unusable, the autoscaler should be told, not 
   per GPU versus roughly 32 GB/s per direction for PCIe Gen4 x16.
 - **The cost of SXM** is fixed eight-card blocks and higher power, so small models waste much of the node.
 
-### Your 140 GB checkpoint takes 23 minutes to become Ready. What do you change, and what does it buy?
+### Your self-hosted agent model's 140 GB checkpoint takes 23 minutes to become Ready. What do you change?
 - **Diagnose:** 140 GB at 100 MB/s is about 23 minutes, so the network volume is the bottleneck, not the GPU.
 - **Fix:** move weights to local NVMe or pre-stage them on the node; at a few GB/s the load drops under a
   minute.
 - **Why it matters:** autoscaling is only useful if new replicas are ready before the queue grows, so
-  ready-time is a capacity number, not a convenience.
+  ready-time is a capacity number, not a convenience; agent sessions waiting on step one time out first.
+
+### Agent runs fail at random steps, but each model call works when replayed. How do you find the cause?
+- **Correlate by replica:** tag each model call in the agent trace with the pod and node that served it;
+  infra faults cluster on one node, prompt bugs do not.
+- **Check that node's layers:** XID entries in its kernel log, DCGM error counters, a driver version that
+  differs from the rest of the pool.
+- **Fix both sides:** cordon the node, and add a one-shot retry on another replica so a single bad card
+  cannot fail a 20-step run.
 
 ## Quiz
 ### Q: Why can `nvidia.com/gpu` not be overcommitted on Kubernetes the way CPU can?

@@ -5,7 +5,8 @@ name: Agent orchestration
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/workflows-vs-agents
   - agents/state-machines
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Agent orchestration is the control layer deciding what runs next (model call, tool, sub-agent or human
-step), with what state, and what happens on failure. The core choice is how much control flow is
-deterministic code versus left to the model.
+Agent orchestration is the control layer of your agent: it decides what runs next (model call, tool,
+sub-agent or human step), with what state, and what happens on failure. The core choice is how much
+control flow is code versus left to the model.
+
+## For agent builders
+- **Why it matters for agents.** Once an agent has two dependent calls, a side-effecting tool or a human
+  approval, something must own ordering, state, retries and interrupts. Making that explicit is the
+  difference between an agent you can resume, test and debug and one you can only re-run.
+- **Where it shows up in your stack.** LangGraph (`StateGraph`, conditional edges, reducers, a
+  checkpointer, `interrupt()`), vendor agent SDKs (the run loop and hand-offs), durable engines such as
+  Temporal for long waits, and run traces in LangSmith or Langfuse.
+- **What you control.** Which steps are nodes, which edges are code routers and which are model choices,
+  the state schema and its reducers, where checkpoints go, idempotency keys on side effects, and the
+  event stream clients see.
+- **What you can skip.** Workflow-engine theory and graph formalisms. The pattern ladder, at-least-once
+  execution and the interrupt-and-resume mechanics are what you need.
 
 ## Why it exists
 - **Two dependent calls already make a program.** Add a second call that depends on the first, a tool
@@ -110,6 +124,17 @@ reimplements them differently.
 - **What matters more than the abstraction:** making state explicit and keeping runtime concerns out of
   the nodes.
 
+| Concept | LangGraph | Vendor agent SDK | Durable engine (Temporal) |
+|---|---|---|---|
+| State | a typed state (TypedDict or Pydantic) | the conversation plus context object | workflow variables |
+| Node | a function added with `add_node` | the model loop, a tool, or a hand-off target | an activity |
+| Router | `add_conditional_edges` | the model's tool or hand-off choice | ordinary workflow code |
+| Persistence | a checkpointer keyed by `thread_id` | usually yours to add | event history, replayed |
+| Human wait | `interrupt()` then `Command(resume=...)` | usually yours to add | a signal the workflow awaits |
+
+- **LangChain is not the orchestrator.** It supplies model, retriever and tool integrations that nodes
+  call; LangGraph (or your own loop) owns the control flow, and LangSmith traces it.
+
 ## Diagram
 The graph from the example below. Static edges are fixed in code, the router after `grade` is a code
 decision on the score, and every node writes a checkpoint so the approval wait holds no worker.
@@ -194,6 +219,48 @@ def run(run_id, store, max_steps=10):
   identical text would collide. In production derive it from the run id (`f"{run_id}:send"`).
 - **Two independent bounds on the revise cycle, one per level:** the `s.step < 6` guard in the router and
   `max_steps` in the loop.
+
+### The same graph in LangGraph
+The hand-rolled executor above, expressed with LangGraph's primitives. `call_model` and `mail` are still
+stand-ins. Check names against the LangGraph version you install: older releases call the in-memory
+checkpointer `MemorySaver`.
+
+```python
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.memory import InMemorySaver   # tutorials only; use a Postgres checkpointer in production
+
+class S(TypedDict, total=False):
+    ticket: str
+    draft: str
+    score: float
+    step: int
+    approved: bool
+
+def draft_reply(s): return {"draft": call_model(f"Draft a reply to: {s['ticket']}").text, "step": s.get("step", 0) + 1}
+def grade(s):       return {"score": float(call_model(f"Score 0-1 as JSON: {s['draft']}").json["score"])}
+def approval(s):    return {"approved": interrupt({"draft": s["draft"]})}   # pauses; resume value lands here
+def send(s):        mail.send_idempotent(key=f"{s['ticket']}:send", body=s["draft"]); return {}
+
+g = StateGraph(S)
+for name, fn in [("draft_reply", draft_reply), ("grade", grade), ("approval", approval), ("send", send)]:
+    g.add_node(name, fn)
+g.add_edge(START, "draft_reply")
+g.add_edge("draft_reply", "grade")
+g.add_conditional_edges("grade", lambda s: "draft_reply" if s["score"] < 0.7 and s["step"] < 6 else "approval",
+                        ["draft_reply", "approval"])
+g.add_conditional_edges("approval", lambda s: "send" if s["approved"] else END, ["send", END])
+g.add_edge("send", END)
+app = g.compile(checkpointer=InMemorySaver())
+
+cfg = {"configurable": {"thread_id": "run-42"}}
+app.invoke({"ticket": "Where is my refund?"}, cfg)   # runs until the interrupt, then returns
+app.invoke(Command(resume=True), cfg)                 # hours later: approval node re-runs and gets True
+```
+
+- **The interrupted node re-runs from its start on resume,** with `interrupt()` returning the resume
+  value, so keep side effects out of code before the `interrupt()` call.
 
 ### Runnable: why parallel branches need a reducer
 Pure Python. Three branches finish in random order and merge into one state field.

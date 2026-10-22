@@ -5,7 +5,8 @@ name: Overfitting
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/train-val-test-split
   - training-adaptation/epochs
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Overfitting is fitting the particulars of training examples (label noise, phrasing) instead of the
-transferable pattern: training loss keeps falling while held-out loss stalls then rises. Fine-tuning a
-small set for many epochs is the commonest way to overfit an LLM.
+Overfitting is fitting the particulars of training examples instead of the transferable pattern. An
+agent model fine-tuned too long replays training traces (same tool order, copied argument values) and
+breaks on new requests; a prompt over-tuned on one eval set does the same.
+
+## For agent builders
+- **Why it matters for agents.** A fine-tuned agent model that memorised its trajectories looks perfect
+  on familiar requests and fails on a new customer, a paraphrase or a tool combination it never saw.
+  Hand-tuning prompts against a small eval set overfits in the same way, without any gradient.
+- **Where it shows up in your stack.** Fine-tuning jobs on agent traces (hosted or Hugging Face and TRL),
+  checkpoint selection with `load_best_model_at_end`, and the eval datasets in your eval tool that you
+  iterate against.
+- **What you control.** Epochs and learning rate, LoRA versus full fine-tune, data diversity and
+  deduplication, and held-out eval slices that probe generalisation: paraphrases, new customers, unseen
+  tool combinations.
+- **What you can skip.** Double-descent theory. Know that the held-out curve, not a rule about model
+  size, tells you when to stop.
 
 ## Why it exists
 - **The objective cannot tell rule from rows.** Training asks only "lower the loss on these examples".
@@ -35,8 +49,8 @@ small set for many epochs is the commonest way to overfit an LLM.
   anything.
 - **Memorising is often easier.** Every dataset carries in-set-only signals: an annotator who filed
   ambiguous tickets under "billing", a template whose phrasing differs by class, an id or timestamp that
-  sorts with the answer. Gradient descent has no reason to prefer the rule, and once it is learned, the
-  shortcuts and noise are the only loss left.
+  sorts with the answer, a trace generator that always calls tools in the same order. Gradient descent
+  has no reason to prefer the rule, and once it is learned, the shortcuts and noise are the only loss left.
 - **Both naive fixes fail.** "Train until the loss stops falling" is the recipe for overfitting, because
   on repeated data training loss falls to zero. "Use a smaller model" throws away the capacity that makes
   the model good at the rule.
@@ -55,10 +69,12 @@ small set for many epochs is the commonest way to overfit an LLM.
 4. **The noise floor.** Label noise sets a floor on achievable *L_val*; a model that goes below it on
    training data has memorised the noise.
 
-### How it looks in LLM fine-tuning
+### How it looks in agent and LLM fine-tuning
 - **Held-out loss turns up after one or two passes** while training loss keeps dropping, often with a
   staircase: an abrupt training-loss drop at each epoch boundary, because the model now predicts rows it
   has already seen.
+- **Trajectory replay.** The agent calls tools in the order its training traces did whether or not the
+  request needs it, and fills arguments with literal values (order ids, amounts) seen in training.
 - **Verbatim reproduction.** The model reproduces training completions, including names, numbers and
   boilerplate, and can be prompted to regurgitate training records: a privacy incident as well as a
   modelling failure.
@@ -70,10 +86,16 @@ small set for many epochs is the commonest way to overfit an LLM.
   or improving, because loss penalises every token including stylistic ones. Pick checkpoints on the
   metric you ship, with loss as the early-warning signal.
 
+### Overfitting without training: prompts and agent configs
+- **Every kept prompt change is a fit.** Iterating a system prompt, tool descriptions or few-shot examples
+  until a 100-task eval set passes selects for that set's quirks, including its noise.
+- **The symptom is the same gap:** dev score up, production success flat. The cure is the same too: a
+  frozen test set read once, and fresh tasks from recent traffic.
+
 ### Levers, and why each one works
 | Lever | How | Why it works |
 |---|---|---|
-| **Data** | more examples, deduplication, cleaner labels | memorisation becomes harder than the rule; duplicates stop being seen several times per epoch; cleaner labels lower the noise floor |
+| **Data** | more examples, deduplication, cleaner labels, more diverse trajectories | memorisation becomes harder than the rule; duplicates stop being seen several times per epoch; cleaner labels lower the noise floor |
 | **Steps** | fewer epochs, lower learning rate, early stopping | limits how far the model travels from the pretrained prior, stopping after shared structure and before particulars |
 | **Capacity** | parameter-efficient fine-tuning (low-rank adapters, a few trainable layers); a smaller model, more bluntly | constrains the update to a small subspace |
 | **Regularisation** | weight decay, dropout, label smoothing, mixing in general-purpose data | penalises large weights, forces redundancy, stops probabilities being driven to exactly one, dilutes row-specific shortcuts |
@@ -100,7 +122,7 @@ small set for many epochs is the commonest way to overfit an LLM.
 | **Contamination or leakage** | held-out data duplicates training data | makes overfitting invisible rather than curing it |
 | **Catastrophic forgetting** | losing capabilities the fine-tuning set never measured | often accompanies overfitting, but diagnosed on a different evaluation |
 
-### A caveat on the classic picture
+### Background: a caveat on the classic picture
 - **The U-curve is not the whole story.** The textbook curve (error falls, then rises with capacity)
   does not fully describe modern networks.
 - **Double descent.** Heavily over-parameterised models can fit training data exactly and still
@@ -130,6 +152,53 @@ flowchart TD
 ```
 
 ## Examples
+### Detecting copied tool arguments
+The agent-specific memorisation check: on held-out requests, flag tool-call argument values that appear
+in training traces but not in the current request. A loss curve cannot show this; a flag is a prompt for
+review, since some constants (a policy document id) are legitimately reused.
+
+```python
+def copied_args(pred_calls, prompts, train_arg_values):
+    """Flag argument values that come from training traces instead of the current request."""
+    flagged = []
+    for call, prompt in zip(pred_calls, prompts):
+        for key, value in call["arguments"].items():
+            v = str(value)
+            if v in train_arg_values and v not in prompt:
+                flagged.append((call["name"], key, v))
+    return flagged
+
+train_arg_values = {"o-1042", "c-77", "49.99", "refund_policy_v2"}   # literals seen in training traces
+prompts = ["Refund order o-5531, it arrived broken",
+           "What is the status of my order for customer c-310?",
+           "Can I return a jacket after 40 days?"]
+pred_calls = [  # the fine-tuned agent's first tool call on each held-out request
+    {"name": "issue_refund", "arguments": {"order_id": "o-5531", "amount": "49.99"}},
+    {"name": "search_orders", "arguments": {"customer_id": "c-77"}},
+    {"name": "search_kb", "arguments": {"query": "return window", "doc": "refund_policy_v2"}},
+]
+for f in copied_args(pred_calls, prompts, train_arg_values):
+    print("COPIED FROM TRAINING:", f)
+# Flags the amount 49.99 and customer c-77 (real memorisation) and refund_policy_v2 (review: likely fine).
+```
+
+### Worked scenario: an agent eval that only looked familiar
+Illustrative numbers. A tool-calling model fine-tuned on 2,000 trajectories, evaluated per epoch on three
+held-out slices: requests phrased like training, paraphrased requests, and tasks needing tool combinations
+absent from training.
+
+| Epoch | Familiar phrasing | Paraphrased | New tool combinations |
+|---|---|---|---|
+| 1 | 84% | 80% | 62% |
+| 2 | 91% | 85% | 66% |
+| 4 | 96% | 79% | 55% |
+| 8 | 98% | 68% | 41% |
+
+- **Reading it.** The familiar slice, which is what most teams' eval sets look like, keeps improving.
+  The other two peak at epoch 2 and then fall: the model is learning the traces, not the skill.
+- **Fix.** Select the checkpoint on the paraphrase and new-combination slices, cut epochs, and add more
+  diverse trajectories rather than more of the same.
+
 ### Worked scenario: ten epochs on 2,000 support replies
 Illustrative numbers. A team fine-tunes a 7B instruct model on 2,000 support replies for ten epochs at a
 modest learning rate and evaluates after each epoch:
@@ -210,22 +279,27 @@ for g in flagged:
 ```
 
 ## Production patterns
+- **Generalisation slices in the agent eval.** Keep held-out slices of paraphrased requests, new
+  customers and unseen tool combinations next to the familiar-phrasing set. Monitor the gap between the
+  familiar slice and the others per model version; a widening gap is memorisation.
 - **Best-checkpoint selection on the shipped metric.** Evaluate at a fixed cadence, save at each
   evaluation and reload the best (in Hugging Face, `load_best_model_at_end=True` with
   `metric_for_best_model` set to your task metric). Monitor the epoch or step of the best checkpoint;
   if it is always the first, cut epochs or the learning rate.
 - **Deduplicate before training and across splits.** Remove exact duplicates by hashing normalised text
   and near-duplicates with a similarity method such as MinHash, then check that no validation row has a
-  near-copy in training. Monitor the duplicate rate per data release.
-- **Verbatim-overlap gate.** Run an n-gram overlap check (as above) between held-out generations and
-  training targets as part of release evaluation, with extra scrutiny on records containing personal
-  data. Monitor the flagged share per model version and block release on any PII copy.
+  near-copy in training. Monitor the duplicate rate per data release, including near-identical
+  synthetic trajectories.
+- **Verbatim and copied-argument gate.** Run an n-gram overlap check between held-out generations and
+  training targets, and the copied-argument check on tool calls, as part of release evaluation, with
+  extra scrutiny on personal data. Monitor the flagged share per model version and block release on any
+  PII copy.
 - **Learning curve before buying labels.** Before commissioning another labeling batch, retrain on 25%,
   50% and 100% of the data and plot validation against size. Fund more data only if the curve is still
   rising steeply.
-- **Paraphrase and general-capability evals.** Keep a held-out set of paraphrased prompts and a small
-  general-skills set alongside the task set. Monitor the gap between original-phrasing and paraphrase
-  accuracy, which widens as the model memorises surface form.
+- **Fresh test tasks for prompt iteration.** When a team iterates prompts against a dev set, refresh a
+  separate test set from recent traces each release and report both. Monitor the dev-test gap as the
+  prompt-overfitting signal.
 
 ## Trade-offs
 - **Less variance vs more bias.** Regularisation and fewer steps reduce variance but add bias; pushed
@@ -238,12 +312,14 @@ for g in flagged:
   memorise, but equally how much of a new task it can learn; for tasks far from pretraining, full
   fine-tuning with more data wins.
 - **More data vs cost.** Among the levers, more data is the only one that improves the achievable
-  ceiling, but it costs labelling time, and synthetic data that shares one template can add rows while
-  adding little diversity.
+  ceiling, but it costs labelling time, and synthetic trajectories that share one template can add rows
+  while adding little diversity.
 
 ## Pitfalls
 - **Judging a run by training loss.** Symptom: a proud "loss went to 0.1" followed by a model that cannot
   handle a rephrased question. Fix: judge on held-out loss and the task metric.
+- **An agent eval set that only looks like the training traces.** Symptom: eval scores near perfect while
+  new customers' requests fail. Fix: add paraphrase, new-customer and new-tool-combination slices.
 - **A validation set that near-duplicates training rows.** Symptom: validation loss tracking training
   loss downward forever, with overfitting surfacing only in production. Fix: deduplicate across splits.
 - **Stopping on the wrong signal.** Stopping on token loss when the task metric matters, or the reverse.
@@ -252,9 +328,9 @@ for g in flagged:
 - **Mistaking distribution shift for overfitting.** Adding regularisation does not help. Symptom:
   validation numbers stay fine while production keeps degrading. Fix: fresh production data and a
   temporal validation set.
-- **Tuning dozens of hyperparameters on one validation set.** Symptom: a validation score that improves
-  with every experiment and a test score that does not, because you have overfit the validation set.
-  Fix: read the untouched test set once, and refresh it when consumed.
+- **Tuning dozens of hyperparameters or prompt variants on one validation set.** Symptom: a validation
+  score that improves with every experiment and a test score that does not, because you have overfit the
+  validation set. Fix: read the untouched test set once, and refresh it when consumed.
 - **Fine-tuning on personal-data records for many epochs.** Symptom: the model regurgitates names,
   addresses or account numbers verbatim when prompted with a prefix. Fix: redact PII before training,
   fewer epochs, and a verbatim-overlap release gate.
@@ -267,8 +343,8 @@ detect and bound it.
 - **Start small:** few epochs and a low learning rate; lengthen only if validation is still improving.
 - **Reach for data first:** more or cleaner data before regularisation knobs, and a smaller trainable
   footprint when data is scarce. A learning curve over data fractions tells you whether more data pays.
-- **Measure:** the train-validation gap at the chosen checkpoint, the task metric on held-out data, and a
-  verbatim-overlap check between generations and training targets.
+- **Measure:** the train-validation gap at the chosen checkpoint, the task metric on held-out data and
+  generalisation slices, and verbatim and copied-argument checks.
 - **Day to day:** the gap between training and validation curves is the first chart in any run review.
 - **Interviews:** explain the gap, the levers, and why the classic U-curve is only a guide for modern
   networks.
@@ -302,6 +378,21 @@ constrain the trainable parameters.
 - **Why low training loss proves little:** the objective cannot tell rule from rows. Both reach low
   training loss; only the rule reaches low loss on unseen examples, which is why held-out data is required.
 
+### Your fine-tuned agent model scores 96% on its eval set but fails often on new customers' requests. How do you investigate?
+- **Check how the eval was built:** if its tasks came from the same templates, sessions or customers as
+  training traces, it measures recognition; re-split by customer or template.
+- **Add generalisation slices:** paraphrased requests and unseen tool combinations, scored per checkpoint;
+  a peak at an early epoch means later checkpoints memorised traces.
+- **Look for replay:** run the copied-argument check and compare tool sequences with training traces,
+  then cut epochs and add more diverse trajectories.
+
+### Can you overfit an agent without training anything?
+- **Yes, through selection.** Each prompt, tool-description or few-shot change kept because a small eval
+  set improved is a decision fit to that set, noise included.
+- **Symptom:** dev score rising every iteration while production success and user feedback stay flat.
+- **Guard:** a frozen test set read only for releases, refreshed from recent traces, with error bars
+  reported next to every score.
+
 ### Validation loss rises after epoch 2 but your task metric keeps improving until epoch 4. Which checkpoint do you ship?
 - **Usually the one that is best on the metric you ship,** because token loss penalises every token,
   including stylistic ones that do not affect usefulness.
@@ -316,13 +407,8 @@ constrain the trainable parameters.
 - **Steep improvement and a narrowing gap** means the model is variance-limited, and more diverse data pays.
 - **Flat validation with train and validation close** means more of the same data will not help; the limit
   is label noise, task definition or model capacity.
-
-### When would you not reach for more regularisation?
-- **When the gap is between validation and production,** not training and validation: that is
-  distribution shift, which needs fresh data and a temporal validation set.
-- **When both losses are high and close:** that is underfitting, and regularisation adds more bias.
-- **When the validation set leaks:** fix the split first, because leakage makes overfitting invisible
-  rather than curing it.
+- **Rule out the look-alikes first:** a validation-production gap is distribution shift and a leaky split
+  hides overfitting, and neither is fixed by more regularisation.
 
 ### How would you check that a fine-tuned support model is not regurgitating customer data?
 - **Run a verbatim-overlap check:** compare held-out generations against training targets for long shared

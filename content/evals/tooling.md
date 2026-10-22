@@ -5,7 +5,8 @@ name: Tooling (Promptfoo, RAGAS, DeepEval, Braintrust, LangSmith, Langfuse)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/eval-harness
   - evals/llm-as-a-judge
@@ -23,9 +24,24 @@ sources:
 ---
 
 ## TL;DR
-Every eval tool runs dataset → system → grade → store and compare. Promptfoo, RAGAS and DeepEval are
-local libraries; Braintrust, LangSmith and Langfuse are platforms holding traces and experiments. Choose
-by where traces live and how much grading you must own.
+Every eval tool runs dataset → agent → grade → store and compare. Promptfoo, RAGAS and DeepEval are
+libraries; Braintrust, LangSmith and Langfuse are platforms holding agent traces and experiments. Choose
+by where traces live and how much grading you own.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a tree of LLM calls and tool calls, so you need a tool
+  that stores the whole trajectory, lets you grade outcome and tool use, and turns a bad production run
+  into a test case. Picking the wrong one means hand-copying traces into spreadsheets.
+- **Where it shows up in your stack.** LangChain and LangGraph trace into LangSmith automatically and
+  into Langfuse through its LangChain callback handler; a hand-rolled loop or another SDK uses LangSmith's
+  `@traceable`, Langfuse's decorator or OpenTelemetry. Promptfoo or DeepEval run in CI; RAGAS scores the
+  retrieval step.
+- **What you control.** The target adapter that runs your agent per item, which scorers grade the final
+  state and which grade the trajectory, the pinned judge model and library version, sampling rate for
+  online evaluators, and redaction before traces leave your network.
+- **What you can skip.** Comparing every feature matrix. Start with the platform your framework already
+  traces into, one library for the CI gate, and your own trajectory graders; add prebuilt metrics only
+  after calibrating them.
 
 ## Why it exists
 - **Every serious team writes the same code.** A runner with concurrency, retries and caching; judge
@@ -53,6 +69,9 @@ by where traces live and how much grading you must own.
 5. **Per-row scores,** then aggregation and comparison across runs.
 
 Each tool is packaging around that shape; the comparison below is about the packaging.
+
+For an agent the target is a function that runs the whole loop for one item and returns both the final
+output and the list of tool calls, so scorers can grade the outcome and the trajectory separately.
 
 | Tool | Type | Best fit | Main sharp edge |
 |---|---|---|---|
@@ -140,6 +159,20 @@ embeddings:
 - **Sharp edges:** you run a multi-service stack yourself; fewer prebuilt scorers than DeepEval or RAGAS,
   so you bring your own graders.
 
+### Where your agent framework meets the eval tools
+| Agent stack | Tracing path | Eval loop that fits |
+|---|---|---|
+| LangChain or LangGraph | LangSmith traces automatically (an API key and tracing env vars); Langfuse via its LangChain callback handler | LangSmith `evaluate` with a target that invokes the graph, or DeepEval/Promptfoo wrapping the same call |
+| Your own loop or a vendor agent SDK | LangSmith `@traceable`, a Langfuse decorator, or OpenTelemetry spans | Braintrust `Eval` or DeepEval tests calling your loop function |
+| RAG-heavy agent | any of the above for the trace | RAGAS metrics on the retrieval step, plus task-level graders on the outcome |
+| Polyglot or non-Python team | HTTP endpoint in front of the agent | Promptfoo with an HTTP or script provider |
+
+- **Agent-aware metrics exist but vary by version.** DeepEval and RAGAS have added tool-use and goal
+  metrics, and LangChain publishes trajectory evaluators; check the installed version's docs before
+  relying on one, and calibrate it like any judge.
+- **Deterministic trajectory checks are usually your own code:** required tool called, forbidden tool
+  avoided, confirmation before a write, step count within budget.
+
 ### How to choose
 Two axes decide it:
 - **Library vs platform:** do you need a CI gate in a repository, or traces, datasets and annotations
@@ -177,7 +210,7 @@ dotted links from production traces and to a shared annotation UI.
 
 ```mermaid
 flowchart TD
-    D[("Dataset rows")] --> T["Target: function, prompt or endpoint"]
+    D[("Dataset rows")] --> T["Target: agent loop or endpoint"]
     T --> O["Stored outputs"]
     O --> S["Scorers: deterministic, embedding, judge"]
     S --> R["Per-row scores"]
@@ -232,6 +265,49 @@ tests:
       - { type: python, value: "'billing' in output.lower() or 'contact' in output.lower()" }
 ```
 
+### An agent experiment in LangSmith
+A LangGraph agent evaluated on a LangSmith dataset with two of your own scorers: one on the outcome, one
+on the trajectory. The target runs the full loop per item and returns the tool calls it made.
+
+```python
+# assumes LANGSMITH_API_KEY and tracing env vars are set; dataset "support-agent-v3" exists
+from langsmith.evaluation import evaluate
+from my_agent import agent          # compiled LangGraph graph, e.g. create_react_agent(model, tools)
+
+def target(inputs: dict) -> dict:
+    result = agent.invoke({"messages": [("user", inputs["question"])]})
+    calls = [tc["name"] for m in result["messages"] for tc in (getattr(m, "tool_calls", None) or [])]
+    return {"answer": result["messages"][-1].content, "tools": calls}
+
+def resolved(outputs: dict, reference_outputs: dict) -> bool:
+    return reference_outputs["must_mention"].lower() in outputs["answer"].lower()
+
+def right_tools(outputs: dict, reference_outputs: dict) -> bool:
+    used = set(outputs["tools"])
+    return set(reference_outputs["required_tools"]) <= used and not (used & {"issue_refund"})
+
+evaluate(target, data="support-agent-v3", evaluators=[resolved, right_tools],
+         experiment_prefix="planner-prompt-v8", num_repetitions=3)   # k samples per item
+```
+
+- **Why own scorers here:** both checks are deterministic, cost nothing per run and mean exactly what the
+  task says; a judge can be added later for answer quality.
+- **The traces of every repetition** sit next to the scores, so a failing item opens straight into the
+  trajectory for error analysis.
+
+### Worked scenario: what an agent eval run costs
+Illustrative: 120 golden tasks, *k* = 3, about 7 LLM steps per agent run, two judge metrics (answer
+quality and a trajectory judge) at one call each.
+
+| Item | Calculation | Calls per run |
+|---|---|---|
+| Agent LLM calls | 120 × 3 × 7 | 2,520 |
+| Judge calls | 120 × 3 × 2 × 1 | 720 |
+| Deterministic trajectory checks | 120 × 3 × 2 | 720, free |
+
+- **The agent, not the judge, dominates here,** unlike single-call features, so cheaper tiers come from a
+  smaller smoke subset of tasks per PR, not only from dropping judges.
+
 ### What the numbers mean underneath
 | Tool | Calculation | Result |
 |---|---|---|
@@ -277,6 +353,9 @@ print(faithfulness(3, 4))                # 0.75 the SCIM case above
 - **One canonical dataset store.** Keep golden items in one place (a platform dataset or a versioned
   JSONL in the repo) and import into every other tool from it. Monitor how many production traces become
   dataset items each week, and alert when two copies diverge.
+- **Trace-to-task in one click.** Configure the platform so a failed production agent run (low user
+  feedback, step cap hit, tool error) can be added to the golden dataset with its input and a corrected
+  expected outcome. Monitor how many such runs become tasks each week.
 - **Online evaluators on sampled traffic.** In Langfuse or LangSmith, attach a judge evaluator to a
   sampled fraction of production traces and write its result as a score next to user feedback. Monitor
   the gap between online judge scores and offline scores for the same slice.
@@ -367,6 +446,21 @@ numbers are components, not the verdict.
 - **Then read traces** of items that moved, and pair faithfulness with a retrieval metric so a faithful
   answer to the wrong chunk is caught.
 
+### Your team builds agents on LangGraph. How would you set up evaluation tooling?
+- **Tracing first:** LangSmith traces LangGraph runs automatically, or Langfuse via its callback handler
+  when self-hosting is required, so every run's tool calls are inspectable.
+- **Offline experiments:** a dataset of golden tasks and a target that invokes the graph, scored by
+  deterministic outcome and trajectory checks, with repetitions for *k* samples.
+- **CI and online:** a fast subset gates PRs; sampled production traces get online evaluators, and
+  failed runs flow back into the dataset.
+
+### How do you evaluate tool use, not just the final answer, with these tools?
+- **Return the trajectory from the target:** the list of tool calls with arguments, alongside the answer.
+- **Score it with your own functions** (required tools, forbidden tools, confirmation before writes,
+  step budget), because these are cheap and exact.
+- **Use packaged agent metrics** from DeepEval, RAGAS or LangChain's trajectory evaluators only after
+  checking the installed version and calibrating against labelled runs.
+
 ### When would you choose a self-hosted platform over a hosted one?
 - **Data residency or contractual limits** on where prompts and customer traces may live; Langfuse is
   open source and self-hostable, and LangSmith offers self-hosting on enterprise tiers.
@@ -378,12 +472,6 @@ numbers are components, not the verdict.
   metrics × ~2 calls × 3 samples is about 9,000 judge calls per run.
 - **Control:** deterministic checks per commit, judges per PR or nightly, a smoke subset for fast loops.
 - **Caching** saves little on the run that tests a change, because the target's outputs differ.
-
-### Why can a prebuilt faithfulness metric reward worse answers?
-- **It is a ratio** of supported to extracted statements, so a terse answer with one supported claim
-  scores 1.0 and a thorough one with nine supported claims and one aside scores 0.9.
-- **It is context-relative:** an answer faithful to the wrong chunk scores perfectly.
-- **So** pair it with task checks and calibrate it on human labels before gating.
 
 ## Quiz
 ### Q: What does a RAGAS faithfulness score of 1.0 tell you?

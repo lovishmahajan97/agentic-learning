@@ -5,7 +5,8 @@ name: KEDA autoscaling
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - infra-capacity-economics/serverless-gpus
   - infra-capacity-economics/inference-clusters
@@ -21,9 +22,19 @@ sources:
 ---
 
 ## TL;DR
-KEDA scales Kubernetes workloads on real demand signals (queue depth, in-flight requests, Prometheus
-queries) and down to zero, which LLM servers need because CPU and GPU utilisation mislead. It moves pod
-counts only: nodes and GPU cold starts still take minutes.
+KEDA scales agent workers and the model servers behind them on real demand (task-queue depth, in-flight
+requests, Prometheus queries) and down to zero, because CPU and GPU utilisation mislead. It moves pod
+counts only: GPU cold starts still take minutes.
+
+## For agent builders
+- **Why it matters for agents.** A self-hosted agent platform has two layers to scale: agent workers
+  that pull tasks from a queue, and the LLM servers those workers call. Scaling the first multiplies load
+  on the second, and both need demand signals rather than CPU.
+- **Where it shows up in your stack.** A ScaledJob or ScaledObject on the agent task queue (Redis,
+  RabbitMQ, SQS), and a ScaledObject on vLLM's running plus waiting requests for the model deployment.
+- **What you control.** The trigger and threshold per layer, `maxReplicaCount` at real GPU quota,
+  scale-down damping and graceful drain, so neither a run nor a stream is cut off.
+- **What you can skip.** KEDA's internals and the scaler catalogue. Know the 0↔1 versus 1↔N split.
 
 ## Why it exists
 - **The HPA assumes CPU rises with load.** The built-in Horizontal Pod Autoscaler was designed for
@@ -106,6 +117,18 @@ KEDA does not replace the HPA; it drives it. The split is the most important thi
   add-on provides an interceptor proxy for that, and serverless GPU platforms exist because doing it well
   is hard.
 
+### Two layers in an agent platform
+1. **Agent workers** pull tasks (one agent run each) from a queue and run the loop: call the model, run
+   tools, repeat. They are usually CPU pods; scale them on queue length with a queue scaler.
+2. **Model servers** answer the workers' calls on GPUs; scale them on running plus waiting requests, as
+   above.
+- **The coupling:** each active run has roughly one model request in flight while it is not executing a
+  tool, so model-server demand ≈ active runs × fraction of time spent waiting on the model.
+- **Why runs suit ScaledJob:** a run lasts minutes and holds state; a Job per task runs to completion
+  instead of being killed by an HPA scale-down mid-run.
+- **Request count misleads more for agents,** because one run's requests grow in context every step, so
+  pair it with KV usage or a token-weighted signal.
+
 ## Diagram
 The two loops and what sits after them: KEDA only flips 0↔1 and feeds the HPA, which sets replica counts;
 GPU nodes, image pulls and weight loads still decide when capacity is actually serving.
@@ -173,6 +196,48 @@ Walkthrough of a day:
 | 18:00 | load falls to 10 | HPA removes at most one pod every two minutes after a ten-minute window, so a brief lull does not throw away warm replicas that cost minutes to rebuild |
 
 The vLLM metric names follow its Prometheus exporter and can change between versions; check `/metrics`.
+
+### Agent workers as a ScaledJob, and what they do to the model tier
+Background agent runs are queued as Redis list entries; KEDA starts one Job per pending task, up to a cap
+sized to what the model tier can absorb. Check the Redis scaler's field names against the KEDA version you
+run.
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: research-agent
+spec:
+  jobTargetRef:
+    template:
+      spec:
+        restartPolicy: Never
+        containers:
+          - name: agent
+            image: ghcr.io/example/research-agent:2.3   # CPU pod: runs the loop, calls the model server
+  pollingInterval: 15
+  maxReplicaCount: 120              # caps concurrent runs, and so load on the GPU tier
+  triggers:
+    - type: redis
+      metadata:
+        address: redis.agents:6379
+        listName: agent-tasks
+        listLength: "1"             # one Job per queued run
+```
+
+How the agent layer drives the model layer (illustrative fractions; take yours from traces):
+
+| Quantity | Value |
+|---|---|
+| Concurrent agent runs (Jobs) | 120 |
+| Share of a run spent waiting on the model (rest is tools) | 60% |
+| Model requests in flight | 120 × 0.6 ≈ 72 |
+| Model ScaledObject threshold (from the example above) | 12 per replica |
+| GPU replicas the HPA asks for | ceil(72 / 12) = 6 |
+
+- **Capping runs caps GPUs:** the Job cap of 120 is how you keep the model tier inside quota; raise it
+  only together with `maxReplicaCount` on the model ScaledObject.
+- **Faster tools raise GPU demand,** because runs spend a larger share of time waiting on the model.
 
 ### Replica calculator: the HPA rule KEDA relies on
 A pure-Python model of the 1↔N loop, handy for choosing a threshold before touching the cluster. It applies

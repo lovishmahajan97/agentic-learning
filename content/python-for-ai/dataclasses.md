@@ -5,7 +5,8 @@ name: dataclasses
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/type-hints
   - python-for-ai/pydantic
@@ -19,9 +20,21 @@ sources:
 ---
 
 ## TL;DR
-`@dataclass` generates `__init__`, `__repr__`, `__eq__` and optionally ordering, hashing and `__slots__`
-from annotated fields, so a record is five lines, not thirty. It suits AI records (configs, agent steps,
-chunks) but validates nothing; that is Pydantic's job.
+Inside an agent, `@dataclass` is the record type for trusted state: steps, run budgets, generation
+configs, retrieved chunks. It generates `__init__`, `__repr__`, `__eq__` and optionally hashing and
+`__slots__`, but validates nothing; model output goes through Pydantic first.
+
+## For agent builders
+- **Why it matters for agents.** A run is a sequence of records: each tool call, its arguments, output
+  and token cost. Frozen dataclasses make those records safe to share, hashable for loop detection and
+  caching, and readable in traces.
+- **Where it shows up in your stack.** Your own step, run and config types; trace spans you export;
+  cache keys for LLM and tool calls. Frameworks mix styles (LangGraph state is often a `TypedDict` or
+  Pydantic model), so the line you draw is "validated at the edge, dataclass inside".
+- **What you control.** `frozen=True` for anything shared or used as a key, `default_factory` for
+  per-run lists, `repr=False` on huge tool outputs and prompts, `slots=True` on high-volume records.
+- **What you can skip.** `order=True`, `InitVar` and `match_args` details; you rarely need them in agent
+  code.
 
 ## Why it exists
 - **Systems fill up with mostly-data classes.** A `GenerationConfig` with a model name and temperature, a
@@ -106,7 +119,8 @@ then attaches methods:
 
 ## Diagram
 What happens once, at class creation: the decorator reads the annotated fields and generates methods,
-and the `eq` and `frozen` settings decide whether instances can be hashed (and so used as cache keys).
+and the `eq` and `frozen` settings decide whether instances can be hashed (and so used as LLM cache
+keys or loop-detection entries for agent steps).
 
 ```mermaid
 flowchart TD
@@ -123,6 +137,55 @@ flowchart TD
 ```
 
 ## Examples
+### An agent run trace: immutable steps, a budget, loop detection
+Steps are frozen records, the run owns a fresh list, a retry is a `replace` rather than a mutation, and
+the hashable step fields make a repeated identical tool call visible. Passes `mypy --strict`.
+
+```python
+import json
+from dataclasses import asdict, dataclass, field, replace
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ToolStep:                                  # one immutable entry in the agent's trace
+    index: int
+    tool: str
+    args_json: str                               # canonical JSON text, so the step stays hashable
+    output: str = field(repr=False)              # can be huge: keep out of logs
+    input_tokens: int
+    output_tokens: int
+
+@dataclass(slots=True)
+class Run:
+    task: str
+    max_steps: int = 8
+    steps: list[ToolStep] = field(default_factory=list)   # fresh list per run
+
+    def record(self, step: ToolStep) -> None:
+        if len(self.steps) >= self.max_steps:
+            raise RuntimeError("step budget exhausted")
+        self.steps.append(step)
+
+    @property
+    def tokens(self) -> int:
+        return sum(s.input_tokens + s.output_tokens for s in self.steps)
+
+run = Run("Find the refund policy")
+s = ToolStep(index=0, tool="search", args_json=json.dumps({"q": "refund"}, sort_keys=True),
+             output="...40 KB of HTML...", input_tokens=1800, output_tokens=60)
+run.record(s)
+run.record(replace(s, index=1, input_tokens=2400))     # a retry: new record, original untouched
+print(run.steps[0])            # ToolStep(index=0, tool='search', args_json='{"q": "refund"}', input_tokens=1800, output_tokens=60)
+print(run.tokens)              # 4320
+seen = {(st.tool, st.args_json) for st in run.steps}
+print(len(seen))               # 1: the same call twice, a loop signal
+trace = asdict(run)            # deep copy, ready for json.dumps to a trace store
+print(sorted(trace))           # ['max_steps', 'steps', 'task']
+```
+
+- **Why `args_json` and not `args: dict`:** a dict field would make the frozen step unhashable, so it
+  could not go in the `seen` set; canonical JSON text (`sort_keys=True`) keeps equal calls equal.
+- **The repr hides the 40 KB output**, so printing the step in a log line stays one line.
+
 ### Frozen config as a cache key, mutable step record
 A frozen, slotted config works as a cache key; the step record gets a per-instance default list; `replace`
 produces a varied config without touching the original.
@@ -205,6 +268,10 @@ print(len({c, c}))                             # 1: frozen + eq gives a hash
 ```
 
 ## Production patterns
+- **Immutable step records, append-only runs.** Record each model turn and tool call as a frozen
+  dataclass appended to the run, never edited in place, so traces, replays and evals see exactly what
+  happened. Key `(tool, canonical args)` into a counter per run to catch an agent repeating itself, and
+  alert on runs that hit the step budget.
 - **Frozen configs as cache and dedup keys.** Model generation settings as `@dataclass(frozen=True)` with
   tuple-typed collections, and key `lru_cache` or a response cache on them. Monitor cache hit rate via
   `cache_info()`; a hit rate near zero often means a field like a timestamp should be `compare=False`.
@@ -216,7 +283,8 @@ print(len({c, c}))                             # 1: frozen + eq gives a hash
 - **Validate at the edge, dataclass inside.** Parse external input with Pydantic, then build internal
   dataclasses from the validated values. Keep only cheap invariant checks in `__post_init__`.
 - **`kw_only=True` on wide records.** Records with many same-typed fields (several `float` scores, several
-  `str` IDs) become keyword-only, so a reordered field never silently swaps two values.
+  `str` IDs, input and output token counts) become keyword-only, so a reordered field never silently
+  swaps two values.
 
 ## Trade-offs
 - **Free dunders vs no validation.** Methods are correct and consistent, but once input comes from outside
@@ -291,6 +359,14 @@ explicit immutable key (a tuple of the fields) and cache on that instead.
   attribute is silently shared.
 - **Confirm** with `a.notes is b.notes` on two fresh instances.
 - **Fix:** `field(default_factory=...)` so each instance gets its own object.
+
+### How would you model an agent's run history so it supports tracing, replay and loop detection?
+- **Frozen step records** (tool, canonical argument JSON, output, token counts) appended to a run that
+  owns its list via `default_factory`, so nothing rewrites history after the fact.
+- **Hashability buys loop detection:** a set or counter of `(tool, args)` per run flags the same call
+  repeating, and the step budget is enforced in one `record` method.
+- **Keep big fields out of reprs** with `repr=False`, and validate model output with Pydantic before it
+  becomes a step, because the dataclass will store whatever it is given.
 
 ### When would you not use a dataclass?
 - **At a trust boundary:** it validates and coerces nothing, so `GenConfig(temperature="hot")`

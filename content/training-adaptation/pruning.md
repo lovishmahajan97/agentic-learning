@@ -5,7 +5,8 @@ name: Pruning
 kind: concept
 difficulty: advanced
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: background
 related:
   - training-adaptation/quantization
   - training-adaptation/knowledge-distillation
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Pruning removes weights, heads, neurons or layers a trained model barely uses, then repairs it by
-fine-tuning or distillation. Only structured removal (rows, heads, layers, or 2:4) gives real GPU speed and
-memory wins; scattered zeros mostly do not.
+Pruning removes weights, heads or layers a model barely uses, then repairs it by distillation. Agent
+builders mostly meet it as the origin of small, fast open models for routers and tool-callers; only
+structured cuts give real GPU speedups.
+
+## For agent builders
+- **Why it matters for agents.** Agents make many short calls (route, pick a tool, emit JSON), so step
+  latency adds up. Several small open models you might put behind those steps were made by pruning a
+  larger parent and distilling it back, which is why they punch above their size.
+- **Where it shows up in your stack.** Mostly upstream: model cards that say "pruned and distilled from"
+  a parent, vendor claims of "50% sparse", and 2:4 sparse checkpoints that need engine kernel support.
+  You rarely run a pruning job yourself.
+- **What you control.** Whether to quantize instead (almost always first), and the eval that decides if
+  a pruned candidate is good enough for your agent: tool-call validity, task success and policy refusals.
+- **What you can skip.** Wanda and SparseGPT internals, lottery tickets and the PyTorch pruning code.
+  Know the granularity ladder, why sparsity is not speedup, and that safety behaviour is fragile.
 
 ## Why it exists
 - **Large models are heavily over-parameterised.** They are trained big because width and depth make
@@ -45,7 +58,20 @@ memory wins; scattered zeros mostly do not.
   the hardware cash in", not "which weights are unimportant".
 
 ## How it works
-### What you remove: the granularity ladder
+### What an agent builder does with pruning
+1. **Treat it as a supplier question.** When a model card says pruned and distilled, ask which parent,
+   which granularity, and which hardware gets the speedup.
+2. **Benchmark on agent traffic.** Measure step latency (time to first token plus a short tool-call
+   decode) at your real concurrency, not sparsity percentages.
+3. **Run the agent eval suite and the policy suite.** Pruned models can keep perplexity while losing
+   instruction following, tool-call formatting and refusals.
+4. **Prefer quantization or a smaller sibling first.** Pruning yourself is a model-training project with
+   a distillation phase, justified only when no existing model fits the size and latency target.
+
+The rest of this section is background: what gets removed, how importance is scored, and how recovery
+works.
+
+### Background: what you remove, the granularity ladder
 | Granularity | Removes | Accuracy at a given sparsity | GPU speedup |
 |---|---|---|---|
 | Unstructured | individual weights anywhere | best | almost none |
@@ -72,28 +98,20 @@ memory wins; scattered zeros mostly do not.
   - The output is a smaller *dense* model, so every kernel on every device gets faster. The coarsest
     constraint costs the most quality, which is why recovery training almost always follows.
 
-### How you decide: importance scores
-- **Magnitude (|w|).** Classic, cheap, and surprisingly good after training with weight decay. On large
-  LLMs it fails in one shot at 50% because of outlier features: a small weight on an input channel that
-  always carries huge activations is important, and magnitude cannot see that.
-- **Activation-aware (Wanda).**
-  - Score each weight by |W_ij| · ‖X_j‖₂: magnitude times the norm of its input feature over a few
-    calibration sequences.
-  - Prune the lowest scores *within each output row*, so every output keeps the same number of inputs.
-  - No gradients, no retraining, seconds per layer. It matches far more expensive methods at 50% on large
-    models precisely because it fixes the outlier blind spot.
-- **Second-order (SparseGPT).**
-  - The Optimal Brain Surgeon machinery GPTQ uses. Prune the weight whose removal least increases
-    ‖WX − ŴX‖², then update the row's remaining weights with **H⁻¹** = (XXᵀ)⁻¹ to compensate.
-  - Column-wise with shared Hessian updates, it prunes 100B+ models to 50–60% unstructured or 2:4 in a few
-    hours on one GPU, more accurately than Wanda at the cost of the Hessian work.
-- **Gradient / Taylor (|w · ∂L/∂w| and group versions).** Estimate the loss change from removing a unit;
-  the usual choice for heads and neurons.
-- **Layer influence by cosine similarity.** Compare a layer's input and output hidden states on
-  calibration data. Similarity near 1 means a near-identity block that can be dropped first. The first and
-  last few layers almost never qualify.
+### Background: how importance is scored
+| Score | What it computes | Strength | Weakness |
+|---|---|---|---|
+| Magnitude | \|w\| | cheap, good after training with weight decay | fails one-shot at 50% on large LLMs: blind to outlier features |
+| Wanda | \|W_ij\| · ‖X_j‖₂ over a few calibration sequences, pruned *within each output row* | no gradients or retraining, seconds per layer, matches costlier methods at 50% | needs calibration data like deployment |
+| SparseGPT | Optimal Brain Surgeon (as in GPTQ): remove the weight that least raises ‖WX − ŴX‖², update the rest with **H⁻¹** = (XXᵀ)⁻¹ | 100B+ models to 50–60% unstructured or 2:4 in a few hours on one GPU, more accurate than Wanda | Hessian work |
+| Gradient / Taylor | \|w · ∂L/∂w\| and group versions: estimated loss change from removing a unit | usual choice for heads and neurons | needs gradients |
+| Layer influence | cosine similarity of a layer's input and output hidden states | similarity near 1 marks a near-identity block to drop first | first and last few layers almost never qualify |
 
-### When you prune and how you recover
+- **Why magnitude fails:** a small weight on an input channel that always carries huge activations is
+  important, and |w| cannot see it; Wanda fixes exactly that blind spot.
+- **Why per row:** pruning within each output row keeps every output's number of inputs equal.
+
+### Background: when you prune and how you recover
 - **One-shot (Wanda, SparseGPT).** Prune a finished model and stop: the right tool for a quick 50% result.
 - **Iterative.** Alternate prune → fine-tune → prune with a gradually ramping sparsity schedule, because
   the network needs time to reroute around each cut.
@@ -117,8 +135,8 @@ Reported findings from that line of work:
 widely adopted way to cut FLOPs per token; see that lesson.
 
 ## Diagram
-The production pipeline: quantization is tried first, the granularity choice decides whether hardware
-can cash in the cut, and recovery plus evals sit between every stage.
+The pipeline behind a pruned agent model: quantization is tried first, the granularity choice decides
+whether hardware can cash in the cut, and recovery plus agent and safety evals sit between every stage.
 
 ```mermaid
 flowchart TD
@@ -131,7 +149,7 @@ flowchart TD
     T --> D["Recover: distil from the dense parent"]
     R --> D
     D --> QZ["Quantize last"]
-    QZ --> E["Task, safety and tokens per second evals"]
+    QZ --> E["Agent task, safety and step latency evals"]
     P -.->|"teacher"| D
 ```
 
@@ -215,7 +233,24 @@ Illustrative planning numbers for a 32-layer model; confirm every row with your 
 
 This is why quantization comes first: it hits the memory target with no training.
 
+### Worked scenario: a pruned router model for a support agent
+A support agent makes 15 calls per task, each a short tool call or routing decision of about 60 output
+tokens, served on an 8B model. Assume an illustrative 10 ms per output token at the serving batch size.
+
+| Candidate | Decode per task (15 × 60 tokens) | Tool-call validity | Policy refusals kept | Verdict |
+|---|---|---|---|---|
+| 8B dense (baseline) | 900 tokens × 10 ms = 9.0 s | baseline | baseline | reference |
+| 8B with 8 of 32 layers dropped, distilled | ~6.75 s (about a quarter less sequential work) | measure | measure: fragile under pruning | ship only if both hold |
+| 8B INT4, no pruning | lower still at low batch, no training | measure | usually close | try first |
+| 50% unstructured sparse 8B | 9.0 s in a dense engine | measure | measure | no latency win |
+
+The decision comes from the two "measure" columns on your agent eval and policy suites, not from the
+latency column alone.
+
 ## Production patterns
+- **Evaluate pruned models as agent models.** When adopting a pruned-and-distilled checkpoint for an
+  agent step, replay your agent task suite and policy-refusal suite against the parent or your current
+  model. Monitor tool-call schema failures and refusal rate per model version after rollout.
 - **Quantize first, prune second.** When the target is bytes or decode latency, try INT8/INT4 before any
   pruning; prune only when parameter count or sequential depth is the constraint. Track tokens per second
   at deployment batch size after each step.
@@ -229,7 +264,8 @@ This is why quantization comes first: it hits the memory target with no training
   converts a 2:4-masked weight for sparse kernels; in a serving engine, confirm the sparse kernel path is
   actually selected. Benchmark real tokens per second against the dense model before claiming a win.
 - **Safety suite as a release gate.** Re-run refusal and safety evals on every pruned candidate, because
-  safety behaviour can be disproportionately fragile under pruning.
+  safety behaviour can be disproportionately fragile under pruning; for agents, include prompts that try
+  to make the agent call tools it should refuse.
 
 ## Trade-offs
 - **Unstructured accuracy vs no GPU speedup.** Best accuracy per removed weight, but it only pays on
@@ -262,6 +298,9 @@ This is why quantization comes first: it hits the memory target with no training
 - **Assuming pruning is behaviour-neutral.** Safety and refusal behaviour can be disproportionately
   fragile. Symptom: a smaller model that complies with requests its parent refused. Re-run the safety
   suite, not just capability evals.
+- **Trusting a pruned model's chat benchmarks for agent work.** Instruction following and strict output
+  formats can degrade while chat scores hold. Symptom: more malformed tool calls and retries per task.
+  Fix: replay your agent suite before swapping it into a step.
 
 ## When to use
 - **Use when:** you need a size that does not exist in your standard family, you have a strong parent and
@@ -270,7 +309,8 @@ This is why quantization comes first: it hits the memory target with no training
   when latency or parameter count, not bytes, is the constraint.
 - **Measure:** tokens per second and task evals at deployment batch size, never sparsity percentages.
   Keep the KV cache in view: pruning query heads does not shrink it, pruning KV heads or layers does.
-- **Day to day:** a model-shrinking project with a distillation phase attached.
+- **Day to day:** a model-shrinking project with a distillation phase attached; for most agent teams,
+  choosing between existing pruned, quantized or smaller sibling models by running the agent evals.
 - **Interviews:** explain why unstructured sparsity does not speed up a GPU, how Wanda differs from
   magnitude pruning, and what 2:4 actually buys.
 
@@ -295,12 +335,22 @@ format and it needs recovery training too, so I would try it only after depth pr
 track task evals and safety evals, not perplexity, and verify the KV cache budget is unchanged.
 
 ## Interview questions
-### What does 2:4 semi-structured sparsity buy you, concretely?
-- **The pattern:** two of every four consecutive weights are zero, which sparse tensor cores on NVIDIA
-  GPUs from Ampere onward run at up to twice the dense matmul rate.
-- **Storage:** per four 16-bit weights, 2 × 16 + 2 × 2 = 36 bits instead of 64, about 56% of dense.
-- **The catch:** sparsity is fixed at 50%, quality drops more than free unstructured pruning, recovery is
-  usually needed, and decode only benefits if the kernel reads the compressed form.
+### A vendor offers a "50% sparse" version of your agent's model. What do you ask before adopting it?
+- **Which sparsity:** unstructured gives no speedup in a dense engine; 2:4 needs sparse tensor cores
+  (Ampere onward) and an engine kernel that reads the compressed form; structured gives a smaller dense
+  model.
+- **Measured step latency:** time to first token plus a short tool-call decode at your concurrency, not
+  sparsity percentages.
+- **Agent quality:** replay your task suite and policy-refusal suite, because formats and safety
+  behaviour degrade before perplexity does.
+
+### Your agent's router step is too slow on an 8B model. Would you prune it?
+- **Not first:** try INT4 or INT8 weights, prefix caching for the shared prompt, or a smaller existing
+  model, because none needs a training run.
+- **Prune when** no model fits the latency target: drop the least influential middle layers by block
+  influence and distil from the 8B parent on router traffic.
+- **Gate it** on routing accuracy, tool-call validity and refusals at real concurrency before switching
+  traffic.
 
 ### One-shot magnitude pruning at 50% wrecked your LLM. Why, and what would you use instead?
 - **Outlier features:** a small weight on an input channel that always carries huge activations matters a

@@ -5,7 +5,8 @@ name: Pydantic
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/type-hints
   - python-for-ai/dataclasses
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Pydantic turns annotated `BaseModel` classes into validators, serializers and JSON Schema. Untrusted
-input (API payloads, LLM output, configs) becomes typed objects with structured errors, and the same
-class emits the schema you give a model, because type hints alone do nothing at runtime.
+Pydantic is the contract layer of most agents: one `BaseModel` emits the tool or output schema the
+model sees and validates what the model sends back, with structured errors you return so it can repair
+the call.
+
+## For agent builders
+- **Why it matters for agents.** Every tool call and structured output is untrusted model JSON. Pydantic
+  turns it into a typed object or a precise error list, which is the difference between a tool that
+  quietly runs with a default and an agent that fixes its own call next turn.
+- **Where it shows up in your stack.** LangChain's `with_structured_output` and tool argument schemas,
+  `instructor`, Pydantic AI, the OpenAI Agents SDK's function tools, provider SDK structured-output
+  helpers and FastAPI request models all build on `BaseModel` and its JSON Schema.
+- **What you control.** Field descriptions (text the model reads), `extra="forbid"` on tool arguments,
+  strictness for IDs and money, and the bounded repair loop around validation failures.
+- **What you can skip.** Custom core schemas, `wrap` validators for most tools, and v1 internals beyond
+  recognising old idioms in copied snippets.
 
 ## Why it exists
 - **Type hints are inert.** A function typed `-> Ticket` will happily return a dict with a misspelled key.
@@ -124,8 +137,9 @@ Settings management lives in the separate `pydantic-settings` package.
   `model_config = ConfigDict(...)`. Copying old snippets gives deprecation warnings or errors.
 
 ## Diagram
-One `model_validate` call, in the order described above. Note that field errors are collected rather
-than stopping at the first, and the after model validator runs only if every field passed.
+One `model_validate` call on a model's tool-call arguments, in the order described above. Field errors
+are collected rather than stopping at the first, the after model validator runs only if every field
+passed, and the dotted edge is the repair message sent back to the model.
 
 ```mermaid
 flowchart TD
@@ -143,6 +157,53 @@ flowchart TD
 ```
 
 ## Examples
+### Agent tool dispatch: validation errors become tool results
+Each tool has an argument model; the schemas go in the request, and a failed validation becomes an
+error `tool_result` (the Anthropic Messages shape, with `is_error`) so the model fixes the call on the
+next turn instead of the handler running with bad input.
+
+```python
+from typing import Any, Callable
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+class GetOrder(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    order_id: str = Field(pattern=r"^ORD-\d{6}$", description="Order id like ORD-123456")
+
+class Refund(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    order_id: str = Field(pattern=r"^ORD-\d{6}$")
+    amount_cents: int = Field(gt=0, strict=True)       # money: no "1250" string coercion
+
+REGISTRY: dict[str, tuple[type[BaseModel], Callable[[Any], str]]] = {
+    "get_order": (GetOrder, lambda a: f"{a.order_id}: shipped"),
+    "refund": (Refund, lambda a: f"refunded {a.amount_cents} on {a.order_id}"),
+}
+TOOLS = [{"name": n, "input_schema": m.model_json_schema()} for n, (m, _) in REGISTRY.items()]
+
+def tool_result(block: dict[str, Any]) -> dict[str, Any]:
+    """Turn one tool_use block from the model into a tool_result block for the next turn."""
+    model, handler = REGISTRY[block["name"]]
+    try:
+        args = model.model_validate(block["input"])
+    except ValidationError as e:
+        issues = "; ".join(f"{'.'.join(map(str, x['loc']))}: {x['msg']}" for x in e.errors())
+        return {"type": "tool_result", "tool_use_id": block["id"], "is_error": True,
+                "content": f"Invalid arguments, fix and call again: {issues}"}
+    return {"type": "tool_result", "tool_use_id": block["id"], "content": handler(args)}
+
+bad = {"id": "t1", "name": "refund", "input": {"order_id": "123456", "amount_cents": "1250", "reason": "late"}}
+print(tool_result(bad)["content"])
+# Invalid arguments, fix and call again: order_id: String should match pattern '^ORD-\d{6}$';
+#   amount_cents: Input should be a valid integer; reason: Extra inputs are not permitted
+good = {"id": "t2", "name": "refund", "input": {"order_id": "ORD-123456", "amount_cents": 1250}}
+print(tool_result(good)["content"])     # refunded 1250 on ORD-123456
+```
+
+- **All three problems in one message:** errors are collected per field, so the model can fix the call
+  in one retry rather than three.
+- **A consequential tool stays strict:** `strict=True` refuses the string amount instead of coercing it.
+
 ### Structured extraction with a repair message
 The schema is generated from the model, and the validation errors become feedback for a repair attempt.
 `extra="forbid"` makes an invented field fail loudly.
@@ -240,8 +301,12 @@ except ValidationError as e:
 
 ## Production patterns
 - **Bounded validate-and-repair loop.** On `ValidationError`, send the `loc: msg` list back to the model
-  and retry at most once or twice, then fail the request. Monitor first-pass and post-repair failure
-  rates separately; a rising first-pass rate means the prompt or schema regressed.
+  and retry at most once or twice, then fail the request. In an agent loop this is an error tool result
+  that counts toward the step budget. Monitor first-pass and post-repair failure rates separately; a
+  rising first-pass rate means the prompt or schema regressed.
+- **One argument model per tool, registered once.** Keep a registry from tool name to argument model and
+  handler; generate the request's tool list from it, and validate every call through it. Tool schema and
+  handler then cannot drift, and adding a tool is one entry. Track invalid-call rate per tool.
 - **Aggregate errors by `loc` and `type`.** Log `e.errors()` as structured fields, never only `str(e)`,
   and chart counts per field. One dominant field usually means an ambiguous `description` or an enum the
   model paraphrases.
@@ -252,7 +317,8 @@ except ValidationError as e:
   request, because compiling the core schema is the expensive part. Watch per-request CPU after
   refactors that move adapters into functions.
 - **Snapshot the generated schema.** A test compares `Model.model_json_schema()` with a committed JSON file,
-  so any change to what the model is shown appears in code review and can be paired with an eval run.
+  so any change to what the model is shown appears in code review and can be paired with an eval run of
+  the agent's tool-selection and argument accuracy.
 
 ## Trade-offs
 - **One class for four jobs vs coupling.** Static type, validator, serializer and schema all follow
@@ -328,6 +394,14 @@ extraction into two smaller calls.
 - **Confirm** by logging the raw tool-call JSON next to `model_dump()`.
 - **Fix:** set `ConfigDict(extra="forbid")` on tool-argument models so the invented key becomes a
   `ValidationError` that a repair loop can report back to the model.
+
+### Your agent's tool calls fail validation on about one call in ten. How do you design the handling so runs still finish?
+- **Return the errors to the model** as an error tool result listing every `loc: msg`, not a stack
+  trace, so it can correct the call on the next step.
+- **Bound it:** a repair attempt counts against the step budget, and after one or two failed repairs the
+  run stops with a clear failure instead of looping.
+- **Fix the cause:** aggregate failures by tool, `loc` and `type`; a dominant field usually needs a
+  clearer `description`, a `Literal` instead of free text, or a flatter schema.
 
 ### Lax or strict mode: which would you choose, and when does it flip?
 - **Lax by default** suits text-shaped sources (query strings, env vars, model output), because `"1200"`

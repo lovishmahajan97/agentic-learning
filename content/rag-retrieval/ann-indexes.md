@@ -5,7 +5,8 @@ name: ANN indexes (HNSW, IVF)
 kind: concept
 difficulty: core
 est_minutes: 19
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - rag-retrieval/similarity-search
   - rag-retrieval/vector-databases
@@ -22,14 +23,27 @@ sources:
 ---
 
 ## TL;DR
-ANN indexes trade a few percent of recall for sublinear vector search. HNSW walks a layered proximity
-graph; IVF scans only the nearest k-means clusters, often with product quantization. Their knobs (ef,
-nprobe) set a recall–latency point you must measure.
+The vector store behind an agent's search tool and memory usually runs an ANN index. HNSW walks a layered
+graph, IVF probes the nearest clusters; their knobs (ef, nprobe) and your tenant filters decide what the
+agent can find.
+
+## For agent builders
+- **Why it matters for agents.** Agents call retrieval many times per task, so per-call latency is
+  multiplied; and agents filter heavily (per user, per tenant, per conversation memory), which is exactly
+  where ANN indexes quietly return fewer than k results.
+- **Where it shows up in your stack.** pgvector `hnsw.ef_search`, Qdrant or Weaviate HNSW parameters,
+  managed stores such as Pinecone that hide the index, and framework wrappers (LangChain and LlamaIndex
+  vector stores) that pass only k and a filter, leaving the knobs at engine defaults.
+- **What you control.** Index type, `M`/`ef_construction` at build time, `ef_search` or `nprobe` per
+  query, how tenant and user filters are applied, and when to rebuild after memory churn.
+- **What you can skip.** The HNSW layer-assignment math and PQ codebook training details. Know the knobs,
+  the filter failure mode and how to measure ANN recall against brute force.
 
 ## Why it exists
 - **Exact search reads everything.** A brute-force scan is O(N·d) per query and reads the whole vector
   matrix each time: 3 GB per query at one million 768-dimensional fp32 vectors, 300 GB at one hundred
-  million. No single machine streams that in the tens of milliseconds a chat product can spare.
+  million. No single machine streams that in the tens of milliseconds a chat product, or an agent making
+  several tool calls, can spare.
 - **More threads do not keep up.** Parallelism helps linearly; the corpus grows faster.
 - **Classical spatial indexes fail.** k-d trees and R-trees prune by splitting coordinates, and in a few
   hundred dimensions nearly every split boundary is close to every point, so the tree visits most leaves
@@ -87,7 +101,8 @@ search_layer(q, entry, ef):
   with M = 16 about 128 bytes of graph on top of a 3 KB vector. It must all live in RAM, since greedy
   traversal is random access.
 - **Deletes are tombstones,** not removals, because cutting a node can disconnect the graph; a heavily
-  churned index needs periodic rebuilding.
+  churned index needs periodic rebuilding. Agent memory stores that overwrite and forget facts are
+  exactly this workload.
 
 ### IVF: cluster, then probe
 1. Run k-means over a training sample to get `nlist` centroids.
@@ -124,6 +139,9 @@ search_layer(q, entry, ef):
 | IVF-Flat | faster to build, simpler | needs training and periodic re-training; at equal recall usually more distances per query, because whole cells are scanned |
 | IVF-PQ | smallest footprint by far, GPU-friendly | lowest raw recall, so pair with exact re-ranking |
 
+- **Agent memory and live tool corpora** get writes all day, which favors HNSW's incremental inserts.
+- **Large static knowledge bases** an agent only reads can take IVF-PQ and scheduled re-training.
+
 ### pgvector settings
 | Index | Build time | Query time (per session) |
 |---|---|---|
@@ -140,13 +158,16 @@ search_layer(q, entry, ef):
 - **The problem:** a filter keeping 1% of vectors breaks the assumptions. HNSW's walk cannot reach the few
   allowed nodes if the path runs through disallowed ones; an IVF probe may find zero allowed vectors in
   the chosen cells.
+- **Agents hit this constantly.** A shared memory table filtered by `user_id`, or a multi-tenant
+  knowledge base filtered by tenant, keeps a tiny fraction of rows per query.
 - **Engine strategies:** filtered traversal (check the filter during the walk and widen ef), pre-filtering
   to an id set with a brute-force fallback when it is small, or partitioning the index by the filter key.
 - **Classic symptom:** "search returns fewer than k results". Know which strategy your engine uses.
 
 ## Diagram
-Compare the two query paths: HNSW descends layers greedily and then beam-searches layer 0 with `ef`,
-while IVF ranks centroids and scans only `nprobe` lists; both feed an optional exact re-rank.
+Compare the two query paths an agent's search call can take: HNSW descends layers greedily and then
+beam-searches layer 0 with `ef`, while IVF ranks centroids and scans only `nprobe` lists; both feed an
+optional exact re-rank.
 
 ```mermaid
 flowchart TD
@@ -165,6 +186,25 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: per-user agent memory that forgets
+An assistant agent stores memories in one pgvector table shared by 20,000 users and recalls with
+`WHERE user_id = $1 ORDER BY embedding <=> $2 LIMIT 10` (illustrative numbers).
+
+| Quantity | Value |
+|---|---|
+| Rows in the table | 10 million memories |
+| Rows for a typical user | ~500, so the filter keeps 0.005% |
+| HNSW candidate list | `hnsw.ef_search` default 40 |
+| Allowed rows among the 40 nearest overall | usually 0 |
+| Agent sees | 0-2 memories, then "I don't have that information" |
+
+- **Diagnosis.** The walk collects the 40 globally nearest memories, the filter discards nearly all of
+  them, and the agent concludes it never knew the fact.
+- **Fixes.** For a user with ~500 rows, an exact scan on a B-tree `user_id` index is cheap and loses no
+  recall. Otherwise use iterative index scans (pgvector 0.8), a partial index per large tenant, or an
+  engine with filtered traversal.
+- **Measure.** Count tool calls where returned rows are fewer than `LIMIT`, per user bucket.
+
 ### Recall–latency sweep in FAISS
 Build an exact index as the recall reference, then HNSW and IVF over the same vectors, and sweep each
 search knob. Random Gaussian data is the worst case for ANN (no cluster structure), so recall will be
@@ -205,7 +245,7 @@ print("flat", report(flat))
 - **Expect** recall to climb toward 1.0 as `efSearch` or `nprobe` grows, per-query time with it, and
   `flat` at exactly 1.0.
 - **Timings are throughput,** batch time divided by 500 (FAISS parallelizes across queries), not
-  single-query latency.
+  single-query latency, which is what an agent's one-at-a-time tool calls pay.
 - **Flat looks competitive here** because batched flat search is one BLAS matrix multiply and 200k vectors
   is small. That is the point of "start with exact search"; the gap opens as N grows, because flat cost is
   linear in N.
@@ -237,37 +277,42 @@ the graph, is what makes the corpus fit.
 
 ## Production patterns
 - **Expose the knob as config and sweep it.** Keep `efSearch` or `nprobe` in configuration, not code, and
-  run a recall@10 vs latency sweep against brute force on a few hundred real queries each release. Monitor
-  ANN recall@10 and p99 latency together; pick the cheapest point where answer quality stays flat.
+  run a recall@10 vs latency sweep against brute force on a few hundred real agent tool queries (pulled
+  from traces) each release. Monitor ANN recall@10 and p99 tool-call latency together; pick the cheapest
+  point where agent task success stays flat.
 - **Set ef per query, not globally.** In pgvector use `SET LOCAL hnsw.ef_search` inside the transaction,
-  always at least the `LIMIT`. Monitor queries that return fewer rows than requested.
-- **Handle selective filters explicitly.** For tenant or category filters, use the engine's filtered
-  traversal, pgvector 0.8 iterative scans, or a partial index per large tenant; send tiny id sets to an
-  exact scan. Monitor result-count shortfall per filter value.
+  always at least the `LIMIT`. Framework retrievers rarely set it, so wrap the tool's SQL yourself.
+  Monitor queries that return fewer rows than requested.
+- **Handle selective filters explicitly.** For tenant, user or category filters on agent memory, use the
+  engine's filtered traversal, pgvector 0.8 iterative scans, or a partial index per large tenant; send
+  tiny id sets to an exact scan. Monitor result-count shortfall per filter value.
 - **Two-stage IVF-PQ with exact re-rank.** When vectors outgrow RAM, search PQ codes for a few hundred
   candidates, then re-score them with exact vectors (FAISS `IndexRefineFlat` wraps this). Monitor recall
   of the final top-k, measured on the quantized configuration.
 - **Scheduled rebuilds.** Rebuild churned HNSW indexes (Postgres `REINDEX INDEX CONCURRENTLY`) and
-  re-train IVF centroids when the content mix shifts. Monitor deleted-row fraction and recall on newly
-  added content separately from old content.
+  re-train IVF centroids when the content mix shifts; agent memory with frequent updates and deletes
+  needs this most. Monitor deleted-row fraction and recall on newly added content separately from old.
 
 ## Trade-offs
 - **HNSW: best recall per millisecond, incremental updates.** Every vector plus its links must sit in RAM;
   once the corpus outgrows memory you move to IVF-PQ or a disk-oriented graph index.
 - **IVF: faster build, quantizes well.** Its training step yields centroids that go stale as data drifts;
   the trade flips against IVF when documents arrive continuously and re-training windows are hard to
-  schedule.
+  schedule, as with agent memory.
 - **Product quantization: an order of magnitude or more smaller,** and GPU search becomes feasible. Raw PQ
   recall is noticeably lower; it only pays when you re-rank the PQ shortlist with exact vectors.
 - **Higher `efSearch` or `nprobe`: more recall, roughly linear latency.** Once recall@k exceeds what
   downstream answer quality can detect, further increases are waste; spend the budget on the reranker.
+- **One shared index vs one per tenant.** A shared index is simpler to operate but starves under
+  selective filters; per-tenant partitions or exact scans for small tenants cost more objects to manage.
 
 ## Pitfalls
 - **Trusting the vendor's benchmark recall.** Symptom: works in demos, misses obvious documents in
   production, because your embeddings and filters are not theirs. Fix: measure against a brute-force scan
   on your data.
-- **Selective filter plus HNSW.** Symptom: fewer than k results, or results that ignore the filter. Fix is
-  engine-specific (filtered traversal, pre-filtering, partitioned indexes); check before shipping.
+- **Selective filter plus HNSW.** Symptom: fewer than k results, or results that ignore the filter, and an
+  agent that claims it has no memory of something the user told it. Fix is engine-specific (filtered
+  traversal, pre-filtering, partitioned indexes); check before shipping.
 - **Heavy churn without rebuilding.** Tombstones accumulate, recall drifts down and memory never shrinks,
   visible as slowly rising latency for the same `efSearch`.
 - **Training IVF on a non-representative sample** (say, only English before a multilingual launch).
@@ -277,8 +322,8 @@ the graph, is what makes the corpus fit.
 
 ## When to use
 - **Stay exact** while the corpus fits in memory and a scan meets your latency budget, typically up to a
-  low number of millions of vectors on a modern CPU. It is simpler, loses no recall and is the reference
-  you need anyway.
+  low number of millions of vectors on a modern CPU. Per-user agent memories are often far smaller. It is
+  simpler, loses no recall and is the reference you need anyway.
 - **Move to HNSW** when latency forces it and the data fits in RAM; pgvector, Lucene, Qdrant, Weaviate and
   most managed services offer it first.
 - **Move to IVF-PQ** when the vector set outgrows memory or must run on GPU at very high throughput.
@@ -321,13 +366,19 @@ configuration, not on a full-precision prototype.
 - **HNSW** walks a layered proximity graph in roughly logarithmic hops; **IVF** clusters with k-means and
   scans only the `nprobe` nearest cells, both trading a few percent of recall for sublinear search.
 
+### Your agent says it has no memory of facts users clearly told it. The memory table uses HNSW. How do you debug it?
+- **Suspect the filter first:** recall filtered by `user_id` keeps a tiny fraction of rows, so the
+  greedy walk's candidate list fills with other users' memories and the filter discards them.
+- **Also check `ef_search`:** in pgvector a plain HNSW scan returns at most `hnsw.ef_search` rows, so
+  `LIMIT 100` with the default 40 yields 40.
+- **Fix:** exact scan for small per-user sets, iterative scans (pgvector 0.8), filtered traversal with a
+  wider ef, or partitioning by the filter key; track tool calls returning fewer rows than requested.
+
 ### A filtered HNSW query asks for 10 results and returns 3. How do you debug it?
 - **Suspect the filter first:** a selective filter starves the greedy walk, because allowed nodes are only
   reachable through disallowed ones and the `ef`-sized candidate list runs dry.
-- **Also check `ef_search`:** in pgvector a plain HNSW scan returns at most `hnsw.ef_search` rows, so
-  `LIMIT 100` with the default 40 yields 40.
-- **Fix:** filtered traversal with a wider ef, iterative scans (pgvector 0.8), pre-filtering to an exact
-  scan for small id sets, or partitioning by the filter key.
+- **Fix:** filtered traversal with a wider ef, iterative scans, pre-filtering to an exact scan for small
+  id sets, or partitioning by the filter key.
 
 ### When would you choose IVF-PQ over HNSW, and what do you give up?
 - **Choose IVF-PQ** when vectors outgrow RAM or must run on GPU: at m = 96 a 768-dim fp32 vector shrinks
@@ -335,11 +386,11 @@ configuration, not on a full-precision prototype.
 - **You give up** raw recall and incremental freshness: PQ is lossy, so re-rank a few hundred candidates
   with exact vectors, and centroids go stale as data drifts, so schedule re-training.
 
-### How do you pick efSearch or nprobe for production?
-- **Sweep, do not guess:** run recall@10 against a brute-force scan on a few hundred real queries while
-  stepping the knob, and record p99 latency at each point.
-- **Pick the cheapest point** where downstream answer quality stays flat, because past that, extra recall
-  is invisible and costs roughly linear latency.
+### How do you pick efSearch or nprobe for an agent's retrieval tool?
+- **Sweep, do not guess:** run recall@10 against a brute-force scan on a few hundred real tool queries
+  from agent traces while stepping the knob, and record p99 latency at each point.
+- **Pick the cheapest point** where agent task success stays flat, because past that, extra recall is
+  invisible and costs roughly linear latency, paid on every one of the agent's searches.
 - **Keep it in config** and set it per query (`SET LOCAL hnsw.ef_search`), always at least k.
 
 ### How much memory does HNSW need for 10 million 768-dimensional vectors?

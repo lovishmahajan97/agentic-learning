@@ -5,7 +5,8 @@ name: DPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/rlhf
   - training-adaptation/grpo
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-DPO trains on preference pairs with a classification-style loss, no reward model or RL loop, because
-RLHF's KL-constrained optimum expresses reward through the policy itself. It gets most of RLHF's effect
-at SFT cost, but offline.
+DPO trains on preference pairs with a classification-style loss, no reward model or RL loop. For agent
+teams it is the practical way to teach "this trajectory beats that one" after SFT, at SFT cost, but
+offline.
+
+## For agent builders
+- **Why it matters for agents.** SFT on traces teaches an agent to call tools; it cannot teach that a
+  three-step trajectory beats a seven-step one, or that answering beats a needless clarifying question.
+  DPO on pairs of agent responses or trajectories does, with one node and a simple loss.
+- **Where it shows up in your stack.** TRL's `DPOConfig` and `DPOTrainer` (conversational prompt,
+  chosen and rejected message lists), provider preference fine-tuning APIs, and KTO when your product
+  only logs thumbs-up and thumbs-down on agent answers.
+- **What you control.** How pairs are built (same history, different next step), who labels them (users,
+  experts or a calibrated judge), β, epochs, and whether pairs come from your own current agent model so
+  they stay on-policy.
+- **What you can skip.** Re-deriving the partition-function algebra and every variant paper. Know the
+  implicit reward, what β does in numbers, and the likelihood-displacement signal to watch.
 
 ## Why it exists
 - **PPO's machinery is heavy.** Four models resident, two training; a generation loop dominating
@@ -32,9 +46,9 @@ at SFT cost, but offline.
   rate schedule) that take experienced teams weeks to stabilise; and a reward model to train, validate
   and keep current.
 - **The tool outsizes the problem.** For a team with ten thousand preference pairs and one node of GPUs,
-  that is a mismatch.
+  that is a mismatch. Most agent teams are that team.
 - **SFT on chosen responses wastes half the signal.** The model learns what good looks like but nothing
-  about bad, and cannot push probability *away* from rejected answers.
+  about bad, and cannot push probability *away* from rejected answers such as a wrong tool choice.
 - **A naive contrastive loss has no leash.** Raising chosen and lowering rejected log-probability can be
   satisfied by driving the rejected sequence to zero probability, trashing everything nearby.
 - **DPO combines leash and comparison analytically.** Invert the exact optimum of "reward minus β·KL",
@@ -42,7 +56,7 @@ at SFT cost, but offline.
   no reward model and no sampling. The leash is inside the formula.
 
 ## How it works
-### The derivation in four lines
+### Background: the derivation in four lines
 1. The KL-regularised objective `max_π E_y~π[r(x,y)] − β·KL(π ‖ π_ref)` is maximised by
    `π*(y|x) = π_ref(y|x)·exp(r(x,y)/β) / Z(x)`, where Z(x) normalises over all responses.
 2. Solve for the reward: `r(x,y) = β·log(π*(y|x)/π_ref(y|x)) + β·log Z(x)`.
@@ -57,6 +71,8 @@ L_DPO(θ) = − E [ log σ( β·log π_θ(y_w|x)/π_ref(y_w|x)  −  β·log π_
 - **Implicit reward:** each log-ratio term is `r̂(x,y) = β·log(π_θ(y|x)/π_ref(y|x))`, how much more the
   policy likes this response than the reference does, scaled by β.
 - **Goal:** make the implicit reward margin between chosen and rejected large and positive.
+- **Agent reading:** x is the shared agent history (system prompt, tools, turns so far); y_w and y_l are
+  two continuations, such as two different next tool calls.
 
 ### What the gradient does
 Differentiating the loss gives `−β·σ(r̂_l − r̂_w)·[∇log π_θ(y_w|x) − ∇log π_θ(y_l|x)]`.
@@ -76,7 +92,8 @@ Differentiating the loss gives `−β·σ(r̂_l − r̂_w)·[∇log π_θ(y_w|x)
   implicitly.
 
 ### Sequence log-probabilities
-- **Each term is a sum** of per-token log-probabilities over response tokens only, prompt masked.
+- **Each term is a sum** of per-token log-probabilities over response tokens only, prompt masked. In
+  multi-turn agent pairs, tool results inside the response stay masked too, as in SFT.
 - **Cache the reference.** It is frozen, so its log-probs for the dataset can be computed once. Training
   memory drops to one trainable model plus stored numbers, versus RLHF's four networks.
 - **LoRA trick:** disable the adapter for the reference forward pass instead of loading a second copy.
@@ -90,13 +107,13 @@ Differentiating the loss gives `−β·σ(r̂_l − r̂_w)·[∇log π_θ(y_w|x)
   chosen responses.
 - **The better fix: go on-policy in rounds.** Generate candidates with the policy (or its SFT ancestor),
   label those, and iterate (often called iterative or online DPO). This recovers much of on-policy RLHF's
-  advantage with the simple loss.
+  advantage with the simple loss. For agents: run the current model on real tasks, label its own runs.
 
 ### Known failure: likelihood displacement
 - **The loss only sees the *difference* in log-ratios.** The margin can grow while both chosen and
   rejected probabilities fall, as long as rejected falls faster.
 - **In practice chosen log-probability often decreases** during DPO, and the mass goes somewhere
-  unobserved, sometimes to worse responses.
+  unobserved, sometimes to worse responses (for agents, malformed or invented tool calls).
 - **Detect** by monitoring chosen log-probability, not just the margin. **Mitigate** by mixing in a small
   SFT term on chosen responses, or by switching to a variant.
 
@@ -113,11 +130,12 @@ wins is data-dependent, so treat them as ablations to run, not upgrades to assum
 
 ## Diagram
 One DPO step: the frozen reference is scored once and cached, the policy is scored every step, and the
-loss pushes the implicit reward margin up, weighted by how wrong the current ranking is.
+loss pushes the implicit reward margin up, weighted by how wrong the current ranking is. For agents the
+pairs are two continuations of the same history.
 
 ```mermaid
 flowchart TD
-    D[("Pairs: prompt, chosen, rejected")] --> REF["Frozen reference, the SFT model"]
+    D[("Pairs: history, chosen, rejected")] --> REF["Frozen reference, the SFT model"]
     REF -->|"score once"| C[("Cached reference log-probs")]
     D --> POL["Policy: response log-probs"]
     POL -->|"policy log-probs"| M["Implicit reward margin"]
@@ -130,6 +148,38 @@ flowchart TD
 ```
 
 ## Examples
+### Turning agent runs into DPO pairs
+Two runs of the same task that share a history and then diverge make a natural pair: the shared prefix
+is the prompt, each run's continuation is chosen or rejected. The output is the conversational
+prompt / chosen / rejected format TRL's DPO trainer accepts.
+
+```python
+def shared_prefix(a, b):
+    n = 0
+    while n < min(len(a), len(b)) and a[n] == b[n]:
+        n += 1
+    return n
+
+def runs_to_pair(run_good, run_bad):
+    """Each run is a list of chat messages; returns None if they never diverge."""
+    n = shared_prefix(run_good, run_bad)
+    if n == min(len(run_good), len(run_bad)):
+        return None
+    return {"prompt": run_good[:n], "chosen": run_good[n:], "rejected": run_bad[n:]}
+
+history = [{"role": "system", "content": "Support agent. Tools: get_order, refund."},
+           {"role": "user", "content": "Refund order A-1042, it arrived broken."}]
+good = history + [{"role": "assistant", "content": "", "tool_calls": [{"type": "function",
+                   "function": {"name": "refund", "arguments": {"order_id": "A-1042"}}}]}]
+bad = history + [{"role": "assistant", "content": "Could you confirm your order number?"}]  # needless ask
+
+pair = runs_to_pair(good, bad)
+print(len(pair["prompt"]), "shared messages;", "chosen calls", pair["chosen"][0]["tool_calls"][0]
+      ["function"]["name"], "| rejected:", pair["rejected"][0]["content"])
+# Label which run is better with users, experts or a calibrated judge; only the step where they diverge
+# is compared, so the pair isolates one decision.
+```
+
 ### The DPO loss from sequence log-probs
 Reference log-probs are precomputed. Shapes are `[batch]` after summing per-token log-probs over
 response tokens; the helper shows the masked sum.
@@ -178,7 +228,7 @@ Preference probability is σ(β × log-ratio margin). Computed for the 4-nat swi
 - **Small β means the loss keeps pulling** until the policy has moved tens of nats from the reference on
   each pair: big behaviour change, more drift risk.
 - **Large β is satisfied after small moves:** the policy stays close to the reference, which is what you
-  want when pairs are noisy or off-policy.
+  want when pairs are noisy or off-policy, as user thumbs often are.
 
 ### Production run with TRL
 A typical first round on the SFT checkpoint. Argument names follow recent TRL releases; check your
@@ -210,7 +260,23 @@ trainer = DPOTrainer(model=model, ref_model=None,   # None: TRL builds the froze
 trainer.train()
 ```
 
+### Worked scenario: cutting needless steps from a support agent
+Illustrative numbers for one DPO round on an SFT-tuned 8B agent.
+
+| Metric on 500 held-out tasks | After SFT | After DPO (β = 0.1, 1 epoch, 6,000 pairs) |
+|---|---|---|
+| Task success | 78% | 80% |
+| Mean tool calls per task | 4.6 | 3.1 |
+| Needless clarifying questions | 14% of tasks | 5% of tasks |
+| Mean final-answer length | 95 words | 120 words, flagged for a length audit |
+
+Pairs were built from the SFT agent's own runs, diverging at one step and labelled by support leads.
+The length creep is the warning sign to check the chosen-to-rejected length ratio before round two.
+
 ## Production patterns
+- **Build pairs at the divergence point.** Run the current agent several times per task, keep pairs of
+  runs that share a history and then differ, and compare only the diverging step. Monitor the share of
+  pairs per decision type (tool choice, ask versus act, final answer) so one kind does not dominate.
 - **Cache or share the reference.** Precompute reference log-probs once (`precompute_ref_log_probs=True`
   in TRL), or with LoRA pass no separate reference so the adapter is disabled for the reference pass.
   Monitor GPU memory and step time; a second full copy is the usual reason a run does not fit.
@@ -222,7 +288,7 @@ trainer.train()
   flat held-out accuracy means the pairs are being memorised.
 - **Regenerate pairs on-policy each round.** Sample candidates from the current checkpoint, have the
   judge or experts label them, and run the next DPO round with that checkpoint as the new reference.
-  Monitor win rate against the previous round's model on a fixed prompt set.
+  Monitor win rate and agent task success against the previous round's model on a fixed task set.
 - **Audit length before training.** Compute the chosen-to-rejected length ratio over the dataset and the
   share of pairs where chosen is longer. If it is heavily skewed, rebalance pairs or try SimPO, and
   monitor mean output length every round.
@@ -237,6 +303,9 @@ trainer.train()
   scorer for rejection sampling, data filtering and monitoring, which matters once you run many rounds.
 - **Reference-free variants vs leash.** ORPO and SimPO save memory and can reduce length bias, but give up
   the explicit leash and need their own margin or length terms to stay stable.
+- **Step-level vs whole-trajectory pairs.** Pairs that diverge at one step isolate a decision and need
+  fewer labels per lesson learned; whole-trajectory pairs are easier to collect from end users but blur
+  which step made the difference.
 
 ## Pitfalls
 - **Several epochs on a small pair set.** Symptom: reward accuracy near 100% on training pairs, falling
@@ -249,6 +318,9 @@ trainer.train()
   round with no quality gain.
 - **Mismatched tokenisation or chat template** between stored reference log-probs and policy inputs. The
   implicit rewards are noise; training appears to work while nothing improves.
+- **Pairs that differ in the tool result, not the agent's choice.** If two runs diverge because a tool
+  returned different data, the pair teaches nothing about the agent's decision. Fix: pair only runs whose
+  first difference is an assistant turn.
 
 ## When to use
 - **Use as the default first preference method** for an application team: a few thousand to a few hundred
@@ -256,9 +328,9 @@ trainer.train()
 - **Run it after SFT**, on pairs generated by the SFT model or by the previous round's policy, and iterate
   in rounds if you can afford fresh labelling.
 - **Prefer RLHF with PPO or GRPO when** you need on-policy exploration, a reusable reward model, or a
-  programmatic reward, and have the engineering to run the loop.
+  programmatic reward (such as a sandbox task check), and have the engineering to run the loop.
 - **Measure** held-out reward accuracy, chosen log-probability, judge or human win rate against the SFT
-  model, and a general capability suite.
+  model, agent task success and steps per task, and a general capability suite.
 - **Interviews:** sketch the derivation, name the implicit reward, and explain why DPO is offline and what
   that costs.
 
@@ -292,6 +364,14 @@ artefacts.
   rejected, leaving a loss over the policy alone.
 - **The leash is inside the formula**, because reference log-probs appear in every pair.
 
+### Your agent works but takes too many steps. How would you use DPO to fix it?
+- **Build pairs from its own runs:** for each task, keep runs that share a history and then diverge, and
+  label the shorter successful path as chosen over the detour or needless question.
+- **Train one round** at β around 0.1 with one epoch, masking tool results, and watch chosen log-prob
+  alongside the margin.
+- **Gate on held-out tasks:** steps per task must fall without task success or a capability suite
+  regressing, then regenerate pairs from the new model for the next round.
+
 ### Your product only collects thumbs-up and thumbs-down on single responses. Can you still do DPO?
 - **Not directly:** DPO needs a chosen and a rejected response to the *same* prompt, and unpaired
   feedback rarely gives you that.
@@ -304,7 +384,8 @@ artefacts.
 - **When you need on-policy exploration**, because DPO only learns from the pairs you give it.
 - **When you want a reusable scorer** (a reward model) for rejection sampling, filtering and monitoring
   across many rounds.
-- **When the reward is programmatic**, such as unit tests or a schema check, which GRPO uses directly.
+- **When the reward is programmatic**, such as unit tests, a schema check or an agent sandbox's end-state
+  check, which GRPO uses directly.
 
 ### What does β = 0.1 versus β = 0.5 mean in numbers?
 - **Preference probability is σ(β × log-ratio margin).** A 4-nat swing gives 0.60 at β = 0.1 and 0.88 at

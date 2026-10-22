@@ -5,7 +5,8 @@ name: Jupyter
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/pandas
   - python-for-ai/async-await
@@ -19,13 +20,25 @@ sources:
 ---
 
 ## TL;DR
-Jupyter runs cells against a long-lived kernel and saves code with outputs in an `.ipynb` file: the
-fastest way to explore data and model outputs. The same state makes notebooks unreliable as production
-code, and as evidence until you restart and run all.
+Jupyter is where agent builders read traces, analyse eval failures and iterate on prompts: cells run
+against a long-lived kernel and save outputs in an `.ipynb` file. That hidden state makes notebooks
+unreliable as agent code or evidence until restart and run all.
+
+## For agent builders
+- **Why it matters for agents.** Improving an agent is mostly reading failures: which step went wrong,
+  which tool returned what, where the model looped. A notebook keeps hundreds of traces in memory so
+  each question about them takes seconds instead of a re-run.
+- **Where it shows up in your stack.** Error analysis over exported traces and eval results, prompt and
+  tool-description iteration, first prototypes of a tool loop, and report notebooks re-executed in CI.
+- **What you control.** The kernel and environment, whether state is rebuilt (Restart and Run All),
+  which logic moves into tested modules, and what outputs get committed.
+- **What you can skip.** The messaging protocol and server internals. Know that state is execution
+  history, that top-level `await` works because the kernel already runs an event loop, and that saved
+  outputs can leak keys and customer data.
 
 ## Why it exists
 - **Much AI work is exploratory.** Look at 50 failing eval cases, try three prompt variants, plot score
-  distributions, inspect what the retriever returned.
+  distributions, inspect what the retriever returned or which tool an agent called.
 - **Scripts make every question start from zero.** Reloading a model, re-reading a dataset, re-calling an
   API you pay for: seconds or minutes of setup dominate a two-second question, and output scrolls away in
   a terminal.
@@ -50,9 +63,17 @@ code, and as evidence until you restart and run all.
 - **The kernel's state is whatever cells you ran, in the order you ran them,** including cells since
   edited or deleted.
 - **The file shows each cell's current text,** which may not be the code that produced the variables in
-  memory.
+  memory. For agents that includes the system prompt and tool list an agent object was built with.
 - **The visible clue:** execution counts (`[7]`, `[3]`) out of order.
 - **The only proof a notebook works:** **Restart Kernel and Run All** producing the same results.
+
+### Driving async agents from cells
+- **Top-level `await` works** *because* IPython kernels already run an event loop, so
+  `await agent.run(task)` or an async SDK call works directly in a cell.
+- **The same fact is why `asyncio.run()` fails** in a notebook with "cannot be called from a running
+  event loop". Agent code copied from a script needs its `asyncio.run(main())` replaced by `await main()`.
+- **Clients and sessions live as long as the kernel.** An HTTP client or MCP session opened in a cell
+  stays open until you close it or restart, which is convenient for exploration and a leak if forgotten.
 
 ### Kernels, environments and the install trap
 - **The kernelspec picks the Python.** It is a small JSON file naming the interpreter to launch, not the
@@ -70,9 +91,8 @@ code, and as evidence until you restart and run all.
   restart reliably gives the memory back.
 
 ### Useful machinery
-- **Magics:** `%timeit` for micro-benchmarks; `%autoreload` to pick up edits to imported modules.
-- **Top-level `await` works** *because* IPython kernels already run an event loop. The same fact is why
-  `asyncio.run()` fails in a notebook with "cannot be called from a running event loop".
+- **Magics:** `%timeit` for micro-benchmarks; `%autoreload` to pick up edits to imported modules, such as
+  the agent package you are changing.
 - **Headless execution:** `jupyter nbconvert --execute` runs a notebook top to bottom; papermill injects
   parameters and runs notebooks as batch jobs, which some teams use for scheduled reports.
 - **Version control helpers:** nbstripout removes outputs before commit; Jupytext pairs a notebook with a
@@ -80,13 +100,13 @@ code, and as evidence until you restart and run all.
 
 ## Diagram
 The kernel's memory comes from the execution history, while the `.ipynb` stores only current cell text
-and saved outputs; Restart and Run All is what makes the two agree.
+and saved outputs; Restart and Run All is what makes the two agree before you trust an agent analysis.
 
 ```mermaid
 flowchart TD
     F["Front end: JupyterLab, Notebook, VS Code"] -->|"execute request"| S["Jupyter Server"]
     S -->|"ZeroMQ messages"| K["Kernel process: ipykernel"]
-    K --> M[("Variables and Out history in memory")]
+    K --> M[("Variables, traces and Out history in memory")]
     K -->|"streamed output and display data"| F
     F -->|"save"| N[("ipynb JSON: cell source, counts, outputs")]
     M -.->|"may differ after edits or out-of-order runs"| N
@@ -94,8 +114,37 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: error analysis over agent traces
+Illustrative: 300 traces from an eval run of a support agent, one row per step, exported as JSONL. The
+notebook answers "where do failing runs go wrong?" in a few cells.
+
+```python
+%load_ext autoreload
+%autoreload 2
+import pandas as pd
+from agent_analysis.labels import first_bad_step     # logic lives in a tested module
+
+steps = pd.read_json("runs/agent-eval-steps.jsonl", lines=True)   # run_id, step, tool, is_error, passed
+runs = steps.groupby("run_id").agg(passed=("passed", "first"), n_steps=("step", "max"),
+                                   tool_errors=("is_error", "sum"))
+failed = runs[~runs.passed]
+print(len(failed), "failed runs;", failed.n_steps.median(), "median steps")
+
+bad = steps[steps.run_id.isin(failed.index)].groupby("run_id").apply(first_bad_step)
+bad.tool.value_counts().head(5)                      # which tool the first wrong step used
+
+answer = await support_agent.run("Is ticket 42 still open?")   # top-level await: re-run one case live
+```
+
+| Question | Illustrative answer |
+|---|---|
+| Failed runs | 48 of 300 |
+| Failed runs with at least one tool error | 31 |
+| First bad step uses `search_docs` | 22 |
+| Next action | Rewrite the `search_docs` description and its error message, then re-run the eval set as a script |
+
 ### Error analysis on 2,000 RAG answers, and the stale-cell trap
-Illustrative numbers from one eval run.
+Illustrative numbers from one eval run of a RAG step.
 
 | Cell | Does | Cost |
 |---|---|---|
@@ -126,8 +175,8 @@ pd.crosstab(fails.doc_type, fails.has_table)
 ```
 
 ### CI check: was this report notebook run top to bottom?
-A pure-Python check for notebooks committed with outputs (curated reports). Counts of 1..n in order are
-what Restart and Run All produces; anything else means hidden state.
+A pure-Python check for notebooks committed with outputs (curated reports such as a weekly agent eval
+summary). Counts of 1..n in order are what Restart and Run All produces; anything else means hidden state.
 
 ```python
 import json, sys
@@ -157,18 +206,21 @@ A notebook whose counts read `[1, 7, 3]` fails with a clear message; one run cle
 it on output-stripped notebooks, where every count is empty.
 
 ## Production patterns
+- **Explore traces in notebooks, decide with scripts.** Use a notebook to find failure patterns in agent
+  traces, then re-run the comparison through the eval harness as a script before changing a prompt or
+  tool. Track that every shipped agent change links to a reproducible eval run, not a notebook cell.
 - **Strip outputs at commit time.** Run `nbstripout --install` in the repo so a git filter removes outputs
   and execution counts from exploratory notebooks. Monitor with a secret scanner over the repository, since
-  saved outputs are where keys and customer records leak.
+  saved outputs (printed traces, tool results, API responses) are where keys and customer records leak.
 - **Pair notebooks with text files for review.** Use Jupytext paired formats (for example ipynb plus a
   percent-format `.py`) so pull requests diff readable code. Review the `.py`; regenerate the notebook
   from it.
 - **Re-execute reports headlessly before publishing.** Run `jupyter nbconvert --to notebook --execute` (or
   papermill with `-p` parameters for scheduled runs) in CI, so published numbers come from a clean kernel.
   Monitor run duration and failures like any batch job.
-- **Promote logic into a tested package.** Once a helper is reused, move it to a module with tests and
-  import it with `%autoreload 2` during exploration. Track how much logic lives only in cells; it should
-  trend to zero for anything scheduled.
+- **Promote logic into a tested package.** Once a helper or tool is reused, move it to a module with tests
+  and import it with `%autoreload 2` during exploration. Track how much logic lives only in cells; it
+  should trend to zero for anything scheduled or served.
 - **One registered kernel per project environment.** Register each project's virtual environment with
   `python -m ipykernel install --user --name <project>` and install only with `%pip`. Watch for
   `ModuleNotFoundError` right after an install, the sign of a mismatched interpreter.
@@ -176,7 +228,7 @@ it on output-stripped notebooks, where every count is empty.
 ## Trade-offs
 - **Fast iteration vs hidden state.** Persistent kernel state makes iteration fast when setup is
   expensive, but results may not reproduce; the balance flips the moment the output informs a decision
-  others rely on.
+  others rely on, such as shipping a new agent prompt.
 - **Readable saved outputs vs bloat and leaks.** Outputs saved in the file make notebooks readable without
   re-running, yet bloat diffs and can leak customer data or keys; strip them for code review, keep them
   only for curated reports.
@@ -189,6 +241,9 @@ it on output-stripped notebooks, where every count is empty.
 ## Pitfalls
 - **Trusting out-of-order execution.** Symptom: a colleague running the notebook top to bottom gets
   different numbers, or a `NameError` for a variable you deleted.
+- **Comparing agent variants built in different cells at different times.** Symptom: a prompt "wins" in
+  the notebook but not in the eval harness, because one variant kept an old tool list or client. Fix:
+  rebuild both agents in one cell after Restart and Run All, then confirm in a script.
 - **Committing outputs with API keys, tokens or customer records.** Symptom: secrets or personal data in
   the repository history and in rendered previews.
 - **Calling `asyncio.run()` in a cell.** It raises because the kernel's loop is already running. The usual
@@ -201,9 +256,11 @@ it on output-stripped notebooks, where every count is empty.
   when someone runs cells in a new order.
 
 ## When to use
-- **Use when:** exploring and communicating: data inspection, error analysis on eval results, prompt
-  iteration, quick model comparisons, and demos for stakeholders.
-- **Move code out when:** it is reused, scheduled or needs tests.
+- **Use when:** exploring and communicating: reading agent traces, data inspection, error analysis on
+  eval results, prompt and tool-description iteration, quick model comparisons, and demos for
+  stakeholders.
+- **Move code out when:** it is reused, scheduled or needs tests, which includes every agent loop that
+  will serve users.
 - **Before trusting numbers:** treat nothing as final until Restart and Run All reproduces it, and pin the
   environment so others can.
 - **Pair with tracking:** for tracking runs and reproducible evaluations, see the LLMOps lessons;
@@ -235,6 +292,20 @@ Then I would move the comparison into a script or eval harness so it can be re-r
   such as JupyterLab, VS Code or a hosted service, all speaking the same ZeroMQ messaging protocol.
 - **The cost is hidden state:** memory reflects what ran, not what the file shows.
 
+### How would you use a notebook to find why an agent fails 16% of eval runs?
+- **Load traces once, one row per step,** with run ID, step number, tool, error flag and pass or fail, so
+  each question is a cheap pandas query over data in memory.
+- **Find the first bad step per failed run** and count by tool, which usually points at one tool's
+  description, arguments or error message.
+- **Then leave the notebook:** fix the tool, re-run the full eval set through the harness as a script, and
+  compare pass rates there, since notebook state cannot be trusted as evidence.
+
+### Your agent works as a script but `asyncio.run(main())` fails in a notebook cell. Why, and what do you do?
+- **The kernel already runs an event loop,** and `asyncio.run()` refuses to start one inside a running loop.
+- **Use top-level `await main()`** in the cell instead; IPython supports it for exactly this reason.
+- **Avoid nested-loop patches,** which hide the problem, and close long-lived clients or sessions you
+  opened in cells before you restart.
+
 ### A notebook hits CUDA out-of-memory on a cell that worked an hour ago. How do you debug and fix it?
 - **Suspect re-run loading cells.** Re-running "load model" creates a second copy before the first can be
   freed.
@@ -242,12 +313,6 @@ Then I would move the comparison into a script or eval harness so it can be re-r
   stays referenced after `del`.
 - **Fix:** restart the kernel, which reliably frees the memory, load the model once in an early cell, and
   avoid displaying large tensors.
-
-### When would you not use a notebook?
-- **For anything scheduled, reused or served,** because notebooks are hard to test, type-check and
-  monitor; that logic belongs in a package the notebook imports.
-- **For results others will rely on, unless re-run cleanly,** because out-of-order state can produce
-  numbers the visible code does not explain.
 
 ### `pip install` succeeded in a cell, but the next cell raises `ModuleNotFoundError`. Why?
 - **`!pip` runs whichever `pip` is first on the server's `PATH`,** which may belong to another

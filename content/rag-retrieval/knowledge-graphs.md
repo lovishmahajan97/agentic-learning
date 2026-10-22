@@ -5,7 +5,8 @@ name: Knowledge graphs
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - rag-retrieval/graphrag
   - rag-retrieval/multi-hop-retrieval
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-A knowledge graph stores facts as typed entities and typed relationships under a schema. In RAG it
-complements vector search, answering joins, counts and exact constraints that similarity cannot. The hard part is building it:
+A knowledge graph stores facts as typed entities and relationships under a schema. For an agent it is a
+tool that answers joins, counts and exact constraints similarity cannot. The hard part is building it:
 extraction, entity resolution, schema design and sync.
+
+## For agent builders
+- **Why it matters for agents.** Questions like "which customers are exposed to CVE-123?" need a chain of
+  exact hops. An agent doing this with vector searches drifts at every hop; one graph tool call returns
+  the exact rows with a source per hop.
+- **Where it shows up in your stack.** Graph-query tools your agent calls (Neo4j via its Python driver,
+  Neptune, Memgraph), text-to-Cypher chains in agent frameworks, and graph-shaped agent memory where
+  facts about users and entities carry validity dates.
+- **What you control.** Whether the agent gets parametrised tools or free-form query generation, the
+  bounds on every query (hops, `LIMIT`, read-only, timeout), the schema, and how the graph stays in sync
+  with systems of record.
+- **What you can skip.** RDF, OWL and formal inference unless a customer requires them; most agent
+  projects use a property graph or plain Postgres.
 
 ## Why it exists
 - **Some answers are a path or a count, not a passage.** Vector retrieval ranks passages by similarity:
@@ -44,7 +58,7 @@ extraction, entity resolution, schema design and sync.
   a similarity guess.
 
 ## How it works
-### Data model
+### Background: data model
 | Family | Model | Query language | Fits |
 |---|---|---|---|
 | Property graphs (Neo4j, Amazon Neptune, Memgraph and others) | nodes with labels and key-value properties; directed relationships with a type and their own properties | Cypher, its standardised relative GQL, or Gremlin | pragmatic, popular in application engineering |
@@ -58,7 +72,8 @@ Either way the unit is a fact like `(Service:payments)-[:DEPENDS_ON]->(Database:
 - **It is the leverage point.** A good schema makes common questions short traversals. A vague one
   ("RELATED_TO" everywhere) degrades the graph back into a co-occurrence network that cannot answer precise
   questions.
-- **Start from the questions** the graph must answer and model only what they need.
+- **Start from the questions** the graph must answer and model only what they need. For an agent, that
+  means the questions its tools must answer.
 
 ### Construction
 1. **From structured sources** (CMDB, HR system, CRM, ticketing): deterministic mapping, high precision. Do
@@ -78,6 +93,16 @@ Either way the unit is a fact like `(Service:payments)-[:DEPENDS_ON]->(Database:
 | Graph as filter or booster | traversal results (e.g. all documents attached to systems owned by team T) become a metadata filter or ranking signal for vector search | keep the traversal cheap |
 | Tools for agents | expose a few parametrised graph queries as tools instead of free-form generation | use when reliability matters more than flexibility |
 
+### How an agent uses the graph
+1. **Pick a tool** by its description: a parametrised query for known question types, a validated
+   text-to-Cypher tool for the rest, vector search for prose.
+2. **Get rows plus provenance**, small enough to fit the context (bounded by `LIMIT`).
+3. **Chain tools:** use the rows (customer names, services) as arguments to the next tool, for example a
+   ticket search filtered to those customers.
+4. **Cite per hop:** the provenance list becomes the citation trail of the final answer.
+5. **Recover on errors:** an empty result or a validator rejection goes back to the agent as a tool error
+   it can act on, not a silent "none".
+
 ### Keeping it true
 - **The graph is derived data.** Sync it from systems of record with change feeds, re-extract changed
   documents, and delete edges whose provenance disappears; otherwise it confidently answers with stale
@@ -86,13 +111,14 @@ Either way the unit is a fact like `(Service:payments)-[:DEPENDS_ON]->(Database:
   pg-main before the migration. Without time on edges, a re-extraction either overwrites history or leaves
   both versions asserted at once, and "who owns X?" returns two people.
 - **Put validity on the edge** (`valid_from`, `valid_to`, plus the source's timestamp), because the
-  relationship, not the node, is what changed. Default queries to "currently valid".
+  relationship, not the node, is what changed. Default queries to "currently valid". The same rule applies
+  to an agent's long-term memory stored as a graph: "user prefers X" must be closable when it changes.
 - **Text-extracted edges carry extraction confidence and run id**, so a bad prompt version can be rolled
   back by deleting its edges.
 
 ## Diagram
 Construction (systems of record and documents through entity resolution, kept current by change feeds)
-keeps the graph true; retrieval turns a relational question into a bounded traversal whose per-hop
+keeps the graph true; the agent turns a relational question into a bounded tool call whose per-hop
 provenance becomes the citation trail.
 
 ```mermaid
@@ -101,12 +127,12 @@ flowchart TD
     TX["Documents"] -->|"LLM extraction into schema"| ER
     ER --> KG[("Knowledge graph: typed nodes, temporal edges, provenance")]
     CF["Change feeds and reconcile"] -.->|"update or delete edges"| KG
-    Q["Relational question"] --> T{"Known question type?"}
+    Q["Agent: relational question"] --> T{"Known question type?"}
     T -->|"yes"| PT["Parametrised tool: bounded hops, LIMIT, read-only"]
     T -->|"no"| TC["Text-to-Cypher behind a validator"]
     PT --> KG
     TC --> KG
-    KG --> A["Rows plus sources into the prompt"]
+    KG --> A["Rows plus sources back to the agent"]
 ```
 
 ## Examples
@@ -153,12 +179,13 @@ print(customers_exposed("CVE-123"))
   which bundles libfoo 2.1. "Any path of `USES|DEPENDS_ON` edges of length 1 to 6" is one Cypher pattern
   (`(s)-[:USES|DEPENDS_ON*1..6]->(l)`) and a recursive CTE with cycle handling in SQL.
 
-### Production snippet: a parametrised, bounded, read-only graph tool
+### Agent tool: a parametrised, bounded, read-only graph query
 What an agent calls instead of writing Cypher itself: fixed query text, parameters only, bounded path
-length, currently-valid edges, a row limit, and read routing. Uses the Neo4j Python driver (5.x).
+length, currently-valid edges, a row limit, and read routing. Uses the Neo4j Python driver (5.x); the tool
+schema and error handling are what the agent loop sees.
 
 ```python
-import os
+import os, re
 from neo4j import GraphDatabase, RoutingControl
 
 driver = GraphDatabase.driver(os.environ["NEO4J_URI"],
@@ -175,25 +202,54 @@ RETURN DISTINCT c.name AS customer, s.name AS service,
 LIMIT $limit
 """
 
+TOOL = {"name": "customers_exposed_to_cve",
+        "description": "Exact list of customers whose subscribed services depend (directly or transitively) "
+                       "on a library affected by a CVE. Returns provenance per hop for citations.",
+        "input_schema": {"type": "object", "properties": {"cve": {"type": "string"}}, "required": ["cve"]}}
+
 def customers_exposed(cve: str, limit: int = 200):
     records, _, _ = driver.execute_query(EXPOSED, cve=cve, limit=min(limit, 200),
                                          routing_=RoutingControl.READ)
     return [r.data() for r in records]       # rows plus per-hop sources for citations
+
+def handle(args):
+    cve = args.get("cve", "").strip().upper()
+    if not re.fullmatch(r"CVE-[0-9A-Z-]+", cve):
+        return {"error": f"'{cve}' is not a CVE id; look it up with search_docs first"}
+    rows = customers_exposed(cve)
+    if not rows:
+        return {"rows": [], "note": "no current exposure found; the CVE node may be missing from the graph"}
+    return {"rows": rows, "truncated": len(rows) == 200}
 ```
 
+### Worked scenario: an incident agent, with and without the graph tool
+The task: "Which customers are exposed to CVE-123, and do any have open tickets about it?" Step counts are
+illustrative.
+
+| Approach | Steps | Outcome |
+|---|---|---|
+| Vector search only | search advisory, search SBOMs, search CRM, guess the join, search tickets | misses customers on transitive dependencies; no per-hop source |
+| Graph tool, then ticket search | `customers_exposed_to_cve`, then `search_tickets` filtered to the returned customers | exact list (Acme, Globex), provenance per hop, tickets scoped by a metadata filter |
+
+The graph result also feeds the next tool as a filter, which is the "graph as filter" pattern driven by
+the agent.
+
 ## Production patterns
+- **Parametrised tools over free-form Cypher.** Expose a few tested queries with bounded hops, `LIMIT` and
+  read routing; allow text-to-Cypher only behind a validator (allowed labels, read-only, row limit) and a
+  query timeout. Monitor tool error rate, empty-result rate and p95 query time per tool.
+- **Actionable tool errors.** Return validator rejections, empty results and truncation as explicit
+  messages the agent can act on ("not a CVE id; look it up first"). Monitor repeated identical graph calls
+  within a run; they mean the error text is not guiding the agent.
 - **Load systems of record first, keyed by stable IDs.** Map CMDB, HR and CRM rows with `MERGE` on their
   IDs and add uniqueness constraints (in Cypher, `CREATE CONSTRAINT ... REQUIRE c.id IS UNIQUE`) so
   duplicates cannot be written. Monitor duplicate-candidate counts from the resolution job.
-- **Parametrised tools over free-form Cypher.** Expose a few tested queries with bounded hops, `LIMIT` and
-  read routing; allow text-to-Cypher only behind a validator (allowed labels, read-only, row limit) and a
-  query timeout. Monitor tool error rate, empty-result rate and p95 query time.
 - **Provenance and run ids on every extracted edge.** Store source document, span, confidence and
   extraction run id, so a bad prompt version is rolled back by deleting edges with that run id. Monitor
   edges per run and the share without provenance (target zero).
 - **Temporal edges by default.** Write `valid_from` and `valid_to` on relationships that change, close the
-  old edge instead of deleting it, and filter queries to currently valid. Monitor entities with more than
-  one currently-valid owner.
+  old edge instead of deleting it, and filter queries to currently valid. Apply the same to graph-backed
+  agent memory. Monitor entities with more than one currently-valid owner.
 - **Change-feed sync plus reconcile.** Apply source change events as they arrive, and run a periodic
   reconcile that deletes edges whose provenance no longer exists. Monitor lag from source change to graph
   update.
@@ -213,6 +269,8 @@ def customers_exposed(cve: str, limit: int = 200):
 - **Graph database vs relational.** A dedicated graph database suits deep variable-length traversal but adds
   an operational system. For shallow, fixed joins plain relational joins are enough, and recursive CTEs
   cover moderate variable-length cases such as reporting chains of bounded depth.
+- **Graph tool vs agentic multi-hop search.** A graph tool answers in one exact call but only for what the
+  schema models; iterative search reaches anything in the text but drifts per hop. Many agents get both.
 
 ## Pitfalls
 - **Modelling everything as a generic `RELATED_TO` edge.** Traversals return everything or nothing, and the
@@ -227,6 +285,8 @@ def customers_exposed(cve: str, limit: int = 200):
   current and the previous owner, or history vanishes after a re-extraction.
 - **Dropping provenance.** Graph answers cannot be cited, and when an extracted fact is wrong nobody can
   find which document or extraction run produced it.
+- **Returning silent empty results to the agent.** Symptom: the agent reports "no customers exposed"
+  when the CVE node was simply never loaded. Fix: say why the result is empty.
 
 ## When to use
 - **Use when** important questions are relational (dependencies, ownership, supply chains, org structure,
@@ -234,7 +294,7 @@ def customers_exposed(cve: str, limit: int = 200):
   much of the data already exists in structured systems.
 - **Avoid when** the corpus is prose and questions are explanatory.
 - **Measure** on a question set split into lookup, relational and aggregate types, comparing graph-backed
-  answers with hybrid retrieval.
+  answers with hybrid retrieval, and count agent steps per task with and without the graph tool.
 - **Interviews:** explain when a graph beats embeddings, how you would build one from messy text, and how
   you keep it consistent with its sources.
 
@@ -263,6 +323,19 @@ types in the extraction schema, and better still, load ownership from the projec
 - **Why vectors fail there:** similarity finds passages about the CVE but cannot follow typed edges or
   count reliably, while a traversal is exact and carries provenance for every hop.
 
+### How do you let an agent query the graph safely?
+- **Prefer parametrised tools:** fixed query text, parameters only, bounded hops, `LIMIT`, read routing and
+  a query timeout, because the model will occasionally invent labels or write unbounded traversals.
+- **Allow text-to-Cypher only behind a validator** (read-only, allowed labels, row limits) and monitor
+  error rate, empty-result rate and p95 query time.
+
+### Your incident agent says "no customers are exposed" to a CVE that clearly affects some. How do you debug it?
+- **Check the tool result in the trace.** An empty row set may mean the CVE node or an edge was never
+  loaded, not that exposure is zero; the tool should say which.
+- **Check the graph:** duplicate library nodes from missing entity resolution, or closed `valid_to` edges,
+  both break the traversal.
+- **Fix the contract:** explicit empty-result notes, sync lag alerts, and an eval case per known CVE.
+
 ### How would you build a knowledge graph from a customer's messy documents and systems?
 - **Start from questions** and design a schema with specific relationship types, never a generic
   `RELATED_TO`.
@@ -281,12 +354,6 @@ types in the extraction schema, and better still, load ownership from the projec
   recursive CTEs with cycle handling cover reporting chains and similar cases without a new system.
 - **A graph database** when deep variable-length traversal is the core workload, such as
   `[:USES|DEPENDS_ON*1..6]` over transitive dependencies, enough to justify operating another store.
-
-### How do you let an agent query the graph safely?
-- **Prefer parametrised tools:** fixed query text, parameters only, bounded hops, `LIMIT`, read routing and
-  a query timeout, because the model will occasionally invent labels or write unbounded traversals.
-- **Allow text-to-Cypher only behind a validator** (read-only, allowed labels, row limits) and monitor
-  error rate, empty-result rate and p95 query time.
 
 ## Quiz
 ### Q: Which question is a knowledge graph best placed to answer that top-k vector search handles poorly?

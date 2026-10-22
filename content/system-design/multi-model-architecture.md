@@ -5,7 +5,8 @@ name: Multi-model architecture
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - system-design/model-portfolio
   - system-design/model-routing-cascading
@@ -18,21 +19,34 @@ related:
 ---
 
 ## TL;DR
-Split the system into stages, each served by the model that fits its quality, latency and cost budget,
-joined by typed contracts. The price is coupling: each stage's output is the next one's input, so version
-and evaluate models together.
+A production agent is a multi-model system: planner, executors, embedder, reranker, guard and judge, each
+sized to its budget and joined by typed contracts. The price is coupling: each stage's output feeds the
+next, so version and evaluate them together.
+
+## For agent builders
+- **Why it matters for agents.** Planner plus executors is the backbone of most agent designs, and around
+  it sit retrieval (embed, rerank), a guard on user input and tool results, and a judge for evals. Each is a
+  different model class with its own latency, cost and failure mode.
+- **Where it shows up in your stack.** Nodes in a LangGraph graph or steps in your own loop, each with its
+  own model; structured outputs (Pydantic or Zod) between them; a gateway or LiteLLM as single egress;
+  LangSmith or OpenTelemetry traces that record model and version per step.
+- **What you control.** Which jobs exist, which model class serves each, the typed contract between them,
+  per-stage timeouts and degraded modes, and evaluating each stage plus end-to-end task success.
+- **What you can skip.** Ensembles and exotic compositions until a high-stakes decision justifies them.
+  Planner plus executors, a retrieval stack and a sampled judge cover most agents.
 
 ## Why it exists
 - **Production requests pass through many jobs.** Safety classifier, PII redaction, query rewriting,
   embedding, retrieval, reranking, generation, structured extraction, perhaps a judge, sometimes speech or
-  vision. Early LLM apps were one prompt and one model; production systems are not.
+  vision. Early LLM apps were one prompt and one model; production systems and agents are not.
 - **No single model is best at every job,** and the best model for each job is rarely the cheapest. Pushing
   everything through one frontier generator fails three ways:
   - **Cost:** embedding a hundred thousand chunks through a generative model is nonsense when an embedding
     model does it for a tiny fraction of the price.
   - **Capability:** a chat model does not emit vectors, and a prompted generalist ranks query–document pairs
     worse and far more expensively than a cross-encoder trained for exactly that.
-  - **Latency:** every extra job on the critical path is another multi-second call.
+  - **Latency:** every extra job on the critical path is another multi-second call, and an agent repeats
+    the path on every step.
 - **The opposite naive design fails on operability.** "Best model for every job from whichever vendor,
   wired up ad hoc": each vendor brings its own authentication, limits, failure modes and tokeniser; nobody
   knows which versions are in production; and when quality drops nobody can tell which stage regressed.
@@ -42,45 +56,53 @@ and evaluate models together.
 
 ## How it works
 ### Decompose by job, not by vendor
-For each job a request needs, record output type (vector, label, score, free text, structured object),
-quality sensitivity, volume, latency budget and data sensitivity. The mapping mostly writes itself:
+For each job a request or agent step needs, record output type (vector, label, score, free text,
+structured object, tool call), quality sensitivity, volume, latency budget and data sensitivity. The
+mapping mostly writes itself:
 
 | Job shape | Model class |
 |---|---|
-| High-volume, narrow output | Small specialised model, often self-hosted |
-| Low-volume, open-ended generation | Frontier model |
-| Vectors | Embedding model |
+| High-volume, narrow output (tool arguments, extraction) | Small specialised model, often self-hosted |
+| Low-volume, open-ended generation (planning, final answer) | Frontier model |
+| Vectors (RAG, long-term memory) | Embedding model |
 | Pairwise relevance | Cross-encoder reranker |
-| Safety screening on every request | Fast classifier; a larger model only for ambiguous cases |
+| Safety screening on every request and tool result | Fast classifier; a larger model only for ambiguous cases |
 
 Routing within a job (see model routing / cascading) is orthogonal to decomposition across jobs.
 
 ### Patterns of composition
-1. **Pipeline.** Guard → rewrite → embed → retrieve → rerank → generate → verify.
+1. **Pipeline.** Guard → rewrite → embed → retrieve → rerank → generate → verify. This is the RAG step an
+   agent calls as a tool.
    - Independent stages (guard and embed) run concurrently.
    - A gate that almost always passes can run *speculatively*: start retrieval, or even generation, while
      the guard decides, and discard the work if it blocks.
    - You pay wasted calls on the few blocked requests to remove the guard's latency from every other one.
-   - Unsafe only if the speculative stage has side effects or streams to the user before the gate passes.
+   - Unsafe only if the speculative stage has side effects or streams to the user before the gate passes,
+     which rules it out for agent steps that call write tools.
 2. **Generator plus verifier.** A second model checks grounding, schema or policy. Inline when it gates the
    response; sampled and asynchronous when it feeds monitoring.
 3. **Planner plus executors.** A strong model decomposes a task and cheap models carry out subtasks; the
-   backbone of most agent designs.
+   backbone of most agent designs. The plan is a typed object, not prose, so executors and replanning can
+   rely on it.
 4. **Ensemble.** Several models answer and a selector or vote picks. Expensive; reserved for high-stakes
    decisions where the extra calls are cheaper than a mistake.
 
 ### Contracts between stages
 - **Typed, versioned schemas:** each stage's input and output is a Pydantic or Zod model, not free text.
-- **Model id and version in the trace** for every stage.
+  For agents that includes the plan, each tool call and each tool result.
+- **Model id and version in the trace** for every stage and agent step.
 - **Why it is not bureaucracy:** the next stage was tuned against *this* stage's output distribution.
   - Swap the query rewriter and the embedder sees different text.
-  - Swap the embedding model and every stored vector is in a different space.
+  - Swap the embedding model and every stored vector (documents and agent memory) is in a different space.
   - Swap the generator and the citation format the verifier parses may change.
+  - Swap the planner and executors receive differently shaped subtasks.
 - **Typed contracts make drift detectable** at the boundary instead of three stages downstream; versions
-  make it attributable.
+  make it attributable. They also stop prompt-injection text in a tool result from riding into the next
+  stage as instructions.
 
 ### Budgets compose, tails do not average
-- **Latency adds along the serial path,** so parallelise what you can and budget with tail numbers.
+- **Latency adds along the serial path,** so parallelise what you can and budget with tail numbers. An
+  agent multiplies the path by its step count.
 - **Bounds:** the p99 of a sum of four stages is at least the largest single-stage p99 and can exceed the
   sum of all four p99s, because tail events in different stages combine. The sum of the p99s is only
   guaranteed to be at least the p96 of the total, by a union bound over the four stages.
@@ -88,15 +110,15 @@ Routing within a job (see model routing / cascading) is orthogonal to decomposit
 - **Correlated slowness** (two stages on one GPU pool or one provider, a retry policy at every stage, a
   shared overloaded network path) drives the real p99 towards or past that sum.
 - **Rule:** budget with the sum, then measure the end-to-end distribution.
-- **Cost adds per request.** Find the dominant stage: usually generation, sometimes a reranker scoring 50
-  candidates with a large cross-encoder.
+- **Cost adds per request.** Find the dominant stage: usually generation (the planner, in an agent),
+  sometimes a reranker scoring 50 candidates with a large cross-encoder.
 - **Failure is per stage.** Each needs its own timeout, fallback and degraded mode (drop the reranker,
   skip the judge).
 
 ### Evaluate per stage and end to end
 | Level | Examples | Tells you |
 |---|---|---|
-| Component | recall@k for retrieval, precision for the guard, schema pass rate for extraction | *Which* stage moved |
+| Component | recall@k for retrieval, precision for the guard, schema pass rate for extraction, tool-call validity for executors | *Which* stage moved |
 | End task | Task success, judged answer quality | Whether it mattered |
 
 - **You need both** *because* a stage can improve on its own metric and hurt the task: a reranker that
@@ -109,9 +131,9 @@ Routing within a job (see model routing / cascading) is orthogonal to decomposit
 - **A stage upgrade is a release,** with a canary, not a config edit.
 
 ## Diagram
-A typical RAG pipeline as stages, matching the code below: guard and embed run concurrently and join at
-the gate, each later stage depends on the previous one's typed output, and the sampled judge sits off the
-hot path.
+A typical RAG pipeline an agent calls as a tool, matching the code below: guard and embed run
+concurrently and join at the gate, each later stage depends on the previous one's typed output, and the
+sampled judge sits off the hot path.
 
 ```mermaid
 flowchart TD
@@ -129,6 +151,52 @@ flowchart TD
 ```
 
 ## Examples
+### Planner plus executors with a typed contract
+The planner (strong model) returns a typed plan; each executor step runs on a small model and its output
+is validated before the next step sees it. `llm_structured` is a thin adapter around any structured-output
+API; the model ids are placeholders.
+
+```python
+from pydantic import BaseModel, Field
+
+MODELS = {"plan": "frontier-chat-2026-06", "execute": "small-chat", "answer": "frontier-chat-2026-06"}
+
+class Step(BaseModel):
+    tool: str                       # must name a registered tool
+    goal: str
+class Plan(BaseModel):
+    steps: list[Step] = Field(max_length=8)   # bound the loop in the contract itself
+class ToolResult(BaseModel):
+    tool: str
+    ok: bool
+    data: dict                      # data, never instructions: the next prompt quotes it as data
+
+async def run_task(task, tools, trace):
+    plan = await llm_structured(MODELS["plan"], Plan, task=task, tools=list(tools))
+    trace.append({"stage": "plan", "model": MODELS["plan"], "steps": len(plan.steps)})
+    results = []
+    for s in plan.steps:
+        if s.tool not in tools:
+            raise ValueError(f"planner invented tool {s.tool}")      # contract violation, caught at the boundary
+        args = await llm_structured(MODELS["execute"], tools[s.tool].Args, goal=s.goal, prior=results)
+        results.append(ToolResult(tool=s.tool, **await tools[s.tool].run(args)))
+        trace.append({"stage": "execute", "model": MODELS["execute"], "tool": s.tool})
+    return await llm_structured(MODELS["answer"], Answer, task=task, results=results)
+```
+
+### Worked scenario: one agent task across stages
+Illustrative units: frontier call 15, small call 1, guard on a tool result 0.2. One task: 1 plan, 6
+executor steps, a guard on each tool result, 1 final answer.
+
+| Design | Calls | Cost per task |
+|---|---|---|
+| Everything on the frontier model | 8 frontier | 8 × 15 = 120 |
+| Planner and answer frontier, executors small, guarded results | 2 frontier, 6 small, 6 guards | 30 + 6 + 1.2 = 37.2 |
+| Latency on the serial path (frontier 3 s, small 0.8 s, guard 0.08 s) | | 6 + 4.8 + 0.48 ≈ 11.3 s vs 24 s |
+
+- **Lesson:** the split cuts cost about 3× and halves serial latency, but now three model classes must stay
+  compatible, so executor tool-call validity and task success both need evals.
+
 ### Typed pipeline skeleton with a trace
 Each stage names its model and records timing and version; independent stages run concurrently; the judge
 runs off the hot path on a sample. `classify`, `embed`, `rerank`, `generate`, `judge` and `vector_search`
@@ -176,7 +244,7 @@ async def answer(question):
   background work finishes, not at return.
 
 ### Worked latency budget
-Illustrative p95s, read off the structure:
+Illustrative p95s for the retrieval tool, read off the structure:
 
 | Stage | p95 | On the serial path? |
 |---|---|---|
@@ -221,31 +289,32 @@ print(f"end-to-end p99, correlated slowness:  {p(corr, .99):,.0f} ms")
 ```
 
 ## Production patterns
-- **Model registry checked in CI.** Keep one file listing every stage's approved model id, version, owner
-  and deprecation date; fail the build if code references a model not in it. Monitor days until each
-  model's deprecation and the number of stages on unregistered or retired versions.
-- **Single egress with stage tags.** Send every model call through the gateway with the stage name and
-  pipeline version attached as request metadata, so spend and errors split by stage. Monitor cost per
-  stage per request and which stage dominates.
+- **Model registry checked in CI.** Keep one file listing every stage's and agent node's approved model
+  id, version, owner and deprecation date; fail the build if code references a model not in it. Monitor
+  days until each model's deprecation and the number of stages on unregistered or retired versions.
+- **Single egress with stage tags.** Send every model call through the gateway with the stage or agent-node
+  name and pipeline version attached as request metadata, so spend and errors split by stage. Monitor cost
+  per stage per task and which stage dominates.
 - **Re-index behind an alias on embedder change.** Build a new index with the new embedding model, compare
   recall@k on the golden set, then switch a read alias in one step; never mix query and document vectors
-  from different models. Monitor recall@k and the share of documents re-embedded.
+  from different models, and re-embed agent memory stores too. Monitor recall@k and the share of documents
+  re-embedded.
 - **Stage upgrades as canaries.** Put each stage's model id behind a flag, send a small share of traffic
-  to the new version, and compare both the component metric and the end-task metric before widening.
-  Monitor the two metrics side by side; divergence means hidden coupling.
+  to the new version, and compare both the component metric and the end-task metric (agent task success)
+  before widening. Monitor the two metrics side by side; divergence means hidden coupling.
 - **Per-stage timeout with a degraded mode.** Give optional stages a hard timeout and a defined fallback
   (rerank times out, so keep vector-search order; the judge is skipped). Monitor degraded-mode rate per
   stage; a rising rate is an incident before users notice.
-- **Sampled asynchronous judge.** Judge a fixed share (for example 5%) of production answers off the hot
-  path and group scores by each stage's model version. Monitor judge score per version and judge
-  agreement with periodic human labels.
+- **Sampled asynchronous judge.** Judge a fixed share (for example 5%) of production answers or agent runs
+  off the hot path and group scores by each stage's model version. Monitor judge score per version and
+  judge agreement with periodic human labels.
 
 ## Trade-offs
 - **Right-sized models vs moving parts.** Each stage gets a right-sized model for quality and cost, but
-  there are more vendors and versions to manage; for low-volume products one strong model's simplicity can
+  there are more vendors and versions to manage; for low-volume agents one strong model's simplicity can
   win outright.
 - **Independent upgrades vs hidden coupling.** A swap is safe only with an end-to-end eval; independence
-  evaporates when stages have been tuned to each other's quirks.
+  evaporates when stages have been tuned to each other's quirks, as executors are to the planner's plans.
 - **Concurrency vs burst cost.** Running independent stages concurrently cuts latency, but raises peak
   concurrency and cost during bursts, and complicates per-stage rate-limit budgeting.
 - **Vendor diversity vs compliance load.** Best-of-breed quality and resilience, but every new processor
@@ -256,21 +325,22 @@ print(f"end-to-end p99, correlated slowness:  {p(corr, .99):,.0f} ms")
   seen them.
 
 ## Pitfalls
-- **Upgrading the embedding model without re-indexing.** Symptom: retrieval recall collapses because query
-  vectors and stored document vectors now live in different spaces.
+- **Upgrading the embedding model without re-indexing.** Symptom: retrieval recall collapses (and agent
+  memory lookups return nonsense) because query vectors and stored document vectors now live in different
+  spaces.
 - **Budgeting latency with averages.** Symptom: an end-to-end p99 far above the sum of stage p50s while
   every stage looks healthy on its own dashboard.
 - **No per-stage telemetry.** Symptom: "the answers got worse" with no way to tell whether the rewriter,
-  retriever, reranker or generator regressed.
+  retriever, reranker, planner or generator regressed.
 - **Free text between stages instead of typed objects.** Symptom: parse failures after a model update and
-  prompt-injection text riding from one stage into the next.
+  prompt-injection text riding from one stage (or tool result) into the next.
 - **An LLM judge inline on all traffic.** Symptom: cost roughly doubling and latency rising with no gain
   the product can show, when a 5% sample would have caught the same regressions.
 - **Treating two vendors' "same" capability as interchangeable.** Symptom: dimension mismatches, silent
   truncation at a different token limit, or changed tool-call formats after a swap.
 
 ## When to use
-- **Always, explicitly:** any system beyond a prototype is already multi-model; the question is whether
+- **Always, explicitly:** any agent beyond a prototype is already multi-model; the question is whether
   the decomposition is explicit.
 - **Make it explicit when** you have more than one model class in the path, or more than one team touching
   the pipeline.
@@ -311,13 +381,22 @@ and a feature flag, regardless of what the public benchmark says.
 - **Latency:** every extra job on the critical path is another multi-second call, so specialised small
   models keep the serial path short.
 
-### Design the model stages for a support assistant with retrieval and a safety check.
-- **Decompose by job:** guard (fast classifier), embed (embedding model), retrieve (vector search), rerank
-  (cross-encoder), generate (frontier model), sampled judge (small model, asynchronous).
+### Design the model stages for a tool-calling support agent with retrieval and a safety check.
+- **Decompose by job:** planner (frontier), executors filling tool arguments (small), a retrieval tool
+  (embed, vector search, cross-encoder rerank), a guard on user input and tool results, and a sampled
+  asynchronous judge.
 - **Compose:** run guard and embed concurrently, or start retrieval speculatively while the guard decides,
-  since retrieval has no side effects.
-- **Contracts:** typed, versioned schemas between stages, with model id and version in the trace for every
-  stage.
+  since retrieval has no side effects; never speculate past a write tool.
+- **Contracts:** typed, versioned schemas for the plan, tool calls and tool results, with model id and
+  version in the trace for every step.
+
+### Your agent's task success dropped after you upgraded only the planner model. How do you localise it?
+- **Check the boundary first:** plan schema pass rate, invented tool names and plan length, because
+  executors were tuned against the old planner's subtask shapes.
+- **Hold the rest fixed:** executor tool-call validity and retrieval recall@k on the golden set should be
+  unchanged, which isolates the regression.
+- **Then compare traces** old versus new on the same tasks, re-tune the planner prompt, and roll out again
+  behind a canary on the end-task metric.
 
 ### How would you budget end-to-end latency across four serial stages?
 - **Budget with the sum of the stage tail numbers,** then measure the end-to-end distribution, because
@@ -335,8 +414,8 @@ and a feature flag, regardless of what the public benchmark says.
   so fewer vendors is the better trade.
 
 ### You must change the embedding model in production. What is your rollout plan?
-- **Re-index, never mix spaces:** query vectors and stored document vectors from different models make
-  recall collapse.
+- **Re-index, never mix spaces:** query vectors and stored document vectors (and agent memory) from
+  different models make recall collapse.
 - **Build the new index alongside,** compare recall@k on the golden set, then run the end-task eval, since a
   better component metric can still hurt the task.
 - **Switch a read alias in one step** behind a flag and canary, and keep the old index until the end-task

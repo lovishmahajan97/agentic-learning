@@ -5,7 +5,8 @@ name: Health / readiness endpoints
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/graceful-shutdown-and-worker-draining
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-Liveness asks "is this process stuck, restart it?"; readiness asks "should it get traffic now?"; a startup
-probe gives slow model loads time. Restarting fixes a deadlock but worsens a database outage, so
-dependency checks belong in readiness, never liveness.
+An agent service depends on a model provider, a vector store, tool backends and a checkpoint store.
+Liveness asks "restart this process?", readiness "route traffic here?", and a startup probe covers slow
+loads. Shared dependencies belong in readiness, or nowhere, never in liveness.
+
+## For agent builders
+- **Why it matters for agents.** Agents fan out to more dependencies than a typical API: an LLM provider,
+  embeddings, a vector store, several tool backends or MCP servers, and a checkpoint store. Probe the wrong
+  ones and one flaky tool backend takes every replica out of rotation, or restarts them all mid-run.
+- **Where it shows up in your stack.** `/livez` and `/readyz` routes on the FastAPI service hosting the
+  agent, the pod's `startupProbe`, `livenessProbe` and `readinessProbe`, and the lifespan code that loads
+  models, prompts and the tool registry.
+- **What you control.** Which dependency failures mean "this instance is broken" (readiness), "the system
+  is degraded" (the agent answers with fewer tools or a fallback model) and "restart fixes it" (rare);
+  probe timings; and the drain flag.
+- **What you can skip.** Probe types other than HTTP (exec, gRPC, TCP). The three questions and the
+  default timings are what you need.
 
 ## Why it exists
 - **Orchestrators need two cheap, automatic decisions per instance:** send it requests or not, and kill
@@ -34,7 +48,8 @@ dependency checks belong in readiness, never liveness.
   for both decisions, so a 20-second shared-database blip fails every replica at once.
   - As readiness, all instances leave rotation: a partial degradation becomes a total outage.
   - As liveness, every pod restarts together; reloading models and reopening pools stampedes the
-    recovering database, and the service stays down longer than the blip.
+    recovering database, and the service stays down longer than the blip, and every in-flight agent run
+    dies with it.
 - **AI adds a crash loop.** A model that takes 90 seconds to load is killed by a liveness probe at 30
   seconds, forever.
 - **Separate probes with separate semantics prevent all three.**
@@ -53,7 +68,7 @@ dependency checks belong in readiness, never liveness.
   which is exactly the condition to detect.
 - **Keep it `async def`.** A plain `def` endpoint runs in the thread pool (AnyIO's default limit is 40
   threads), so it can fail when blocking work exhausts the pool while the loop is fine, restarting a
-  process that only needed to shed load.
+  process that only needed to shed load. Synchronous tool implementations are a common way to exhaust it.
 - **Several workers per pod blur it.** Each probe reaches whichever worker accepts the connection, so one
   wedged worker out of four fails only some probes and rarely produces the consecutive failures that
   trigger a restart. Gunicorn's heartbeat timeout catches per-worker hangs better, one more reason for one
@@ -61,7 +76,7 @@ dependency checks belong in readiness, never liveness.
 
 **Readiness**
 - Reflects local state the instance needs to serve: lifespan finished, model loaded, connection pools
-  created, not draining for shutdown.
+  created, tool registry and prompt versions loaded, not draining for shutdown.
 
 **Startup**
 - While it has not yet succeeded, Kubernetes does not run liveness or readiness, so a slow model load is
@@ -80,25 +95,37 @@ dependency checks belong in readiness, never liveness.
   inherits that dependency's latency.
 
 ### What readiness should check
-- **Prefer state over calls.** Lifespan sets flags (`model_loaded`, `pools_ready`); the probe reads them in
-  microseconds.
+- **Prefer state over calls.** Lifespan sets flags (`model_loaded`, `pools_ready`, `tools_loaded`); the
+  probe reads them in microseconds.
 - **Only dependencies this instance *alone* can lose**, such as its own pool's ability to hand out a
   connection, with a tight timeout and a cached result, so probes do not become load on the database.
 - **Shared external dependencies, especially the LLM provider, usually should not gate readiness.** If the
   provider is down for everyone, removing every replica removes your ability to serve cached answers,
   fallback models or a clear error message.
+- **Tool backends are shared too.** A down search API or MCP server should remove that tool from the
+  agent's list (degraded mode), not the replica from rotation.
+
+### Classifying an agent's dependencies
+| Dependency | Lost by one instance alone? | Belongs in | On failure |
+|---|---|---|---|
+| Event loop | yes | liveness | restart |
+| Local model or reranker loaded, tool registry built | yes | readiness (flags) | out of rotation until loaded |
+| This instance's checkpoint-store pool | yes | readiness (cached check), if runs cannot start without it | out of rotation |
+| LLM provider | no, shared | neither | fallback model or fast 503, alert |
+| A tool backend or MCP server | no, shared | neither | hide that tool, agent continues with the rest, alert |
 
 ### Deep health for humans
 - Keep a separate, authenticated `/health/details` reporting each dependency's status and latency for
-  dashboards and on-call, wired to no automated restart or routing decision.
+  dashboards and on-call, wired to no automated restart or routing decision. For agents, list each tool
+  backend so on-call sees which tools are degraded.
 
 ## Diagram
 Each probe moves a pod along a different edge: startup gates the others, readiness only toggles traffic,
-and only liveness (or an exhausted startup probe) restarts the container.
+and only liveness (or an exhausted startup probe) restarts the container and its in-flight agent runs.
 
 ```mermaid
 stateDiagram-v2
-    state "Starting, model loading, probes held" as S
+    state "Starting, model and tools loading" as S
     state "Ready, in rotation" as R
     state "Not ready, out of rotation, still running" as N
     state "Container restarted" as X
@@ -114,6 +141,64 @@ stateDiagram-v2
 ```
 
 ## Examples
+### Agent scenario: readiness from local flags, tools degrade instead of failing the pod
+An agent service loads prompts and the tool registry in lifespan. Readiness reads local flags only; a
+background task tracks tool-backend health and hides failing tools from the agent.
+
+```python
+import asyncio
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Response
+
+class AgentState:
+    prompts_loaded = False
+    tools: dict = {}            # name -> tool client, built in lifespan
+    tool_ok: dict = {}          # name -> last health result, updated in the background
+    draining = False
+
+s = AgentState()
+
+async def watch_tools(interval_s: float = 15.0):
+    while True:
+        for name, tool in s.tools.items():
+            try:
+                async with asyncio.timeout(2.0):
+                    s.tool_ok[name] = await tool.ping()      # your client's cheap health call
+            except Exception:
+                s.tool_ok[name] = False
+        await asyncio.sleep(interval_s)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    s.tools = await build_tool_registry()                    # connect tool backends, MCP sessions
+    s.prompts_loaded = await load_prompt_versions()
+    watcher = asyncio.create_task(watch_tools())
+    yield
+    s.draining = True
+    watcher.cancel()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/livez", include_in_schema=False)
+async def livez():
+    return {"ok": True}
+
+@app.get("/readyz", include_in_schema=False)
+async def readyz(response: Response):
+    ready = s.prompts_loaded and bool(s.tools) and not s.draining   # local state only
+    response.status_code = 200 if ready else 503
+    return {"ready": ready}
+
+def available_tools() -> list:
+    """What the agent loop offers the model this step: failing backends are hidden."""
+    return [t for name, t in s.tools.items() if s.tool_ok.get(name, True)]
+```
+
+- **A search-API outage now costs one tool, not the service:** readiness stays 200, the agent answers
+  without search, and `/health/details` shows which tool is down.
+- **`build_tool_registry`, `load_prompt_versions` and `tool.ping` are your own code;** the split between
+  local flags and shared-dependency handling is the point.
+
 ### Liveness, readiness and a draining flag
 A service that loads an embedding model in lifespan.
 
@@ -184,8 +269,9 @@ readinessProbe:
   reaches only one of them, so use one worker per pod or a shared signal such as a file.
 
 ### Cached, time-boxed pool check for readiness
-Checks the database through this instance's own pool at most once every 5 seconds, and never waits past
-the probe's 1 s timeout. Uses `asyncio.timeout` (Python 3.11+) and an SQLAlchemy async engine.
+Checks the database (for an agent, often the checkpoint store) through this instance's own pool at most
+once every 5 seconds, and never waits past the probe's 1 s timeout. Uses `asyncio.timeout` (Python 3.11+)
+and an SQLAlchemy async engine.
 
 ```python
 import asyncio, time
@@ -226,27 +312,31 @@ Illustrative: 12 replicas, a 40-second shared-database blip, the 60-90 s model l
 | t=40 | DB recovers, but pods are reloading models | full service resumes |
 | t≈100-130 | 12 pods reopen pools at once, stampeding the DB | (already recovered) |
 
-A 40-second blip becomes a two-minute outage when liveness checks a shared dependency.
+A 40-second blip becomes a two-minute outage when liveness checks a shared dependency. For an agent
+service the restart column also kills every in-flight run on all 12 pods at t≈30.
 
 ## Production patterns
+- **Degrade tools, do not fail pods.** Agent teams track each tool backend's health in the background and
+  hide failing tools from the model's tool list, leaving readiness on local state. Monitor: per-tool
+  availability, and agent task success rate while a tool is hidden.
 - **Keep probes off the middleware path.** Skip auth, rate limiting and access logging for `/livez` and
-  `/readyz` (check the path first in middleware) and mark them `include_in_schema=False`. Monitor: probe
-  401s or 429s, and the share of log lines that are probes.
+  `/readyz` (check the path first in middleware) and mark them `include_in_schema=False`, which also keeps
+  them out of OpenAPI-generated agent tools. Monitor: probe 401s or 429s, and the share of log lines that
+  are probes.
 - **Startup probe sized from measured load time.** Take the slowest observed model load on the slowest node
   type, add margin, and set `failureThreshold × periodSeconds` above it. Monitor: time from container start
   to ready, per node type, and CrashLoopBackOff events.
 - **Readiness from lifespan flags, plus a cached check only where it earns its place.** Flags for model,
-  pools and draining; add the cached pool check above only if no route can serve without the database.
-  Monitor: readiness flaps per pod; many pods flapping together means a shared dependency leaked into the
-  probe.
+  pools, tools and draining; add the cached pool check above only if no route can serve without the
+  database. Monitor: readiness flaps per pod; many pods flapping together means a shared dependency leaked
+  into the probe.
 - **Alert on restarts, not just errors.** Track container restarts per pod (for example
   `kube_pod_container_status_restarts_total` from kube-state-metrics). Monitor: restarts on every replica
   at once, the signature of a liveness probe that checks a shared dependency.
-- **Authenticated details endpoint for on-call.** `/health/details` reports each dependency's status and
-  latency for dashboards, behind auth, with no probe pointed at it. Monitor: dependency latency trends
-  there instead of in probe results.
-- **One worker per pod, or a shared drain signal.** So both liveness and the drain flag mean something for
-  the whole pod. Monitor: readiness still returning 200 during termination.
+- **Authenticated details endpoint and one worker per pod.** `/health/details` reports each dependency's
+  status and latency for on-call, behind auth, with no probe pointed at it; one worker per pod (or a shared
+  drain signal) keeps liveness and the drain flag meaningful for the whole pod. Monitor: dependency latency
+  trends there, and readiness still returning 200 during termination.
 
 ## Trade-offs
 - **Dependency checks in readiness vs coupling.** They remove instances that genuinely cannot serve, but
@@ -259,6 +349,9 @@ A 40-second blip becomes a two-minute outage when liveness checks a shared depen
 - **Gating readiness on the provider vs fallbacks.** Failing readiness when the LLM provider is down
   protects users from slow errors, but forfeits fallbacks and cached answers; flip to gating only when the
   instance truly has nothing useful to return.
+- **Hiding a failed tool vs answer quality.** Degrading keeps the agent available, but it may now answer
+  confidently without data it needed; pair it with an instruction or a message telling the user which
+  capability is unavailable.
 
 ## Pitfalls
 - **Same endpoint for liveness and readiness.** Symptom: all pods restarting together during a database
@@ -267,6 +360,8 @@ A 40-second blip becomes a two-minute outage when liveness checks a shared depen
   about the same age, before it ever logs "model loaded".
 - **Liveness that calls the database or the provider.** Symptom: restart storms correlated with upstream
   incidents, with restart counts climbing on every replica at once.
+- **Readiness that pings every tool backend.** Symptom: one third-party tool's outage removes all replicas
+  from rotation, and probe latency exceeds 1 s because it awaits several remote calls.
 - **Synchronous inference on the event loop.** Symptom: liveness timeouts and restarts under load only,
   because probes queue behind the blocking work, killing pods that were merely busy.
 - **Drain flag in process memory with several workers per pod.** Symptom: readiness keeps returning 200 on
@@ -313,6 +408,14 @@ endpoint serves dashboards.
 - **Startup** holds the other two until initialisation finishes, so a slow model load is not mistaken for
   a hang.
 
+### Your agent uses six tools backed by different services. What do your health endpoints check?
+- **Liveness:** only that the event loop answers, because no tool outage is fixed by restarting the agent
+  service.
+- **Readiness:** local state: prompts and tool registry loaded, own pools created, not draining. Tool
+  backends are shared, so they never gate it.
+- **Tool health:** a background check per backend that hides failing tools from the model and shows up in
+  `/health/details` and alerts, so the agent degrades instead of disappearing.
+
 ### A new model version puts pods into CrashLoopBackOff, each killed at the same age. How do you debug it?
 - **The same age is the clue:** the container is killed by a probe on a fixed schedule before it ever logs
   "model loaded", typically liveness at about 30 seconds with defaults.
@@ -331,8 +434,8 @@ endpoint serves dashboards.
 - **First ask whether it should:** a check that reaches a shared database fails on every replica at once
   during an outage, pulling them all, so keep it only if no route can serve without the database.
 - **Prefer instance-local signals** (lifespan flags, this instance's own pool state) over a round trip.
-- **If you keep it, bound and cache it:** a 0.3 s budget inside the default 1 s `timeoutSeconds`, and a cached result for
-  5 seconds, so probes are not load on the database.
+- **If you keep it, bound and cache it:** a 0.3 s budget inside the default 1 s `timeoutSeconds`, and a
+  cached result for 5 seconds, so probes are not load on the database.
 - **Watch for many pods flapping together**, which means a shared dependency has leaked into the probe.
 
 ### Why should liveness be an async def that does almost nothing?

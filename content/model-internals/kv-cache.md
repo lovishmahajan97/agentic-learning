@@ -341,3 +341,23 @@ answer also notes decode is bandwidth-bound, so higher concurrency raises per-re
 > Cache size is proportional to the number of KV heads; GQA shares each K/V head across several query
 > heads, so Llama-3-8B's 8 KV heads need a quarter of the cache of a 32-head layout. Speculative decoding
 > changes compute per step, not cache per token.
+
+## Use cases & projects
+### Use cases
+- **Long-running coding and research agents.** Prefix caching keeps the cost of step 30 close to step 1
+  when the transcript is append-only.
+- **Multi-tenant agent platforms.** KV-cache math sets how many concurrent agent sessions one GPU can host
+  and when to add replicas.
+- **Agents over large documents.** Deciding between a 100k-token context and a retrieval step is a KV-cache
+  memory decision as much as a quality one.
+- **Cost control on hosted APIs.** Provider prompt caching bills cached input tokens at a fraction of the
+  normal rate, so a stable prefix directly cuts agent cost.
+
+### Mini project
+**Measure prefix caching in an agent loop (1-2 hours).**
+- **Goal:** show how much a stable prefix saves across a 10-step tool-calling loop.
+- **Steps:** build a tiny agent with two fake tools; run it twice, once with a stable system prompt and tool
+  list, once with a timestamp injected at the top of the prompt; log input, cached-input and output tokens
+  per step from the provider usage fields (or vLLM metrics when self-hosting).
+- **Done when:** you have a per-step table and a chart showing cached tokens climbing in the stable run and
+  staying near zero in the timestamped run, plus a one-paragraph explanation of why.

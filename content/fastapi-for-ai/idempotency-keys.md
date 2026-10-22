@@ -5,7 +5,8 @@ name: Idempotency keys
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/timeouts
   - fastapi-for-ai/redis-caching
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-An idempotency key is a client-chosen unique ID sent with a request. The server records the first
-outcome under it and replays it on retries, so a retried POST cannot bill twice or rerun a generation:
-at-least-once delivery becomes effectively-once.
+Agents retry: after a timeout, a crash or a resumed run, the same tool call or generation fires again.
+An idempotency key names the operation once; the server records the first outcome and replays it, so a
+retry cannot send, charge or bill twice.
+
+## For agent builders
+- **Why it matters for agents.** Agent tool calls have side effects (send an email, file a ticket,
+  charge a card), and agent runtimes retry steps after timeouts or resume a run from a checkpoint. Without
+  a key per tool call, every retry is a second email.
+- **Where it shows up in your stack.** The `Idempotency-Key` header on your own FastAPI endpoints, the
+  same header on payment and messaging APIs your tools call, and the claim table or Redis key behind your
+  tool executor.
+- **What you control.** Deriving a stable key from the run and the tool call (run id plus step or tool
+  call id), never from the attempt; what outcomes you store; and passing a derived key downstream.
+- **What you can skip.** Building waiting or pub/sub for in-progress duplicates; a 409 with
+  `Retry-After` is enough for agent workers, which already loop.
 
 ## Why it exists
 - **Retries are essential but ambiguous.** Timeouts, dropped connections and 502s from proxies are
@@ -100,9 +113,27 @@ For each key the server stores a record: `{fingerprint, state, status_code, resp
   key, but a crash between the effect and the record write can still duplicate it. Pass the key
   downstream (many payment and messaging APIs accept one) to close that gap.
 
+### Keys for agent tool calls
+In an agent, the "client" that retries is often your own runtime, so you mint the key yourself:
+
+| Retry source | Same operation? | Key to use |
+|---|---|---|
+| HTTP retry of one tool request after a timeout | yes | reuse the tool call's key |
+| Run resumed from a checkpoint replays step 4 | yes | `run_id:step:tool_call_id`, stable across resumes |
+| Model calls `send_email` twice with the same args in one run | maybe not | a new tool call id, so a new key; dedupe by args only if your product says so |
+| User re-asks the same question tomorrow | no | a new run id |
+
+- **Derive, do not generate, inside the loop.** A key built from run id and tool call id is the same on
+  every attempt and every resume; a fresh UUID per attempt is the classic duplicate bug.
+- **The model's tool call id may not survive a resume.** If the resumed step re-asks the model, the new
+  reply carries a new id; key on the persisted step number instead when you checkpoint between steps.
+- **Store the tool result, not just "done".** The replayed result goes back into the transcript, so the
+  model sees the same observation it would have seen the first time.
+
 ## Diagram
-The server's decision path for one keyed request: a single atomic claim decides whether this attempt
-does the work, waits, replays or is rejected.
+The server's decision path for one keyed request, whether it comes from a client or from your agent's
+tool executor: a single atomic claim decides whether this attempt does the work, waits, replays or is
+rejected.
 
 ```mermaid
 flowchart TD
@@ -170,6 +201,41 @@ async def create(payload: dict, claim=Depends(idem)):
   principal, or a caller can scope keys into someone else's namespace.
 - **No owner token here.** This version omits the compare-and-set; the Postgres example below adds it.
 
+### Agent tool executor with derived keys
+Side-effecting tools run through one wrapper; the key comes from the run and step, so a resumed run
+replays the stored observation. `store` is the Redis client above; `send_email` is your own tool.
+
+```python
+import json
+
+SIDE_EFFECT_TOOLS = {"send_email", "create_ticket", "refund"}
+
+async def execute_tool(store, run_id: str, step: int, call: dict, tools: dict) -> dict:
+    if call["name"] not in SIDE_EFFECT_TOOLS:
+        return await tools[call["name"]](**call["args"])       # reads are safe to repeat
+    key = f"idem:tool:{run_id}:{step}:{call['name']}"           # stable across retries and resumes
+    fp = json.dumps(call["args"], sort_keys=True)
+    if not await store.set(key, json.dumps({"fp": fp, "state": "in_progress"}), nx=True, ex=120):
+        rec = json.loads(await store.get(key) or "{}")
+        if rec.get("fp") != fp:
+            return {"error": "step replayed with different arguments; not executed"}
+        if rec.get("state") == "in_progress":
+            return {"error": "already running; check again shortly"}
+        return rec["result"]                                     # same observation as the first time
+    try:
+        result = await tools[call["name"]](**call["args"], idempotency_key=key)  # pass it downstream
+    except Exception:
+        await store.delete(key); raise                           # transient: let the retry run
+    await store.set(key, json.dumps({"fp": fp, "state": "done", "result": result}), ex=24 * 3600)
+    return result
+```
+
+| Event | Without the wrapper | With it |
+|---|---|---|
+| Step 3 `send_email` succeeds, worker dies before checkpoint | — | result stored under `run_id:3` |
+| Run resumes at step 3 | second email sent | stored result replayed, no email |
+| Model sees | two "sent" observations over two runs | one, identical to the first |
+
 ### Worked timeline: a timeout during a 12-second generation
 The client posts with key `7f3c...`, has a 10 s timeout, and the model takes 12 s.
 
@@ -225,6 +291,10 @@ If the claim returns no row, read the existing record and apply steps 3-5 of the
   user action happens, store it with the pending operation, and reuse it for every attempt (including
   after an app restart). Monitor distinct keys per logical operation; more than one means a retry path
   mints new keys.
+- **Keys derived from run and step for agent tools** — in every agent runtime with side-effecting tools.
+  Build the key from run id, persisted step number and tool name, route those tools through one
+  executor wrapper, and store the tool result for replay. Monitor side-effect calls per run step; more
+  than one means a retry path bypasses the wrapper.
 - **Lease above the deadline, retention above the retry window** — on every keyed endpoint. Set the lease
   above the request deadline (for example a 90 s deadline under a 120 s lease) and the retention TTL
   above the client's retry window. Monitor completions whose start times are one lease apart for the
@@ -249,6 +319,10 @@ If the claim returns no row, read the existing record and apply steps 3-5 of the
 - **Redis vs Postgres.** Redis gives fast atomic claims and automatic expiry, but a failover can lose
   recent keys. Postgres gives durability and commits the record with the side effect, at higher latency.
   The trade flips toward Postgres when a duplicate costs money.
+- **Per-step keys vs model intent.** Keying on run and step stops retries and resumes from repeating an
+  action, but it will not stop a model that deliberately calls `send_email` twice in one run with new
+  call ids. Catching that needs an argument-level dedupe or a confirmation step, which can block
+  legitimate repeats.
 - **Required vs optional header.** Requiring it on every POST catches client bugs early but breaks naive
   integrations. Optional keys are friendlier but leave unkeyed retries unprotected.
 
@@ -265,13 +339,17 @@ If the claim returns no row, read the existing record and apply steps 3-5 of the
   interrupted keys return 409 for hours instead of re-running.
 - **A lease shorter than the slowest request.** Symptom: duplicates only for long generations, with two
   completed attempts per key whose start times are one lease apart.
+- **Minting a fresh key per agent attempt.** A UUID generated inside the tool executor or the step
+  retry. Symptom: duplicate emails or tickets only after worker restarts or resumed runs. Fix: derive the
+  key from run id and persisted step.
 - **Re-running generation on replay.** Instead of returning the stored body. Symptom: users see two
   different answers for one question, and token bills don't match request counts.
 
 ## When to use
 - **Use when** an endpoint is non-idempotent and a duplicate is costly or visible: anything that
   charges, creates a resource, kicks off a long job, or lets an agent take an external action.
-- **Most important where clients retry automatically:** SDKs, queues, mobile apps, webhook senders.
+- **Most important where clients retry automatically:** SDKs, queues, mobile apps, webhook senders, and
+  agent runtimes that retry steps or resume runs from checkpoints.
 - **Skip for** GET, or writes that are naturally idempotent (PUT of a full resource, upserts keyed by a
   natural ID).
 - **Measure:** replay and conflict counts; a high 409 rate means client timeouts are shorter than your
@@ -308,9 +386,9 @@ reused key with a different body.
 - **The key names the intent**, chosen before the first attempt, which is exactly what the server cannot
   infer from bytes.
 
-### Customers report occasional double charges even though you implemented idempotency keys. How do you investigate?
-- **Count distinct keys per logical operation.** More than one means the client mints a key inside its
-  retry loop, so every attempt looks new.
+### Your agent occasionally files duplicate tickets or double charges even though you implemented idempotency keys. How do you investigate?
+- **Count distinct keys per logical operation.** More than one means the client or the agent runtime
+  mints a key inside its retry loop or on resume, so every attempt looks new.
 - **Check the claim.** A read followed by an insert races; two retries 50 ms apart both see nothing.
   It must be `SET NX` or a unique-constraint insert.
 - **Check lease versus duration.** Two completed attempts whose start times are one lease apart mean the
@@ -331,6 +409,14 @@ reused key with a different body.
 - **Retention must exceed the client's retry window.** Stripe, for example, keeps keys for at least 24
   hours; shorter lets a late retry run twice.
 - **A long TTL on the claim is a bug**: a crashed worker leaves the key returning 409 for a day.
+
+### How do you make an agent's side-effecting tools safe when runs can be retried or resumed?
+- **Route them through one executor** that claims a key derived from run id, persisted step and tool
+  name, so every retry and resume maps to the same operation.
+- **Store and replay the tool result**, so the model sees the same observation and the transcript stays
+  consistent with what actually happened.
+- **Pass a derived key downstream** to payment or messaging APIs, because a crash between the effect and
+  your record write is the remaining gap.
 
 ### Why store a 4xx outcome but not a 5xx one?
 - **A 4xx is deterministic**: the same request would fail the same way, so replaying it is correct and

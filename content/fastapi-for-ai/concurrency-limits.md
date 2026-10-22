@@ -5,7 +5,8 @@ name: Concurrency limits (semaphores)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/backpressure
   - fastapi-for-ai/rate-limiting
@@ -22,14 +23,26 @@ sources:
 ---
 
 ## TL;DR
-An async worker will start thousands of model calls at once; providers, GPUs and memory cannot cope. A
-semaphore caps calls in flight. Size it from the downstream limit divided across workers, bound the
-wait, and fail fast with 503.
+Agents multiply load: every run makes several model calls and may fan out parallel tool calls, and an
+async worker starts them all at once. A semaphore per dependency caps calls in flight; size it from the
+downstream limit across workers, and fail fast.
+
+## For agent builders
+- **Why it matters for agents.** One user message can become five model calls and a burst of parallel
+  tool calls. Without a cap, 100 concurrent agent runs become hundreds of provider calls, 429s, and retries
+  that make it worse.
+- **Where it shows up in your stack.** `asyncio.Semaphore` or AnyIO `CapacityLimiter` on `app.state`
+  around each LLM, embedding, reranker and tool call; `asyncio.gather` fan-out inside the agent loop; the
+  AnyIO thread pool behind sync SDK calls; Uvicorn `--limit-concurrency`.
+- **What you control.** One limit per dependency, *n* from the quota divided by workers and replicas, a
+  bounded wait, slots taken per call rather than per agent run, and a per-run cap on parallel tool calls.
+- **What you can skip.** Adaptive limiter algorithms. Know Little's law, per-process sizing and the
+  streaming release rule; that sizes almost any agent service.
 
 ## Why it exists
 - **Async removes the natural brake.** With `async def` endpoints a worker does not run out of threads;
   each request is a cheap coroutine. A burst of 2,000 chat requests becomes 2,000 concurrent provider
-  calls in a few milliseconds.
+  calls in a few milliseconds, more if each agent run fans out.
 - **Everything downstream suffers and nothing pushes back.** The provider answers with 429s past its
   concurrency quota, a self-hosted vLLM server queues internally until latency is useless, each
   in-flight request holds a connection, a prompt and a growing response in memory, and retries from
@@ -63,6 +76,14 @@ wait, and fail fast with 503.
   you need a shared limiter (for example leases with expiry in Redis) or a gateway that enforces the
   global cap.
 
+### Agent loops: limit calls, not runs
+- **Take the slot around each model or tool call,** not around the whole agent run, *because* a run spends
+  much of its time in tools and holding an LLM slot meanwhile wastes provider capacity.
+- **Cap fan-out per run.** When the model asks for several tool calls at once, run them with
+  `asyncio.gather` under a small per-run semaphore, so one run cannot take every tool slot.
+- **Count agent runs separately if you must.** A cap on concurrent runs per worker bounds memory for
+  transcripts; it does not replace the per-dependency caps.
+
 ### Bound the wait
 - **A plain `async with sem:` waits forever.** Under sustained overload the wait queue grows without limit,
   which is just an unbounded queue with extra steps.
@@ -70,6 +91,8 @@ wait, and fail fast with 503.
   honest rejection lets the client or load balancer retry elsewhere while a slow one burns the client's
   whole timeout.
 - **Reject immediately** by checking `sem.locked()` when there is no free slot.
+- **Inside an agent loop,** a timed-out tool slot can become a tool error returned to the model instead of
+  a failed run.
 
 ### Choosing n
 | Dependency | Starting point |
@@ -91,7 +114,8 @@ The sweep for a self-hosted engine:
 
 ### Not all calls cost the same
 - **Quotas count tokens too.** A provider quota is often in tokens per minute as well as requests, and a
-  50k-token prompt holds far more of a self-hosted engine's KV cache than a 200-token one.
+  50k-token prompt holds far more of a self-hosted engine's KV cache than a 200-token one. Late agent
+  steps, with long transcripts, are the expensive ones.
 - **A slot-per-request semaphore treats them as equal.** A weighted limit charges each call units
   proportional to its expected tokens.
 - **Do not call `acquire()` *k* times on an `asyncio.Semaphore`.** Acquisition is not atomic, so two large
@@ -116,7 +140,7 @@ The sweep for a self-hosted engine:
 ### The hidden limit you already have
 - **The thread pool.** Sync `def` endpoints and `run_in_threadpool` calls run on AnyIO's worker thread
   pool, which has a default capacity limiter (40 threads in current AnyIO). That is a concurrency limit
-  too, often hit by accident when blocking SDK calls sit in a sync endpoint.
+  too, often hit by accident when blocking SDK calls sit in a sync endpoint or a sync tool function.
 - **Uvicorn's `--limit-concurrency`** returns 503 once a worker holds too many connections or tasks; it is
   a coarse safety net, not a per-dependency limit.
 
@@ -126,7 +150,7 @@ until the generator's `finally`, not until the endpoint returns.
 
 ```mermaid
 flowchart TD
-    A["Request arrives at one worker"] --> B{"Free slot in the dependency semaphore?"}
+    A["Agent call arrives at one worker"] --> B{"Free slot in the dependency semaphore?"}
     B -->|"yes"| C["acquire: counter minus 1"]
     B -->|"no"| W["Wait, bounded by asyncio.timeout"]
     W -->|"slot freed in time"| C
@@ -185,6 +209,40 @@ async def chat(body: dict, request: Request):
   chunk, `gen()` never runs its `finally` and the slot leaks, so production code adds the release-once
   guard and an alert on slots that never return.
 
+### Agent step with capped parallel tool calls
+The model asks for several tools at once. Each call takes the shared tool slot only for its own duration,
+and a per-run limit stops one run from taking all of them. Timeouts become tool errors the model can see.
+
+```python
+import asyncio
+
+TOOL_SLOTS = asyncio.BoundedSemaphore(8)        # per worker, created in the lifespan in real code
+PER_RUN_FANOUT = 3
+
+async def call_tool_capped(name, args, impl, run_sem, wait_s=1.0):
+    try:
+        async with asyncio.timeout(wait_s):
+            await run_sem.acquire()
+            try:
+                await TOOL_SLOTS.acquire()
+            except BaseException:
+                run_sem.release(); raise
+    except TimeoutError:
+        return {"tool": name, "error": "busy, retry later"}   # the model sees this as a result
+    try:
+        return {"tool": name, "result": await impl(**args)}
+    finally:
+        TOOL_SLOTS.release(); run_sem.release()
+
+async def run_tool_batch(tool_calls, registry):
+    run_sem = asyncio.Semaphore(PER_RUN_FANOUT)            # one per agent run
+    return await asyncio.gather(*(call_tool_capped(c["name"], c["args"], registry[c["name"]], run_sem)
+                                  for c in tool_calls))
+```
+
+- **Why per call, not per run:** a run that holds an LLM slot while its tools execute starves other runs of
+  provider capacity it is not using.
+
 ### Runnable: a burst against a bounded semaphore
 Twelve requests arrive at once against 4 slots; each call takes 1 second and waiters give up after 0.5
 seconds. Runs on Python 3.11+ with no dependencies.
@@ -226,9 +284,12 @@ asyncio.run(main())   # peak in flight=4, served=4, rejected=8
 | Scale to 8 workers, same *n* | 8 × 16 = 128 in flight | double the quota: 429s return |
 | Scale to 8 workers, re-sized | `floor(64 / 8)` = 8 per worker | fleet stays at 64 |
 
+- **In agent runs:** if each run makes 4 model calls of about 8 s each (illustrative), 8 model calls per
+  second across the fleet means about 8 / 4 = 2 agent runs started per second, not 8.
+
 ## Production patterns
-- **Per-dependency bulkheads in the lifespan.** When an endpoint fans out to an LLM, embeddings and a
-  reranker, create one `BoundedSemaphore` per dependency on `app.state` and take each only around its
+- **Per-dependency bulkheads in the lifespan.** When an agent fans out to an LLM, embeddings, a reranker
+  and tools, create one `BoundedSemaphore` per dependency on `app.state` and take each only around its
   call. Monitor slots in use, wait time and rejections per dependency (count them in your own code, since
   the semaphore exposes no public in-use counter).
 - **Derive *n* from config, not a constant.** Read the quota and the worker and replica counts from
@@ -241,9 +302,9 @@ asyncio.run(main())   # peak in flight=4, served=4, rejected=8
   default limiter in the lifespan, for example
   `anyio.to_thread.current_default_thread_limiter().total_tokens = 100`, sized to the downstream. Monitor
   latency of sync endpoints under load, which plateaus at the thread cap.
-- **Per-tenant caps on top of the global cap.** For multi-tenant APIs, give each tenant a small semaphore
-  checked before the shared one, so a noisy customer cannot take every slot. Monitor rejections by tenant
-  and idle global capacity.
+- **Per-tenant caps on top of the global cap.** For multi-tenant agent APIs, give each tenant a small
+  semaphore checked before the shared one, so a noisy customer's batch of agent runs cannot take every
+  slot. Monitor rejections by tenant and idle global capacity.
 - **Uvicorn `--limit-concurrency` as the outer net.** Set it above the sum of your dependency caps so it
   only fires when something else has failed. Monitor its 503s separately from your own.
 
@@ -259,12 +320,16 @@ asyncio.run(main())   # peak in flight=4, served=4, rejected=8
 - **Shared vs per-tenant caps.** One shared cap per dependency is fair to no one in particular; per-tenant
   caps prevent a noisy customer from taking every slot, at the cost of idle capacity when tenants are
   quiet.
+- **Wide vs narrow tool fan-out.** Letting a run execute all requested tools in parallel finishes the step
+  sooner, but one run can then monopolise tool slots; a small per-run cap trades step latency for fairness.
 
 ## Pitfalls
 - **Creating the semaphore inside the endpoint or a per-request dependency.** It limits nothing; the
   symptom is provider 429s at the same load as before the change.
 - **Forgetting that the cap is per worker.** Scaling from 4 to 8 workers doubles provider concurrency and
   429s return after the scale-up.
+- **Holding the LLM slot for the whole agent run.** Symptom: provider concurrency sits well below the cap
+  while requests get 503s, because slots are held during tool execution. Fix: acquire per model call.
 - **Acquiring without a timeout.** Under overload p99 latency climbs to the client timeout and memory
   grows with the number of suspended waiters.
 - **Releasing in the endpoint for a streaming response.** The slot is freed when headers go out, so real
@@ -275,9 +340,9 @@ asyncio.run(main())   # peak in flight=4, served=4, rejected=8
   Symptom: throughput does not rise when *n* is raised while time per token keeps growing.
 
 ## When to use
-- **Use in front of** every scarce or quota-bound dependency an async service calls: hosted LLMs with
-  concurrency quotas, self-hosted inference servers whose latency degrades past a batch size, embedding
-  and reranking services, slow internal tools.
+- **Use in front of** every scarce or quota-bound dependency an async agent service calls: hosted LLMs
+  with concurrency quotas, self-hosted inference servers whose latency degrades past a batch size,
+  embedding and reranking services, slow internal tools.
 - **Pair it** with rate limiting for per-client fairness and with backpressure for what to do when slots
   run out.
 - **Measure** slot utilisation, wait time, rejection rate and downstream latency against concurrency.
@@ -311,6 +376,14 @@ max tokens), caching, or routing some traffic to another model.
   internally, and every in-flight call holds memory and a connection.
 - **A semaphore per scarce dependency** caps calls in flight before the work starts.
 
+### Should an agent hold its LLM concurrency slot for the whole run or per model call?
+- **Per model call.** A run alternates model calls and tool calls, and holding the LLM slot during tools
+  leaves provider capacity idle while other runs get 503s.
+- **Tools get their own slots** per dependency, plus a small per-run fan-out cap so parallel tool calls
+  from one run cannot take every slot.
+- **Cap concurrent runs separately** only to bound transcript memory; it is not a substitute for the
+  per-dependency caps.
+
 ### After scaling from 4 to 8 workers, provider 429s come back even though the code did not change. Why?
 - **The semaphore is per process,** so the fleet limit is `workers × n`. With 16 per worker, 8 workers allow
   128 in flight against a quota of 64.
@@ -326,9 +399,9 @@ max tokens), caching, or routing some traffic to another model.
 - **For calls of very different cost:** a 50k-token prompt is not one slot's worth, so weight the limit or
   cap request size.
 
-### How would you pick n for a self-hosted inference server that has no quota?
-- **Run a concurrency sweep:** step concurrency up in a load test and record throughput, time to first
-  token and time per output token at each step.
+### How would you pick n for a self-hosted inference server that serves your agents and has no quota?
+- **Run a concurrency sweep:** step concurrency up in a load test with realistic agent prompts (long
+  transcripts included) and record throughput, time to first token and time per output token at each step.
 - **Find the knee:** throughput rises then flattens while latency stays flat then climbs; set *n* just
   before it, because past it extra concurrency only queues inside the engine.
 - **Check the ceiling with Little's law:** `max throughput ≈ n / mean latency`, and re-run the sweep when

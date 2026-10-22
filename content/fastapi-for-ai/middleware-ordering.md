@@ -5,7 +5,8 @@ name: Middleware ordering
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/cors
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-Middleware is a stack of nested ASGI apps: requests walk in, responses walk out. `app.add_middleware()`
-inserts at the *outside*, so the last added runs first. Order decides whether a 401 carries CORS headers
-and whether timing sees exceptions.
+An agent API wraps every run in middleware: request IDs, CORS, auth, tracing, limits. It is a stack of
+nested ASGI apps; `app.add_middleware()` inserts at the *outside*, so the last added runs first, which
+decides whether runs are traced and errors are readable.
+
+## For agent builders
+- **Why it matters for agents.** One agent run produces dozens of log lines, LLM calls and tool calls.
+  If the request-ID or trace layer sits in the wrong place, those lines cannot be stitched into one run,
+  and a browser chat UI sees "CORS error" instead of the real 401 or 500.
+- **Where it shows up in your stack.** `FastAPI(middleware=[...])`, Starlette's `CORSMiddleware`,
+  OpenTelemetry instrumentation, the tracing hooks that send agent spans to LangSmith, Langfuse or a
+  similar backend, and any gateway in front of your agent service.
+- **What you control.** The order of layers, whether streaming-route layers are pure ASGI (so step and
+  token events are not buffered), and which concerns are middleware versus route dependencies.
+- **What you can skip.** Starlette's internals beyond the two fixed layers. Know "last added is
+  outermost" and where `ServerErrorMiddleware` and `ExceptionMiddleware` sit; that answers most bugs.
 
 ## Why it exists
 - **Cross-cutting concerns need one chain.** Request IDs, auth, CORS, compression, timing, tracing and
@@ -60,7 +73,8 @@ out: Auth's 401 -> CORS (adds Allow-Origin) -> RequestID (adds x-request-id) -> 
      ExceptionMiddleware, Router and the endpoint never run
 ```
 
-- A good request goes all the way in to the endpoint and back out through the same layers in reverse.
+- A good request goes all the way in to the endpoint (where the agent loop runs) and back out through the
+  same layers in reverse.
 - Each layer runs code at two moments, before and after it calls the inner app, so "first in" is always
   "last out".
 
@@ -100,13 +114,13 @@ out: Auth's 401 -> CORS (adds Allow-Origin) -> RequestID (adds x-request-id) -> 
   - context variables set downstream are not visible to the middleware afterwards;
   - the extra task adds overhead per request;
   - it has a history of interfering with streaming and background tasks.
-- For token streaming and trace propagation, write pure ASGI middleware that wraps `send`; it adds no
-  task and passes `more_body` chunks through untouched.
+- For token streaming, agent step events and trace propagation, write pure ASGI middleware that wraps
+  `send`; it adds no task and passes `more_body` chunks through untouched.
 
-### A sane default order, outermost first
-1. **Request ID / trace context**, so every later log line and span has it.
+### A sane default order for an agent API, outermost first
+1. **Request ID / trace context**, so every later log line, LLM span and tool span has it.
 2. **CORS**, so every response, including auth rejections and preflight answers, gets its headers.
-3. **Body-size limits and timeouts**, to reject before spending anything.
+3. **Body-size limits and timeouts**, to reject before spending anything (huge pasted documents, uploads).
 4. **Authentication**, which needs the trace and produces a principal for inner layers.
 5. **Timing and metrics**, inside auth if you want handler time, outside it if you want total time.
 6. **Compression**, kept away from token streams, since buffering for gzip delays each chunk.
@@ -120,11 +134,11 @@ that still passes back through CORS, while a crash caught by `ServerErrorMiddlew
 ```mermaid
 flowchart TD
     W["Server"] --> SE["ServerErrorMiddleware (fixed, outermost)"]
-    SE --> RID["RequestID"]
+    SE --> RID["RequestID and run context"]
     RID --> CO["CORS"]
     CO --> AU["Auth"]
     AU -->|"good key"| EX["ExceptionMiddleware (fixed, innermost)"]
-    EX --> R["Router and endpoint"]
+    EX --> R["Router and agent endpoint"]
     AU -.->|"bad key: 401 on the way out"| CO
     CO -.->|"adds Allow-Origin"| RID
     R -.->|"unhandled exception propagates"| SE
@@ -132,6 +146,51 @@ flowchart TD
 ```
 
 ## Examples
+### Run-ID middleware that tags every LLM and tool call in an agent run
+A pure ASGI layer outermost sets a contextvar, so code deep inside the agent loop (tool wrappers, LLM
+client hooks, loggers) can tag every line with the run ID without passing it through every function. It
+wraps `send` without buffering, so SSE step events still stream.
+
+```python
+import contextvars, uuid, logging
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from starlette.middleware import Middleware
+
+run_id_var = contextvars.ContextVar("run_id", default="-")
+log = logging.getLogger("agent")
+
+class RunContext:                                  # pure ASGI: same task, contextvar visible inside
+    def __init__(self, app): self.app = app
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        rid = uuid.uuid4().hex[:12]
+        token = run_id_var.set(rid)
+        async def send_with_id(msg):
+            if msg["type"] == "http.response.start":
+                msg = {**msg, "headers": [*msg.get("headers", []), (b"x-run-id", rid.encode())]}
+            await send(msg)                        # every more_body chunk passes straight through
+        try:
+            await self.app(scope, receive, send_with_id)
+        finally:
+            run_id_var.reset(token)
+
+async def call_tool(name: str, args: dict) -> dict:
+    log.info("tool=%s run_id=%s", name, run_id_var.get())   # tagged without plumbing
+    return {"ok": True}
+
+app = FastAPI(middleware=[Middleware(RunContext)])          # outermost: everything inside is tagged
+
+@app.post("/agent/run")
+async def run(body: dict):
+    async def events():
+        for step in range(3):
+            await call_tool("search", {"q": body.get("task", "")})
+            yield f"data: step {step} run {run_id_var.get()}\n\n"
+    return StreamingResponse(events(), media_type="text/event-stream")
+```
+
 ### Explicit order with the constructor list
 A pure ASGI request-ID layer sits outermost, CORS wraps everything else, and a timing layer uses
 `try/finally` so exceptions are timed too. The 401 raised in the endpoint is turned into a response by
@@ -213,26 +272,30 @@ expecting the request ID to exist before auth runs.
 
 - **Auth runs before the ID exists.** Its "rejected key" log lines have no request ID, and its 401
   never passes back through RequestID, so the response carries no `x-request-id` either.
-- **GZip wraps everything, token streams included**, where compression buffering can delay chunks.
+- **GZip wraps everything, token streams included**, where compression buffering can delay chunks: the
+  agent UI shows nothing until several steps have finished.
 - **Fix:** use the list form in the intended order (RequestID, then Auth, then GZip), and keep
   compression off streaming routes.
 
 ## Production patterns
+- **Run context outermost, propagated by contextvar.** Use on every agent service: a pure ASGI layer sets
+  the run or trace ID first, and tool wrappers, LLM client hooks and loggers read it. Monitor the share of
+  log lines and spans without a run ID; it should be zero for agent routes.
 - **Declare the stack in one list.** Use for every service: pass `FastAPI(middleware=[...])` in
   outermost-first order so reviewers read execution order directly. There is nothing to monitor at runtime;
   enforce in code review that `add_middleware` is not mixed in elsewhere.
 - **Pin order with contract tests.** Use whenever CORS, auth or timing middleware exist: one test sends a
   bad key with an `Origin` header and asserts `access-control-allow-origin`, another raises in an
   endpoint and asserts the timing log line. Run them in CI on every Starlette upgrade.
-- **Catch crashes inside CORS.** Use when the browser must read error bodies: add a small pure ASGI layer
-  just inside `CORSMiddleware` that catches exceptions, logs them and sends its own 500. Monitor the rate
-  of those 500s, since they no longer surface as server tracebacks unless you log them.
-- **Pure ASGI for streaming and tracing layers.** Use on token-streaming routes and wherever contextvars
-  carry trace IDs: implement `__call__(scope, receive, send)` and wrap `send` instead of
-  `BaseHTTPMiddleware`. Monitor time to first token through the full stack versus at the endpoint.
-- **Route-specific concerns as dependencies.** Use when only some routes need auth or quotas: attach
-  `dependencies=[Depends(...)]` on the router, where `HTTPException` works and the scheme shows in
-  OpenAPI. Keep middleware for things that must see raw ASGI events.
+- **Catch crashes inside CORS.** Use when the browser chat UI must read error bodies: add a small pure
+  ASGI layer just inside `CORSMiddleware` that catches exceptions, logs them and sends its own 500. Monitor
+  the rate of those 500s, since they no longer surface as server tracebacks unless you log them.
+- **Pure ASGI for streaming and tracing layers.** Use on token-streaming and agent-step routes and
+  wherever contextvars carry trace IDs: implement `__call__(scope, receive, send)` and wrap `send` instead
+  of `BaseHTTPMiddleware`. Monitor time to first token through the full stack versus at the endpoint.
+- **Route-specific concerns as dependencies.** Use when only some routes need auth, quotas or a per-user
+  token budget: attach `dependencies=[Depends(...)]` on the router, where `HTTPException` works and the
+  scheme shows in OpenAPI. Keep middleware for things that must see raw ASGI events.
 
 ## Trade-offs
 - **Outer placement vs measuring handler time.** Outer layers see every request including ones later
@@ -269,10 +332,10 @@ expecting the request ID to exist before auth runs.
   "added first" produces IDs that the auth middleware's log lines never contain.
 
 ## When to use
-- **Use middleware** for concerns that must touch every request at the ASGI level: request IDs, CORS,
-  compression, body limits, tracing, global timing.
+- **Use middleware** for concerns that must touch every request at the ASGI level: request IDs, run
+  context, CORS, compression, body limits, tracing, global timing.
 - **Use dependencies instead** when the concern is per-route, needs typed parameters, or should appear in
-  OpenAPI (auth schemes).
+  OpenAPI (auth schemes, per-user agent quotas).
 - **Decide order** by listing the request path from the edge inwards and asking, per layer, "what must
   already exist when this runs, and who must see its output on the way back?"
 - **Measure:** verify empirically with a test that triggers a 401 and asserts the CORS header, and a test
@@ -313,6 +376,14 @@ in a layer inside CORS if the browser must read crash responses.
 - **Exceptions propagate outward**, so whether a layer observes a failure depends on where it sits
   relative to `ExceptionMiddleware` and `ServerErrorMiddleware`.
 
+### Your agent traces show LLM calls and tool calls that cannot be linked to a run. Where do you look?
+- **Order first.** The layer that creates the run or trace ID must be outermost, before auth, limits and
+  any logging layer, or early spans and rejected runs have no ID.
+- **Then propagation.** A `BaseHTTPMiddleware` runs downstream code in a separate task, so contextvars
+  set on one side are not visible on the other; set the ID in a pure ASGI layer that awaits the app in
+  the same task.
+- **Verify:** count spans and log lines without a run ID per route; for agent routes it should be zero.
+
 ### Your front end cannot read the body of 500 responses, but 401s work fine. What is going on?
 - **The 500 is produced outside CORS.** `ServerErrorMiddleware` is always outermost, so its response never
   passes back through `CORSMiddleware`, and the browser reports a CORS failure.
@@ -329,7 +400,7 @@ in a layer inside CORS if the browser must read crash responses.
 - **Keep middleware** for things that must see raw ASGI events: body bytes, response chunks, every
   request including 404s.
 
-### Why can `BaseHTTPMiddleware` hurt a token-streaming endpoint, and what do you use instead?
+### Why can `BaseHTTPMiddleware` hurt a token-streaming agent endpoint, and what do you use instead?
 - **It runs the downstream app in a separate task** and exposes the response as a streaming body, which
   adds per-request overhead and hides context variables set downstream from the middleware.
 - **It has a history of interfering with streaming and background tasks.**

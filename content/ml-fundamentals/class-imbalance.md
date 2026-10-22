@@ -5,7 +5,8 @@ name: Class imbalance
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/confusion-matrix
   - ml-fundamentals/precision-recall-f1
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-With a rare class, accuracy, an unweighted loss and a 0.5 threshold quietly optimise for "say the common
-class". It is less a data problem than a cost problem: fix evaluation, then the threshold, and only then
-weights, resampling or focal loss, which distort probabilities.
+The events an agent must catch are rare: injections in tool results, failed runs, unsafe actions, escalations.
+Accuracy and a 0.5 threshold then reward "say the common class". Fix evaluation and the threshold first;
+weights and resampling distort probabilities.
+
+## For agent builders
+- **Why it matters for agents.** Guardrails, LLM judges, router classes for rare tools and "should I hand
+  off to a human" checks all score a class that is 0.1% to 5% of traffic. A guardrail can be "99% accurate"
+  and block nothing, or catch everything and drown users in false blocks.
+- **Where it shows up in your stack.** Prompt-injection and moderation classifiers on user input and tool
+  outputs, judge pass/fail rates in your eval harness, few-shot demonstrations in classifier prompts, and
+  feedback triage on thumbs-down traces.
+- **What you control.** The threshold (from a false-block budget), how many real positives your eval set
+  holds, how balanced your few-shot examples are, and whether a cheap filter feeds a precise LLM check.
+- **What you can skip.** SMOTE and focal-loss details unless you train classifiers yourself; with hosted
+  models your levers are thresholds, demonstrations and cascades.
 
 ## Why it exists
 - **Rare positives are the valuable case.** Fraud, abuse, prompt injection, hallucinated answers, churn,
@@ -134,7 +147,11 @@ precision_at_prod = TPR * pi / (TPR * pi + FPR * (1 - pi))
 | TPR 0.95, FPR 0.001 | injections 0.1% of traffic | about 0.49 |
 | TPR 0.95, FPR 0.01 | injections 0.1% of traffic | about 0.09 |
 
-### Imbalance in LLM systems
+### Imbalance in LLM and agent systems
+- **Guardrails run on every step, not every conversation.** An agent that makes 10 tool calls per task runs
+  its injection check 10 times, so a per-check FPR of 0.01 becomes roughly one false block in ten tasks.
+- **Rare tools in a router.** If one tool is called in 2% of tasks, the router's overall accuracy hides that
+  it almost never picks it; report per-tool recall.
 - **Few-shot majority-label bias.** If nine of ten demonstrations are "benign", the model leans benign
   regardless of input; balance the demonstrations or calibrate the outputs.
 - **Judges.** On a set where 3% of outputs are failures, a judge can "agree with humans 97%" by passing
@@ -143,7 +160,8 @@ precision_at_prod = TPR * pi / (TPR * pi + FPR * (1 - pi))
   headline should be recall on bad outputs at a fixed review budget.
 
 ## Diagram
-Work down the levers in order of cost; stop at the first one that meets the operating constraint.
+Work down the levers in order of cost; stop at the first one that meets the operating constraint, such as
+an agent guardrail's false-block budget.
 
 ```mermaid
 flowchart TD
@@ -242,6 +260,30 @@ for p in (0.5, 0.9):                             # balanced weights act like a 5
 The prior correction is exact only for a well-specified model; for anything else, recalibrate on a sample at
 production prevalence and compare.
 
+### Agent scenario: an injection guardrail on tool results
+A browsing agent makes about 10 tool calls per task, and each tool result passes through an injection
+detector. Injections are 0.1% of tool results (illustrative numbers, 100,000 tasks a day, so 1,000,000 checks).
+
+```python
+checks, prevalence = 1_000_000, 0.001
+for tpr, fpr in ((0.95, 0.01), (0.95, 0.001)):
+    caught = tpr * checks * prevalence
+    false_blocks = fpr * checks * (1 - prevalence)
+    print(f"FPR {fpr}: caught {caught:.0f}, false blocks {false_blocks:.0f}, "
+          f"precision {caught / (caught + false_blocks):.2f}")
+# FPR 0.01: caught 950, false blocks 9990, precision 0.09
+# FPR 0.001: caught 950, false blocks 999, precision 0.49
+```
+
+| Design | False blocks per day | Tasks disrupted | Missed injections |
+|---|---|---|---|
+| One detector, FPR 0.01 | ~9,990 | up to ~10% of tasks | ~50 |
+| One detector, FPR 0.001 | ~999 | ~1% of tasks | ~50 |
+| Cascade: FPR 0.01 filter, then an LLM check on ~10,940 flagged results | depends on stage two | far fewer | stage-one misses plus stage-two misses |
+
+- **The per-step multiplier is the agent-specific twist:** a guardrail acceptable for one chat message
+  disrupts many multi-step tasks.
+
 ## Production patterns
 - **Threshold from a cost model or alert budget.** Pick τ on validation with `precision_recall_curve`
   against a written constraint (recall floor, or N alerts per day), version τ with the model, and never
@@ -257,6 +299,9 @@ production prevalence and compare.
   observed positive rate per day.
 - **Cascade for very rare positives.** A cheap high-recall classifier routes a small enriched slice to an LLM
   judge or human review. Monitor stage-one recall on a labelled audit sample and stage-two queue volume.
+- **Budget guardrail false blocks per task, not per call.** Agent teams multiply the per-check FPR by
+  tool calls per task when setting thresholds, and log every block with the trace id so reviewers can
+  label it. Monitor blocked-task rate and the reviewed false-block share per guardrail.
 
 ## Trade-offs
 - **Free threshold moving vs a ceiling.** It costs nothing and keeps probabilities honest, but cannot help a
@@ -286,6 +331,9 @@ production prevalence and compare.
   every downstream threshold breaks. Fix: recalibrate or prior-correct first.
 - **Measuring precision on the enriched evaluation set.** Symptom: 0.8 offline and 0.1 in production with no
   change in the model. Fix: convert through TPR, FPR and the production prior.
+- **Setting a guardrail threshold from single-message tests.** Symptom: the guardrail looked quiet in the
+  chat demo but long agent tasks fail with spurious blocks. Fix: measure false blocks per task at the real
+  number of checks per task.
 - **Few-shot prompts whose demonstrations are all one class.** Symptom: predictions skew to that class
   whatever the input says.
 - **Validating on LLM-generated minority examples.** Symptom: excellent numbers on synthetic positives and no
@@ -300,6 +348,7 @@ production prevalence and compare.
   enormous and redundant.
 - **Use anomaly detection or a cascade** when positives are below one in a thousand.
 - **Always recalibrate** before anyone consumes the probabilities, whatever you did to the training distribution.
+- **In agents:** apply this to every guardrail, judge and rare-tool route, and size thresholds per task.
 - **Interviews:** why accuracy fails, the cost-optimal threshold formula, how resampling causes leakage, and
   how enriched-set precision converts to production precision.
 
@@ -357,6 +406,13 @@ review a sample so drift in either class is noticed.
   ±0.11; 400 give about ±0.04.
 - **So size by positives, not rows,** and enrich the evaluation set, then convert precision back to
   production prevalence.
+
+### Your LLM judge passes 97% of agent runs and "agrees with humans 97% of the time". Is it a good judge?
+- **Not necessarily:** if 3% of runs are failures, a judge that passes everything scores the same agreement.
+- **Measure the rare class:** recall and precision on human-labelled failures, from a set enriched with real
+  failed runs so recall is estimated tightly.
+- **Then fix it:** balance the judge's few-shot examples, tighten the rubric for failure modes, and re-check
+  failure recall before using it as a release gate.
 
 ## Quiz
 ### Q: Missing a fraud costs about fifty times as much as a false alarm. With calibrated probabilities, which decision threshold minimises expected cost?

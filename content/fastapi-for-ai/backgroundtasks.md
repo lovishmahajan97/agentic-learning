@@ -5,7 +5,8 @@ name: BackgroundTasks
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/job-queues-and-durable-workers
   - fastapi-for-ai/dependency-injection
@@ -20,9 +21,20 @@ sources:
 ---
 
 ## TL;DR
-`BackgroundTasks` runs functions after the response is sent, in the same process, with no persistence,
-retry or status. Use it for cheap, loss-tolerant follow-ups (traces, counters, webhooks); anything that
-must happen or takes seconds needs a durable queue.
+`BackgroundTasks` runs functions after your agent's response is sent, in the same process, with no
+persistence, retry or status. Use it for cheap, loss-tolerant follow-ups (traces, eval samples,
+counters); agent runs, memory extraction and anything that must happen need a durable queue.
+
+## For agent builders
+- **Why it matters for agents.** Every agent turn leaves follow-up work: write the trace with its tool
+  calls, bump token usage, sample the run for evals, maybe extract long-term memory. Doing it inline adds
+  latency to every turn; doing it in `BackgroundTasks` is free until the process dies.
+- **Where it shows up in your stack.** A `BackgroundTasks` parameter on your FastAPI agent route, and the
+  tempting misuse: "run the agent in the background and return a run id", which loses runs on every deploy.
+- **What you control.** Which follow-ups are loss-tolerant, giving each task its own DB session and
+  exception handling, and keeping task duration well inside the shutdown grace period.
+- **What you can skip.** Starlette internals beyond "runs after the body, sequentially, in this process".
+  Remember the decision test: if losing it on a crash is not acceptable, use a queue.
 
 ## Why it exists
 - **Every LLM request drags follow-up work.** Persist prompt, response and token usage for observability
@@ -99,17 +111,28 @@ background work in flight ≈ request rate × task duration
 
 That is on top of the requests themselves; if those tasks are sync, that alone exceeds the 40-thread pool.
 
+### Agent follow-ups: which fit
+| Follow-up after an agent turn | Fits `BackgroundTasks`? | Why |
+|---|---|---|
+| Trace with steps, tool calls and token usage | yes | short, and a missing trace is tolerable |
+| Eval sample (copy a fraction of runs to an eval table) | yes | short; sampling already tolerates gaps |
+| Long-term memory extraction (another model call) | usually no | seconds long and the user expects the memory to exist next session |
+| The agent run itself | no | minutes long, must survive deploys, needs status |
+
+- **Memory writes are the grey zone.** A cheap insert of the raw turn fits; an LLM call that summarises
+  the turn into memories belongs on a queue, because it is long and losing it changes future behaviour.
+
 ## Diagram
 The decision path for a follow-up: only short, loss-tolerant work reaches `BackgroundTasks`, and there
 the function type decides whether it runs on the loop or in the thread pool.
 
 ```mermaid
 flowchart TD
-    W["Follow-up work after the answer"] --> Q1{"Is losing it on a crash acceptable?"}
-    Q1 -->|"no: billing, audit, LLM job"| Q2{"Must it commit with the request?"}
+    W["Follow-up after the agent answers"] --> Q1{"Is losing it on a crash acceptable?"}
+    Q1 -->|"no: billing, memory, agent run"| Q2{"Must it commit with the request?"}
     Q2 -->|"yes"| TX["Write inline in the same transaction"]
     Q2 -->|"no"| OB["Outbox row plus durable worker"]
-    Q1 -->|"yes: trace, counter, cache warm"| Q3{"Finishes well inside the shutdown grace period?"}
+    Q1 -->|"yes: trace, eval sample, counter"| Q3{"Finishes well inside the shutdown grace period?"}
     Q3 -->|"no"| OB
     Q3 -->|"yes"| BT["background_tasks.add_task"]
     BT --> R["Runs after body is sent, in insertion order"]
@@ -118,11 +141,12 @@ flowchart TD
 ```
 
 ## Examples
-### LLM endpoint that records a trace after answering
-The task opens its own session, guards its own exceptions, and would be harmless if run twice.
+### Agent endpoint that records its trace after answering
+The task opens its own session, guards its own exceptions, and would be harmless if run twice (the run
+id is the primary key). A random 5% of runs are also copied to the eval sample table.
 
 ```python
-import logging, time
+import logging, random, time, uuid
 from fastapi import BackgroundTasks, FastAPI
 from pydantic import BaseModel
 
@@ -131,27 +155,32 @@ app, log = FastAPI(), logging.getLogger("trace")
 class Ask(BaseModel):
     prompt: str
 
-async def call_model(prompt: str) -> tuple[str, int]:
-    return f"echo: {prompt}", 7                      # stand-in: (answer, output_tokens)
+async def run_agent(prompt: str) -> tuple[str, list[dict], int]:
+    # stand-in: (answer, tool calls made, output_tokens)
+    return f"echo: {prompt}", [{"tool": "search", "ms": 120}], 7
 
-async def record_trace(user_id: str, prompt: str, answer: str, tokens: int, ms: float):
+async def record_trace(run_id: str, user_id: str, prompt: str, answer: str,
+                       steps: list[dict], tokens: int, ms: float, sample: bool):
     try:
         async with session_factory() as session:     # its OWN session; never the request's
-            session.add(Trace(user_id=user_id, prompt=prompt, answer=answer,
-                              output_tokens=tokens, latency_ms=ms))
-            await session.commit()
+            await session.merge(Trace(id=run_id, user_id=user_id, prompt=prompt, answer=answer,
+                                      tool_calls=steps, output_tokens=tokens, latency_ms=ms))
+            if sample:
+                await session.merge(EvalSample(run_id=run_id, prompt=prompt, answer=answer))
+            await session.commit()                   # merge on run_id: a rerun overwrites, never duplicates
     except Exception:
         log.exception("trace write failed")          # client already has its answer: log, don't raise
 
-@app.post("/answer")
+@app.post("/agent/run")
 async def answer(body: Ask, bg: BackgroundTasks):
-    t0 = time.perf_counter()
-    text, tokens = await call_model(body.prompt)
+    t0, run_id = time.perf_counter(), str(uuid.uuid4())
+    text, steps, tokens = await run_agent(body.prompt)
     ms = (time.perf_counter() - t0) * 1000
-    bg.add_task(record_trace, "user-123", body.prompt, text, tokens, ms)   # runs after the body is sent
-    return {"answer": text}
+    bg.add_task(record_trace, run_id, "user-123", body.prompt, text, steps, tokens, ms,
+                random.random() < 0.05)              # runs after the body is sent
+    return {"run_id": run_id, "answer": text}
 
-# session_factory and Trace come from your SQLAlchemy setup (see the async database lesson).
+# session_factory, Trace and EvalSample come from your SQLAlchemy setup (see the async database lesson).
 ```
 
 ### If you must use `create_task`: keep a strong reference
@@ -191,18 +220,24 @@ asyncio.run(main())
 
 Still not durable: a SIGKILL loses these exactly as it loses `BackgroundTasks`.
 
-### Worked scenario: which follow-ups survive a deploy?
+### Worked scenario: which agent follow-ups survive a deploy?
 Illustrative: 30 s Kubernetes grace period, uvicorn draining in-flight requests on SIGTERM.
 
 | Follow-up | Duration | Loss acceptable? | Verdict |
 |---|---|---|---|
 | Trace write | ~250 ms | yes, a missing trace is tolerable | `BackgroundTasks` |
+| Eval sample copy | a few ms more in the same task | yes, it is a sample | `BackgroundTasks` |
 | Usage counter bump | ~5 ms | yes, if reconciled from traces | `BackgroundTasks` |
+| Memory extraction model call | seconds | no, next session depends on it | durable job queue |
 | Webhook to customer | ~300 ms, can hang | no, customer expects it | outbox row + worker |
 | Summarisation model call | ~40 s | no, user waits for it | durable job queue |
 | Billing ledger entry | ~5 ms | never | same transaction as the request |
 
 ## Production patterns
+- **Trace and sample agent runs after the response.** Agent teams write the run trace (steps, tool calls,
+  tokens, latency) keyed by run id in a background task, and copy a small random fraction to an eval
+  table for offline grading. Monitor trace coverage: runs answered versus traces stored, which exposes
+  silent task failures.
 - **Own resources inside the task.** For any task touching a database or HTTP client, open it inside the
   task (`async with session_factory() as session`) or use an app-scoped client from lifespan, never a
   `yield` dependency's object. Monitor "session is closed" and pool-checkout errors after upgrades.
@@ -232,6 +267,9 @@ Illustrative: 30 s Kubernetes grace period, uvicorn draining in-flight requests 
   hides failures unless you add logging and metrics yourself.
 
 ## Pitfalls
+- **Extracting long-term memory with a model call in a background task.** Symptom: the agent sometimes
+  "forgets" what a user told it, always around deploys or crashes. Fix: enqueue memory extraction as a
+  durable job keyed by run id.
 - **Running the LLM job itself in the background and returning a job id.** Symptom: jobs vanish after
   every deploy and the status endpoint has nothing to read, because nothing persisted the job.
 - **Passing the request's yield-dependency session into a task.** Symptom: "session is closed" or
@@ -246,10 +284,10 @@ Illustrative: 30 s Kubernetes grace period, uvicorn draining in-flight requests 
   no error, because nothing held a strong reference to them.
 
 ## When to use
-- **Use when** follow-ups are short, idempotent and loss-tolerant: trace and metric writes, cache warming,
-  non-critical notifications, cleanup of temporary files.
-- **Avoid when** it is the LLM call, anything a customer will later ask about, retries, or work longer
-  than a few seconds.
+- **Use when** follow-ups are short, idempotent and loss-tolerant: agent trace and metric writes, eval
+  sampling, cache warming, non-critical notifications, cleanup of temporary files.
+- **Avoid when** it is the LLM call or agent run itself, memory extraction, anything a customer will
+  later ask about, retries, or work longer than a few seconds.
 - **Decision test:** "if this process dies now, is losing this acceptable?"
 - **Measure** task duration, failure rate from your own logging, and thread-pool saturation.
 - **Interviews:** articulate after-response versus durable: when it runs, where it runs, and what happens
@@ -304,6 +342,20 @@ double-charge. Keep `BackgroundTasks` for the non-financial trace and metrics wr
   an outbox row.
 - **When the task needs the request's database session.** Yield-dependency teardown timing has changed
   across FastAPI versions (0.106 changed the default), so create resources inside the task instead.
+
+### After each agent turn you want a trace, an eval sample and new long-term memories. Where does each run?
+- **Trace and eval sample: `BackgroundTasks`.** Both are short inserts keyed by run id, and a rare loss
+  only dents observability, so after-response in-process work is right.
+- **Memory extraction: a durable queue.** It is another model call lasting seconds, and losing it changes
+  what the agent knows next session, so enqueue a job with the run id as idempotency key.
+- **Measure** trace coverage against answered runs to catch silent background failures.
+
+### Your agent's trace coverage dropped from nearly all runs to 97% after a release. How do you investigate?
+- **Look for task exceptions first.** Background failures only show up in logs, so check the per-task
+  failure counter and "trace write failed" lines around the release.
+- **Then check shutdown and sessions.** Traces lost in bursts at deploy times mean tasks were cut off at
+  SIGKILL; "session is closed" errors mean a request-scoped session leaked into the task.
+- **Fix the cause,** and promote traces to an outbox if the business now treats them as must-have.
 
 ## Quiz
 ### Q: When exactly does a function added with BackgroundTasks start running?

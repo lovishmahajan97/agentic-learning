@@ -5,7 +5,8 @@ name: Integration tests with real dependencies
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/testclient-plus-pytest-asyncio
   - python-for-ai/integration-and-end-to-end-testing
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Integration tests run the app against real Postgres, pgvector and Redis in disposable containers, each
-test isolated by rollback or cleanup, because fakes cannot prove your SQL, migrations or TTLs work. The
-LLM is the exception: use recordings or a separate contract suite.
+An agent's retrieval, memory and caching run on real Postgres, pgvector and Redis, so test them against
+disposable containers with per-test rollback or cleanup, because fakes cannot prove your SQL, vector
+dimensions or TTLs. The LLM is the exception: use recordings.
+
+## For agent builders
+- **Why it matters for agents.** The agent's tools are mostly queries: vector search for RAG, rows for
+  conversation memory, Redis for caches, locks and rate limits. A fake vector store returns whatever you
+  told it, so it never catches a wrong distance operator, a missing tenant filter or a dimension mismatch
+  after an embedding-model change.
+- **Where it shows up in your stack.** Testcontainers or CI service containers in `conftest.py`, a
+  pgvector Postgres image, Alembic migrations, a Redis container, and recorded provider responses for the
+  model calls between tool steps.
+- **What you control.** Image tags (match production), the isolation strategy per test, which tools get
+  real-dependency tests, and how often the live-model contract suite runs.
+- **What you can skip.** Container orchestration details. Know session-scoped containers, readiness,
+  migrations-not-`create_all`, and the rollback-vs-truncate rule.
 
 ## Why it exists
 - **AI services lean on infrastructure with real semantics.** Postgres with JSONB queries and row locks,
@@ -67,7 +81,7 @@ LLM is the exception: use recordings or a separate contract suite.
 ### Bring the schema up the real way
 - **Run your migrations** (for example `alembic upgrade head`) against the fresh database rather than
   `metadata.create_all()`, *because* the migration chain is what production runs, and a suite that never
-  applies it will not notice a broken or missing migration.
+  applies it will not notice a broken or missing migration, such as the one adding the vector index.
 
 ### Isolate each test
 Every test must start from a known state. Options, in order of speed:
@@ -77,7 +91,7 @@ Every test must start from a known state. Options, in order of speed:
      `join_transaction_mode="create_savepoint"` turns those commits into savepoint releases so the outer
      rollback still wins.
    - It does not work for code that commits on separate connections or relies on committed data being
-     visible to other connections.
+     visible to other connections, such as a background worker that embeds uploaded documents.
 2. **Truncate after each test.** Slower, but works when the app commits or uses several connections.
 3. **Per-test database or schema.** Strongest isolation; use when tests run in parallel workers.
 - **For Redis,** use a dedicated logical database or a per-test key prefix and `FLUSHDB` between tests.
@@ -94,6 +108,8 @@ Every test must start from a known state. Options, in order of speed:
 - **Record and replay:** record real responses once and replay them (cassette-style recording at the
   httpx layer), or run a self-hosted small model in a container when you need a live endpoint.
 - **A small, separately scheduled contract suite** hits the real provider to catch API and schema drift.
+- **Agent quality is a third suite.** Whether the model picks the right tool is an eval question, run on
+  a dataset with scoring, not an integration test with a pass or fail assertion.
 
 ## Diagram
 Expensive work happens once per session (pgvector Postgres and Redis containers at production tags,
@@ -108,7 +124,7 @@ flowchart TD
     R -->|"ready"| M["alembic upgrade head"]
     M --> B["Per test: connect and begin outer transaction"]
     B --> O["Override get_session and settings"]
-    O --> T["Drive the app with TestClient or ASGITransport"]
+    O --> T["Drive the agent app or its tools"]
     T --> RB["Rollback outer transaction and FLUSHDB"]
     RB -->|"next test"| B
     RB -->|"session ends"| D["Stop containers, reaper cleans up aborted runs"]
@@ -176,9 +192,38 @@ Trace it:
 - **Async apps:** use the same structure with `AsyncEngine`, `AsyncConnection` and `AsyncSession`, driven
   through `ASGITransport` so the app and the fixtures share one event loop.
 
+### The agent's retrieval tool against real pgvector
+Reuses the `session` fixture above. The test seeds chunks for two tenants and asserts the RAG tool returns
+the nearest chunk for the caller's tenant only. `search_chunks` stands for the tool function the agent
+calls; the table columns are this app's own.
+
+```python
+from sqlalchemy import text
+from app.tools import search_chunks          # the agent's retrieval tool (code under test)
+
+def vec(hot: int, dim: int = 1024) -> str:   # one-hot test vector in pgvector text form
+    v = [0.0] * dim; v[hot] = 1.0
+    return "[" + ",".join(map(str, v)) + "]"
+
+def test_search_is_nearest_and_tenant_scoped(session):
+    rows = [("t1", "refunds take 5 days", 0), ("t1", "shipping is free", 1),
+            ("t2", "t2 secret refund rule", 0)]
+    for tenant, body, hot in rows:
+        session.execute(text("INSERT INTO chunks (tenant_id, body, embedding) "
+                             "VALUES (:t, :b, CAST(:e AS vector))"),
+                        {"t": tenant, "b": body, "e": vec(hot)})
+    hits = search_chunks(session, tenant="t1", query_vec=vec(0), k=2)
+    assert hits[0]["body"] == "refunds take 5 days"            # real distance operator ordering
+    assert all("t2" not in h["body"] for h in hits)            # no cross-tenant leak into the agent
+```
+
+- **What a fake would miss:** the wrong distance operator, a forgotten `tenant_id` filter, or a cast that
+  only fails on a real `vector` column.
+
 ### Redis container: real TTL and `SET NX` semantics
 A Redis container fixture has the same shape: point the app at it by overriding settings, and flush its
-database between tests. These tests catch the "TTL set on the wrong call" bug and a broken lock.
+database between tests. These tests catch the "TTL set on the wrong call" bug and a broken lock, both of
+which an agent's tool cache depends on.
 
 ```python
 import pytest, redis
@@ -213,7 +258,7 @@ def test_lock_is_exclusive(r):
 |---|---|---|---|
 | One session, commits on it | Yes (savepoints) | Yes | Yes |
 | Commits on separate connections | No | Yes | Yes |
-| A worker reads rows the endpoint wrote | No | Yes | Yes |
+| A worker reads rows the endpoint wrote (async ingestion for RAG) | No | Yes | Yes |
 | Parallel `pytest-xdist` workers on one database | Mostly, but same-key inserts can block across workers | No: a truncate wipes other workers' data | Yes |
 
 - **Why rollback mostly survives parallelism:** each test's rows stay uncommitted and invisible to other
@@ -230,6 +275,9 @@ def test_lock_is_exclusive(r):
 - **Schema assertions as tests.** For invariants a fake can never check (vector dimension, required
   indexes, extensions installed), query the catalog as in the `atttypmod` test above. Monitor these
   failing on migration pull requests, which is exactly where you want them to fail.
+- **Real-dependency tests per agent tool.** Give every tool that touches a database or cache (retrieval,
+  memory read and write, ticket lookup) at least one test against the containers, including tenant
+  scoping. Monitor which tools have none; those are where cross-tenant leaks hide.
 - **Recorded provider responses with a scheduled live suite.** Replay recorded httpx responses in the main
   suite, and run a small live contract suite on a schedule against the real provider. Monitor the live
   suite's failures as early warning of API and schema drift.
@@ -255,6 +303,9 @@ def test_lock_is_exclusive(r):
   production image tag.
 - **Creating tables with `create_all()` instead of running migrations.** A missing or broken migration
   ships, and the symptom is the first deploy failing on `alembic upgrade`.
+- **Testing retrieval only with a fake vector store.** Symptom: the agent cites another tenant's document
+  or irrelevant chunks in production while every test passes. Fix: a pgvector container test per
+  retrieval tool, with two tenants seeded.
 - **No per-test isolation.** Tests pass alone and fail together, or depend on execution order. Fix: pick
   rollback, truncation or a per-test database from the table above.
 - **A different image or major version from production,** such as the latest Postgres image. Symptom: a
@@ -264,8 +315,8 @@ def test_lock_is_exclusive(r):
 
 ## When to use
 - **Use for** every code path whose correctness depends on the semantics of a real dependency: SQL and
-  migrations, vector search queries, Redis-based caching, locks and rate limits, upload storage and queue
-  handoffs.
+  migrations, vector search queries behind RAG tools, agent memory tables, Redis-based caching, locks and
+  rate limits, upload storage and queue handoffs.
 - **Keep them** fewer than unit tests, run them on every pull request, and keep the live-LLM contract
   suite separate and scheduled.
 - **Measure** suite runtime, flake rate and which production incidents the suite would have caught.
@@ -299,6 +350,13 @@ rollback for the many tests that stay on one connection, because it is much fast
   cannot run in parallel.
 - **A disposable container** gives the real engine, private to the run, in a known state, gone afterward.
 
+### How would you test that your agent's RAG tool never returns another tenant's documents?
+- **Run it against real pgvector,** not a fake store, with migrations applied, because the bug lives in the
+  real query: a missing `tenant_id` filter or a join that drops it.
+- **Seed two tenants with near-identical chunks,** so the other tenant's chunk would win on distance if the
+  filter were missing, then assert every hit belongs to the caller.
+- **Make it a required check** on changes to retrieval code and migrations, alongside the dimension test.
+
 ### The first few integration tests fail with connection refused on CI but pass on laptops. How do you fix it?
 - **A running container is not a ready database.** On a cold CI runner Postgres is still starting when the
   first test connects; on a warm laptop it is already up.
@@ -314,20 +372,20 @@ rollback for the many tests that stay on one connection, because it is much fast
 - **Make it a required check on migration pull requests,** so the build fails where the model and
   migration disagree, not on the first deploy.
 
+### How do you keep the LLM provider in your agent's test strategy without making the suite slow and flaky?
+- **Keep real calls out of the main suite,** because they are slow, billed, rate-limited and not
+  deterministic; replay recorded responses at the httpx layer between real tool steps.
+- **Run a small live contract suite on a schedule** to catch provider API and schema drift, since recordings
+  go stale when the provider changes its format.
+- **Judge agent quality in evals,** a scored dataset run separately, because tool choice is a rate, not a
+  pass or fail assertion.
+
 ### How would you parallelise a slow integration suite with pytest-xdist?
 - **Each xdist worker is a separate process** with its own session fixtures, so session-scoped containers
   multiply unless you plan for it.
 - **Option one:** one container set per worker, simple but heavier on CI memory and startup time.
 - **Option two:** one shared container with a database per worker, named from the `worker_id` fixture;
   monitor runtime and cross-test flakes after the switch.
-
-### How do you keep the LLM provider in your test strategy without making the suite slow and flaky?
-- **Keep real calls out of the main suite,** because they are slow, billed, rate-limited and not
-  deterministic.
-- **Replay recorded responses** at the httpx layer, or run a self-hosted small model in a container when a
-  live endpoint is needed.
-- **Run a small live contract suite on a schedule** to catch provider API and schema drift, since recordings
-  go stale when the provider changes its format.
 
 ## Quiz
 ### Q: Why are database migrations, rather than `metadata.create_all()`, the better way to build the test schema?

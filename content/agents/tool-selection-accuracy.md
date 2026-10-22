@@ -5,7 +5,8 @@ name: Tool selection accuracy
 kind: metric
 difficulty: core
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/tool-calling
   - agents/tool-schemas-and-argument-validation
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Tool selection accuracy is the share of decision points where the model picks the right tool, or none,
-with correct arguments. It falls as tools multiply and overlap; instrument it first, because it isolates
-the decision made every step.
+Tool selection accuracy is the share of an agent's decision points where the model picks the right
+tool, or none, with correct arguments. It falls as tools multiply and overlap; instrument it first,
+because it isolates the decision made every step.
+
+## For agent builders
+- **Why it matters for agents.** Every step of the loop starts with this decision, and errors compound:
+  a wrong tool at step 2 sends the rest of the run down the wrong path. It is also the cheapest agent
+  metric to measure, one model call per case with no tools executed.
+- **Where it shows up in your stack.** An eval dataset run in CI, in LangSmith datasets and evaluators,
+  Braintrust, Langfuse or a plain pytest harness; trace attributes (tool name, schema-validation outcome)
+  for the label-free production signals; tool search or deferred loading once the catalogue grows.
+- **What you control.** Tool names, descriptions with trigger conditions, how many tools are in context,
+  enums on parameters, the system prompt's act-versus-answer guidance, and the labelled case set.
+- **What you can skip.** Elaborate statistics. The standard-error and paired-count checks in this lesson
+  are enough to tell a real change from noise.
 
 ## Why it exists
 - **"The agent feels dumb" decomposes into three failures:** it answered from memory when it should have
@@ -300,6 +313,13 @@ every message. In production, confirm by tracking the share of delivery-date ans
 - **Tool calls per turn:** a sudden drop suggests under-calling; a jump suggests over-calling.
 - **Schema-validation failure rate per tool,** which rises when arguments degrade.
 - **Use them as triggers** to run the full labelled eval, not as the eval itself.
+
+### How would you turn production traces into a selection eval?
+- **Sample decision points from traces,** for example exported from LangSmith or your tracing store,
+  snapshotting the conversation up to each tool decision as the case input.
+- **Label the expected tool (or `none`) and key arguments,** oversampling near-miss pairs and keeping
+  `none` cases near their real share.
+- **Version the set with the tool definitions** and run it on every description, catalogue or model change.
 
 ## Quiz
 ### Q: Which metric captures "the agent answered from memory when it should have looked it up"?

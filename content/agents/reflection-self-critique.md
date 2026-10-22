@@ -5,7 +5,8 @@ name: Reflection / self-critique
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-loop
   - agents/planning
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-Reflection is a generate–critique–revise loop. It pays off only when the critique brings new
-information (a failing test, a tool error, a verifier, a fresh rubric context); "look again" with no new
-signal can turn right answers wrong.
+Reflection is a generate–critique–revise loop inside your agent. It pays off only when the critique
+brings new information (a failing test, a tool error, a verifier, a fresh rubric context); "look again"
+with no new signal can turn right answers wrong.
+
+## For agent builders
+- **Why it matters for agents.** "Review before submit" is one of the most common steps added to coding,
+  research and writing agents, and one of the most commonly wasted. Whether it helps is decided by the
+  evidence the critic sees, so the design work is building the evaluator, not the critique prompt.
+- **Where it shows up in your stack.** The evaluator-optimizer workflow (generator and critic nodes with a
+  conditional edge back, as in LangGraph's reflection examples); output guardrails that validate a final
+  answer (OpenAI Agents SDK); test runners and schema validators as tools; LLM-as-judge evaluators in
+  LangSmith or similar for checking critic agreement offline.
+- **What you control.** The evaluator kind (code, tool-grounded, rubric critic or plain reconsideration),
+  whether the critic runs in a fresh context or another model, the structured issue schema, keep-best,
+  the iteration cap and whether lessons persist across episodes.
+- **What you can skip.** Benchmark tables from the Self-Refine, Reflexion and CRITIC papers; remember
+  which signal each feeds back and the gated cost formula.
 
 ## Why it exists
 - **One forward pass cannot step back.** It commits token by token. Fine for a short factual question.
@@ -218,6 +233,10 @@ The fix was not more iterations; it was giving the critic the source document an
 - **Scoped, expiring lesson memory.** Store cross-episode lessons keyed by task type with a creation date,
   retrieve only matching ones, and expire them. Monitor whether success on a task type improves after
   lessons start applying.
+- **Trace every attempt and critique.** Record each attempt, its evaluator score and the critic's issues
+  as child spans of the agent run (LangSmith or OpenTelemetry), then turn disputed critiques into a
+  labelled dataset for the critic. Monitor score per iteration; a flat or falling curve says remove the
+  loop.
 
 ## Trade-offs
 - **Higher success vs per-iteration cost.** Grounded reflection raises success rates on checkable tasks
@@ -306,6 +325,12 @@ support rate before and after rather than trusting that more iterations means be
   favour outputs resembling their own.
 - **Check its structured output drives decisions:** pass and fail rates, issue severity distribution, and
   whether revisions guided by it raise a ground-truth metric, not just the critic's own score.
+
+### Your research agent's always-on critic doubled cost per task. How do you decide whether to keep it?
+- **Measure what it changes:** on a labelled sample, compare final accuracy with and without the critic
+  and count how often its issues led to a revision that raised the ground-truth score.
+- **Gate it:** run a cheap deterministic check first (citations resolve, required sections present) and
+  call the critic only on failures or high-risk tasks, so cost follows (1 − p₁) instead of every task.
 
 ## Quiz
 ### Q: Which reflection setup is most likely to improve correctness on a reasoning or coding task?

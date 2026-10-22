@@ -5,7 +5,8 @@ name: Reranking (cross-encoder)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/hybrid-search
   - rag-retrieval/similarity-search
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-A cross-encoder scores query and passage together: far more accurate than a bi-encoder, far too slow
-for a corpus. So a cheap retriever pulls a few dozen candidates, the cross-encoder reorders them, and
-only the top few reach the prompt.
+A reranker decides which few chunks enter an agent's context. A cross-encoder scores query and passage
+together, far more accurately than a bi-encoder but too slowly for a corpus, so retrieval pulls a few
+dozen candidates and the reranker keeps the best.
+
+## For agent builders
+- **Why it matters for agents.** Every tool result stays in the transcript, so each extra chunk is paid
+  for on every later step. A reranker lets the search tool return 3 good chunks instead of 10 mixed ones,
+  cutting tokens, distractors and wrong tool decisions, and its score gives the agent an honest "nothing
+  relevant found".
+- **Where it shows up in your stack.** LangChain's `ContextualCompressionRetriever` with a cross-encoder
+  or Cohere reranker, LlamaIndex node postprocessors, sentence-transformers `CrossEncoder`, hosted rerank
+  APIs, and the step between retrieve and generate in a LangGraph RAG agent.
+- **What you control.** Candidate depth n, final k, the reranker model, the "no relevant context"
+  threshold, the latency budget and fallback, and deduplication.
+- **What you can skip.** Reranker training losses. Know that hard negatives are why rerankers fix what
+  retrievers miss, and that each pair is scored in isolation.
 
 ## Why it exists
 - **First-stage retrieval is built for recall at scale.** BM25, dense or hybrid, the architecture that
@@ -33,7 +47,8 @@ only the top few reach the prompt.
   interaction is one dot product at the end. "Does this passage answer this question" must be squeezed
   into a fixed-size vector computed without knowing the question.
 - **Fine distinctions blur.** Right product but wrong year, discusses the topic without answering, answers
-  a negated version of the question: exactly what a single vector loses.
+  a negated version of the question: exactly what a single vector loses, and exactly what makes an agent
+  act on the wrong policy.
 - **The accurate model is too slow for a corpus.** A cross-encoder runs attention across query and passage
   as one sequence, so it can check the year, notice negation and verify the answer is present. But every
   pair needs a full forward pass, with nothing precomputable, because the passage representation depends
@@ -66,29 +81,34 @@ only the top few reach the prompt.
 - **Worked cost:** a 20-token query and 400-token passages, 50 candidates = 50 passes over about 420 tokens
   each, 21,000 tokens of encoder compute per query.
 - **Latency (illustrative; measure yours):** with GPU batching, typically tens of milliseconds for a
-  small model and more for a large one.
+  small model and more for a large one. An agent pays it on every search.
 - **Scaling:** linear in n, and somewhat faster than linear in passage length, because attention in each
   pass is quadratic in the pair's length while the rest is linear.
 - **So decide chunk size and reranker together:** longer chunks cost more per candidate and risk
   truncation.
 
-### The pipeline
+### The pipeline inside an agent's search tool
 1. **Retrieve** the top-n from the first stage (hybrid or dense), with n chosen so recall@n is near its
    ceiling on your labeled set; 30 to 100 is typical.
 2. **Score** n pairs with the cross-encoder in one batch.
-3. **Sort** by reranker score and keep the top k (3 to 10) for the prompt.
+3. **Sort** by reranker score and keep the top k (3 to 10) for the tool result.
 4. **Optionally threshold** to drop candidates the reranker considers irrelevant, so the LLM sees fewer
-   distractors and a "no relevant context" path can trigger.
+   distractors and a "no relevant context" path can trigger; for an agent, that path tells it to
+   rephrase, try another tool, or ask the user.
 
 n is the lever: too small and the reranker cannot recover what retrieval missed (it only reorders); too
 large and latency and cost grow for no gain, because recall@n has plateaued.
+
+- **Query choice matters in agents.** Rerank against the agent's tool query, or against the user's
+  original question when the tool query is a terse keyword rewrite; evaluate both on traces.
 
 ### Why it improves answers, not just rankings
 - **The answer moves to position 1 or 2.** Models use information at the start (and end) of a long
   context more reliably than information buried in its middle.
 - **Near-misses are demoted.** Passages that share vocabulary but not the answer are precisely the ones
   that induce confident wrong answers.
-- **Smaller k after reranking** shortens prompts and cuts cost.
+- **Smaller k after reranking** shortens prompts and cuts cost, and in an agent the saving repeats on
+  every later step because tool results stay in the transcript.
 
 ### Length and truncation
 - **Hard limit:** 512 tokens for BERT-derived models, longer for newer ones.
@@ -106,6 +126,8 @@ large and latency and cost grow for no gain, because recall@n has plateaued.
 
 - Listwise LLM reranking usually runs as a sliding window from the bottom of the list to the top, because
   the full pool does not fit or degrades in one prompt.
+- **The agent itself is an LLM reranker** if you hand it 30 chunks; a dedicated reranker is usually far
+  cheaper per call than spending the agent model's context on that judgment.
 
 ### What a reranker does not see
 - **Each pair is scored in isolation;** it does not know what else is in the list.
@@ -122,9 +144,9 @@ large and latency and cost grow for no gain, because recall@n has plateaued.
 - **Calibrate on labeled data;** it is not a probability unless the training made it one.
 
 ## Diagram
-Follow the funnel: the cheap first stage narrows the corpus to n candidates, the cross-encoder scores
-each query–passage pair jointly in one batch, and only the top k (after dedup and an optional threshold)
-reach the prompt.
+Follow the funnel inside one agent search call: the cheap first stage narrows the corpus to n
+candidates, the cross-encoder scores each pair jointly in one batch, and only the top k (after dedup and
+an optional threshold) go back to the agent.
 
 ```mermaid
 flowchart TD
@@ -134,12 +156,56 @@ flowchart TD
     CE -->|"one batched call, one logit per pair"| S["Sort by reranker score"]
     S --> DD["Dedup: cap per source or MMR"]
     DD --> T{"Best score above calibrated threshold?"}
-    T -->|"yes"| K["Top k, 3 to 10, into the prompt"]
-    T -->|"no"| NF["No relevant context path"]
+    T -->|"yes"| K["Top k, 3 to 10, into agent context"]
+    T -->|"no"| NF["Tell agent: no relevant context"]
     CE -.->|"timeout"| FB["Fall back to first-stage order"]
 ```
 
 ## Examples
+### Worked scenario: what reranking saves an agent in context tokens
+A research agent searches 5 times per task. Chunks are 400 tokens, and every tool result stays in the
+transcript for the remaining steps.
+
+| Configuration | Chunks per search | Tokens added per search | Tool-result tokens after 5 searches |
+|---|---|---|---|
+| No reranker, k = 10 | 10 | 4,000 | 20,000 |
+| Reranker over n = 50, k = 3 | 3 | 1,200 | 6,000 |
+
+- **Compounding.** Each later LLM step re-reads all earlier results, so the 14,000-token difference is
+  paid again on every step after the last search (prefix caching cuts the price but not the distraction).
+- **Quality.** Fewer near-miss chunks means fewer confident wrong tool calls; check it on an agent eval
+  set, not only with NDCG.
+
+### Rerank inside the agent's search tool, with threshold and timeout fallback
+The tool reranks in one batched call under a hard time budget, falls back to first-stage order on
+timeout, and returns an explicit signal when nothing clears the calibrated threshold.
+
+```python
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as Timeout
+from sentence_transformers import CrossEncoder
+
+ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
+pool = ThreadPoolExecutor(max_workers=4)
+THRESHOLD = 0.0          # calibrated on labeled queries for THIS model version
+BUDGET_S = 0.15          # hard latency budget for the rerank step
+
+def search_tool(query, first_stage, n=50, k=3):
+    cands = first_stage(query, n)                       # [(chunk_id, text)], best first
+    fut = pool.submit(ce.predict, [(query, t) for _, t in cands], batch_size=64)
+    try:
+        scores = fut.result(timeout=BUDGET_S)
+    except Timeout:
+        return {"results": [c for c, _ in cands[:k]], "reranked": False}   # fallback
+    ranked = sorted(zip(cands, scores), key=lambda x: -x[1])
+    keep = [(c[0], float(s)) for c, s in ranked[:k] if s >= THRESHOLD]
+    if not keep:
+        return {"results": [], "note": "No relevant passages. Rephrase or try another source."}
+    return {"results": keep, "reranked": True}
+```
+
+- **Log `reranked` and the top score** in the trace; a rising fallback rate or a shifted score
+  distribution is the first sign of GPU trouble or a model change.
+
 ### Two-stage retrieval with public models
 A small bi-encoder retrieves five candidates by cosine; an MS MARCO cross-encoder rescores each pair
 jointly.
@@ -237,8 +303,9 @@ Read recall@n off your labeled set first; the right n is where that curve flatte
 runs out.
 
 ## Production patterns
-- **Pick n from the recall@n curve.** Plot recall@n for n = 10 to 200 on labeled queries and set n just
-  past the knee; keep it in configuration. Monitor recall@n and reranker p95 together each release.
+- **Pick n from the recall@n curve.** Plot recall@n for n = 10 to 200 on labeled queries (seeded from
+  real agent tool calls) and set n just past the knee; keep it in configuration. Monitor recall@n and
+  reranker p95 together each release.
 - **One batched call per query.** Send all pairs in a single `predict` call with an explicit `batch_size`,
   never a per-candidate loop. Monitor p95 latency against n; linear growth with n at small n means you
   are unbatched.
@@ -246,12 +313,14 @@ runs out.
   tokenizer at ingestion, and window long chunks as above. Monitor the share of candidates that would be
   truncated.
 - **Calibrate the "no relevant context" threshold.** Choose the cutoff on labeled queries for this model,
-  store it with the model version, and route below-threshold queries to a "not found" or clarification
-  path. Monitor the fire rate; a sudden change usually means a model or data change.
+  store it with the model version, and have the agent's tool return an explicit "nothing relevant"
+  result below it, so the agent rephrases, switches tools or asks the user. Monitor the fire rate; a
+  sudden change usually means a model or data change.
 - **Fall back on timeout.** Give the reranker a hard latency budget and return the first-stage order if it
-  is exceeded, so a slow GPU does not fail the request. Monitor fallback rate.
-- **Deduplicate after reranking.** Cap results per source document or apply MMR before filling the prompt.
-  Monitor duplicate-source rate in the final top k.
+  is exceeded, so a slow GPU does not fail the agent's step. Monitor fallback rate in traces.
+- **Deduplicate and keep k small.** Cap results per source document or apply MMR before returning to the
+  agent, and keep k at 3 to 5 unless evals show the agent needs more. Monitor duplicate-source rate and
+  tool-result tokens per task.
 
 ## Trade-offs
 - **Precision the first stage cannot reach,** at one transformer pass per candidate per query; it turns
@@ -264,6 +333,9 @@ runs out.
 - **Hosted rerank APIs remove the GPU and model maintenance,** but add a network hop, per-call cost and a
   data-egress question some customers cannot accept; self-hosting wins when volume is high or data is
   sensitive.
+- **Reranker vs letting the agent model judge.** A reranker adds a model and a latency step but saves
+  agent context on every later step; handing the agent 30 chunks is simpler but costs tokens and invites
+  distraction.
 
 ## Pitfalls
 - **Reranking the top 5 and expecting better recall.** Symptom: "the reranker did nothing", because the
@@ -273,19 +345,21 @@ runs out.
 - **A web-QA reranker in a domain with its own relevance** (legal, clinical, code). Symptom: confident
   reordering that human reviewers disagree with. Validate with NDCG on your labels and fine-tune if needed.
 - **Unbatched reranking on the critical path.** Symptom: p95 latency scales with n because candidates were
-  scored one at a time.
+  scored one at a time, multiplied by every search the agent makes.
 - **Raw-logit thresholds copied from another model or dataset.** Symptom: a "no relevant context" path
-  that fires on everything or never, since score scales differ between rerankers.
+  that fires on everything or never, since score scales differ between rerankers; the agent then either
+  gives up on every task or never admits it found nothing.
 - **No deduplication after reranking.** Symptom: five prompt slots hold three copies of the same
   boilerplate paragraph from different document versions, crowding out the passage that differed.
 
 ## When to use
 - **Add a reranker when** the relevant chunk is usually in the top 30 to 50 but not reliably in the top 5,
-  the common state of a tuned hybrid system; it is often the cheapest single improvement to answer quality.
+  the common state of a tuned hybrid system; it is often the cheapest single improvement to agent answer
+  quality and context size.
 - **Skip it when** first-stage precision is already high on your labels, the latency budget cannot absorb
   tens of milliseconds, or the corpus is tiny enough that the LLM can read everything.
 - **Measure:** NDCG@k or MRR before and after, recall@n at the chosen depth, added p95 latency and
-  per-query cost.
+  per-query cost, plus agent task success and tool-result tokens per task.
 - **Day to day:** the n and k configuration, the batching code and the length check.
 - **Interviews:** explain why a bi-encoder cannot do what a cross-encoder does, and why that makes two
   stages necessary.
@@ -321,6 +395,19 @@ those checks would I try a different or fine-tuned reranker.
 - **So two stages:** the bi-encoder (or BM25, or hybrid) for recall, the cross-encoder for precision over
   a few dozen candidates.
 
+### Your agent's context grows past budget on research tasks and its answers wander. How can reranking help?
+- **Shrink each tool result:** rerank 50 candidates and return the top 3 instead of 10, so a 5-search
+  task adds about 6,000 tokens of results rather than 20,000 at 400-token chunks.
+- **Cut distractors:** near-miss chunks that share vocabulary but not the answer are demoted, which reduces
+  confident wrong tool calls.
+- **Verify on agent evals:** compare task success and tool-result tokens per task, not only NDCG.
+
+### Should an agent's search tool return "nothing found" based on the reranker score?
+- **Yes, when calibrated:** a cutoff chosen on labeled queries for this reranker version lets the tool
+  return an explicit empty result, so the agent rephrases, tries another tool or asks the user.
+- **Guard it:** store the threshold with the model version, monitor the fire rate, and recalibrate on any
+  model change, because logit scales differ between rerankers.
+
 ### Long, relevant passages keep scoring low after reranking. What is going on?
 - **Silent truncation:** BERT-derived rerankers stop at 512 tokens, so a passage longer than the limit
   minus the query is scored only on its beginning.
@@ -330,7 +417,8 @@ those checks would I try a different or fine-tuned reranker.
 ### How do you budget reranker latency, and what is the cost of 50 candidates?
 - **Cost is per pair:** a 20-token query and 400-token passages give about 420 tokens per pass, so 50
   candidates are 21,000 encoder tokens per query, linear in n.
-- **Latency is illustrative until measured:** tens of milliseconds for a small model with GPU batching.
+- **Latency is illustrative until measured:** tens of milliseconds for a small model with GPU batching,
+  paid on every agent search.
 - **Protect the request:** one batched call, a hard timeout, and a fallback to first-stage order.
 
 ### When would you not add a reranker, or reach for an LLM reranker instead?
@@ -338,12 +426,6 @@ those checks would I try a different or fine-tuned reranker.
   milliseconds, or the corpus is small enough for the LLM to read everything.
 - **LLM rerankers** are strongest on nuanced relevance and instructions such as "prefer the newest policy",
   but they are slowest, most expensive and sensitive to candidate order.
-
-### Your top 5 after reranking holds three copies of the same boilerplate. Why, and what do you do?
-- **Each pair is scored in isolation,** so near-duplicate chunks get near-identical high scores and each
-  takes a slot.
-- **Fix after reranking:** cap results per source document or apply maximal marginal relevance, then
-  monitor the duplicate-source rate in the final top k.
 
 ## Quiz
 ### Q: Why is a cross-encoder more accurate than a bi-encoder at judging whether a passage answers a query?

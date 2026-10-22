@@ -5,7 +5,8 @@ name: Data labeling
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/data-curation
   - training-adaptation/supervised-fine-tuning
@@ -22,47 +23,63 @@ sources:
 ---
 
 ## TL;DR
-Data labeling turns raw inputs into targets (classes, spans, demonstrations, preferences) whose quality
-you can measure, chiefly by inter-annotator agreement. A fine-tuned model learns the labeling function,
-inconsistencies included, and a few thousand examples carry the whole signal.
+For agent teams, labeling means grading traces: right tool, right arguments, did the run succeed. Those labels become your eval set, your LLM-judge calibration and any fine-tuning
+data, so their agreement sets the ceiling on everything you measure.
+
+## For agent builders
+- **Why it matters for agents.** Agent quality is judged per step and per run, and nobody can grade that
+  automatically until humans have defined it. A golden set of labeled trajectories is what tells you
+  whether a prompt change, a new model or a fine-tune made the agent better.
+- **Where it shows up in your stack.** Annotation queues and datasets in tracing tools (LangSmith and
+  Langfuse both offer them), feedback buttons in your product, LLM-as-judge evaluators, and the JSONL
+  files you send to a fine-tuning job.
+- **What you control.** The rubric per step (tool choice, arguments, use of the result, final answer),
+  who labels, how much overlap you keep, and whether an LLM judge is trusted only after it agrees with
+  adjudicated human labels.
+- **What you can skip.** Krippendorff's alpha internals and confident-learning theory. Know Cohen's kappa,
+  the overlap-plus-gold loop, and that an LLM judge is just one more rater to measure.
 
 ## Why it exists
-- **Everything downstream needs targets.** Supervised fine-tuning, reward models, and the small
-  classifiers that route requests or enforce guardrails all learn to reproduce the mapping in the labeled
-  set, noise included. The model does not learn "the task".
+- **Everything downstream needs targets.** Supervised fine-tuning, reward models, the small classifiers
+  that route requests or enforce guardrails, and the LLM judges that score agent runs all learn or
+  apply the mapping in the labeled set, noise included. The model does not learn "the task".
 - **Noise has a direction.** If 15% of labels are wrong in a consistent direction, the model learns that
   direction. If they are wrong at random, achievable accuracy drops and more data is needed to reach any
   given level.
 - **Small sets do not average errors away.** Pretraining averages any single document away across
   billions of tokens. A fine-tuning set of 2,000 examples has no such averaging, so one annotator's habit
-  of filing every ambiguous ticket under "billing" becomes model behaviour.
-- **A one-line instruction to whoever is free fails three ways.** Real tasks are underspecified ("is
-  this answer helpful?" means different things to different people), so labels encode the annotator. One
-  labeler per item cannot measure noise, so an 80% validation plateau is unattributable. And rare,
-  borderline items are exactly where untrained labelers disagree most.
+  of filing every ambiguous ticket under "billing" becomes model behaviour, and one reviewer's habit of
+  passing any agent run that ends politely becomes your eval's definition of success.
+- **A one-line instruction to whoever is free fails three ways.** Real tasks are underspecified ("was
+  this agent run helpful?" means different things to different people), so labels encode the annotator.
+  One labeler per item cannot measure noise, so an 80% plateau is unattributable. And rare, borderline
+  items are exactly where untrained labelers disagree most.
 - **Labeling as a discipline fixes this.** The target becomes defined (guidelines with worked edge
   cases), measurable (agreement on overlapping items) and improvable (adjudicated disagreements feed
   back into the guidelines).
 
 ## How it works
-### What a label is in LLM work
+### What a label is in agent work
 | Label type | What it is | Cost and use |
 |---|---|---|
-| **Categorical** | intent, topic, toxicity, routing class | cheapest per item; feeds classifiers and guardrails |
-| **Span or structured** | entities, citations, JSON fields | needs a schema and tooling that enforces it |
-| **Demonstrations** | a complete target response, written or edited by an expert | SFT data; most expensive, because the annotator produces rather than judges |
-| **Preferences** | a prompt plus two candidates: which is better, optionally why | feeds reward models, RLHF and DPO |
-| **Rubric scores** | 1–5 on named criteria | convenient; hardest to keep consistent unless every level has anchor examples |
+| **Categorical** | intent, topic, toxicity, routing class, "right tool: yes or no" per step | cheapest per item; feeds routers, guardrails and step-level evals |
+| **Span or structured** | entities, citations, JSON fields, corrected tool arguments | needs a schema and tooling that enforces it |
+| **Demonstrations** | a complete target response or corrected trajectory, written or edited by an expert | SFT data; most expensive, because the annotator produces rather than judges |
+| **Preferences** | a prompt plus two candidates (two answers, or two trajectories): which is better, optionally why | feeds reward models, RLHF and DPO |
+| **Rubric scores** | 1–5 on named criteria, such as groundedness of a RAG answer | convenient; hardest to keep consistent unless every level has anchor examples |
 
 - **Why preferences dominate RLHF data.** Comparing is easier and more consistent than writing, and a
   comparison stays informative even when both candidates are flawed. That is why InstructGPT-style
   pipelines collect far more comparisons than demonstrations.
+- **Label agent traces per step and per run.** A run can reach the right answer through a wasted or
+  unsafe step, so a single pass/fail label hides the failures you most need to fix.
 
 ### The loop
 1. **Define the task on paper.** Label schema, decision rules, and 20–30 worked examples that include
    the boundary cases and an explicit "if unsure, do X" rule. Ambiguity left here gets resolved
    differently by every annotator later.
-2. **Pilot.** 100–200 items, each labeled independently by two or three people.
+2. **Pilot.** 100–200 items (tickets, or agent traces), each labeled independently by two or three
+   people.
 3. **Measure agreement.** Use chance-corrected agreement (formula and bands below), bootstrap it, and
    read the confusion matrix.
 4. **Adjudicate and rewrite.** Every disagreement is a guideline gap or an annotator error. Fix the
@@ -82,7 +99,7 @@ p_e = agreement expected by chance from each rater's label frequencies
 ```
 
 - **Why correct for chance.** Two raters who both say "not spam" 95% of the time agree about 90% of the
-  time by luck alone.
+  time by luck alone. The same happens when most agent steps are fine and both raters mostly say "ok".
 - **More raters or other scales.** Fleiss' kappa extends this to many raters; Krippendorff's alpha also
   handles missing labels and ordinal scales.
 - **Landis–Koch bands (the common reading):**
@@ -103,14 +120,24 @@ p_e = agreement expected by chance from each rater's label frequencies
   which pairs of classes the guideline fails to separate.
 
 ### Who labels, and how much a model should help
-- **Domain experts** are the only option for specialised demonstrations.
+- **Domain experts** are the only option for specialised demonstrations and for judging whether an agent
+  took a correct action in their system.
 - **Crowd or vendor workforces** scale categorical tasks once guidelines are solid.
 - **Model-assisted labeling** (an LLM proposes a label or drafts a response, a human verifies) cuts cost
   sharply but introduces anchoring. People accept plausible suggestions, so confident model errors pass
   through, and a model later trained on that data is partly trained on its own output.
 - **Keep overlap and gold subsets blind** to the suggestion, so you can measure the acceptance bias.
 - **Active learning** chooses which items to label next: those where the current model is uncertain or
-  annotators disagreed, because labels on items the model already handles add little.
+  annotators disagreed, because labels on items the model already handles add little. For agents, that
+  means traces with low judge confidence, user thumbs-down or retries.
+
+### LLM judges are raters too
+- **Treat an LLM labeler as one more rater.** Compute its agreement with adjudicated human labels on the
+  pilot, and only then decide where to trust it.
+- **Check it per label value, not overall.** A judge that marks nearly every step "ok" can show high raw
+  agreement while catching few of the failures, which is exactly the skew problem kappa exists for.
+- **Recalibrate when the agent changes.** A new tool or prompt produces new failure modes the judge was
+  never checked on, so re-run its agreement on a fresh labeled slice.
 
 ### Finding label errors after the fact
 Agreement measures noise on the overlap; it does not tell you *which* single-labeled items are wrong.
@@ -120,27 +147,26 @@ Agreement measures noise on the overlap; it does not tell you *which* single-lab
    a label error.
 3. **Review the top of the list by hand** rather than auto-relabeling, because the model's confident
    disagreements also include genuinely hard cases it gets wrong.
-4. **Treat an LLM labeler as one more rater.** Compute its agreement with adjudicated human labels on the
-   pilot, and only then decide where to trust it.
 
 ### Why agreement rather than accuracy
 - **There is no external truth.** The labels are the truth you are constructing.
 - **Agreement is the observable proxy** for whether the task is defined well enough to be learnable.
-- **It sets a ceiling.** A model cannot be meaningfully evaluated above the level at which humans agree
-  with each other.
+- **It sets a ceiling.** A model, or an agent, cannot be meaningfully evaluated above the level at which
+  humans agree with each other.
 
 ## Diagram
 Follow the loop: guidelines are not finished until a pilot's agreement is acceptable, and production
-labeling keeps feeding overlap, gold and audit results back into the guideline.
+labeling (including LLM-judge labels) keeps feeding overlap, gold and audit results back into the guideline.
 
 ```mermaid
 flowchart TD
-    G["Write guideline: schema, rules, 20-30 worked examples"] --> P["Pilot: 100-200 items, 2-3 raters each"]
+    G["Write guideline: schema, rules, 20-30 worked examples"] --> P["Pilot: 100-200 traces, 2-3 raters each"]
     P --> K["Measure kappa, bootstrap it, read confusion matrix"]
     K --> Q{"Agreement acceptable for the stakes?"}
     Q -->|"no"| A["Adjudicate disagreements"]
     A -->|"revise guideline, re-brief"| G
-    Q -->|"yes"| PR["Production: 5-10% overlap plus seeded gold"]
+    Q -->|"yes"| J["Calibrate LLM judge against adjudicated labels"]
+    J --> PR["Production: 5-10% overlap plus seeded gold"]
     PR --> V[("Versioned records: guideline, annotator, timestamp")]
     PR -->|"flagged items, gold failures"| A
     V --> AU["Out-of-fold audit of likely label errors"]
@@ -148,23 +174,13 @@ flowchart TD
 ```
 
 ## Examples
-### Pilot round: kappa, adjudication and SFT records
-Two annotators label support tickets; kappa is computed by hand, disagreements are listed for
-adjudication, and the adjudicated result is written as SFT records with provenance. On this data it
-prints kappa ≈ 0.48, "moderate" on the Landis–Koch scale, which means the guidelines are not finished.
+### Calibrating an LLM judge on agent steps
+A support agent's traces are exported from an annotation queue. A human and an LLM judge each label
+every step "right" or "wrong" for tool choice. Before the judge grades thousands of runs, measure it as a
+rater: kappa, how many human-flagged failures it catches, and which steps go to adjudication.
 
 ```python
 from collections import Counter
-import json
-
-pilot = [  # (item_id, text, label_from_annotator_a, label_from_annotator_b)
-    ("t1", "Card charged twice this month", "billing", "billing"),
-    ("t2", "App crashes when I open invoices", "bug", "billing"),
-    ("t3", "How do I export my data?", "howto", "howto"),
-    ("t4", "Refund still not received after 10 days", "billing", "billing"),
-    ("t5", "Login page blank on Safari", "bug", "bug"),
-    ("t6", "Can I pay yearly instead of monthly?", "billing", "howto"),
-]
 
 def cohen_kappa(a, b):
     n = len(a)
@@ -173,24 +189,48 @@ def cohen_kappa(a, b):
     p_e = sum((ca[k] / n) * (cb[k] / n) for k in set(ca) | set(cb))
     return (p_o - p_e) / (1 - p_e)
 
-a = [r[2] for r in pilot]; b = [r[3] for r in pilot]
-print(f"kappa = {cohen_kappa(a, b):.2f}")          # 0.48 on this pilot
-for item_id, text, la, lb in pilot:
-    if la != lb:
-        print(f"ADJUDICATE {item_id}: {text!r}  A={la}  B={lb}")
-
-# After adjudication the agreed label is the target. Keep provenance on every record.
-gold = {"t2": "bug", "t6": "billing"}
-with open("tickets_sft.jsonl", "w") as f:
-    for item_id, text, la, lb in pilot:
-        label = gold.get(item_id, la)
-        record = {
-            "messages": [{"role": "user", "content": f"Classify this support ticket: {text}"},
-                         {"role": "assistant", "content": label}],
-            "meta": {"guideline": "v3", "annotators": ["a", "b"], "adjudicated": item_id in gold},
-        }
-        f.write(json.dumps(record) + "\n")
+steps = [  # (trace_id, step, tool called, human label, judge label) for "right tool?"
+    ("tr1", 1, "search_orders", "right", "right"),
+    ("tr1", 2, "issue_refund", "wrong", "right"),   # refunded before checking eligibility
+    ("tr2", 1, "search_kb", "right", "right"),
+    ("tr2", 2, "search_kb", "wrong", "wrong"),      # repeated the same search
+    ("tr3", 1, "get_invoice", "right", "right"),
+    ("tr3", 2, "send_email", "right", "wrong"),
+    ("tr4", 1, "search_orders", "right", "right"),
+    ("tr4", 2, "escalate", "wrong", "right"),
+]
+human = [s[3] for s in steps]; judge = [s[4] for s in steps]
+print(f"kappa(human, judge) = {cohen_kappa(human, judge):.2f}")   # 0.14: slight
+bad = [s for s in steps if s[3] == "wrong"]
+caught = sum(s[4] == "wrong" for s in bad)
+print(f"judge caught {caught} of {len(bad)} human-flagged wrong steps")   # 1 of 3
+for t, i, tool, h, j in steps:
+    if h != j:
+        print(f"ADJUDICATE {t} step {i} ({tool}): human={h} judge={j}")
 ```
+
+- **Reading it.** The judge agrees on 5 of 8 steps but kappa is only 0.14, and it misses two of three
+  bad steps. It is too lenient to gate releases; fix its rubric and re-measure on a larger pilot.
+- **Keep provenance.** When adjudicated steps become eval or SFT records, store guideline version,
+  annotators and an `adjudicated` flag in each record's metadata.
+
+### Worked scenario: a judge at 85% raw agreement
+200 agent steps, each labeled by a human and by an LLM judge for "right tool".
+
+| Quantity | Value |
+|---|---|
+| Both "right" / both "wrong" | 150 / 20 |
+| Human "right", judge "wrong" | 10 |
+| Human "wrong", judge "right" | 20 |
+| Raw agreement p_o | 170 / 200 = 0.85 |
+| Chance agreement p_e | 0.80 × 0.85 + 0.20 × 0.15 = 0.71 |
+| κ | (0.85 − 0.71) / (1 − 0.71) ≈ 0.48, "moderate" |
+| Judge recall on human-flagged failures | 20 / 40 = 50% |
+
+- **Reading it.** 85% sounds fine, but the judge passes half the steps humans call wrong. Used as a
+  release gate it would report an agent better than it is.
+- **Fix.** Add the missed failure types as worked examples in the judge prompt, then re-measure on a
+  fresh slice the judge's author never saw.
 
 ### Worked scenario: 96% agreement, kappa 0.31
 Two raters label 1,000 tickets for a rare "fraud" class; each marks 30 items as fraud, but they agree on
@@ -205,13 +245,15 @@ only 10 of them.
 | κ | (0.96 − 0.9418) / (1 − 0.9418) ≈ 0.31, "fair" |
 
 - **Reading it.** Every disagreement sits on the rare class. The guideline does not define "fraud"
-  well enough; the workforce is not careless.
+  well enough; the workforce is not careless. Rare agent failures (an unsafe action, a wrong refund)
+  behave the same way.
 - **Fix.** Add worked fraud and not-fraud boundary cases to the guideline, then re-pilot with the rare
   class oversampled.
 
 ### Ranking likely label errors with out-of-fold predictions
 A sketch with scikit-learn: every item is scored by a model that never trained on it, then the items
-whose given label gets the lowest predicted probability go to a human review queue.
+whose given label gets the lowest predicted probability go to a human review queue. It works the same for
+ticket labels and for a router that picks which agent or tool handles a request.
 
 ```python
 import numpy as np
@@ -227,32 +269,36 @@ suspects = np.argsort(given_label_prob)[:200]       # lowest-confidence labels f
 ```
 
 ## Production patterns
+- **Trace annotation queues.** Route sampled production traces, thumbs-down runs and judge low-confidence
+  runs into an annotation queue in your tracing tool, labeled per step against a written rubric. Monitor
+  queue age and the share of labeled traces that become golden-set items.
 - **Overlap plus seeded gold.** During production labeling, give 5–10% of items to two annotators and
   mix in gold items with known answers. Monitor kappa on the overlap per week and the gold pass rate per
   annotator; a falling pass rate flags drift or inattention before the batch is accepted.
-- **Provenance on every record.** Store guideline version, annotator id, timestamp and an
-  `adjudicated` flag in each record's metadata (as in the pilot example). When a batch turns out bad,
-  filter it out by annotator or guideline version instead of discarding the dataset.
+- **Judge calibration before judge gating.** Before an LLM judge scores agent runs in CI, measure its
+  kappa and failure recall against adjudicated human labels, and re-measure on every rubric, tool or
+  prompt change. Monitor judge-human agreement on a small weekly human-labeled sample.
+- **Provenance on every record.** Store guideline version, annotator id, timestamp and an `adjudicated`
+  flag in each record's metadata. When a batch turns out bad, filter it out by annotator or guideline
+  version instead of discarding the dataset.
 - **Blind subset for model-assisted labeling.** When an LLM pre-fills labels, route a slice of items to
   annotators without the suggestion. Compare agreement and label distribution between the blind and
   assisted slices; a large gap is acceptance bias, not quality.
-- **Out-of-fold label audit.** After the first model, score every item with cross-validated predictions
-  (as in the scikit-learn sketch, or a confident-learning library such as cleanlab) and hand-review the
-  lowest-confidence labels. Track the fraction of reviewed items that are actually relabeled.
-- **Stratified, uncertainty-driven queues.** Fill the labeling queue by class quotas and by model
-  uncertainty or past disagreement, not uniformly from production. Monitor per-class item counts and
-  recall on the rare class you built the model for.
-- **Redact before export.** Strip PII from customer text and sign a data-processing agreement before
-  anything reaches a vendor. Monitor redaction coverage with a sampled audit of exported items.
+- **Redact before export.** Agent traces carry tool results full of customer data. Strip PII and sign a
+  data-processing agreement before anything reaches a vendor; monitor redaction coverage with a sampled
+  audit of exported items.
 
 ## Trade-offs
 - **Expert quality vs cost and throughput.** Domain experts give the highest label quality and are
-  mandatory for specialised demonstrations, but cost and throughput push most categorical work to
-  trained crowds once agreement is stable.
+  mandatory for specialised demonstrations and for judging agent actions in their systems, but cost and
+  throughput push most categorical work to trained crowds once agreement is stable.
 - **Overlap vs budget.** Overlapping annotators multiplies cost, but it is the only way to measure label
   noise. Reduce overlap to 5–10% only after the pilot shows agreement has stabilised.
 - **Model assistance vs anchoring.** It cuts cost and time sharply but anchors humans to the model's
   errors; the saving is real only if a blind subset shows acceptance is not inflating agreement.
+- **LLM judge vs human labels.** A judge scores every run cheaply and instantly, but only within the
+  failure types it was calibrated on; the balance flips back to humans for new tools, new risks and
+  any release decision with real stakes.
 - **Detailed guidelines vs drift.** They raise consistency but freeze a definition. When production
   inputs drift, agreement on new items falls and the guideline must be reopened rather than defended.
 - **Preferences vs demonstrations.** Preference labels are cheaper per item and tolerate imperfect
@@ -262,32 +308,35 @@ suspects = np.argsort(given_label_prob)[:200]       # lowest-confidence labels f
 ## Pitfalls
 - **One annotator per item, no overlap.** Symptom: a validation plateau nobody can attribute to the model
   or the labels. Fix: overlap in the pilot and 5–10% in production.
+- **Trusting an uncalibrated LLM judge.** Symptom: agent eval scores climb release after release while
+  user complaints do not fall. Fix: measure the judge's kappa and failure recall against human labels.
 - **Same model-assisted pipeline for the eval set.** Symptom: inflated scores that collapse on a
   human-only audit. Fix: label the evaluation set human-only, blind to suggestions.
 - **Changing guidelines mid-project without relabeling.** Symptom: agreement with gold items drifts over
   time and the model learns a blend of two definitions. Fix: relabel earlier items or split by version.
-- **Uniform sampling from production.** Rare classes get a handful of examples. Symptom: high overall
-  accuracy with near-zero recall on the class you built the model for. Fix: stratify.
+- **Uniform sampling from production.** Rare classes and rare agent failures get a handful of examples.
+  Symptom: high overall accuracy with near-zero recall on the class you built the model for. Fix:
+  stratify.
 - **Reading low kappa on a skewed task as careless raters.** With a 97% majority class, kappa can be low
   even at very high raw agreement. Symptom: the confusion matrix shows all disagreement on the rare
   class, a guideline problem for that class, not a workforce problem. Fix: add boundary cases for that
   class and re-pilot with it oversampled.
 - **Rubric scores without anchor examples per level.** Symptom: one annotator's "4" is another's "2",
   hidden because most items cluster in the middle. Fix: anchor every score level.
-- **Raw customer text to a vendor without PII redaction and a data-processing agreement.** Symptom: a
-  compliance incident rather than a model problem. Fix: redact and contract first.
+- **Raw customer text or traces to a vendor without PII redaction and a data-processing agreement.**
+  Symptom: a compliance incident rather than a model problem. Fix: redact and contract first.
 
 ## When to use
-- **Use when:** the behaviour you need is not in the base model or cannot be prompted reliably, and you
-  will measure the result: a routing classifier, a reward model for your domain, SFT demonstrations in a
-  house style, or a golden evaluation set.
+- **Use when:** you need an agent eval set, a calibrated LLM judge, or behaviour the base model cannot
+  be prompted into reliably: a routing classifier, a reward model for your domain, SFT demonstrations of
+  correct tool use, or a golden evaluation set.
 - **Check first:** whether a few hundred high-quality examples plus a strong prompt gets you there. In
   LLM fine-tuning, quality and coverage beat volume; a smaller set of clean, diverse demonstrations
   routinely outperforms a much larger noisy one.
-- **Measure:** kappa on the pilot, the gold-item pass rate during production, and the model's accuracy
-  on a human-only held-out set.
+- **Measure:** kappa on the pilot, the gold-item pass rate during production, judge-human agreement, and
+  the model's accuracy on a human-only held-out set.
 - **Interviews:** explain why chance-corrected agreement matters, how adjudication improves guidelines,
-  and what model-assisted labeling does to the data it produces.
+  and what model-assisted labeling and LLM judges do to the data they produce.
 
 ## Role lens
 - **Engineer:** Builds the labeling export and import, computes agreement in the pipeline, stores
@@ -318,8 +367,21 @@ analysis can isolate a bad batch instead of discarding the whole dataset.
 - **Fleiss' kappa:** three or more raters on nominal labels, the usual choice for a multi-rater pilot.
 - **Krippendorff's alpha:** when some items are missing labels, or the scale is ordinal (rubric 1–5),
   because it can count a 4-vs-5 disagreement as smaller than a 1-vs-5 one.
-- **Whichever you pick:** bootstrap an interval on a small pilot and read the confusion matrix, because
-  one number hides which classes the guideline fails to separate.
+
+### You want an LLM judge to grade every agent run in CI. How do you decide whether to trust it?
+- **Treat it as a rater:** have humans label a pilot of a few hundred steps or runs, adjudicate, and
+  compute the judge's kappa against the adjudicated labels, not raw agreement.
+- **Check failure recall separately:** most steps are fine, so a lenient judge can reach 85% raw
+  agreement while catching only half the failures.
+- **Keep checking:** re-measure on a weekly human sample and after every new tool or rubric change,
+  because new failure modes are exactly the ones it was never calibrated on.
+
+### How would you design the labeling rubric for a tool-calling agent's traces?
+- **Label per step and per run:** right tool, correct arguments, correct use of the result, and whether
+  the run reached the goal safely, because a correct final answer can hide a wasted or unsafe step.
+- **Write worked boundary cases:** a repeated search, an action taken before a required check, a correct
+  escalation. Ambiguity left out of the guideline is resolved differently by every rater.
+- **Pilot with overlap,** compute kappa per dimension, and only then scale labeling or hand it to a judge.
 
 ### Your classifier plateaus at 80% validation accuracy. How do you tell whether the labels or the model are the limit?
 - **Measure label noise first:** have two or three people independently relabel a few hundred validation
@@ -338,20 +400,14 @@ analysis can isolate a bad batch instead of discarding the whole dataset.
 - **When the next model trains on it:** that model is partly trained on its predecessor's output, so its
   errors compound rather than average out.
 
-### Should you collect demonstrations or preference pairs for an assistant in your domain?
-- **Demonstrations** teach the format and house style directly through SFT, but they are the most
-  expensive label because the annotator produces rather than judges, and they need domain experts.
-- **Preferences** are cheaper and more consistent per item and still informative when both candidates are
-  flawed, but each carries less information, so you need many more plus a reward model or DPO.
-- **Typical answer:** a smaller expert demonstration set to establish behaviour, then preference
-  comparisons at scale to refine it, the shape InstructGPT-style pipelines use.
-
 ### How do you keep label quality from drifting over a multi-week production labeling run?
 - **Ongoing overlap:** 5–10% of items double-labeled, with kappa tracked per week.
 - **Seeded gold items:** known answers mixed into the queue, with a pass rate tracked per annotator; a
   falling rate flags drift or inattention before a batch is accepted.
 - **Versioned guidelines:** store guideline version and annotator id on every record, and relabel or split
   by version when the guideline changes, so the model does not learn a blend of two definitions.
+- **Demonstrations versus preferences:** when the run also collects SFT data, a smaller expert
+  demonstration set establishes behaviour and cheaper preference comparisons refine it at scale.
 
 ## Quiz
 ### Q: Why report Cohen's kappa instead of the raw percentage of items two annotators agree on?

@@ -5,7 +5,8 @@ name: Rubrics
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/llm-as-a-judge
   - evals/judge-calibration-and-bias
@@ -16,9 +17,22 @@ related:
 ---
 
 ## TL;DR
-A rubric turns "is this good?" into specific, observable criteria with defined levels, so two graders (or
-a human and an LLM judge) score alike. Build it from failure modes, prefer binary checks, gate
-catastrophic criteria, and version it.
+A rubric turns "did the agent do a good job?" into observable criteria over its reply and its
+trajectory, so humans and LLM judges score alike. Build it from failure modes, prefer binary checks,
+gate catastrophic actions, and version it.
+
+## For agent builders
+- **Why it matters for agents.** An agent run has an outcome (final state), a process (which tools,
+  in what order, with what arguments) and a reply. "Rate this run 1–10" mixes all three; a rubric
+  separates them so a regression points at the planner, a tool or the reply.
+- **Where it shows up in your stack.** The judge prompts and code evaluators you register in LangSmith,
+  Braintrust, promptfoo or Inspect, the annotation queue your reviewers label traces in, and the
+  acceptance criteria in a customer's statement of work.
+- **What you control.** Which criteria are code checks over the trace and which need a judge, which
+  are gates (destructive action without confirmation, fabricated tool result, leaked secret), each
+  criterion's applicability condition, and the rubric version stamped on every result.
+- **What you can skip.** Elaborate weighting schemes and long Likert scales. Binary criteria, a few
+  gates and per-criterion pass rates cover almost every agent eval.
 
 ## Why it exists
 - **Unanchored scores measure the grader.** Ask three engineers to rate a support-bot answer from 1 to
@@ -49,6 +63,22 @@ catastrophic criteria, and version it.
 - **The test:** the anchored version can be applied by someone who has never met you.
 - **Criteria must be independent and single-barreled.** "Accurate and complete" is two criteria; an
   answer that is accurate but incomplete splits graders down the middle, and you lose which half failed.
+
+### Rubrics for agent runs
+An agent trace is graded on three layers, and each criterion is assigned to the cheapest grader that
+can apply it.
+
+| Layer | Example criteria (binary) | Usually graded by |
+|---|---|---|
+| **Outcome** | the order is cancelled in the sandbox; the ticket has the right status | code: assert final state |
+| **Process** | called `lookup_order` before `cancel_order`; no tool called with invented IDs; at most the step budget | code over the trace |
+| **Gates** | no destructive action without user confirmation; no secret in the reply; no fabricated tool result | code where possible, judge for the rest |
+| **Reply** | states what was done; every factual claim matches a tool result; asks a clarifying question when the request is ambiguous | LLM judge with the tool results in view |
+
+- **Applicability is common in agent rubrics:** "asked for confirmation before cancelling" is N/A on a
+  run that cancelled nothing, so it must be excluded, not passed.
+- **Process criteria are guard rails, not a script.** Penalise only steps that are wrong or wasteful;
+  requiring one exact tool sequence fails valid alternative plans.
 
 ### Analytic vs holistic
 | | Analytic | Holistic |
@@ -131,7 +161,7 @@ once per item, after every applicable criterion has been graded.
 
 ```mermaid
 flowchart TD
-    E["Error analysis on 50-100 outputs"] --> R["Rubric version: criteria, anchors, gates"]
+    E["Error analysis on 50-100 agent traces"] --> R["Rubric version: criteria, anchors, gates"]
     R --> C["For each criterion"]
     C --> A{"Applies to this item?"}
     A -->|"no"| NA["N/A: out of denominator"]
@@ -226,6 +256,61 @@ print(aggregate(graded, gates={"no_fabrication"}))
 | "escalates" pass rate | 0/1: the only out-of-scope item was mishandled | 3/4 = 75%, looks healthy |
 | Gate failure rate | 25%, shown on its own | hidden inside an average |
 
+### Agent scenario: code checks over a trajectory, judge only for the reply
+An order-support agent's trace is a list of steps. Outcome, process and gate criteria are plain
+functions returning True, False or None (N/A); only the reply criterion needs a judge. The output
+plugs straight into `aggregate()` above.
+
+```python
+DESTRUCTIVE = {"cancel_order", "issue_refund"}
+
+def calls(trace):
+    return [s for s in trace["steps"] if s["type"] == "tool_call"]
+
+def confirmed_before_destructive(trace):
+    confirmed = False
+    for s in trace["steps"]:
+        if s["type"] == "user" and s.get("confirms"):
+            confirmed = True
+        if s["type"] == "tool_call" and s["name"] in DESTRUCTIVE:
+            return confirmed                          # first destructive call decides it
+    return None                                       # N/A: nothing destructive happened
+
+def looked_up_first(trace):
+    names = [c["name"] for c in calls(trace)]
+    if "cancel_order" not in names:
+        return None
+    return "lookup_order" in names[:names.index("cancel_order")]
+
+def within_budget(trace, max_steps=8):
+    return len(calls(trace)) <= max_steps
+
+def final_state_ok(trace):
+    return trace["sandbox_after"].get(trace["expect_key"]) == trace["expect_value"]
+
+CHECKS = {"confirmed": confirmed_before_destructive, "lookup_first": looked_up_first,
+          "budget": within_budget, "outcome": final_state_ok}
+GATES = {"confirmed"}
+
+def grade_run(trace, judge_reply):
+    g = {name: fn(trace) for name, fn in CHECKS.items()}
+    g["reply_matches_tools"] = judge_reply(trace)     # the one criterion that needs an LLM judge
+    return g
+# per_criterion, gate_rate, score = aggregate([grade_run(t, judge) for t in traces], gates=GATES)
+```
+
+Illustrative release comparison over 200 eval runs:
+
+| Criterion | v1 | v2 | Reading |
+|---|---|---|---|
+| outcome | 158/200 | 166/200 | +4 points: the headline improvement |
+| confirmed (gate, applies to 70 runs) | 70/70 | 63/70 | 7 cancellations without confirmation: block the release |
+| lookup_first (applies to 60 runs) | 57/60 | 59/60 | fine |
+| reply_matches_tools (judge) | 188/200 | 176/200 | v2 summarises actions it did not take more often |
+
+- **A blended score would have shipped v2.** Per-criterion rates with a separate gate rate show the
+  outcome gain was bought with unconfirmed destructive actions.
+
 ## Production patterns
 - **Rubric in version control next to the dataset.** Store criteria, anchors and exemplars as a YAML or
   JSON file, tag a version, and write that version into every eval result row. Monitor that comparisons
@@ -233,15 +318,19 @@ print(aggregate(graded, gates={"no_fabrication"}))
 - **Per-criterion dashboards, gate rate separate.** Chart each criterion's pass rate over its applicable
   items plus the gate-failure rate, rather than one blended score. Alert when a gate rate rises above its
   baseline or a criterion drops beyond its bootstrap interval.
+- **Code first, judge last, per agent criterion.** For each criterion, write a check over the trace or
+  the sandbox's final state if one is possible, and register a judge evaluator only for what remains
+  (reply grounding, tone, clarification). Monitor the share of criteria graded by code; it should grow
+  as the agent matures.
 - **One judge call per high-stakes criterion.** Run gates and domain-correctness checks as separate,
   parallel judge calls with structured PASS/FAIL output; batch low-stakes format checks into one call.
   Monitor judge–human agreement per criterion after any batching change.
 - **Item-specific "must mention" lists from SMEs.** Store must-state and must-not-state facts on each
   golden item, and have the judge check presence or absence. Monitor list staleness by re-reviewing items
   when the product or policy they reference changes.
-- **Quarterly rubric review from error analysis.** Sample fresh production outputs, cluster failures not
-  covered by any criterion, and add or retire criteria in a new version. Monitor the share of complaints
-  that map to no criterion.
+- **Quarterly rubric review from trace error analysis.** Sample fresh production agent traces, cluster
+  failures not covered by any criterion (a new tool misused, a loop that never stops), and add or retire
+  criteria in a new version. Monitor the share of complaints that map to no criterion.
 
 ## Trade-offs
 - **Diagnosis vs grader time.** Analytic rubrics give per-criterion diagnosis but cost more grader time
@@ -274,10 +363,13 @@ print(aggregate(graded, gates={"no_fabrication"}))
   criteria graded in isolation. Fix: split high-stakes criteria into their own calls.
 - **Treating the rubric as finished.** Symptom: a green eval dashboard while production complaints
   describe a failure mode no criterion covers. Fix: periodic error analysis.
+- **Scripting the agent's exact tool sequence as a criterion.** Symptom: a new model that solves tasks
+  in fewer steps fails "process" checks while the outcome rate rises. Fix: check outcome and forbidden
+  or wasteful steps, not one expected path.
 
 ## When to use
-- **Use when** a human or model scores free-form output: chat answers, summaries, generated documents,
-  agent reports.
+- **Use when** a human or model scores free-form output or behaviour: agent runs and replies, chat
+  answers, summaries, generated documents, agent reports.
 - **Avoid when** the task has an executable oracle; run the tests.
 - **Start with** three to six criteria drawn from error analysis, binary where possible, with a gating
   subset.
@@ -330,7 +422,15 @@ version so future scores are comparable.
   because weights hide trade-offs such as a tone regression under a 0.1 weight.
 - **Never weight a gate:** fabricated citations or leaked secrets override any average.
 
-### How would you roll out a rubric for an LLM judge on a live product without breaking trend lines?
+### Design a rubric for a tool-calling agent that cancels and refunds orders.
+- **Split the layers:** outcome (final order state in the sandbox), process (looked the order up first,
+  no invented IDs, within a step budget) and reply (states what was done, matches the tool results).
+- **Gate the dangerous actions:** any cancel or refund without user confirmation, or a reply claiming an
+  action whose tool call failed, fails the run regardless of the rest.
+- **Grade with code where possible** and keep the judge for reply criteria, with explicit N/A when no
+  destructive action happened, so the confirmation rate is computed only over runs where it applied.
+
+### How would you roll out a rubric for an LLM judge on a live agent without breaking trend lines?
 - **Version it with the dataset** and write the rubric version into every result row, because scores
   are only comparable within a version.
 - **Regrade the baseline** with the new version before comparing, so an "improvement" is not a rubric

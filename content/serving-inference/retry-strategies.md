@@ -5,7 +5,8 @@ name: Retry strategies
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/timeouts
   - serving-inference/idempotency
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-A retry re-issues a request that failed transiently. Classify the error, back off exponentially with
-jitter, honour `Retry-After`, cap attempts and time, keep a global budget, and rely on idempotency, or a
-brief hiccup becomes a self-inflicted outage.
+An agent retries at several layers at once: SDK, framework node, tool and the model itself. Classify
+errors, back off with jitter, honour `Retry-After`, cap attempts per run, and use idempotency keys, or a
+hiccup becomes duplicate actions and an outage.
+
+## For agent builders
+- **Why it matters for agents.** Retry layers multiply inside a loop: SDK retries × framework node
+  retries × the model re-calling a failed tool × the user pressing "regenerate". A run that should cost 10
+  calls can cost 100, and a retried tool call can send a second email.
+- **Where it shows up in your stack.** `max_retries` and `timeout` on the Anthropic and OpenAI clients;
+  LangChain's `.with_retry()`; LangGraph's per-node `RetryPolicy`; tenacity around tool functions; and
+  LangSmith traces, where stacked retries are visible as repeated spans.
+- **What you control.** Which single layer retries transport errors, which tool errors go back to the
+  model as observations instead, a per-run retry and step budget, and idempotency keys on every
+  side-effecting tool.
+- **What you can skip.** Comparing jitter formulas in depth. Use full jitter, honour `Retry-After`, and
+  spend the attention on layering and budgets.
 
 ## Why it exists
 - **Provider APIs fail a small fraction of the time by design:** 429 when shared capacity is tight, 529
@@ -116,6 +130,20 @@ Worked numbers, a fleet at 200 requests per second when the provider goes fully 
   "tail at scale" pattern).
 - **A wrong answer is not a transient failure.** Validation-driven regeneration is a separate loop with
   its own bound, usually with a changed prompt or temperature.
+
+### Retry layers in an agent loop
+| Layer | What fails | Who should handle it |
+|---|---|---|
+| Model transport | 429, 5xx, 529, connection reset | the SDK, as the single retrying layer |
+| Framework node | an exception escaping a graph node | a node retry policy only if the SDK does not already retry; otherwise none |
+| Tool transport | a tool's HTTP API times out or returns 503 | the tool wrapper, with jittered backoff and an idempotency key |
+| Tool semantics | bad arguments, "not found", permission denied | return the error to the model as the tool result, so it can change the call |
+| Output validation | unparseable tool arguments or JSON | a bounded re-ask with the validation error, usually once or twice |
+
+- **Semantic errors are not retried, they are reported.** The model sees "customer 4412 not found" and
+  can search instead; a blind retry would fail identically.
+- **Count every layer against one run budget.** A cap on total model calls and tool calls per run is
+  the agent version of the retry budget, because it bounds what any loop of retries can cost.
 
 ## Diagram
 Each failure passes through four gates in order; any "no" ends the loop with an error or a fallback
@@ -215,7 +243,51 @@ One user click traced through a stack that retries at three layers, then after t
 | SDK | 3 (retries twice) | 3 (the only retrying layer) |
 | Worst case per click | 3 × 4 × 4 = 48 | 3 per target tried, so 6 if the fallback rung also runs |
 
+### Agent tool wrapper: retry transport, report semantics
+Transport failures are retried with jitter under the same key; semantic failures go back to the model as
+the tool result. `ToolHTTPError` and `send_email_api` stand in for your tool client.
+
+```python
+import random, time
+
+TRANSIENT = {408, 429, 500, 502, 503, 504}
+
+def call_tool(fn, args, key, attempts=3, base=0.5, cap=4.0):
+    """Returns a tool-result dict the agent appends to its transcript."""
+    for attempt in range(attempts):
+        try:
+            return {"ok": True, "result": fn(**args, idempotency_key=key)}   # same key on every attempt
+        except ToolHTTPError as e:
+            if e.status in TRANSIENT and attempt < attempts - 1:
+                time.sleep(random.uniform(0, min(cap, base * 2 ** attempt)))  # full jitter
+                continue
+            # Semantic error, or retries exhausted: let the model decide what to do next.
+            return {"ok": False, "error": f"{e.status}: {e.message}", "retryable": e.status in TRANSIENT}
+
+class RunBudget:
+    """Caps every call a run makes, retries included."""
+    def __init__(self, max_calls=40): self.left = max_calls
+    def spend(self):
+        self.left -= 1
+        if self.left < 0:
+            raise RuntimeError("run budget exhausted: stop and report")
+
+result = call_tool(send_email_api, {"to": "a@example.com", "body": "..."}, key=f"{run_id}:step4:email")
+```
+
+### Worked scenario: layered retries in a 10-step agent during a provider blip
+Illustrative: the provider fails every attempt for 20 seconds; the agent is at step 6.
+
+| Layers that retry | Attempts for step 6 alone | What the trace shows |
+|---|---|---|
+| SDK 3 attempts × LangGraph node 3 attempts × user regenerate 2 | 3 × 3 × 2 = 18 | 18 model spans for one step, then the whole run restarts |
+| SDK only (node retry off), then fallback | 3 then 1 on the fallback | 4 spans, run continues from step 6 |
+| Plus a per-run budget of 40 calls | never above 40 for the run | runaway loops stop with a clear "budget exhausted" result |
+
 ## Production patterns
+- **Errors as observations, plus a run budget.** Agent teams retry only transport failures in code, return
+  semantic tool errors to the model as tool results, bound output re-asks to one or two, and cap total
+  calls per run. Monitor calls per run, tool error rate by tool, and runs ended by the budget.
 - **SDK as the single retry layer.** Keep the official SDK's retries and set them explicitly, for example
   `max_retries` and `timeout` on the Anthropic or OpenAI Python client, and remove retries above it.
   Monitor the amplification factor (provider calls per user request).
@@ -241,6 +313,9 @@ One user click traced through a stack that retries at three layers, then after t
   time-to-first-token variance is high and the call is cheap relative to the user's time.
 - **Retrying timeouts vs duplicates.** Retrying after timeouts recovers from stalls but risks duplicated
   effects; without idempotency keys the safe choice is to surface the timeout.
+- **Model-driven recovery vs code retries.** Handing a tool error to the model lets it fix arguments or
+  pick another tool, but each recovery is a full model call and can loop. Code retries are cheaper for
+  pure transport faults; the model is better only when the request itself must change.
 
 ## Pitfalls
 - **Retrying 400s and context-length errors.** Symptom: the identical error three times in a row in the
@@ -254,6 +329,10 @@ One user click traced through a stack that retries at three layers, then after t
 - **`time.sleep` inside an async handler.** Symptom: every in-flight request stalls whenever one request
   backs off.
 - **Retrying inside an open stream.** Symptom: duplicated paragraphs appear in the user interface.
+- **Framework retries on top of SDK retries.** Symptom: a LangSmith trace shows nine model spans for one
+  agent step during a blip. Fix: turn retries off in either the node policy or the client, not both.
+- **Retrying a semantic tool error in code.** Symptom: the same "not found" error three times, then the
+  run fails without the model ever seeing it. Fix: return it as the tool result.
 
 ## When to use
 - **Always have an explicit policy** for every outbound LLM call, even if it is "the SDK's two attempts
@@ -304,11 +383,21 @@ policy holds.
   and fallback.
 - **Add a retry budget** so even a misconfigured layer cannot amplify load during an incident.
 
-### When should a timeout not be retried?
-- **When the operation is not idempotent,** because the timed-out call may already have sent the email or
+### Your agent's send_email tool timed out. Should the loop retry it?
+- **Not unless the operation is idempotent,** because the timed-out call may already have sent the email or
   created the ticket. Without an idempotency key, surface the timeout instead.
-- **When tokens have already been streamed,** because a retry would duplicate text; restart as a new
-  message instead.
+- **With a key, retry under the same key,** so the email provider deduplicates; never let the model
+  regenerate the call with a fresh key.
+- **When tokens have already been streamed,** a retry would duplicate text; restart as a new message
+  instead.
+
+### Design the retry policy for a LangGraph agent whose nodes call a hosted model and three HTTP tools.
+- **One layer for model transport:** keep the SDK's `max_retries` and leave node retry policies off for
+  model nodes (or the reverse), so attempts do not multiply.
+- **Tool wrappers retry 5xx and timeouts** with full jitter and idempotency keys; semantic errors return to
+  the model as tool results.
+- **A per-run budget** on model and tool calls, plus a fallback model after retries, bounds cost; LangSmith
+  traces confirm the amplification factor.
 
 ### The provider goes fully down and your fleet sends 200 requests per second. What load does it see?
 - **Three attempts, no budget:** about 600 requests per second, and up to triple load during partial

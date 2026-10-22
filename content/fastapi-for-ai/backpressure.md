@@ -5,7 +5,8 @@ name: Backpressure
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/concurrency-limits
   - fastapi-for-ai/streamingresponse
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Backpressure carries a slow consumer's signal back to a fast producer so it slows down instead of
-filling buffers. In FastAPI it means bounded queues, early 429/503 with `Retry-After`, and stream flow
-control; without it, overload grows latency and memory until collapse.
+Backpressure carries the model's limit back to whoever sends work, so an agent service under load admits
+what it can finish and refuses the rest early: bounded queues, 429/503 with `Retry-After`, and honouring
+provider 429s inside the loop.
+
+## For agent builders
+- **Why it matters for agents.** An agent run holds a model and tool budget for tens of seconds or
+  minutes, so a launch-day burst turns into thousands of half-finished runs, each retrying provider 429s.
+  Without bounds, every run gets slower until all of them time out.
+- **Where it shows up in your stack.** Admission checks before an agent run starts, bounded
+  `asyncio.Queue` workers for ingestion and embedding, a durable job queue for long-running agent tasks,
+  retry policies around provider calls, and the event stream back to the user.
+- **What you control.** How many runs you admit, the queue bound from the latency budget, which traffic
+  sheds first, when a run goes async (202 plus a run ID), and how the loop backs off on provider 429s.
+- **What you can skip.** TCP flow-control internals and adaptive limiter maths. Know Little's law, the
+  bounded-buffer rule and where to reject.
 
 ## Why it exists
 - **Every pipeline has a slowest stage,** and in AI services it is almost always the model: a GPU that
@@ -66,6 +79,14 @@ L_max = X × W_budget
 - **Example:** a stage doing 16 items per second with a 15-second wait budget should hold at most about
   240 waiting items; anything deeper guarantees the tail of the queue misses its deadline.
 
+### Agent runs are the unit of admission
+- **Admit runs, not just calls.** A run that starts and then cannot get model slots for its later steps
+  wastes the tokens it already spent, so decide at the start whether the service can finish it.
+- **Interactive vs background.** Interactive runs get a small bound and a fast 503; long research or batch
+  runs go to a durable queue and return 202 with a run ID the client polls or subscribes to.
+- **Inside the loop,** a provider 429 should slow this run (back off within its deadline) and lower the
+  service's concurrency, not trigger an immediate retry from every run at once.
+
 ### At the HTTP edge you cannot slow the client, only answer it
 - **The client is a producer you do not control.** The only tools are refusing early and saying when to
   come back: `503 Service Unavailable` (or `429 Too Many Requests` when it is a per-client quota) with a
@@ -89,7 +110,7 @@ L_max = X × W_budget
   control may eventually reach the provider's front end once you stop reading, but generation on its side
   is typically decoupled from socket writes, so it keeps decoding and buffers or bills tokens regardless.
 - **So for an expensive upstream,** a stalled or vanished client should become an explicit decision to
-  cancel, not an implicit pause.
+  cancel, not an implicit pause. For an agent, that includes the tool calls the run would make next.
 
 ### Upstream signals
 - **Your service is also a producer for the provider.** A 429 or 503 from the provider, especially with
@@ -104,7 +125,7 @@ L_max = X × W_budget
 |---|---|---|
 | Backpressure | Slows the producer | Bounded queue, early 503 |
 | Load shedding | Drops work when slowing is impossible, least valuable first | Free tier before paid, background re-indexing before interactive chat |
-| Durable job queue | Moves work that can wait out of the request path, with its own depth limit | Batch embedding |
+| Durable job queue | Moves work that can wait out of the request path, with its own depth limit | Batch embedding, long-running agent tasks |
 
 A well-built service uses all three.
 
@@ -114,7 +135,7 @@ flowing back, each ending in a deliberate wait, slowdown or refusal.
 
 ```mermaid
 flowchart TD
-    C["Client"] -->|"POST /ingest"| E{"Admission check before body or model"}
+    C["Client starts an agent run"] -->|"POST /runs"| E{"Admission check before body or model"}
     E -->|"full"| R["503 or 429 with Retry-After"]
     R -.->|"retry with backoff"| C
     E -->|"room"| Q[("Bounded queue, L_max = X times W_budget")]
@@ -128,8 +149,8 @@ flowchart TD
 
 ## Examples
 ### Bounded ingest queue with all-or-nothing admission
-An ingest endpoint feeding a bounded queue drained by a fixed pool of embedding workers. When the queue is
-full the endpoint rejects at once instead of queueing more work than the workers can finish within the
+The RAG ingest endpoint feeds a bounded queue drained by a fixed pool of embedding workers. When the queue
+is full the endpoint rejects at once instead of queueing more work than the workers can finish within the
 latency budget.
 
 ```python
@@ -191,6 +212,49 @@ Two details make the bound real, plus two caveats:
   That is fine for small JSON batches; for large uploads, admit before reading the body, as described
   above.
 
+### Admitting agent runs: run now, queue, or refuse
+Interactive runs start only if a run slot is free; background runs go to a bounded pending queue and get
+202 with a run ID; everything else gets 503. `start_run` and `enqueue_run` stand in for your agent runner
+and job queue.
+
+```python
+import uuid
+from fastapi import HTTPException, Request
+from fastapi.responses import JSONResponse
+
+MAX_ACTIVE_RUNS, MAX_PENDING = 20, 100          # per worker, from the sizing table below
+
+@app.post("/runs")
+async def create_run(body: dict, request: Request):
+    st = request.app.state                       # active_runs: BoundedSemaphore(20), pending: int
+    if body.get("mode") == "interactive":
+        if st.active_runs.locked():              # no free slot: refuse now, do not queue
+            raise HTTPException(503, "agents busy", headers={"Retry-After": "5"})
+        await st.active_runs.acquire()           # free slot, so this does not wait
+        return start_run(body, release=st.active_runs.release)   # streams events, releases at end
+    if st.pending >= MAX_PENDING:
+        raise HTTPException(503, "run queue full", headers={"Retry-After": "60"})
+    st.pending += 1
+    run_id = str(uuid.uuid4())
+    await enqueue_run(run_id, body)              # durable queue; worker decrements pending on pickup
+    return JSONResponse({"run_id": run_id, "status": "queued"}, status_code=202)
+```
+
+- **In real code** keep the pending count in the durable queue itself, since a per-process counter is lost
+  on restart and differs per worker.
+
+### Worked numbers: sizing agent-run admission
+Illustrative: interactive runs average 30 s and make 5 model calls each; the worker may hold 20 runs.
+
+| Quantity | Value |
+|---|---|
+| Run throughput per worker | 20 / 30 s ≈ 0.67 runs per second |
+| Model calls in flight at full admission | up to 20 (one model call per run at a time) |
+| Burst of 2 runs per second for 60 s | 120 arrive, about 40 can start in that minute |
+| Unbounded admission | 80 extra runs compete for model slots and every run slows |
+| Bounded admission | 80 get fast 503s or move to the background queue |
+| Background queue of 100 at 0.67 runs/s | the last one waits about 150 s, acceptable for a 202 job |
+
 ### Runnable: bounded vs unbounded under the same burst
 Thirty arrivals per second against a 16-per-second stage for 300 seconds. Pure Python, no dependencies.
 
@@ -218,6 +282,9 @@ for bound in (None, 200):
 - **Expose queue depth and time in queue as metrics.** For every bounded queue, publish `qsize()` as a
   gauge and record enqueue-to-dequeue time per item. Alert on depth approaching the bound and on p99 time
   in queue, which move before average latency does.
+- **Admit agent runs, not only requests.** Cap active runs per worker and decide at the start whether a
+  run is interactive (fast 503 when full) or background (202 plus a run ID on a durable queue). Monitor
+  active runs, pending runs, and runs abandoned mid-way for lack of model slots.
 - **Admit before the body is read.** For upload and ingest routes, check capacity in middleware (or take
   the raw `Request`) and reject with 503 and `Retry-After` before streaming the body in. Monitor how much
   request-body bandwidth rejected requests still consume.
@@ -230,9 +297,9 @@ for bound in (None, 200):
   latency of the protected class during overload.
 - **Uvicorn `--limit-concurrency` as a last resort.** Set it above the sum of your own bounds so the
   server-wide 503 only fires if the precise limits fail. Monitor its 503 count separately.
-- **Durable queue for work that can wait.** Route batch embedding and re-indexing to a durable job queue
-  with a depth limit and return 202, keeping in-process queues for short-lived work. Monitor job age and
-  dead-letter counts.
+- **Durable queue for work that can wait.** Route batch embedding, re-indexing and long agent tasks to a
+  durable job queue with a depth limit and return 202, keeping in-process queues for short-lived work.
+  Monitor job age and dead-letter counts.
 
 ## Trade-offs
 - **Predictable latency vs absorbed bursts.** Bounded queues keep latency predictable but reject work
@@ -245,12 +312,18 @@ for bound in (None, 200):
 - **Priority shedding vs classification cost.** Shedding by priority keeps paid or interactive traffic
   healthy under overload, at the cost of classifying requests up front and occasionally failing work that
   was cheap to serve.
+- **Sync agent runs vs 202 jobs.** Streaming a run back on the request is the best experience, but ties
+  capacity to open connections; a 202 job survives disconnects and queues cleanly, at the cost of polling
+  or a separate event channel.
 
 ## Pitfalls
 - **Unbounded `asyncio.Queue()` or unbounded task creation with `create_task` per request.** Symptom:
   memory climbs during a burst and p99 latency rises steadily while CPU looks idle.
 - **Retrying provider 429s immediately at full concurrency.** Symptom: the error rate increases after the
-  first throttle instead of recovering, because retries add load to a saturated dependency.
+  first throttle instead of recovering, because retries add load to a saturated dependency. In agent
+  loops every run retries at once, which makes it worse.
+- **Admitting every agent run and throttling only model calls.** Symptom: during a burst, many runs finish
+  their first step and then stall, so tokens are spent on runs that never complete. Fix: admission per run.
 - **Rejecting only after reading the full body or calling the model.** Overload responses are as
   expensive as successes, so shedding does not relieve anything.
 - **Assuming a paused stream pauses the provider.** A slow or stalled client keeps upstream tokens billing
@@ -262,7 +335,7 @@ for bound in (None, 200):
 
 ## When to use
 - **Design for it** in any service whose slowest stage is a model, a quota or a GPU, which is nearly
-  every AI service.
+  every agent service.
 - **Do:** bound every queue and in-flight pool, decide which requests to reject first, return 503 or 429
   with `Retry-After`, honour the same signals from your providers, and move work that can wait into a
   durable queue.
@@ -299,6 +372,14 @@ depth, and raises real capacity if the overload is normal demand rather than a s
 - **A bigger buffer only delays collapse,** because a deeper queue means longer waits for everything in it,
   until the tail misses client timeouts.
 
+### How would you apply backpressure to an agent service where each run makes several model calls?
+- **Admit at the run level:** cap active runs per worker from run duration and model capacity, because a
+  run that starts and then starves for model slots wastes the tokens it already spent.
+- **Split interactive and background work:** interactive runs get a fast 503 with `Retry-After` when full;
+  long runs go to a durable queue with a depth limit and return 202 with a run ID.
+- **Inside the loop,** back off on provider 429s with jitter within the run's deadline, and lower service
+  concurrency instead of retrying every run at once.
+
 ### How would you size the bound on an in-process queue in front of an embedding stage?
 - **Start from the latency budget,** because the wait at the back of a queue of length *L* in front of a
   stage with throughput *X* is about *L / X*.
@@ -318,13 +399,14 @@ depth, and raises real capacity if the overload is normal demand rather than a s
   awaited `send` stalls and the generator stops being iterated.
 - **The provider typically keeps decoding,** because generation on its side is decoupled from socket
   writes, so tokens are buffered or billed regardless.
-- **So for an expensive upstream,** treat a stalled or vanished client as an explicit decision to cancel.
+- **So for an expensive upstream,** treat a stalled or vanished client as an explicit decision to cancel,
+  including the agent's next tool calls.
 
 ### When would you shed load or use a durable queue instead of just applying backpressure?
 - **Shed when slowing is impossible:** drop the least valuable work first, such as free tier before paid or
   background re-indexing before interactive chat.
-- **Use a durable job queue** for work that can wait, such as batch embedding: return 202, keep its own
-  depth limit, and survive restarts that would lose an in-process queue.
+- **Use a durable job queue** for work that can wait, such as batch embedding or long agent tasks: return
+  202, keep its own depth limit, and survive restarts that would lose an in-process queue.
 - **The trade-off:** classification adds up-front cost and occasionally fails cheap work, but keeps the
   protected class healthy under overload.
 

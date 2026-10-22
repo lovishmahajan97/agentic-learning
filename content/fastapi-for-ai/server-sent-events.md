@@ -5,7 +5,8 @@ name: Server-Sent Events
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/streamingresponse
   - fastapi-for-ai/websockets
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-Server-Sent Events is one-way text streaming in a normal `text/event-stream` HTTP response: `field: value`
-lines, a blank line ending each event. Typed events, plus browsers reconnecting with `Last-Event-ID`, make
-it the default for LLM token streams.
+Server-Sent Events is one-way typed event streaming over a normal `text/event-stream` HTTP response. It is
+the default wire format for agent runs: `token`, `tool_call` and `done` events, keepalives through silent
+tools, and resumption via `Last-Event-ID`.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a sequence of different events (steps, tool calls,
+  tokens, usage, errors), not one text blob. SSE gives each a name, keeps the stream alive through silent
+  tool calls and lets a dropped client catch up instead of paying for a second run.
+- **Where it shows up in your stack.** Both major vendor APIs stream over SSE, so their SDKs parse it for
+  you; your FastAPI agent endpoint re-emits your own vocabulary through `StreamingResponse` or
+  `sse-starlette`, and many agent frameworks' streaming helpers emit it too.
+- **What you control.** The event vocabulary, the keepalive interval relative to the idle timeouts on the
+  path, event ids plus a per-run buffer for resumption, and the explicit `done` that ends a run.
+- **What you can skip.** Memorising every vendor's event names; write one adapter and check the vendor
+  docs when you build it. `EventSource` internals matter only if you write the frontend.
 
 ## Why it exists
 - **Bytes are not messages.** `StreamingResponse` gets bytes out early, but a chat client must tell a
@@ -131,6 +144,19 @@ Vocabularies differ by vendor and by API generation, so check the current docs.
 Define your own small vocabulary (`token`, `tool_call`, `usage`, `done`, `error`) and translate, so
 swapping the model provider never changes the frontend.
 
+### Mapping an agent loop onto events
+| Agent loop moment | Your event | Notes |
+|---|---|---|
+| iteration starts | `step` | include the step number and the step budget |
+| model requests a tool | `tool_call` | tool name and safe arguments, never secrets |
+| tool returns | `tool_result` | a summary; keep the raw result in agent state |
+| answer tokens | `token` | coalesce tiny deltas if event volume hurts |
+| run ends | `usage`, then `done` or `error` | `done` is what makes the client call `close()` |
+
+- **One run, one id.** The run id ties the SSE stream to the trace, the replay buffer and the eval record.
+- **A human-approval pause is just another event.** An agent waiting for a person to approve a tool call
+  emits an `approval_needed` event and goes quiet, so keepalives and resumption matter even more.
+
 ## Diagram
 A resumable run: the worker writes every event to a per-run buffer, so a reconnect with `Last-Event-ID`
 replays the gap instead of starting a second billed generation.
@@ -154,14 +180,14 @@ sequenceDiagram
 ```
 
 ## Examples
-### FastAPI SSE endpoint with keepalives
+### FastAPI SSE endpoint for an agent run, with keepalives
 Built directly on `StreamingResponse`:
-- **Producer task plus queue.** The model stream feeds a queue, so the consumer can wait with a timeout
-  and emit a keepalive comment during silent phases without cancelling the producer.
+- **Producer task plus queue.** The agent loop feeds a queue, so the consumer can wait with a timeout
+  and emit a keepalive comment during silent tool calls without cancelling the producer.
 - **Monotonic ids.** This endpoint does not replay, but those ids are exactly what a resume endpoint (see
   Resumability) would key its buffer on.
 - **When the ping fires.** With tokens 0.3 s apart nothing is silent for 15 s, so the ping fires only if
-  the model stalls, for instance during a long tool call.
+  the model stalls, for instance during the long tool call simulated here (one ping during its 20 s).
 
 ```python
 import asyncio, json
@@ -177,18 +203,21 @@ class Ask(BaseModel):
 def sse(event: str, data: dict, id: int) -> str:
     return f"event: {event}\nid: {id}\ndata: {json.dumps(data)}\n\n"   # blank line dispatches
 
-async def model_stream(prompt: str):                  # stand-in for your SDK's async stream
+async def agent_loop(prompt: str):                    # stand-in for your loop over an SDK stream
+    yield "tool_call", {"name": "web_search", "args": {"q": prompt}}
+    await asyncio.sleep(20)                           # a slow tool: 20 s of silence on the wire
+    yield "tool_result", {"name": "web_search", "summary": "3 results"}
     for w in "Server-sent events frame the tokens.".split():
-        await asyncio.sleep(0.3); yield w + " "
+        await asyncio.sleep(0.3); yield "token", {"delta": w + " "}
 
-@app.post("/chat")
-async def chat(body: Ask):
+@app.post("/agent/run")
+async def run(body: Ask):
     q: asyncio.Queue = asyncio.Queue()
 
     async def produce():
         try:
-            async for piece in model_stream(body.prompt):
-                await q.put(("token", {"delta": piece}))
+            async for event, data in agent_loop(body.prompt):
+                await q.put((event, data))
             await q.put(("done", {}))
         except Exception as exc:
             await q.put(("error", {"message": str(exc)}))
@@ -255,6 +284,10 @@ one tool call.
 | Ping + per-run buffer | drop on mobile instead, reconnect with `Last-Event-ID: 42` | events 43+ replayed, no second run |
 
 ## Production patterns
+- **Decouple the agent run from the stream.** Agent teams start the run in a worker (or a background
+  task for short runs), write events to the per-run buffer, and make the SSE route a reader of it, so a
+  closed tab neither kills a paid run nor starts a second one. Monitor runs completed with no reader
+  attached and duplicate runs per user request.
 - **Own a small event vocabulary.** For any user-facing stream, translate vendor events into `token`,
   `tool_call`, `usage`, `done`, `error` in one adapter module, so a provider switch is a backend change.
   Monitor parser errors reported by the frontend.
@@ -363,6 +396,14 @@ rather than inside the request's generator, and the response generator becomes a
   ever needs the tail of a live or just-finished run, not history.
 - **Shrink the event count if needed.** Coalesce token deltas into small time batches (tens of
   milliseconds) before buffering, which users do not notice, and monitor Redis memory and replay length.
+
+### Your agent pauses for human approval before a risky tool call. How does the SSE stream handle it?
+- **Emit a typed pause event.** Send `approval_needed` with the run id and the proposed tool call, then
+  keep pinging, because the stream may be silent for minutes while a person decides.
+- **Do not hold the run in the request.** Persist the run state, end or idle the stream, and resume the
+  agent in a worker when the approval arrives via a separate POST.
+- **Resume the stream by event id.** The client reconnects with `Last-Event-ID` and receives the events
+  produced after approval from the per-run buffer.
 
 ## Quiz
 ### Q: What does a line beginning with a colon mean in an SSE stream?

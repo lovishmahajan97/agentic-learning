@@ -5,7 +5,8 @@ name: Memory & performance profiling
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/gil
   - python-for-ai/asyncio-vs-threads-vs-multiprocessing
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Profiling replaces guessing: CPU profilers show which functions consume time, memory profilers which lines
-allocated the bytes still alive. AI services often wait on network or GPU and hold native buffers Python's
-own tools cannot see, so pick the tool by the question.
+Profiling replaces guessing about slow or memory-hungry agents: CPU profilers show where time goes, memory
+profilers which lines allocated the bytes still alive. Agent steps mostly wait on models and tools, so
+measure wall versus CPU time first.
+
+## For agent builders
+- **Why it matters for agents.** "The agent is slow" is usually sequential tool or model calls, not
+  Python, and "the agent server gets OOM-killed" is usually transcripts, caches or session state that
+  never get evicted. Profiling tells you which, before you rewrite the wrong thing.
+- **Where it shows up in your stack.** Trace waterfalls in LangSmith, Langfuse or an OpenTelemetry
+  backend answer "where did this step's time go" across model and tool calls; `py-spy` answers it inside
+  one Python worker; `tracemalloc` and `memray` explain RSS growth in long-lived agent servers; the
+  `torch.cuda` APIs cover self-hosted embedding or reranker models.
+- **What you control.** Whether independent tool calls run concurrently, how session memory is bounded
+  (step caps, compaction, TTL eviction), worker recycling, and which benchmarks gate a performance change.
+- **What you can skip.** Micro-optimizing prompt-building or JSON parsing code. In an agent it is rarely
+  more than a sliver of a step that waits seconds on a model.
 
 ## Why it exists
 - **Two tickets dominate.** "The pipeline is slow" and "the worker gets OOM-killed after a few hours", and
@@ -61,6 +75,8 @@ Three axes decide it: CPU or wall time, Python heap or native memory, dev box or
   show time inside the event loop's selector.
 - **The fix is then** concurrency, batching or caching, and the right measurement is a trace with spans per
   remote call, not a function profile.
+- **Agent steps are almost always in this bucket:** a step is a model call plus tool calls, each a network
+  wait, so the first lever is running independent tool calls concurrently and trimming model calls.
 
 ### Deterministic profiling: cProfile
 - **How:** `cProfile` (stdlib) hooks every call and return, recording call counts, `tottime` (time inside
@@ -218,6 +234,56 @@ measure(tokenize_loop, 20_000)      # wall ≈ cpu -> CPU-bound
 
 The 0.5 threshold is a rule of thumb for the demo, not a standard.
 
+### Agent scenario: session memory that never shrinks
+An agent server keeps each conversation's transcript in a dict keyed by session ID. tracemalloc shows the
+growth line; the fix bounds both the number of sessions and the transcript per session. Standard library
+only.
+
+```python
+import tracemalloc
+from collections import OrderedDict, deque
+
+SESSIONS: dict[str, list[str]] = {}                      # the bug: no eviction, no cap per session
+
+def agent_step(sid: str, i: int) -> None:
+    turn = f"tool result {i}: " + "x" * 2_000             # stands in for a large tool output
+    SESSIONS.setdefault(sid, []).append(turn)
+
+tracemalloc.start()
+before = tracemalloc.take_snapshot()
+for i in range(20_000):
+    agent_step(f"s{i % 2_000}", i)                        # 2,000 sessions, 10 steps each
+after = tracemalloc.take_snapshot()
+print(after.compare_to(before, "lineno")[0])              # points at the `turn = ...` line
+tracemalloc.stop()
+
+class BoundedSessions:                                    # the fix: LRU over sessions, cap per session
+    def __init__(self, max_sessions: int = 500, max_turns: int = 50) -> None:
+        self._d: OrderedDict[str, deque] = OrderedDict()
+        self._max_s, self._max_t = max_sessions, max_turns
+    def append(self, sid: str, turn: str) -> None:
+        q = self._d.pop(sid, None) or deque(maxlen=self._max_t)
+        q.append(turn)
+        self._d[sid] = q                                  # most recent at the end
+        if len(self._d) > self._max_s:
+            self._d.popitem(last=False)                   # evict least recently used session
+```
+
+In production, durable conversation state belongs in a store (Redis, Postgres or a LangGraph
+checkpointer); the in-process structure should only be a bounded cache.
+
+### Worked scenario: an agent step that "needed a faster model"
+A support agent's step took about 8 s at p95. Wall versus CPU time and a trace told a different story
+(illustrative numbers from one run).
+
+| Measurement | Value | Inference |
+|---|---|---|
+| Step wall time | ~8 s | user-visible |
+| Step CPU time in the worker | ~0.3 s | over 95% of the step is waiting |
+| Trace: model call | ~2 s | not the main cost |
+| Trace: 3 independent tool calls, sequential | ~2 s each | ~6 s spent waiting one after another |
+| After running them with `asyncio.gather` | ~2 s for all three | step drops to ~4 s, same model |
+
 ### Worked scenario: the OOM-killed ingestion worker
 Same facts as Check yourself, walked as a diagnosis.
 
@@ -229,6 +295,12 @@ Same facts as Check yourself, walked as a diagnosis.
 | RSS after fix | flat, or plateaus | if it plateaus, recycle workers after N jobs |
 
 ## Production patterns
+- **Trace every agent step before tuning it.** Give each model call, tool call and retrieval its own span
+  (LangSmith, Langfuse or OpenTelemetry) and look at the waterfall; sequential independent spans are the
+  most common fix. Monitor p95 step latency and tool-span share per agent.
+- **Bound agent state in the process.** Cap steps per run and turns per session, compact old turns, and
+  evict idle sessions to an external store. Monitor RSS per worker against active sessions; RSS that
+  grows while sessions stay flat means something else is retaining transcripts.
 - **Attach py-spy to a misbehaving worker.** `py-spy record -o flame.svg --pid <PID>` (add `--idle` for
   waiting threads) or `py-spy dump --pid <PID>` for a hang. In containers this needs ptrace permission, for
   example adding the `SYS_PTRACE` capability to a debug pod. Keep sessions short and watch overhead.
@@ -258,6 +330,9 @@ Same facts as Check yourself, walked as a diagnosis.
   wall time is dominated by remote calls; batching or parallelizing those calls is the larger lever.
 
 ## Pitfalls
+- **Profiling the agent worker when the time is in remote calls.** Symptom: a flame graph full of event
+  loop and SSL frames, and no speedup after optimizing Python. Fix: look at the trace waterfall for
+  sequential model and tool spans first.
 - **cProfile on an I/O-bound async service,** then "optimizing" the top entry. Symptom: the selector or event
   loop dominates and latency does not improve. Fix: measure wall vs CPU first, then trace.
 - **Treating high RSS after a peak as a leak.** Symptom: memory plateaus under steady load rather than
@@ -312,12 +387,21 @@ unbounded (a real leak). Then fix, rerun the same workload, and confirm RSS stay
   safe to attach to a live production worker.
 - **Typical order:** sample first to find the hot area, then a deterministic or line profile of that function.
 
-### A RAG endpoint's p95 is 3 s. How do you find out where the time goes?
+### A RAG agent's p95 is 3 s. How do you find out where the time goes?
 - **Start with wall vs CPU time:** if `time.process_time()` is a small fraction of `time.perf_counter()`, the
   request is waiting on network or GPU, not computing.
 - **If waiting:** add trace spans per LLM, embedding and vector-store call; sequential remote calls are the
   usual culprit, fixed by concurrency or batching.
 - **If CPU-bound:** take a py-spy flame graph, then confirm the fix with p50 and p95 under the same load script.
+
+### Your long-running agent server's RSS climbs all day and it gets OOM-killed overnight. How do you approach it?
+- **Confirm the slope:** RSS that climbs under steady load, not a plateau, while active sessions stay
+  roughly constant.
+- **Diff the Python heap:** tracemalloc snapshots around a burst of runs usually point at transcript,
+  tool-output or cache lines; then find the retainer, often a module-level session dict or an unbounded
+  `lru_cache`.
+- **Fix and verify:** cap turns per session, evict idle sessions to an external store, re-run the
+  diff; if the heap is flat but RSS still grows, use `memray` for native buffers.
 
 ### Why can't you trust `perf_counter()` around a PyTorch forward pass on a GPU?
 - **Kernels launch asynchronously,** so the timer measures how long it took to queue the work.

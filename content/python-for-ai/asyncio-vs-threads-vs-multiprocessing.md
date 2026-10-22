@@ -5,7 +5,8 @@ name: asyncio vs threads vs multiprocessing
 kind: decision
 difficulty: core
 est_minutes: 17
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/asyncio
   - python-for-ai/gil
@@ -21,24 +22,38 @@ sources:
 ---
 
 ## TL;DR
-Pick by what the work waits on: asyncio for many network waits, threads for blocking libraries and
-GIL-releasing C code, processes for CPU-bound pure Python. AI pipelines mix all three: async core,
-`asyncio.to_thread` for blocking SDKs, a process pool for parsing.
+Run each agent tool where its waiting fits: asyncio for model and API calls, threads for blocking SDKs
+and GIL-releasing C code, processes for CPU-bound Python. Keep an async core, bridged by
+`asyncio.to_thread` and a process pool.
+
+## For agent builders
+- **Why it matters for agents.** An agent loop is mostly network waits (model, search, MCP servers), but
+  its tools are a mix: a sync database driver, a vendor SDK with no async client, a PDF parser or code
+  linter that burns CPU. Each tool must run where it cannot freeze the loop that serves every session.
+- **Where it shows up in your stack.** FastAPI and Uvicorn workers serving the agent, `asyncio.to_thread`
+  around sync tools (frameworks such as LangChain also run sync tools in a thread pool when invoked
+  asynchronously), and process pools or separate workers for RAG ingestion and document parsing.
+- **What you control.** Which executor each tool uses, the size of the default thread pool, process-pool
+  `initializer=`, `chunksize=` and start method, and how many server workers fit your memory budget.
+- **What you can skip.** Writing your own process orchestration or shared-memory schemes. Learn the
+  decision procedure and the bridges; reach for a job queue when CPU work outgrows one machine.
 
 ## Why it exists
-- **AI backends do two kinds of work.** Most wall-clock time is waiting (model provider, embedding API,
-  vector database, S3 download). Some is pure CPU (parsing PDFs, chunking, tokenising, JSON-schema
-  validation of large outputs, local re-ranking). Each of Python's three models fits only some of it.
+- **Agent backends do two kinds of work.** Most wall-clock time is waiting (model provider, embedding API,
+  vector database, S3 download, web search tool). Some is pure CPU (parsing PDFs, chunking, tokenising,
+  JSON-schema validation of large tool outputs, local re-ranking). Each of Python's three models fits only
+  some of it.
 - **"Everything async" breaks on the first sync library** (a vendor SDK, a PDF parser, a database driver
-  without async support): it blocks the event loop and every concurrent request stalls behind it.
+  without async support inside a tool): it blocks the event loop and every concurrent agent session stalls
+  behind it.
 - **"Everything threads" does not speed up pure-Python CPU work**, because in standard CPython the GIL
   lets only one thread run bytecode at a time, and thousands of threads for thousands of in-flight
-  requests are heavy.
+  sessions are heavy.
 - **"Everything multiprocessing" costs memory and pickling.** Each process has its own memory, model copies
   and connection pools, and every argument and result is pickled across a pipe, which can cost more than
   the work itself.
-- **Getting it wrong is quietly expensive.** Usually not a crash, but a service whose throughput does not
-  move however many workers you add.
+- **Getting it wrong is quietly expensive.** Usually not a crash, but an agent service whose throughput
+  does not move however many workers you add.
 
 ## How it works
 ### The three models at a glance
@@ -49,6 +64,7 @@ GIL-releasing C code, processes for CPU-bound pure Python. AI pipelines mix all 
 | Practical count | Tens of thousands of waits on one thread | Hundreds to low thousands | About the core count |
 | Shared state | Shared; races only across awaits | Shared; needs `threading.Lock` | No shared heap; data is pickled |
 | Main cost | Every layer must be async | GIL for pure Python | Pickling, startup, memory per worker |
+| Agent fit | The loop, model calls, async tools | Sync SDK tools, NumPy-heavy tools | Parsing, chunking, CPU-heavy tools |
 
 ### asyncio: one thread, many waits
 - **Mechanism.** An event loop multiplexes sockets and resumes coroutines when their I/O is ready.
@@ -90,7 +106,7 @@ GIL-releasing C code, processes for CPU-bound pure Python. AI pipelines mix all 
   (`len(pickle.dumps(arg))` and a quick timing tell you).
 - **Batch small items** into chunks (`chunksize=` on `map`) until compute dominates.
 
-### A decision procedure
+### A decision procedure (per tool or pipeline stage)
 1. **Measure first:** wall time, process CPU time and per-core utilisation for a representative run.
 2. **CPU well below one core while latency is high:** you are waiting. Use asyncio if the libraries are
    async, threads if they are blocking. Either way, bound concurrency to what the dependency allows.
@@ -110,25 +126,79 @@ GIL-releasing C code, processes for CPU-bound pure Python. AI pipelines mix all 
   Python version before relying on it.
 
 ## Diagram
-The decision procedure as a path: measure first, then let what the work waits on pick the model. Mixed
-workloads keep one async core and bridge out to the matching executor.
+The decision procedure, applied to each tool or pipeline stage: measure first, then let what the work
+waits on pick the model. Mixed agents keep one async core and bridge out.
 
 ```mermaid
 flowchart TD
-    M["Measure: wall time, CPU time, per-core use"] --> Q1{"CPU well below one core while latency is high?"}
-    Q1 -->|"yes, waiting on I/O"| Q2{"Are the libraries async?"}
-    Q2 -->|"yes"| A["asyncio, bounded by a Semaphore"]
-    Q2 -->|"no, blocking SDK"| T["Threads, via asyncio.to_thread"]
-    Q1 -->|"no, CPU busy"| Q3{"Hot path in GIL-releasing native code?"}
-    Q3 -->|"yes, several cores busy"| T2["Threads: share memory and weights"]
-    Q3 -->|"no, one core pinned"| P["ProcessPoolExecutor with batching, or native code"]
-    A --> MIX["Mixed work: async core plus run_in_executor bridges"]
+    M["Measure wall time, CPU, cores"] --> Q1{"CPU low while latency high?"}
+    Q1 -->|"yes, waiting on I/O"| Q2{"Library async?"}
+    Q2 -->|"yes"| A["asyncio plus a Semaphore"]
+    Q2 -->|"no, blocking SDK"| T["Threads via asyncio.to_thread"]
+    Q1 -->|"no, CPU busy"| Q3{"Native code releases GIL?"}
+    Q3 -->|"yes, several cores busy"| T2["Threads, shared weights"]
+    Q3 -->|"no, one core pinned"| P["Process pool, batched"]
+    A --> MIX["Async core plus executor bridges"]
     T --> MIX
     P --> MIX
 ```
 
 ## Examples
-### Worked scenario: ingesting 2,000 PDFs
+### Routing agent tools to the right executor
+One dispatcher decides per tool: async tools are awaited, blocking tools go to a bounded thread pool, and
+CPU-heavy tools go to a process pool. Tool bodies are stand-ins.
+
+```python
+import asyncio, time
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+async def web_search(q):            # async client: await directly
+    await asyncio.sleep(0.4); return f"results for {q}"
+
+def crm_lookup(user_id):            # sync vendor SDK: blocks, releases GIL on I/O
+    time.sleep(0.3); return {"id": user_id, "tier": "gold"}
+
+def parse_attachment(text):         # pure-Python CPU: holds the GIL
+    return sum(ord(c) % 7 for c in text * 2000)
+
+TOOLS = {"web_search": ("async", web_search),
+         "crm_lookup": ("thread", crm_lookup),
+         "parse_attachment": ("process", parse_attachment)}
+
+async def run_tool(name, arg, procs):
+    kind, fn = TOOLS[name]
+    loop = asyncio.get_running_loop()
+    if kind == "async":
+        return await fn(arg)
+    if kind == "thread":
+        return await asyncio.to_thread(fn, arg)           # default executor, bounded below
+    return await loop.run_in_executor(procs, fn, arg)     # fn and arg must be picklable
+
+async def main():
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=16))
+    with ProcessPoolExecutor(max_workers=4) as procs:
+        t = time.perf_counter()
+        calls = [("web_search", "refund policy"), ("crm_lookup", 7),
+                 ("parse_attachment", "invoice line " * 500)]
+        out = await asyncio.gather(*(run_tool(n, a, procs) for n, a in calls))
+        print(f"{len(out)} tools in {time.perf_counter() - t:.2f}s; loop never blocked")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Worked scenario: one agent step with three tools
+Illustrative numbers for a step where the model requested a web search (0.4 s network), a CRM lookup
+through a sync SDK (0.3 s network) and parsing an attachment (0.8 s pure-Python CPU), on a worker serving
+50 other sessions.
+
+| Design | Step time | Effect on other sessions |
+|---|---|---|
+| All three called directly in the coroutine | 0.4 + 0.3 + 0.8 = 1.5 s, sequential | Loop frozen for 1.1 s (CRM plus parse) |
+| Search awaited, CRM and parse via `to_thread` | about 0.8 s | Loop free, but the parse still holds the GIL, so other sessions' Python work is slowed while it runs |
+| Search awaited, CRM via `to_thread`, parse in a process pool | about 0.8 s | Loop free and the parse runs on another core |
+
+### Worked scenario: ingesting 2,000 PDFs for an agent's RAG index
 Illustrative numbers. Each PDF: download from S3 (about 0.3 s, network), extract text with a pure-Python
 parser (about 0.5 s CPU), embed chunks via an API (about 0.4 s, network). 8-core machine.
 
@@ -188,6 +258,9 @@ What to expect (one laptop run, illustrative, not a benchmark):
   the parent dominated until batching made compute the larger share.
 
 ## Production patterns
+- **Classify every tool by executor.** Keep a registry that marks each agent tool async, thread or process,
+  and route through one dispatcher as above, so a new sync tool cannot land on the loop by accident.
+  Monitor loop lag and per-tool latency.
 - **Bound the default thread pool.** At startup, call
   `loop.set_default_executor(ThreadPoolExecutor(max_workers=N))` so `to_thread` calls to a slow sync SDK
   cannot grow without limit. Monitor executor queue length and the latency of offloaded calls.
@@ -196,29 +269,28 @@ What to expect (one laptop run, illustrative, not a benchmark):
 - **Choose the start method explicitly.** Pass `mp_context=multiprocessing.get_context("spawn")` (or
   `"forkserver"`) when the parent has threads or CUDA, instead of relying on the platform default. Watch
   for intermittent worker hangs, the fork-with-threads fingerprint.
-- **Batch CPU tasks.** Send hundreds of small documents per task (`chunksize=` or explicit batches) and
-  tune the size empirically against throughput. Monitor tasks/s and the parent process's CPU.
-- **Split CPU work into its own service.** Run parsing and chunking as queue-fed workers scaled separately
-  from the I/O-bound API tier. Monitor queue depth and age of the oldest job.
+- **Batch CPU tasks and split them out.** Send hundreds of small documents per task (`chunksize=` or explicit
+  batches), and run RAG parsing and chunking as queue-fed workers scaled separately from the I/O-bound
+  agent API tier. Monitor tasks/s, queue depth and age of the oldest job.
 - **Size server workers against memory.** Each Uvicorn/Gunicorn worker process duplicates models and pools,
   so set the worker count from the memory budget, not only from cores. Monitor RSS per worker.
 
 ## Trade-offs
 - **Concurrency per byte vs async everywhere.** asyncio gives the most concurrency per byte of memory but
-  demands async libraries throughout; one synchronous dependency in the hot path makes threads the
-  pragmatic choice.
+  demands async libraries throughout; one synchronous tool dependency in the hot path makes threads the
+  pragmatic choice for that tool.
 - **Easy parallel I/O vs no CPU gain.** Threads are the easiest way to parallelise blocking SDK calls, but
   shared state needs locks and pure-Python CPU work gains nothing. That flips when the CPU work is in
   GIL-releasing native code.
 - **Real CPU parallelism vs overhead.** Processes pay pickling, startup and memory per worker; they stop
   paying off when each task is so small that serialisation dominates the compute.
-- **Free scaling vs memory.** Separate server workers (Uvicorn/Gunicorn processes) scale a web tier across
-  cores without code changes, but multiply model memory and connection pools per worker, which matters
-  with local models.
+- **Free scaling vs memory.** Separate server workers (Uvicorn/Gunicorn processes) scale an agent tier
+  across cores without code changes, but multiply model memory and connection pools per worker, which
+  matters with local models and embedding models loaded in-process.
 
 ## Pitfalls
-- **A synchronous SDK or `requests` inside `async def`.** Symptom: p99 latency rises for all requests on a
-  worker while CPU stays low. Fix: async client or `to_thread`.
+- **A synchronous SDK or `requests` inside an `async def` tool.** Symptom: p99 latency rises for all
+  sessions on a worker while CPU stays low. Fix: async client or `to_thread`.
 - **Threads to speed up pure-Python parsing or tokenisation.** Symptom: CPU sits at about one core and wall
   time barely changes. Fix: processes or native code.
 - **Large objects per task to a process pool** (documents, NumPy arrays, model weights). Symptom: profiling
@@ -231,8 +303,8 @@ What to expect (one laptop run, illustrative, not a benchmark):
 
 ## When to use
 - **Measure first.** CPU low while latency is high means I/O-bound; one core pinned means CPU-bound in Python.
-- **API server calling LLMs and vector stores:** asyncio with async clients such as `httpx` or the official
-  async SDKs; wrap unavoidable blocking calls in `asyncio.to_thread`.
+- **Agent API calling LLMs, tools and vector stores:** asyncio with async clients such as `httpx` or the
+  official async SDKs; wrap unavoidable blocking tools in `asyncio.to_thread`.
 - **Heavy parsing, chunking or local inference preprocessing:** a process pool, or a separate worker service.
 - **GPU inference:** the work runs in native code, and a dedicated serving engine usually beats rolling your
   own concurrency.
@@ -272,9 +344,16 @@ empirical. If the hot loop can be expressed as vectorised Polars string operatio
 - **Processes** each have their own interpreter and GIL, so CPU-bound Python scales across cores at the
   cost of pickling, startup and memory per worker.
 
-### An async API calls a vendor SDK that has no async client. How do you integrate it?
+### Your agent has a web-search tool, a sync CRM SDK tool and a PDF-parsing tool. How do you run them?
+- **Search is awaited directly** on the loop with an async client, inside a semaphore and a timeout.
+- **The CRM tool goes through `asyncio.to_thread`** with a bounded default executor, because it blocks on
+  I/O and releases the GIL while waiting.
+- **The parser goes to a process pool** (or a separate worker service), because pure-Python CPU work would
+  otherwise hold the GIL and slow every session; check that its inputs and outputs pickle cheaply.
+
+### An async agent API calls a vendor SDK that has no async client. How do you integrate it?
 - **Offload each call** with `await asyncio.to_thread(sdk_call, ...)`, so the event loop keeps serving
-  other requests while the call blocks in a worker thread.
+  other sessions while the call blocks in a worker thread.
 - **Bound the pool:** set `loop.set_default_executor(ThreadPoolExecutor(max_workers=N))` at startup and
   cap in-flight calls, because each offloaded call holds a thread.
 - **Monitor** executor queue length and offloaded-call latency, and switch to an async client when one
@@ -295,11 +374,11 @@ empirical. If the hot loop can be expressed as vectorised Polars string operatio
   `if __name__ == "__main__":` guard and models must load in the initializer, not at import.
 - **Pass the context explicitly** with `mp_context=` rather than relying on platform defaults.
 
-### How do you size Uvicorn or Gunicorn workers for a service that loads a local model?
+### How do you size Uvicorn or Gunicorn workers for an agent service that loads a local model?
 - **Memory first:** each worker process duplicates the model and connection pools, so the count comes
   from the memory budget divided by per-worker RSS, not only from cores.
-- **Keep the I/O tier async** so each worker handles many concurrent requests, and move CPU-heavy parsing
-  to a separately scaled queue-fed worker service.
+- **Keep the I/O tier async** so each worker handles many concurrent agent sessions, and move CPU-heavy
+  parsing to a separately scaled queue-fed worker service.
 - **Monitor** RSS per worker, queue depth and oldest-job age.
 
 ## Quiz

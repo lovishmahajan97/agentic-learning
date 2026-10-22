@@ -5,7 +5,8 @@ name: KV-cache paging & eviction
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - serving-inference/pagedattention
   - serving-inference/kv-cache-memory-estimation
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Paging stores each request's KV cache in fixed-size blocks behind a block table, like OS virtual memory,
-so sequences grow without reserving their maximum or fragmenting the pool. Eviction handles overflow:
-preempt sequences, drop cached prefixes, or (lossily) drop tokens.
+Paging stores each agent step's KV cache in fixed-size blocks behind a block table, so transcripts grow
+without fragmenting the pool. Eviction handles overflow: preempt sequences, drop cached prefixes (an idle
+agent's transcript), or lossily drop tokens.
+
+## For agent builders
+- **Why it matters for agents.** While your agent waits on a tool, its transcript's blocks are
+  unreferenced cached prefix, first in line for LRU eviction. Under load, a slow tool means the next step
+  re-prefills the whole transcript; an oversubscribed pool also preempts steps mid-generation.
+- **Where it shows up in your stack.** Self-hosted engines: vLLM's preemption counter and block metrics,
+  SGLang's radix cache, host-memory prefix tiers (SGLang's hierarchical cache, LMCache with vLLM). Hosted
+  APIs hide it, but cache-hit fields in usage reveal evictions.
+- **What you control.** Admission limits (`max_num_seqs`, `max_model_len`), whether long-lived agent
+  prefixes get a host-memory tier, routing steps back to the same replica, and keeping in-sequence token
+  eviction off unless an agent eval approves it.
+- **What you can skip.** The PagedAttention kernel itself and block-table data structures beyond the
+  toy below.
 
 ## Why it exists
 - **Final length is unknown.** A request's cache grows one token per decode step until the model emits a
@@ -97,6 +111,10 @@ Consequences that follow directly:
   are long and reused across minutes.
 - **SGLang's radix tree.** It organizes cached prefixes as a radix tree and evicts leaves
   least-recently-used, which keeps shared ancestors (the system prompt) resident longest.
+- **What this means for an agent between steps.** When a step finishes, its blocks drop to zero
+  references and become cached prefix. The longer the tool runs and the busier the pool, the likelier the
+  transcript's tail (its newest, least-shared blocks) is evicted before the next step arrives. The shared
+  system prompt and tool schemas usually survive.
 
 ### Eviction inside a sequence
 - **Exact for sliding-window models.** They attend only to the last *W* positions, so older blocks can be
@@ -112,17 +130,19 @@ Consequences that follow directly:
 - **Preemptions above zero under normal load** mean admission is too optimistic for the sequence-length
   distribution.
 - **Falling prefix hit rate with rising cache usage** means the pool is too small for both duties.
+- **For agents,** compare cached-token share on steps that followed a slow tool with steps that followed a
+  fast one; a gap means transcripts are being evicted during tool waits.
 
 ## Diagram
 What the engine does when a running sequence needs a new block: free list first, then unreferenced cached
-prefixes, and only then preemption.
+prefixes (including transcripts of agents waiting on tools), and only then preemption.
 
 ```mermaid
 flowchart TD
     N["Sequence needs a new block"] --> F{"Free block available?"}
     F -->|"yes"| A["Append to block table"]
     F -->|"no"| C{"Unreferenced cached prefix block?"}
-    C -->|"yes"| E["Evict LRU prefix block"]
+    C -->|"yes"| E["Evict LRU prefix block, e.g. idle agent"]
     E --> A
     C -->|"no"| P["Preempt newest sequence"]
     P --> M{"Preemption mode"}
@@ -223,6 +243,36 @@ for name, kv, params in [("GQA 8B", GQA, 8), ("MHA 7B", MHA, 7)]:
 - **Read it as:** the thin GQA cache favours swap, and more so at long lengths once attention's quadratic
   term is added; the fat MHA cache favours recompute. Recompute also competes with live decode for
   compute, which this sketch ignores.
+
+### Agent scenario: the transcript evicted during a slow tool call
+A research agent on the 8B GQA model has a 20,000-token transcript and calls a web-scrape tool that takes
+30 s. The pool is busy, so its unreferenced blocks are evicted LRU before the next step. Same illustrative
+figures as above.
+
+| Next step finds | What runs | Extra latency on that step |
+|---|---|---|
+| Whole transcript still cached | prefill only the ~1,000-token tool result | ~18 ms |
+| System prompt and tools cached (6,000), rest evicted | re-prefill ~15,000 tokens | ~267 ms |
+| Everything evicted | re-prefill 21,000 tokens | ~373 ms |
+| Evicted to a host-memory tier | copy ~2.6 GB back over the host link, then prefill ~1,000 | ~105 ms + ~18 ms |
+
+```python
+KV = 128 * 1024
+ctx, new = 20_000, 1_000
+print("hit:", round(recompute_ms(8, new)), "ms")
+print("tail evicted:", round(recompute_ms(8, ctx - 6_000 + new)), "ms")
+print("all evicted:", round(recompute_ms(8, ctx + new)), "ms")
+print("host tier:", round(swap_ms(KV, ctx) / 2), "ms in +", round(recompute_ms(8, new)), "ms")
+```
+
+- **Read it as:** one miss costs a few hundred milliseconds per step on this model (more on bigger models
+  or longer transcripts) and burns prefill compute other agents needed. Across a 20-step run with many
+  slow tools, misses can dominate task latency.
+
+## Production patterns
+- **Keep agent transcripts resident across tool waits.** Route every step of a run to the same replica,
+  leave headroom in the pool so idle prefixes survive, and add a host-memory tier when tool waits are
+  long. Monitor prefix hit rate on the step after each tool call, split by tool latency.
 
 ## Production patterns
 - **Alert on preemptions, not memory percent.** Page on the engine's preemption counter (in vLLM,

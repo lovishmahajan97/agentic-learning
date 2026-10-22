@@ -5,7 +5,8 @@ name: Model Context Protocol (MCP)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/mcp-authentication-authorization-transport-security
   - agents/a2a-protocol
@@ -21,9 +22,23 @@ sources:
 ---
 
 ## TL;DR
-MCP, an open protocol Anthropic released in November 2024, standardizes how AI applications connect to
-capability servers exposing tools, resources and prompts over JSON-RPC. Integrations are written once; it
-does not remove authentication, trust decisions or tool-set curation.
+MCP, an open protocol Anthropic released in November 2024, standardizes how agents connect to capability
+servers exposing tools, resources and prompts over JSON-RPC. Integrations are written once; it does not
+remove authentication, trust decisions or tool-set curation.
+
+## For agent builders
+- **Why it matters for agents.** It is the common way to give an agent tools you did not write (GitHub,
+  databases, SaaS APIs) and to expose your tools to agents you do not run. Each server you connect
+  adds tool definitions to every request and a new trust boundary to your harness.
+- **Where it shows up in your stack.** Hosts such as Claude Desktop, Claude Code and IDE agents; the
+  official Python SDK's `FastMCP` for servers; `langchain-mcp-adapters` (`MultiServerMCPClient`) to load
+  MCP tools into LangChain or LangGraph; MCP server classes in the OpenAI Agents SDK; the Claude Agent
+  SDK's `mcp_servers` option; and provider-side remote MCP connectors.
+- **What you control.** Which servers and which of their tools reach the model, name prefixes,
+  authentication, your own side-effect classes and approval gates, timeouts, and what happens when a
+  server dies mid-run.
+- **What you can skip.** The full specification. Know the handshake, `tools/list`, `tools/call`, the two
+  error channels and the transports; the SDKs handle the rest.
 
 ## Why it exists
 - **Every framework had its own plugin format.** A vendor wanting its database, ticketing system or document
@@ -369,6 +384,13 @@ set and check latency and error rates per server before go-live.
 - **Version negotiation:** the client states its revision, the server picks the one it will use.
 - **Capability negotiation:** each side uses only features both declared, *because* hosts and servers upgrade
   on different schedules, so an unsupported feature is simply not used rather than failing at runtime.
+
+### You load three vendor MCP servers into a LangGraph agent and tool accuracy drops. What do you do?
+- **Count what you added:** every tool from every server is now in context, so check the tool count and
+  the token overhead per request.
+- **Curate:** expose only the tools the agent needs, prefix names by server, and rewrite vague
+  descriptions in your own registry.
+- **Re-run the selection eval** on the curated set, and treat the vendor descriptions as untrusted input.
 
 ## Quiz
 ### Q: Which MCP primitive is "model-controlled", meaning the model decides when to invoke it?

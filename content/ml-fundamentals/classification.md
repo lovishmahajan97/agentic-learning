@@ -5,7 +5,8 @@ name: Classification
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - ml-fundamentals/regression
   - ml-fundamentals/loss-functions
@@ -22,13 +23,25 @@ sources:
 ---
 
 ## TL;DR
-Classification predicts which of a fixed set of categories an input belongs to: score each class, turn
-scores into probabilities, then apply a separate decision rule that encodes the cost of each mistake.
-Every LLM token is a classification over the vocabulary.
+An agent is full of classifiers: the intent router, tool selection, guardrails and LLM-as-judge pass/fail.
+Each should score classes, turn scores into probabilities, then apply a separate threshold that encodes
+the cost of each mistake.
+
+## For agent builders
+- **Why it matters for agents.** Every branch in an agent is a discrete decision: which tool, which
+  sub-agent, block or allow, escalate or answer, pass or fail in an eval. Treating them as classifiers
+  gives you a confusion matrix, a tunable threshold and an abstain path instead of a silent wrong turn.
+- **Where it shows up in your stack.** Router prompts or small fine-tuned routers, safety and PII filters,
+  judge prompts that output a label, and the tool choice inside the model itself (every generated token
+  is a classification over the vocabulary).
+- **What you control.** The label set (tool names, intents), whether you read token log-probabilities or
+  only text, the threshold per route, and when to hand off to a human.
+- **What you can skip.** Deriving logistic regression by hand and generative-versus-discriminative
+  theory. Know cross-entropy, softmax versus sigmoid, the expected-cost threshold and the metric family.
 
 ## Why it exists
-- **Many decisions are discrete.** Spam or not, which team handles this ticket, which intent, is this
-  answer grounded in the source, which token comes next.
+- **Many decisions are discrete.** Spam or not, which team handles this ticket, which intent, which tool
+  to call, is this answer grounded in the source, which token comes next.
 - **Hand-written rules fail.** They are brittle, do not scale to thousands of edge cases, and produce no
   notion of confidence; a rule either fires or it does not, so there is no way to send borderline cases to
   a human.
@@ -38,12 +51,12 @@ Every LLM token is a classification over the vocabulary.
 - **What is needed:** one score per class, a loss that rewards putting probability on the correct class
   and nothing else, and a decision rule that accounts for asymmetric costs.
 - **The probability matters on its own.** A 0.51 spam score and a 0.99 spam score should lead to
-  different actions (flag for review versus delete), and a downstream system can only make that
-  distinction if the classifier exposes it. Classification formalises the split: estimate
-  P(class | input), then decide.
+  different actions (flag for review versus delete), and a downstream system, such as an agent deciding
+  whether to act, can only make that distinction if the classifier exposes it. Estimate P(class | input),
+  then decide.
 
 ## How it works
-### From features to scores
+### Background: from features to scores
 1. **Linear scores.** A linear classifier computes z = Wx + b: one score per class, from a weight vector
    per class.
 2. **Binary: sigmoid.** Logistic regression has one logit and p = σ(z) = 1/(1 + e^(−z)). Inverting the
@@ -57,7 +70,7 @@ Every LLM token is a classification over the vocabulary.
 Other model families end the same way, with a score per class:
 - **Neural networks** replace the raw features x with learned features and keep the same final linear
   layer. In a transformer the "LM head" is exactly this: a linear map from the hidden state to
-  vocabulary-sized logits followed by softmax.
+  vocabulary-sized logits followed by softmax. When your agent's LLM picks a tool name, it is classifying.
 - **Tree ensembles** partition the feature space instead of drawing linear boundaries.
 - **k-nearest-neighbours** votes among similar training points.
 
@@ -70,7 +83,7 @@ Other model families end the same way, with a score per class:
 - **Cross-entropy, −log p_y,** the negative log probability assigned to the true class.
 - **Why:** it is the maximum-likelihood objective for a categorical outcome, and its gradient with
   respect to the logits is simply p − onehot(y): large when the model is confidently wrong, near zero when
-  it is confidently right.
+  it is confidently right. The same loss trains the LLM and any router you fine-tune.
 - **Squared error on probabilities loses that property,** which is why it trains badly for classes. The
   loss-functions lesson derives this.
 
@@ -87,13 +100,15 @@ missed fraud costs 10x a false alarm  ->  threshold = 1/11 ≈ 0.09, not 0.5
 ```
 
 - **Needs calibration.** This only works if p is calibrated, which is why calibration is a separate lesson.
+- **Agents add a third option: abstain.** Below a confidence cutoff the agent asks a clarifying question
+  or hands off to a human, which is often cheaper than either error.
 
 ### Binary, multiclass, multilabel
-| Shape | Output layer | Decision |
-|---|---|---|
-| Binary | one logit, sigmoid | one threshold |
-| Multiclass (exactly one label) | K logits, softmax | argmax, or a threshold on the top probability with an "abstain" branch for low-confidence cases |
-| Multilabel (any subset of K tags) | K logits, independent sigmoids | per-tag thresholds |
+| Shape | Output layer | Decision | Agent example |
+|---|---|---|---|
+| Binary | one logit, sigmoid | one threshold | guardrail allow or block |
+| Multiclass (exactly one label) | K logits, softmax | argmax, or a threshold on the top probability with an "abstain" branch for low-confidence cases | intent router, next tool |
+| Multilabel (any subset of K tags) | K logits, independent sigmoids | per-tag thresholds | policy categories a reply violates |
 
 - **Softmax is wrong for multilabel,** because it forces the tags to compete for a total of one.
 - **Ordinal and hierarchical labels** (small, medium, large; department, then team) need their own
@@ -101,7 +116,7 @@ missed fraud costs 10x a false alarm  ->  threshold = 1/11 ≈ 0.09, not 0.5
 
 ### Evaluation
 - **Accuracy misleads whenever classes are imbalanced:** with 1% positives, predicting "negative" always
-  scores 99%.
+  scores 99%. Most guardrail and escalation classes are rare.
 - **Use the metric family:** the confusion matrix shows where errors go; precision, recall and F1
   summarise it at one threshold; ROC-AUC and PR-AUC summarise ranking quality across thresholds;
   calibration checks whether a 0.8 means 80%. The metric lessons in this module cover each.
@@ -135,6 +150,37 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: a router with an abstain branch
+The router scores each intent from label-token log-probabilities (or a small classifier), normalises them
+and only dispatches when the top class is confident enough; otherwise the agent asks the user.
+
+```python
+import math
+
+def route(label_logprobs, tau=0.7):
+    """label_logprobs: {intent: log-probability of that label}, read from the model or a classifier."""
+    m = max(label_logprobs.values())
+    exp = {k: math.exp(v - m) for k, v in label_logprobs.items()}
+    total = sum(exp.values())
+    probs = {k: v / total for k, v in exp.items()}        # softmax over the closed label set
+    best = max(probs, key=probs.get)
+    return (best, probs[best]) if probs[best] >= tau else ("ask_clarifying_question", probs[best])
+
+print(route({"refund": -0.1, "shipping": -2.5, "account": -4.0}))   # ('refund', ~0.90)
+print(route({"refund": -0.9, "shipping": -1.0, "account": -2.0}))   # abstains: top prob ~0.45
+```
+
+Worked numbers for choosing τ on 1,000 labelled conversations (illustrative):
+
+| τ | Auto-routed | Wrong tool among auto-routed | Clarifying questions |
+|---|---|---|---|
+| 0.5 | 960 | 58 | 40 |
+| 0.7 | 870 | 17 | 130 |
+| 0.9 | 640 | 4 | 360 |
+
+If a wrong tool call costs a refund reversal and a clarifying question costs one extra turn, 0.7 is the
+usual compromise; the table, not intuition, picks it.
+
 ### Same model, two thresholds
 A fraud-style problem with 3% positives. The same trained model gives very different operating points
 depending on the threshold; the threshold, not the model, is where the business decision lives.
@@ -165,8 +211,8 @@ for tau in (0.5, 1 / 11):
 ```
 
 ### Worked scenario: undoing a rebalanced training set
-A team trained on a 50/50 rebalanced set; production has 3% positives. For a single binary logit, add the
-log of the ratio of prior odds: log((0.03/0.97) / (0.5/0.5)) ≈ −3.48.
+A team trained a guardrail on a 50/50 rebalanced set; production has 3% positives. For a single binary
+logit, add the log of the ratio of prior odds: log((0.03/0.97) / (0.5/0.5)) ≈ −3.48.
 
 | Score from the rebalanced model | Corrected probability at 3% prior |
 |---|---|
@@ -190,22 +236,24 @@ print(round(correct_prior(0.8), 2))   # 0.11
 ```
 
 ## Production patterns
-- **Return probabilities, decide in config.** The service returns the score; the threshold lives in
-  configuration per route or customer, so changing an operating point needs no retrain. Monitor flag rate
-  and precision on a weekly labelled sample.
+- **Return probabilities, decide in config.** The router or guardrail service returns the score; the
+  threshold lives in configuration per route or customer, so changing an operating point needs no retrain
+  or prompt change. Monitor flag rate and precision on a weekly labelled sample.
+- **Constrain the label set, then read log-probabilities.** Give the router an enum of tool or intent
+  names (structured output or a closed list in the prompt) and score those label tokens rather than
+  parsing free text. Monitor the share of outputs outside the label set; it should be zero.
 - **Pick the threshold on a held-out set at the natural distribution.** Sweep τ with scikit-learn
   `precision_recall_curve`, pick the point that meets the cost or recall target, and record it with the
-  model version. Monitor recall on the rare class after each deploy.
+  model and prompt version. Monitor recall on the rare class after each deploy.
 - **Calibrate before thresholding.** Wrap the model in scikit-learn `CalibratedClassifierCV` (sigmoid or
   isotonic) or fit temperature scaling on a validation set. Monitor a reliability curve and expected
   calibration error per release.
-- **Abstain to a human on low confidence.** Route predictions whose top probability falls below a cutoff
-  to a review queue. Monitor queue volume and the accuracy of auto-handled cases.
-- **Embed-then-logistic-regression baseline.** Before fine-tuning or prompting, fit logistic regression
-  on frozen embeddings; it is cheap and often good enough. Monitor per-class recall against the prompted
-  LLM on the same held-out set.
-- **Watch class-distribution drift.** Log the predicted class distribution daily and alert when it moves
-  sharply from the training mix, then re-label a fresh sample.
+- **Abstain to a human or a clarifying question on low confidence.** Route predictions whose top
+  probability falls below a cutoff to a review queue or back to the user. Monitor queue volume and the
+  accuracy of auto-handled cases.
+- **Embed-then-logistic-regression router before an LLM router.** Fit logistic regression on frozen
+  embeddings; it is cheap, fast and often good enough. Compare per-class recall against the prompted LLM
+  on the same held-out set, and log the predicted class distribution daily to catch drift.
 
 ## Trade-offs
 - **Tunable probabilities vs calibration upkeep.** Exposing probabilities with a tunable threshold is more
@@ -215,11 +263,11 @@ print(round(correct_prior(0.8), 2))   # 0.11
   but is wrong for overlapping labels; switch to per-label sigmoids the moment one input can legitimately
   carry two tags.
 - **Prompted LLM vs trained classifier.** The LLM needs no labelled data and changes in minutes, but costs
-  more per call, adds latency and gives no calibrated score. Once you have a few thousand labels and real
-  throughput, a trained small classifier usually wins on all three.
-- **Fine taxonomy vs examples per class.** Finer labels are more useful but give fewer examples per class,
-  so tail classes degrade. A coarse classifier followed by a fine one within each branch flips the balance
-  when tail classes matter.
+  more per call, adds latency to every agent step and gives no calibrated score. Once you have a few
+  thousand labels and real throughput, a trained small classifier usually wins on all three.
+- **Fine taxonomy vs examples per class.** Finer labels (more tools, more intents) are more useful but
+  give fewer examples per class, so tail classes degrade. A coarse classifier followed by a fine one
+  within each branch flips the balance when tail classes matter.
 
 ## Pitfalls
 - **Reporting accuracy on imbalanced data.** Symptom: 99% accuracy from a model that never predicts the
@@ -231,7 +279,8 @@ print(round(correct_prior(0.8), 2))   # 0.11
 - **Using softmax for a multilabel task.** Symptom: the model can never assign two tags to one document
   and splits probability between them instead.
 - **Vague or overlapping class definitions.** Symptom: low inter-annotator agreement and a confusion
-  matrix whose errors concentrate between the same two classes, a ceiling no model can break.
+  matrix whose errors concentrate between the same two classes, a ceiling no model can break. In agents
+  this looks like two tools with overlapping descriptions that the model confuses.
 - **Training rebalanced, deploying on the natural distribution.** Symptom: systematic over-prediction of
   the minority class and miscalibrated probabilities. If only the class priors changed, add
   log(π_prod / π_train) to each class's softmax logit (for a single binary logit, the log of the ratio of
@@ -239,7 +288,8 @@ print(round(correct_prior(0.8), 2))   # 0.11
 
 ## When to use
 - **Use when** the output is a choice from a fixed set and you can state what each kind of error costs.
-  Day to day it appears as routing, guardrails, intent detection, triage and judge pass/fail decisions.
+  Day to day it appears as routing, tool selection, guardrails, intent detection, triage and judge
+  pass/fail decisions.
 - **Avoid when** the label set is open-ended or changes weekly (use extraction, retrieval or generation),
   or when the "class" is really a quantity in disguise (regression).
 - **Measure** with a confusion matrix at the deployed threshold, one threshold-free metric for ranking
@@ -283,13 +333,21 @@ and periodic re-labelling, because the input distribution will move.
   reliability curve first.
 - **Sanity check:** confirm the resulting flag volume is something operations can actually review.
 
-### Your intent router has 95% accuracy but users complain about one intent. How do you debug it?
+### Your agent's intent router has 95% accuracy but users complain about one intent. How do you debug it?
 - **Per-class recall and the confusion matrix** show whether that intent is being absorbed by a
   neighbour.
 - **Check label definitions:** if errors concentrate between two classes, look at annotator agreement on
-  that pair; overlapping definitions set a ceiling.
-- **Fix** with clearer guidelines, more examples for the tail class, or a per-class threshold, then
-  re-measure that class specifically.
+  that pair and at the two tool descriptions; overlapping definitions set a ceiling.
+- **Fix** with clearer descriptions and guidelines, more examples for the tail class, or a per-class
+  threshold, then re-measure that class specifically.
+
+### How would you evaluate tool selection in an agent as a classification problem?
+- **Build a labelled set** of (conversation state, correct tool or no tool) pairs from reviewed traces,
+  including cases where the right answer is to ask the user.
+- **Report a confusion matrix over tools** plus per-tool recall, because a frequent tool hides a rare,
+  expensive one.
+- **Re-run it on every prompt, tool-schema or model change,** since adding one tool can steal
+  probability from its neighbours.
 
 ### When would you use a prompted LLM instead of a trained classifier?
 - **Use the LLM** with no labels, a label set that changes often, or low volume where per-call cost does
@@ -302,7 +360,8 @@ and periodic re-labelling, because the input distribution will move.
 - **Not from its words:** verbal confidence is poorly calibrated.
 - **Read token log-probabilities** of the label tokens, constrained to the label set, and normalise across
   labels.
-- **Calibrate** those scores on a labelled validation set, then threshold them like any other classifier.
+- **Calibrate** those scores on a labelled validation set, then threshold them like any other classifier,
+  with an abstain branch for the agent below the cutoff.
 
 ## Quiz
 ### Q: Why not treat a K-class problem as regression on the label index 0..K−1?

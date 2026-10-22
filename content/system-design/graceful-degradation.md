@@ -5,7 +5,8 @@ name: Graceful degradation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - system-design/model-fallback-strategies
   - reliability/backpressure-and-load-shedding
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-When the AI path fails, slows, overspends or overloads, step down to a cheaper, simpler, honestly labelled
-version instead of falling over, using a designed ladder with triggers, hysteresis and exercised paths.
-Fallbacks change the provider; degradation keeps users moving by changing the function.
+When an agent's model path fails, slows, overspends or overloads, step down to a cheaper, simpler,
+honestly labelled mode (fewer steps, read-only tools, cache, human handoff) instead of failing. Fallbacks
+change the provider; degradation changes the function.
+
+## For agent builders
+- **Why it matters for agents.** Agents are the most expensive and most failure-prone path in a product:
+  many calls, many tools, long runs. Under an incident or budget pressure you need predefined smaller
+  modes, such as fewer steps, a smaller model, no write tools, or "here is what I found so far".
+- **Where it shows up in your stack.** The agent's config per level (model alias, max steps, allowed
+  tools), a feature-flag service for the level and kill switch, the step-budget and recursion limits in
+  your framework (LangGraph has a recursion limit per run), and a human-handoff path.
+- **What you control.** The ladder per agent, triggers with hysteresis, which tools are disabled first
+  (writes before reads), what partial result the user gets when the budget ends, and the label that says
+  so.
+- **What you can skip.** Elaborate load-shedding infrastructure for an internal prototype. Even then, keep
+  a kill switch and a step cap; they are cheap and stop the worst incidents.
 
 ## Why it exists
 - **Most AI features enhance a product that already worked:** search, support, editors, dashboards. A
@@ -54,6 +68,16 @@ Fallbacks change the provider; degradation keeps users moving by changing the fu
 
 For each level write down what the user sees, what it costs, and who gets it.
 
+### Agent-specific levels
+- **Shrink the loop first.** Lower max steps and tokens per run, then drop to a smaller model for
+  executor steps, keeping the strong model for the final answer as long as budget allows.
+- **Disable write tools before read tools.** A read-only agent ("I drafted the refund; an agent will
+  apply it") keeps most value and removes the riskiest actions while the system is unhealthy.
+- **Return progress, not nothing.** When the step or time budget ends, return what was gathered (sources,
+  intermediate findings) with a label, and offer to continue later.
+- **Queue instead of run.** Long background agent tasks can be deferred to off-peak with a promised
+  completion time, which frees capacity for interactive users.
+
 ### Triggers
 - **Dependency health:** breaker state, error rate, p95 latency.
 - **Load:** queue depth, concurrency.
@@ -70,6 +94,8 @@ For each level write down what the user sees, what it costs, and who gets it.
   Reduced when p95 exceeds 4 s; leave only after p95 has stayed under 2.5 s for ten minutes.
 - **The gap between 4 s and 2.5 s** stops a signal hovering near one threshold from toggling the level on
   every sample.
+- **Pin the level per agent run.** Read it once at run start so one run does not switch models and tools
+  halfway through.
 
 ### Budget triggers: projected burn, not spend so far
 | Trigger | When it fires on a heavy day | Effect |
@@ -80,11 +106,11 @@ For each level write down what the user sees, what it costs, and who gets it.
 ### Shed by priority, isolate by class
 1. **Classify requests:** interactive versus batch, paying versus free, critical versus nice-to-have.
 2. **Shed batch and low tiers first.**
-3. **Reserve capacity** for critical interactive traffic in its own bulkhead, so a batch backfill can never
-   starve the chat box.
+3. **Reserve capacity** for critical interactive traffic in its own bulkhead, so a batch backfill (or a
+   fleet of background agents) can never starve the chat box.
 4. **Shed at admission, before any tokens are spent.** A request abandoned after generation started has
    already paid for the work it throws away, and under overload that waste is exactly the capacity you
-   were short of.
+   were short of. For agents, admission means before step 1.
 
 ### Deadlines and partial results
 - **Give each request a deadline** and return what you have when it expires: retrieved passages without
@@ -130,6 +156,50 @@ stateDiagram-v2
 ```
 
 ## Examples
+### Agent configuration per degradation level
+The level is read once at run start and mapped to a config the agent loop obeys. Write tools go first;
+the user always gets a labelled result. Model aliases and tool names are placeholders.
+
+```python
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class AgentMode:
+    model: str
+    max_steps: int
+    tools: frozenset
+    label: str | None
+
+READ = frozenset({"search_kb", "get_order"})
+WRITE = frozenset({"issue_refund", "send_email"})
+MODES = {
+    0: AgentMode("strong", 15, READ | WRITE, None),
+    1: AgentMode("fast", 5, READ | WRITE, "Reduced-quality answer"),
+    2: AgentMode("fast", 3, READ, "Read-only mode: actions are drafted for a human to approve"),
+}
+
+def mode_for_run(level):
+    return MODES.get(level)            # None: levels 3-4, no agent; show search results or a handoff
+
+def on_budget_exhausted(findings, mode):
+    """Never return nothing: return what the run gathered, labelled, with a way to continue."""
+    return {"answer": None, "partial": findings[-5:],
+            "label": f"Stopped after {mode.max_steps} steps; here is what was found so far",
+            "actions": ["continue later", "hand off to a human"]}
+```
+
+### Worked scenario: a research agent under budget pressure
+Illustrative: strong-model step ~$0.06, fast-model step ~$0.01; 2,000 runs a day; daily cap $1,500.
+
+| Mode | Steps per run | Cost per run | Daily cost at 2,000 runs |
+|---|---|---|---|
+| Level 0, full | 15 | 15 × $0.06 = $0.90 | $1,800, over the cap |
+| Level 1, reduced | 5 | 5 × $0.01 = $0.05 | $100 |
+| Mixed: paying users full (1,200 runs), free users reduced (800 runs) | | | $1,080 + $40 = $1,120, under the cap |
+
+- **Lesson:** priority shedding by tier keeps paying users at full quality all day, instead of a cliff for
+  everyone when the cap is hit.
+
 ### Support-answer endpoint with a degradation ladder
 A background task refreshes `h`, a health snapshot, every few seconds; the handler picks a level, enforces a
 deadline, and steps down rather than raising when a stage fails. `keyword_or_vector_search`, `generate`,
@@ -226,26 +296,30 @@ Illustrative: daily cap $500, a heavy day where spend reaches $150 by 10:00 and 
 | Spend so far: $150 + $40/h reaches $500 | about 18:45 | Everyone drops straight to Cached for the rest of the day |
 
 ## Production patterns
-- **Levels as runtime flags.** Read the forced level and the kill switch per request from your
-  feature-flag service or a config key, never from code, so mitigation is a flag flip, not a deploy. Name
-  each flag in the runbook. Monitor flag changes with who and when, and time from alert to flip.
+- **Levels as runtime flags.** Read the forced level and the kill switch per request (per agent run) from
+  your feature-flag service or a config key, never from code, so mitigation is a flag flip, not a deploy.
+  Name each flag in the runbook. Monitor flag changes with who and when, and time from alert to flip.
+- **Read-only switch for agents.** Keep a flag that removes write tools from every agent's tool list and
+  routes drafted actions to a human approval queue. Flip it during incidents, suspected prompt injection
+  or a bad deploy. Monitor drafted-action backlog and approval latency.
 - **Admission-time bulkheads.** Give each request class its own concurrency pool (for example a separate
-  semaphore or worker pool for batch with a hard cap) and reject over-limit batch work with 503 and a
-  `Retry-After` before any model call. Monitor shed rate per class and interactive p95 during batch runs.
+  semaphore or worker pool for batch and background agents with a hard cap) and reject over-limit batch
+  work with 503 and a `Retry-After` before any model call. Monitor shed rate per class and interactive p95
+  during batch runs.
 - **Projected-burn budget job.** Every few minutes compute `spent + current_rate × hours_left` per feature
   and tenant, and write the resulting level into the health snapshot. Monitor projected versus actual
   end-of-day spend and hours spent at each budget-driven level.
-- **Synthetic checks per level.** Run a canary query against each level on a schedule by forcing the level
-  with a test-only header or flag, and fail the check if the non-AI index is stale or a credential is
-  expired. Monitor canary success per level, not only for Level 0.
-- **Level-mix SLO.** Emit the served level as a metric label on every response and set an SLO on the share
-  of sessions at Level 0, alerting on burn rate. Monitor the level histogram per tenant, so one noisy
-  tenant's degradation is visible.
+- **Synthetic checks per level.** Run a canary query or agent task against each level on a schedule by
+  forcing the level with a test-only header or flag, and fail the check if the non-AI index is stale or a
+  credential is expired. Monitor canary success per level, not only for Level 0.
+- **Level-mix SLO.** Emit the served level as a metric label on every response and agent run, and set an
+  SLO on the share of sessions at Level 0, alerting on burn rate. Monitor the level histogram per tenant,
+  so one noisy tenant's degradation is visible.
 
 ## Trade-offs
 - **Survival vs code-path cost.** The product survives incidents, but you maintain several code paths and
-  an eval for each. When the AI feature *is* the product, degrade within AI levels and then be honest,
-  since no non-AI path exists.
+  an eval for each. When the AI feature (the agent) *is* the product, degrade within AI levels and then be
+  honest, since no non-AI path exists.
 - **Trust vs visible degradation.** Honest labelling preserves trust but shows degradation to users and
   competitors; where outputs are acted on, visibility is the correct default and the trade is rarely worth
   reversing.
@@ -266,6 +340,8 @@ Illustrative: daily cap $500, a heavy day where spend reaches $150 by 10:00 and 
   quality complaints or a bill that dropped for no known reason.
 - **Flapping between levels.** Symptom: a user gets a fast reduced answer, then a slow full one, then a
   cached one within a single session, which reads as randomness.
+- **Switching level mid agent run.** Symptom: a run plans with the strong model's tools and then executes
+  without them, producing half-finished actions. Fix: pin the level at run start.
 - **Degrading to something more expensive,** such as retries or a larger fallback model. Symptom: cost
   rises during the incident instead of falling.
 - **A kill switch that requires a deploy.** Symptom: a 40-minute mitigation for a 2-minute decision.
@@ -273,11 +349,12 @@ Illustrative: daily cap $500, a heavy day where spend reaches $150 by 10:00 and 
   nobody is degraded while that tenant's queue grows unbounded.
 
 ## When to use
-- **Use for** any user-facing AI feature with an SLO; design the ladder alongside the non-functional
-  requirements, because the levels shape the architecture (what stays deterministic, where caches live,
-  which flags exist).
+- **Use for** any user-facing AI feature or agent with an SLO; design the ladder alongside the
+  non-functional requirements, because the levels shape the architecture (what stays deterministic, where
+  caches live, which flags exist).
 - **Skip the ladder for** offline batch work, which usually needs only retry-later.
-- **Agree degraded behaviour before go-live** with product and, in customer deployments, with the customer.
+- **Agree degraded behaviour before go-live** with product and, in customer deployments, with the customer,
+  including which agent actions become drafts in read-only mode.
 - **Measure:** time per level, outcomes per level and recovery time; set an SLO on the share of sessions
   served at full quality.
 - **Interviews:** distinguish degradation from fallback, then describe the ladder, triggers with
@@ -305,13 +382,21 @@ SLO, for example the share of sessions served at full quality, and agree the dri
 works.
 
 ## Interview questions
-### Why is a model fallback not enough on its own to keep an AI feature available?
+### Why is a model fallback not enough on its own to keep an agent available?
 - **A fallback changes the provider, not the function:** it handles a provider outage, but not overload,
   budget exhaustion or a latency SLO the fallback also misses.
-- **Degradation changes the function** to something cheaper and simpler (smaller model, cache, non-AI path,
-  honest message), so an incident lowers spend instead of raising it.
+- **Degradation changes the function** to something cheaper and simpler (fewer steps, smaller model, cache,
+  non-AI path, honest message), so an incident lowers spend instead of raising it.
 - **AI adds a trust failure** too: a produced answer that failed its grounding check should be demoted to
   sources-only, not shown.
+
+### Design the degradation ladder for a support agent that can issue refunds.
+- **Level 0:** strong model, full tool set, 15-step budget. **Level 1:** fast model for executor steps,
+  5-step budget, same tools.
+- **Level 2, read-only:** write tools removed; refunds are drafted for a human to approve, which keeps
+  most value while the system is unhealthy.
+- **Below that:** knowledge-base search results, then an honest handoff to a human; pin the level per run
+  and label every degraded answer.
 
 ### Users report answers flipping between fast and slow, short and full, within one session. What is wrong?
 - **No hysteresis:** a single threshold near the signal's typical value toggles the level on every sample,
@@ -334,8 +419,8 @@ works.
   because a half answer can mislead.
 
 ### How do you prove each degraded level actually works before an incident?
-- **Exercise it routinely:** send a small share of traffic through each level and run synthetic checks that
-  fail on a stale non-AI index or an expired credential.
+- **Exercise it routinely:** send a small share of traffic (and canary agent tasks) through each level and
+  run synthetic checks that fail on a stale non-AI index or an expired credential.
 - **Make every level a runtime flag** named in the runbook, so mitigation is a flag flip, not a deploy.
 - **Hold game days** and track time per level, outcomes per level and time to recover to full.
 

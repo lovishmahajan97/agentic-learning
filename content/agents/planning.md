@@ -5,7 +5,8 @@ name: Planning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-loop
   - agents/task-decomposition
@@ -23,9 +24,23 @@ sources:
 ---
 
 ## TL;DR
-Planning is how an agent decides which actions to take and in what order. An explicit plan gives the
-loop a target to measure progress against and a place to replan; where planning lives trades tokens for
-robustness.
+Planning is how your agent decides which tool calls to make and in what order. An explicit plan gives
+the loop a target to check progress against and a hook to replan; where planning lives trades tokens for
+robustness on long tasks.
+
+## For agent builders
+- **Why it matters for agents.** Past roughly five tool calls, a greedy loop drifts: it repeats work,
+  forgets the goal and stops when the last output looks fine. A plan with step statuses is the cheapest
+  fix, and it is also what lets a human approve the approach before side effects.
+- **Where it shows up in your stack.** LangGraph, where plan-then-execute and ReWOO are graphs of planner,
+  executor and replanner nodes with the plan held in graph state; todo-list tools in coding agents (Claude
+  Code's todo tool, LangChain's deep agents planning tool); and step caps such as LangGraph's
+  `recursion_limit` or the OpenAI Agents SDK's `max_turns`.
+- **What you control.** Where planning lives (interleaved, up front, placeholders or search), the plan
+  schema and its `done_when` checks, whether the plan is re-injected each turn, replan triggers and the
+  step and replan budgets.
+- **What you can skip.** PDDL and classical planners unless your domain is fully formalised, and tree
+  search unless you have a cheap, reliable evaluator such as a test suite.
 
 ## Why it exists
 - **The basic loop is greedy.** Look at the conversation, choose one tool call, observe, repeat. Fine for
@@ -250,6 +265,9 @@ Interleaved grows quadratically, so doubling to 20 steps more than triples its t
 - **Budgets on steps and replans.** Set explicit limits (for example 20 steps, 3 replans) and return a
   status report rather than an exception when they trip. Monitor replans per task and budget-exhausted
   rate.
+- **Count planner calls in traces.** Tag planner, executor and verifier spans separately in your tracing
+  tool (LangSmith, or any OpenTelemetry backend) so a dashboard shows planner calls per tool call and
+  replans per task. Alert when the ratio climbs, which is the signature of over-eager replanning.
 - **Plan against the real tool list.** Put the available tool names and descriptions in the planner prompt
   and reject plan steps that need tools the agent lacks before execution starts. Monitor plan validation
   failures.
@@ -343,6 +361,14 @@ batch. Better still, "matched" should be a deterministic check on stored records
   with steps²; with 2,000 stable and 1,000 per observation, 20 steps is about 230,000 input tokens.
 - **Plan-then-execute:** one planner call plus 20 small executor and verify calls, roughly linear, so
   tens of thousands. Prompt caching lowers price, not attention dilution.
+
+### How would you build plan-then-execute in a graph framework such as LangGraph?
+- **Keep the plan in state, not in messages.** State holds the step list with statuses and results; a
+  planner node writes it, an executor node runs the next pending step, a verify node checks `done_when`.
+- **Route with conditional edges:** pass goes back to the executor or ends, a second failure goes to the
+  replanner while the replan count is under its cap, otherwise to a give-up node.
+- **Persist with a checkpointer** so a crashed run resumes from the last verified step, and add an
+  approval interrupt before side-effecting steps.
 
 ## Quiz
 ### Q: Why does plan-then-execute often beat interleaved ReAct on long tasks?

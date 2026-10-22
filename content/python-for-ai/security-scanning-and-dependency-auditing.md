@@ -5,7 +5,8 @@ name: Security scanning & dependency auditing (pip-audit, Bandit)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
   - python-for-ai/uv-poetry-pip
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-**pip-audit** checks your exact installed versions against vulnerability databases; **Bandit** scans your
-own code for risky patterns like `pickle.load`, `eval`, `shell=True` and hard-coded secrets. Both run in
-seconds in CI; neither proves code safe, they free reviewers for design-level risks.
+**pip-audit** checks an agent's exact locked dependencies against vulnerability databases; **Bandit** scans
+your agent and tool code for risky patterns like `pickle.load`, `eval`, `shell=True` and hard-coded keys.
+Both run in seconds in CI; neither proves an agent safe.
+
+## For agent builders
+- **Why it matters for agents.** Agents turn model output into actions: shell commands, SQL, file paths,
+  HTTP calls. The patterns Bandit flags (`shell=True`, `eval`, string-built SQL) are exactly where model
+  output becomes code execution, and the agent's large dependency graph is where known CVEs hide.
+- **Where it shows up in your stack.** LangChain community integrations, MCP server packages, provider
+  SDKs, parsers for retrieved documents and model loaders all arrive through your lock; pip-audit runs on
+  that lock in CI, Bandit or Ruff `S` rules run on your tool code, and a secret scanner guards the API keys
+  agents need.
+- **What you control.** Which tool and integration packages are admitted, the CI gate and its expiring
+  suppressions, a model-artifact policy (safetensors, pinned revisions), and whether a code-executing
+  agent may install packages at runtime, from which index.
+- **What you can skip.** Building your own vulnerability database or data-flow analyzer. Prompt
+  injection and tool authorization are design problems; scanners will not find them.
 
 ## Why it exists
 - **An AI service is mostly third-party code:** an LLM SDK, an HTTP stack, a web framework, tokenizers,
@@ -103,6 +118,8 @@ A finding is the start of a decision, not the decision. A useful order:
 |---|---|
 | **Malicious or typosquatted packages** with no CVE | locks with hashes, approved indexes or mirrors, reviewing new dependencies |
 | **Logic and authorization bugs**, prompt injection, data leakage between tenants | design and review |
+| **Over-privileged agent tools** (a shell tool, unrestricted SQL, unscoped API tokens) | least-privilege tool design, allowlists, sandboxes, human approval for writes |
+| **Packages an agent installs at runtime**, including hallucinated names an attacker registered | no runtime installs, or an allowlisted internal index inside the sandbox |
 | **Secrets already committed** | dedicated secret scanners (gitleaks, trufflehog) search history, which Bandit's string heuristics do not |
 | **Model artifacts** | prefer safetensors over pickle-based checkpoints, pin model revisions, avoid `trust_remote_code=True` for unreviewed repositories |
 | **Reachability** (vulnerable function present but never called) | tools such as OSV-Scanner, Dependabot alerts, Safety or Snyk differ in databases and triage features; choose by workflow |
@@ -167,6 +184,19 @@ cfg_safe = yaml.safe_load(open("agent.yaml"))
   shell) on `run_tool_safe`, plus `B403` for `import pickle`. Both are low severity; review them once rather
   than suppressing them by default.
 
+### Agent scenario: what each control covers in a coding agent
+A coding agent with a shell tool, a SQL tool and community integrations. Map each risk to the control
+that can actually see it.
+
+| Risk in the agent | pip-audit | Bandit / Ruff `S` | What actually covers it |
+|---|---|---|---|
+| CVE in an HTTP parser pulled in by an integration | yes, on the exported lock | no | upgrade through the lock, scheduled audits |
+| Tool runs model output with `shell=True` | no | yes, `B602` | no shell, argv allowlist, sandbox, timeout |
+| SQL tool formats model output into a query | no | yes, `B608` | parameters, read-only DB role, row limits |
+| `API_KEY = "sk-..."` in a tool module | no | missed (B105 matches names like `password`) | gitleaks or trufflehog, keys from a secrets manager |
+| Agent runs `pip install` for a package name it invented | no | no | block runtime installs, or an allowlisted index in the sandbox |
+| Prompt injection in a retrieved page asks the agent to email data | no | no | tool permissions, output filtering, human approval |
+
 ### Scanner configuration kept in the repo
 Bandit reads `[tool.bandit]` from `pyproject.toml` when you pass the file with `-c` (install `bandit[toml]`);
 the Ruff block is the in-linter alternative. Pick one.
@@ -196,6 +226,15 @@ pip-audit on the exported lock reports an advisory in `jinja2`, pulled in by a w
 | Record | `--ignore-vuln <ID>` in the CI script with reason and review date | revisit when the framework ships support |
 
 ## Production patterns
+- **Scan tool code with the strictest settings.** Run Bandit (or Ruff `S` rules) on the agent's tool
+  modules without the `-ll` severity floor, because tools are where model output meets subprocess, SQL
+  and the filesystem. Review every `# nosec` in a tool module like a permission grant.
+- **Admit agent integrations like any dependency.** Review new LangChain integration, MCP server or tool
+  packages before adding them (maintainer, release history, what they can reach), lock them with hashes,
+  and keep them in the scheduled audit. Track the number of tool packages per agent.
+- **No runtime installs from public indexes.** Code-executing agents get a sandbox image with
+  preinstalled, audited packages, or an allowlisted internal index; models sometimes suggest package
+  names that do not exist, and attackers can register them.
 - **Audit the artifact that ships.** In CI export the lock (`uv export --format requirements-txt ...`) and
   run `pip-audit -r req.txt --no-deps --disable-pip`, never the developer's environment. Track open findings
   and time from advisory to fix deployed.
@@ -224,6 +263,9 @@ pip-audit on the exported lock reports an advisory in `jinja2`, pulled in by a w
   set and configuration; pick one and keep the rule list explicit.
 
 ## Pitfalls
+- **A clean scan treated as a safe agent.** Symptom: an agent with green pip-audit and Bandit runs is
+  talked by injected text into calling a powerful tool. Fix: least-privilege tools, approval for writes and
+  injection tests in the eval suite; scanners do not see tool permissions.
 - **Auditing `pyproject.toml` ranges or the developer's environment** instead of the lock that ships.
   Symptom: a clean report while the production image contains a flagged version.
 - **Blanket `# nosec` or skipped test IDs** to make the build green. Symptom: a security review finds
@@ -238,7 +280,7 @@ pip-audit on the exported lock reports an advisory in `jinja2`, pulled in by a w
   execution on the inference host, which no dependency scanner would report.
 
 ## When to use
-- **Use when:** a project has a lockfile and code that will run with real data or credentials; for AI
+- **Use when:** an agent has a lockfile and tools that will run with real data or credentials; for agent
   services that is usually the first deployment.
 - **Run:** pip-audit against the exact lock on every PR and on a schedule; Bandit (or Ruff `S` rules) on
   source directories, with tests excluded or treated leniently.
@@ -296,6 +338,14 @@ credentials. Clean scanner output narrows risk; it does not certify the system.
   expanded.
 - **Allowlist commands** and validate arguments such as paths, because a permitted binary can still be misused.
 - **Add a timeout and minimal credentials** for the process; Bandit's B602 would have flagged the original.
+
+### Your coding agent can run `pip install` inside its sandbox. What controls do you put in place?
+- **Prefer no runtime installs:** bake an audited set of packages into the sandbox image, built from a
+  lock and covered by pip-audit.
+- **If installs are needed:** point the sandbox at an internal mirror or allowlisted index, never public
+  PyPI, because a model can invent a package name that an attacker has registered.
+- **Contain the blast radius:** no network beyond that index, no credentials in the sandbox, CPU, memory
+  and time limits, and logged install commands per run.
 
 ## Quiz
 ### Q: Why should pip-audit run against the lockfile rather than the version ranges in pyproject.toml?

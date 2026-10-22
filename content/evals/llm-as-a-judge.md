@@ -5,7 +5,8 @@ name: LLM-as-a-judge
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/judge-calibration-and-bias
   - evals/rubrics
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-LLM-as-a-judge has a model grade open outputs against a rubric, often with a reference. It scales
+LLM-as-a-judge has a model grade an agent's open outputs or trajectories against a rubric. It scales
 grading, but is only as good as its measured agreement with humans: judges carry position, verbosity
-and self-preference biases and grade confidently, right or wrong.
+and self-preference biases.
+
+## For agent builders
+- **Why it matters for agents.** Much of what makes an agent good cannot be asserted in code: is the
+  final reply faithful to what the tools returned, did it ask a clarifying question when it should,
+  was the plan sensible. A calibrated judge grades those over hundreds of traces per run.
+- **Where it shows up in your stack.** Evaluators in LangSmith, Braintrust, promptfoo or Inspect,
+  online scoring of sampled production traces, and inside the agent itself as a critic or reflection
+  step that reviews a draft before it is sent.
+- **What you control.** The criterion per judge call, what slice of the trace it sees (final reply,
+  tool results, whole trajectory), the judge model family, the rubric and anchors, and the calibration
+  threshold before a judge may gate a release.
+- **What you can skip.** Judges for anything checkable: final sandbox state, tool-argument validity,
+  schema, step counts and code that can be executed. Use assertions there and keep the judge for the
+  rest.
 
 ## Why it exists
 - **Open-ended outputs have no exact match.** A summarizer, a support reply or an agent's final report
@@ -53,6 +68,16 @@ and self-preference biases and grade confidently, right or wrong.
 | **Pairwise** | Outputs A and B → preference | Relative comparisons (prompt v1 vs v2, model X vs Y) | Must run in both orders because of position bias; a preference that flips with order is a tie |
 | **Probability-weighted** | Score-token probabilities → expected value | Finer-grained scores | Turns a coarse 1–5 scale into a continuous score that ties less often |
 | **Reference-free quality** | Answer + retrieved context, e.g. faithfulness | RAG grounding | The "reference" is the context; rubric is "supported, not supported, contradicted" |
+| **Trajectory judge (agents)** | User request + tool calls and results + final reply | Grounding in tool results, clarifying behavior, plan quality | Many valid paths exist, so a rubric question about the path beats matching one expected sequence |
+
+### Judging agent trajectories
+- **Show the judge only what the criterion needs.** For "reply is faithful to tool results" pass the
+  tool results and the reply, not the whole system prompt, *because* long traces dilute attention and
+  cost tokens on every item.
+- **Truncate long tool outputs deliberately,** keeping the fields the reply cites, and record what was
+  cut, so a "fail" is not caused by evidence the judge never saw.
+- **Assert first, judge second.** Final state, forbidden tools and step budgets come from code; the
+  judge sees only runs that passed those, so its budget goes to the questions code cannot answer.
 
 - **Probability-weighted detail.** G-Eval reads the probabilities the judge assigns to each score token
   and reports the expected value, after a chain-of-thought step that writes out the evaluation steps. A
@@ -189,6 +214,38 @@ def calibrate(items, human: dict[str, bool]) -> dict:
 - **Why the bias matters:** when comparing two systems, if version B's errors are the kind this judge
   misses more often, B can look better than A while being worse.
 
+### Agent scenario: a judge for "the reply is grounded in tool results"
+A support agent's final reply must state only facts its tools returned. The judge sees the tool
+results from the stored trace and the reply; `llm` is the same call as above.
+
+```python
+TOOL_GROUNDING_PROMPT = """You are grading a support agent's FINAL REPLY for GROUNDING only.
+Tool results the agent received, in order:
+{tool_results}
+Final reply to the customer: {reply}
+
+Pass only if every factual claim in the reply (amounts, dates, order status, policy) appears in or
+follows directly from the tool results. Fail if the reply states a fact no tool returned.
+Reply with JSON: {{"reason": "<name the unsupported claim, if any>", "verdict": "pass" | "fail"}}"""
+
+def judge_grounding(trace: list[dict], reply: str, max_chars=2000) -> dict:
+    results = "\n".join(f"- {t['tool']}: {str(t['result'])[:max_chars]}" for t in trace)
+    raw = llm(TOOL_GROUNDING_PROMPT.format(tool_results=results, reply=reply), temperature=0)
+    out = json.loads(raw[raw.find("{"): raw.rfind("}") + 1])
+    assert out["verdict"] in ("pass", "fail")
+    return out
+```
+
+| Calibration on 150 human-labeled traces (illustrative) | Value |
+|---|---|
+| Human-labeled ungrounded replies | 40 |
+| Caught by the judge (failure recall) | 34 of 40, 85% |
+| Grounded replies wrongly failed | 6 of 110 |
+| Misses traced to truncated tool output | 4 of the 6 missed failures |
+
+- **Reading it:** most misses come from `max_chars` cutting the field the reply cited, so raise the
+  limit for that tool or pass only the cited fields, then re-run calibration before gating on it.
+
 ### Pairwise in both orders, plus the corrected pass rate
 Pure Python. Counts order-consistent wins, treats flips as ties, tests the decisive items, and applies
 the correction above.
@@ -242,6 +299,10 @@ print("corrected pass rate:", round(rogan_gladen(0.75, 135 / 140, 0.75), 3))
 - **Cross-family panel for high-stakes criteria.** Use judges from model families other than the
   generator, combined by majority vote. Monitor per-judge agreement by generator to catch
   self-preference.
+- **Critic step inside the agent, measured like any judge.** When an agent reviews its own draft
+  before sending (a reflection or critic step), calibrate that critic on labeled traces the same way,
+  and cap revisions at a small fixed number. Monitor how often the critic triggers a revision and
+  whether revised replies actually pass the offline judge more often.
 
 ## Trade-offs
 - **Speed vs bias.** A judge grades hundreds of outputs in minutes for a few dollars, but every verdict
@@ -267,6 +328,8 @@ print("corrected pass rate:", round(rogan_gladen(0.75, 135 / 140, 0.75), 3))
   that disappears when a different judge family is used.
 - **Verifying arithmetic or code by reading.** Symptom: confidently passed outputs that fail when
   executed.
+- **Feeding the judge the whole agent trace.** Symptom: grading cost grows with every step the agent
+  takes and verdicts cite irrelevant turns. Fix: pass only the trace parts the criterion needs.
 - **Never re-calibrating after a generator change.** Symptom: failure recall quietly drops as the new
   generator's errors look different from the ones the rubric anticipated.
 
@@ -319,6 +382,14 @@ feeds back into the rubric and triggers re-calibration when the generator change
 - **Before trusting it:** calibrate on a human-labeled set with both passes and failures, and use a
   judge from a different model family than the generator.
 
+### How would you use a judge to evaluate a tool-calling agent's runs?
+- **Assert what code can check first:** final sandbox state, forbidden tools, argument validity and
+  step budgets, so the judge is not spent on them.
+- **One judge per open criterion:** grounding of the reply in tool results, clarifying questions on
+  ambiguous requests, tone; each sees only the trace parts it needs.
+- **Calibrate on labeled traces** and read failure recall before gating, re-calibrating when the agent's
+  model, prompt or tools change.
+
 ### Your judge agrees with humans 90% of the time. Is it ready to gate releases?
 - **Not necessarily.** With most items passing, high agreement is compatible with missing many
   failures; read recall on failures, which was 75% in the worked example.
@@ -334,7 +405,7 @@ feeds back into the rubric and triggers re-calibration when the generator change
 - **Synchronous guardrails by default:** a judge on the request path adds a full model call to latency,
   so it should be a deliberate decision rather than the default.
 
-### Judge costs now exceed generation costs. How do you bring them down?
+### Judge costs on your agent's eval runs now exceed the agent's own costs. How do you bring them down?
 - **Move deterministic criteria off the judge** and keep it only for what cannot be checked otherwise.
 - **Use a smaller judge model per criterion** once its agreement has been re-measured, knowing cheap
   judges fail first on subtle factual errors.

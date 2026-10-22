@@ -5,7 +5,8 @@ name: BM25 internals
 kind: concept
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - rag-retrieval/inverted-indexes
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -20,13 +21,26 @@ sources:
 ---
 
 ## TL;DR
-BM25 sums, over query terms, a rarity weight (IDF) times a saturating, length-normalized term frequency.
-Each piece fixes one failure of raw counting, and two parameters, k1 and b, set how strong those
-corrections are.
+BM25 is the keyword arm of most agent retrieval tools: it sums, over query terms, a rarity weight (IDF)
+times a saturating, length-normalized term frequency. Knowing k1, b and the analyzer explains most "the
+agent searched and found nothing" bugs.
+
+## For agent builders
+- **Why it matters for agents.** The sparse arm is what finds the ids, error codes and names agents pass
+  between tools. Agent-written queries also differ from human ones (longer, more terms, copied
+  fragments), and BM25 scores scale with query length, so thresholds tuned on humans break on agents.
+- **Where it shows up in your stack.** Elasticsearch and OpenSearch (BM25 by default), LangChain's
+  `BM25Retriever` built on `rank_bm25`, BM25 extensions for Postgres, and the keyword half of hybrid
+  modes in vector databases. Postgres's built-in `ts_rank` is not BM25.
+- **What you control.** The analyzer (tokenization of identifiers, stemming, stopwords), k1 and b, field
+  boosts, and how the search tool turns raw scores into something the agent or fusion layer can use.
+- **What you can skip.** The two-Poisson derivation. Keep the three failures BM25 fixes and the fact that
+  scores are query-relative.
 
 ## Why it exists
 - **Common words swamp raw counts.** "the" appears everywhere, so the query "the indemnification cap" is
-  dominated by a term that carries no information. IDF fixes this.
+  dominated by a term that carries no information. IDF fixes this, which matters when an LLM writes
+  wordy, natural-language queries.
 - **Raw counts scale without limit.** A document mentioning "cap" fifty times scores ten times one that
   mentions it five times, although the second is clearly about caps and the first is probably a glossary.
   Saturation (k1) stops a term repeated 50 times beating one repeated 5 times by 10×.
@@ -104,7 +118,7 @@ The curve is already flat by ten.
 - **Why 0.75 by default:** long documents are partly long because they cover more topics (discount their
   counts) and partly because they say more about the same topic (so not fully).
 
-### Where the shape comes from
+### Background: where the shape comes from
 - **IDF factor:** the Robertson–Spärck Jones term weight with no relevance information: log-odds that a
   term appears in relevant vs non-relevant documents, assuming almost every document is non-relevant.
 - **TF factor:** the "eliteness" idea. A document is about a term or not; counts are modelled as a mixture
@@ -142,14 +156,17 @@ Nothing needs the document text at query time:
 - A three-term query produces larger numbers than a one-term query, and scores from different indexes or
   corpora are not comparable.
 - So fusing BM25 with dense scores needs rank-based methods or per-query normalization.
+- **Agent consequence:** never hand raw BM25 scores to the model as "confidence", and never gate a tool's
+  results on a fixed raw cutoff, because agent queries vary far more in length than human ones.
 
 ## Diagram
-Follow one query term through scoring: the analyzer defines the term, IDF comes from index statistics,
-and the TF factor combines the posting's count with the length factor L before the per-term scores sum.
+Follow one term of an agent's tool query through scoring: the analyzer defines the term, IDF comes from
+index statistics, and the TF factor combines the posting's count with the length factor L before the
+per-term scores sum.
 
 ```mermaid
 flowchart TD
-    Q["Query text"] --> AN["Analyzer, identical at index time"]
+    Q["Agent tool query text"] --> AN["Analyzer, identical at index time"]
     AN --> T["Query term q"]
     T --> ST[("Index stats: N, n of q, avgdl")]
     T --> PL[("Posting list: f per document")]
@@ -164,6 +181,45 @@ flowchart TD
 ```
 
 ## Examples
+### Worked scenario: a raw-score cutoff that breaks on agent queries
+A support agent's keyword tool drops hits below a raw BM25 score of 8.0, tuned on the agent's own wordy
+queries. Collection as in the IDF table: N = 1,000, each hit at average length with f = 1, so the TF
+factor is 1.0 and each matching term adds its IDF (illustrative).
+
+| Query | Matching terms and IDF | Score of the right document | Passes 8.0? |
+|---|---|---|---|
+| Agent: "error E4012 fuser overheating printer" | E4012 4.56, fuser 4.56, error 0.51, printer 0.0005 | ≈ 9.6 | yes |
+| Human retry: "E4012" | E4012 4.56 | ≈ 4.56 | no, tool returns nothing |
+| Agent query reworded: "E4012 meaning" | E4012 4.56, meaning ~0 | ≈ 4.6 | no |
+
+- **The right document is top-ranked in all three,** yet the tool hides it in two, and the agent reports
+  that no documentation exists.
+- **Fix.** Return the top k by rank, normalize per query before any cutoff, or let a reranker decide.
+
+### Agent keyword tool that reports evidence, not raw scores
+The tool returns rank, a per-query normalized score and the matched terms, so the agent (and your traces)
+can see why a hit came back. It reuses the analyzer from the from-scratch example below.
+
+```python
+import re
+
+analyze = lambda s: re.findall(r"[a-z0-9]+", s.lower())   # same analyzer as the index
+
+def keyword_search(query, docs, bm25, k=5):
+    """docs: {id: text}; bm25(query, doc_id) -> raw score."""
+    raw = {d: bm25(query, d) for d in docs}
+    ranked = [d for d in sorted(raw, key=raw.get, reverse=True) if raw[d] > 0][:k]
+    if not ranked:
+        return {"results": [], "note": "No keyword matches. Try synonyms or semantic_search."}
+    top = raw[ranked[0]]
+    q_terms = set(analyze(query))
+    return {"results": [
+        {"id": d, "rank": i + 1,
+         "relative_score": round(raw[d] / top, 2),           # 1.0 = best for THIS query only
+         "matched_terms": sorted(q_terms & set(analyze(docs[d])))}
+        for i, d in enumerate(ranked)]}
+```
+
 ### BM25 from scratch
 Three short contract passages make every term visible. The analyzer is deliberately trivial (lowercase,
 alphanumerics) and shared by index and query; change it in one place and both sides change together.
@@ -246,20 +302,23 @@ GET /manuals/_search
 ```
 
 ## Production patterns
-- **Grid-search k1 and b on labeled queries.** When the corpus is unlike TREC-style news (tweets, 200-page
-  manuals, short snippets), sweep k1 over roughly 0.5 to 2 and b over 0 to 1 offline and record the values
-  with the experiment. Monitor recall@k per query type before and after any change on a live index.
-- **Debug ranking with explain and the analyzer API.** Use `explain` on a surprising hit to see each
-  term's IDF and TF factor, and Elasticsearch's `_analyze` endpoint to compare index-time and query-time
-  tokens. Monitor zero-result rate for queries copied verbatim from documents.
+- **Grid-search k1 and b on labeled agent queries.** When the corpus is unlike TREC-style news (tweets,
+  200-page manuals, short snippets), sweep k1 over roughly 0.5 to 2 and b over 0 to 1 offline, using
+  queries the agent actually issued, and record the values with the experiment. Monitor recall@k per
+  query type before and after any change on a live index.
+- **Debug agent misses with explain and the analyzer API.** When a trace shows a keyword search that
+  returned nothing, replay it with `explain` on the expected hit to see each term's IDF and TF factor,
+  and with Elasticsearch's `_analyze` endpoint to compare index-time and query-time tokens. Monitor
+  zero-result rate for tool queries containing identifiers.
 - **Index sections, boost identity fields.** Split long manuals into sections near average length, and put
   "this is the manual for X" into a title or product field with a boost (`"title^3"`) or BM25F instead of
   bending b. Monitor where the canonical document ranks for its own product name.
 - **Use global statistics where shards are small or uneven.** Run tests and small indexes on one shard, or
-  use the `dfs_query_then_fetch` search type when per-shard IDF skews results. Monitor score drift for the
-  same document across shards.
-- **Normalize before fusion.** Never threshold or add raw BM25 scores to cosine scores; fuse by rank or
-  normalize per query first. Monitor fused-result overlap with each arm alone.
+  use the `dfs_query_then_fetch` search type when per-shard IDF skews results. Per-tenant agent indexes
+  are often small enough for this to bite. Monitor score drift for the same document across shards.
+- **Normalize before fusion or cutoffs.** Never threshold or add raw BM25 scores to cosine scores; fuse by
+  rank or normalize per query first, and give the agent ranks or relative scores. Monitor fused-result
+  overlap with each arm alone.
 
 ## Trade-offs
 - **No training data, no GPU.** BM25 is the cheapest retriever to stand up and the easiest to debug; it
@@ -270,10 +329,14 @@ GET /manuals/_search
   stubs), lowering b stops penalizing the complete documents.
 - **Field-aware scoring (BM25F or boosted fields)** lets a title match outrank a body mention, at the cost
   of boosts that must be tuned per corpus and re-validated whenever the document schema changes.
+- **Verbose agent queries vs short ones.** Extra terms add recall for documents that match them, but
+  common filler adds noise and inflates scores; prompting the agent for keyword-style queries helps BM25
+  but can hurt the dense arm, so measure both.
 
 ## Pitfalls
 - **Index and query analyzers differ** (stemming on one side, a different tokenizer, or hyphen handling).
-  Symptom: exact phrases copied from a document return zero results.
+  Symptom: exact phrases copied from a document, or ids copied from another tool's output, return zero
+  results.
 - **Wrong stopword policy.** Keeping them where meaningless or stripping them where meaningful ("the Who",
   "to be or not to be"). Symptom: noisy hits or impossible queries; IDF does not fully compensate.
 - **Thresholding BM25 scores as absolute relevance.** Symptom: a cutoff that works for three-word queries
@@ -287,8 +350,8 @@ GET /manuals/_search
   or uneven shards and in tests with few documents.
 
 ## When to use
-- **Always first:** BM25 is the right first retriever for any corpus and the baseline every other
-  retriever must beat on your labeled queries before it earns its cost.
+- **Always first:** BM25 is the right first retriever for any corpus an agent searches and the baseline
+  every other retriever must beat on your labeled queries before it earns its cost.
 - **Sole retriever when** queries are identifier-heavy, the corpus churns fast or the serving budget is
   CPU-only; **one arm of hybrid** everywhere else.
 - **Measure:** recall@k on labeled queries by query type, with the analyzer and the k1, b values recorded
@@ -334,17 +397,24 @@ long, loosely relevant document.
 - **Length normalization (b)** divides counts by length relative to `avgdl`, so a long manual does not win
   just by containing more words.
 
-### A user copies an exact phrase from a document and gets zero results. How do you debug it?
+### An agent's trace shows it searched for an error code copied from a log tool and got zero results. How do you debug it?
 - **Suspect the analyzer first:** most "BM25 is broken" bugs are index-time and query-time analysis that
-  differ, for example stemming on one side or different hyphen handling.
-- **Compare tokens** with Elasticsearch's `_analyze` endpoint for both analyzers, then use `explain` on a
-  document that should match to see which terms contributed.
+  differ, for example stemming on one side or different hyphen handling of codes like `E-4012`.
+- **Replay the exact tool query:** compare tokens with Elasticsearch's `_analyze` endpoint for both
+  analyzers, then use `explain` on a document that should match to see which terms contributed.
+- **Check the tool wrapper:** a raw-score cutoff in the tool can hide a top-ranked hit for a short query.
 
 ### Why can you not threshold BM25 scores or add them directly to cosine scores?
 - **Scores are query-relative:** a sum of unbounded positive terms, so a three-term query scores higher
   than a one-term query and a fixed cutoff fails on short queries.
 - **Scales differ across indexes and retrievers,** so fusion needs rank-based methods such as RRF or
   per-query normalization first.
+
+### What should a keyword search tool return to an agent, and why not the raw BM25 score?
+- **Return rank and evidence:** the top k by rank, a per-query relative score, and the matched terms, so
+  the agent can judge relevance and your traces show why each hit came back.
+- **Raw scores mislead:** they scale with query length and corpus statistics, so the model treats 9.6 as
+  better than 4.56 even when both are the right document for different queries.
 
 ### When would you change k1 or b from the defaults of 1.2 and 0.75?
 - **Lower b** when length is itself a quality signal (complete articles versus stubs), so complete

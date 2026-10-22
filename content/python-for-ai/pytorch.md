@@ -5,7 +5,8 @@ name: PyTorch (tensors, autograd, nn.Module, DataLoader, device)
 kind: tool
 difficulty: core
 est_minutes: 20
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/numpy
   - python-for-ai/hugging-face
@@ -21,9 +22,23 @@ sources:
 ---
 
 ## TL;DR
-PyTorch is GPU-capable NumPy-style tensors that record their operations, so `loss.backward()` computes
-every gradient. `nn.Module` packages parameters, `DataLoader` feeds batches, `device` places memory, and
-the graph is built by running plain Python.
+PyTorch runs every local model your agent touches: embedders, rerankers, routers and fine-tuned LLMs.
+Tensors record operations so `loss.backward()` computes gradients; `nn.Module`, `DataLoader` and `device`
+decide whether your agent's tool models fit, stay fast and stop leaking memory.
+
+## For agent builders
+- **Why it matters for agents.** Hosted LLM calls hide PyTorch, but the moment an agent runs a local
+  embedding model, a reranker, a small intent router or a LoRA fine-tuned on agent traces, a PyTorch
+  module is in the request path. Its memory and latency become your agent's memory and latency.
+- **Where it shows up in your stack.** Under Hugging Face Transformers, sentence-transformers, PEFT and
+  TRL for fine-tuning, under LangChain or LlamaIndex embedding wrappers that load local models, and
+  inside engines like vLLM and SGLang that serve self-hosted agent models.
+- **What you control.** `model.eval()` plus `torch.inference_mode()` in every tool handler, `dtype`
+  (bf16 halves memory), `device` placement, batch size across concurrent agents, and whether the model
+  runs in-process or behind its own server.
+- **What you can skip.** Writing training loops from scratch for standard LLM fine-tuning, and the
+  autograd internals beyond "gradients accumulate and graphs hold memory". Literacy is enough to debug
+  OOMs, NaNs and accidental CPU fallbacks.
 
 ## Why it exists
 - **NumPy lacks three things training needs.** The derivative of a scalar loss with respect to millions
@@ -42,11 +57,20 @@ the graph is built by running plain Python.
 - **Define-by-run fixes it, and is now the lingua franca.** The graph is recorded as Python executes,
   every iteration, so control flow is just Python and you debug with print statements and `pdb`, not a
   separate graph compiler; that is why it won.
-- **Literacy is the payoff today, more than writing loops from scratch.** Every Hugging Face model, LoRA adapter, embedding model
-  and most local inference stacks are PyTorch modules; when one OOMs, produces NaNs or runs on the CPU by
-  accident, you need to know which of the five pieces is responsible.
+- **For agent builders, literacy is the payoff.** Every Hugging Face model, LoRA adapter, embedding model
+  and most local inference stacks are PyTorch modules. When the agent's retriever OOMs, a fine-tuned
+  router produces NaNs, or a tool model runs on the CPU by accident, you need to know which of the five
+  pieces is responsible.
 
 ## How it works
+### Where agents meet PyTorch
+| Agent component | PyTorch role | What to get right |
+|---|---|---|
+| RAG embedder and reranker | forward pass per query or batch of chunks | `inference_mode`, batching, bf16 |
+| Intent or tool router (small classifier) | `nn.Module` loaded at startup | `model.eval()`, flat memory per request |
+| LoRA fine-tune on agent traces | training loop via PEFT/TRL | zeroed grads, precision, memory budget |
+| Self-hosted agent LLM | weights loaded by vLLM or SGLang | dtype and device; the engine owns the loop |
+
 ### Tensors
 - **What a tensor is.** A typed, strided n-dimensional array: a pointer to storage plus `shape`,
   `stride`, `dtype` and `device`.
@@ -78,7 +102,8 @@ Design choices and their reasons:
   small multiple of forward, and `backward()` with no argument only works on a scalar; for a vector
   output you supply the vector to multiply by.
 - **Stop recording for inference.** `torch.no_grad()` (or `torch.inference_mode()`) records nothing, so
-  no activations are saved for a backward pass that will never happen.
+  no activations are saved for a backward pass that will never happen. Every agent tool that calls a
+  local model is inference, so this is the setting that matters most.
 
 Three lines make accumulation concrete:
 
@@ -100,7 +125,7 @@ y = 2 * w**2; y.backward(); print(w.grad)   # tensor(24.)  accumulated, not repl
 - **Auto-registration.** Attributes that are `nn.Parameter`s or other modules register automatically.
 - **What registration buys.** `model.parameters()` (for the optimizer), `model.to(device)`,
   `model.state_dict()` (for saving) and `model.train()` / `model.eval()` all work across an arbitrarily
-  nested tree.
+  nested tree. A LoRA adapter is just extra registered parameters, which is why PEFT can save only them.
 - **`train()`/`eval()` flip layer behaviour** such as dropout and batch norm. They do not disable
   gradients.
 - **Call it, don't call forward.** You write `forward`, and call the module as `model(x)` so hooks run.
@@ -108,9 +133,9 @@ y = 2 * w**2; y.backward(); print(w.grad)   # tensor(24.)  accumulated, not repl
 ### DataLoader
 | Piece | Job |
 |---|---|
-| `Dataset` | answers `len()` and `__getitem__(i)` |
+| `Dataset` | answers `len()` and `__getitem__(i)`, for example one agent trace per index |
 | `DataLoader` | batching and shuffling |
-| `collate_fn` | stacks samples, or pads variable-length sequences |
+| `collate_fn` | stacks samples, or pads variable-length sequences (traces vary a lot in length) |
 | `num_workers` | subprocesses that prefetch, so tokenisation or image decoding overlaps GPU compute |
 | `pin_memory=True` | page-locked host memory, so the GPU copy is async with `non_blocking=True` on `.to(device)` |
 
@@ -121,15 +146,15 @@ y = 2 * w**2; y.backward(); print(w.grad)   # tensor(24.)  accumulated, not repl
 - **Moves are explicit** (`.to(device)`), because a host-to-GPU copy crosses PCIe and is slow relative to
   GPU compute, and PyTorch refuses to hide that cost.
 - **CUDA calls are asynchronous.** Python returns before the kernel finishes, so naive timing measures
-  launch time unless you call `torch.cuda.synchronize()`.
+  launch time unless you call `torch.cuda.synchronize()`. Time agent tool latency only after a sync.
 
 ## Diagram
-One training step, end to end: follow a batch from the DataLoader onto the device, through the forward
-pass that records the graph, and back through autograd into the optimizer.
+Two paths an agent team runs: the fine-tuning step (batch of traces through forward, backward and the
+optimizer) and the serving path a tool handler takes under `inference_mode`, with no graph kept.
 
 ```mermaid
 flowchart TD
-    DS["Dataset: len and getitem"] --> DL["DataLoader workers: batch, shuffle, collate"]
+    DS["Dataset: agent traces"] --> DL["DataLoader workers: batch, collate"]
     DL -->|"pinned memory, non_blocking copy"| DEV["Batch on device"]
     DEV --> F["model(x): forward records grad_fn graph"]
     F --> L["Scalar loss"]
@@ -137,12 +162,42 @@ flowchart TD
     G --> O["optimizer.step()"]
     O --> Z["optimizer.zero_grad()"]
     Z -->|"next batch"| DL
-    DEV -.->|"inference_mode: no graph, no saved activations"| P["Predictions to CPU"]
+    T["Agent tool call"] -.->|"inference_mode: no graph"| P["Scores back to agent as Python values"]
 ```
 
 ## Examples
+### Agent tool: a local router model that does not leak
+An agent decides per user turn whether to call the search tool. A small PyTorch classifier scores the
+turn embedding; the handler is safe to call thousands of times.
+
+```python
+import torch
+from torch import nn
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+class Router(nn.Module):                         # embedding (384-d) -> [no_tool, search]
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(384, 64), nn.ReLU(), nn.Linear(64, 2))
+    def forward(self, x):
+        return self.net(x)
+
+router = Router().to(device).eval()              # eval: dropout off; does NOT stop autograd
+
+@torch.inference_mode()                          # no graph, no saved activations
+def route(turn_embeddings: torch.Tensor) -> list[str]:
+    probs = router(turn_embeddings.to(device, non_blocking=True)).softmax(-1)
+    return ["search" if p[1] > 0.5 else "answer" for p in probs.cpu().tolist()]
+
+# inside the agent loop: batch all pending turns from concurrent sessions into one call
+decisions = route(torch.randn(16, 384))          # 16 sessions, one forward pass
+print(decisions[:4])
+```
+
 ### Minimal training loop
-Every line maps to one of the five pieces.
+Every line maps to one of the five pieces. Swap the toy data for embedded agent turns and the same loop
+trains the router above.
 
 ```python
 import torch
@@ -185,7 +240,7 @@ for epoch in range(5):
 
 ### Leak-free inference handler
 The fix for the Check-yourself bug, reusing `model` and `device` from the loop above on a CUDA GPU: no
-graph, plain Python results, flat memory.
+graph, plain Python results, flat memory. This is the shape of every agent tool that wraps a local model.
 
 ```python
 import torch
@@ -204,7 +259,7 @@ print(torch.cuda.memory_allocated() - before)    # should stay ~0 across request
 ```
 
 ### Worked scenario: will full fine-tuning of a 1B model fit?
-Plain fp32 training with AdamW, before activations:
+Plain fp32 training with AdamW, before activations, for example a 1B model tuned on tool-calling traces:
 
 | Item | Bytes per parameter | 1B parameters |
 |---|---|---|
@@ -213,15 +268,27 @@ Plain fp32 training with AdamW, before activations:
 | AdamW state (two moments, fp32) | 8 | 8 GB |
 | **Total before activations** | **16** | **16 GB** |
 
-- Activations for backward come on top and grow with batch size and sequence length; gradient
-  checkpointing trades roughly one extra forward pass for much lower activation memory.
-- Inference alone needs only the weights: 4 GB in fp32, 2 GB in bf16, because no `.grad`, optimizer state
-  or saved activations exist under `inference_mode()`.
+- **Activations come on top.** They grow with batch size and sequence length, and agent traces are long
+  (multi-turn tool calls and results); gradient checkpointing trades roughly one extra forward pass for
+  much lower activation memory.
+- **Inference alone needs only the weights:** 4 GB in fp32, 2 GB in bf16, because no `.grad`, optimizer
+  state or saved activations exist under `inference_mode()`.
+- **Why agent teams use LoRA instead.** The same arithmetic for an 8B model gives 16 × 8 = 128 GB before
+  activations. LoRA freezes the base (2 bytes × 8B = 16 GB in bf16) and trains only small adapter
+  matrices, so gradients and optimizer state shrink to the adapter's size (illustrative arithmetic, not a
+  benchmark).
 
 ## Production patterns
-- **Inference mode everywhere you serve.** Wrap request handlers in `@torch.inference_mode()` plus
-  `model.eval()` at startup, and return `.cpu().tolist()` values. Monitor `torch.cuda.memory_allocated()`
-  per request; it should stay flat.
+- **Inference mode in every tool handler.** Wrap request handlers in `@torch.inference_mode()` plus
+  `model.eval()` at startup, and return `.cpu().tolist()` values to the agent, never tensors. Monitor
+  `torch.cuda.memory_allocated()` per request; it should stay flat over a long-running agent session.
+- **Keep model calls off the agent's event loop.** A forward pass is blocking Python; inside an async
+  agent framework it stalls every other session. Run it in a worker thread or, better, behind a separate
+  model server (Text Embeddings Inference, vLLM, a small FastAPI service). Monitor event-loop lag and
+  tool-call p95 latency.
+- **Micro-batch tool calls across concurrent agents.** Many sessions embedding or reranking at once
+  should share one forward pass instead of running batch 1 each, because GPUs are underused at batch 1.
+  Monitor batch size and queue wait per tool.
 - **bf16 autocast for training and serving.** On hardware that supports it, wrap forward in
   `torch.autocast(device_type="cuda", dtype=torch.bfloat16)`; unlike fp16 it needs no loss scaling. Watch
   the loss curve and eval metrics against an fp32 baseline run.
@@ -237,6 +304,10 @@ Plain fp32 training with AdamW, before activations:
   `torch.cuda.synchronize()`, so metrics neither stall the loop nor lie.
 
 ## Trade-offs
+- **In-process tool model vs separate model server.** Loading the embedder or router inside the agent
+  process is simplest and has no network hop, but it ties GPU memory to agent replicas and blocks the
+  event loop. A dedicated server batches across agents and scales separately; it wins once several agent
+  replicas or teams share the model.
 - **Eager debuggability vs per-op overhead.** Define-by-run makes debugging trivial, but per-op Python
   overhead hurts small models. `torch.compile` recovers speed by tracing to fused kernels, at the cost of
   compile time and graph breaks.
@@ -250,13 +321,18 @@ Plain fp32 training with AdamW, before activations:
   activation memory.
 
 ## Pitfalls
+- **Inference without `torch.no_grad()` or `inference_mode()`.** Every forward saves activations for a
+  backward that never comes, so peak memory is higher. If any output is kept (cached, appended to a list,
+  stored in agent memory) its graph stays alive, and memory climbs per request until a CUDA out-of-memory
+  error.
+- **Returning tensors into agent state.** A tensor stored in conversation memory or a tool result keeps
+  its device memory (and maybe its graph) alive for the session. Symptom: GPU memory tracks open
+  sessions. Fix: convert to Python values with `.cpu().tolist()` at the tool boundary.
 - **Forgetting `optimizer.zero_grad()`.** Gradients from every step add up. Symptom: loss diverges or
   oscillates wildly after a few steps.
-- **Inference without `torch.no_grad()` or `inference_mode()`.** Every forward saves activations for a
-  backward that never comes, so peak memory is higher. If any output is kept (cached, appended to a list)
-  its graph stays alive, and memory climbs per request until a CUDA out-of-memory error.
 - **Forgetting `model.eval()` before evaluation.** Dropout stays active, so the same input gives
-  different outputs and validation metrics look noisy and worse than expected.
+  different outputs and validation metrics look noisy and worse than expected. In an agent, the router
+  makes different tool choices for identical turns.
 - **`total += loss` instead of `loss.item()`.** You keep every step's graph referenced. Symptom: steadily
   rising GPU memory across an epoch.
 - **`torch.zeros(n)` inside `forward` after moving to GPU.** The new tensor lands on the CPU. Symptom:
@@ -270,11 +346,14 @@ Plain fp32 training with AdamW, before activations:
 
 ## When to use
 - **Use raw PyTorch when** you need control a higher-level library hides: a custom loss, a non-standard
-  training step, inspecting activations, or debugging why a Hugging Face model misbehaves.
-- **Use a library on top when** fine-tuning standard LLMs: Transformers, PEFT and TRL rather than
-  hand-written loops.
+  training step, a small router or scorer for your agent, inspecting activations, or debugging why a
+  Hugging Face model misbehaves.
+- **Use a library on top when** fine-tuning standard LLMs on agent traces: Transformers, PEFT and TRL
+  rather than hand-written loops.
 - **Avoid for serving LLMs at scale:** use an inference engine (vLLM, SGLang, TensorRT-LLM) rather than a
-  PyTorch `generate` loop.
+  PyTorch `generate` loop behind your agent.
+- **Skip entirely when** the agent only calls hosted APIs; PyTorch only enters when a model runs on your
+  own hardware.
 - **Measure:** GPU utilisation, peak memory (`torch.cuda.max_memory_allocated()`) and samples per second.
   A GPU idling at low utilisation usually means the DataLoader is the bottleneck.
 - **Interviews:** explain why gradients accumulate, what `no_grad` saves, and the difference between
@@ -306,6 +385,22 @@ tensors before storing them, and check `torch.cuda.memory_allocated()` stays fla
   inspecting a separately compiled graph, as TensorFlow 1.x sessions required.
 - **Cost it accepts:** per-op Python overhead, which `torch.compile` later recovers by fusing kernels.
 
+### Your agent's GPU memory grows with the number of open sessions, though each tool call is small. What do you check?
+- **Graph retention first:** confirm every local-model tool runs under `torch.inference_mode()`; `eval()`
+  alone still records graphs.
+- **Then the tool boundary:** look for tensors stored in session memory, caches or tool results; convert
+  them with `.cpu().tolist()` so nothing pins device memory.
+- **Confirm with numbers:** log `torch.cuda.memory_allocated()` before and after a burst of requests; it
+  should return to the same baseline once sessions close.
+
+### You add a local reranker to an async agent and every session's latency doubles. Why, and what is the fix?
+- **The forward pass blocks the event loop:** PyTorch calls are synchronous Python, so while one session
+  reranks, every other coroutine waits.
+- **Fix the placement:** run the model in a worker thread for a quick fix, or behind a model server that
+  micro-batches requests across sessions, which also raises GPU utilisation.
+- **Measure:** event-loop lag and tool p95 latency before and after; batch size per forward pass should
+  rise above 1.
+
 ### Training loss diverges after a few steps in a loop a colleague wrote. How do you debug it?
 - **Check gradient zeroing first:** a missing `optimizer.zero_grad()` makes every step's gradients add up,
   which matches divergence after a few steps.
@@ -314,13 +409,6 @@ tensors before storing them, and check `torch.cuda.memory_allocated()` stays fla
   inf or NaN; NaN or extreme values in the batch show up as sudden loss spikes.
 - **Confirm with numbers:** log the gradient norm every N steps (using `.item()` sparingly) and compare
   against an fp32 baseline run.
-
-### When would you not write a raw PyTorch loop?
-- **Fine-tuning standard LLMs:** Transformers, PEFT and TRL already handle mixed precision, checkpointing
-  and distributed setup, so a hand-written loop is extra code to maintain and debug.
-- **Serving LLMs at scale:** an inference engine such as vLLM, SGLang or TensorRT-LLM batches requests and
-  manages the KV cache, which a PyTorch `generate` loop does not.
-- **Still drop to raw PyTorch** for a custom loss, a non-standard training step or inspecting activations.
 
 ### How much GPU memory does full fp32 AdamW fine-tuning of a 1B-parameter model need?
 - **16 bytes per parameter before activations:** 4 for weights, 4 for gradients and 8 for the two AdamW

@@ -5,7 +5,8 @@ name: Build vs buy
 kind: decision
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - strategy/vendor-evaluation
   - security-governance-compliance/vendor-exit-strategy
@@ -18,15 +19,27 @@ related:
 ---
 
 ## TL;DR
-Build versus buy in AI is one decision per stack layer. Buy what is commodity and fast-moving, build
-what differentiates and touches your data most, and own a thin seam at every boundary so each decision
-stays reversible.
+For an agent, build versus buy is one decision per stack layer: model, gateway, agent framework,
+retrieval, tracing and evals, guardrails, product. Buy or adopt commodity plumbing, build tools, context
+assembly and eval sets, and own a thin seam everywhere.
+
+## For agent builders
+- **Why it matters for agents.** The agent stack is young and crowded: frameworks, tracing platforms,
+  managed agent services and vector stores all overlap. Choosing badly means either months on plumbing
+  or an agent whose prompts, traces and test set live inside someone else's platform.
+- **Where it shows up in your stack.** Orchestration: a hand-written loop, an open-source framework
+  such as LangGraph, LangChain or LlamaIndex, or a vendor's managed agent service. Tracing and evals:
+  LangSmith, Langfuse, Arize Phoenix or your own spans. Gateway: LiteLLM proxy or Portkey.
+- **What you control.** The layer map, the seams (a tool interface, an agent runner interface, a
+  retriever interface), and the golden set of agent tasks that every option is measured against.
+- **What you can skip.** Feature-by-feature framework comparisons. Ask the four questions per layer,
+  keep the seam, and measure time-to-swap instead of debating.
 
 ## Why it exists
 - **The boundaries are not settled yet.** In mature domains nobody writes their own database. The AI
-  stack is young: is an AI gateway a product or three hundred lines? Is eval tooling a vendor or a script
-  and a spreadsheet? Is a retrieval pipeline a managed service or core IP? Unclear answers push teams
-  into one of two mistakes.
+  stack is young: is an AI gateway a product or three hundred lines? Is an agent framework worth its
+  abstractions, or is the loop forty lines? Is eval tooling a vendor or a script and a spreadsheet? Is a
+  retrieval pipeline a managed service or core IP? Unclear answers push teams into one of two mistakes.
 - **Mistake 1: build everything, because AI is strategic.** Six months later there is a home-grown
   vector store, gateway, tracing system and prompt manager, the product is behind schedule, and the
   platform competes with open-source projects that improved faster. The error conflates strategic
@@ -37,7 +50,7 @@ stays reversible.
   rather than value, and the quality loop is a black box you cannot evaluate. At renewal, prompts,
   analytics and the test set all live inside their platform.
 - **What mistake 2 gets wrong.** It treats the application layer as commodity when it is precisely where
-  your domain knowledge and data live.
+  your domain knowledge, tools and data live.
 - **Each default is wrong at specific layers,** not everywhere. That is why the decision must be
   decomposed before it can be made.
 
@@ -48,7 +61,7 @@ stays reversible.
 | 1 | **Foundation model** | rent through an API or run open weights | training from scratch is for a handful of organisations |
 | 2 | **Serving** | buy (the API) or build on open-source engines if self-hosting | rarely write your own |
 | 3 | **Gateway and routing** | buy, adopt open source, or a thin build | commodity, but you must own the configuration because it encodes your portfolio and budgets |
-| 4 | **Orchestration and agent logic** | usually built, in plain code or on an open-source framework | this is where your workflow lives and most testing happens |
+| 4 | **Orchestration and agent logic** | usually built, in plain code or on an open-source framework | this is where your workflow, tools and state live and most testing happens |
 | 5 | **Retrieval and knowledge** | buy the vector store or search engine; build ingestion, chunking, access-control mapping and ranking tuned to your corpus | that is where quality is decided |
 | 6 | **Evaluation and observability** | buy or adopt the tracing and eval platform; always build golden sets and task metrics | nobody can sell you your own test set |
 | 7 | **Guardrails** | buy generic detectors (PII, toxicity, injection); build domain policies and the evals that prove they hold | generic is commodity, policy is yours |
@@ -59,15 +72,29 @@ stays reversible.
 - **The other real model-layer choices** are self-host versus API and open-weight versus proprietary,
   each with its own lesson.
 
+### The agent framework layer, specifically
+| Option | You get | You pay |
+|---|---|---|
+| Hand-written loop | full control, few dependencies, easy to debug | you build state persistence, retries, human-in-the-loop pauses yourself |
+| Open-source framework (LangGraph, LangChain, LlamaIndex) | graph or chain abstractions, checkpointed state, integrations | its abstractions, upgrade churn, debugging through framework code |
+| Managed agent service from a model or cloud vendor | hosted runtime, built-in tools, fast start | lock-in to that vendor's models and runtime, less control of the loop |
+
+- **Tools and their contracts are always yours,** whatever runs the loop, because they encode your
+  systems of record and permissions.
+- **Tracing platforms are a separate decision.** A framework's companion tracing product (LangSmith for
+  LangChain and LangGraph) is convenient; an open-source option such as Langfuse can be self-hosted when
+  traces cannot leave your environment.
+
 ### Four questions per layer
 1. **Does it differentiate?** Would a customer choose you or pay more because of your version of this
-   layer? Differentiation usually lives in data, domain workflows, evaluation sets and integrations,
-   rarely in plumbing. If no, buy.
+   layer? Differentiation usually lives in data, domain workflows, tools, evaluation sets and
+   integrations, rarely in plumbing. If no, buy.
 2. **How fast is the layer moving?** Buy or adopt a fast-moving commodity layer, *because* a build
-   will be obsolete before it is finished. Build a fast-moving core layer thin and keep it switchable.
+   will be obsolete before it is finished. Build a fast-moving core layer thin and keep it switchable;
+   agent orchestration is the textbook case.
 3. **What do data and compliance require?** A source that cannot leave your environment, retention
    rules or audit requirements narrow buy options to vendors that deploy where you are, and sometimes
-   force a build.
+   force a build. Agent traces contain tool results, so they inherit the data's class.
 4. **What is the total cost including exit?** Compare over three years, not year one:
    - **Build:** engineering time to a first version, plus ongoing maintenance (a material fraction of
      build cost every year), plus the opportunity cost of what those engineers did not ship.
@@ -89,10 +116,11 @@ TCO_buy   = licence over 3 years (at projected seats or usage) + integration
 - **Buy then build.** Adopt a vendor to learn real requirements, then replace the differentiating part
   once usage shows what it is. Justified when requirement uncertainty is high, *because* you cannot know
   what differentiates before users use it.
-- **Build on open source.** The middle path for gateways, serving, eval frameworks: you own deployment
-  and configuration but not development. It trades licence fees for operational expertise.
+- **Build on open source.** The middle path for gateways, serving, agent frameworks, eval frameworks:
+  you own deployment and configuration but not development. It trades licence fees for operational
+  expertise.
 - **Buy the platform, build the product.** The common enterprise shape: a managed model platform with
-  governance, in-house applications on top.
+  governance, in-house agents and applications on top.
 - **Build the eval whatever else you buy.** The evaluation set is the one asset always yours, *because*
   it is the only instrument that holds a vendor accountable and makes switching measurable.
 - **Own the seams.** Wrap every bought component in an interface you control. The test of a seam is
@@ -102,14 +130,15 @@ TCO_buy   = licence over 3 years (at projected seats or usage) + integration
 - **Calendar time is fixed.** Security review, data-processing agreement, residency, subprocessor lists
   and certifications take calendar time regardless of technical merit.
 - **Pricing model matters as much as price.** Per-seat pricing punishes successful adoption; usage
-  pricing without caps punishes success differently.
+  pricing without caps punishes success differently, and agents consume many calls per task.
 - **Leverage.** A credible build alternative is the strongest negotiating position.
 - **For FDEs the roles reverse.** The customer is making this decision about *your* product; your job is
   to make "buy" credible by showing the integration path, the exit path and a transparent quality loop.
 
 ## Diagram
-Run this path once per stack layer, not once per project: compliance (may this data reach the vendor?)
-can force a build before cost is compared, and every outcome ends behind a seam you own.
+Run this path once per stack layer, not once per project: compliance (may this data or these traces
+reach the vendor?) can force a build before cost is compared, and every outcome ends behind a seam you
+own.
 
 ```mermaid
 flowchart TD
@@ -161,6 +190,18 @@ parties. Three options over three years, all figures **illustrative** and in abs
 5. The restricted data source would have forced B regardless: the compliance question overrides the
    cost question.
 
+### Worked scenario: the same assistant becomes an agent
+A year later the team adds tools: create a ticket, look up an order, draft a reply for approval. The
+per-layer walk, with no new numbers needed:
+
+| Layer | Decision | Reason |
+|---|---|---|
+| Agent loop | adopt an open-source framework (for example LangGraph) behind an `AgentRunner` seam | checkpointed state and approval pauses would take weeks to build; the seam keeps a hand-written loop possible |
+| Tools | build | they wrap the ticketing system, the order database and its access controls |
+| Tracing | self-hosted open-source tracing | tool results contain data from the restricted source, so traces cannot leave |
+| Agent eval set | build | 100 real tasks with expected end states, run against every framework or model change |
+| Managed agent service | rejected | the restricted source rules out sending tool results to the vendor's runtime |
+
 ### Three-year TCO and flip point as code
 Runnable; defaults are the scenario's illustrative figures. Add `p_switch × exit_cost` and opportunity
 cost for your own case, because those are the terms people drop.
@@ -183,9 +224,10 @@ flip = next(s for s in range(1, 10_000) if tco_buy(s) > tco_build(s))
 print("flip at", flip, "seats")   # 363: the "s ≈ 360" of the worked scenario
 ```
 
-### An owned seam with a contract test
+### Owned seams with contract tests: retriever and agent runner
 The seam is an interface you own plus one test suite every implementation must pass; running it
-against a candidate is how "time to swap" becomes a measured number.
+against a candidate is how "time to swap" becomes a measured number. The `AgentRunner` adapter wraps
+whichever framework or hand-written loop you use.
 
 ```python
 from dataclasses import dataclass
@@ -207,23 +249,45 @@ def contract_test(r: Retriever, golden: list[dict]) -> float:
         assert all(c.doc_id not in case["forbidden_docs"] for c in got), "ACL leak"
         hits += any(c.doc_id in case["relevant_docs"] for c in got)
     return hits / len(golden)          # recall@5 to compare implementations
+
+@dataclass
+class RunResult:
+    final_state: dict          # what the agent changed, read back from the sandboxed tools
+    tool_calls: list[str]      # names of tools called, in order
+
+class AgentRunner(Protocol):   # adapter over LangGraph, another framework, or your own loop
+    def run(self, task: str, user_id: str, max_steps: int) -> RunResult: ...
+
+def agent_contract_test(a: AgentRunner, tasks: list[dict]) -> float:
+    ok = 0
+    for t in tasks:
+        res = a.run(t["task"], t["user_id"], max_steps=10)
+        assert not set(res.tool_calls) & set(t["forbidden_tools"]), "unapproved tool used"
+        ok += all(res.final_state.get(k) == v for k, v in t["expected_state"].items())
+    return ok / len(tasks)     # task success rate to compare implementations
 ```
 
 ## Production patterns
 - **Layer map in the architecture record.** At the start of any AI initiative and at each renewal. Keep
-  a table with one row per layer: build, buy or adopt, the vendor, the three-year cost including exit,
-  and the measured time-to-swap. Monitor spend by layer and the integration-to-licence cost ratio.
-- **Vendor-neutral golden set from day one.** Whatever you buy. Store the evaluation set and task
-  metrics in your own repository or bucket, and run every vendor and home-built option against it.
-  Monitor score per vendor release, so last month's update is visibly better or worse.
-- **Adapter plus contract test per bought component.** For every vendor in the request path. Wrap it in
-  an interface you own and keep a contract test suite that any replacement must pass. Monitor how long a
-  trial swap takes in a staging environment; rehearse it once a year.
+  a table with one row per layer, agent framework and tracing included: build, buy or adopt, the vendor,
+  the three-year cost including exit, and the measured time-to-swap. Monitor spend by layer and the
+  integration-to-licence cost ratio.
+- **Vendor-neutral golden set from day one.** Whatever you buy. Store the evaluation set of agent tasks
+  and task metrics in your own repository or bucket, and run every vendor, framework and home-built
+  option against it. Monitor score per vendor release, so last month's update is visibly better or worse.
+- **Adapter plus contract test per bought component.** For every vendor or framework in the request
+  path. Wrap it in an interface you own (retriever, tool, agent runner) and keep a contract test suite
+  that any replacement must pass. Monitor how long a trial swap takes in a staging environment; rehearse
+  it once a year.
+- **Traces in a format you can export.** For any hosted tracing or eval platform. Emit spans with
+  OpenTelemetry where your stack supports it, or export traces on a schedule into storage you control,
+  so the trace history survives a switch. Monitor export completeness.
 - **Export clause and periodic export.** For any SaaS that stores prompts, analytics or labels. Make data
   export part of the contract and run the export on a schedule into storage you control. Monitor that the
   export job succeeds and is complete.
-- **Spend caps on usage-priced vendors.** For any usage-priced component. Set budget alerts and hard caps
-  in the vendor console or your gateway, per environment. Monitor spend against forecast weekly.
+- **Spend caps on usage-priced vendors.** For any usage-priced component, especially managed agent
+  runtimes that bill per step. Set budget alerts and hard caps in the vendor console or your gateway, per
+  environment. Monitor spend against forecast weekly.
 
 ## Trade-offs
 - **Buying: speed vs control.** Time-to-value and someone else's roadmap, but you pay lock-in and lose
@@ -231,6 +295,9 @@ def contract_test(r: Retriever, golden: list[dict]) -> float:
 - **Building: differentiation vs maintenance.** Control and differentiation, but you pay the build,
   permanent maintenance and the opportunity cost, while open-source alternatives keep improving; it
   flips when the layer commoditises.
+- **Agent framework vs hand-written loop.** A framework gives state persistence, pauses and integrations
+  quickly, but its abstractions and upgrades become your problem; a plain loop is easier to debug and
+  wins when the agent is simple and the team must understand every step.
 - **Open source: no licence vs ownership.** It avoids licence fees and vendor lock-in, but you own
   upgrades, security patches and the expertise to run it; with a small team that often exceeds a licence.
 - **Buy-then-build: de-risked vs paying twice.** It de-risks requirements, but you pay twice plus a
@@ -242,6 +309,9 @@ def contract_test(r: Retriever, golden: list[dict]) -> float:
 ## Pitfalls
 - **Reading "AI is strategic" as "build every layer".** Symptom: a platform team six months in with an
   in-house vector database and no shipped product.
+- **Coupling agent logic to a framework's internals.** Symptom: a framework upgrade breaks tools, state
+  and prompts at once, and nobody can run the agent without it. Fix: tools and prompts in your own
+  modules, the framework behind an `AgentRunner` seam.
 - **Underestimating integration for a bought product.** Symptom: the licence was a third of the project
   cost; SSO, connectors and access-control mapping were the rest.
 - **Buying a product with an opaque quality loop.** Symptom: nobody can explain a wrong answer, run the
@@ -257,9 +327,10 @@ def contract_test(r: Retriever, golden: list[dict]) -> float:
 - **Run the per-layer decision:** at the start of any AI initiative, again at each renewal, and whenever
   a layer visibly commoditises (a capability that needed a vendor last year ships in an open-source
   project this year).
-- **Buy by default:** models, serving, gateways, tracing, vector stores and generic guardrails.
-- **Build by default:** evaluation sets, domain workflows, context assembly, integrations with your
-  systems of record, and the experience if it is your product.
+- **Buy by default:** models, serving, gateways, tracing, vector stores and generic guardrails; adopt an
+  agent framework when you need its state and pause features.
+- **Build by default:** evaluation sets, tools, domain workflows, context assembly, integrations with
+  your systems of record, and the experience if it is your product.
 - **Measure:** time-to-swap per bought component, spend by layer, the integration-to-licence cost ratio,
   and whether a new engineer can point to which parts are yours.
 - **Interviews:** "would you build or buy X" is answered with the layer decomposition and the four
@@ -294,8 +365,16 @@ vector store, and revisit at renewal.
   differentiation; buying end-to-end treats the application layer as commodity when your domain
   knowledge and data live there.
 - **Layers differ in differentiation, rate of change and data sensitivity,** so models, serving and
-  gateways usually lean buy while evaluation sets, workflows and context assembly lean build.
+  gateways usually lean buy while evaluation sets, tools, workflows and context assembly lean build.
 - **Decomposing first** makes the four questions answerable for each layer.
+
+### Would you build your agent on LangGraph, write the loop yourself, or use a vendor's managed agent service?
+- **Start from what the agent needs.** Long-running runs with checkpointed state and human approval
+  pauses favour a framework; a short tool loop with three tools is often clearer as plain code.
+- **A managed service is fastest but couples you** to that vendor's models, runtime and trace storage,
+  and fails if tool results cannot leave your environment.
+- **Whatever you pick, own the tools, prompts and eval set,** and put the runner behind an interface
+  with a contract test so a later switch is measured, not a rewrite.
 
 ### Walk me through a three-year TCO comparison. Which terms do people usually drop?
 - **Build:** effort plus about three years of maintenance, infrastructure, usage and opportunity cost.
@@ -305,6 +384,14 @@ vector store, and revisit at renewal.
 - **Look for the flip point,** because licence grows with adoption while most build cost is fixed; in
   the scenario it was about 360 seats.
 
+### Your agent traces go to a hosted tracing platform, and legal now says tool results contain regulated data. What do you do?
+- **Treat traces as data of the highest class they contain,** because tool results and retrieved chunks
+  are copied into every span.
+- **Move to a self-hostable option or redact before export,** for example an open-source tracing stack
+  inside your environment, keeping a small sampled full-fidelity set under tighter access.
+- **Keep the seam:** emit spans in a portable format and export history, so the switch does not lose
+  the trace data your evals were built from.
+
 ### A vendor's assistant scores well in the demo. What would make you reject it anyway?
 - **The data cannot go to the vendor.** A restricted source that cannot leave your environment overrides
   the cost question.
@@ -313,19 +400,11 @@ vector store, and revisit at renewal.
 - **No exit path:** prompts, analytics and labels live only inside their platform, with no export clause
   or scheduled export.
 
-### When would you deliberately buy first and plan to build later?
-- **When requirement uncertainty is high,** because you cannot know what differentiates before users use
-  it.
-- **The cost is paying twice plus a migration,** so it is worth it only if the vendor's exit path is
-  clean.
-- **Keep your golden set and an adapter seam from day one,** so the later build is measured against the
-  vendor rather than started from zero.
-
 ### How do you make "time to swap a vendor" a measured number rather than a guess?
-- **Wrap the component in an interface you own,** such as a retriever protocol, and keep one contract
-  test suite every implementation must pass.
+- **Wrap the component in an interface you own,** such as a retriever or agent runner protocol, and keep
+  one contract test suite every implementation must pass.
 - **Run the suite against a candidate replacement in staging,** checking both quality (for example
-  recall at 5 on the golden set) and safety properties such as no ACL leaks.
+  recall at 5 on the golden set, or task success for agents) and safety properties such as no ACL leaks.
 - **Rehearse a trial swap about once a year** and record the time in the layer map.
 
 ## Quiz

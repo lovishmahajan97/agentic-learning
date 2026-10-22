@@ -5,7 +5,8 @@ name: Eval harness
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/golden-dataset
   - evals/llm-as-a-judge
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-An eval harness runs a versioned dataset through the system under test with pinned configuration,
-grades stored outputs, and reports per-slice scores with intervals. It turns notebook evaluation into a
+An eval harness runs your agent over a versioned task set in fresh sandboxes with pinned configuration,
+stores every output and trajectory, grades them, and reports per-slice scores with intervals: a
 repeatable artifact with the status of a test suite.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is many LLM calls plus tool side effects, so the failure
+  modes of a notebook loop (dropped errors, overwritten outputs, unpinned config) multiply. The harness
+  is what lets you say "the new planner prompt fixed 9 tasks and broke 2" with traces to prove it.
+- **Where it shows up in your stack.** Eval runners in LangSmith, Braintrust, promptfoo or Inspect, or
+  your own script; a target adapter that calls your agent (LangGraph graph, OpenAI Agents SDK runner,
+  or a hand-rolled loop); a CI job that turns thresholds into an exit code.
+- **What you control.** The target adapter, the sandbox per task, the step, token and wall-clock
+  budgets, what goes in the run manifest, the graders, sample count *k*, and which runs block merges.
+- **What you can skip.** Building dashboards before the basics. Pinning, stored raw outputs and
+  trajectories, error reporting and a paired diff against a baseline matter far more.
 
 ## Why it exists
 - **The notebook loop works once.** Iterate over a CSV, call the model, eyeball outputs, count passes.
@@ -92,6 +105,11 @@ An agent changes the shape of `run(item)`:
   an agent fails, the step where it went wrong is the evidence.
 - **Budgets on every run:** maximum steps, tokens and wall-clock time, so a looping agent becomes a
   recorded failure instead of a hung CI job.
+- **Pin the tool layer too.** Tool schema version, tool descriptions and any recorded tool responses
+  go in the manifest, *because* a reworded tool description changes agent behavior as much as a prompt.
+- **Record vs live tools.** Recorded (replayed) tool responses make runs repeatable but break when the
+  agent takes a new path the recording never saw; a seeded fake backend handles new paths at more
+  build cost.
 
 ### Capability harnesses versus application harnesses
 - **Capability harnesses** such as EleutherAI's lm-evaluation-harness and Inspect standardize prompting
@@ -109,8 +127,8 @@ An agent changes the shape of `run(item)`:
   blocking merges, and their count is itself a quality signal.
 
 ## Diagram
-One CI run end to end: note that raw outputs are stored before grading, so graders can be re-run without
-calling the system again.
+One CI run end to end: the target adapter runs the agent per item in its own sandbox, and raw outputs
+and trajectories are stored before grading, so graders can be re-run without calling the agent again.
 
 ```mermaid
 sequenceDiagram
@@ -198,6 +216,52 @@ def wilson(k, n, z=1.96):          # stays sane at 10/10 or 0/10, where the norm
   approximation reports a 10/10 slice as 100% ± 0, which is false confidence; Wilson gives roughly 72%
   to 100% for the same slice.
 
+### Agent scenario: a target adapter with a sandbox, budgets and a trajectory
+The same `run_eval` drives an agent when `target` builds a fresh sandbox, runs the loop under budgets
+and returns the final state plus the trace. `agent_step` stands for one call of your agent framework
+or model API; `seed_db` and `TOOLS` are your fixtures.
+
+```python
+import copy, time
+
+class BudgetExceeded(Exception): pass
+
+def agent_target(item, config):
+    db = copy.deepcopy(seed_db(item["seed"]))           # fresh state per item, never shared
+    tools = {name: (lambda f: lambda **a: f(db, **a))(f) for name, f in TOOLS.items()}
+    messages, trace, t0, tokens = [{"role": "user", "content": item["input"]["message"]}], [], time.time(), 0
+    for step in range(config["max_steps"]):            # e.g. 10
+        action = agent_step(messages, config)          # -> {"tool": name, "args": {...}} or {"final": text}
+        tokens += action["usage_tokens"]
+        if tokens > config["max_tokens"] or time.time() - t0 > config["max_seconds"]:
+            raise BudgetExceeded(f"step {step}")
+        if "final" in action:
+            return {"final": action["final"], "state": db, "trace": trace, "steps": step + 1, "tokens": tokens}
+        result = tools[action["tool"]](**action["args"])
+        trace.append({"tool": action["tool"], "args": action["args"], "result": result})
+        messages.append({"role": "tool", "name": action["tool"], "content": str(result)})
+    raise BudgetExceeded("max_steps")                  # a looping agent is a recorded failure
+
+def grade_agent(out, item):                            # outcome first, path only where it matters
+    exp = item["expected"]
+    state_ok = all(out["state"][k] == v for k, v in exp["final_state"].items())
+    called = [t["tool"] for t in out["trace"]]
+    path_ok = all(t in called for t in exp["required_tools"]) and not set(called) & set(exp["forbidden_tools"])
+    return state_ok and path_ok and out["steps"] <= exp["max_steps"]
+```
+
+| Run of 120 refund tasks, *k* = 3 (illustrative) | Count |
+|---|---|
+| Passed (state, path and budget) | 291 of 360 |
+| Failed on final state | 41 |
+| Failed on forbidden or missing tool | 16 |
+| `BudgetExceeded` (reported as errors, not dropped) | 12 |
+
+- **Reading it:** the 12 budget errors cluster on 4 tasks where the agent re-calls `lookup_order` in a
+  loop; the stored trace shows the tool returned an error string the prompt never explains.
+- **One adjustment to `run_eval`:** do not retry `BudgetExceeded`, because it is a deterministic agent
+  failure, not a transient provider error; retry only rate limits and timeouts.
+
 ### A CI gate against a baseline
 Pure Python. It compares graded results from a baseline and a candidate run on the same items, fails on
 errors and slice floors, and reports whether the flip count clears the measured noise floor.
@@ -256,6 +320,9 @@ sys.exit(1 if problems else 0)
 - **Hermetic agent environments.** Build each agent item's sandbox from a seed (a container or a fresh
   temp directory plus a seeded database), enforce step, token and wall-clock budgets, and store the
   trajectory. Monitor budget-exceeded counts.
+- **Trace link on every result.** Store the trace id from your tracing tool next to each graded item,
+  so the PR comment's list of flipped tasks opens straight into the step where the agent diverged.
+  Monitor items with missing traces, since those failures cannot be diagnosed.
 
 ## Trade-offs
 - **Stored outputs vs storage.** Storing every raw output makes re-grading free and failures
@@ -270,6 +337,9 @@ sys.exit(1 if problems else 0)
 - **Hosted product vs owned code.** A hosted eval product gives dashboards, trend history and
   human-review queues out of the box, but owns your dataset format and graders. A few hundred lines you
   own are portable but need maintenance.
+- **Recorded tools vs seeded fakes.** Replaying recorded tool responses is cheap and exact, but fails
+  when a new prompt makes the agent take a path the recording lacks. Seeded fake backends answer any
+  path at the cost of building and maintaining them; use recordings for read-only tools.
 
 ## Pitfalls
 - **Dropping errored items from the denominator.** Symptom: the score improves on the day the provider
@@ -286,6 +356,9 @@ sys.exit(1 if problems else 0)
   empty diff.
 - **Reusing one environment across agent items.** Symptom: results depend on item order; an item passes
   alone and fails when run after another that changed shared state.
+- **Retrying agent failures as if they were transient.** Symptom: a looping task burns three full step
+  budgets per sample and the run cost triples. Fix: retry only provider errors; record budget overruns
+  once as failures.
 
 ## When to use
 - **Build it before the first eval:** a harness is needed the moment a prompt or chain is evaluated
@@ -334,6 +407,14 @@ per-slice interval that says whether six points at that n is signal at all.
   action sequences are correct.
 - **Store the full trajectory and enforce budgets** on steps, tokens and wall-clock time, so a looping
   agent is a recorded failure rather than a hung CI job.
+
+### An agent task passes when run alone but fails in the full harness run. What is wrong?
+- **Shared state between items:** an earlier item wrote a file, row or ticket the later one reads, so
+  results depend on order. Fix with a fresh sandbox per item, built from the item's seed.
+- **Shared caches or rate limits:** a tool response cached under too coarse a key, or a tool throttled
+  under concurrency, returns something different in the full run.
+- **Confirm it:** shuffle item order with a fixed seed and compare; order-dependent flips prove the
+  harness, not the agent, is at fault.
 
 ### The model is nondeterministic even at temperature 0. How do you set a gate that is not just noise?
 - **Measure the noise floor:** run the unchanged baseline twice and count items that flip; a candidate

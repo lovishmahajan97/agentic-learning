@@ -5,7 +5,8 @@ name: Saga pattern & distributed transactions
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - system-design/outbox-inbox-patterns
   - system-design/event-driven-architecture
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-A saga replaces one cross-service transaction with local transactions, each paired with a compensating
-action. It gives atomicity and durability but not isolation, so order steps around the irreversible pivot,
-mark in-flight state and make every step idempotent. An agent calling several tools is a saga.
+An agent calling several side-effecting tools runs a saga: local steps, each paired with a
+compensating action, with no shared transaction. It gives atomicity and durability but not isolation, so
+order tools around the irreversible pivot, gate it, and make every call idempotent.
+
+## For agent builders
+- **Why it matters for agents.** A model decides which tools to call, in what order, with what arguments,
+  and any step can fail part-way. Without a saga design, a failed step leaves a created ticket, a charged
+  card and no record of what to undo.
+- **Where it shows up in your stack.** Tool adapters that expose an undo (close ticket, void
+  authorisation), a run log or checkpointer (LangGraph's checkpointer, a Temporal workflow history, or
+  your own table), and a human-approval pause in front of irreversible tools.
+- **What you control.** Classifying every tool as compensatable, pivot or retriable, the order the agent
+  is allowed to call them in, idempotency keys of the form `{saga_id}:{step}`, the approval gate, and
+  persisting the model's chosen arguments so retries replay them instead of re-asking the model.
+- **What you can skip.** Three-phase commit and XA internals. Know why 2PC cannot include SaaS APIs, the
+  compensatable, pivot and retriable split, and the unknown-outcome rule.
 
 ## Why it exists
 - **No shared transaction across systems.** "Place order" reserves stock in inventory, charges the card
@@ -142,6 +156,15 @@ Countermeasures named in Richardson's treatment:
 - **Tool adapters** should expose compensations where they exist (close ticket, delete message).
 - **The orchestrator** should place irreversible tools after a pivot, and **approval gates** belong exactly
   at the pivot.
+
+What makes an agent saga harder than a classic one:
+
+| Difference | Why it bites | What you do |
+|---|---|---|
+| The step list is chosen at run time | the model may call the irreversible tool first | enforce ordering in the tool layer: refuse pivot tools until required checks have succeeded in this run |
+| Arguments are non-deterministic | a retry that re-asks the model gets different arguments | log each step's chosen tool and arguments before executing, replay them on recovery |
+| Undo may be another tool call | compensation can itself fail or time out | key compensations too, and route repeated failures to a human queue |
+| Long waits for approval | holds and authorisations can expire | pause the run durably and size hold expiry to the approval SLA |
 
 ## Diagram
 An orchestrated saga: business checks come first, the pivot is gated, failures before the pivot unwind in
@@ -264,6 +287,44 @@ print(stock.held, pay.charges, pay.refunds)
 # {} {'order-42:charge': 30} {'order-42:charge:undo': 30}   one refund, not two
 ```
 
+### Agent scenario: a tool layer that knows each tool's saga class
+The model proposes tool calls; the tool layer enforces the saga rules, so the guarantees do not depend on
+the prompt. `approve` stands in for a durable human-approval pause.
+
+```python
+TOOLS = {   # class, compensation tool (or None)
+    "create_ticket": ("compensatable", "close_ticket"),
+    "authorize_card": ("compensatable", "void_authorization"),
+    "book_hotel":    ("pivot", None),          # non-refundable
+    "send_email":    ("retriable", None),
+}
+
+def execute(run, call, impl, approve):
+    cls, undo = TOOLS[call.name]
+    if cls == "retriable" and not run.pivot_done:
+        raise PermissionError("retriable tools run only after the pivot")   # keep emails last
+    if cls == "pivot":
+        if not run.checks_passed:
+            raise PermissionError("pivot refused: policy and fraud checks not done")
+        if not approve(run.id, call):                    # human gate exactly at the pivot
+            run.compensate_all(); return "rejected"
+    key = f"{run.id}:{call.name}:{run.step}"
+    run.log("started", call.name, call.args, key)      # args persisted: replay, never re-ask the model
+    out = impl[call.name](**call.args, idempotency_key=key)
+    run.log("done", call.name, out, key)
+    if undo:
+        run.push_compensation(undo, out, key + ":undo")
+    if cls == "pivot":
+        run.pivot_done = True
+    return out
+```
+
+| Run event | Classic code saga | Agent with this tool layer |
+|---|---|---|
+| Model calls `book_hotel` before the fraud check | not possible, order is in code | refused, the model gets the error and calls the check first |
+| Worker crashes after `started book_hotel` | resume from log | resume, query partner by key, replay the logged arguments |
+| Reviewer rejects at the gate | n/a | void the authorisation, close the ticket, end `compensated` |
+
 ### Worked scenario: where the failure lands decides the outcome
 The travel saga above, failing at each step in turn.
 
@@ -292,6 +353,13 @@ The travel saga above, failing at each step in turn.
 - **Stuck-saga reaper and repair queue.** A scheduled job finds sagas whose last log entry is older than a
   threshold, resumes them, and after N attempts routes them to a human queue. Track saga completion rate,
   compensation rate and manual-repair count.
+- **Saga metadata on every agent tool.** Register each tool with its class (compensatable, pivot,
+  retriable), its compensation tool and whether it accepts an idempotency key, and have the tool layer
+  enforce ordering and gates. Review the registry when a tool is added. Monitor refused pivot calls,
+  compensations per run and runs ending `compensated`.
+- **Durable approval pause at the pivot.** Pause the agent run with its state checkpointed (frameworks
+  such as LangGraph support pausing a graph for human input; durable engines wait on a signal), notify a
+  reviewer, and resume with the decision. Monitor approval wait time against hold and authorisation expiry.
 
 ## Trade-offs
 - **Independent availability vs visible intermediate state.** Sagas keep every service available on its own
@@ -404,6 +472,14 @@ crashed worker resumes rather than rebooking.
   action, and retry everything after it forward.
 - **Persist the agent's decisions** in the saga log, because re-running the LLM on retry can produce
   different arguments than the ones the compensation expects.
+
+### Your agent sometimes calls the irreversible tool before the checks it depends on. How do you stop that without relying on the prompt?
+- **Enforce order in the tool layer.** Tag tools with saga classes and refuse pivot tools until the
+  required checks have succeeded in this run; return the refusal to the model as a tool error.
+- **Gate the pivot.** Put a durable human or policy approval in front of it, and pause the run with its
+  state checkpointed instead of holding a connection.
+- **Test it.** Add eval cases where the model is nudged to call the pivot early, and assert the refusal and
+  the absence of side effects.
 
 ## Quiz
 ### Q: Why is two-phase commit rarely used to coordinate a payment provider, a ticketing SaaS and an internal database?

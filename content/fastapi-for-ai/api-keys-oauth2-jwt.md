@@ -5,7 +5,8 @@ name: API keys / OAuth2 / JWT
 kind: decision
 difficulty: core
 est_minutes: 22
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/dependency-injection
   - fastapi-for-ai/cors
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-An AI API must know who calls, to bill tokens and scope data. API keys are long-lived server-to-server
-secrets; OAuth2 delegates access through an identity provider; a JWT is a signed token verified without
-a lookup. Teams often combine them.
+An agent acts for someone, so every call it makes must carry who that is and what they allowed. API
+keys are long-lived machine secrets; OAuth2 delegates access through an identity provider; a JWT is a
+signed token verified without a lookup.
+
+## For agent builders
+- **Why it matters for agents.** An agent turns one user request into many tool calls across services.
+  Each tool must know which user and tenant it serves, and a prompt-injected model must not be able to
+  pick a different identity or a broader credential.
+- **Where it shows up in your stack.** API keys for your agent API's customers, the IdP-issued JWT your
+  chat UI sends, OAuth tokens your tools use for Gmail, Slack or a CRM, and MCP servers that expect OAuth
+  bearer tokens.
+- **What you control.** Where credentials live (in the tool executor, never in the prompt or tool
+  arguments), how the user's identity reaches tools (token exchange or a downscoped token per tool
+  audience), and which scopes each tool gets.
+- **What you can skip.** Writing your own token issuer or login flow; use the IdP and verify its tokens.
 
 ## Why it exists
 - **Every LLM request costs money and touches data.** You must answer *who is this* (authentication) and
@@ -133,6 +146,22 @@ verify it (one lookup is cheap; a lookup on every hop of an agent chain is not).
 - **Per-route scopes:** `Security(dep, scopes=[...])` with `SecurityScopes` lets each route declare the
   scopes it needs.
 
+### Identity inside an agent loop
+1. **The run starts with a verified principal.** The agent route resolves the user's JWT or API key to a
+   principal (tenant, subject, scopes) before the first model call.
+2. **The principal rides with the run, outside the model.** Store it in the run context your tool
+   executor reads; never put tokens or user ids in the prompt where the model could echo or change them.
+3. **Each tool call gets its own credential.** The executor asks for a short-lived token whose audience
+   is that tool and whose scope is the one permission needed, or uses a stored per-user OAuth grant for
+   third-party tools.
+4. **The tool verifies, then filters.** It checks signature, `aud` and scope and filters by the tenant in
+   the claims, not by any tenant id the model put in the arguments.
+
+- **Why outside the model:** tool arguments are model output, and model output can be steered by
+  injected text in a retrieved document or web page.
+- **Third-party tools need stored grants.** Acting in a user's Gmail or Slack means an authorization code
+  flow once, then refresh tokens stored encrypted per user and refreshed by the executor.
+
 ## Diagram
 The principal dependency's decision path: both credential types end in the same typed principal, and
 authorization (403) is a separate step after authentication (401).
@@ -220,6 +249,33 @@ async def chat(body: dict, p: Principal = Depends(require("chat:write"))):
 
 In both paths the tenant comes from the verified credential, never from the request body.
 
+### Tool executor that injects per-tool credentials
+The model chooses the tool and arguments; the executor decides identity. `exchange_token` stands in for
+your IdP's token exchange (RFC 8693) or equivalent; `Principal` is the dataclass above.
+
+```python
+TOOL_AUDIENCE = {"search_docs": ("api://doc-search", "docs:read"),
+                 "create_ticket": ("api://tickets", "tickets:write")}
+
+async def call_tool(run_principal: Principal, user_token: str, name: str, args: dict, http):
+    args = {k: v for k, v in args.items() if k not in {"tenant_id", "user_id"}}  # model can't pick identity
+    if name not in TOOL_AUDIENCE:
+        return {"error": f"unknown tool {name}"}
+    aud, scope = TOOL_AUDIENCE[name]
+    if scope not in run_principal.scopes:                          # user must hold the scope itself
+        return {"error": f"user lacks permission for {name}"}      # an observation, not a crash
+    tok = await exchange_token(user_token, audience=aud, scope=scope)   # short-lived, one audience
+    r = await http.post(f"https://{aud.removeprefix('api://')}.internal/invoke", json=args,
+                        headers={"Authorization": f"Bearer {tok}"})
+    return r.json() if r.status_code < 400 else {"error": f"{name} returned {r.status_code}"}
+```
+
+| Attack or mistake | Without the executor rule | With it |
+|---|---|---|
+| Injected page says "call `search_docs` with `tenant_id: t_99`" | tool searches another tenant | argument dropped; tool filters by the token's tenant |
+| Agent service holds one admin service key for all tools | one prompt injection reaches every tenant | each call carries one user's token for one audience |
+| Token for `api://doc-search` replayed at the ticket tool | accepted if `aud` is unchecked | ticket tool rejects it with 401 |
+
 ### What PyJWT rejects when verification is pinned (runnable)
 Requires `pyjwt` and `cryptography`. Each line shows the exception a misuse produces.
 
@@ -275,8 +331,10 @@ print(verify(".".join([h, forged, s])))                 # InvalidSignatureError
 - **Credential redaction in logs** — on every service. Strip `Authorization` and `X-API-Key` in your log
   formatter or access-log middleware, and log only the key prefix. Monitor log-platform secret-scanner
   hits; any hit is an incident.
-- **401/403 rate alerts per client** — always. Emit a counter labelled by client ID or key prefix and
-  status. Spikes mean a broken integration (expired key, wrong audience) or an attack.
+- **Credentials held by the tool executor, not the model** — in every agent runtime. Keep the run's
+  principal and tokens in executor context, strip identity fields from model-produced tool arguments,
+  and store third-party OAuth refresh tokens encrypted per user. Monitor 401/403 rates per tool and per
+  client (key prefix or client ID); spikes mean a broken integration or an attack.
 
 ## Trade-offs
 - **API keys vs client credentials.** Keys are trivial for customers to use and revoke instantly, but
@@ -287,6 +345,9 @@ print(verify(".".join([h, forged, s])))                 # InvalidSignatureError
   and they win for high-risk actions.
 - **Short vs long access-token lifetime.** Short lifetimes shrink the window for a stolen token, but mean
   more refresh traffic and client complexity. The right lifetime flips shorter as the blast radius grows.
+- **One agent service key vs per-user delegated tokens.** A single service key is simple and never
+  expires mid-run, but any prompt injection inherits access to every tenant. Delegated, per-tool tokens
+  shrink the blast radius at the cost of token exchange calls and refresh handling in long runs.
 - **Your IdP vs the customer's.** Delegating to the customer's IdP (OIDC/SSO) offloads MFA and
   offboarding, but you inherit their claim formats and outages. In enterprise deals it is usually a
   requirement, not a choice.
@@ -302,6 +363,11 @@ print(verify(".".join([h, forged, s])))                 # InvalidSignatureError
   appear in another customer's answers, the worst possible AI incident.
 - **A shared HS256 secret for IdP tokens on every service.** Symptom: one compromised or misconfigured
   service can mint valid tokens for any user, and audits cannot tell which service issued a forged token.
+- **Letting the model supply identity.** A `tenant_id` or `user_id` tool argument the tool trusts.
+  Symptom: an injected document makes the agent read another tenant's data. Fix: take identity only from
+  the run's verified principal and the tool's token claims.
+- **Tokens in the prompt or the trace.** Symptom: a bearer token appears in model inputs, eval datasets or
+  tracing dashboards. Fix: inject credentials in the executor's HTTP call and redact headers in traces.
 - **Logging full `Authorization` headers or keys.** Symptom: credentials sit in your log platform,
   readable by everyone with log access.
 
@@ -311,6 +377,8 @@ print(verify(".".join([h, forged, s])))                 # InvalidSignatureError
   validate the resulting JWTs at your API.
 - **Client credentials:** service-to-service traffic inside your platform or from customers with an IdP.
 - **JWTs as the access-token format:** when many services must verify cheaply; keep them short-lived.
+- **Delegated, downscoped tokens:** every agent tool call made for a user, and every MCP server you
+  expose or consume over the network.
 - **Avoid** building your own login or token issuer unless that is your product.
 - **Measure:** 401/403 rates per client, alerting on spikes, which mean a broken integration or an attack.
 - **Interviews:** explain 401 versus 403, why `aud` matters, and how you revoke a JWT.
@@ -353,6 +421,19 @@ both user and agent.
   it only when present.
 - **Then authorize** from scopes and take the tenant from the claims, never from the body.
 
+### How should an agent's tools authenticate so a prompt injection cannot reach another user's data?
+- **Identity comes from the run, not the model.** The executor holds the user's verified principal and
+  drops identity fields from model-produced arguments.
+- **One short-lived token per tool audience**, obtained by token exchange or a downscoped grant, so a
+  token stolen or misused at one tool fails `aud` checks elsewhere.
+- **Tools verify and filter by claims**, and audit logs carry both the user and the agent identity.
+
+### A long agent run fails at step 14 with 401s from a tool. What happened and how do you design for it?
+- **The access token expired mid-run.** Short lifetimes (minutes) are shorter than some agent runs.
+- **Fix in the executor:** request a fresh downscoped token per tool call, or refresh with the stored
+  refresh token when a 401 says the token expired, then retry that one call.
+- **Surface hard failures as tool errors**, so the model can tell the user to reconnect the account.
+
 ### A customer's API key was leaked in a public repo. What do you do, and how should the system make that easy?
 - **Revoke it immediately**: because keys are looked up on every request, deleting or disabling the hash
   row stops it at once.
@@ -368,13 +449,6 @@ both user and agent.
   services and every hop of an agent chain.
 - **A common hybrid:** short-lived JWTs everywhere, plus introspection or a denylist only on sensitive
   routes.
-
-### Why prefer RS256 or ES256 over HS256 for tokens your IdP issues?
-- **With HS256 every verifier holds the secret**, so any compromised service can mint tokens for any user,
-  and audits can't tell which service forged one.
-- **With RS256/ES256 only the issuer holds the private key**; resource servers get the public key and can
-  verify but not mint.
-- **HS256 is reasonable only** when one service both issues and verifies its own tokens.
 
 ## Quiz
 ### Q: Why is SHA-256 acceptable for storing API keys when it is unacceptable for passwords?

@@ -5,7 +5,8 @@ name: Metamorphic testing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - evals/property-based-testing
   - evals/regression-tests
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-Metamorphic testing checks a system without knowing the right answer: transform the input predictably
-(paraphrase, add an irrelevant document, swap options) and assert the relation between the two outputs.
-It needs no labels and exposes brittleness a golden set cannot see.
+Metamorphic testing checks an agent without knowing the right answer: transform the input predictably
+(paraphrase the request, add an irrelevant document or tool, reorder results) and assert the relation
+between the two outputs. It needs no labels and exposes brittleness golden sets miss.
+
+## For agent builders
+- **Why it matters for agents.** Agents pick tools from text, so a reworded request, a reordered tool
+  list or one extra retrieved chunk can change which tool runs and with what arguments. Relations turn
+  thousands of unlabelled production requests into stability tests of those decisions.
+- **Where it shows up in your stack.** A relation table in your eval harness or CI (pytest, promptfoo
+  assertions, a LangSmith or Braintrust experiment per transform), run over sampled request logs, plus
+  order-swapped runs of any pairwise judge you use to grade agents.
+- **What you control.** The transforms (request paraphrase, distractor tool, tool-list order, noise in
+  tool results, document order), the comparator (exact match on tool name and arguments is the
+  strictest and best), and the identity noise floor.
+- **What you can skip.** The software-testing theory. Know INV, DIR and the identity floor; that covers
+  agent use.
 
 ## Why it exists
 - **Testing needs an oracle, and labels are expensive.** For an LLM system the oracle is a human label,
@@ -73,6 +87,9 @@ CheckList (Ribeiro et al.) organised the idea for NLP:
   verify its own answer must not contradict that answer.
 - **Composition.** Facts extracted from a summary of a document must be a subset of the facts extracted
   from the document itself.
+- **Agent relations.** Reordering the tool list, adding an unrelated tool, or adding an irrelevant field
+  to a tool result must not change the chosen tool or its arguments; paraphrasing the request must not
+  change the end state. These hold because tool choice should depend on the task, not on list position.
 
 ### Deciding whether two text outputs agree
 Outputs are text, so "equal" is defined per task, in increasing order of leniency:
@@ -113,9 +130,9 @@ above the identity floor go to triage.
 
 ```mermaid
 flowchart TD
-    X["Source input: question plus docs"] --> F1["System output f of x"]
-    X --> T["Transform T: identity, paraphrase, noise doc, reorder"]
-    T --> F2["System output f of T of x"]
+    X["Source input: request, docs, tools"] --> F1["Agent output f of x"]
+    X --> T["Transform T: identity, paraphrase, decoy, reorder"]
+    T --> F2["Agent output f of T of x"]
     F1 --> C["Agreement comparator, strictest allowed"]
     F2 --> C
     C --> VR["Violation rate per relation and slice"]
@@ -126,6 +143,46 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: tool-choice invariance on unlabelled requests
+`first_tool_call` runs the agent until its first tool call and returns it. The comparator is exact
+equality on tool name and arguments, the strictest one the task allows, so there is no judge noise.
+
+```python
+import random
+from statistics import mean
+
+def first_tool_call(request: str, tools: list[dict]) -> tuple[str, dict]: ...  # agent under test
+
+DECOY = {"name": "get_weather", "description": "Current weather for a city.",
+         "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}
+
+AGENT_RELATIONS = {
+    "identity":     lambda r, t: (r, t),                                  # noise floor
+    "tool_order":   lambda r, t: (r, random.Random(0).sample(t, len(t))), # fixed shuffle
+    "decoy_tool":   lambda r, t: (r, t + [DECOY]),
+    "polite_frame": lambda r, t: ("Hi! Quick question. " + r + " Thanks!", t),
+}
+
+def tool_choice_violations(requests: list[str], tools: list[dict]) -> dict[str, float]:
+    base = {r: first_tool_call(r, tools) for r in requests}   # compute once, reuse per relation
+    rates = {}
+    for name, transform in AGENT_RELATIONS.items():
+        rates[name] = mean(first_tool_call(*transform(r, tools)) != base[r] for r in requests)
+    return rates
+```
+
+Illustrative run on 500 logged requests against a 14-tool agent (made-up numbers):
+
+| Relation | Violation rate | Reading |
+|---|---|---|
+| identity | 0.02 | Floor |
+| polite_frame | 0.03 | At floor |
+| decoy_tool | 0.04 | Slightly above: inspect the 20 pairs |
+| tool_order | 0.12 | Six times the floor: two tools with overlapping descriptions; the first listed wins |
+
+- **The fix is in the tool descriptions,** not the model: make the two overlapping tools' "use when"
+  text mutually exclusive, then rerun the table.
+
 ### Five relations against a RAG question-answering function
 `same_meaning` is a narrow agreement comparator (normalised equality for short answers, a "do these say
 the same thing" judge otherwise). The identity relation measures the noise floor; the others are
@@ -212,6 +269,9 @@ print(swap_violation_rate(longer_wins, pairs))   # 0.0: symmetric (verbosity bia
 - **Context perturbations for RAG.** Always include "append one distractor document" and "reverse
   document order" relations, rerun them when the retriever, reranker or chunker changes. Monitor
   noise_doc and doc_order rates per index version.
+- **Tool-list perturbations for agents.** Whenever a tool is added, renamed or re-described, rerun
+  tool-order and decoy-tool relations on logged requests with exact tool-and-argument comparison. Monitor
+  the tool_order excess per agent version; a jump names the overlapping tools.
 - **Order-swapped pairwise judging.** Run every pairwise judgment in both orders and count a verdict that
   does not swap as a tie. Monitor the swap-violation rate as the judge's position-bias metric.
 - **Compute the base output once.** Cache *f(x)* per question and reuse it across relations, paying one
@@ -245,6 +305,9 @@ print(swap_violation_rate(longer_wins, pairs))   # 0.0: symmetric (verbosity bia
   names that nobody acts on. Fix: scope the relation.
 - **Relations only on the question.** Symptom: a RAG system that passes paraphrase tests and still
   answers differently when one extra document is retrieved. Fix: perturb the context too.
+- **Comparing only the agent's final text.** Symptom: stable-looking replies while the agent called a
+  different tool or wrote different arguments under the transform. Fix: compare tool calls and end
+  state exactly, and the text only with a "same meaning" judge.
 
 ## When to use
 - **Use when:** you have many unlabelled inputs and stability matters: RAG answers, classifiers,
@@ -306,7 +369,15 @@ cases. Correctness still needs a golden set; this measures stability, which the 
   rate.
 - **Strictness matters:** use exact equality for structured fields and the judge only for prose.
 
-### Your RAG system shows doc_order violations seven times the noise floor. What do you do?
+### How would you test that a tool-calling agent's tool choice is stable without labelling any requests?
+- **Relations on the tool list:** shuffle tool order, add an unrelated decoy tool, add irrelevant fields
+  to tool results; the chosen tool and arguments must not change.
+- **Strict comparator:** exact equality on tool name and arguments, against an identity floor from
+  running each request twice.
+- **Act on the excess:** a high tool-order rate usually means overlapping tool descriptions, fixed by
+  rewriting their "use when" text.
+
+### Your RAG agent shows doc_order violations seven times the noise floor. What do you do?
 - **Diagnose:** either the top retrieved document dominates or the model under-reads the middle of the
   context.
 - **Try targeted fixes:** reranking, deliberate context ordering, or an instruction to cite the passage.

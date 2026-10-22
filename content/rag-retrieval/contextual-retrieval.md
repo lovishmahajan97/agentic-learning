@@ -5,7 +5,8 @@ name: Contextual retrieval
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/parent-document-retrieval
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-Chunks lose their subject when cut from a document. Contextual retrieval fixes the index: at ingestion an
-LLM reads the whole document and writes a short context for each chunk, prepended before embedding and
-BM25 indexing. One cached LLM call per chunk, no query latency.
+Chunks lose their subject when cut from a document. Contextual retrieval has an LLM write a short
+per-chunk context at ingestion, prepended before embedding and BM25 indexing, so the agent's search tool
+finds them with zero added latency per step.
+
+## For agent builders
+- **Why it matters for agents.** An agent searches several times per task, so query-side fixes are paid
+  on every step; this one is paid once, at ingestion. It also applies to agent memory: a note saved as
+  "she prefers the annual plan" is unfindable later without who and when.
+- **Where it shows up in your stack.** Your knowledge-base ingestion job (often a LangChain or LlamaIndex
+  pipeline or a plain batch script), provider prompt caching for the document prefix, the dense and BM25
+  indexes behind the search tool, and the memory-write path.
+- **What you control.** The context prompt, its length, whether both index legs get it, caching and
+  fan-out order, re-contextualisation triggers, and validation of generated contexts.
+- **What you can skip.** Comparing this with late chunking unless you run long-context encoders yourself.
+  Try title and heading prefixes first, then this.
 
 ## Why it exists
 - **Chunks are written to be read in place.** Authors rely on surrounding pages to supply the subject: "the
@@ -113,6 +126,16 @@ shape (each layer helps, and they stack), not the exact percentages.
   to the generator.
 - **That is the main attraction** versus query-side techniques: all the cost is paid at ingestion, and query
   latency does not move.
+- **For agents the saving multiplies.** Query rewriting, HyDE or extra retries add a cost to each search
+  call, and an agent makes several per task; an index-side fix costs nothing per call.
+
+### The same idea for agent memory
+- **Memory notes are chunks cut from a conversation.** "Prefers the annual plan; renewal is next month"
+  has no user, account or date once the conversation is gone.
+- **Contextualise at write time.** When the agent saves a note, a small LLM call reads the recent
+  conversation and writes one sentence naming who, what and when, with relative dates resolved.
+- **Index both legs and keep the bare note,** exactly as for documents, and scope every memory search by
+  the user or tenant id from the session.
 
 ### Variants and neighbours
 - **Structural context by rule** (title, heading path, metadata): zero LLM cost, often enough.
@@ -127,7 +150,7 @@ shape (each layer helps, and they stack), not the exact percentages.
 
 ## Diagram
 All the work is on the ingestion side: one cached LLM call per chunk writes a context that feeds both
-index legs, while the query path stays exactly as it was.
+index legs, while the agent's search-tool path stays exactly as it was.
 
 ```mermaid
 flowchart TD
@@ -137,7 +160,7 @@ flowchart TD
     CC -->|"contextual embeddings"| DV[("Dense index")]
     CC -->|"contextual BM25"| BM[("BM25 index")]
     CH -->|"original text for citation"| ST[("Chunk store")]
-    Q["Query, unchanged serving path"] --> H["Hybrid search plus rank fusion"]
+    Q["Agent search tool, unchanged"] --> H["Hybrid search plus rank fusion"]
     DV --> H
     BM --> H
     H --> RR["Reranker, top-n to generator"]
@@ -199,6 +222,46 @@ for doc, chunks in ((20_000, 50), (40_000, 100), (80_000, 200)):
   dominates, the "roughly document length squared" growth.
 - **So split long documents into sections** and contextualise each against its section.
 
+### Agent scenario: contextualised memory writes
+The agent's `save_memory` tool stores a note so a later session can find it. `llm`, `embed`, `new_id` and
+the two memory indexes are stubs; `user_id` comes from the session, never from the model.
+
+```python
+NOTE_CONTEXT = """Recent conversation (most recent last):
+{conversation}
+The assistant is saving this memory note:
+{note}
+Today is {today}. Write one sentence naming who and what the note is about (user, account, project)
+and turn relative dates into absolute ones. Answer only with that sentence."""
+
+def save_memory(user_id, conversation, note, today):
+    context = llm(NOTE_CONTEXT.format(conversation=conversation[-6000:], note=note, today=today),
+                  max_tokens=60).strip()
+    contextualised = f"{context}\n{note}"
+    mid = new_id()
+    memory_dense.add(mid, embed(contextualised, kind="passage"), meta={"user_id": user_id})
+    memory_bm25.add(mid, contextualised, meta={"user_id": user_id})
+    memory_store[mid] = {"note": note, "context": context, "user_id": user_id}   # bare note for display
+    return {"status": "saved", "id": mid}
+
+# note:    "Prefers the annual plan; renewal is next month."
+# context, illustrative: "Memory about Dana Lee (account acme-ops) from a billing conversation; the
+#          renewal date mentioned is in November 2026."
+# A later search for "acme-ops renewal annual plan" now matches on both legs.
+```
+
+### Worked scenario: sizing the knowledge-base job for an agent
+Illustrative: 2,000 documents of 20,000 tokens with 50 chunks each, using the ratios above.
+
+| Quantity | Value |
+|---|---|
+| Document tokens | 2,000 × 20,000 = 40 million |
+| Cached cost per document | ~148,000 full-price equivalents |
+| Whole corpus, cached | ~296 million full-price equivalents |
+| Whole corpus, uncached | 2,000 × 1,025,000 ≈ 2,050 million |
+| The post's rough rule (about one dollar per million document tokens, cached) | on the order of $40 |
+| Added latency per agent search call | 0 |
+
 ## Production patterns
 - **Cache the document block explicitly.** On Anthropic's Messages API, put the document in its own content
   block marked with `cache_control` of type `"ephemeral"` and the chunk plus instruction after it. Monitor
@@ -216,6 +279,9 @@ for doc, chunks in ((20_000, 50), (40_000, 100), (80_000, 200)):
 - **Validate generated contexts.** Cheaply check that entities and dates in each context appear somewhere
   in the source document, and fall back to the structural prefix when they do not. Monitor the fallback
   rate, which spikes on scanned or messy documents.
+- **Contextualise agent memory on write.** When an agent saves a note, add one short context sentence
+  (who, what, absolute date) from the recent conversation, index both legs and scope by user id from the
+  session. Monitor memory-recall on a golden set of "what did I tell you about X" questions.
 
 ## Trade-offs
 - **Query-free quality gain vs ingestion cost.** Retrieval quality rises with zero added query latency, but
@@ -227,6 +293,9 @@ for doc, chunks in ((20_000, 50), (40_000, 100), (80_000, 200)):
   retrieval; documents with clear metadata produce reliable contexts, scanned or messy ones do not.
 - **Matching vs generation context.** Versus parent-document retrieval it fixes matching rather than
   generation context; the two compose, and using only one leaves the other failure mode in place.
+- **Index-side fix vs per-call fixes in an agent.** Contextual retrieval adds nothing to each of the
+  agent's search calls, whereas rewriting or HyDE add to every call; the index-side fix flips to worse
+  only when corpus churn makes re-contextualising cost more than the per-call fixes would.
 
 ## Pitfalls
 - **Embedding only the context or only the chunk** instead of the concatenation. The symptom is no
@@ -246,12 +315,16 @@ for doc, chunks in ((20_000, 50), (40_000, 100), (80_000, 200)):
   in the source document.
 - **Shipping contexts and a reranker in one release without a golden set.** The symptom is not knowing
   which change produced the gain or the regression.
+- **Saving agent memory notes bare.** The symptom is a later session that cannot find "the annual plan
+  note" because the note never named the account or the date; contextualise at write time.
 
 ## When to use
 - **Use when** failure analysis shows chunks that cannot be matched because they lost their subject: many
   similar documents, heavy pronouns and references, tables and figures whose rows are meaningless without
   headers.
 - **Try structural prefixes first;** they are free.
+- **Prefer it over query-side fixes for agents** that search many times per task, since the cost is paid
+  once per chunk instead of on every search call.
 - **Avoid for** corpora that fit in the context window, corpora that change faster than you can afford to
   re-contextualise, and collections of short self-contained records that never lost context.
 - **Measure:** retrieval failure rate or recall@20 on a golden set before and after, with and without
@@ -291,12 +364,20 @@ baseline.
   lacks, such as the quarter, the product variant or the entity three paragraphs up.
 - **Why it matters:** it fixes a recall failure caused by the indexing unit, with no added query latency.
 
-### Contextual embeddings shipped but exact-name queries still miss. What do you check?
+### Contextual embeddings shipped, but your agent's search calls with exact names still miss. What do you check?
 - **Both legs:** the contexts must be in the BM25 index too; the post reported around 35% failure reduction
   for embeddings alone versus around 49% with contextual BM25.
 - **The concatenation:** embedding only the context or only the chunk gives no measurable gain.
 - **Context quality:** check that entities and dates in the generated context appear in the source, and
   that long documents were not silently truncated before late chunks were contextualised.
+
+### Your agent saves memory notes but cannot find them in later sessions. What do you change?
+- **Diagnose:** the notes lost their subject; "prefers the annual plan; renewal is next month" names no
+  account and a relative date, so neither leg matches a later query.
+- **Contextualise on write:** one short LLM call writes who, what and the absolute date from the recent
+  conversation, prepended for both indexes, with the bare note kept for display.
+- **Scope and measure:** filter by the session's user id and track recall on a golden set of memory
+  questions.
 
 ### When would you not use contextual retrieval?
 - **Small corpora** that fit in the context window: put them in the prompt with caching and skip retrieval.

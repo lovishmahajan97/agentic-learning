@@ -5,7 +5,8 @@ name: Tool calling
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-loop
   - agents/tool-schemas-and-argument-validation
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Tool calling lets a model request an action instead of describing one: it emits a structured, typed call
-against a declared schema, your code executes it, and the result returns to context. Models cannot reach
-live data, and parsing actions from free text is unreliable.
+Tool calling is how an agent acts: the model emits a structured, typed call against a declared schema,
+your harness executes it, and the result returns to context. Without it models cannot reach live data,
+and parsing actions from free text is unreliable.
+
+## For agent builders
+- **Why it matters for agents.** Every action your agent takes in the world, from a search to a refund,
+  is a tool call. Its declarations decide whether the model picks the right action and sends usable
+  arguments; your dispatcher decides whether the action is allowed and what the model reads back.
+- **Where it shows up in your stack.** The `tools` parameter of the Claude Messages API and OpenAI APIs.
+  In LangChain, `@tool` plus `bind_tools()` on a chat model, with requests on `AIMessage.tool_calls` and
+  answers as `ToolMessage` keyed by `tool_call_id`. Also the OpenAI Agents SDK's `@function_tool`,
+  Pydantic AI's `@agent.tool`, and MCP servers feeding any of them.
+- **What you control.** Tool names, descriptions and schemas, catalogue size, `tool_choice`, the
+  dispatcher that executes and gates calls, and the shape of every result.
+- **What you can skip.** How Toolformer-style training taught models to emit calls. You consume trained
+  tool use through an API; spend the time on declarations and the dispatcher.
 
 ## Why it exists
 - **Models stop at their training cutoff and their output text.** Ask for today's exchange rate or to
@@ -328,6 +342,14 @@ logging the ratio of calls to answerable queries.
   text, each keyed by `tool_use_id`.
 - **OpenAI Chat Completions:** one `role: "tool"` message per call, keyed by `tool_call_id`.
 - **Same invariant:** every call is answered before the next model turn, or the request is rejected.
+
+### Your team wraps tools with LangChain's `@tool`. What do you still own?
+- **The declaration quality.** The decorator builds the schema from the type hints and docstring, so a
+  vague docstring becomes a vague description the model selects on.
+- **Execution policy.** Validation beyond types, tenant scoping from the session, approval for writes
+  and per-call timeouts live in your code, not the decorator.
+- **Result shape and errors.** Decide what the `ToolMessage` contains and make failures readable results
+  rather than exceptions that end the run.
 
 ## Quiz
 ### Q: What does the model actually do when it "calls" a tool?

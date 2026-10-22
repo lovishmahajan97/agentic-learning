@@ -5,7 +5,8 @@ name: FastAPI
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/async-endpoints
@@ -22,13 +23,26 @@ sources:
 ---
 
 ## TL;DR
-FastAPI is the default framework for Python AI services: async-native ASGI on Starlette, Pydantic as one contract
-for validation and docs, first-class streaming and DI. Sharp edge: one blocking call in `async def`
-stalls the worker. (Deep dive: `fastapi-for-ai`.)
+FastAPI is the usual way to put a Python agent behind HTTP: async ASGI that holds long agent runs, Pydantic
+contracts, SSE streaming of steps, and DI for shared clients. Sharp edge: one blocking call in
+`async def` stalls the worker. (Deep dive: `fastapi-for-ai`.)
+
+## For agent builders
+- **Why it matters for agents.** An agent run holds a connection for seconds to minutes, makes many model
+  and tool calls, and should stream its progress. FastAPI's async handlers, `StreamingResponse` and
+  `lifespan`-scoped clients are exactly that shape, which is why most Python agent backends use it.
+- **Where it shows up in your stack.** Your own agent API wrapping a LangGraph graph, a LangChain chain or
+  a hand-written loop; LangServe was built on FastAPI; MCP tool servers can be served over HTTP from an
+  ASGI app; webhook receivers that start agent runs.
+- **What you control.** Request schemas with step and token budgets, streaming event format, shared
+  provider clients, disconnect handling, worker count, and where long runs go (inline stream versus a
+  durable job queue).
+- **What you can skip.** ASGI protocol internals and Starlette's routing code. Know the request path, the
+  `def` versus `async def` rule and the threadpool cap.
 
 ## Why it exists
-- **An AI endpoint is unusual HTTP.** A request may hold its connection open for ten seconds, stream
-  hundreds of chunks, carry large structured bodies both ways, and share expensive clients (a provider
+- **An agent endpoint is unusual HTTP.** A request may hold its connection open for ten seconds or far
+  longer, stream hundreds of chunks and step events, carry large structured bodies both ways, and share expensive clients (a provider
   connection pool, a vector store) across every request.
 - **WSGI was built for the opposite.** Flask and traditional Django dedicate one thread or process per
   request. With 200 in-flight model calls of five seconds each, a WSGI server needs 200 workers that sit
@@ -94,13 +108,25 @@ stalls the worker. (Deep dive: `fastapi-for-ai`.)
   and SDKs.
 - **A slow stream does not block others**, because each `yield` happens between awaits.
 
+### Serving an agent run
+1. **Validate the run request** with a Pydantic model that carries the task plus budgets (`max_steps`,
+   a token or cost cap), so a client cannot ask for an unbounded run.
+2. **Run the loop inside an async generator.** Each model call and tool call is an `await`, so one worker
+   holds many concurrent runs.
+3. **Yield typed events** (`tool_call`, `tool_result`, `final`) as SSE, so the UI can show progress and a
+   trace viewer can replay the run.
+4. **Check for client disconnect** between steps (Starlette's `await request.is_disconnected()`) and stop,
+   because every extra step costs tokens nobody will read.
+5. **Hand off when runs get long.** If a run can exceed a few minutes or must survive a deploy, enqueue it
+   as a job and stream progress from the job's event log instead.
+
 ### Background tasks are not a job queue
 - **`BackgroundTasks` runs a function after the response is sent, in the same process.** Fine for a few
   hundred milliseconds of follow-up (an audit row, a metric).
 - **Wrong home for a two-minute summarisation**, *because* the work dies with the process on a deploy or
   crash, nothing retries it, and it competes with live requests for the same loop or threadpool.
 - **Long or must-complete work** goes to a durable queue and a separate worker, with a `202` and a job
-  resource on the API side.
+  resource on the API side. Multi-step agent runs that call slow tools usually fall in this bucket.
 
 ### Compared with the alternatives
 | Framework | Strength | Fit |
@@ -111,12 +137,12 @@ stalls the worker. (Deep dive: `fastapi-for-ai`.)
 | Litestar | comparable ASGI framework, different DI style | the reasoning in this lesson applies too |
 
 ## Diagram
-Follow one request: validation can reject it before the handler, and the handler's type decides
-whether it runs on the loop or in the threadpool.
+Follow one agent-run request: validation can reject it (a bad budget, an empty task) before the handler,
+and the handler's type decides whether the run loop lives on the event loop or in the threadpool.
 
 ```mermaid
 flowchart TD
-    C["Client request"] --> U["Uvicorn: ASGI scope"]
+    C["Client starts agent run"] --> U["Uvicorn: ASGI scope"]
     U --> M["Middleware: CORS, auth, tracing"]
     M --> R["Router: path and method"]
     R --> D["Resolve dependencies"]
@@ -130,6 +156,53 @@ flowchart TD
 ```
 
 ## Examples
+### Agent-run endpoint that streams steps
+A validated run request with a step budget, a loop inside an async generator, typed SSE events per step,
+and a disconnect check so an abandoned run stops spending. `plan_step` and `run_tool` stand in for a
+model call and an async tool; a LangGraph graph's async streaming method would slot into the same place.
+
+```python
+import asyncio, json
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+app = FastAPI()
+
+class RunRequest(BaseModel):
+    task: str = Field(min_length=1, max_length=8000)
+    max_steps: int = Field(8, ge=1, le=20)        # step budget is part of the contract
+
+async def plan_step(task: str, step: int) -> dict:  # stand-in for a model call that picks a tool
+    await asyncio.sleep(0.05)
+    return {"tool": "search_docs", "args": {"query": task}} if step < 2 else {"final": "Refunds take 5 days."}
+
+async def run_tool(name: str, args: dict) -> str:   # stand-in for an async tool
+    await asyncio.sleep(0.05)
+    return f"3 docs for {args['query']!r}"
+
+def sse(event: dict) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
+@app.post("/v1/agent/runs")
+async def run_agent(body: RunRequest, request: Request):
+    async def events():
+        for step in range(body.max_steps):
+            if await request.is_disconnected():     # user closed the tab: stop paying for steps
+                return
+            action = await plan_step(body.task, step)
+            if "final" in action:
+                yield sse({"type": "final", "text": action["final"]})
+                break
+            yield sse({"type": "tool_call", "step": step, **action})
+            result = await run_tool(action["tool"], action["args"])
+            yield sse({"type": "tool_result", "step": step, "content": result})
+        yield "data: [DONE]\n\n"
+    return StreamingResponse(events(), media_type="text/event-stream")
+# POST {"task": "refund policy"} streams 2 tool_call/tool_result pairs, a final event, then [DONE].
+# POST {"task": "x", "max_steps": 50} returns 422 before any model call is made.
+```
+
 ### Streaming chat endpoint
 One shared upstream client created in `lifespan`, a validated request body, and an SSE stream from an
 async generator. Every `await` inside `events()` releases the loop to other requests, which is the
@@ -212,7 +285,27 @@ Target: 30 requests per second of a model call that takes 5 seconds.
 By Little's law, 30 rps × 5 s means ~150 requests in flight at once whatever the design; the question is
 only whether each one costs a thread or a coroutine.
 
+### Worked scenario: the same arithmetic for agent runs
+An agent run makes 6 model calls of ~5 s each plus tools, so it holds its connection ~30 s. Figures are
+illustrative.
+
+| Load | In flight (Little's law) | `def` handler, 40 threads | `async def` |
+|---|---|---|---|
+| 2 runs started per second | 2 × 30 = 60 runs | 2 workers just for threads, all idle on sockets | 1 worker holds all 60 |
+| 10 runs per second | 300 runs | 8 workers | 1-2 workers; the provider rate limit binds first |
+
+At 10 runs per second the provider sees 60 model calls per second, so the real limit is the rate limit
+and token quota, not FastAPI.
+
 ## Production patterns
+- **Budgets in the request schema.** Put `max_steps`, a token or cost cap and a wall-clock timeout on the
+  run request with `Field` bounds, and enforce them in the loop. Monitor steps per run and cost per run;
+  a creeping p95 means the agent is looping.
+- **Typed step events over SSE, with a run id.** Stream `tool_call`, `tool_result` and `final` events,
+  tag each with the run id that your tracing (LangSmith, Langfuse or OpenTelemetry) also records, and log
+  the same events server side. Monitor time to first event and disconnect rate.
+- **Stop work on disconnect.** Check `request.is_disconnected()` between steps and cancel in-flight model
+  calls, because an abandoned run keeps billing tokens. Monitor tokens spent after disconnect.
 - **Shared clients in `lifespan`.** Create one `httpx.AsyncClient` per process at startup, with explicit
   `timeout` and `httpx.Limits(max_connections=...)`, inject it via `Depends`, and close it on shutdown.
   Monitor connection-pool waits and new TLS handshakes per second.
@@ -249,6 +342,9 @@ only whether each one costs a thread or a coroutine.
   cost figure, a secret flag) appears in client responses. Fix: declare `response_model` on every route.
 - **CPU-heavy work in the handler** (tokenizing megabytes, re-ranking in pure Python). Symptom: loop
   stalls visible as every endpoint slowing together. Fix: a thread, process or worker.
+- **Unbounded agent runs.** No step or token cap on the endpoint. Symptom: a few runs that loop on a
+  failing tool consume the provider quota and hold connections for minutes. Fix: budgets in the request
+  model, enforced in the loop, with a clear `final` event when the budget runs out.
 - **Long jobs through `BackgroundTasks`.** Symptom: work silently vanishes on every deploy or pod restart,
   with no error logged because the request already returned 200. Fix: a durable queue and a worker.
 - **State in module-level variables.** Symptom: behaviour depends on which worker served the request (a
@@ -256,8 +352,11 @@ only whether each one costs a thread or a coroutine.
   or the database.
 
 ## When to use
-- **Use when** building the HTTP layer of a Python AI service: model gateways, RAG endpoints, agent
-  runners, anything that awaits a model and benefits from streaming and typed contracts.
+- **Use when** building the HTTP layer of a Python agent or AI service: agent runners, model gateways,
+  RAG endpoints, MCP or tool servers, anything that awaits a model and benefits from streaming and typed
+  contracts.
+- **Move runs to a queue when** a run can exceed a few minutes, must survive deploys, or needs human
+  approval mid-run; keep FastAPI as the front door that starts runs and streams their events.
 - **Prefer Django** when the application is mostly conventional CRUD with an ORM and admin, and Flask only
   for tiny sync tools.
 - **Measure:** event-loop lag (schedule a no-op every 100 ms and record how late it fires), health-check
@@ -299,6 +398,22 @@ so a regression is visible, and treat a slow health check as the first sign of a
 - **Response filtering:** `response_model` drops undeclared fields, so internal attributes do not leak.
 - **Documentation:** the OpenAPI schema comes from the same declarations, so docs and behaviour cannot
   drift; the model can also be the structured-output schema given to an LLM.
+
+### How would you expose a multi-step agent over HTTP with FastAPI?
+- **Contract:** a `POST /v1/agent/runs` body validated by Pydantic with the task and budgets (steps,
+  tokens, timeout), so runaway runs are rejected or capped at the boundary.
+- **Execution:** an `async def` handler returning a `StreamingResponse` whose generator runs the loop
+  and yields typed SSE events per step; shared provider and tool clients come from `lifespan` via
+  `Depends`.
+- **Lifecycle:** stop on client disconnect, and move runs that can take minutes or need approval to a
+  durable queue with a run resource the client polls or subscribes to.
+
+### Users close the chat tab mid-run, yet your token bill shows the agents kept working. Why, and what do you change?
+- **Why:** the generator keeps running the loop after the client leaves, unless something checks for the
+  disconnect or the server cancels the task; each further step bills tokens.
+- **Fix:** check `await request.is_disconnected()` between steps, cancel in-flight model calls, and record
+  a `cancelled` status on the run.
+- **Measure:** tokens spent after disconnect per day, which should drop to near zero.
 
 ### A streaming endpoint works locally but users see the whole answer at once in production. What do you check?
 - **Buffering in front of the app:** a reverse proxy or load balancer buffering responses holds chunks

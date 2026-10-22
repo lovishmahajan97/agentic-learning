@@ -5,7 +5,8 @@ name: GPU utilization & memory bandwidth
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/continuous-batching
@@ -22,9 +23,20 @@ sources:
 ---
 
 ## TL;DR
-`nvidia-smi` GPU-Util says a kernel ran, not that the chip was busy. Decode does about one FLOP per
-weight byte per sequence against roofline ridges of ~150-300, so small batches are bandwidth-bound:
-batch more or move fewer bytes.
+Every agent step pays decode time for its tool call; decode does about one FLOP per weight byte per
+sequence against roofline ridges of ~150-300, so it is bandwidth-bound. `nvidia-smi` GPU-Util says a
+kernel ran, not that the chip was busy.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a chain of model calls, so per-step decode latency is
+  multiplied by the step count. Bandwidth sets the floor on each step; batching many agents together
+  raises fleet throughput but lengthens every run.
+- **Where it shows up in your stack.** Self-hosted engines (vLLM `--max-num-seqs`, CUDA graphs), DCGM
+  dashboards for the agent model's GPUs, and the autoscaling signal you pick (queue depth, not GPU-Util).
+- **What you control.** Batch limit versus per-run latency SLO, output length of tool calls, prefix
+  caching to keep prefill small, and quantisation to cut bytes per step.
+- **What you can skip.** Deriving roofline curves for custom kernels. Keep "decode step ≈ bytes ÷
+  bandwidth" and "intensity ≈ batch size".
 
 ## Why it exists
 - **The spec sheet and the dashboard disagree.** Teams buy GPUs for their FLOPs, then an H100 serving a
@@ -101,6 +113,15 @@ tracks bandwidth rather than TFLOPs.
 - **Consequence:** time-to-first-token scales with prompt length and TFLOPs, while time-per-output-token
   scales with bandwidth, which is why engines schedule prefill and decode differently.
 
+### What an agent step costs in each regime
+- **Prefill of the new turn.** Each step appends a tool result to a growing transcript. Without prefix
+  reuse the whole transcript is re-prefilled (compute-bound, grows with context); with it, only the new
+  tokens are.
+- **Decode of the tool call.** The model then emits a tool-call or answer, often a short JSON object.
+  Each output token costs one bandwidth-bound step, so step latency ≈ output tokens × step time.
+- **Run latency is the sum.** Twenty steps multiply both terms, which is why agents feel slow on hardware
+  that serves single chats comfortably.
+
 ### What the utilisation metrics measure
 | Metric | What it measures | Reading it |
 |---|---|---|
@@ -129,7 +150,7 @@ tracks bandwidth rather than TFLOPs.
   upgrade will help.
 
 ## Diagram
-The triage path for "decode is slow": compute the bandwidth floor first, then let the DCGM signals say
+The triage path for "agent steps are slow" once prefill is ruled out: compute the bandwidth floor first, then let the DCGM signals say
 whether to batch, cut bytes, or look at the host.
 
 ```mermaid
@@ -196,6 +217,22 @@ memory-bound, so throughput is set by bytes read per step.
 - **At 4k contexts the cache eats the gain:** batch 64 reads three times the weight bytes, so per-sequence
   latency rises and the ceiling grows only about 20x.
 
+### Worked scenario: fleet throughput vs agent run latency
+Same rows, read from the agent's seat. Each step emits a ~150-token tool call; a run has 20 steps. Decode
+time only, from the step floors above (prefill and tool execution come on top).
+
+| Concurrent agents (batch) | Step floor at 4k | Decode per step (150 tokens) | Decode per 20-step run |
+|---|---|---|---|
+| 1 | 4.9 ms | ≈ 0.7 s | ≈ 15 s |
+| 8 | 6.1 ms | ≈ 0.9 s | ≈ 18 s |
+| 32 | 9.9 ms | ≈ 1.5 s | ≈ 30 s |
+| 64 | 15.0 ms | ≈ 2.3 s | ≈ 45 s |
+
+- **Batching is still the right default:** 64 agents share the card for 3x the run latency of one, a
+  far better cost per run than 64 cards.
+- **The SLO picks the batch:** if a run must finish decode in 20 s, cap concurrency near 8 per card and
+  scale out; shorter tool-call outputs buy back latency at any batch.
+
 ## Production patterns
 - **Dashboard profiling fields, not GPU-Util.** Use on every serving fleet. Enable `DCGM_FI_PROF_DRAM_ACTIVE`,
   `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` and `DCGM_FI_PROF_SM_ACTIVE` in the DCGM exporter's metric list and
@@ -203,12 +240,16 @@ memory-bound, so throughput is set by bytes read per step.
 - **Autoscale on queue depth or tokens/s.** Use instead of any utilisation-based scaling rule. Scale on
   the engine's waiting-requests gauge (vLLM exposes `vllm:num_requests_waiting`) or on tokens/s per card
   against a tested ceiling. Monitor per-card throughput after scale-out: flat means you replicated idle hardware.
-- **Raise the batch limit before buying cards.** Use when MBU is low and KV room allows. Increase the
-  engine's concurrent-sequence cap (vLLM `--max-num-seqs`) in steps under a load test at target
-  concurrency. Monitor time-per-output-token p95 and preemptions; stop when latency SLOs bend.
+- **Raise the batch limit against the agent run SLO.** Use when MBU is low and KV room allows. Increase
+  the engine's concurrent-sequence cap (vLLM `--max-num-seqs`) in steps under a load test that replays
+  real agent traces at target concurrency. Monitor time-per-output-token p95, preemptions and end-to-end
+  run latency; stop when the run SLO bends, not just the per-token one.
 - **Keep CUDA graphs on.** Use for latency-sensitive decode with small batches. vLLM captures CUDA graphs
   by default; avoid `--enforce-eager` outside debugging, because it brings kernel-launch overhead back.
   Monitor step time at batch 1 against the bandwidth floor.
+- **Keep tool-call outputs short.** Use in any agent where decode dominates step time. Ask for compact
+  structured tool arguments, cap output tokens per step, and move long reasoning out of the hot loop
+  where quality allows. Monitor output tokens per step and step latency in agent traces.
 - **Track MBU in a benchmark per release.** Use whenever the engine, model or card changes. Run a fixed
   load test, compute bytes per step × steps per second ÷ peak bandwidth, and record it. Monitor regressions:
   a drop in MBU with unchanged hardware points at host-side or engine changes.
@@ -223,6 +264,8 @@ memory-bound, so throughput is set by bytes read per step.
   which pays when decode is bandwidth-bound and acceptance rates are high, and costs throughput otherwise.
 - **Faster memory vs price.** A faster-memory card (H100 over A100) buys decode speed roughly in
   proportion to bandwidth, not price; for prefill-heavy or training workloads the FLOPs gap matters more.
+- **More concurrent agents per card vs run latency.** Packing agents raises runs per GPU-hour, but every
+  run's decode time grows with the step floor. It flips when the run SLO, not cost, is binding.
 
 ## Pitfalls
 - **Reading `nvidia-smi` GPU-Util as "busy".** Symptom: a fleet at 95% utilisation that delivers a small
@@ -235,10 +278,13 @@ memory-bound, so throughput is set by bytes read per step.
   even though weights never changed. Fix: count KV bytes per step.
 - **Blaming the GPU for host-side stalls.** Symptom: low DRAM *and* low tensor activity together, with a
   single Python process pegged at 100% CPU. Fix: profile the host before touching hardware.
+- **Judging agent latency on per-token metrics alone.** Symptom: time-per-output-token looks healthy but
+  runs time out, *because* step count and output length multiply it. Fix: track latency per step and per
+  run in agent traces alongside engine metrics.
 
 ## When to use
-- **Reach for the roofline when:** throughput is below expectation, when choosing between cards, or when
-  someone proposes "more GPUs" as the fix.
+- **Reach for the roofline when:** throughput is below expectation, when agent runs are slower than step
+  count suggests, when choosing between cards, or when someone proposes "more GPUs" as the fix.
 - **Method:** compute the bytes a decode step must read, divide by bandwidth, and compare with observed
   time-per-output-token.
 - **Close to the floor:** you are bandwidth-bound and need batching, quantisation or faster memory. Far
@@ -299,12 +345,20 @@ Buy hardware only after per-card tokens/s approaches the bandwidth bound at the 
   overhead or small batches.
 - **High MBU with poor tokens/s** means the card is near its ceiling, so reduce bytes per token or batch more.
 
-### Your autoscaler adds GPUs whenever GPU-Util exceeds 80%. What is wrong with that policy?
+### Your agent platform's autoscaler adds GPUs whenever GPU-Util exceeds 80%. What is wrong with that policy?
 - **GPU-Util is a time fraction:** it reads near 100% whenever any kernel runs, even one tiny kernel on an
   otherwise idle chip.
 - **So it scales on noise:** the fleet grows while per-card tokens/s stays flat and the bill climbs.
 - **Better signals:** queue depth or waiting requests, and tokens/s per card against a tested ceiling, with
   DCGM profiling fields to explain why a card is slow.
+
+### A 20-step agent on a self-hosted 8B model takes 45 seconds per run. Where does the time go, and what do you change?
+- **Split the step:** from traces, separate prefill (new transcript tokens), decode (output tokens × step
+  time) and tool execution; the model's share is often decode at a large batch.
+- **Check the floor:** at batch 64 and 4k context the H100 step floor is about 15 ms, so 150-token tool
+  calls cost ≈ 2.3 s each and ≈ 45 s per run before tools.
+- **Levers:** cap concurrency per card for the run SLO, shorten tool-call outputs, keep prefixes cached
+  so prefill stays small, or quantise to cut bytes per step.
 
 ## Quiz
 ### Q: Why does doubling the batch size roughly double decode throughput on a bandwidth-bound GPU?

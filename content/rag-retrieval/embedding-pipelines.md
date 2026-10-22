@@ -5,7 +5,8 @@ name: Embedding pipelines
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/embedding-models
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-An embedding pipeline turns source documents into indexed vectors and keeps them in sync: parse, chunk,
-enrich, embed, upsert, update, delete. Its goals are idempotent chunk ids, incremental updates, and
-identical embedding at index time and query time.
+An embedding pipeline keeps the index your agent searches in sync with its sources: parse, chunk,
+enrich, embed, upsert, update, delete. It needs idempotent chunk ids, incremental updates, and identical
+embedding at index time and query time.
+
+## For agent builders
+- **Why it matters for agents.** An agent acts on what its search tool returns. A stale chunk becomes a
+  wrong refund amount; a deleted page that never left the index becomes a cited policy that no longer
+  exists; a missing ACL field becomes a data leak across users.
+- **Where it shows up in your stack.** LangChain's indexing API (`index(...)` with a record manager),
+  LlamaIndex `IngestionPipeline`, a queue worker behind your agent backend, and any `remember` or
+  `save_note` tool that writes agent memory, which is a small embedding pipeline of its own.
+- **What you control.** Chunk ids, change detection, the shared embed function, rate limiting, deletion
+  propagation, the metadata (tenant, ACL, dates) the agent's search later filters on, and freshness SLA.
+- **What you can skip.** Building a general data platform. One idempotent per-document function, a
+  golden-vector test and deletion handling cover most agent knowledge bases.
 
 ## Why it exists
 - **The demo works once.** Ten lines: read every file, split, embed each piece, insert. Three things
@@ -50,7 +63,7 @@ identical embedding at index time and query time.
    Deterministic, because the same bytes must always produce the same text and chunk ids depend on it.
 3. **Chunk.** Apply the chunking strategy; attach `chunk_index`, heading path and character offsets.
 4. **Enrich.** Add filter metadata (tenant, ACL groups, document date, section title) and any contextual
-   prefix the retrieval design calls for.
+   prefix the retrieval design calls for. The agent's search tool can only filter on what is stored here.
 5. **Embed.** Batch, apply the model's prefix, call with a concurrency limit, retry rate limits and
    transient errors with backoff, normalize, and record model name and version.
 6. **Upsert.** Write vector, payload and text (or a pointer to it) under the deterministic id.
@@ -79,6 +92,14 @@ chunk_id = hash(model_version, doc_id, chunk_index, chunk_text)
 - **Frameworks do the same:** LangChain's indexing API and LlamaIndex's ingestion pipeline map document
   ids to content hashes via a record manager or docstore.
 
+### Agent memory is the same pipeline, written by the agent
+- **A memory tool is a writer.** When the agent saves "user prefers invoices in EUR", that text is
+  embedded and upserted like any chunk, from inside the agent loop.
+- **So the same rules apply:** a content-addressed id stops the agent saving one fact twenty times, the
+  shared embed function keeps memory and query vectors in one space, and user id metadata scopes recall.
+- **Difference:** writes are tiny and synchronous, so latency matters more than throughput; embed one
+  item and return quickly, or queue it and let the tool answer "saved".
+
 ### Write new before deleting old
 - **Upsert the new chunks first, then delete the stale ones.** A crash in between leaves both versions
   for a while, a mild duplicate problem; the reverse order leaves a gap where the document is
@@ -99,16 +120,18 @@ Estimate the backfill before choosing (illustrative orders of magnitude):
   Against an illustrative quota of one million tokens per minute, 300 minutes: five hours before retries.
   For self-hosted models, GPU throughput sets the rate.
 - **Concurrency cap:** workers × tokens per request × requests per worker per minute must stay under the
-  quota, or extra workers only buy 429s.
+  quota, or extra workers only buy 429s. If agents share that quota for query embeddings, reserve part
+  of it so a backfill cannot starve live searches.
 
 ### Batch versus streaming
 - **Nightly batch** is enough for slowly changing corpora.
-- **Queue consumer on change events** when users notice staleness.
+- **Queue consumer on change events** when users notice staleness, for example an agent quoting prices
+  or stock levels.
 - **One shared per-document function for both modes** keeps the two paths identical.
 
 ### Query-time parity
-- **One module** holds the embedding call, prefix logic and normalization; indexer and query service both
-  import it.
+- **One module** holds the embedding call, prefix logic and normalization; indexer, agent search tool
+  and memory tool all import it.
 - **Golden-vector test:** embed a fixed sentence and compare with a stored vector. Compare cosine within
   a tight tolerance rather than exact equality, because some hosted endpoints show tiny run-to-run noise.
   A silent model change behind a hosted endpoint, or a dependency bump, then fails CI instead of
@@ -120,16 +143,16 @@ embedded, and stale ids are deleted only after their replacements are live.
 
 ```mermaid
 flowchart TD
-    S["Source change event or nightly scan"] --> H{"Content hash or model version changed?"}
+    S["Source change event or nightly scan"] --> H{"Content hash or model changed?"}
     H -->|"no"| SKIP["Skip, nothing embedded"]
     H -->|"yes"| P["Parse and normalize, deterministic"]
-    P --> C["Chunk and enrich with metadata"]
-    C --> ID["chunk_id from model_version, doc_id, index, text"]
+    P --> C["Chunk, enrich with ACL and dates"]
+    C --> ID["chunk_id from model, doc, index, text"]
     ID --> DIFF{"Id already in store?"}
     DIFF -->|"yes"| KEEP["Keep existing vector"]
-    DIFF -->|"no"| EMB["Shared embed fn: batch, rate limit, retry"]
+    DIFF -->|"no"| EMB["Shared embed fn: batch, limit, retry"]
     EMB -->|"repeated failure"| DLQ[("Dead-letter queue")]
-    EMB --> UP[("Upsert vectors with model and payload")]
+    EMB --> UP[("Upsert vectors with payload")]
     UP --> DEL["Delete stale ids for this doc"]
     DEL --> OBS["Emit counts, tokens, lag"]
 ```
@@ -178,6 +201,28 @@ def index_document(doc_id, chunks, store, embed_fn, batch_size=64):
     return {"embedded": len(todo), "deleted": len(stale), "unchanged": len(existing & wanted.keys())}
 ```
 
+### Agent scenario: an idempotent memory tool
+The agent's `save_memory` tool reuses the same id scheme and embed function, so repeated saves of one
+fact are no-ops and memories are scoped to a user.
+
+```python
+def save_memory(user_id: str, fact: str, store, embed_fn) -> str:
+    """Tool exposed to the agent: remember a durable fact about this user."""
+    text = " ".join(fact.split())                     # deterministic cleanup before hashing
+    mid = hashlib.sha256(f"{MODEL}\x00{user_id}\x00{text.lower()}".encode()).hexdigest()[:32]
+    if store.exists(mid):
+        return "Already remembered."                  # agent re-saving the same fact costs nothing
+    vec = embed_with_retry(embed_fn, [text])[0]       # same shared function as the search tool
+    store.upsert([{"id": mid, "vector": vec, "user_id": user_id, "model": MODEL,
+                   "text": text, "kind": "memory", "saved_at": time.time()}])
+    return "Saved."
+```
+
+- **Why `user_id` in the id and payload:** recall must filter by user, and two users can state the same
+  fact without colliding.
+- **What it does not handle:** contradictions ("prefers EUR" then "prefers USD"). That needs an update
+  policy, such as replacing memories on the same topic, decided in your memory design.
+
 ### A golden-vector test in CI
 `embedder.embed` is the shared function; `tests/golden_vector.json` was written once from a known-good
 run. The 0.999 tolerance is illustrative: set it just below the noise you observe from your endpoint.
@@ -214,8 +259,8 @@ Illustrative quota and latency; plug in your own.
 | Worker doing one 2-second request at a time | 30 requests per minute |
 | Useful workers | 52 ÷ 30 ≈ 1.7: run 2 behind a shared limiter capped near 52 requests per minute; a third worker only adds 429s and backoff |
 
-Run blue/green: the old collection keeps serving for the five hours, so the overnight window, not the
-bill, is the decision.
+Run blue/green: the old collection keeps serving the agent for the five hours, so the overnight window,
+not the bill, is the decision.
 
 ## Production patterns
 - **Record-manager incremental indexing** — when you use LangChain, call its `index(...)` function with
@@ -224,10 +269,14 @@ bill, is the decision.
   unchanged corpus should embed close to zero.
 - **Docstore-backed ingestion pipeline** — in LlamaIndex, give `IngestionPipeline` a docstore and a
   vector store so documents whose hash has not changed are skipped and changed ones are upserted.
-  Monitor the lag from source change to searchable.
+  Monitor the lag from source change to searchable by the agent.
+- **ACL and tenant metadata at write time** — copy access-control groups and tenant id onto every chunk
+  and memory, so the agent's search tool filters by the calling user. Monitor with a test that a user's
+  agent cannot retrieve another tenant's seeded document.
 - **Shared rate limiter sized to the quota** — one token-bucket limiter (in Redis or the queue) that all
-  workers draw from, set below the vendor's tokens-per-minute and requests-per-minute limits. Monitor the
-  429 rate; above a few percent means the limiter is set too high.
+  workers draw from, set below the vendor's tokens-per-minute and requests-per-minute limits, with
+  headroom reserved for live agent queries. Monitor the 429 rate; above a few percent means the limiter
+  is set too high.
 - **Validate, then dead-letter** — count tokens per chunk before the call, re-chunk anything over the
   model limit, and send repeated failures to a dead-letter queue with the document id. Alert on queue
   depth so one poison pill cannot stall the run.
@@ -244,6 +293,9 @@ bill, is the decision.
 - **Streaming vs nightly batch.** Per-document streaming gives minutes-level freshness at the cost of
   queues, ordering and dedup logic; a nightly batch is far simpler and wins until users notice stale
   answers.
+- **Synchronous vs queued memory writes.** Embedding inside the tool call makes a memory searchable on
+  the next step but adds latency to the agent loop; queueing is faster to return but the memory may be
+  missing for a moment.
 - **Text in the vector store vs a pointer.** Storing chunk text makes retrieval a single hop but
   duplicates data and inflates memory; a pointer to a document store saves memory and adds a lookup per
   result.
@@ -256,7 +308,8 @@ bill, is the decision.
   the index grows with no new documents).
 - **Query service embeds differently from the indexer.** A different model, version or prefix makes
   recall collapse after a deploy that "only touched the API".
-- **Deletions never propagated.** Answers cite documents that were removed weeks ago.
+- **Deletions never propagated.** Answers cite documents that were removed weeks ago, and the agent acts
+  on them.
 - **No model version on the record.** After an upgrade nobody can tell which chunks still need
   re-embedding.
 - **A poison-pill input.** One chunk over the model's token limit fails the whole batch on every retry,
@@ -264,13 +317,15 @@ bill, is the decision.
   failures to a dead-letter queue.
 - **Unbounded concurrency against a rate-limited API.** Adding workers lowers throughput, because most
   calls return 429 and retry.
+- **Random ids in the memory tool.** The agent saves the same preference on every turn and recall
+  returns ten copies of it. Use content-addressed ids per user.
 - **Embedding repeated boilerplate.** Navigation, headers and legal footers across thousands of pages
   make top-k results near-duplicate chunks of the same boilerplate.
 
 ## When to use
 - **Build a real pipeline** as soon as the corpus will be updated more than once, which is almost always;
   keep the single script only for a throwaway prototype on a static dump.
-- **Batch vs streaming:** decide from how fast users need to see changes.
+- **Batch vs streaming:** decide from how fast users need to see changes in what the agent says.
 - **Blue/green vs in-place:** decide from how often you expect to change models.
 - **Measure:** index lag (source change to searchable), re-run cost on an unchanged corpus (near zero),
   duplicate rate, and the golden-vector test in CI.
@@ -304,13 +359,20 @@ collection until the comparison is done.
 - **Deterministic parsing and chunking:** the same bytes must always yield the same text, or ids churn.
 - **Reconcile per document:** upsert new ids, then delete the document's ids that are no longer wanted.
 
-### Users report answers citing a policy page that was deleted last month. How do you debug and fix it?
+### Your support agent keeps citing a policy page that was deleted last month. How do you debug and fix it?
 - **Confirm:** list the vector store's ids for that `doc_id`; surviving chunks mean deletions never
   propagated.
 - **Cause:** the pipeline only processes documents it sees, so a removed source document never triggers
   its own cleanup.
 - **Fix:** consume delete events or diff source document ids against the store on each run, delete
   orphaned chunks, and track an orphan count as a metric.
+
+### How would you design the write path for an agent's long-term memory?
+- **Treat it as a pipeline:** a tool that cleans the text, derives a content-addressed id scoped by user,
+  embeds with the shared function and upserts with user id and timestamp metadata.
+- **Decide sync versus queued** from whether the memory must be searchable on the very next step.
+- **Operate it:** monitor duplicate memories per user, recall filtered by user in tests, and an update
+  policy for contradicting facts.
 
 ### Batch or streaming ingestion: how do you choose?
 - **Nightly batch** is far simpler and fine for slowly changing corpora.

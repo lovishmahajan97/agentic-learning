@@ -5,7 +5,8 @@ name: CORS
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/middleware-ordering
   - fastapi-for-ai/api-keys-oauth2-jwt
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-CORS is the set of response headers by which a server lets another origin's JavaScript read its
-responses. Browsers enforce it, not your server, so it is not authentication: curl, scripts and other
-servers ignore it, and your API still needs real auth.
+CORS headers let a browser chat UI on another origin read your agent API's responses and streams.
+Browsers enforce it, so it is not authentication: curl, your agent's tool calls and other servers
+ignore it, and the API still needs real auth.
+
+## For agent builders
+- **Why it matters for agents.** The usual agent product is a browser UI streaming a run from a FastAPI
+  backend on another origin. A CORS mistake shows up as "the agent hangs" in the UI, while the server
+  logs a perfectly good run, or a 401 or 429 the UI never sees.
+- **Where it shows up in your stack.** `CORSMiddleware` on the agent API, the preflight before every JSON
+  or bearer-token call, `expose_headers` for a run id or `Retry-After`, and per-tenant origin lists for
+  embeddable agent widgets.
+- **What you control.** The origin allowlist per environment, middleware order (CORS outermost), which
+  response headers the UI may read, and how the stream is authenticated (`fetch` reader versus
+  `EventSource`).
+- **What you can skip.** CORS for server-side hops: the agent calling LLM providers, tools, MCP servers
+  or a vector store from Python never touches it, because no browser is involved.
 
 ## Why it exists
 - **The same-origin policy is the browser's basic defence.** A script loaded from `evil.example` must not
@@ -103,9 +117,21 @@ because it adds them to the response start.
   short-circuit a request (auth returning 401, rate limiters returning 429). Otherwise those responses
   lack CORS headers and the browser reports a CORS error instead of the real status.
 
+### Which hops in an agent stack involve CORS
+| Hop | Browser involved? | CORS? |
+|---|---|---|
+| Chat UI script to your agent API | yes | yes: preflight, allowlist, exposed headers |
+| Agent API to LLM provider, tools, vector store | no, server-side Python | no; auth and egress rules instead |
+| Browser UI calling an LLM provider directly with a key | yes | it may work, but it ships your key to every visitor; route through your backend |
+| Agent driving a headless browser that fetches pages | the page's own script is | the page's CORS applies to that page, not to your API |
+
+- **Run state the UI needs travels in headers or the stream.** A run id, `Retry-After` or token usage
+  must be listed in `expose_headers`, or put in the stream's first event, because the script cannot read
+  unlisted headers.
+
 ## Diagram
-A preflighted JSON call with a bearer token: the browser asks permission with `OPTIONS`, and only an
-allowed answer lets the real POST go out and its response reach the script.
+A chat UI starting an agent run with a JSON body and a bearer token: the browser asks permission with
+`OPTIONS`, and only an allowed answer lets the real POST go out and its response reach the script.
 
 ```mermaid
 sequenceDiagram
@@ -174,6 +200,44 @@ the page's origin, then acts on the answer.
   obtain, such as the bearer token here.
 - **That is why the bearer token must be validated**: curl ignores CORS entirely.
 
+### Agent run endpoint that streams to a browser UI
+The UI starts a run with `fetch` (so it can send `Authorization`), reads the run id header to show a
+"cancel" button, and reads `Retry-After` when the run is rate limited.
+
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+import json, uuid
+
+app = FastAPI()
+# auth and rate-limit middleware added here, before CORS ...
+app.add_middleware(
+    CORSMiddleware,                                    # added last => outermost
+    allow_origins=["https://chat.acme.com"],
+    allow_methods=["POST", "DELETE"],                  # start a run, cancel a run
+    allow_headers=["authorization", "content-type", "idempotency-key"],
+    expose_headers=["x-run-id", "retry-after"],        # the UI script reads these
+    max_age=600,
+)
+
+@app.post("/v1/agent/runs")
+async def start_run(body: dict):
+    run_id = str(uuid.uuid4())
+    async def events():
+        yield f"data: {json.dumps({'type': 'run_started', 'run_id': run_id})}\n\n"
+        yield f"data: {json.dumps({'type': 'tool_call', 'name': 'search'})}\n\n"
+        yield f"data: {json.dumps({'type': 'final', 'text': '...'})}\n\n"
+    return StreamingResponse(events(), media_type="text/event-stream",
+                             headers={"x-run-id": run_id})
+```
+
+| Symptom in the UI | Real cause | Fix |
+|---|---|---|
+| "CORS error", run never starts | `idempotency-key` missing from `allow_headers` | add it; check the preflight's 400 body |
+| Run streams, cancel button shows `null` run id | `x-run-id` not exposed | add to `expose_headers` or send it in the first event |
+| Busy hours: "CORS error" instead of "slow down" | rate limiter outside CORS returns a bare 429 | add CORS last so it is outermost |
+
 ### Verify the policy with TestClient (runnable)
 Simulate preflights and a simple request, and see the wildcard-plus-credentials reflection.
 
@@ -217,12 +281,13 @@ print(r.headers.get("access-control-allow-origin"),          # https://evil.exam
 - **CORS outermost in the middleware stack** — whenever auth or rate limiting is middleware. Call
   `app.add_middleware(CORSMiddleware, ...)` last, since the last added wraps everything. Monitor browser
   error reports that say "CORS" while server logs show 401 or 429 for the same request ID.
-- **Tenant-specific origins for embeddable widgets** — when customers embed your chat on their sites.
+- **Tenant-specific origins for embeddable agent widgets** — when customers embed your agent on their sites.
   Store allowed origins with the tenant and check the `Origin` against that list in your own small
   middleware, adding `Vary: Origin`. Monitor per-tenant rejected origins so FDEs can fix config fast.
-- **Expose headers the UI reads** — for rate limits and support tickets. List `x-request-id` and
-  `retry-after` in `expose_headers` and add a front-end test that reads them. Monitor support tickets
-  that arrive without a request ID.
+- **Expose headers the agent UI reads** — for rate limits, run ids and support tickets. List
+  `x-request-id`, a run id header and `retry-after` in `expose_headers` (or send the run id in the first
+  stream event) and add a front-end test that reads them. Monitor support tickets that arrive without a
+  request or run ID.
 - **Same-origin path routing for first-party UIs** — when UI and API ship together. Serve `/api` behind
   the same host via the reverse proxy, which removes preflights entirely. Monitor preflight count; it
   should drop to zero.
@@ -236,6 +301,9 @@ print(r.headers.get("access-control-allow-origin"),          # https://evil.exam
 - **Cookies vs bearer tokens.** Cookie-based auth with credentials gives simpler UX and HttpOnly storage,
   but needs exact origins, `Vary: Origin` and separate CSRF defences. Bearer tokens avoid CSRF but must
   be stored by front-end code.
+- **Browser-direct LLM calls vs a backend agent.** Calling a provider straight from the browser skips a
+  hop and your CORS config, but exposes the API key and puts tool execution in untrusted code. Keep the
+  agent loop server-side unless the provider issues short-lived, scoped browser tokens.
 - **Long vs short `max_age`.** A long one cuts preflight round trips (which hurt chat latency on high-RTT
   mobile links), but policy changes take longer to reach browsers that cached the old answer.
 - **Same origin vs cross-origin.** Serving UI and API from one origin (a path-based reverse proxy)
@@ -255,14 +323,17 @@ print(r.headers.get("access-control-allow-origin"),          # https://evil.exam
   `SameSite=None`, so the browser attaches it to cross-site requests).
 - **A long-lived API token in an `EventSource` URL.** Symptom: streams work in the browser, and full
   credentials are visible in proxy access logs and browser history.
+- **Adding CORS config to fix a server-side agent call.** Symptom: an agent's tool call to a third-party
+  API fails and someone edits `allow_origins`. CORS never applies to Python-to-API calls; read the real
+  status, auth error or network failure instead.
 - **Expecting a trailing slash or a different port to match.** Symptom: the allowlist works in staging
   and fails in prod because `https://chat.acme.com/` was listed with a slash.
 
 ## When to use
 - **Use when** browser JavaScript on one origin calls your API on another: SPA front ends, embeddable
   chat widgets, browser extensions, notebooks hosted elsewhere.
-- **Skip for** server-to-server and mobile-native clients, which don't enforce it, and for same-origin
-  deployments.
+- **Skip for** server-to-server and mobile-native clients, which don't enforce it, for same-origin
+  deployments, and for every call your agent makes to models, tools or MCP servers from the backend.
 - **Default to** an explicit allowlist from configuration per environment, the minimum methods and
   headers, and bearer tokens unless you have a reason for cookies. For a widget embedded on many
   customer sites, consider per-tenant origin lists stored with the tenant.
@@ -311,7 +382,14 @@ response.
   store them, and `EventSource` cannot send the `Authorization` header.
 - **Common choice:** bearer tokens with SSE read through `fetch` and a stream reader.
 
-### How would you support an embeddable chat widget that runs on hundreds of customer sites?
+### Your agent UI says "the agent is stuck" for some users, but traces show the run completed. Where do you look?
+- **The preflight and the stream response in the network tab.** A missing `Allow-Headers` entry or an
+  unexposed run id header breaks the UI while the server-side run succeeds.
+- **Short-circuited responses.** A 401 or 429 from middleware outside CORS reaches the browser without
+  CORS headers, so the UI sees a CORS error and waits.
+- **Not the agent's tool calls**, which run server-side and never involve CORS.
+
+### How would you support an embeddable agent widget that runs on hundreds of customer sites?
 - **Per-tenant origin allowlists** stored with the tenant, checked against the incoming `Origin` in a
   small middleware that also sets `Vary: Origin`, so adding a customer needs no deploy.
 - **Never** fall back to reflecting any origin or `allow_origins=["*"]` with credentials.

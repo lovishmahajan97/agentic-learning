@@ -5,7 +5,8 @@ name: Dependency injection (Depends)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/dependency-injection-and-interface-boundaries
   - fastapi-for-ai/request-scoped-vs-application-scoped-resources
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-`Depends` lets an endpoint declare what it needs (principal, DB session, LLM client, tenant config) as
-typed parameters. FastAPI resolves, caches and cleans them up per request, and tests swap any of them
-with `dependency_overrides`.
+`Depends` is how an agent endpoint gets its LLM client, the user's permitted tools, a token budget and a
+checkpointer as typed parameters. FastAPI resolves, caches and cleans them per request; tests swap the
+LLM with `dependency_overrides`.
+
+## For agent builders
+- **Why it matters for agents.** An agent run needs a different toolset per user (permissions,
+  tenant data), a spend cap per run, and a model client that tests can replace with a scripted fake.
+  Dependencies give each of those one typed, overridable seam instead of globals inside the agent loop.
+- **Where it shows up in your stack.** `Depends(get_llm)`, `Depends(get_tools)`, `Depends(budget)` on
+  `/agent/run`; router-level auth; and `app.dependency_overrides` in tests that run the agent against a
+  fake model returning a fixed tool call, so agent tests are deterministic and cost nothing.
+- **What you control.** Which tools a principal may see (built per request from their scopes), where the
+  shared client comes from (lifespan, never built per request), what cleanup runs after the run (record
+  spend, close the session), and what tests replace.
+- **What you can skip.** DI container libraries and the dependency-graph internals. Know caching, `yield`
+  teardown, sibling ordering and overrides.
 
 ## Why it exists
 - **Every endpoint needs the same things.** Who is calling, which tenant, a provider client, a retrieval
@@ -103,6 +117,14 @@ fixed tenant.
 - **Request-scoped objects** (a session, a per-tenant configuration, a trace span) are created inside the
   dependency and torn down after `yield`.
 
+### Dependencies in an agent endpoint
+| Dependency | Scope | Why it is a dependency |
+|---|---|---|
+| `get_llm` | fetches the lifespan client | tests swap it for a scripted fake |
+| `get_tools(principal)` | built per request | the toolset is filtered by the caller's scopes, so the model never sees a tool it may not use |
+| `budget` (yield) | per run | caps spend across all steps, records spend in teardown even on a 429 |
+| `get_checkpointer` | fetches a shared store | resumes or persists agent state; tests use an in-memory store |
+
 ## Diagram
 The dependency tree for the `/chat` example below, resolved leaves first: `get_tenant` is shared by two
 dependents but runs once, the client comes from lifespan state, and the yield dependency's teardown
@@ -121,6 +143,70 @@ flowchart TD
 ```
 
 ## Examples
+### Agent endpoint with per-user tools and a scripted fake model in tests
+The toolset is built per request from the caller's scopes, so a viewer's agent cannot even propose
+`refund_order`. In the test, `ScriptedLLM` returns a fixed tool call and then an answer, which makes the
+agent loop deterministic and free to run in CI.
+
+```python
+from typing import Annotated
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+USERS = {"key-viewer": {"id": "u1", "scopes": {"orders:read"}},
+         "key-admin": {"id": "u2", "scopes": {"orders:read", "orders:refund"}}}
+ALL_TOOLS = {"lookup_order": "orders:read", "refund_order": "orders:refund"}
+
+def get_principal(x_api_key: Annotated[str, Header()]) -> dict:
+    p = USERS.get(x_api_key)
+    if p is None:
+        raise HTTPException(401, "invalid api key")
+    return p
+
+def get_tools(p: Annotated[dict, Depends(get_principal)]) -> list[str]:
+    return [t for t, scope in ALL_TOOLS.items() if scope in p["scopes"]]   # per request
+
+def get_llm(request: Request):
+    return request.app.state.llm                      # built once in lifespan (not shown)
+
+@app.post("/agent/run")
+async def run(task: str, tools: Annotated[list[str], Depends(get_tools)], llm=Depends(get_llm)):
+    history, steps = [task], []
+    for _ in range(5):                                # max steps
+        reply = await llm.next(history, tools)
+        if reply["type"] == "answer":
+            return {"answer": reply["text"], "steps": steps}
+        if reply["tool"] not in tools:                # defence in depth: re-check every call
+            raise HTTPException(403, f"tool {reply['tool']} not allowed")
+        steps.append(reply["tool"]); history.append(f"{reply['tool']} -> ok")
+    return {"answer": None, "steps": steps}
+
+class ScriptedLLM:                                    # deterministic fake for agent tests
+    def __init__(self): self.calls = 0
+    async def next(self, history, tools):
+        self.calls += 1
+        return {"type": "tool", "tool": "lookup_order"} if self.calls == 1 else {"type": "answer", "text": "shipped"}
+
+app.dependency_overrides[get_llm] = ScriptedLLM       # class is callable: fresh fake per request
+with TestClient(app) as c:
+    r = c.post("/agent/run", params={"task": "where is order 7?"}, headers={"x-api-key": "key-viewer"})
+    assert r.json() == {"answer": "shipped", "steps": ["lookup_order"]}
+app.dependency_overrides.clear()
+```
+
+### Worked scenario: agent test suite with and without the override
+A suite of 200 agent tests, each averaging 4 steps (illustrative costs and latencies).
+
+| | Real model | `ScriptedLLM` override |
+|---|---|---|
+| LLM calls per CI run | 200 × 4 = 800 | 0 |
+| Wall time (about 3 s per call, run serially) | ~40 minutes | seconds |
+| Flaky failures | model output varies between runs | none: the script is fixed |
+| What it tests | prompt quality and wiring together | wiring: tool filtering, budget, loop limits, error paths |
+
+Keep a separate, smaller eval suite against the real model for prompt quality; do not mix the two.
+
 ### Auth, shared client, request-scoped budget and a test override
 - **Auth:** an API-key dependency.
 - **Shared client:** the LLM client fetched from `app.state`.
@@ -220,6 +306,13 @@ with TestClient(app) as c:
 ```
 
 ## Production patterns
+- **Build the toolset per request from the principal.** Use on every multi-user agent: a dependency
+  filters the tool registry by the caller's scopes and tenant, the agent only sees that list, and the
+  executor re-checks each call. Monitor denied tool calls; a non-zero rate means the model is proposing
+  tools it was never offered, or a prompt injection is trying.
+- **Scripted fakes for agent wiring tests.** Use in CI: override `get_llm` with a fake that returns a
+  fixed sequence of tool calls and answers, so tests cover tool filtering, budgets and step limits with
+  no tokens spent. Run real-model evals separately and track their pass rate per prompt version.
 - **Enforce auth at router level.** Use for every group of protected routes: create
   `APIRouter(dependencies=[Depends(verify_api_key)])` so new routes inherit it. Add a test that walks
   `app.routes` and fails if a protected path lacks the dependency; monitor 401 rate per route.
@@ -258,6 +351,9 @@ with TestClient(app) as c:
   is closed" errors whose frequency depends on timing and FastAPI version.
 - **Forgetting `dependencies=[Depends(auth)]` on a new router.** Symptom: one unauthenticated route found
   in a pentest, because auth was attached per route instead of per router.
+- **Building the agent's toolset once at startup for everyone.** Symptom: a read-only user's agent issues
+  a refund because the model saw every tool. Fix: build the list in a per-request dependency from the
+  principal, and re-check each call in the tool executor.
 - **Leaving `app.dependency_overrides` set after a test.** Symptom: a later test passes against the fake
   model locally and fails when CI runs the files in a different order.
 
@@ -304,6 +400,21 @@ session and one transaction, which is the intended scope.
 - **Lifecycle:** `yield` dependencies give every session or transaction the same teardown, even when the
   handler raises, because the exception is re-raised at the `yield` point.
 
+### How do you test an agent endpoint's loop logic without calling the model?
+- **Override the client.** `app.dependency_overrides[get_llm]` with a scripted fake that returns a fixed
+  tool call, then an answer, so each test is deterministic and spends no tokens.
+- **Test the wiring, not the prompt:** tool filtering by scope, step limits, budget teardown, behaviour
+  when a tool fails or the model proposes a tool it was not given.
+- **Clean up and separate.** Set and clear overrides in a fixture, and keep real-model evals in their own
+  suite measured by pass rate.
+
+### How do you make sure each user's agent can only call the tools that user is allowed to use?
+- **A per-request dependency builds the toolset** from the principal's scopes and tenant, so the model is
+  never offered a tool the user may not use.
+- **Re-check at execution.** The tool executor validates each call against that same list, because the
+  model (or an injected instruction) can still name a tool it was not given.
+- **Attach auth at router level** so a new agent route cannot ship without the principal dependency.
+
 ### A protected endpoint has 400 ms of latency before the handler body even starts. How do you find and fix it?
 - **Trace the dependency tree.** Open a span or timer inside each slow dependency and compare total
   request time with handler time.
@@ -327,13 +438,6 @@ session and one transaction, which is the intended scope.
   itself.
 - **In tests, keep a reference** to the instance you registered, since overriding a new `RateLimit(...)`
   object matches nothing.
-
-### Your test suite passes locally but fails in CI when files run in a different order. What is your first suspect?
-- **A leaked override.** `app.dependency_overrides` is global on the app object, so a test that sets a
-  fake model and never clears it changes later tests.
-- **Fix:** set overrides in a pytest fixture that yields the `TestClient` and calls
-  `app.dependency_overrides.clear()` afterwards.
-- **Prevent it** by making that fixture the only place overrides are set.
 
 ## Quiz
 ### Q: `get_settings` is a dependency of both `get_llm` and `get_retriever`, and an endpoint depends on both. How many times does `get_settings` run per request by default?

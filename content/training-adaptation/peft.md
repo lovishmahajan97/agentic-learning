@@ -142,22 +142,35 @@ During training:
 
 LoRA remains the default because it merges away.
 
+### Applying it to an agent model
+What an agent fine-tune teaches is mostly behaviour, which is exactly where low rank holds:
+1. **Collect trajectories.** Successful agent runs from logs or a stronger teacher model: system prompt,
+   tool schemas, user turn, assistant tool calls, tool results, final answer.
+2. **Render them with the serving chat template**, tools included, because the adapter learns the exact
+   token patterns around tool-call markers.
+3. **Mask the loss to assistant tokens.** Tool results and user turns are inputs the model never has
+   to produce, so training on them wastes capacity and teaches it to hallucinate tool output.
+4. **Train LoRA on all linear layers**, then evaluate on an agent suite (tool-name accuracy, argument
+   validity, task success), not only held-out loss.
+5. **Ship** merged for a single agent, or unmerged when one base serves many agents or tenants.
+
 ## Diagram
-The input feeds two paths: the frozen base matrix and the trainable low-rank pair A then B. Only A and B
-get gradients; after training the update is either merged into W₀ or kept as a swappable adapter.
+Agent traces train only the low-rank pair A then B; the frozen base is shared. After an agent eval gate,
+the update is either merged into W₀ or kept as one swappable adapter per agent or tenant.
 
 ```mermaid
 flowchart TD
-    X["Input x"] --> W["Frozen W0: bf16 in LoRA, NF4 in QLoRA"]
+    T["Agent traces: assistant turns only"] --> X["Input x"]
+    X --> W["Frozen W0: bf16 in LoRA, NF4 in QLoRA"]
     X --> A["A: r x k, trainable, small random init"]
     A --> B["B: d x r, trainable, starts at zero"]
     W --> S["h = W0x + (alpha / r) B(Ax)"]
     B -->|"scale by alpha / r"| S
     S --> L["Loss: gradients flow only to A and B"]
     L -.->|"update"| A
-    L -.->|"update"| B
-    B -->|"after training"| M["Merge: W = W0 + (alpha / r)BA, zero extra latency"]
-    B -->|"after training"| K["Keep separate: one base serves many adapters"]
+    L --> E["Eval: tool-call validity and task success"]
+    E -->|"one agent"| M["Merge: zero extra latency"]
+    E -->|"many agents"| K["Keep separate: one base, many adapters"]
 ```
 
 ## Examples
@@ -224,7 +237,51 @@ larger):
 | 8B QLoRA | yes, with room for activations | yes |
 | 70B QLoRA | no | yes |
 
+### Loss mask for agent trajectories
+Pure Python, runnable anywhere. Only assistant tokens (tool calls and final answers) get labels; system,
+user and tool-result tokens get -100, the index PyTorch's cross-entropy ignores.
+
+```python
+IGNORE = -100   # torch.nn.CrossEntropyLoss default ignore_index
+
+def build_labels(segments):
+    """segments: list of (role, token_ids) in rendered chat-template order."""
+    input_ids, labels = [], []
+    for role, ids in segments:
+        input_ids += ids
+        labels += ids if role == "assistant" else [IGNORE] * len(ids)
+    return input_ids, labels
+
+trace = [("system", [1] * 900),      # policy plus tool schemas
+         ("user", [2] * 60),
+         ("assistant", [3] * 40),    # tool call: search_orders(...)
+         ("tool", [4] * 700),        # tool result: the model must not learn to produce this
+         ("assistant", [5] * 120)]   # final answer
+ids, labels = build_labels(trace)
+trained = sum(l != IGNORE for l in labels)
+print(len(ids), trained, f"{trained / len(ids):.0%}")   # 1820 160 9%
+```
+
+### Worked scenario: per-tenant support agents on one base
+A platform runs a customer-support agent for 30 tenants on an 8B model. Each tenant wants its own tone
+and ticket format; tool schemas are shared.
+
+| Option | Storage | GPUs to keep all resident | Notes |
+|---|---|---|---|
+| 30 full fine-tunes | 30 × 16 GB = 480 GB | many cards, or cold loads | 128 GB each to train |
+| 30 merged LoRA models | 480 GB | same as above | zero adapter latency |
+| 1 base + 30 unmerged adapters (r = 16) | 16 GB + 30 × ~85 MB ≈ 18.6 GB | one 80 GB card, room for KV cache | small extra matmul per request |
+
+The unmerged design wins until one tenant's traffic is large enough to justify its own merged
+deployment. Rollback for a tenant is swapping an ~85 MB directory.
+
 ## Production patterns
+- **Train on successful trajectories, assistant turns only.** Filter logs to runs that reached the goal,
+  render them with the serving template and tool schemas, and mask non-assistant tokens. Monitor the
+  share of trained tokens per example; a very low share means tool output dominates the context.
+- **Gate adapters on an agent eval suite.** Before release, replay a fixed set of tasks and score
+  tool-name accuracy, schema-valid arguments and task success against the base model and the previous
+  adapter. Block the release on any regression, not only on held-out loss.
 - **One base, many adapters.** When tenants or tasks share a base, serve unmerged adapters: vLLM's
   `--enable-lora` with `--max-loras` and `--max-lora-rank` sized to your adapters. Monitor per-adapter
   latency and adapter load/evict churn.
@@ -234,11 +291,10 @@ larger):
 - **Merge-then-eval release gate.** Before shipping a merged or re-quantized model, re-run the task eval
   and a small general benchmark on the final artifact and block release if it drops below the
   unmerged adapter's numbers. Track task metric, general metric and the merged-versus-unmerged gap.
-- **Small rank sweep, all linear layers.** Fix `target_modules` to all projections and sweep r over
-  8, 16 and 32 with the LR held near 1e-4 to 2e-4; keep the smallest r where held-out loss stops
-  improving. Watch train-versus-eval loss for overfitting.
-- **Gradient checkpointing by default for long sequences.** Set `gradient_checkpointing=True` in the
-  trainer arguments, because activations, not adapters, are what OOM. Monitor peak memory and step time.
+- **Small rank sweep, all linear layers, checkpointing on.** Fix `target_modules` to all projections and
+  sweep r over 8, 16 and 32 with the LR held near 1e-4 to 2e-4; keep the smallest r where the agent eval
+  stops improving. Agent traces are long, so set `gradient_checkpointing=True`, because activations, not
+  adapters, are what OOM. Monitor peak memory, step time and train-versus-eval loss.
 
 ## Trade-offs
 - **Memory vs speed.** Memory falls by an order of magnitude and checkpoints by about two, but per-step
@@ -254,6 +310,9 @@ larger):
   one model per adapter.
 - **Higher rank vs diminishing returns.** Past the point where training loss stops improving with r,
   extra rank only adds memory and overfitting risk.
+- **Fine-tuned small model vs prompted frontier model.** An adapter on an 8B model can make each agent
+  step far cheaper and faster, but you now own data collection, evals and retraining whenever tools
+  change. It flips toward prompting when tools or policies change weekly.
 
 ## Pitfalls
 - **Copying a full fine-tuning learning rate (≈1e-5).** LoRA parameters are tiny and need a larger LR.
@@ -265,6 +324,12 @@ larger):
   re-quantizing the merged model to GPTQ/AWQ for serving.
 - **Training with one chat template, serving with another.** The adapter learned token patterns around
   the template. Symptom: rambling, never emitting the end token, or ignoring the system prompt.
+- **Training on tool results as targets.** Without a loss mask the model learns to write tool output
+  itself. Symptom: the agent invents a result instead of emitting a tool call. Fix: label assistant
+  tokens only.
+- **Shipping an adapter after the tool set changed.** It memorised the old tool names and schemas.
+  Symptom: calls to removed tools or stale argument names. Fix: retrain or refresh traces when schemas
+  change, and keep schema-validation errors on a dashboard.
 - **Not pinning the exact base model revision.** Adapters are deltas against specific weights, so a
   silently updated base produces a quietly different model.
 - **Forgetting `prepare_model_for_kbit_training` or input-gradient hooks with gradient checkpointing on
@@ -272,6 +337,9 @@ larger):
   changes.
 
 ## When to use
+- **Try prompting first:** a frontier model with good tool descriptions and few-shot examples usually
+  beats a fine-tune you have not evaluated; fine-tune when cost, latency or data residency forces a
+  smaller self-hosted model.
 - **Use LoRA when:** fine-tuning a model larger than a few hundred million parameters for a style,
   format, domain-vocabulary or behaviour shift: support-ticket tone, structured output, a house-specific
   classifier, tool-call formatting.
@@ -333,7 +401,15 @@ trained against the quantized base.
 - **Checkpoint:** about 80 MB in bf16 against 13.4 GB for the base, which is what makes per-tenant
   adapters cheap to store and roll back.
 
-### You must serve fine-tuned variants for 50 tenants on a shared base. How do you design it?
+### You want an 8B model to replace a frontier model in your tool-calling agent. How do you build the LoRA training set and judge success?
+- **Data:** successful trajectories from production logs or a stronger teacher, rendered with the exact
+  serving chat template and tool schemas, with loss on assistant turns only.
+- **Training:** LoRA on all linear layers at r = 16 and an LR near 1e-4 to 2e-4, QLoRA if the bf16 base
+  does not fit.
+- **Success:** replay a held-out task suite and compare tool-name accuracy, schema-valid arguments, task
+  success and cost per task against the frontier baseline, not just held-out loss.
+
+### You must serve fine-tuned agent variants for 50 tenants on a shared base. How do you design it?
 - **Serve unmerged adapters:** one base resident on the GPUs, adapters loaded on demand, with an engine
   that batches requests across adapters (vLLM's `--enable-lora`, `--max-loras`, `--max-lora-rank`).
 - **Pin the base revision:** every adapter is a delta against exact weights, so store the base commit

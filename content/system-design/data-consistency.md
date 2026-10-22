@@ -5,7 +5,8 @@ name: Data consistency
 kind: concept
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - system-design/distributed-systems
   - system-design/saga-pattern-and-distributed-transactions
@@ -23,9 +24,23 @@ sources:
 ---
 
 ## TL;DR
-"Consistency" means invariants inside one database (ACID's C) and which value a read returns when copies
-exist (linearizable to eventual). Keep a few invariants strong (permissions, quotas, idempotency keys); let
-index, cache and agent memory lag visibly.
+Your agent reads copies: a RAG index, a memory store, a cache, a replica. Consistency decides what those
+reads may return, from linearizable to eventual. Keep a few invariants strong (permissions, token
+quotas, idempotency keys); let index and memory lag visibly.
+
+## For agent builders
+- **Why it matters for agents.** An agent acts on what it reads. A stale memory read makes it repeat a
+  tool call, a stale index makes it deny a document the user just uploaded, and a stale ACL makes it quote
+  a folder the user lost access to.
+- **Where it shows up in your stack.** The vector store's refresh or indexing delay, the replica your
+  memory and checkpoint reads hit, framework memory stores (LangGraph's store, a Postgres or Redis
+  backend), permission metadata copied into chunk filters, and the counter that enforces a per-tenant
+  token budget across concurrent runs.
+- **What you control.** Which reads go to the primary within a run, version tokens after memory writes,
+  query-time ACL checks after retrieval, tombstones on deletion, atomic quota debits, and whether the UI
+  shows "indexing" instead of pretending the index is current.
+- **What you can skip.** Formal definitions of sequential consistency and CRDT proofs. Know the ladder,
+  write skew, read-your-writes and the derived-copy permission problem.
 
 ## Why it exists
 - **One serializable database lets you forget this topic.** Every read sees every committed write, and
@@ -134,6 +149,19 @@ List each piece of state, name the invariant, and ask what a stale read costs.
 - **Domain-driven design says the same:** strong consistency inside an aggregate, eventual between
   aggregates.
 
+### The agent's state, classified
+| Agent state | Level it needs | Why |
+|---|---|---|
+| Run checkpoint, idempotency and step-result records | strong, primary only | a stale read re-executes a step or repeats a side effect |
+| Per-tenant token or spend budget | strong, atomic debit | concurrent runs otherwise overspend (write skew) |
+| Permissions behind retrieval | strong at query time | a lag window is a data leak |
+| Memory the agent wrote in this run or session | read-your-writes | the agent must not miss its own note and redo work |
+| Long-term memory summaries, user profile facts | eventual, with a merge rule | written by background jobs; concurrent runs may disagree |
+| RAG index of documents | eventual, measured and shown | refreshes take seconds to minutes |
+
+- **Concurrent runs share memory.** Two runs for the same user can each update a profile fact; decide the
+  merge (append facts with timestamps and sources, not overwrite one blob) before it happens.
+
 ## Diagram
 The per-invariant decision: ask what a stale read costs, then buy only the guarantee that cost justifies.
 
@@ -218,6 +246,21 @@ if snapshot_t2 + 8 <= quota: usage_rows.append(8)               # T2 passes its 
 print(sum(usage_rows))                        # 106: both committed, invariant broken
 ```
 
+### Agent scenario: a memory read on a lagging replica
+An agent saves "refund issued for order 881" to memory at step 6 and reads memory at step 7, 300 ms later,
+to decide what to do next. Illustrative lag figures; measure your own.
+
+| Replica lag at that moment | Read with no token | Read with LSN token (example above) |
+|---|---|---|
+| 50 ms (normal) | sees the note | replica fresh, sees the note |
+| 2 s (replica under load) | misses the note; the model decides the refund is still pending and calls the tool again | replica behind, routed to primary, sees the note |
+| Replica down | read fails | primary serves it |
+
+- **The second row is the incident.** Unless the refund tool is keyed, the customer is refunded twice; the
+  idempotency key and read-your-writes are two independent defences, and you want both.
+- **Cheaper alternative inside one run:** keep the run's own notes in the run state the loop already holds,
+  and only read the shared store for memory written by other sessions.
+
 ### Worked scenario: fixing the quota write skew
 Quota 100, current usage 90, two concurrent requests of 8 each (the last block above).
 
@@ -248,6 +291,13 @@ Quota 100, current usage 90, two concurrent requests of 8 each (the last block a
 - **Query-time ACL check after retrieval.** Pre-filter by index metadata, then drop candidates whose current
   permission, read from the authoritative store, denies the user. Measure revocation-to-enforcement time
   and report it.
+- **Atomic token-budget debits across concurrent runs.** Before each model call, debit the estimated tokens
+  with the conditional `UPDATE` above and reconcile with actual usage after the response, so ten parallel
+  runs cannot each see headroom and overspend. Monitor rejected debits and the gap between estimated and
+  actual tokens.
+- **Primary reads for run state.** Route checkpoint, step-result and in-run memory reads to the primary (or
+  require a version token), and leave replicas for analytics and other users' dashboards. Monitor the
+  share of agent-runtime reads served by replicas; it should be near zero for these tables.
 
 ## Trade-offs
 - **Linearizable reads vs latency and availability.** They make correctness trivial to reason about, but each
@@ -279,6 +329,9 @@ Quota 100, current usage 90, two concurrent requests of 8 each (the last block a
   and another the stale cache entry, producing responses that contradict each other within one page load.
 - **Wall-clock last-writer-wins to merge concurrent updates across replicas.** An edit silently disappears and
   no error is ever logged.
+- **Concurrent agent runs overwriting one memory blob.** Two sessions each load the user profile, add a
+  fact and write the whole blob back; one fact disappears. Fix: append facts as rows, or use a version
+  check and re-read on conflict.
 
 ## When to use
 You are always choosing a consistency level, whether you name it or not; the default of "whatever the
@@ -356,6 +409,14 @@ revocation-to-enforcement time and report it.
   or a human choice.
 - **CRDTs** suit data whose merge can be defined up front (counters, sets, collaborative text), but cannot
   protect invariants that need coordination before the write.
+
+### Ten agent runs for one tenant execute in parallel against a shared monthly token budget. How do you stop them overspending?
+- **Name the anomaly.** Each run reads remaining budget, sees headroom and proceeds, which is write skew;
+  checking in application code before the call does not help.
+- **Debit atomically before each model call.** One conditional `UPDATE ... WHERE used + $1 <= quota_limit`
+  on a single counter row; zero rows means stop or degrade, then reconcile with actual usage afterwards.
+- **Decide the overshoot policy.** Estimates can be wrong by a call's worth of tokens, so state the
+  tolerance and alert on rejected debits per tenant.
 
 ## Quiz
 ### Q: Which guarantee ensures a user always sees the memory note their agent wrote a moment ago, without requiring every read in the system to go to the leader?

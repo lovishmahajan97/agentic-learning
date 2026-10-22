@@ -5,7 +5,8 @@ name: Retrieval failure diagnosis
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/retrieval-evaluation
   - evals/error-analysis
@@ -18,14 +19,27 @@ related:
 ---
 
 ## TL;DR
-A wrong RAG answer means evidence was lost at one stage. Diagnosis traces the gold evidence through
-ingestion, parsing, chunking, indexing, filtering, ranking, context and generation to the *first* stage
-where it disappears, because each stage has its own fix and tuning another changes nothing.
+A wrong agent answer means evidence was lost somewhere: in ingestion, parsing, chunking, indexing,
+filtering, the agent's own search calls, ranking, context or generation. Trace the gold evidence to the
+*first* stage where it disappears, because only that stage's fix helps.
+
+## For agent builders
+- **Why it matters for agents.** In an agent, retrieval is a tool the model chooses to call, with a query
+  the model writes. That adds failure stages a fixed pipeline does not have: the agent never searched,
+  searched with a query that dropped the key term, picked the wrong index, or stopped after one weak result.
+- **Where it shows up in your stack.** Agent traces in tools such as LangSmith, Langfuse, Arize Phoenix or
+  OpenTelemetry spans: each `search` tool call with its arguments, the returned chunk IDs and scores, and
+  the final prompt. Retrieval evals with gold spans sit beside your end-to-end agent evals.
+- **What you control.** What the retrieval tool logs (candidate IDs per retriever, filters, index version),
+  how gold is labelled (document plus answer span), and the per-stage regression tests that gate a prompt,
+  model or index change.
+- **What you can skip.** Fancy attribution tooling. A labelled set of a few dozen failures, complete traces
+  and a counting script locate the dominant cause.
 
 ## Why it exists
 - **A RAG pipeline is a chain of lossy steps**, and the user sees only the end. Stages where evidence can
   vanish: never ingested, parsed or chunked badly, missing from the index, filtered out, ranked too low,
-  dropped from the context, or ignored by the model.
+  dropped from the context, or ignored by the model. An agent adds its own search decisions on top.
 - **One symptom, many unrelated causes.** "The bot said our refund window is 14 days, it is 30" could mean:
   the PDF was never synced; OCR turned "30" into "3O"; the number landed in a chunk with no mention of
   refunds; an ACL filter excluded it; a blog post outranked it; the reranker ranked it 6th when only the
@@ -40,7 +54,8 @@ where it disappears, because each stage has its own fix and tuning another chang
 
 ## How it works
 ### Step 1: get failures with known gold evidence
-- **Collect failing queries** from evals, thumbs-down feedback or support escalations.
+- **Collect failing queries** from evals, thumbs-down feedback or support escalations. For agents, collect
+  the whole run, not just the final message.
 - **Identify the *gold* source** for each: the document and passage that actually answers it, found by a
   person (or an LLM, spot-checked by a human). Without a gold target you can only guess, so this
   labelling is the expensive but non-negotiable part.
@@ -50,6 +65,7 @@ where it disappears, because each stage has its own fix and tuning another chang
   Map the span to whichever chunks contain it at diagnosis time.
 - **Track multi-evidence questions per span.** A limit in one section and the exception in another, or two
   documents to compare: the answer fails if *any* span is lost, and each may be lost at a different stage.
+  Agents meet these often, because multi-step questions are why you built an agent.
 
 ### Step 2: walk the stages in pipeline order
 Ask the same questions in the order data flows, and stop at the first "no":
@@ -69,6 +85,8 @@ Ask the same questions in the order data flows, and stop at the first "no":
    and transformed queries. Re-run retrieval with the raw query: if gold appears, the loss is here.
    - A rewriter that drops the product code, a router sending a billing question to the HR index, or a
      decomposition that loses the constraint all look like recall failures downstream.
+   - **In an agent this stage is the model's tool call.** The query argument, the index or tool chosen,
+     and whether it searched at all are all model decisions; see the agent stages below.
 8. **Candidate recall.** At a generous depth (say k=100), what rank does gold get from dense search, from
    BM25, and after fusion?
    - **Absent at k=100** is a representation problem: vocabulary mismatch, IDs and codes that embeddings
@@ -80,38 +98,53 @@ Ask the same questions in the order data flows, and stop at the first "no":
    - **The asymmetry with step 8:** recall at depth is a property of the representation; ordering within
      the candidates is a property of the scorer. That is why the two numbers point at different components.
 10. **Context assembly.** Did it survive token budgeting, deduplication and ordering, or was it truncated or
-    buried mid-context?
+    buried mid-context? In agents, also check tool-result truncation and history compaction, which can
+    drop a passage the agent retrieved several steps earlier.
 11. **Generation.** It was in the prompt, near the top, and the model still answered wrong: a grounding,
     prompt or model problem, not retrieval. Separate the sub-cases:
     - **A conflicting passage the model preferred** was also in context (a retrieval-precision problem in disguise).
     - **Parametric knowledge won:** the model ignored the context.
     - **Reasoning failed:** the answer needed arithmetic or combining two passages and the model got it wrong.
 
+### The agent-specific stages
+When retrieval is a tool, stage 7 splits into decisions you can read straight from the trace:
+
+| Agent stage | Question | Typical fix |
+|---|---|---|
+| Tool selection | did it call search at all, or answer from memory? | tool description, a system rule to search before answering policy questions |
+| Tool routing | did it call the right index or tool? | clearer tool names and descriptions, fewer overlapping tools |
+| Query argument | did the query keep the key terms (codes, names, dates)? | tool description asking for exact identifiers, a hybrid BM25 leg |
+| Persistence | did it stop after one weak result or loop on the same query? | step budget, "rephrase once if nothing relevant" instruction, dedup of repeated calls |
+| Result use | was gold in a tool result but later truncated or compacted away? | larger result budget, cite-then-compact |
+
+- **Diagnose with the raw question too.** Re-run retrieval with the user's original question: if gold
+  appears there but not for the agent's query, the loss is the query argument, not the index.
+
 ### Step 3: count, then fix the biggest bucket
 - **Tally first-loss stage across failures.** The distribution decides the work, *because* each fix only
   helps its own bucket: a reranker cannot recover a chunk that was never indexed, and re-embedding cannot
-  fix a table the parser flattened.
+  fix a table the parser flattened, and neither helps an agent that never called search.
 - **Hold the fix with regression tests.** Turn labelled failures into per-stage assertions
-  (`gold in candidates@100`, `gold in context`).
+  (`gold in candidates@100`, `gold in context`), plus "search was called" for agent runs.
 
 ### What makes this cheap
 - **Log a trace per request:** query, rewritten queries, filters applied, candidate IDs with scores from
-  each retriever, post-rerank order, and final context IDs.
+  each retriever, post-rerank order, and final context IDs. In an agent, log this per tool call.
 - **With the trace, steps 5 to 9 are lookups** instead of re-runs.
 - **Without it, every diagnosis reproduces state** that may have changed since.
 
 ## Diagram
 Walk a labelled failure down the pipeline and stop at the first "no": that stage is its bucket, and the
-bucket names the fix.
+bucket names the fix. For an agent, the filter-and-rewrite question includes the agent's own tool call.
 
 ```mermaid
 flowchart TD
-    Q["Failing query with gold span"] --> C{"Answer in any source document?"}
+    Q["Failing run with gold span"] --> C{"Answer in any source document?"}
     C -->|"no"| G1["Content gap: abstain, add content"]
     C -->|"yes"| P{"Synced, parsed, chunked and indexed intact?"}
     P -->|"no"| G2["Fix sync, parser, chunker or index job"]
-    P -->|"yes"| F{"Survives filters and query rewrite?"}
-    F -->|"no"| G3["Fix ACL, metadata filter or rewriter"]
+    P -->|"yes"| F{"Searched, right tool, good query, filters ok?"}
+    F -->|"no"| G3["Fix tool description, ACL filter or rewriter"]
     F -->|"yes"| R{"Gold in candidates at k=100?"}
     R -->|"no"| G4["Recall: representation, BM25, rewriting"]
     R -->|"yes"| K{"Gold in final top-k and context?"}
@@ -120,8 +153,39 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: first loss across an agent's tool calls
+An agent run may call `search` several times. This checks the agent-specific stages first, then hands the
+best call to the pipeline-stage check below.
+
+```python
+def agent_first_loss(gold_doc: str, gold_span: str, run: dict, retrieve) -> str:
+    """run: one agent trace. run['calls'] = [{'tool','args','result_ids','result_docs'}...];
+    retrieve(query) -> doc ids for the raw question (re-run at diagnosis time, same index version)."""
+    searches = [c for c in run["calls"] if c["tool"].startswith("search")]
+    if not searches:
+        return "tool selection: agent answered without searching"
+    if not any(c["tool"] == run["expected_tool"] for c in searches):
+        return f"tool routing: called {[c['tool'] for c in searches]}, expected {run['expected_tool']}"
+    hit = [c for c in searches if gold_doc in c["result_docs"]]
+    if not hit:
+        if gold_doc in retrieve(run["user_question"]):
+            qs = [c["args"]["query"] for c in searches]
+            return f"query argument: raw question finds gold, agent queries {qs} do not"
+        return f"retrieval: gold absent for raw and agent queries after {len(searches)} calls"
+    if gold_span not in run["final_prompt"]:
+        return "result use: retrieved, then truncated or compacted out of context"
+    return "generation: gold was in context, model did not use it"
+
+run = {"user_question": "What is the refund window for plan PRO-7?", "expected_tool": "search_policies",
+       "calls": [{"tool": "search_policies", "args": {"query": "refund window"},
+                  "result_ids": ["c2"], "result_docs": ["refund-faq"]}],
+       "final_prompt": "...Old FAQ: refunds within 14 days..."}
+print(agent_first_loss("refund-policy", "within 30 days", run, lambda q: ["refund-policy"]))
+# query argument: raw question finds gold, agent queries ['refund window'] do not
+```
+
 ### First-loss attribution from a logged trace
-Finds the first stage where the gold chunk is lost.
+Finds the first stage where the gold chunk is lost inside one retrieval call.
 
 ```python
 def first_loss(gold: str, trace: dict, store: dict) -> str:
@@ -176,7 +240,7 @@ print(resolve_gold("refund-policy", "within 30 days", chunks))   # ['c1']
 ```
 
 ### Worked scenario: what the buckets say
-Running attribution across, illustratively, 60 labelled failures:
+Running attribution across, illustratively, 60 labelled failures of a RAG pipeline:
 
 | First-loss stage | Failures | Share | What it points to |
 |---|---|---|---|
@@ -188,22 +252,31 @@ Running attribution across, illustratively, 60 labelled failures:
 
 - **Conclusion:** add or tune the reranker and fix the parser first.
 - **The embedding model is not the bottleneck at all**: no bucket is "recall absent at depth".
+- **The same team's agent version** (illustrative) could show a different chart: if many failures land in
+  "query argument" or "tool selection", the fix is the tool description or a search-first rule, and no
+  retrieval change would move them.
 
 ## Production patterns
-- **Per-request retrieval traces.** On every request, log query, rewritten queries, filters, candidate IDs
-  and scores per retriever, rerank order, final context IDs and the index version. For regulated corpora,
-  log IDs and hashes only. Monitor the share of requests with a complete trace.
+- **Per-call retrieval traces.** On every request (and every search tool call inside an agent run), log
+  query, rewritten queries, filters, candidate IDs and scores per retriever, rerank order, final context
+  IDs and the index version. For regulated corpora, log IDs and hashes only. Monitor the share of
+  requests with a complete trace.
 - **Per-stage regression tests in CI.** For every labelled failure, assert `gold in candidates@100`, gold in
-  the final top-k, and `gold in context`. Run them on any chunker, embedding, reranker or prompt change,
-  and track which assertion breaks, not just pass/fail.
+  the final top-k, and `gold in context`; for agent runs also assert the expected search tool was called.
+  Run them on any chunker, embedding, reranker, tool-description or prompt change, and track which
+  assertion breaks, not just pass/fail.
 - **Weekly failure triage.** Sample thumbs-down and escalated queries, label gold spans with SMEs, run
   first-loss attribution and publish the bucket chart. Track bucket shares week over week to confirm a
   fix shrank its own bucket.
 - **Separate stage metrics on the dashboard.** Report recall@100, recall at final k and gold-in-context rate
-  as three numbers, never one blended score. Alert when any drops after a deploy or re-index.
+  as three numbers, never one blended score, plus search-call rate and searches per run for agents.
+  Alert when any drops after a deploy or re-index.
 - **Span-based gold labels.** Store gold as `doc_id` plus answer-span text and resolve to chunk IDs at eval
   time by substring match, so a chunking change does not silently zero the eval set. Monitor spans that
   resolve to no chunk: those are parsing or chunking losses.
+- **Raw-question replay.** For agent failures, automatically re-run retrieval with the user's original
+  question and compare with the agent's tool queries. A high share of "raw finds gold, agent query does
+  not" points at the tool description, not the index.
 
 ## Trade-offs
 - **Labelling gold vs speed.** Labelling every failure is slow but is the only thing that makes stage
@@ -217,6 +290,9 @@ Running attribution across, illustratively, 60 labelled failures:
 - **Deep-k recall vs eval cost.** Measuring recall at a deep k (100) isolates representation from ranking
   but costs extra queries per eval. It is worth it whenever you are about to choose between an embedding
   change and a reranker.
+- **Agent freedom vs diagnosability.** Letting the agent choose whether and how to search handles varied
+  questions, but adds tool-selection and query-argument buckets. A fixed retrieve-first step removes those
+  buckets when nearly every question needs documents.
 
 ## Pitfalls
 - **Changing the embedding model first** because it is the most visible component. Symptom: a costly
@@ -231,10 +307,15 @@ Running attribution across, illustratively, 60 labelled failures:
   query because nobody saw the distribution.
 - **Recording gold evidence as chunk IDs.** Symptom: measured recall collapses to near zero right after a
   chunking change, because the labelled IDs no longer exist, while real answer quality is unchanged.
+- **Evaluating the retriever with your questions, not the agent's queries.** Symptom: offline recall looks
+  fine while the agent keeps failing, because it searches with short paraphrases that drop identifiers.
+  Fix: build retrieval evals from logged agent tool-call queries as well as user questions.
 
 ## When to use
 - **Use when:** answer quality is below target and the cause is not obvious, before any model or index
   change, and as the standing triage process for production feedback.
+- **Use for agents** whenever an agent eval fails on a knowledge question: decide first whether it is an
+  agent-decision bucket or a pipeline bucket.
 - **Measure:** recall@k at candidate depth, recall at final k, and "gold in context" separately, so each
   stage has its own number.
 - **Interviews:** "your RAG bot is wrong 20% of the time, what do you do?" The strong answer is a staged
@@ -269,6 +350,14 @@ would not move with any retrieval change.
 - **Why not an answer score:** an LLM judge gives the failure rate, not its location, so it cannot choose
   between a reranker, a parser fix and a prompt change.
 
+### Your agent answers policy questions wrongly, but offline retrieval evals look healthy. How do you find the cause?
+- **Read the agent traces, not the retriever metrics:** did it call search at all, the right tool, and with
+  what query argument? Offline evals usually use the user's question, not the agent's query.
+- **Replay the raw question:** if gold appears for the user's question but not for the agent's query, the
+  loss is the query argument; fix the tool description (keep identifiers verbatim) or add a BM25 leg.
+- **Check result use:** gold retrieved early but compacted or truncated before the answer is a context
+  problem, fixed with a larger result budget or citing before compaction.
+
 ### Your RAG bot is wrong on 20% of questions. Walk me through your first week.
 - **Build the inputs:** collect failing queries from evals, thumbs-down and escalations, and label gold as
   document plus answer span with SMEs; a few dozen usually reveal the dominant cause.
@@ -284,6 +373,8 @@ would not move with any retrieval change.
   so the fix is the grounding prompt, conflict handling or the model.
 - **When the bucket is a content gap:** the answer is in no document, so the right behaviour is abstention,
   and "improving" retrieval only surfaces loosely related chunks.
+- **When the agent never searched:** a tool-selection failure is fixed in the tool description or a
+  search-first rule; no ranking change reaches it.
 
 ### Measured recall dropped to near zero right after a chunking change, but users report no difference. What happened?
 - **Gold was labelled as chunk IDs**, which are an artifact of the current chunker and no longer exist after
@@ -293,14 +384,16 @@ would not move with any retrieval change.
 - **Monitor** spans that resolve to no chunk at all, because those are genuine parsing or chunking losses
   rather than label drift.
 
-### What would you put on a retrieval quality dashboard, and what numbers would make you act?
+### What would you put on a retrieval quality dashboard for a production agent, and what numbers would make you act?
 - **Three separate stage numbers:** recall@100, recall at final k, and gold-in-context rate, never one
   blended score.
 - **Read the gap:** a wide gap between recall@100 and recall at final k points at ranking (reranker, fusion,
   final k); low recall@100 points at representation or an upstream loss; gold in top-k but not in context
   points at token budgeting or dedup.
-- **Alert on deltas:** any of the three dropping after a deploy or re-index, plus the share of requests with
-  a complete trace falling.
+- **Agent signals:** search-call rate on knowledge questions and searches per run; a drop after a prompt or
+  model change means the agent stopped looking.
+- **Alert on deltas:** any of these dropping after a deploy or re-index, plus the share of requests with a
+  complete trace falling.
 
 ## Quiz
 ### Q: The gold chunk, whose parsed text you have confirmed contains the answer intact, appears at rank 2 in BM25 results and nowhere in dense results, but the answer is still wrong. What do you check next?

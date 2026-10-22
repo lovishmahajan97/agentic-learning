@@ -5,7 +5,8 @@ name: Job queues & durable workers (Celery / ARQ + job-status endpoint)
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - backend-fundamentals/background-jobs-durable-workers
   - backend-fundamentals/message-queues
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-A job queue moves slow or must-complete work to workers after persisting a job record; the API answers
-`202 Accepted` with a job id and a status endpoint reports the outcome. Celery is sync-first, ARQ
+Long agent runs, batch evals and ingestion belong on a job queue: persist a job row, answer `202 Accepted`
+with a job id, let a worker run it and a status endpoint report it. Celery is sync-first, ARQ
 asyncio-native; both need idempotent jobs.
+
+## For agent builders
+- **Why it matters for agents.** A research agent that loops for five minutes, a nightly eval over 500
+  test cases, or ingesting a corpus for RAG cannot live inside an HTTP request. The job row, not the
+  connection, keeps the run alive across timeouts, retries and deploys.
+- **Where it shows up in your stack.** Celery or ARQ workers next to your FastAPI agent API, a job table
+  in Postgres, and the provider rate limit that sets worker concurrency. Workflow engines take over when
+  runs need step-level checkpoints.
+- **What you control.** Commit-then-enqueue, idempotent job and tool bodies (a redelivered agent job must
+  not send the email twice), retry classification for 429s, per-step progress, and concurrency per queue.
+- **What you can skip.** Broker internals (AMQP details, Redis data structures). Know at-least-once
+  delivery, visibility timeouts and late acks; that covers most agent-job incidents.
 
 ## Why it exists
 - **Intermediaries cut long requests.** Connections that run or idle too long are dropped, commonly after
@@ -106,6 +119,18 @@ Either way delivery is at-least-once, so the body must be idempotent:
 - **Check the job's status before acting.**
 - **Write results with upserts keyed by job id.**
 - **Pass idempotency keys to external calls.**
+
+### Running an agent loop as a job
+A tool-calling agent is a job with many steps, and at-least-once delivery applies to every one of them.
+1. **Checkpoint after every step.** Append the step (model output, tool call, tool result) to a run-steps
+   table keyed by job id and step number, so a redelivered job reloads the transcript and continues.
+2. **Make side-effecting tools idempotent.** Derive an idempotency key from job id plus step number and
+   pass it to the external API, or record "tool done" before acting on a retry.
+3. **Report progress as steps.** `progress` becomes "step 4 of at most 15" plus the latest tool name, which
+   the status route or an SSE stream shows.
+4. **Check a cancel flag between steps.** A `cancelled` status written by `POST /jobs/{id}/cancel` stops
+   the loop at the next step boundary.
+5. **Bound the run.** A step budget and the job timeout stop a looping agent from spending forever.
 
 ### Backpressure and capacity
 - **Queue depth is the backpressure signal.** Export it and cap in-flight jobs per tenant.
@@ -225,6 +250,37 @@ def summarize_corpus(self, job_id: str, corpus_id: str):
     asyncio.run(summarize_corpus_async(job_id, corpus_id))   # same idempotent body as the ARQ version
 ```
 
+### A long agent run as a checkpointed ARQ job
+Each step is persisted before the next starts, so a redelivered job resumes at the last finished step
+and a side-effecting tool sees the same idempotency key on a retry. `ctx["agent"]` and `db` are
+placeholders for your agent step function and data layer.
+
+```python
+MAX_STEPS = 15
+
+async def run_agent_job(ctx, job_id: str):
+    job = await db.get_job(job_id)
+    if job.status in ("succeeded", "failed", "cancelled"):              # terminal states are immutable
+        return
+    await db.set_status(job_id, "running")
+    steps = await db.load_steps(job_id)                                  # resume: transcript so far
+    while len(steps) < MAX_STEPS:
+        if await db.job_status(job_id) == "cancelled":                   # cancel checked at step boundary
+            return
+        n = len(steps) + 1
+        step = await ctx["agent"].next_step(job.input, steps)            # one model call
+        if step.tool_call:
+            step.tool_result = await ctx["agent"].call_tool(
+                step.tool_call, idempotency_key=f"{job_id}:{n}")         # same key on redelivery
+        await db.append_step(job_id, n, step)                            # upsert on (job_id, n)
+        await db.set_progress(job_id, n, MAX_STEPS)
+        steps.append(step)
+        if step.final_answer:
+            await db.set_status(job_id, "succeeded", result=step.final_answer)
+            return
+    await db.set_status(job_id, "failed", error="step budget exhausted")
+```
+
 ### Worked scenario: sizing workers against a provider rate limit
 Illustrative numbers: 1,000 documents, one model call per document, a provider limit of 600 requests per
 minute, ~4 s per call.
@@ -239,7 +295,15 @@ minute, ~4 s per call.
 
 More workers past the rate limit add retries, not throughput; CPU never enters the sum.
 
+- **The same arithmetic holds for agent jobs.** An agent job makes one model call per step, so 40 agent
+  jobs in flight each waiting ~4 s per step saturate the same 600-per-minute limit; size `max_jobs` by
+  calls in flight, not by job count.
+
 ## Production patterns
+- **Checkpoint agent steps, not just jobs.** Agent teams persist every step (model output, tool call,
+  tool result) keyed by job id and step number, and key side-effecting tool calls on the same pair, so a
+  redelivery resumes instead of repeating actions. Monitor steps re-executed per job and duplicate tool
+  calls by idempotency key.
 - **Commit-then-enqueue plus a sweeper.** For every job type, commit the row before enqueueing, and run a
   periodic sweep (Celery Beat, or ARQ `cron_jobs`) that re-enqueues rows stuck in `queued` and fails
   `running` rows whose heartbeat is stale. Monitor the count of stuck rows each sweep finds.
@@ -270,6 +334,9 @@ More workers past the rate limit add retries, not throughput; CPU never enters t
   canvas, no priorities, retries only on explicit `Retry`).
 
 ## Pitfalls
+- **Restarting an agent job from step 1 on redelivery.** Symptom: after a worker crash the customer gets
+  the same email twice and model spend for that run doubles. Fix: checkpoint steps and pass idempotency
+  keys to side-effecting tools.
 - **Enqueueing before the job row is committed.** Symptom: workers log "job not found" and retry until
   the row appears, or never.
 - **Stuffing documents into the message.** Symptom: Redis memory spikes and slow enqueues. Fix: pass
@@ -291,8 +358,9 @@ More workers past the rate limit add retries, not throughput; CPU never enters t
 ## When to use
 - **Use when** work outlives a reasonable HTTP timeout, must survive restarts, needs retries, or should be
   throttled against provider rate limits independently of API traffic: corpus ingestion and embedding,
-  batch evaluation runs, scheduled re-summarisation, long agent tasks.
-- **Avoid when** it is interactive single-turn chat (stream instead) or sub-second follow-ups.
+  batch evaluation runs over agent test sets, scheduled re-summarisation, long or scheduled agent runs.
+- **Avoid when** it is an interactive agent turn of a few seconds (stream instead) or sub-second
+  follow-ups.
 - **Measure** queue depth, time-in-queue, job duration percentiles, retry and duplicate rates, and status
   polls per job.
 - **Interviews:** draw the 202-plus-status contract, explain why the job row beats the result backend, and
@@ -340,17 +408,26 @@ cases the row, not the broker, is what the status endpoint and the on-call engin
   chords, and prefork processes for CPU-bound work, at the cost of sync task bodies.
 - **Either way delivery is at-least-once,** so the job body must be idempotent.
 
-### The same job id shows up twice in worker logs and model spend has doubled. What happened?
+### An agent job ran twice: the same job id appears twice in worker logs, model spend doubled and a customer got two emails. What happened?
 - **A redelivery.** With Celery on Redis, an unacknowledged message is redelivered after
   `visibility_timeout`, which defaults to one hour, so any longer job runs twice.
 - **Fix the setting and the body:** raise the timeout above the longest job, and make the task check
   status first and upsert results keyed by job or document id so a rerun only does the remaining work.
+- **Fix the tools too:** checkpoint agent steps and pass job id plus step number as the idempotency key
+  to the email tool, so a resumed run cannot repeat a side effect.
 
 ### How do you size worker concurrency for a job type that calls a rate-limited model provider?
 - **The provider limit is the ceiling, not CPU.** Concurrency times calls per second per job must stay
   under the rate limit; more workers past it only add 429s and retries.
 - **Watch queue depth and time-in-queue,** and reject early with `429` or `503` when depth × average
   duration exceeds the promised turnaround.
+
+### When would you move agent runs from a job queue to a durable workflow engine?
+- **When steps need first-class checkpoints and resumption.** A queue retries whole jobs, so you hand-roll
+  step tables and idempotency keys; a workflow engine records each step and replays from the last one.
+- **When runs wait on humans or timers.** Approvals that take hours or days fit workflow waits better
+  than a worker holding a job.
+- **Stay on the queue** while runs are minutes long, single-shot, and the step table stays simple.
 
 ## Quiz
 ### Q: Why does the API return 202 with a job id instead of holding the connection until the work finishes?

@@ -5,7 +5,8 @@ name: GRPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/rlhf
   - training-adaptation/dpo
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-GRPO is PPO without the value model: sample a group of responses per prompt and use the group's reward
-mean and spread as the baseline. It keeps PPO's clip and a KL term; open reasoning models with
-verifiable rewards usually use it.
+GRPO is PPO without the value model: sample a group of agent rollouts per task and use the group's
+reward mean and spread as the baseline. With a verifiable reward (a sandbox end-state check) it is the
+usual way to RL-train agents.
+
+## For agent builders
+- **Why it matters for agents.** Agent tasks often have checkable outcomes: tests pass, the ticket was
+  created with the right fields, the database row changed. GRPO turns those checks directly into training
+  signal, so the model learns which tool sequences actually succeed instead of imitating traces.
+- **Where it shows up in your stack.** TRL's `GRPOTrainer` and `GRPOConfig`, OpenRLHF, vLLM as the rollout
+  engine, and a sandbox that executes tool calls during training. Multi-turn tool rollout support varies
+  by library and version, so check yours.
+- **What you control.** The reward function (the real product decision), the task set and its pass-rate
+  curation, group size G, the KL leash, the length cap, and which tokens are trained (the agent's turns,
+  not tool output).
+- **What you can skip.** Re-deriving PPO and the exact variant zoo. Know the group advantage, why
+  all-equal groups give no gradient, and how reward hacking shows up.
 
 ## Why it exists
 - **PPO's critic is costly and unstable for text.** PPO judges each token against a *value model's*
@@ -32,7 +46,7 @@ verifiable rewards usually use it.
   it. That doubles trainable memory.
 - **Its estimates are poor.** The reward arrives only at the end of a long response, the value model must
   guess from partial text, and its errors feed straight into the advantages. Teams spent as much effort
-  stabilising the critic as training the policy.
+  stabilising the critic as training the policy. Multi-turn agent rollouts make the horizon longer still.
 - **Verifiable rewards changed the economics.** For maths with a known answer, code with unit tests, or
   checkable formats, a *program* scores the response: no reward model, no raters, no overoptimisation of a
   learned proxy. Cheap rewards make many samples per prompt affordable.
@@ -44,11 +58,12 @@ verifiable rewards usually use it.
 
 ## How it works
 ### Sampling the group
-1. For each prompt q, the current ("old") policy samples G responses o₁ … o_G.
+1. For each prompt q (for agents, a task plus its starting environment), the current ("old") policy
+   samples G responses o₁ … o_G. For agents each o_i is a whole rollout: tool calls, tool results, answer.
 2. G is commonly between 8 and 16 in open recipes, and as high as 64 in DeepSeekMath; larger groups suit
    harder tasks.
 3. Each response gets a scalar reward r_i: a rule-based verifier, a reward model, or a sum of terms
-   (accuracy plus format, for instance).
+   (accuracy plus format, for instance; for agents, end-state check plus valid-call terms).
 
 ### Group-relative advantage
 ```
@@ -56,7 +71,8 @@ verifiable rewards usually use it.
 ```
 
 - **Every token of response i gets the same Â_i**, because the reward is for the whole outcome and nothing
-  finer-grained is known.
+  finer-grained is known. In agent rollouts, tool-result tokens are masked out: the environment wrote
+  them, so the policy should not be pushed toward or away from them.
 - **Two numbers per prompt replace the value model.** Cheap and nearly unbiased: the group mean includes
   the sample's own reward, a small bias that a leave-one-out baseline such as RLOO removes.
 - **Difficulty-adaptive:** the signal concentrates on prompts the model sometimes, but not always, solves.
@@ -66,7 +82,7 @@ verifiable rewards usually use it.
 - **All-equal groups contribute nothing** (zero variance). Implementations add a small epsilon to the
   denominator and often filter such prompts out of the batch.
 
-### The clipped surrogate
+### Background: the clipped surrogate
 ```
 ratio_t = π_θ(o_t | q, o_<t) / π_old(o_t | q, o_<t)
 L_clip  = mean over tokens of  min( ratio_t · Â_i ,  clip(ratio_t, 1−ε, 1+ε) · Â_i )
@@ -88,11 +104,13 @@ L_clip  = mean over tokens of  min( ratio_t · Â_i ,  clip(ratio_t, 1−ε, 1+�
 | Credit assignment | coarse: every token shares the outcome | more precise, per reasoning step |
 | Cost | needs only a final-answer check | needs a step-level scorer: expensive and itself hackable |
 | Used by | most open reasoning recipes since DeepSeekMath | described in DeepSeekMath |
+| Agent analogue | task end-state check | per-step checks (valid call, right tool) |
 
 ### The KL term
 - **Added to the loss, not the reward:** `L = −L_clip + β · KL(π_θ ‖ π_ref)`.
 - **Per-token estimator:** `π_ref/π_θ − log(π_ref/π_θ) − 1`, low-variance and always non-negative.
-- **Reference:** the SFT or base checkpoint the run started from.
+- **Reference:** the SFT or base checkpoint the run started from, for agents usually the SFT-on-traces
+  model.
 - **Why separate:** advantages then reflect only task success, and drift is controlled on its own knob.
 - **Some later recipes drop the KL entirely** when the reward is fully verifiable and the run is
   monitored, trading safety for faster movement.
@@ -102,13 +120,15 @@ L_clip  = mean over tokens of  min( ratio_t · Â_i ,  clip(ratio_t, 1−ε, 1+�
 - **DeepSeek-R1 used rule-based rewards:** an accuracy reward checking the final answer against ground
   truth, and a format reward checking that reasoning appears inside designated tags.
 - **Rules cannot be flattered** the way a learned reward model can, **but they can be gamed** by format
-  tricks, answers that match a lax checker, or incomplete test suites.
+  tricks, answers that match a lax checker, or incomplete test suites. Agents add their own hacks: calling
+  a tool that marks the task done without doing it, or touching state the checker does not inspect.
 - **Without a verifier** you use a reward model, and GRPO inherits RLHF's overoptimisation problem.
 
 ### Why long reasoning emerges
 - **Outcome rewards plus many samples select for checking, backtracking and trying alternatives**,
   because those responses succeed more often on hard problems.
 - **Length grows during training** as a result: a feature when it buys accuracy, a cost when it does not.
+  For agents the same pressure can grow the number of tool calls per task.
 - **Length normalisation interacts with this.** Averaging the loss per response over its own length (the
   original formulation) penalises wrong long responses less per token than wrong short ones, biasing
   toward verbosity on failures.
@@ -122,18 +142,18 @@ Which normalisation and clipping you use is a real design choice, not a detail: 
 differ in it is comparing different algorithms.
 
 ## Diagram
-One GRPO iteration: the old policy samples a group of G responses (often 8 to 16), and the group of
-samples replaces the critic. Rewards are standardised within the group (minus the group mean, divided
-by the group std) before the clipped update on new-over-old token ratios.
+One GRPO iteration on agent tasks: the old policy runs G rollouts per task (often 8 to 16) in a sandbox,
+a verifier scores each end state, and the group replaces the critic. Rewards are standardised within the
+group before the clipped update on new-over-old token ratios.
 
 ```mermaid
 flowchart TD
-    Q["Prompt q"] --> OLD["Old policy samples G responses"]
-    OLD --> VR["Verifier scores each response"]
+    Q["Task q and sandbox"] --> OLD["Old policy runs G rollouts"]
+    OLD --> VR["Verifier checks each end state"]
     VR --> Z{"All rewards equal?"}
     Z -->|"yes: zero advantage"| DROP["Filter group, no gradient"]
     Z -->|"no"| ADV["Group-standardised advantage"]
-    ADV -->|"same advantage on every token"| CL["Clipped surrogate loss"]
+    ADV -->|"same advantage on agent tokens"| CL["Clipped surrogate loss"]
     REF["Frozen reference"] -->|"per-token KL in the loss"| CL
     CL --> UP["1 to 4 gradient steps"]
     UP --> NEW["Updated policy"]
@@ -143,6 +163,35 @@ flowchart TD
 ```
 
 ## Examples
+### A verifiable reward for an agent rollout
+The reward checks the sandbox's end state, not the transcript's claims, and adds small terms for valid
+calls. Pure Python; the rollout and state dictionaries stand in for your sandbox's records.
+
+```python
+from statistics import mean, stdev
+
+def agent_reward(rollout, state, expected):
+    """rollout: list of tool calls made; state: sandbox state after the run; expected: target state."""
+    if any(c.get("error") == "invalid_arguments" for c in rollout):
+        return 0.0                                   # malformed calls earn nothing
+    done = all(state.get(k) == v for k, v in expected.items())   # check the world, not the answer text
+    steps_penalty = 0.05 * max(0, len(rollout) - 4)              # mild pressure against detours
+    return max(0.0, (1.0 if done else 0.0) - steps_penalty)
+
+expected = {"ticket_A-1042": "refunded"}
+group = [  # 4 of G rollouts for one task, with the end state each produced
+    ([{"name": "get_order"}, {"name": "refund"}], {"ticket_A-1042": "refunded"}),
+    ([{"name": "refund", "error": "invalid_arguments"}], {}),
+    ([{"name": "get_order"}] * 6 + [{"name": "refund"}], {"ticket_A-1042": "refunded"}),
+    ([{"name": "close_ticket"}], {"ticket_A-1042": "closed"}),          # looks done, is not
+]
+r = [agent_reward(calls, st, expected) for calls, st in group]
+adv = [round((x - mean(r)) / (stdev(r) + 1e-4), 2) for x in r]
+print("rewards:", r, "advantages:", adv)
+# The direct two-call success gets the biggest push; the detour still beats the wrong close and the
+# malformed call. Train only on the agent's own tokens; tool-result tokens are masked.
+```
+
 ### Group advantages and the GRPO loss
 One prompt, eight sampled responses, verifier rewards with three of eight correct. Token log-probs are
 illustrative placeholders.
@@ -172,7 +221,7 @@ T = 12
 logp_old = -torch.rand(G, T) * 3
 logp_new = logp_old + 0.05 * torch.randn(G, T)                     # a small policy change
 logp_ref = logp_old + 0.1 * torch.randn(G, T)
-mask = torch.ones(G, T)
+mask = torch.ones(G, T)            # for agent rollouts, 0 on tool-result tokens
 print("loss:", grpo_loss(logp_new, logp_old, logp_ref, adv, mask).item())
 # In a real step: sample G responses per prompt with vLLM, score them, compute logp_old once,
 # then take 1-4 gradient steps on this loss before sampling again.
@@ -212,23 +261,42 @@ for k in (1, 2, 4, 6, 7):
   up-weighting of near-always-failed and near-always-solved prompts described above.
 - **Without it (Dr. GRPO)** half-solved prompts carry relatively more of the gradient.
 
+### Worked scenario: what one agent RL step costs
+Illustrative orders of magnitude for one batch of agent tasks.
+
+| Quantity | Value |
+|---|---|
+| Tasks per batch | 64 |
+| Rollouts per task (G) | 8, so 512 rollouts |
+| Turns per rollout | up to 10 tool calls |
+| Tokens generated per rollout | ~3k agent tokens, plus tool results that are read, not trained |
+| Generated tokens per batch | ~1.5M, which is why rollout speed dominates wall clock |
+| Tasks with 0/8 or 8/8 success | filtered: no gradient, only cost |
+
+Two consequences: tool calls must run fast and in parallel in the sandbox, and pass-rate curation pays
+for itself because every all-solved task burns 8 rollouts for nothing.
+
 ## Production patterns
-- **Curate prompts by pass rate before training.** Sample G responses per prompt from the starting
+- **Curate tasks by pass rate before training.** Sample G responses per prompt from the starting
   checkpoint, score them, and drop prompts solved 0/G or G/G. Monitor the share of zero-advantage groups
   per step and re-curate as the policy improves, because solved prompts accumulate.
+- **Run tools in a hermetic, resettable sandbox.** Each rollout gets a fresh copy of the environment
+  (database snapshot, mock APIs, file system), and the verifier reads its end state. Monitor tool latency
+  and timeout rate, since slow tools stall the whole group.
 - **Generate rollouts with a fast inference engine.** Trainers such as TRL's `GRPOTrainer` (with
   `GRPOConfig(num_generations=..., use_vllm=True)`) or OpenRLHF hand sampling to vLLM. If π_old comes
   from the sampler's log-probs, monitor the ratio at the first gradient step on fresh samples; values far
   from 1 mean the sampler and trainer disagree.
 - **Unit-test the reward function like production code.** Keep a suite of known hacks (empty reasoning
-  tags, hard-coded test outputs, answers that fool a lax parser) and assert they score zero. Log each
-  reward component separately per step so a format term cannot hide a falling accuracy term.
+  tags, hard-coded test outputs, answers that fool a lax parser, a "done" tool call with no real change)
+  and assert they score zero. Log each reward component separately per step so a format term cannot hide
+  a falling accuracy term.
 - **Score against an independent held-out verifier.** Evaluate every few dozen steps on prompts and tests
   the reward never sees. Stop or roll back when training reward rises and held-out accuracy does not:
   the reward-hacking signature.
-- **Cap and watch length.** Set a maximum completion length and, if needed, an overlong penalty. Monitor
-  mean response length, truncation rate and accuracy together; length rising with flat accuracy means
-  you pay inference cost for nothing.
+- **Cap and watch length.** Set a maximum completion length (and a turn cap for agents) and, if needed, an
+  overlong penalty. Monitor mean response length, tool calls per task, truncation rate and accuracy
+  together; length rising with flat accuracy means you pay inference cost for nothing.
 
 ## Trade-offs
 - **No value model vs more sampling.** Removing it halves trainable memory and eliminates critic
@@ -240,12 +308,16 @@ for k in (1, 2, 4, 6, 7):
   small groups are cheaper. The balance shifts toward larger G as pass rate per prompt falls.
 - **KL term vs speed.** Keeping it protects capability and prevents collapse but slows movement where the
   reward is trustworthy; dropping it is defensible only with close monitoring of general evals.
+- **RL-trained agent vs SFT plus DPO.** RL can find tool strategies no trace contains, but needs a
+  sandbox, a trustworthy verifier and far more compute; SFT and DPO are cheaper when good traces exist.
 
 ## Pitfalls
 - **Prompts the model always or never solves.** Symptom: many zero-advantage groups and GPU time burned on
   samples that produce no gradient. Fix: curate difficulty and filter such groups.
 - **Reward hacking on format or verifier gaps.** Symptom: reward rising while accuracy on an independent
   held-out checker stays flat, or outputs that satisfy tags with empty reasoning.
+- **Training on tool-result tokens.** Symptom: the policy drifts toward writing tool output itself, or
+  advantages are spent on text the model did not choose. Fix: mask environment tokens in the loss.
 - **Sampler and trainer probabilities disagree** (different kernels or precision). Symptom: ratios far
   from 1 at the first gradient step and erratic training.
 - **Unchecked response length.** Symptom: rising mean length with flat accuracy and exploding inference
@@ -295,6 +367,14 @@ task.
 - **The result:** about half the trainable memory, no critic instability, and a signal that concentrates
   on prompts the model sometimes but not always solves.
 
+### Design a GRPO setup to improve a tool-using agent on customer-support tasks.
+- **Environment:** a resettable sandbox per rollout with a database snapshot and mock APIs, and tasks
+  whose target end state is known.
+- **Reward:** check the end state, give zero for malformed calls, add a mild penalty for steps beyond a
+  budget, and unit-test it against known hacks such as closing a ticket without fixing it.
+- **Training:** start from the SFT-on-traces model as reference, G around 8, curate tasks by pass rate,
+  mask tool-result tokens, cap turns, and gate on a held-out task set and a capability suite.
+
 ### Half your batches have zero advantage. What is going on and what do you do?
 - **Those groups are all-correct or all-wrong**, so every reward equals the group mean.
 - **Curate by pass rate:** drop prompts solved 0/G or G/G at the start, and re-curate as the policy
@@ -316,13 +396,13 @@ task.
 - **When the starting policy almost never succeeds:** every group is all-zero, so there is no gradient;
   SFT on demonstrations or an easier curriculum has to come first.
 
-### Training reward climbs and mean response length doubles, but held-out accuracy is flat. Diagnose.
-- **Paying for length with nothing to show:** outcome rewards select for long reasoning only when it
-  buys accuracy.
+### Training reward climbs and mean tool calls per task double, but held-out success is flat. Diagnose.
+- **Paying for length with nothing to show:** outcome rewards select for long reasoning and extra steps
+  only when they buy accuracy.
 - **Check normalisation:** per-response length averaging penalises wrong long responses less per token,
   biasing toward verbosity on failures.
 - **Check the reward for hacks** such as format terms or a lax checker, then set a maximum completion
-  length or an overlong penalty and watch truncation rate.
+  length, a turn cap or an overlong penalty, and watch truncation rate.
 
 ## Quiz
 ### Q: What does GRPO use instead of PPO's value model to compute advantages?

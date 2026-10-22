@@ -5,7 +5,8 @@ name: Agentic RAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/agent-loop
   - prompting/react
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Agentic RAG makes retrieval tools the model calls in a loop, deciding what to search, where, and when to
-stop. It exists because multi-hop, ambiguous and multi-source questions defeat one query against one
-index, and it costs latency, tokens and predictability.
+Agentic RAG is the agent loop applied to knowledge: retrieval becomes tools the model calls, deciding
+what to search, where, and when to stop. It beats one-shot RAG on multi-hop, ambiguous and multi-source
+questions, at a cost in latency, tokens and predictability.
+
+## For agent builders
+- **Why it matters for agents.** This is the most common agent you will ship: a tool-calling loop whose
+  tools are search, fetch and query. Every agent reliability topic (step budgets, trajectory evals,
+  injection, cost growth) shows up here first.
+- **Where it shows up in your stack.** LangGraph (a `StateGraph` with an agent node, a `ToolNode` and a
+  conditional edge, bounded by `recursion_limit`), LangChain retrievers wrapped as tools, LlamaIndex query
+  engines exposed as tools, provider tool-calling APIs directly, and LangSmith or Langfuse traces of each
+  step's tool calls.
+- **What you control.** Tool set and descriptions, where the user identity and ACL filters are injected,
+  how much of each result enters the history, the step, token and time budgets, and the citation check.
+- **What you can skip.** Training the model to retrieve (Self-RAG-style). Prompting a capable tool-using
+  model is what most production systems do.
 
 ## Why it exists
 - **Classic RAG is a straight line:** embed the question, fetch top-k, generate. It assumes the user's
@@ -116,6 +130,18 @@ n steps total  ≈ n·b + r·n²/2
   critique its own outputs (Self-RAG); most production systems get the behaviour from prompting a capable
   tool-using model.
 
+### Where the pieces live in common frameworks
+| Concern | Hand-rolled loop | LangGraph / LangChain | What to check |
+|---|---|---|---|
+| Loop | a `for` over model calls | agent node, `ToolNode`, conditional edge back to the agent | the edge ends the run when no tool is called |
+| Step budget | `MAX_STEPS` | `recursion_limit` in the run config | hitting it raises an error; catch it and return a partial answer |
+| Retrieval tool | your function | a retriever wrapped as a tool, or a `@tool` function | the description says when to use it and to keep identifiers verbatim |
+| User identity and ACL | passed by the runtime | read from run config or closure, never a tool argument | the model cannot set or change it |
+| Tracing | your logger | LangSmith (or Langfuse, OpenTelemetry) spans per step | tool args, returned IDs, tokens per step |
+
+- **Frameworks give you the loop, not the policy.** Budgets, ACL injection, result pruning and citation
+  checks are still your code, wherever the loop lives.
+
 ## Diagram
 The loop: the model decides each next action from the evidence so far, the runtime executes tools under
 the user's permissions, and code (not the model) enforces the budget and verifies citations.
@@ -179,6 +205,52 @@ def agentic_rag(question: str, user, call_model, tools: dict) -> dict:
 
 A fixed pipeline would have run only the first query.
 
+### The same loop in LangGraph
+A sketch of the prebuilt pattern: an agent node, a `ToolNode` and `tools_condition` routing back and forth.
+`chat_model`, `acl_search` and `run_readonly_sql` stand for your model and your ACL-aware backends.
+
+```python
+from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import tool
+from langgraph.errors import GraphRecursionError
+from langgraph.graph import StateGraph, MessagesState, START
+from langgraph.prebuilt import ToolNode, tools_condition
+
+@tool
+def search_docs(query: str, config: RunnableConfig) -> list[dict]:
+    """Search internal documents. Keep product codes, vendor names and dates verbatim."""
+    user = config["configurable"]["user_id"]          # injected by the runtime, not chosen by the model
+    return acl_search(query, user=user, k=5)          # returns [{"id": ..., "text": ...}], trimmed
+
+@tool
+def sql_query(sql: str, config: RunnableConfig) -> list[dict]:
+    """Read-only SQL over the incidents warehouse, for counts, sums and date ranges."""
+    return run_readonly_sql(sql, user=config["configurable"]["user_id"])
+
+tools = [search_docs, sql_query]
+llm = chat_model.bind_tools(tools)
+
+def agent(state: MessagesState):
+    return {"messages": [llm.invoke(state["messages"])]}
+
+g = StateGraph(MessagesState)
+g.add_node("agent", agent)
+g.add_node("tools", ToolNode(tools))
+g.add_edge(START, "agent")
+g.add_conditional_edges("agent", tools_condition)     # tool call -> "tools", otherwise end
+g.add_edge("tools", "agent")
+app = g.compile()
+
+try:
+    out = app.invoke({"messages": [("user", question)]},
+                     config={"recursion_limit": 12, "configurable": {"user_id": "u-42"}})
+except GraphRecursionError:
+    out = None                                         # budget hit: return partial evidence, state the gap
+```
+
+- **What the framework did not do:** prune results, verify citations against returned IDs, or cap tokens.
+  Add those as nodes or inside the tools, as in the hand-rolled loop above.
+
 ### Token cost of pruning, and a novelty check
 Runnable; token counts are illustrative.
 
@@ -224,8 +296,11 @@ The gap widens with every step, which is the quadratic term showing up on the bi
   is never a model-supplied argument), side-effecting tools are excluded or approval-gated, and results
   are wrapped as data. Run an injection red-team suite in CI and alert on denied-access events.
 - **Trajectory logging and evaluation.** Log every tool name, arguments, returned IDs and token counts per
-  step, and score trajectories as well as answers. Alert on repeated near-identical queries and on
-  citation-verification rejections.
+  step, and score trajectories as well as answers, in LangSmith, Langfuse or your own store. Alert on
+  repeated near-identical queries and on citation-verification rejections.
+- **Tool descriptions under version control and eval.** Treat each tool's name, description and argument
+  schema as a prompt: review changes, and re-run the trajectory eval (search-call rate, right-tool rate,
+  steps per query) on every edit. Monitor right-tool rate per question type.
 
 ## Trade-offs
 - **Multi-hop answers vs latency and cost.** Iterative search answers what a single pass cannot, but each
@@ -239,6 +314,9 @@ The gap widens with every step, which is the quadratic term showing up on the bi
   why an answer was produced.
 - **Sufficiency checks vs over-searching.** Checks reduce unsupported answers, yet they can cause
   over-searching on unanswerable questions. A hard budget plus an explicit "not found" answer keeps that bounded.
+- **Framework loop vs hand-rolled loop.** LangGraph or a similar framework gives checkpoints, streaming,
+  human-in-the-loop interrupts and tracing integration for free, at the cost of another abstraction to
+  debug. A 30-line loop is easier to reason about when the agent has two tools and no persistence.
 
 ## Pitfalls
 - **No enforced step budget.** Symptom: occasional requests run for a minute while the agent reformulates
@@ -254,6 +332,11 @@ The gap widens with every step, which is the quadratic term showing up on the bi
   instructions embedded in a retrieved page.
 - **Evaluating only the final answer.** Symptom: a passing eval that hides wasteful or lucky trajectories,
   which surface later as cost spikes and inconsistent answers.
+- **Treating the framework's recursion limit as the whole budget.** Symptom: runs that stop with an
+  unhandled error instead of a partial answer, and no cap on tokens or wall-clock time. Fix: catch the
+  limit error, and enforce token and time budgets in your own code.
+- **Letting the model pass the user id as a tool argument.** Symptom: a prompt-injected or confused agent
+  searches as another user. Fix: read identity from run config or a closure that the model cannot write.
 
 ## When to use
 - **Use when:** your eval set shows a meaningful share of questions that are multi-hop, span several

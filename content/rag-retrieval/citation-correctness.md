@@ -5,7 +5,8 @@ name: Citation correctness
 kind: metric
 difficulty: advanced
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - rag-retrieval/citations-grounding
   - evals/faithfulness-groundedness
@@ -21,13 +22,26 @@ sources:
 ---
 
 ## TL;DR
-Citation correctness asks whether each citation actually supports its claim, not whether citations exist.
-It splits into citation recall (claims fully supported) and precision (citations necessary), measured with
-an entailment model or calibrated judge on labelled samples.
+Citation correctness is the eval that asks whether each citation in your agent's answer actually
+supports its claim. It splits into citation recall (claims fully supported) and precision (citations
+necessary), scored per claim by an entailment model or calibrated judge.
+
+## For agent builders
+- **Why it matters for agents.** Once your agent cites tool results, users and downstream actions trust
+  those pointers. Citation rate tells you nothing; this metric tells you whether a clicked citation, or a
+  citation-gated action, rests on real evidence.
+- **Where it shows up in your stack.** Your offline eval harness on a golden set, online scoring of
+  sampled production traces in your tracing or eval tool, and the release gate for prompt, model and
+  retriever changes.
+- **What you control.** How answers are split into claims, which passages the judge sees (only the cited
+  tool results, at the version the agent saw), the judge's calibration against human labels, and the
+  thresholds that block a release.
+- **What you can skip.** Training your own attribution model. An NLI model plus a calibrated LLM judge on
+  a sample covers most agent products.
 
 ## Why it exists
 - **A cited but unsupported sentence is worse than an uncited one:** it borrows the source's authority.
-  Once a RAG system emits citations, teams need to know whether they can be trusted.
+  Once a RAG system or agent emits citations, teams need to know whether they can be trusted.
 - **Citation rate is easy and nearly useless.** The share of sentences with a citation says nothing about
   support: a model can cite every sentence while the cited text says something different. Studies of
   generative search engines found exactly this gap: fluent, heavily cited answers in which a substantial
@@ -44,7 +58,8 @@ an entailment model or calibrated judge on labelled samples.
 ## How it works
 ### Unit of evaluation
 1. Split the answer into claims: usually sentences, or atomic facts if sentences are compound.
-2. Each claim *c* has a set of cited passages *P(c)*.
+2. Each claim *c* has a set of cited passages *P(c)*. In an agent, these are the tool results the citation
+   IDs point to, read from the run's trace.
 3. Ask the attribution question: would a reasonable reader, given only *P(c)*, agree that *c* is true? This
    is the "attributable to identified sources" framing used in attribution research.
 
@@ -76,8 +91,8 @@ citation_recall = |{c : entails(concat(P(c)), c)}| / |claims requiring citation|
 | LLM judge ("does this passage fully support this claim: yes / partial / no") | more capable | has biases; must be calibrated against human labels |
 | Humans | the reference | expensive |
 
-- **Give the LLM judge the passage and claim only**, never the full answer, so it cannot be swayed by
-  fluency.
+- **Give the LLM judge the passage and claim only**, never the full answer or the whole agent trace, so it
+  cannot be swayed by fluency.
 - **Calibrate:** label a few hundred claim-citation pairs, then measure the automated judge's agreement
   before trusting its numbers.
 - **Report agreement per label, not only overall.** The costly error is calling a partial or unsupported
@@ -98,7 +113,7 @@ citation_recall = |{c : entails(concat(P(c)), c)}| / |claims requiring citation|
 | Low precision | citation spraying | tighten the instruction or schema to one or two citations per claim |
 
 **One extra judge call per unsupported claim sharpens the diagnosis.** Check the claim against *all*
-retrieved passages, not just the cited ones:
+retrieved passages (every tool result in the run), not just the cited ones:
 - **Supported by an uncited passage → misattribution.** The answer is grounded but points at the wrong
   chunk; a post-hoc re-citation pass can repair it.
 - **Supported by nothing in context → parametric knowledge or invention.** Only abstention or better
@@ -106,17 +121,17 @@ retrieved passages, not just the cited ones:
 - The two look identical in citation recall and need opposite remedies.
 
 ## Diagram
-How one claim is scored: judge it against its cited passages only, then, if unsupported, re-judge against
-everything retrieved to separate misattribution from invention.
+How one claim from an agent answer is scored: judge it against its cited tool results only, then, if
+unsupported, re-judge against everything the run retrieved to separate misattribution from invention.
 
 ```mermaid
 flowchart TD
-    A["Answer"] --> S["Split into claims, sentences or atomic facts"]
+    A["Agent final answer plus trace"] --> S["Split into claims, sentences or atomic facts"]
     S --> C{"Claim has citations?"}
     C -->|"no"| U["Unsupported: counts against citation recall"]
-    C -->|"yes"| J["Judge: claim plus cited passages only"]
+    C -->|"yes"| J["Judge: claim plus cited tool results only"]
     J -->|"full"| F["Supported, then test each citation for precision"]
-    J -->|"partial or none"| X["Re-judge against all retrieved passages"]
+    J -->|"partial or none"| X["Re-judge against all tool results in the run"]
     U --> X
     X -->|"supported by uncited passage"| M["Misattribution: re-citation pass"]
     X -->|"supported by nothing"| I["Invention or parametric: abstain or fix retrieval"]
@@ -177,6 +192,36 @@ def score(answer):
 print(score(answer))   # {'recall': 0.6, 'precision': 0.6, 'rate': 0.8}
 ```
 
+### Scoring an agent trace: passages come from the run's tool results
+In an agent, cited IDs resolve to tool results logged in the trace, at the version the agent saw. The
+same judge then splits failures into misattribution and invention. The trace shape is illustrative;
+adapt it to your tracing tool's export.
+
+```python
+def score_trace(trace, judge):
+    """trace: {"tool_results": {"S1": text, ...}, "claims": [{"text": ..., "source_ids": [...]}]}"""
+    pool = trace["tool_results"]                       # everything the agent retrieved in this run
+    out = {"full": 0, "misattributed": 0, "invented": 0, "n": len(trace["claims"])}
+    for cl in trace["claims"]:
+        cited = [pool[s] for s in cl["source_ids"] if s in pool]
+        if cited and judge(cl["text"], cited) == "full":
+            out["full"] += 1
+        elif judge(cl["text"], list(pool.values())) == "full":
+            out["misattributed"] += 1                  # grounded somewhere in the run: re-cite
+        else:
+            out["invented"] += 1                       # nothing in the run supports it
+    out["citation_recall"] = out["full"] / max(out["n"], 1)
+    return out
+```
+
+| Run slice (illustrative) | Claims | Full | Misattributed | Invented |
+|---|---|---|---|---|
+| Runs with 1 search call | 400 | 352 | 20 | 28 |
+| Runs with 4+ search calls | 400 | 300 | 76 | 24 |
+
+- **Long runs misattribute more:** evidence is in the trace but the agent cites the wrong tool result, a
+  run-level ID or re-citation problem, not a retrieval one.
+
 ### Putting an interval on the number
 Claims within one answer are correlated, so resample questions, not claims. Synthetic data, illustrative.
 
@@ -206,16 +251,18 @@ print(f"citation recall {point:.3f}, 95% CI [{lo:.3f}, {hi:.3f}]")
 ```
 
 ## Production patterns
-- **Release gate on contradictions.** Run the scorer on a golden set for every prompt, model or retrieval
-  change and block the release if contradiction rate rises or citation recall drops beyond its bootstrap
-  interval. Monitor recall, precision and contradiction rate per release.
+- **Release gate on contradictions.** Run the scorer on a golden set of agent tasks for every prompt,
+  model, tool or retrieval change and block the release if contradiction rate rises or citation recall
+  drops beyond its bootstrap interval. Monitor recall, precision and contradiction rate per release.
 - **Claim-scoped judge calls.** Send the judge one claim plus only its cited passages, ask for full /
   partial / none, and store the label with the chunk version. Monitor the judge's agreement with a
   human-labelled set whenever the judge prompt or model changes.
-- **Version-pinned evaluation.** Score against the chunk text the generator saw (logged with the trace),
-  not the document fetched at eval time. Monitor the share of pairs whose chunk version no longer exists.
-- **Sampled online scoring.** Score a small daily slice of production answers with the same judge and
-  slice by question type. Alert on contradiction-rate jumps rather than on the overall average.
+- **Version-pinned evaluation from traces.** Score against the tool-result text the agent saw (logged with
+  the trace), not the document fetched at eval time. Monitor the share of pairs whose chunk version no
+  longer exists.
+- **Sampled online scoring of agent runs.** Score a small daily slice of production traces with the same
+  judge and slice by question type and by number of tool calls. Alert on contradiction-rate jumps rather
+  than on the overall average.
 - **Misattribution vs invention split.** For each unsupported claim, re-judge against all retrieved
   passages and route misattributions to a re-citation pass. Track the two rates separately, since they
   need opposite fixes.
@@ -231,6 +278,8 @@ print(f"citation recall {point:.3f}, 95% CI [{lo:.3f}, {hi:.3f}]")
   multi-source synthesis. For summary-style answers, weight recall more and accept redundant citations.
 - **Passage-only judging vs truth.** It isolates citation quality but ignores whether the claim is actually
   true; pair it with answer-correctness evals when sources themselves may be stale or wrong.
+- **Scoring final answers vs every step.** Scoring only the final answer is cheap, but agents also act on
+  intermediate claims; score citations on side-effecting tool calls too when actions matter.
 
 ## Pitfalls
 - **Reporting citation rate as citation quality.** Symptom: a dashboard near 100% while user feedback
@@ -244,9 +293,12 @@ print(f"citation recall {point:.3f}, 95% CI [{lo:.3f}, {hi:.3f}]")
   citations score as unsupported after edits, or wrong ones score as fine.
 - **Collapsing "partial" into "full".** Dropped qualifiers and wrong numbers, the errors that cause real
   harm, disappear from the metric.
+- **Not logging tool results in agent traces.** Symptom: citation IDs in the answer cannot be resolved at
+  eval time, so the metric is computed on re-fetched documents or skipped. Fix: persist each tool result
+  with its ID.
 
 ## When to use
-- **Use when** your product shows citations to users or relies on them for audit. If you show no
+- **Use when** your product or agent shows citations to users or relies on them for audit. If you show no
   citations, measure faithfulness instead.
 - **Run** offline on a golden set for every prompt, model or retrieval change, and online on a sampled
   slice of production traffic.
@@ -292,6 +344,14 @@ accuracy.
 - **Why both:** recall alone rewards citation spraying (five sources per sentence); precision penalises
   it. State which variant of the definition you use.
 
+### How would you evaluate citation correctness for a multi-step research agent in production?
+- **Log every tool result with its citation ID** in the trace, so cited passages can be resolved to the
+  exact text the agent saw.
+- **Score sampled traces per claim** against cited tool results only, then re-judge failures against all
+  results in the run to split misattribution from invention.
+- **Slice by run shape** (number of tool calls, question type); long runs often misattribute more, which
+  points at ID handling rather than retrieval.
+
 ### You want an LLM judge to score support. How do you make its numbers trustworthy?
 - **Scope the input:** one claim and only its cited passages, never the whole answer, so fluency and other
   sources cannot inflate support.
@@ -299,7 +359,7 @@ accuracy.
   above all the precision of the judge's "full" verdict, since judges tend to err lenient.
 - **Re-check** agreement whenever the judge prompt or model changes.
 
-### Citation recall moved from 0.80 to 0.82 on 300 questions. Do you ship the change?
+### Citation recall moved from 0.80 to 0.82 on 300 questions after an agent prompt change. Do you ship it?
 - **Not on that evidence alone.** Claims within one answer are correlated, so bootstrap over questions,
   not claims. On a few hundred questions the 95% interval is typically a few points wide (about plus or
   minus 3 in the synthetic example above), so a two-point move is within noise.

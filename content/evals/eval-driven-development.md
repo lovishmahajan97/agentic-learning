@@ -5,7 +5,8 @@ name: Eval-driven development
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Eval-driven development makes the eval suite the executable spec of an LLM feature: criteria and a seed
-golden set come first, every change is judged by eval numbers, and failures grow the suite, because
-"looked fine in the playground" misses non-local regressions.
+Eval-driven development makes the eval suite the executable spec of your agent: criteria and seed tasks
+come first, every prompt, tool or model change is judged by eval numbers, and failures grow the suite,
+because "worked in the playground" misses non-local regressions.
+
+## For agent builders
+- **Why it matters for agents.** An agent changes in many places at once: system prompt, tool
+  descriptions, tool code, model, step budget. A one-line tool-description edit can change which tool
+  the planner picks on tasks nobody re-ran, so only a suite run on every change tells you what moved.
+- **Where it shows up in your stack.** A pytest or eval-runner job in CI (LangSmith, Braintrust,
+  promptfoo or Inspect), golden task files in the repo next to the prompts, a baseline file of per-task
+  scores, and a PR comment carrying the eval diff.
+- **What you control.** The acceptance criteria (task success, cost and step budgets, benign refusal
+  rate), the graders on outcome and trajectory, *k* samples per task, the tolerance band, slice floors
+  and which tier blocks a merge.
+- **What you can skip.** Elaborate statistics on day one. A few dozen tasks, deterministic graders, *k*
+  samples and a paired flip count against the last accepted run carry most of the value.
 
 ## Why it exists
 - **LLM features break the ordinary loop three ways.** Non-deterministic: the same input gives different
@@ -97,6 +111,18 @@ golden set come first, every change is judged by eval numbers, and failures grow
 - **Retire or harden items** that have passed for months; a suite at 100% carries no information, though
   a few should stay as smoke tests.
 
+### What changes for agents
+- **Grade outcome and trajectory separately.** Outcome: did the task end in the right state (ticket
+  resolved, record updated, answer correct)? Trajectory: were the required tools called, forbidden ones
+  avoided, and was a confirmation present before any write? Both become per-task graders.
+- **Budgets are acceptance criteria.** Steps per task, tokens or cost per task, and wall-clock time get
+  thresholds like quality does, *because* a prompt change that adds three tool calls per task can pass
+  on quality and still double the bill.
+- **Fresh sandbox per task.** Each run gets its own fixture data and stubbed or sandboxed tools, so one
+  task's side effects cannot change another task's result.
+- **Variance compounds over steps,** so agents need *k* samples per task even more than single-call
+  features do.
+
 ### What changes for the team
 - **A prompt change is a pull request with an eval diff attached,** like a test report.
 - **"Did you run the evals?"** replaces "did you try it?".
@@ -110,7 +136,7 @@ accepted baseline, and production traffic feeds new items back in.
 ```mermaid
 flowchart TD
     C["Acceptance criteria and budgets"] --> G[("Seed golden set and graders")]
-    G --> B["Simplest version: per-slice baseline"]
+    G --> B["Simplest agent: per-slice baseline"]
     B --> E["Error analysis on failures"]
     E -->|"new failing items"| G
     E --> X["Change one variable"]
@@ -135,6 +161,44 @@ annual plan, whose window is 14 days.
 | Grow the suite | that cross-tier case becomes an item; the next iteration starts from there |
 
 Nothing in this loop required anyone to have "tried it in the playground".
+
+### One iteration on a tool-calling agent
+Illustrative: a support agent on 120 golden tasks, *k* = 3, comparing a planner-prompt change against the
+last accepted baseline.
+
+| Metric | Baseline | Candidate | Gate |
+|---|---|---|---|
+| Task success (outcome grader) | 0.74 | 0.79 | pass: 14 tasks up, 4 down, sign test p ≈ 0.03 |
+| Write without confirmation (trajectory grader) | 0 tasks | 1 task | fail: zero-tolerance criterion |
+| Mean steps per task | 6.1 | 7.4 | warn: budget is 8 |
+| Cost per task | $0.041 | $0.052 | within the $0.06 budget |
+
+- **The higher mean does not ship:** one task now writes without confirming, which is a hard criterion.
+  That trace goes to error analysis, the fix is a tool-description change, and the task stays in the
+  suite as a regression item.
+- **Steps rose by 1.3,** so the next iteration watches the step budget, not only success.
+
+Trajectory graders are small functions over the logged tool calls:
+
+```python
+# calls: list of {"name": str, "args": dict} logged for one agent run
+WRITE_TOOLS = {"issue_refund", "update_record"}
+
+def confirmed_before_write(calls):
+    confirmed = False
+    for c in calls:
+        if c["name"] == "ask_user_confirmation":
+            confirmed = True
+        if c["name"] in WRITE_TOOLS and not confirmed:
+            return False
+    return True
+
+def used_required_tools(calls, required):          # required comes from the golden task
+    return set(required) <= {c["name"] for c in calls}
+
+def within_budget(calls, max_steps=8):
+    return len(calls) <= max_steps
+```
 
 ### CI gate in pytest
 It runs each golden item *k* times, scores with a deterministic check and a calibrated judge, and fails
@@ -232,6 +296,10 @@ print(round(sign_test(15, 3), 3))        # 0.008: unlikely to be chance
 - **Accept-only baseline refresh.** Write the baseline file only on merge to main, never from a branch
   run, so every gate compares against what actually shipped. Pair the tolerance band with a trend chart
   across accepted runs to catch slow drift.
+- **Agent eval tiers per change type.** A tool-description or prompt change runs the full golden task set
+  with trajectory graders; a tool-code change also runs that tool's contract tests; a model swap runs
+  everything plus the adversarial suite. Monitor runtime and cost per tier so the per-PR tier stays
+  fast enough that nobody bypasses it.
 - **Offline-to-online check.** After each release, compare the offline score change with the online
   metric it should predict (task completion, escalation rate, thumbs-down rate). Monitor the correlation
   over releases; when it weakens, the golden set has drifted from real traffic.
@@ -316,6 +384,13 @@ latency or benign refusals exceed budget, or if the judge cannot yet be trusted 
   (roughly 2-3 standard deviations), per-slice floors and a list of regressed items, so it does not flake.
 - **Promote judges carefully:** a judge blocks merges only after its agreement with human labels is
   measured; until then it informs review.
+
+### You are adding a new tool to a working agent. How do you develop it eval-first?
+- **Write tasks that need the tool** and tasks that must not use it, with outcome graders and a
+  trajectory grader for correct use, before writing the tool description.
+- **Run the existing suite too,** because a new tool changes the planner's choices on old tasks; compare
+  paired against the baseline and read the flips.
+- **Add budgets:** steps and cost per task, since an extra tool often adds calls without adding success.
 
 ### When would you not write evals before building?
 - **A one-day throwaway spike** whose purpose is to learn what the task even is; there is no stable

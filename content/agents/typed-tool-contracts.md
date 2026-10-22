@@ -5,7 +5,8 @@ name: Typed tool contracts
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/tool-schemas-and-argument-validation
   - agents/tool-result-interpretation
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-A typed tool contract defines a tool once as types: input, output, error kinds and side-effect metadata.
-Schema, handler signature, serialization and tests are derived from it, so schema and handler cannot drift
-and the model always reads results of a stable shape.
+A typed tool contract defines each agent tool once as types: input, output, error kinds and side-effect
+metadata. Schema, handler, serialization and tests derive from it, so they cannot drift and the model
+always reads results of a stable shape.
+
+## For agent builders
+- **Why it matters for agents.** An agent with 20 tools has 20 schemas, handlers and result formats that
+  drift apart one edit at a time. One typed definition per tool keeps what the model is told, what the
+  handler accepts and what the model reads back in lockstep, and gives the harness the metadata it gates on.
+- **Where it shows up in your stack.** Pydantic or Zod models behind Anthropic's `@beta_tool` and
+  `betaZodTool`, LangChain tools with an `args_schema`, the OpenAI Agents SDK's `@function_tool`, Pydantic
+  AI's typed tools and results, and MCP's `inputSchema`, `outputSchema` and annotations.
+- **What you control.** The registry, the shared error taxonomy with `retryable` flags, side-effect and
+  parallel-safety classes, idempotency keys for writes, and the schema snapshot test that guards changes.
+- **What you can skip.** Building a general framework. A dictionary from tool name to contract, plus one
+  dispatch function, covers most agents.
 
 ## Why it exists
 - **Hand-written schemas drift from handlers.** The schema is a dictionary in one file and the handler
@@ -329,6 +342,12 @@ hours, not days.
 - **No, not for a server you do not control:** annotations are claims, not guarantees.
 - **Keep your own side-effect class** per tool in the harness and gate on that.
 - **Use the hint** only as a default when registering a server you own and have reviewed.
+
+### Your agent mixes LangChain tools, in-house functions and two MCP servers. How do you keep contracts consistent?
+- **Normalize at the registry.** Wrap every source behind one contract shape: input type, output type,
+  error kind and side-effect class, whatever the origin.
+- **Assign side-effect classes yourself** for third-party tools, because their metadata is a claim.
+- **Snapshot every generated schema** in CI, so a dependency upgrade that changes a tool fails loudly.
 
 ## Quiz
 ### Q: What is the main benefit of generating the tool schema from the handler's input type instead of writing it by hand?

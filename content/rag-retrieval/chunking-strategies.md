@@ -5,7 +5,8 @@ name: Chunking strategies (fixed, recursive, semantic)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/chunk-overlap
   - rag-retrieval/retrieval-granularity
@@ -21,17 +22,30 @@ sources:
 ---
 
 ## TL;DR
-Chunking cuts documents into retrievable units before embedding, because one vector per document blurs
-the passage a question needs. Fixed-size is predictable, recursive follows natural boundaries, semantic
-follows topic shifts. The strategy defines what "a hit" means.
+When your agent calls a search tool, each result it reads is a chunk. Chunking (fixed, recursive or
+semantic) decides what one hit contains, so it sets how often the agent finds the right passage and how
+many tokens every tool call costs.
+
+## For agent builders
+- **Why it matters for agents.** A retrieval tool returns top-k chunks straight into the agent's context.
+  Chunks that lose their subject make the agent act on the wrong component; oversized chunks burn the
+  context budget on every call and crowd out tool results from later steps.
+- **Where it shows up in your stack.** LangChain text splitters (`RecursiveCharacterTextSplitter`,
+  `MarkdownHeaderTextSplitter`), LlamaIndex node parsers, the ingestion job behind a LangGraph or
+  LlamaIndex retrieval tool, and managed "file search" features that chunk for you with their own defaults.
+- **What you control.** Splitter per document type, chunk size in tokens, the metadata every chunk
+  carries (heading path, source, position for citations), and how many chunks the tool returns per call.
+- **What you can skip.** Exotic splitter research. A token-counted recursive splitter with heading paths,
+  measured on your agent's own questions, covers most corpora.
 
 ## Why it exists
 - **Encoders have a hard input limit.** Typically 512 tokens for BERT-derived encoders and around 8,000
   for many newer long-context ones. Local libraries such as sentence-transformers truncate silently
   (some hosted APIs return an error instead), so the second half of a long document never reaches the
-  vector and no query can retrieve it.
+  vector and no agent query can retrieve it.
 - **The generator has a budget too.** Stuffing ten full documents into every prompt is slow, expensive
-  and, past a point, hurts answer quality because the model has to find the needle itself.
+  and, past a point, hurts answer quality because the model has to find the needle itself. In an agent
+  that cost repeats on every search step.
 - **Dilution decides retrieval quality.** Pooling a 30-page contract into one vector gives "a contract",
   not "the indemnification cap in clause 14.3". A query about that cap scores middling against the whole
   document and loses to a shorter one that mentions caps; a chunk holding only clause 14 scores high.
@@ -39,15 +53,15 @@ follows topic shifts. The strategy defines what "a hit" means.
   function bodies in half, and separates headings from their paragraphs, so a chunk says "set this to 30
   seconds" with no indication of what.
 - **So chunking is a design decision.** It chooses what unit of meaning gets its own address in the
-  index, not a preprocessing detail.
+  index, which is exactly what your agent's search tool can hand back.
 
 ## How it works
 ### The common skeleton
 Every splitter answers three questions:
 1. **Where may a boundary fall?** (any token, a separator, a topic shift)
 2. **How large may a piece be?** Measured in tokens, not characters, because both the embedder's limit
-   and the LLM's context budget are in tokens.
-3. **What metadata travels with each piece?**
+   and the agent's context budget are in tokens.
+3. **What metadata travels with each piece?** The agent needs it to cite, filter and fetch neighbours.
 
 - **Why tokens:** the characters-per-token ratio varies (English prose is roughly four characters per
   token; code, CJK text and tables differ).
@@ -66,7 +80,7 @@ Every splitter answers three questions:
 - **Works on:** text with no structure at all, such as OCR output or log files, because it ignores
   content.
 - **Fails where content has structure:** a code function split between signature and body, a table
-  split between header row and data rows.
+  split between header row and data rows. A coding agent that retrieves half a function will guess the rest.
 
 ### Recursive (separator hierarchy)
 1. Take an ordered list of separators from coarse to fine, for example `["\n\n", "\n", ". ", " ", ""]`.
@@ -92,47 +106,56 @@ Every splitter answers three questions:
 
 - **Illustrative run, six transcript sentences:** consecutive similarities 0.81, 0.78, 0.34, 0.80, 0.76.
   The drop to 0.34 between sentences 3 and 4 stands out, so a percentile rule (break on the largest few
-  percent of distances, distance = 1 − similarity) yields two chunks of three sentences.
+  percent of distances, distance = 1 − similarity) yields two chunks of three sentences. In code, the
+  `sims` list comes from sentence embeddings and the cut is a percentile of `1 - s` over it.
 - **The rule is relative on purpose.** Absolute cosine levels differ by embedding model, so a fixed
-  threshold such as 0.5 that works under one model splits everywhere or nowhere under another.
+  threshold such as 0.5 that works under one model splits everywhere or nowhere under another. A
+  percentile of the document's own distances still cuts at the largest drop after a model swap, as long
+  as that drop stays the largest.
+- **But a pure percentile rule always cuts somewhere,** even inside a single-topic document, so pair it
+  with a minimum chunk size as well as the hard cap.
 - **Payoff:** boundaries follow topic shifts rather than formatting, so meeting transcripts and long
-  narrative get coherent chunks.
+  narrative get coherent chunks, useful for a meeting-notes or call-review agent.
 - **Costs:** one embedding call per sentence before you embed the chunks, a per-corpus threshold, highly
   variable chunk sizes, and little gain over recursive splitting on text with paragraphs and headings.
 
-### Choosing the size
-- **Small chunks:** sharper matches, less context for the generator. Factoid lookups prefer them.
+### Choosing the size for an agent
+- **Small chunks:** sharper matches, less context per hit. Factoid lookups and agents that search many
+  times per task prefer them, because each call stays cheap.
 - **Large chunks:** more context, blurrier vectors, fewer fit in the prompt. "Summarise the section"
   prefers them.
 - **Starting range:** somewhere between a couple of hundred and a thousand tokens (illustrative, not a
   benchmark), then measure recall@k and answer quality on a golden set across several sizes.
+- **Budget per call:** chunk size × k is the token cost of one search result; multiply by searches per
+  run to see what retrieval does to the agent's context.
 - **Decouple the tension:** index small spans and return their larger parent (see retrieval granularity
   and parent-document retrieval).
 
 ### Metadata
 Every chunk carries its document id, position index, section or heading path, and source location (page,
 URL, line range). That makes deduplication, reassembly, citations, metadata filtering and incremental
-re-indexing possible later.
+re-indexing possible later, and lets an agent cite a source or call a follow-up tool to read the
+neighbouring chunk.
 
 ## Diagram
 Read it as the choice of strategy per document, then the recursive fallback loop that guarantees every
-piece fits the token limit before metadata is attached.
+piece fits the token limit before metadata is attached and the agent's search tool can return it.
 
 ```mermaid
 flowchart TD
     D["Parsed document"] --> Q{"Has usable structure?"}
     Q -->|"headings, paragraphs, code"| R["Recursive: split on coarsest separator"]
-    Q -->|"unstructured prose, transcripts"| S["Semantic: embed sentences, break at similarity drops"]
+    Q -->|"unstructured prose, transcripts"| S["Semantic: break at similarity drops"]
     Q -->|"no structure, OCR or logs"| F["Fixed-size: cut every N tokens"]
     R --> C{"Piece over token limit?"}
-    C -->|"yes"| N["Split again with next finer separator"]
+    C -->|"yes"| N["Split with next finer separator"]
     N --> C
-    C -->|"no"| G["Greedy merge small pieces up to limit"]
-    S --> CAP["Apply size cap and fallback split"]
-    G --> M["Attach doc id, position, heading path, source"]
+    C -->|"no"| G["Greedy merge up to limit"]
+    S --> CAP["Size cap and fallback split"]
+    G --> M["Attach doc id, heading path, source"]
     CAP --> M
     F --> M
-    M --> E[("Embed and index")]
+    M --> E[("Index behind agent search tool")]
 ```
 
 ## Examples
@@ -172,33 +195,41 @@ for c in recursive_split(doc, max_len=200):
 # splitters copy the heading path into every chunk instead of treating it as ordinary text.
 ```
 
-### Semantic breakpoints by percentile
-The illustrative run above, in pure Python. Real use would compute `sims` from sentence embeddings.
+### Agent scenario: a search tool that returns cite-able chunks
+The tool the agent calls formats each chunk with its heading path and source, and stops at a token
+budget so one search cannot flood the context. `store.search` stands for your vector store client.
 
 ```python
-def breakpoints(sims, pct=95):
-    dists = [1 - s for s in sims]                 # distance between sentence i and i+1
-    ranked = sorted(dists)
-    cut = ranked[min(len(ranked) - 1, int(len(ranked) * pct / 100))]
-    return [i + 1 for i, d in enumerate(dists) if d >= cut]   # boundary before sentence i+1
-
-def group(sentences, cuts):
-    out, start = [], 0
-    for c in cuts + [len(sentences)]:
-        out.append(sentences[start:c]); start = c
-    return out
-
-sims = [0.81, 0.78, 0.34, 0.80, 0.76]             # consecutive similarities, 6 sentences
-cuts = breakpoints(sims)
-print([round(1 - s, 2) for s in sims], cuts)       # [0.19, 0.22, 0.66, 0.2, 0.24] [3]
-print([len(g) for g in group([f"s{i}" for i in range(1, 7)], cuts)])   # [3, 3]
+def search_docs(query: str, k: int = 5, budget_tokens: int = 2000) -> str:
+    """Tool exposed to the agent: search the engineering handbook."""
+    hits = store.search(query, k=k)            # each hit: text, metadata, score
+    out, used = [], 0
+    for h in hits:
+        m = h.metadata
+        block = f"[{m['doc_id']}#{m['position']}] {m['heading_path']}\n{h.text}"
+        cost = count_tokens(block)             # same tokenizer family as the agent model
+        if used + cost > budget_tokens:
+            break                              # keep later agent steps room to think
+        out.append(block); used += cost
+    if not out:
+        return "No matching passages. Try a more specific query or another tool."
+    return "\n\n".join(out)
 ```
 
-- **Why relative helps:** the cut is a percentile of this document's own distances, so a model swap that
-  shifts every similarity up or down still places the boundary at the largest drop, as long as that drop
-  stays the largest.
-- **What it costs:** a pure percentile rule always cuts somewhere, even inside a single-topic document,
-  so pair it with a minimum chunk size as well as the hard cap.
+- **Why the heading path is in the tool output:** the agent model, not just the embedder, needs to know
+  which subsystem "set this to 30 seconds" belongs to.
+- **Why the id and position:** the agent can cite them, or call a `read_chunk` style tool for neighbours.
+
+### Worked scenario: chunk size times search steps
+A support agent calls the search tool about six times per task with k = 5 (illustrative numbers).
+
+| Chunk size | Tokens per search (k = 5) | Retrieval tokens per task (6 searches) |
+|---|---|---|
+| 300 tokens | 1,500 | 9,000 |
+| 800 tokens | 4,000 | 24,000 |
+
+With 800-token chunks, retrieval alone takes 24k tokens of a task's context, before tool schemas and
+reasoning. Smaller chunks plus parent expansion only on the hits the agent actually uses cut that sharply.
 
 ### Worked scenario: the wrong-subsystem answers
 | Symptom | Cause | Fix |
@@ -209,18 +240,22 @@ print([len(g) for g in group([f"s{i}" for i in range(1, 7)], cuts)])   # [3, 3]
 | Table chunk shows headers but no rows | split mid-table | treat tables as atomic, repeat header row |
 
 ## Production patterns
-- **Token-counted recursive default** — for most corpora, build the splitter from the embedder's
-  tokenizer, for example LangChain's `RecursiveCharacterTextSplitter.from_tiktoken_encoder(...)` or
-  `from_huggingface_tokenizer(...)`, with `chunk_size` well under the model limit. Monitor the chunk
+- **Token-counted recursive default** — for most agent knowledge bases, build the splitter from the
+  embedder's tokenizer, for example LangChain's `RecursiveCharacterTextSplitter.from_tiktoken_encoder(...)`
+  or `from_huggingface_tokenizer(...)`, with `chunk_size` well under the model limit. Monitor the chunk
   token-count histogram and the count of chunks at the cap.
 - **Per-format splitters** — route by document type: `MarkdownHeaderTextSplitter` for docs (heading path
-  into metadata), `RecursiveCharacterTextSplitter.from_language(Language.PYTHON, ...)` for code, plain
-  recursive for prose. Monitor recall@k per source type, not just overall.
+  into metadata), `RecursiveCharacterTextSplitter.from_language(Language.PYTHON, ...)` for code a coding
+  agent searches, plain recursive for prose. Monitor recall@k per source type, not just overall.
+- **Budgeted tool output** — cap the search tool's result in tokens, not just in k, and include source ids
+  so the agent can cite and fetch neighbours. Monitor retrieval tokens per agent step in your traces
+  (LangSmith or any tracing tool) and the share of runs that hit the context limit.
 - **Versioned chunk config** — store splitter name, separators, size and tokenizer in each chunk's
   metadata (or a config hash), and re-index into a new index when it changes. Monitor that every live
   chunk carries the current version.
-- **Chunk-size sweep in CI** — re-run a golden question set at two or three sizes whenever parsing or
-  chunking changes, and gate the merge on recall@k and answer quality. Monitor regressions per release.
+- **Chunk-size sweep in CI** — re-run a golden question set (ideally real agent queries pulled from
+  traces) at two or three sizes whenever parsing or chunking changes, and gate the merge on recall@k and
+  task success. Monitor regressions per release.
 - **Semantic splitting only where structure is absent** — for transcripts, use a percentile breakpoint
   (LlamaIndex `SemanticSplitterNodeParser` or LangChain's experimental `SemanticChunker` both offer
   one) plus a hard size cap. Monitor chunk-size variance and embedding cost per document.
@@ -233,10 +268,11 @@ print([len(g) for g in group([f"s{i}" for i in range(1, 7)], cuts)])   # [3, 3]
   fixed-size splitting.
 - **Semantic coherence vs cost.** Coherent chunks from unstructured prose, at the price of embedding
   every sentence and tuning a corpus-specific threshold; on already-structured text the gain rarely pays.
-- **Small chunks vs generator context.** Small chunks sharpen matching but starve the generator; the
-  trade disappears once you index small spans and return their parent section.
+- **Small chunks vs generator context.** Small chunks sharpen matching and keep each agent search cheap
+  but starve the generator; the trade disappears once you index small spans and return their parent.
 - **Heading path in text vs token spend.** Prepending it improves matching and disambiguation, but costs
-  tokens on every chunk and can over-weight heading words for very short chunks.
+  tokens on every chunk, on every search the agent makes, and can over-weight heading words for very
+  short chunks.
 
 ## Pitfalls
 - **Counting characters instead of tokens.** Chunks exceed the embedder's limit and are truncated
@@ -244,7 +280,9 @@ print([len(g) for g in group([f"s{i}" for i in range(1, 7)], cuts)])   # [3, 3]
 - **Splitting tables or code mid-structure.** Retrieved chunks show column headers with no rows, or a
   function body with no signature, and the model guesses the rest.
 - **Dropping heading context.** A chunk reads "set this to 30 seconds" with no subject; plausible-looking
-  retrievals lead the model to answer for the wrong component.
+  retrievals lead the agent to act on the wrong component.
+- **Unbounded tool output.** k large chunks per search, repeated across steps, fill the agent's window
+  and older tool results get truncated. Fix: a token budget in the tool and smaller chunks.
 - **Tuning chunk size by intuition.** Without a golden set you get silent regressions after every
   "improvement" and an argument nobody can settle.
 - **Leaving tiny trailing chunks.** A 12-token final paragraph's unspecific vector crowds the top-k for
@@ -256,12 +294,12 @@ print([len(g) for g in group([f"s{i}" for i in range(1, 7)], cuts)])   # [3, 3]
 
 ## When to use
 - **Default:** recursive, token-counted, structure-aware splitting with a few hundred tokens per chunk
-  and full metadata on every chunk; it is cheap and handles most corpora.
+  and full metadata on every chunk; it is cheap and handles most agent knowledge bases.
 - **Semantic chunking:** only for unstructured prose where evaluation shows boundary problems, because
   its sentence-embedding cost and threshold tuning only pay when structure is absent.
 - **Fixed-size:** the fallback for structureless text, or the inner step of a recursive chain.
 - **Measure, do not guess:** hold chunking constant while you tune anything else, and compare strategies
-  on recall@k and end-task answer quality.
+  on recall@k, end-task answer quality and retrieval tokens per agent run.
 - **Interviews:** explain dilution, why recursive splitting is the sensible default, and how
   parent-document retrieval decouples match size from context size.
 
@@ -293,7 +331,7 @@ known, measuring recall@k before and after rather than eyeballing results.
 - **Pooling dilutes meaning.** One vector for a 30-page contract represents "a contract", so a query about
   one clause scores middling and loses to a shorter document that merely mentions the topic.
 - **The generator also has a budget.** Returning whole documents is slow, costly and makes the model find
-  the needle itself.
+  the needle itself, on every search an agent makes.
 
 ### Walk me through how a recursive character splitter decides where to cut.
 - **Ordered separators, coarse to fine,** such as paragraph break, newline, sentence end, space, then
@@ -321,12 +359,20 @@ known, measuring recall@k before and after rather than eyeballing results.
 - **Fix options:** revert, route by query type, or index small spans and return the parent section so match
   size and context size are decoupled.
 
-### How do you make chunking safe to change in a production index?
+### Your agent's traces show it calling the search tool four or five times for one question and still answering vaguely. What do you look at in chunking?
+- **Read the returned chunks in the trace.** If they lack subject words (headings stripped, mid-table
+  cuts), the agent cannot tell a hit is relevant and keeps re-querying.
+- **Check chunk size against k.** Huge chunks bury the answer; tiny ones lack context, so the agent
+  searches again for the surrounding text.
+- **Fix and measure:** heading paths in chunk text, parent expansion or a neighbour-fetch tool, then
+  compare searches per task and task success on a golden set.
+
+### How do you make chunking safe to change in a production index that agents depend on?
 - **Version the config:** store splitter, separators, size and tokenizer (or a config hash) on every chunk.
-- **Re-index into a new index** when the config changes, then switch over, instead of mixing two chunkings
-  in one index.
-- **Gate the change in CI** on a golden-set recall@k run and watch the chunk token-count histogram after
-  rollout.
+- **Re-index into a new index** when the config changes, then switch the agent's tool over, instead of
+  mixing two chunkings in one index.
+- **Gate the change in CI** on a golden-set recall@k and agent task-success run, and watch the chunk
+  token-count histogram after rollout.
 
 ## Quiz
 ### Q: Why are documents chunked before embedding rather than embedded whole?

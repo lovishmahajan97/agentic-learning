@@ -5,7 +5,8 @@ name: Database design
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - backend-fundamentals/sql
   - backend-fundamentals/nosql
@@ -22,9 +23,24 @@ sources:
 ---
 
 ## TL;DR
-The schema outlives every version of the code, so encode the facts that must stay true (keys,
-constraints, ownership), not the shape of today's screens. Normalize so each fact lives once, denormalize
-only where a measured read needs it, and index real queries.
+An agent's runs, tool calls, memory and eval results outlive every prompt and framework version, so
+encode what must stay true (keys, constraints, ownership) in the schema. Normalize, denormalize only
+where a measured read needs it, and index real queries.
+
+## For agent builders
+- **Why it matters for agents.** An agent is a loop that writes state on every step: messages, tool
+  calls, tool results, checkpoints, costs. That data feeds resumption after a crash, memory retrieval,
+  debugging, billing and evals, so a sloppy schema becomes duplicated tool calls and unanswerable "what
+  did the agent do?" questions.
+- **Where it shows up in your stack.** LangGraph checkpointers (the Postgres one creates its own tables
+  keyed by `thread_id`), LangChain chat-history stores, pgvector tables for RAG chunks, your own
+  `agent_runs` and `tool_calls` tables, and trace exports from LangSmith or OpenTelemetry that you later
+  join against them.
+- **What you control.** Tenant on every row, one run row owning its steps, a unique key that makes each
+  side-effecting tool call recordable once, real columns for the fields you filter on (model, status,
+  token counts) and jsonb for raw payloads.
+- **What you can skip.** Normal-form theory beyond 3NF and vendor-specific tuning. Know the constraints,
+  the composite-index rule and expand/contract; that covers agent state schemas.
 
 ## Why it exists
 - **Data outlives code.** Code is rewritten every year; the data it produced is still there a decade
@@ -50,8 +66,9 @@ only where a measured read needs it, and index real queries.
    tool calls, a document has many chunks.
 3. **Give each entity a table and a primary key.** A **surrogate key** (bigint identity or UUID) is the
    default *because* natural keys (email, external IDs) change, get reused, or turn out not to be unique.
-4. **Prefer time-ordered UUIDs.** Use UUIDv7 over random UUIDv4 for primary keys, because a B-tree on
-   random keys inserts into random pages, which defeats cache locality and bloats the index as it grows.
+4. **Prefer time-ordered UUIDs.** Use UUIDv7 over random UUIDv4 for primary keys, because new UUIDv7 keys
+   land at the right edge of the B-tree, while random keys insert into random pages, which defeats cache
+   locality and bloats the index as it grows.
 5. **Turn relationships into foreign keys** the database enforces, so an orphan cannot exist even when a
    script bypasses the application.
 
@@ -114,6 +131,22 @@ A table describes one kind of thing, and every non-key column depends on the who
 - **Index foreign-key columns (usually).** Joins and cascading deletes look rows up by them, and
   PostgreSQL does not create one automatically on the referencing side.
 
+### Modelling agent state
+The same rules applied to an agent loop give a small, predictable set of tables:
+
+| Table | One row per | Key rule |
+|---|---|---|
+| `agent_runs` | one task the agent was given | owns everything below it; carries `tenant_id`, status, model, totals |
+| `agent_steps` | one turn of the loop | `UNIQUE (run_id, step_no)` so a replayed step cannot be written twice |
+| `tool_calls` | one tool invocation | `UNIQUE (tenant_id, idempotency_key)` so a retried side effect is recorded once |
+| memory or chunk tables | one remembered fact or retrieved chunk | tenant-leading index, plus the embedding column if you use pgvector |
+
+- **Checkpoints are not your audit log.** A framework checkpointer stores serialized graph state for
+  resumption; its format belongs to the framework and can change between versions. Keep your own
+  normalized run and tool-call rows for queries, billing and evals.
+- **Status columns get `CHECK`s.** A run is `running`, `waiting_human`, `succeeded` or `failed`; an
+  unconstrained text column collects typos that dashboards silently miss.
+
 ### Evolving the schema
 The schema changes while old code still runs, so every change must work with both versions for the length
 of a deploy. That is the **expand/contract** rule:
@@ -133,12 +166,13 @@ of a deploy. That is the **expand/contract** rule:
 Review every migration for which locks it takes on a large, hot table.
 
 ## Diagram
-Read it top to bottom: design starts from entities and invariants, indexes come from queries, and
-denormalization is a measured exception, not a default.
+Read it top to bottom: design starts from the agent's entities (run, step, tool call) and invariants,
+indexes come from the queries your agent and dashboards run, and denormalization is a measured
+exception, not a default.
 
 ```mermaid
 flowchart TD
-    N["Name entities and cardinality"] --> K["Tables with surrogate keys"]
+    N["Name entities: run, step, tool call"] --> K["Tables with surrogate keys"]
     K --> C["FKs, CHECK, NOT NULL, UNIQUE"]
     C --> NF["Normalize to 3NF"]
     NF --> Q["List hot WHERE and ORDER BY"]
@@ -239,6 +273,42 @@ plan = db.execute("EXPLAIN QUERY PLAN SELECT * FROM messages "
 print(plan[-1][-1])   # SEARCH messages USING INDEX messages_by_conversation (conversation_id=?)
 ```
 
+### Agent scenario: a run that crashes mid-tool-call
+An agent with a `send_invoice` tool crashes after the tool succeeded but before the step was saved. On
+resume it replays step 7. The schema decides what happens.
+
+```sql
+CREATE TABLE agent_runs (
+  id          uuid PRIMARY KEY,                    -- UUIDv7
+  tenant_id   uuid NOT NULL,
+  status      text NOT NULL CHECK (status IN ('running','waiting_human','succeeded','failed')),
+  model       text NOT NULL,
+  total_input_tokens  integer NOT NULL DEFAULT 0 CHECK (total_input_tokens >= 0),
+  created_at  timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (tenant_id, id)
+);
+
+CREATE TABLE agent_steps (
+  id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  tenant_id   uuid NOT NULL,
+  run_id      uuid NOT NULL,
+  step_no     integer NOT NULL CHECK (step_no >= 0),
+  tool_name   text,
+  tool_args   jsonb,
+  idempotency_key text,                            -- e.g. run_id || ':' || step_no
+  FOREIGN KEY (tenant_id, run_id) REFERENCES agent_runs (tenant_id, id) ON DELETE CASCADE,
+  UNIQUE (run_id, step_no),                        -- a replayed step cannot be inserted twice
+  UNIQUE (tenant_id, idempotency_key)              -- the tool sees the same key on retry
+);
+CREATE INDEX agent_steps_by_run ON agent_steps (run_id, step_no);
+```
+
+| Design | What the replay of step 7 does |
+|---|---|
+| No unique key, no idempotency key | second invoice sent, two step-7 rows, cost report double-counts |
+| `UNIQUE (run_id, step_no)` only | duplicate row rejected, but the invoice API was already called twice |
+| Both keys, key passed to the tool | insert conflicts, the tool's own idempotency check returns the first result |
+
 ### Worked scenario: renaming a column with zero downtime
 The team wants `messages.content` renamed to `body` on a large, hot table while three app versions roll out.
 
@@ -253,6 +323,12 @@ The team wants `messages.content` renamed to `body` on a large, hot table while 
 A one-step `ALTER TABLE ... RENAME COLUMN` would have broken every v1 instance still serving traffic.
 
 ## Production patterns
+- **Own your run log next to the checkpointer.** Use the framework checkpointer (for example LangGraph's
+  Postgres saver) for resume, and write `agent_runs`, `agent_steps` and `tool_calls` rows yourself for
+  queries. Store the framework's run or trace id in a column so a LangSmith trace joins to your rows.
+  Monitor runs stuck in `running` past their timeout.
+- **One idempotency key per side-effecting step.** Derive it from run id and step number, store it under a
+  unique constraint and pass it to the tool. Monitor unique-violation counts; a spike means replays.
 - **Lock-safe migrations.** For any migration on a hot table, set `SET lock_timeout = '5s'` in the
   migration session so a blocked `ALTER` fails fast instead of queueing every write behind it, and build
   indexes with `CREATE INDEX CONCURRENTLY`. Monitor lock waits in `pg_stat_activity` and drop invalid indexes.
@@ -271,6 +347,9 @@ A one-step `ALTER TABLE ... RENAME COLUMN` would have broken every v1 instance s
   `pg_total_relation_size` and cache hit ratio.
 
 ## Trade-offs
+- **Framework checkpoint tables vs your own schema.** Checkpointers give resume for free, but their
+  serialized blobs are hard to query and tied to a framework version; your own tables cost a little
+  write code and survive a framework switch. Flip to checkpoints-only for short-lived prototypes.
 - **Normalization vs joins.** One fact in one place costs joins; flip to denormalization only when a
   specific read path is measured slow and its duplicate can be maintained transactionally.
 - **Surrogate keys vs natural identifiers.** Surrogate keys are stable and cheap to join, but you still
@@ -286,6 +365,9 @@ A one-step `ALTER TABLE ... RENAME COLUMN` would have broken every v1 instance s
   only point that sees every path; dropping them "for speed" trades microseconds for untrustworthy data.
 
 ## Pitfalls
+- **Treating the transcript blob as the database.** Storing each agent run as one jsonb array of
+  messages; the symptom is that "which tool failed most this week" needs a script that parses every run.
+  Fix: one row per step and per tool call, raw payload in a jsonb column on that row.
 - **Omitting `tenant_id` from child tables.** Relying on joins to the parent for scoping; the symptom is
   a query that returns another tenant's rows the first time someone forgets the join.
 - **Using `float` for money or token prices.** Symptom: invoices off by a cent and tests that compare
@@ -305,7 +387,8 @@ A one-step `ALTER TABLE ... RENAME COLUMN` would have broken every v1 instance s
 
 ## When to use
 - **Use when:** data will be read by anything other than the code that wrote it: dashboards, evaluations,
-  audits, other services, or future you.
+  audits, other services, or future you. Every production agent qualifies, because its runs feed resume,
+  cost reports and eval sets.
 - **Prototype exception:** for a throwaway prototype a single jsonb column is fine; the moment a second
   query pattern appears, extract real columns.
 - **Measure before denormalizing:** run `EXPLAIN ANALYZE` on the slow query and check the write rate of
@@ -337,12 +420,6 @@ on. If the inbox view needs `last_message_at`, denormalize that single column an
 transaction as the insert.
 
 ## Interview questions
-### Why default to surrogate keys, and why UUIDv7 rather than UUIDv4?
-- **Surrogate keys are stable.** Natural keys like email or external IDs change, get reused or turn out
-  not unique, so a bigint identity or UUID is the primary key and the natural key gets its own unique constraint.
-- **UUIDv7 is time-ordered.** New keys land at the right edge of the B-tree, while random UUIDv4 inserts
-  into random pages, hurting cache locality and bloating the index as the table grows.
-
 ### How would you stop a message from pointing at another tenant's conversation?
 - **A plain FK is not enough,** because nothing compares the child's `tenant_id` with the parent's.
 - **Use a composite key:** make `(tenant_id, id)` unique on conversations and reference that pair from
@@ -370,6 +447,20 @@ transaction as the insert.
 - **Watch locks:** adding a column with a constant default is cheap since PostgreSQL 11, a type change
   generally rewrites the table, and indexes go in with `CREATE INDEX CONCURRENTLY`.
 - **Fail fast:** set a short lock timeout in migration sessions so a blocked DDL does not queue all writes.
+
+### Design the tables behind a tool-calling agent that must survive crashes and be audited.
+- **Entities:** `agent_runs` owns `agent_steps`, which own `tool_calls`; every row carries `tenant_id`
+  and children reference `(tenant_id, run_id)` so nothing crosses tenants.
+- **Replay safety:** `UNIQUE (run_id, step_no)` plus an idempotency key per side-effecting call, stored
+  under a unique constraint and passed to the tool, so a resumed run cannot repeat an action.
+- **Queryability:** model, status and token counts as real columns with `CHECK`s; raw arguments and
+  responses as jsonb; an index on `(run_id, step_no)` for the replay view.
+
+### Your team uses a framework checkpointer. Why still keep your own run tables?
+- **Checkpoints serve resume, not questions.** They store serialized state per thread, so "failure rate
+  per tool per tenant" or "spend per run" means deserializing blobs.
+- **Framework coupling.** The checkpoint format follows the framework version; your own rows survive an
+  upgrade or a framework switch and join cleanly with traces and eval results.
 
 ## Quiz
 ### Q: Why is a composite index on (conversation_id, created_at) better than two single-column indexes for loading a conversation's messages in order?

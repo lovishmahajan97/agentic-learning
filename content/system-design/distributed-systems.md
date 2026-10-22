@@ -5,7 +5,8 @@ name: Distributed systems
 kind: concept
 difficulty: core
 est_minutes: 17
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - system-design/data-consistency
   - system-design/exactly-once-processing-limitations
@@ -24,9 +25,23 @@ sources:
 ---
 
 ## TL;DR
-Machines cooperating over a network, defined by **partial failure**: any node or link can fail or stall
-while the rest continue, and "slow" looks like "dead". Every AI product is one. The discipline: deadlines,
-idempotent retries, quorums, fenced leases, consensus, tracing.
+Every agent is a distributed system: model API, vector store, tools and workers on separate machines,
+defined by **partial failure**, where "slow" looks like "dead". The discipline: deadlines, idempotent
+retries, quorums, fenced leases, consensus, tracing.
+
+## For agent builders
+- **Why it matters for agents.** One agent run crosses the network dozens of times: model calls, retrieval,
+  tool APIs, checkpoint writes. Any of them can time out with the outcome unknown, so the loop must decide
+  whether to retry, fall back or stop without knowing what happened.
+- **Where it shows up in your stack.** The timeout and retry settings on your model client (provider SDKs
+  and LangChain chat-model wrappers retry by default), tool adapters with idempotency keys, the replica
+  your memory or RAG store reads from, the lease that keeps one worker per run, and traces in LangSmith or
+  an OpenTelemetry backend that stitch a run back together.
+- **What you control.** A deadline per run and per step, which single layer owns retries, idempotency keys
+  on tools, circuit breakers and fallback models, fencing tokens on the run lease, and primary versus
+  replica reads after the agent writes memory.
+- **What you can skip.** Proving FLP or implementing Raft. Know what a timeout tells you, quorum overlap,
+  why 3 or 5 voters, and why a lease needs a fencing token.
 
 ## Why it exists
 - **One machine is predictable.** A function call returns or the process is dead; a write happens or the
@@ -142,6 +157,18 @@ Copying data to several nodes buys availability and read throughput.
 - **Practical reading:** strong consistency is bought per operation, so systems make a few operations strongly
   consistent (allocating an id, taking a lock, debiting a quota) and the rest eventually consistent.
 
+### Where an agent run meets partial failure
+| Hop in the loop | Partial failure you will see | Default response |
+|---|---|---|
+| Model API | timeout or 429 under load, response lost after tokens were billed | deadline-aware retry once, then a fallback model or a clear failure |
+| Retrieval | replica lag hides a document the user just uploaded | read from the primary for freshness-sensitive queries |
+| Side-effecting tool | timeout after the ticket was created | retry with the same key, or query by key first |
+| Run lease (one worker per run) | a paused worker resumes after its lease moved | fencing token checked on every checkpoint write |
+| Checkpoint or memory store | write acknowledged by a minority, then failover | treat as unknown, re-read before acting |
+
+- **The loop multiplies exposure.** At an illustrative 0.5% timeout rate per call and 40 calls per run,
+  about 18% of runs see at least one timeout (1 − 0.995⁴⁰), so handling it is the normal path, not an edge case.
+
 ### Seeing it
 - **No single stack trace exists,** so correlation ids and distributed tracing are not optional; they are how
   a "request" is reconstituted from spans that ran on different machines.
@@ -236,6 +263,37 @@ for n, w, r in [(3, 2, 2), (5, 3, 3), (5, 2, 2), (5, 1, 4)]:
 
 - **Retrying at one layer only** (3 retries, 1 layer) caps the fan-out at 4 attempts instead of 1,024.
 
+### Agent scenario: one tool-call wrapper that owns deadline, retry and key
+The agent runtime is the single retry layer, so the model SDK's own retries are turned off. Each tool call
+gets the run's remaining budget, the same key on every attempt and a breaker per tool. `breaker` and
+`tool.call` stand in for your circuit breaker and tool client.
+
+```python
+import random, time
+
+def call_tool(tool, args, run, step, breaker, max_attempts=2, min_budget_s=0.5):
+    key = f"{run.id}:{step}"                          # same key on every attempt
+    for attempt in range(max_attempts):
+        remaining = run.deadline - time.monotonic()   # monotonic clock, not wall clock
+        if remaining < min_budget_s:
+            return {"error": "deadline exhausted", "retryable": False}
+        if breaker.is_open(tool.name):
+            return {"error": f"{tool.name} unavailable", "retryable": False}  # model can pick another path
+        try:
+            out = tool.call(args, timeout=min(tool.cap_s, remaining), idempotency_key=key)
+            breaker.record(tool.name, ok=True)
+            return out
+        except TimeoutError:
+            breaker.record(tool.name, ok=False)       # outcome unknown: the key makes a retry safe
+            time.sleep(random.uniform(0, 0.2 * 2 ** attempt))  # jittered backoff
+    return {"error": "timed out, outcome unknown", "retryable": False, "key": key}
+```
+
+- **Return errors to the model as data.** A structured "unavailable" or "outcome unknown" result lets the
+  agent choose a fallback or tell the user, instead of the loop crashing or retrying blindly.
+- **Caveat:** the key only prevents duplicates if the tool's API deduplicates on it; for tools that do not,
+  query by a correlation id before any retry.
+
 ### Worked scenario: propagating a deadline through an agent request
 A chat request arrives with a 10-second budget (illustrative numbers). Each hop passes on what is left
 rather than its own default timeout.
@@ -269,6 +327,16 @@ rather than its own default timeout.
 - **Odd-sized consensus across three failure domains.** Deploy 3 or 5 voters spread across three zones, so
   losing one zone leaves a majority. Monitor leader elections per hour; frequent elections mean timeouts
   are tighter than the network.
+- **Agent runtime owns retries.** Provider SDKs and framework wrappers often retry on their own; set their
+  retry count to zero or one (the OpenAI and Anthropic Python clients and LangChain chat models expose a
+  `max_retries` setting) when your agent loop or durable engine already retries, so attempts do not
+  multiply. Monitor model calls per run step; more than about one per step means hidden retries.
+- **Run-level deadline and fallback model.** Give every agent run and every step a budget, pass the
+  remainder to each model and tool call, and switch to a smaller or secondary-provider model when the
+  primary times out with too little budget left. Track fallback rate and runs ending on deadline.
+- **One trace per run.** Propagate one trace id through model calls, retrieval and tools (LangSmith, or
+  OpenTelemetry with GenAI conventions in your tracing backend) so a failed run can be reconstructed hop
+  by hop. Monitor the share of runs with complete traces.
 
 ## Trade-offs
 - **Replicas vs write latency or staleness.** Replicating raises availability and read capacity, but every
@@ -301,6 +369,11 @@ rather than its own default timeout.
   under load or replica failure.
 - **Consensus-backed stores with an even number of nodes or across two data centres.** A clean split leaves
   neither side with a majority and the whole cluster unavailable.
+- **Letting the SDK, the framework and the agent loop all retry.** Symptom: one slow model endpoint shows
+  several times the expected call volume and token spend during an incident. Fix: one retry layer, the
+  others set to zero.
+- **Crashing the run on a tool timeout.** Symptom: whole agent runs fail because one optional tool was
+  slow. Fix: return a structured error to the model and let it continue, fall back or stop cleanly.
 
 ## When to use
 You do not choose to build a distributed system; any product that calls a model API, keeps state in a
@@ -351,7 +424,7 @@ longer than the TTL.
 - **No shared clock or memory.** Ordering needs logical clocks or version numbers, and agreement needs a
   protocol with round trips.
 
-### One slow dependency at the bottom of a call chain took the whole platform down. Walk me through why.
+### One slow tool at the bottom of your agents' call chain took the whole platform down. Walk me through why.
 - **Retry amplification.** If five layers each retry three times, one failing call becomes up to 4⁵ ≈ 1,000
   attempts against the dependency that is already slow.
 - **Thread and connection exhaustion.** Callers without short deadlines hold resources while waiting, so
@@ -377,6 +450,14 @@ longer than the TTL.
 - **Add fencing:** each grant returns a strictly increasing token, and the resource the scheduler writes to
   rejects tokens lower than the highest it has seen.
 - **Operate it:** keep the lease in etcd or ZooKeeper, and alert when hold time approaches the TTL.
+
+### Your agent's model call times out at step 14 of a run. What should the loop do?
+- **Treat it as outcome unknown.** The provider may have produced and billed the response; nothing has
+  acted on it yet, so the model call itself is safe to retry, unlike a side-effecting tool.
+- **Check the budget.** Retry once with jitter only if the run's remaining deadline covers another call;
+  otherwise fall back to a faster model or end the run with a clear status.
+- **Keep one retry layer.** Make sure the SDK is not also retrying underneath, or one timeout becomes
+  several paid calls.
 
 ## Quiz
 ### Q: A call to the embedding service times out after 10 seconds. Which statement is correct?

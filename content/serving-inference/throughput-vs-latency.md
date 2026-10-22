@@ -5,7 +5,8 @@ name: Throughput vs latency
 kind: decision
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - serving-inference/continuous-batching
   - serving-inference/batching-and-concurrency-limits
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-A decode step costs about the same for one sequence or thirty-two, because reading the weights
-dominates, so batching multiplies throughput until compute or KV memory saturates. Each added request
-also lengthens every step and the queue: pick an operating point per workload.
+Batching multiplies throughput almost for free until compute or KV memory saturates, but every added
+request lengthens each step and the queue. Agents pay that latency on every sequential step, so pick
+separate operating points for interactive and background agents.
+
+## For agent builders
+- **Why it matters for agents.** A 10-step agent pays queue wait and step time ten times in a row, so a
+  latency regression that is mild for chat is multiplied for agents. Background agents and eval runs are
+  the opposite case: nobody waits, so run them at the throughput end.
+- **Where it shows up in your stack.** Provider interactive versus batch tiers (OpenAI Batch, Anthropic
+  Message Batches), rate limits per API key, your agent framework's max parallel tool calls or
+  sub-agents, and vLLM `--max-num-seqs` when self-hosting.
+- **What you control.** How many calls each agent keeps in flight, which traffic goes to a batch tier,
+  per-step timeouts, and admission limits in front of your own replicas.
+- **What you can skip.** Deriving the M/M/1 formula; remember ρ = 0.9 means about 10× service time and
+  that the tail breaks first.
 
 ## Why it exists
 - **A GPU at concurrency 1 is mostly idle.** It streams 16 GB of weights through its memory system to
@@ -111,9 +124,17 @@ latency.
   to pay for provisioned or dedicated capacity when tail latency matters.
 - **The provider's rate limits are**, in effect, the operating point they chose for you.
 
+### Agents on the curve
+- **Sequential steps multiply latency.** Run time ≈ steps × (queue wait + TTFT + decode) + tool time, so
+  operating near the knee costs an agent several times what it costs a single chat turn.
+- **Agents generate their own load.** Parallel tool calls, sub-agents and retries put several requests
+  in flight per user, so concurrency rises faster than user count; cap in-flight calls per run.
+- **Two traffic classes, two points.** Interactive agents sit at the knee; background agents, evals and
+  trace backfills belong at the plateau or on a provider batch tier.
+
 ## Diagram
 How an operating point is chosen and enforced: the SLO picks the concurrency, and everything above that
-limit is shed, queued visibly or sent to a cheaper pool.
+limit is shed, queued visibly or sent to a cheaper pool, which is where background agents and evals go.
 
 ```mermaid
 flowchart TD
@@ -123,7 +144,7 @@ flowchart TD
     C --> R{"Request arrives"}
     R -->|"under limit"| A["Admit to batch"]
     R -->|"over limit"| X["Fast 429 or visible queue"]
-    R -->|"batch traffic"| B["Throughput pool at plateau"]
+    R -->|"background agents, evals"| B["Throughput pool at plateau"]
     X -.->|"queue depth"| H["Autoscale replicas"]
 ```
 
@@ -165,6 +186,20 @@ for slo in (0.050, 0.015, 0.010):
 # SLO   10 ms  B= 35  step 10.0 ms   3500 tok/s
 ```
 
+### Agent scenario: one replica, interactive versus background agents
+Same illustrative replica; an agent run emits 1,500 output tokens across 10 steps (decode only, no TTFT,
+queue or tool time).
+
+| Operating point | Step time (TPOT) | Decode time per run | Replica throughput | Runs per replica-hour |
+|---|---|---|---|---|
+| Full replica, B ≈ 120 | ~23 ms | 1,500 × 23 ms ≈ 34.5 s | ~5,300 tok/s | ~12,700 |
+| Latency-capped, B ≈ 35 | 10 ms | 1,500 × 10 ms = 15 s | ~3,500 tok/s | ~8,400 |
+
+- **An interactive agent** where a user waits wants the second row: less than half the decode time per
+  run, at about a third fewer runs per hour.
+- **A nightly research or eval agent** wants the first row, or a batch tier, because only runs per
+  dollar matter.
+
 ### Why the tail explodes near saturation
 Runnable: a single-server FIFO queue with random arrivals and service times (Lindley's recursion),
 compared with the `service_time / (1 − ρ)` formula.
@@ -188,6 +223,12 @@ for rho in (0.5, 0.7, 0.9, 0.95):
 ```
 
 ## Production patterns
+- **Split agent traffic by who is waiting.** Route user-facing agent runs to the latency pool or
+  interactive tier, and eval sweeps, background agents and trace re-scoring to a batch pool or provider
+  batch API. Monitor interactive per-step TTFT while background jobs run.
+- **Cap in-flight calls per agent run.** Limit parallel tool calls and sub-agents per run with a
+  semaphore or the framework's concurrency setting, so one run cannot fill a replica. Monitor in-flight
+  requests per run and per tenant.
 - **Concurrency cap from the load curve.** Set vLLM `--max-num-seqs` (and the per-step token budget
   `--max-num-batched-tokens`) at the largest concurrency that met the SLO, minus burst headroom. Monitor
   TTFT p95 and TPOT p95 against running sequences.
@@ -234,7 +275,7 @@ for rho in (0.5, 0.7, 0.9, 0.95):
 - **Every time** you configure a replica, choose a provider tier, or set a rate limit, you are making
   this decision.
 - **Latency end** whenever a person or latency-sensitive agent is waiting: chat, completions, voice,
-  interactive tools.
+  interactive tools, user-facing agent runs whose steps compound.
 - **Throughput end** for evaluation runs, bulk extraction, embeddings backfills, nightly summaries and
   anything with a deadline measured in hours.
 - **Measure** throughput, TTFT p95 and TPOT p95 against concurrency for each model and hardware pairing,
@@ -264,18 +305,25 @@ traffic to off-peak hours or a separate cheap pool. Finally measure goodput at t
 finance with cost per token at the required latency, which is the real request.
 
 ## Interview questions
-### Why does batching raise throughput almost for free, and where does that stop?
-- **Decode is bandwidth-bound:** each step reads the weights once whatever the batch size, so more
-  sequences per step means more tokens for nearly the same step time.
-- **It stops** when per-sequence KV reads dominate the bytes moved, when arithmetic catches up with
-  bandwidth, or when KV memory is full and new requests must queue.
-
 ### How would you choose the concurrency limit for a new chat deployment?
 - **Start from the SLO** as percentiles, such as TTFT p95 ≤ 1 s and TPOT p95 ≤ 50 ms.
 - **Run an open-loop load curve** at production prompt and output lengths, and take the largest
   concurrency at which both percentiles hold, minus burst headroom.
 - **Enforce it** with the engine's max-sequences setting, shed the excess with 429s, and autoscale on
   queue depth.
+
+### Your agent runs got 3× slower after traffic doubled, but single chat calls only got slightly slower. Why?
+- **Agents pay the queue every step.** Near the knee, queue wait and step time rise per call; a 10-step
+  agent pays that increase ten times sequentially.
+- **Agents add their own load:** parallel tool calls and retries push concurrency up faster than users.
+- **Fix:** cap per-replica concurrency below the knee, cap in-flight calls per run, autoscale on queue
+  depth, and move background agents off the interactive pool.
+
+### How do you run a nightly eval of 10,000 agent trajectories without hurting live users?
+- **Separate the traffic:** a provider batch tier or a separate pool run at the plateau, not the
+  interactive replicas.
+- **Throughput is the goal:** high concurrency per replica, because nobody waits on a single run.
+- **Watch the live pool's** TTFT p95 during the run as the guardrail.
 
 ### When would you deliberately run a replica at low utilisation?
 - **Interactive tiers with strict tails:** at ρ = 0.9 time in system is about ten times service time, so

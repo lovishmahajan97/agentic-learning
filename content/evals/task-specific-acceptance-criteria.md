@@ -5,7 +5,8 @@ name: Task-specific acceptance criteria
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/golden-dataset
   - evals/rubrics
@@ -18,9 +19,21 @@ related:
 ---
 
 ## TL;DR
-Acceptance criteria turn "the model should work well" into checkable statements about one task's
-outputs (format, content, correctness, edge cases, latency, cost), each with a threshold and scope.
-Generic scores cannot say whether that task is safe to ship.
+Acceptance criteria turn "the agent should work well" into checkable statements about one task's
+outputs and actions (format, content, correctness, tool use, edge cases, latency, cost), each with a
+threshold and scope. Generic scores cannot say whether that agent is safe to ship.
+
+## For agent builders
+- **Why it matters for agents.** An agent does things: it issues refunds, edits tickets, sends emails.
+  Criteria decide which of those failures may average out (a slightly long reply) and which must block
+  a release and be guarded at runtime (a write action without confirmation, a leaked address).
+- **Where it shows up in your stack.** Graders in your eval harness, the CI gate, output validation
+  (Pydantic or JSON schema on tool arguments and final output), guardrail checks before a tool runs,
+  and online monitors over traces.
+- **What you control.** The list of criteria per task, hard versus soft, slice floors, step and cost
+  budgets, and which hard criteria also get a runtime guard in the agent loop.
+- **What you can skip.** Generic "helpfulness 1 to 10" scores and leaderboard metrics; they tell you
+  nothing about whether this agent's actions are safe on this customer's data.
 
 ## Why it exists
 - **Without a definition, every review restarts.** Ask three people whether the new summarizer is "good
@@ -64,10 +77,13 @@ Generic scores cannot say whether that task is safe to ship.
 | **Behavioural** | Refuses out-of-scope requests, asks a clarifying question on ambiguous input, escalates when confidence is low | Dedicated golden slices built for those behaviours |
 | **Consistency** | Same answer on a paraphrase; same classification when irrelevant fields change | Metamorphic checks |
 | **Operational** | p95 latency, cost per request, token budget | Measured by the harness alongside quality, *because* a quality gain that doubles cost is a different decision |
+| **Agent actions** | Right tool chosen, tool arguments valid and grounded in the input, lookup before any write, confirmation before irreversible actions, no forbidden tools | Trajectory checks over the stored trace, plus a final-state assertion in the sandbox |
+| **Agent budgets** | Steps per task, tool calls per task, tokens and wall-clock per task, no loops | Counted from the trace; a run that hits the cap is a failure, not an error |
 
 ### Hard versus soft, and thresholds per slice
 - **Hard criteria are 100%.** A single violation blocks the release, *because* the cost of one
-  occurrence is unacceptable (PII leak, invalid output that crashes a downstream parser).
+  occurrence is unacceptable (PII leak, invalid output that crashes a downstream parser, a refund
+  issued without the required lookup).
 - **Soft criteria are statistical.** A pass-rate threshold on the golden dataset with a floor per slice,
   *because* an overall 92% can be a 60% on the slice the biggest customer uses.
 - **Thresholds come from the business and the baseline:** what error rate the downstream human reviewer
@@ -114,8 +130,8 @@ One definition, used in four places, keeps offline, gate and online views consis
 4. **Headings** of the release report.
 
 ## Diagram
-Criteria come out of error analysis, split into hard and soft, and one definition feeds the offline
-gate and the runtime guard alike.
+Criteria come out of error analysis of agent outputs and traces, split into hard and soft, and one
+definition feeds the offline gate and the runtime guard in the agent loop alike.
 
 ```mermaid
 flowchart TD
@@ -180,6 +196,24 @@ def gate(results):                     # results: [(slice, [(name, passed, sever
   regardless of the 94% category accuracy. The criteria encode which failures may average and which
   may not.
 
+### Agent scenario: criteria for a refund agent
+A support agent with `lookup_order`, `issue_refund` and `escalate` tools. Numbers are an illustrative
+release run on 250 golden tasks, each run 3 times (750 runs).
+
+| Criterion | Kind | Threshold | Result | Gate |
+|---|---|---|---|---|
+| `issue_refund` only after `lookup_order` on the same order | Hard | 100% of runs | 749 of 750 | Block |
+| Refund amount ≤ order amount from the lookup | Hard | 100% of runs | 750 of 750 | Pass |
+| Final state correct (sandbox assertion) | Soft | ≥ 90% overall, ≥ 85% per intent | 91%, worst intent 86% | Pass |
+| Escalates when the policy tool returns "manual review" | Soft | ≥ 95% | 97% | Pass |
+| Steps per task ≤ 8 | Soft | ≥ 98% of runs | 99% | Pass |
+| Cost per task | Operational | ≤ $0.05 mean | $0.031 | Pass |
+
+- **One violation blocks.** The single out-of-order refund is enough; its trace shows the agent reused
+  an order id from earlier in the conversation, so the fix is a prompt rule plus a runtime guard.
+- **The runtime guard is code, not prompting:** the `issue_refund` handler refuses unless a
+  `lookup_order` result for that order id exists in the current run's state.
+
 ### What can a clean run actually prove? Sizing hard criteria and slice floors
 Pure Python; the numbers below match the statistical facts above.
 
@@ -231,6 +265,10 @@ print(f"items for +/-5 points at 85%: {items_for(0.85, 0.05)}")
 - **Cheap checks on 100% of live traffic.** Run schema, PII and length checks online and page on any
   hard violation; sample expensive judge-based criteria. Monitor violation counts per criterion per
   day.
+- **Pre-execution checks on agent tool calls.** Validate every tool call's arguments against its schema
+  and the hard criteria (lookup before write, amount limits, allowed recipients) inside the tool
+  handler before it executes, and return a clear error to the agent on refusal. Monitor refusals per
+  tool; a spike after a prompt change is a regression the offline set missed.
 
 ## Trade-offs
 - **Decomposed criteria vs maintenance.** They make failures actionable and gates precise, but a long
@@ -258,6 +296,9 @@ print(f"items for +/-5 points at 85%: {items_for(0.85, 0.05)}")
   the enterprise customer cares about.
 - **A clean offline run taken as proof a hard criterion holds.** Symptom: the first real violation
   arrives weeks after launch on an input pattern the golden set never contained, with no runtime guard.
+- **Only grading the agent's final message.** Symptom: a polite "your refund is processed" reply passes
+  while the trace shows the wrong order was refunded. Fix: criteria on final state and tool calls, not
+  only on text.
 
 ## When to use
 - **Timing:** write criteria for any LLM feature before committing to a delivery date; revise them after
@@ -306,6 +347,14 @@ I would get the support lead to sign the list, encode every check as a grader, a
   floor per vendor or document-layout slice, sized so each slice has enough items.
 - **Operational:** p95 latency and cost per document within budget, measured in the same harness run.
 
+### Write acceptance criteria for an agent that can issue refunds through a tool.
+- **Hard, 100%, plus a runtime guard:** refund only after a lookup of the same order, amount never above
+  the order total, no refund when policy says manual review, because one wrong write costs real money.
+- **Soft with floors:** final sandbox state correct per intent, escalation behavior on its own golden
+  slice, reply rubric for tone and accuracy, each with a slice floor sized to the slice.
+- **Budgets and operations:** steps and tool calls per task, cost and p95 latency per task, all read
+  from the stored traces in the same run.
+
 ### Your PII check passes all 300 golden items. Can you tell the customer the system never leaks PII?
 - **No.** Zero violations in *n* items bounds the true rate at about 3/*n* (the rule of three), so 300
   clean items are consistent with up to 1%.
@@ -321,7 +370,7 @@ I would get the support lead to sign the list, encode every check as a grader, a
 - **Keep strictness for hard criteria** with deterministic checks; making a judgment call hard produces
   flaky blocks from judge noise.
 
-### A gate keeps blocking on a slice of 40 items. What do you do?
+### Your agent's release gate keeps blocking on a slice of 40 tasks. What do you do?
 - **Check whether the floor is resolvable:** at 85% on 40 items the 95% interval is roughly ±11
   points, so ordinary run-to-run noise can push a healthy slice under the floor.
 - **Grow the slice** toward about 200 items for ±5 points, or loosen the floor to what the slice can

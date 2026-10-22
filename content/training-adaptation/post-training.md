@@ -5,7 +5,8 @@ name: Post-training
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/pre-training
   - training-adaptation/supervised-fine-tuning
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Post-training turns a base model into a useful, safe assistant: SFT on demonstrations, preference
-optimisation (RLHF, DPO) on comparisons, and RL on verifiable rewards. It uses a tiny fraction of
-pre-training compute but decides almost everything users experience.
+Post-training turns a base model into one that can drive an agent: SFT on tool-call traces, preference
+optimisation (RLHF, DPO) on comparisons, and RL on verifiable rewards. Cheap next to pre-training, it
+decides how well your agent calls tools.
+
+## For agent builders
+- **Why it matters for agents.** Chat templates, tool-call formats, stopping after a call, refusing or
+  escalating, and multi-step reasoning are all installed in post-training. When a hosted model is good
+  at agents, that is a post-training result; when your open-weight agent is not, post-training is the fix.
+- **Where it shows up in your stack.** The instruct or chat checkpoint you deploy, its chat template
+  (`apply_chat_template` in Transformers), and the trainers you would use yourself, such as TRL's SFT,
+  DPO and GRPO trainers or provider fine-tuning APIs.
+- **What you control.** Whether to post-train at all versus prompting and RAG, which stage fixes which
+  agent failure (format, quality, or a checkable skill), the eval gate between rounds, and the data:
+  traces, rankings and reward functions.
+- **What you can skip.** Reproducing a full frontier recipe. Agent teams usually run one targeted stage
+  (SFT on traces, then maybe DPO or GRPO) on top of an existing instruct model.
 
 ## Why it exists
 - **A base model is a very good autocomplete.** Asked a question, it may continue with more questions, a
@@ -38,32 +52,34 @@ pre-training compute but decides almost everything users experience.
 - **So post-training adds layers, each past the previous one's limit.** Demonstrations teach format and
   basic behaviour. Comparisons teach quality, because most prompts have no single correct answer, only
   better and worse ones. Checkable-reward RL teaches behaviours that need many attempts to discover, such
-  as multi-step reasoning.
+  as multi-step reasoning and multi-step tool use.
 
 ## How it works
 ### The three stages at a glance
-| Stage | Signal | Teaches | Limit |
+| Stage | Signal | Teaches (agent view) | Limit |
 |---|---|---|---|
-| 1. SFT | demonstrations | chat template, persona, "answer the question" | can only imitate |
-| 2. Preference optimisation | comparisons | quality, tone, refusals | only reranks answers the SFT policy already produces; cannot discover behaviours that need many attempts |
-| 3. RL on verifiable rewards | programmatic checks | multi-step reasoning, exact formats | only for checkable tasks |
+| 1. SFT | demonstrations | chat template, persona, tool-call syntax, "answer the question" | can only imitate |
+| 2. Preference optimisation | comparisons | quality, tone, refusals, when to ask versus act | only reranks answers the SFT policy already produces; cannot discover behaviours that need many attempts |
+| 3. RL on verifiable rewards | programmatic checks | multi-step reasoning, exact formats, task success in a sandbox | only for checkable tasks |
 
 The stages are ordered because each one needs the behaviour the previous one installed.
 
 ### Stage 1: supervised fine-tuning on demonstrations
 1. Humans (or a stronger model) write prompt-response pairs in the target format: system prompt, user
-   turn, assistant turn.
-2. Train with the same next-token loss as pre-training, but only on the assistant tokens.
-3. Result: the chat template, the assistant persona and basic answering behaviour.
+   turn, assistant turn, and for agents the tool calls and tool results in between.
+2. Train with the same next-token loss as pre-training, but only on the assistant tokens (not on tool
+   results the environment returned).
+3. Result: the chat template, the assistant persona, tool-call syntax and basic answering behaviour.
 
 - **It comes first because it is cheap and stable**, and later stages need a policy that already
-  produces plausible candidate answers.
+  produces plausible candidate answers and well-formed tool calls.
 - **Its limit:** it cannot tell the model that one of two fluent answers is wrong. See *supervised
   fine-tuning* and *instruction tuning* for mechanics and data design.
 
 ### Stage 2: preference optimisation on comparisons
 - **Data:** raters see two or more responses to the same prompt and rank them. Cheaper than
-  demonstrations, and it captures judgements people find easy to make but hard to write down.
+  demonstrations, and it captures judgements people find easy to make but hard to write down, such as
+  "this agent asked a needless clarifying question".
 - **RLHF:** train a reward model on the comparisons, then optimise the policy against it with PPO and a
   KL penalty that stops it drifting too far from the SFT model.
 - **DPO:** skip the reward model; optimise the policy directly on the pairs with a classification-style
@@ -75,14 +91,15 @@ The stages are ordered because each one needs the behaviour the previous one ins
 
 ### Stage 3: reinforcement learning on verifiable rewards
 1. Pick tasks with a checkable answer: maths with a known result, code with unit tests, output that must
-   parse as JSON.
+   parse as JSON, or an agent task whose end state a script can verify.
 2. Compute the reward with a program rather than learning it from humans.
 3. Sample many attempts per prompt, reward the correct ones, push toward whatever reasoning got there.
 
 - **GRPO is the common algorithm** in open recipes because it needs no value model.
 - **This stage is credited with long chain-of-thought** in reasoning models such as DeepSeek-R1.
 - **It is usually the most expensive post-training stage**, because generating many long samples per
-  prompt dominates the cost, though it remains orders of magnitude below pre-training.
+  prompt dominates the cost, though it remains orders of magnitude below pre-training. Multi-turn agent
+  rollouts with real tool calls are longer still.
 
 ### Where the signal comes from
 The mix of sources is the main cost lever:
@@ -91,11 +108,12 @@ The mix of sources is the main cost lever:
 |---|---|---|---|
 | **People** | annotators, domain experts | highest trust; the only source that can define "good" for a new domain | slowest |
 | **Stronger models** | teacher writes SFT responses (distillation through data); judge ranks pairs (RL from AI feedback, LLM-as-a-judge) | cheap, scalable | student inherits teacher's blind spots and judge's biases (e.g. preferring longer answers), so keep a human-labelled slice to calibrate |
-| **Programs** | verifiers, schema validators, unit tests | free per sample, impossible to flatter | only for checkable tasks; reward exactly what they check, gaps included |
+| **Programs** | verifiers, schema validators, unit tests, sandbox end-state checks | free per sample, impossible to flatter | only for checkable tasks; reward exactly what they check, gaps included |
 
-**Rejection sampling bridges the stages.** Sample several responses from the current model, keep the ones
-a reward model, judge or verifier scores highest, and SFT on them. It reuses cheap SFT machinery while
-learning from a quality signal, which is why many recipes run it before or instead of full RL.
+**Rejection sampling bridges the stages.** Sample several responses (or whole agent trajectories) from
+the current model, keep the ones a reward model, judge or verifier scores highest, and SFT on them. It
+reuses cheap SFT machinery while learning from a quality signal, which is why many recipes run it before
+or instead of full RL.
 
 ### Recurring design constraints
 - **A reference model and a KL leash.** Nearly every stage after SFT penalises distance from the previous
@@ -106,9 +124,10 @@ learning from a quality signal, which is why many recipes run it before or inste
   moves.
 - **Evaluation per stage.** Forgetting after SFT, verbosity after preference training and reward hacking
   after RL each get their own gates: capability benchmarks (the loss is the *alignment tax*), preference
-  win rates, task-specific checks.
+  win rates, task-specific checks such as valid tool-call rate.
 - **Safety and policy.** Refusals, sensitive topics and tool-use permissions are trained in with targeted
-  SFT data and preference pairs, then red-teamed, because a helpful but unsafe model cannot ship.
+  SFT data and preference pairs, then red-teamed, because a helpful but unsafe model cannot ship, and an
+  agent with tools can act on its mistakes.
 
 ### What post-training costs
 | Stage | Compute |
@@ -123,32 +142,31 @@ evaluation sets that tell you whether a round helped.
 
 ## Diagram
 Read it top to bottom: each stage consumes a different signal, and each round ends at an eval gate
-(format, win rate, refusals on harmful and benign sets, length, capability delta). A failed or
-unfinished round samples the new model and feeds fresh on-policy comparisons back into stage 2, with a
-KL leash to the reference model.
+(tool-call format, win rate, refusals on harmful and benign sets, length, capability delta). A failed or
+unfinished round samples the new model and feeds fresh on-policy comparisons back into stage 2.
 
 ```mermaid
 flowchart TD
-    B["Base model"] --> SFT["Stage 1: SFT"]
+    B["Base model"] --> SFT["Stage 1: SFT on traces"]
     H["People and teacher models"] -->|"demonstrations"| SFT
     SFT --> PO["Stage 2: RLHF or DPO"]
     J["Raters, reward model, AI judge"] -->|"ranked comparisons"| PO
     PO --> RL["Stage 3: RL, e.g. GRPO"]
     V["Programs: tests, schema checks"] -->|"verifiable reward"| RL
     RL --> G{"Eval gate"}
-    G -->|"pass"| S["Ship assistant"]
+    G -->|"pass"| S["Ship agent model"]
     G -->|"fail or next round"| N["Sample new model, rank again"]
     N -->|"on-policy pairs"| PO
 ```
 
 ## Examples
-### Worked scenario: post-training a support assistant
-A team post-trains an open-weight 8B base model as a support assistant for a software product. All sizes
-are illustrative.
+### Worked scenario: post-training a support agent
+A team post-trains an open-weight 8B base model as a support agent for a software product. The agent
+answers questions and opens help-desk tickets through a tool call. All sizes are illustrative.
 
 1. **SFT.** 6,000 demonstrations: real support tickets paired with answers by senior agents, rendered
-   through a chat template with a fixed system prompt. After two epochs it answers in the right voice and
-   format.
+   through a chat template with a fixed system prompt and the ticket tool's schema. After two epochs it
+   answers in the right voice and format.
    - Held-out eval: fluent, but invents feature names about one time in eight.
    - It answers "how do I delete my account" with a wall of text where policy is a short, specific
      procedure.
@@ -157,7 +175,7 @@ are illustrative.
    - DPO on the pairs (top-ranked against each of the other three, 6,000 in all) cuts hallucinated
      feature names by more than half on the held-out set and shortens answers.
    - A capability benchmark before and after confirms general question-answering has not regressed.
-3. **Verifiable rewards.** Some answers must emit a JSON block that opens a help-desk ticket. Reward: +1 if
+3. **Verifiable rewards.** Some answers must emit a JSON block (the ticket tool's arguments). Reward: +1 if
    the JSON parses and matches the schema, +1 if the category is correct per a lookup table, 0 otherwise.
    - A few hundred GRPO steps with 8 samples per prompt raise schema validity from 91% to above 99%.
    - SFT alone never got there because the few malformed examples were drowned out.
@@ -170,7 +188,8 @@ are illustrative.
 | People | several weeks of agent time, the line that dominates the budget |
 
 ### The data plumbing behind steps 2 and 3
-Rankings become DPO pairs, and the JSON check becomes a reward function. Pure Python, runnable as is.
+Rankings become DPO pairs, and the tool-argument check becomes a reward function. Pure Python, runnable
+as is; the same `ticket_reward` doubles as an offline eval of tool-call validity.
 
 ```python
 import json
@@ -183,7 +202,7 @@ def rank_to_pairs(prompt, ranked):              # ranked: best first
 pairs = rank_to_pairs("How do I reset my password?", ["A", "B", "C", "D"])
 print(len(pairs), "pairs per ticket ->", 2000 * len(pairs), "pairs for 2,000 tickets")
 
-# 2) Verifiable reward for the ticket-opening JSON block (0, 1 or 2).
+# 2) Verifiable reward for the ticket tool's arguments (0, 1 or 2).
 CATEGORY = {"login": "account", "invoice": "billing", "crash": "bug"}   # lookup table
 REQUIRED = {"title": str, "category": str, "priority": int}
 
@@ -206,36 +225,46 @@ print([ticket_reward(s, "login") for s in samples])   # [2, 1, 0, 0]
 The `{"prompt", "chosen", "rejected"}` record is the shape common preference trainers (for example TRL's
 DPO trainer) consume.
 
+### Which stage fixes which agent failure
+| Agent failure seen in traces | Stage that fixes it | Signal |
+|---|---|---|
+| Wrong tool-call syntax, no stop after a call | SFT | correct traces |
+| Valid calls, but needless steps or verbose answers | preference optimisation | ranked trajectories |
+| Calls valid tools but the task still fails | RL on verifiable rewards | sandbox end-state check |
+| Knows nothing about this week's prices | none: retrieval or a tool | not a training problem |
+
 ## Production patterns
-- **Gate every round on a fixed eval suite.** Before promoting a checkpoint, run format or schema
-  compliance, win rate against the previous checkpoint on held-out prompts, refusal rate on harmful and
-  benign borderline sets, mean response length and a general capability suite. Block promotion when the
-  capability delta is negative, whatever the stage's own metric says.
+- **Gate every round on a fixed agent eval suite.** Before promoting a checkpoint, run tool-call schema
+  compliance, task success on held-out agent tasks, win rate against the previous checkpoint, refusal
+  rate on harmful and benign borderline sets, mean response length and a general capability suite. Block
+  promotion when the capability delta is negative, whatever the stage's own metric says.
 - **Refresh preference data on-policy each round.** Sample the next batch of comparison prompts from the
   current checkpoint, not the one that produced the last dataset. Monitor the gap between training-set
   win rate and real-user complaint rate; a widening gap means the pairs have gone stale.
-- **Use rejection sampling before full RL.** Sample several responses per prompt, score them with a
+- **Use rejection sampling before full RL.** Sample several trajectories per task, score them with a
   verifier, judge or reward model, keep the best, and run an ordinary SFT pass on them. Monitor the
   pass rate of kept samples per round; when it plateaus, on-policy RL is the next step.
 - **Calibrate AI judges against a human slice.** Keep a few hundred human-ranked pairs and measure judge
   agreement on them. Swap response order between calls to cancel position bias, and track judge
   preference versus length. Re-audit whenever the domain or teacher model changes.
 - **Ship the chat template with the checkpoint.** Store the template in the tokenizer config saved next to
-  the weights and render training and serving data with the same `apply_chat_template` call. Monitor
-  format-compliance rate in production, which drops first when they diverge.
+  the weights and render training and serving data with the same `apply_chat_template` call, tools
+  included. Monitor format-compliance and tool-call parse rate in production, which drop first when they
+  diverge.
 
 ## Trade-offs
 - **Demonstrations vs comparisons.** Demonstrations are precise but expensive and only teach imitation.
   Comparisons are cheaper and express quality, but a poorly designed rubric teaches length and
   confidence instead of correctness.
 - **Offline vs on-policy.** SFT and DPO are simple and reproducible. On-policy RL keeps learning as the
-  model changes, at the price of a sampling loop, more hyperparameters and harder debugging.
+  model changes, at the price of a sampling loop (for agents, a tool sandbox), more hyperparameters and
+  harder debugging.
 - **Strong vs loose KL leash.** A strong leash preserves capabilities and prevents reward hacking but caps
   how far behaviour moves. Loosen it when the target is far from the SFT model and evaluation can catch
   drift.
 - **Trained-in safety vs over-refusal.** Training refusals in makes the model safer by default but raises
-  over-refusal on benign edge cases. The balance depends on the audience and whether external guardrails
-  exist.
+  over-refusal on benign edge cases, which in an agent shows up as tasks abandoned. The balance depends on
+  the audience and whether external guardrails exist.
 - **AI-generated data vs quality ceiling.** Model-written data and AI judges cut labelling cost
   dramatically but cap the student near the teacher. The saving becomes a liability where the teacher is
   weak, which only a human-labelled audit slice reveals.
@@ -249,17 +278,17 @@ DPO trainer) consume.
 - **Measuring only the preference metric.** A model can win more comparisons while losing points on
   reasoning or coding benchmarks: catastrophic forgetting hiding behind a good-looking number. Fix: gate
   on a general capability suite too.
-- **Optimising the reward that is easy to compute rather than the one that matters.** Symptom: outputs
-  that satisfy the schema or the judge yet are useless to the person reading them. Fix: audit a sample of
-  high-reward outputs by hand each round.
+- **Optimising the reward that is easy to compute rather than the one that matters.** Symptom: tool
+  calls that satisfy the schema or the judge yet do nothing useful for the user. Fix: audit a sample of
+  high-reward outputs by hand each round, and reward task end state, not only format.
 - **Measuring refusals only on harmful prompts.** Symptom: the model passes the safety set yet declines
   ordinary requests that merely mention a sensitive word. Fix: track refusal rate on a benign borderline
   set too.
 
 ## When to use
-- **Use when** prompting and retrieval cannot give the behaviour: a house format that must hold on every
-  response, a reliable refusal or escalation policy, a domain style prompting keeps drifting from, or a
-  multi-step skill that needs reward-driven practice.
+- **Use when** prompting and retrieval cannot give the behaviour: a tool-call format that must hold on
+  every response, a reliable refusal or escalation policy, a domain style prompting keeps drifting from,
+  or a multi-step agent skill that needs reward-driven practice.
 - **Order:** start with SFT (cheap and diagnostic); add preference optimisation when the failure is
   "fluent but worse than it should be"; add verifiable-reward RL only when you can write a trustworthy
   reward function.
@@ -295,12 +324,20 @@ the DPO stage stable, so the saving is not worth it.
 ## Interview questions
 ### What does post-training add that pre-training cannot, and why are there three stages?
 - **Pre-training gives knowledge, not behaviour.** A base model has no notion of user and assistant and
-  no reason to be concise or to refuse.
+  no reason to be concise, to refuse or to call a tool.
 - **Each stage covers the previous one's limit.** SFT imitates demonstrations; preference optimisation
   learns "better than" from comparisons; verifiable-reward RL discovers behaviours that need many
   attempts, such as multi-step reasoning.
 - **The order is not arbitrary**, because each stage needs a policy that already produces what the
   previous stage installed.
+
+### Your open-weight agent emits valid tool calls but finishes only 60% of tasks. Which post-training stage do you reach for?
+- **Not more SFT first.** Format is already right; imitation of more traces raises the average but does
+  not single out the failing decisions.
+- **If task success is checkable** (a sandbox end state, tests, a database row), run rejection sampling
+  then GRPO-style RL with that check as the reward and a KL leash to the current model.
+- **If it is a quality judgement**, rank trajectories and run DPO. Either way, gate on held-out task
+  success and a capability suite.
 
 ### After a DPO round, win rate on your training distribution is up but user complaints are flat. Why?
 - **Stale pairs are the first suspect.** The comparisons describe an older model's mistakes, so the
@@ -317,13 +354,14 @@ the DPO stage stable, so the saving is not worth it.
 
 ### Roughly what does post-training an 8B assistant cost, and what dominates?
 - **Compute is small:** SFT on tens of thousands of examples is GPU-hours on one node; a full recipe like
-  the support-assistant example is a few hundred GPU-hours.
+  the support-agent example is a few hundred GPU-hours.
 - **RL costs most of the compute**, because generating many long samples per prompt dominates.
 - **People dominate the budget:** demonstrations, rankings and eval sets took several weeks of agent time
   in the worked example.
 
-### What would you put on the eval gate between post-training rounds?
-- **Stage metrics:** format or schema compliance and win rate against the previous checkpoint.
+### What would you put on the eval gate between post-training rounds of an agent model?
+- **Stage metrics:** tool-call format or schema compliance, task success and win rate against the
+  previous checkpoint.
 - **Side effects:** refusal rate on harmful and benign borderline sets, mean response length, and the
   delta on a general capability suite (the alignment tax).
 - **Rule:** a negative capability delta blocks promotion, whatever the stage's own metric says.

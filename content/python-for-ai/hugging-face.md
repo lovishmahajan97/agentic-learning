@@ -5,7 +5,8 @@ name: Hugging Face (transformers, datasets, tokenizers, accelerate, PEFT, TRL)
 kind: tool
 difficulty: core
 est_minutes: 22
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/pytorch
   - python-for-ai/safetensors
@@ -22,17 +23,29 @@ sources:
 ---
 
 ## TL;DR
-Hugging Face is a set of libraries over a model hub: load, tokenise, feed data, scale to many GPUs, train
-adapters and preference-tune, all by model name. It exists because every open model would otherwise
-ship incompatible loading and training code.
+Hugging Face is how agent teams run and adapt open models: load by name, render tool-calling chats with
+the right template, and LoRA-tune a model on agent traces with PEFT and TRL, without per-model glue code.
+
+## For agent builders
+- **Why it matters for agents.** When a hosted model is too expensive, too slow or not allowed, the
+  replacement is an open model from the Hub. Making it call tools reliably means rendering tool schemas
+  with its own chat template and, often, fine-tuning on your agent's successful traces.
+- **Where it shows up in your stack.** `transformers` and `tokenizers` for local agent models and evals,
+  `datasets` for trace corpora, PEFT and TRL for SFT and DPO on traces, `langchain-huggingface` wrappers
+  in LangChain, Hugging Face's own `smolagents` library, and vLLM or SGLang loading the same Hub repos.
+- **What you control.** The pinned `revision`, `apply_chat_template` with your tool definitions, loss
+  masking to assistant (and tool-call) tokens, LoRA rank and targets, and whether adapters are merged or
+  swapped per tenant.
+- **What you can skip.** Training tokenizers, writing Accelerate configs by hand for a first run, and
+  serving traffic from `generate()`; export to an inference engine instead.
 
 ## Why it exists
 - **A model is more than a weights file.** You also need matching architecture code, the config (layer
   count, heads, rope settings), the tokenizer with its exact vocabulary and special tokens, and the chat
-  template that formats a conversation.
+  template that formats a conversation, including how tool calls and tool results are written.
 - **Mismatches fail silently.** Before a common hub each release had its own repository and conventions,
   so swapping models meant rewriting glue. The wrong tokenizer or a missing BOS token produced a model
-  that ran but generated garbage, with no error.
+  that ran but generated garbage, with no error. In an agent, it shows up as tool calls that never parse.
 - **Training adds more glue.** Datasets of tens of gigabytes do not fit in RAM as Python lists;
   multi-GPU needs process launching, gradient sync and mixed precision. Full fine-tuning of a 7B model at
   about 16 bytes per parameter (bf16 weights and gradients, fp32 master weights, two fp32 AdamW moments)
@@ -45,14 +58,14 @@ ship incompatible loading and training code.
 
 ## How it works
 ### The libraries at a glance
-| Library | Job |
-|---|---|
-| `transformers` | loads any published architecture and its weights by name |
-| `tokenizers` | turns text into the exact ids that model expects |
-| `datasets` | streams and memory-maps training data |
-| `accelerate` | runs the same PyTorch code on one GPU or many |
-| `PEFT` | trains small adapters instead of all weights |
-| `TRL` | SFT and preference-tuning trainers |
+| Library | Job | Agent use |
+|---|---|---|
+| `transformers` | loads any published architecture and its weights by name | local agent model, judge, evals |
+| `tokenizers` | turns text into the exact ids that model expects | token budgets, chat and tool templates |
+| `datasets` | streams and memory-maps training data | trace corpora for SFT and DPO |
+| `accelerate` | runs the same PyTorch code on one GPU or many | scaling a trace fine-tune |
+| `PEFT` | trains small adapters instead of all weights | one adapter per agent or tenant |
+| `TRL` | SFT and preference-tuning trainers | tune tool-calling on good versus bad traces |
 
 ### transformers
 1. **Resolve.** `AutoModelForCausalLM.from_pretrained("org/name")` downloads `config.json` and reads its
@@ -75,11 +88,11 @@ Load-time options and helpers:
   commit hash) to files.
 - **Content-addressed cache.** Files download once into a cache under `HF_HOME` and are reused after.
 - **Pin a commit hash for reproducibility**, because a branch such as `main` can be rewritten by the
-  repository owner.
+  repository owner, and a changed chat template silently changes how your agent's tools are rendered.
 - **Offline mode.** `HF_HUB_OFFLINE=1` resolves loads only from the cache; that is how air-gapped
   deployments work once the cache is pre-populated.
 
-### tokenizers
+### tokenizers and chat templates
 - **Fast tokenizers are Rust**, exposed to Python, because tokenising a large corpus in pure Python is a
   bottleneck.
 - **`AutoTokenizer`** loads that exact model's vocabulary and merges and returns offsets for span
@@ -87,6 +100,9 @@ Load-time options and helpers:
 - **`apply_chat_template`** renders a list of messages into the model's prompt format with the Jinja
   template stored with the tokenizer. Using it, not hand-concatenating `"User: ...\nAssistant:"`, keeps a
   chat model on-distribution.
+- **Tools go through the template too.** Recent `transformers` versions let you pass tool definitions to
+  `apply_chat_template` so the model sees them in the format it was trained on. Models that were not
+  trained for tool use have no tool section in their template; check before choosing one for an agent.
 - **Training new tokenizers** (BPE, WordPiece or Unigram) matters only when you pre-train or adapt a
   vocabulary; for fine-tuning always reuse the base model's tokenizer.
 - **Left-pad for batched generation** with decoder-only models (`padding_side="left"`), because
@@ -120,7 +136,7 @@ merge:     W' = W + (α/r)·B·A
   from known-good behaviour.
 - **The `α/r` scale** keeps the update's magnitude roughly stable when you change r.
 - **What shrinks.** Optimizer state shrinks proportionally, the saved adapter is megabytes instead of
-  gigabytes, and one base can serve many adapters.
+  gigabytes, and one base can serve many adapters (for example one per agent persona or tenant).
 - **Deploy: merge or keep separate.** Merging removes any extra inference cost but fixes one adapter
   into the weights; separate adapters let a server swap them per request.
 - **Why LoRA is the default.** Prompt/prefix tuning and IA³ are other PEFT methods, but LoRA adds no
@@ -131,26 +147,26 @@ merge:     W' = W + (α/r)·B·A
 Trainers built on the `transformers` Trainer; they accept a `peft_config`, so adapters and preference
 tuning compose.
 
-| Trainer | Use |
-|---|---|
-| `SFTTrainer` | supervised fine-tuning on chat or instruction data; applies the chat template and can compute loss only on assistant tokens |
-| `DPOTrainer` | preference pairs; needs a frozen reference model to measure how far the policy moved |
-| reward and online RL trainers | reward modelling, PPO, GRPO |
+| Trainer | Use | Agent data |
+|---|---|---|
+| `SFTTrainer` | supervised fine-tuning on chat or instruction data; applies the chat template and can compute loss only on assistant tokens | successful traces with tool calls and results |
+| `DPOTrainer` | preference pairs; needs a frozen reference model to measure how far the policy moved | a good versus a bad tool choice for the same state |
+| reward and online RL trainers | reward modelling, PPO, GRPO | rewards from task success or a verifier |
 
 - **DPO with an adapter** can use the base model with the adapter disabled as the reference, instead of
   loading a second copy.
 - **TRL's API changes frequently** across releases, so pin the version and read its docs.
 
 ## Diagram
-The path of a LoRA fine-tune: a pinned Hub repository feeds the model and tokenizer, `datasets` feeds
-templated rows, TRL trains only the adapter, and the result is merged or served alongside the base.
+The path of a LoRA fine-tune on agent traces: a pinned Hub repository feeds the model and tokenizer,
+`datasets` feeds templated traces, TRL trains only the adapter, and the result is merged or served.
 
 ```mermaid
 flowchart TD
     HUB[("Hub repo at a pinned revision")] --> CACHE[("Local cache under HF_HOME")]
     CACHE --> M["transformers: config, class, safetensors weights"]
     CACHE --> TK["tokenizers: vocab plus chat template"]
-    DATA[("datasets: memory-mapped Arrow")] -->|"map with apply_chat_template"| TR["TRL SFTTrainer or DPOTrainer"]
+    DATA[("datasets: agent traces as Arrow")] -->|"map with apply_chat_template"| TR["TRL SFTTrainer or DPOTrainer"]
     M --> TR
     TK --> TR
     PEFT["PEFT LoraConfig: frozen base, trainable B and A"] --> TR
@@ -161,8 +177,36 @@ flowchart TD
 ```
 
 ## Examples
+### Render a tool-calling trace exactly as the model sees it
+Before fine-tuning or serving an open model in an agent, print one rendered trace. If the tool schema or
+the tool result does not appear in the model's native format, the agent will not call tools reliably.
+
+```python
+from transformers import AutoTokenizer
+
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")   # pin revision= in production
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_order_status",
+        "description": "Look up an order by id",
+        "parameters": {"type": "object",
+                       "properties": {"order_id": {"type": "string"}},
+                       "required": ["order_id"]},
+    },
+}]
+messages = [
+    {"role": "system", "content": "You are a support agent. Use tools for order data."},
+    {"role": "user", "content": "Where is order A-1042?"},
+]
+prompt = tok.apply_chat_template(messages, tools=tools, add_generation_prompt=True, tokenize=False)
+print(prompt)                       # check: tool schema present, roles marked, generation prompt at end
+print(len(tok(prompt).input_ids))   # tool schemas cost tokens on every agent step
+```
+
 ### LoRA SFT of a small chat model with TRL and PEFT
-Argument names follow recent TRL releases; check them against your pinned version.
+Argument names follow recent TRL releases; check them against your pinned version. For an agent, each
+row is a successful trace: user turn, assistant tool call, tool result, final answer.
 
 ```python
 from datasets import load_dataset
@@ -219,7 +263,7 @@ merged.save_pretrained("out/support-merged")                  # safetensors by d
 AutoTokenizer.from_pretrained(base_id).save_pretrained("out/support-merged")  # ship template too
 ```
 
-### Worked scenario: what fits on one 80 GB GPU for a 7B model
+### Worked scenario: what fits on one 80 GB GPU for a 7B agent model
 Rough weight-and-optimizer memory before activations (illustrative orders of magnitude):
 
 | Approach | What is stored | Approx. memory |
@@ -229,9 +273,13 @@ Rough weight-and-optimizer memory before activations (illustrative orders of mag
 | QLoRA on a 4-bit base | ~0.5 bytes per frozen parameter + adapter | ~3.5 GB + adapter |
 
 Activations for the batch come on top in every row, which is why batch size and sequence length still
-decide whether a LoRA run fits.
+decide whether a LoRA run fits. Agent traces are long (tool schemas, calls and results), so sequence
+length is usually the binding constraint.
 
 ## Production patterns
+- **Fine-tune on curated agent traces, not raw logs.** Keep only traces that passed your eval or a human
+  review, render each with `apply_chat_template` and the same tool definitions the agent uses, and hold
+  out a set of tasks. Monitor tool-call parse rate and task success on the held-out tasks after training.
 - **Pin and mirror every artifact.** Pass `revision="<commit sha>"` to each `from_pretrained`, pre-fill
   the cache with `huggingface_hub.snapshot_download`, and run with `HF_HUB_OFFLINE=1`. Monitor for any
   load that reaches the network in production.
@@ -241,15 +289,19 @@ decide whether a LoRA run fits.
   `accelerate` in a lockfile next to the config, because renamed arguments or changed defaults silently
   alter training. Record versions with every run.
 - **Mask loss to assistant tokens and verify it.** Use your TRL version's assistant-only or
-  completion-only loss option, then decode one batch and check that prompt positions have label -100
-  (the ignore index). Watch held-out task metrics, not training loss.
+  completion-only loss option, then decode one batch and check that prompt and tool-result positions have
+  label -100 (the ignore index). Watch held-out task metrics, not training loss.
 - **Merge for one tenant, swap for many.** Merge with `merge_and_unload()` when one adapter serves all
   traffic; keep adapters separate on an engine that loads LoRA per request (for example vLLM with
   `--enable-lora`) for adapter-per-tenant. Monitor per-adapter latency and quality.
 - **Export to an inference engine for traffic.** Use `generate()` for evals and batch jobs, and serve
-  concurrent users from vLLM or SGLang. Monitor time to first token and throughput under load.
+  concurrent agents from vLLM or SGLang behind an OpenAI-compatible endpoint, so the agent code does not
+  change. Monitor time to first token and throughput under load.
 
 ## Trade-offs
+- **Fine-tuned open model vs prompted hosted model.** A LoRA on traces can match a narrow agent task at
+  lower cost and latency, and keeps data in-house, but you own evals, serving and every base-model
+  upgrade. Prompting a hosted model wins while the task still changes weekly.
 - **Instant access vs supply-chain risk.** `from_pretrained` by name reaches thousands of models but
   fetches weights at runtime (and, with `trust_remote_code=True`, Python code too) from whatever the
   branch currently holds. Pin a revision hash and mirror artifacts once you leave experimentation.
@@ -266,9 +318,13 @@ decide whether a LoRA run fits.
 
 ## Pitfalls
 - **Hand-formatted prompts instead of `apply_chat_template`.** The model answers, but quality is oddly
-  poor, it ignores the system prompt, or keeps generating past where it should stop.
-- **Loss on prompt tokens as well as completions during SFT.** The model learns to imitate users.
-  Symptom: outputs that echo or continue the question instead of answering it.
+  poor, it ignores the system prompt, or keeps generating past where it should stop. With tools, it
+  writes tool calls in a format your parser rejects.
+- **Training and serving with different tool renderings.** Traces rendered one way at training time and
+  tools passed another way at inference. Symptom: tool-call accuracy on evals drops after deployment.
+  Fix: one function renders both, through the same template and tool list.
+- **Loss on prompt tokens as well as completions during SFT.** The model learns to imitate users (and
+  tool outputs). Symptom: outputs that echo or continue the question instead of answering it.
 - **`trust_remote_code=True` on an unvetted repository.** It executes arbitrary Python from the hub at
   load time; the symptom may be nothing visible at all, which is the danger.
 - **Unpinned library versions.** TRL or transformers upgrades rename arguments or change defaults, and a
@@ -281,14 +337,15 @@ decide whether a LoRA run fits.
 
 ## When to use
 - **Use `transformers` + `tokenizers`** whenever you run an open-weight model in Python for experiments,
-  offline batch work, evaluation or embedding.
-- **Use `datasets`** when training or eval data exceeds a few hundred megabytes or needs reproducible
-  preprocessing.
+  offline batch work, evaluation, an LLM judge or embedding.
+- **Use `datasets`** when training or eval data (agent traces, eval tasks) exceeds a few hundred
+  megabytes or needs reproducible preprocessing.
 - **Use PEFT + TRL** when prompting and retrieval have plateaued and you have a few thousand high-quality
   examples of the target behaviour; use Accelerate when one GPU is not enough.
 - **Avoid** serving high-concurrency traffic from this stack; export the model (merged weights or base
   plus adapter) to an inference engine.
-- **Measure** eval loss and a task metric on a held-out set, not training loss.
+- **Measure** eval loss and a task metric on a held-out set (for agents, tool-call validity and task
+  success), not training loss.
 - **Interviews:** LoRA's parameter arithmetic, why chat templates matter, and when to fine-tune instead
   of prompt.
 
@@ -327,13 +384,21 @@ metric on held-out conversations, since falling training loss says little about 
 - **Scale:** with `lora_alpha=32` the update is multiplied by α/r = 2, which keeps magnitude stable if
   you later change r.
 
-### When would you choose full fine-tuning over LoRA, or neither?
-- **Neither** while prompting and retrieval still improve the task metric, because both are cheaper to
-  change than weights.
-- **LoRA by default:** far less memory, megabyte-sized adapters, many adapters per base and no latency
-  once merged.
+### When would you fine-tune an open model for your agent, and when would you not?
+- **Not while prompting and retrieval still improve the task metric**, because both are cheaper to
+  change than weights, and a hosted model with good tool use may already be enough.
+- **LoRA by default** when cost, latency or data residency force an open model: far less memory,
+  megabyte-sized adapters, many adapters per base and no latency once merged.
 - **Full fine-tuning** when the task needs broad behaviour change that LoRA underfits and you can afford
   roughly 16 bytes per parameter of training memory.
+
+### After LoRA SFT on agent traces, the model's tool calls fail to parse 20 percent of the time in production but not in evals. What do you check?
+- **Rendering parity:** are tools passed to `apply_chat_template` at inference exactly as they were when
+  the traces were rendered for training, with the same pinned tokenizer revision?
+- **Serving path:** does the inference engine apply the same chat template and tool parser as your eval
+  harness, or a default one?
+- **Data coverage:** do training traces include the tools and argument shapes now failing? Log failing
+  raw outputs and diff them against the training format.
 
 ### A customer runs in an air-gapped network. How do you deliver a fine-tuned open model?
 - **Pre-fetch everything outside:** `huggingface_hub.snapshot_download` at a pinned commit for the base,

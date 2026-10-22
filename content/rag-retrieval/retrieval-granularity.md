@@ -5,7 +5,8 @@ name: Retrieval granularity
 kind: decision
 difficulty: core
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/chunking-strategies
   - rag-retrieval/chunk-overlap
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Granularity is the size of the retrieved unit, from sentence to document. Small units match sharply but
-starve the generator; large units carry context but blur vectors. Resolve it by matching on small units
-and returning their parent, measured per question type.
+Granularity is what one search hit hands your agent: a sentence, a section or a document. Small units
+match sharply but starve the agent of context; large ones blur vectors and eat its window. Match small,
+return the parent, or let the agent expand hits.
+
+## For agent builders
+- **Why it matters for agents.** An agent reads every tool result into a context it shares with tool
+  schemas, history and reasoning. The return unit decides whether one search answers the step or
+  whether the agent burns more calls hunting for the qualifier in the next sentence.
+- **Where it shows up in your stack.** LangChain `ParentDocumentRetriever`, LlamaIndex
+  `SentenceWindowNodeParser` and auto-merging retrievers, and in agent design as a two-tool pattern:
+  a search tool that returns short snippets with ids plus a read tool that fetches the parent section.
+- **What you control.** Match unit, return unit, parent scoring (max or sum), the evidence token budget
+  per tool call, and whether expansion is automatic or a decision the agent makes.
+- **What you can skip.** Proposition rewriting and late-interaction models until a golden set shows
+  small-to-big with parent dedupe is not enough.
 
 ## Why it exists
 - **It is a different question from chunking.** Chunking decides how a document is cut; granularity
@@ -61,11 +74,19 @@ Index the small unit with a pointer to its parent: `{unit_id, text, parent_id, p
 2. Map each to its parent.
 3. Deduplicate parents (several sentences from one section are one hit).
 4. Score each parent by its best child, or by a sum that rewards sections with several matching sentences.
-5. Return the top-k parents to the generator.
+5. Return the top-k parents to the agent.
 
-This works *because* sentence vectors stay sharp for matching while the generator gets the section that
+This works *because* sentence vectors stay sharp for matching while the agent gets the section that
 makes the sentence interpretable. It is the mechanism behind sentence-window retrieval, parent-document
 retrieval and auto-merging retrievers in common frameworks.
+
+### Agent-driven expansion
+- **The agent can be the parent lookup.** The search tool returns short snippets with `parent_id`; a
+  second tool returns the parent on request. The agent reads parents only for hits it judges relevant.
+- **Why it helps:** most snippets are rejected cheaply, so the budget goes to the one or two parents
+  that matter. Coding agents already work this way: search, then open the file.
+- **What it costs:** an extra tool call, and therefore an extra model step, per expanded hit, plus the
+  risk the agent answers from the snippet without expanding. Prompt it to expand before quoting numbers.
 
 ### Variants
 - **Sentence window:** match a sentence, return it plus `w` neighbours on each side. Cheap and local;
@@ -81,15 +102,17 @@ retrieval and auto-merging retrievers in common frameworks.
   the cost of an LLM pass over the whole corpus at indexing time.
 - **Multi-vector (late interaction):** the finest match unit is the token. ColBERT-style models keep one
   vector per token and score a passage by summing, over query tokens, each one's best match among
-  passage tokens. The return unit stays the passage: decoupling at its limit, because matching sees fine
-  detail without a separate parent lookup, paid for with one vector per token instead of one per chunk.
+  passage tokens. The return unit stays the passage.
+- **Why late interaction is decoupling at its limit:** matching sees fine detail without a separate
+  parent lookup, paid for with one vector per token instead of one per chunk.
 
 ### Making the small unit self-sufficient
 - **"The cap is twelve months of fees" embeds well only if the vector knows *which* cap.**
 - Carry context into the embedded text: the heading path, the document title, or a short generated
   description of where the span sits (contextual retrieval).
 - **The finer the match unit, the more it depends on this**, because a sentence has less of its own
-  context to lean on than a 500-token passage.
+  context to lean on than a 500-token passage. Snippets shown to an agent need it too, or the agent
+  cannot judge which hit to expand.
 
 ### Scoring parents
 | Scoring | Favours | Question type |
@@ -103,26 +126,27 @@ parent text together, settle the order.
 ### Interaction with the context budget
 - **A budget of, say, 4,000 tokens of evidence** fits forty 100-token sentence windows, eight 500-token
   passages or two 2,000-token sections.
-- **Usage degrades** as the prompt grows and as relevant facts move away from the beginning and end.
+- **Usage degrades** as the prompt grows and as relevant facts move away from the beginning and end. In
+  an agent, earlier tool results pile up, so each new result lands further into a long context.
 - **So fewer, larger, well-chosen parents** usually beat filling the budget with small fragments.
   Granularity is also a lever on lost-in-the-middle effects.
 
 ## Diagram
 Follow the small-to-big path: small units are matched, mapped to parents, deduplicated and scored, and
-only bounded parents reach the generator's evidence budget.
+only bounded parents reach the agent's evidence budget.
 
 ```mermaid
 flowchart TD
-    Q["Query"] --> V[("Index of small units, each with parent_id")]
+    Q["Agent search query"] --> V[("Small units, each with parent_id")]
     V -->|"top-N units"| P["Map each unit to its parent"]
     P --> D["Deduplicate parents"]
     D --> S{"Question type?"}
     S -->|"pointed factoid"| MX["Score parent by max child"]
-    S -->|"explain or compare"| SM["Score by sum or count, or auto-merge"]
+    S -->|"explain or compare"| SM["Sum, count or auto-merge"]
     MX --> R["Optional cross-encoder rerank"]
     SM --> R
-    R --> B["Pack top-k parents into evidence budget"]
-    B --> G["Generator"]
+    R --> B["Pack top-k parents into budget"]
+    B --> G["Tool result to agent"]
 ```
 
 ## Examples
@@ -165,6 +189,33 @@ for hit in retrieve("how much can fees be capped at?"):
 # receives the whole section, including the exclusions it needs to answer correctly.
 ```
 
+### Agent scenario: search snippets plus a read tool
+Two tools built on the index above. The agent decides which hits deserve the full parent.
+
+```python
+TOOLS = [
+    {"name": "search", "description": "Find candidate passages. Returns one-sentence snippets "
+     "with a section_id. Snippets omit exceptions: call read_section before quoting a number.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+                      "required": ["query"]}},
+    {"name": "read_section", "description": "Return the full text of one section by section_id.",
+     "input_schema": {"type": "object", "properties": {"section_id": {"type": "string"}},
+                      "required": ["section_id"]}},
+]
+
+def run_tool(name, args):
+    if name == "search":
+        q = model.encode([args["query"]], normalize_embeddings=True)[0]
+        top = np.argsort(-(E @ q))[:5]
+        return "\n".join(f"{parent[i]}: {units[i]}" for i in top)
+    if name == "read_section":
+        return sections.get(args["section_id"], "Unknown section_id.")
+```
+
+- **Typical trace:** search returns "billing/caps: The cap is twelve months of fees." The agent calls
+  `read_section("billing/caps")`, sees the tax exclusion, and answers with the qualifier.
+- **The tool description does real work:** it tells the model when expansion is required.
+
 ### Auto-merging in a few lines
 Return the parent when evidence is concentrated, the children when it is scattered. Pure Python.
 
@@ -200,6 +251,8 @@ print(auto_merge(child_hits, children_of))
 - **The expected fix:** sentence matching with clause-level return sharpens the match on the cap, while
   prompts stay bounded because parents are clauses, not whole contracts. Confirm the gain with
   parent-level recall@k on a golden set rather than assuming it.
+- **Agent variant (illustrative):** five 30-token snippets cost about 150 tokens; expanding the one
+  relevant 500-token clause brings the step to about 650 tokens, against 2,500 for five passages.
 
 ## Production patterns
 - **Parent-document retriever** — when pointed questions rank diluted chunks above the precise one, use
@@ -208,11 +261,15 @@ print(auto_merge(child_hits, children_of))
 - **Sentence window with metadata replacement** — for factoid-heavy corpora, LlamaIndex's
   `SentenceWindowNodeParser` stores neighbours in metadata and `MetadataReplacementPostProcessor` swaps
   them in after retrieval. Monitor answers that miss a qualifier from just outside the window.
+- **Search plus read tools** — for agents, return snippets with ids from search and parents from a
+  separate read tool. Monitor in traces how often the agent expands before quoting, and tool calls per
+  task.
 - **Over-retrieve parents, then rerank** — fetch more parents than you will send (for example 20 for a
   final 5) and let a cross-encoder order them. Monitor reranker latency p95 and the rank of the gold
   parent before and after reranking.
-- **Hard evidence budget** — pack parents in rank order until a fixed evidence token cap, truncating or
-  dropping the rest rather than growing the prompt. Monitor prompt tokens p95 and truncation rate.
+- **Hard evidence budget** — pack parents in rank order until a fixed evidence token cap per tool call,
+  truncating or dropping the rest rather than growing the prompt. Monitor prompt tokens p95 and
+  truncation rate.
 - **Granularity per question type** — route factoid queries to max-child scoring and explanatory or
   comparison queries to sum scoring or auto-merging. Monitor eval scores split by query type, not one
   blended number.
@@ -224,6 +281,8 @@ print(auto_merge(child_hits, children_of))
 - **Large return units vs budget and position.** They give context but spend the budget faster and push
   facts toward the middle of the prompt, where models use them least reliably; the flip point is your
   context budget.
+- **Automatic vs agent-driven expansion.** Automatic parents cost tokens on every hit; agent-driven
+  expansion saves tokens but adds steps and latency, and fails when the model skips the read.
 - **Max-child vs sum scoring.** Max is simple and good for pointed factual questions; sum rewards depth
   and suits explanatory ones. Choose per query type or let a reranker decide.
 - **Propositions vs indexing cost.** Self-contained units brought reported retrieval and QA gains
@@ -240,7 +299,9 @@ print(auto_merge(child_hits, children_of))
 - **One size for matching and returning.** Tuning it endlessly gives a recall-versus-answer-quality
   seesaw that no single value settles.
 - **Parents so large that two fill the context.** Prompts get long, generations slow and costly, and
-  facts in the middle of the prompt are ignored.
+  facts in the middle of the prompt are ignored; in a multi-step agent, earlier results get truncated.
+- **Snippets the agent cannot judge.** A search tool returns bare sentences with no section name, so the
+  agent expands the wrong hit or none. Fix: put the heading path or title in each snippet.
 - **Fixed granularity across question types.** Factoid queries do well while "explain" or "compare"
   queries get fragments that never add up to a complete picture.
 
@@ -249,6 +310,8 @@ print(auto_merge(child_hits, children_of))
   context problems (small chunks producing answers that lack qualifiers).
 - **Start with:** sentence- or small-chunk matching, section-level return, parent dedupe and max-child
   scoring; move to auto-merging or sum scoring when explanatory queries dominate.
+- **Agent-driven expansion when:** the agent searches often and most hits are irrelevant, so paying for
+  parents only on chosen hits saves real context.
 - **Keep whole-document retrieval:** for short documents such as FAQs or tickets, where the document is
   already the right unit.
 - **Measure:** parent-level recall@k, answer faithfulness and prompt token usage together, because
@@ -292,6 +355,13 @@ explanatory queries regress, I would add sum-based parent scoring or a reranker 
   parents.
 - **Make units self-sufficient** by embedding the heading path or title with each small unit.
 
+### Would you give an agent automatic parent expansion or a separate read tool? Defend the choice.
+- **Read tool** when the agent searches many times per task and most hits are noise: snippets are cheap,
+  and only chosen parents spend context.
+- **Automatic expansion** when tasks are single-shot or latency-sensitive, because each read costs a full
+  model step, and a weaker model may skip the read and answer from a fragment.
+- **Decide on evidence:** compare task success, tokens and steps per task on the same golden set.
+
 ### When would you not use sentence-level matching?
 - **Short documents** such as FAQs or tickets are already the right unit, so whole-document retrieval is
   simpler.
@@ -299,16 +369,18 @@ explanatory queries regress, I would add sum-based parent scoring or a reranker 
   index, which costs storage and latency at tens of millions of units.
 - **Explanatory-heavy traffic** may be better served by passage units with sum scoring or auto-merging.
 
-### You have a 4,000-token evidence budget. How do you decide what to send?
+### You have a 4,000-token evidence budget per agent step. How do you decide what to send?
 - **Do the arithmetic:** forty 100-token windows, eight 500-token passages or two 2,000-token sections.
 - **Prefer fewer, well-chosen parents,** because usage degrades as prompts grow and facts drift to the
-  middle.
+  middle, and agent context already holds earlier tool results.
 - **Over-retrieve and rerank,** then pack in rank order until the cap, and monitor truncation rate and
   prompt tokens p95.
 
-### Answers quote the right number but miss an exception stated in the next sentence. What is wrong?
-- **The return unit is too small:** the retriever is sending the matched sentence alone.
-- **Fix:** return a sentence window or the parent clause, so the qualifier travels with the fact.
+### Your agent quotes the right number but misses an exception stated in the next sentence. What is wrong?
+- **The return unit is too small:** the tool is sending the matched sentence alone, or the agent did not
+  call the read tool before answering.
+- **Fix:** return a sentence window or the parent clause, or make the tool description require reading
+  the section before quoting figures.
 - **Verify** with faithfulness checks on a golden set of questions whose answers carry exceptions.
 
 ## Quiz

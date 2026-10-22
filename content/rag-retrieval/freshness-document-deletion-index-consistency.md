@@ -5,7 +5,8 @@ name: Freshness, document deletion and index consistency
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - rag-retrieval/embedding-pipelines
   - rag-retrieval/metadata-filtering
@@ -18,17 +19,31 @@ related:
 ---
 
 ## TL;DR
-A retrieval index is a derived copy that goes stale the moment it is built. Keep it fresh, delete
-completely and never mix versions with one discipline: stable document identity, versioned chunk ids,
-write-new-then-delete-old, and a reconciliation job.
+An agent's search tool reads a derived index that goes stale the moment it is built, and an agent acts
+on what it reads. Keep it fresh and deletable with stable document ids, versioned chunk ids,
+write-new-then-delete-old, and reconciliation.
+
+## For agent builders
+- **Why it matters for agents.** A chatbot that cites a retired policy misleads one user; an agent that
+  reads it may then *act*: quote the old price, approve a refund under last year's rules, email a
+  customer. Stale or undeleted chunks become wrong tool calls, not just wrong sentences.
+- **Where it shows up in your stack.** The ingestion pipeline behind every `search_docs`-style tool, the
+  vector and BM25 stores it queries, semantic answer caches, agent long-term memory stores, and the
+  traces your observability tool keeps of retrieved text.
+- **What you control.** Deterministic chunk ids, the upsert order, the delete fan-out list, a read-time
+  version guard inside the retrieval tool, and returning `version` and `modified_at` in tool results so
+  the agent (and your evals) can see how fresh a passage is.
+- **What you can skip.** Engine internals of lazy deletion and compaction. Know that a delete
+  acknowledgement is not proof, and probe.
 
 ## Why it exists
 - **Everything retrieved is a materialized view.** Chunks, embeddings, keyword postings, parent
-  documents, generated chunk contexts and cached answers were all computed from a past snapshot. None of
-  it is the source of truth.
+  documents, generated chunk contexts, cached answers and agent memories were all computed from a past
+  snapshot. None of it is the source of truth.
 - **The source moves.** A pricing page is edited, an HR policy replaced, a contract terminated, an
   employee's files removed on offboarding, an erasure request received. A stale index answers with full
-  confidence *and a citation*, which is worse than no answer because the user was given a reason to trust it.
+  confidence *and a citation*, which is worse than no answer because the user (or the agent) was given a
+  reason to trust it.
 - **Deletion raises the stakes.** An embedding of a chunk with personal data is still derived personal
   data; a keyword index still holds the words; a cached answer still quotes the paragraph. "We deleted the
   document" is only true when every derived artifact is gone, and a retrieval probe can prove it either way.
@@ -37,15 +52,15 @@ write-new-then-delete-old, and a reconciliation job.
   index partly empty; insert-then-delete duplicates every document. And a crawler only sees what exists
   *now*, so a deleted document never comes up again and its chunks live on forever.
 - **"The model will ignore stale passages" is false.** It cannot tell which of two near-identical policy
-  paragraphs is current; they look equally authoritative.
+  paragraphs is current; they look equally authoritative, and an agent will happily plan on either.
 
 ## How it works
 ### The three properties
-| Property | Meaning |
-|---|---|
-| Freshness | how long a source change takes to become visible in retrieval |
-| Deletion | removing every derived artifact of a document when the source goes away |
-| Consistency | never serving a mix of old and new versions of the same document |
+| Property | Meaning | What it means for an agent |
+|---|---|---|
+| Freshness | how long a source change takes to become visible in retrieval | how long the agent acts on old facts |
+| Deletion | removing every derived artifact of a document when the source goes away | whether the agent can still quote erased data |
+| Consistency | never serving a mix of old and new versions of the same document | whether one tool call returns contradictory passages |
 
 ### Identity first: doc_id, version, chunk id
 - **Every chunk carries four fields.** `doc_id` (stable source identity: a CMS id, a file path plus
@@ -56,7 +71,7 @@ write-new-then-delete-old, and a reconciliation job.
 - **The content hash makes change detection cheap.** Hash the normalized text, compare with the stored
   version, and skip the embedding call when nothing changed.
 - **The hash does not cover metadata.** Permissions can change while the text stays identical, so ACL
-  refresh needs its own path.
+  refresh needs its own path. For agents acting on behalf of a user, a stale ACL is a data leak.
 
 ### Detecting change: push, pull, crawl
 | Mechanism | Sees deletes? | Freshness ceiling | Cost |
@@ -74,18 +89,19 @@ write-new-then-delete-old, and a reconciliation job.
 3. **Delete** chunks whose `doc_id` matches and whose `version` does not.
 
 - **Why this order:** at no point is the document absent, and the old version is removed by filter rather
-  than by an assumed chunk count.
+  than by an assumed chunk count. An agent mid-run never gets an empty search for a document that exists.
 - **The classic bug is overwriting by `doc_id:chunk_index`.** A document that shrinks from nine chunks to
   seven leaves chunks seven and eight of the old text in the index indefinitely.
 - **The both-versions window is normally short:** the gap between two writes plus any engine refresh
   delay. A crash between steps 1 and 3 can stretch it until reconciliation runs.
 - **Belt and braces: filter after retrieval.** Per `doc_id`, drop chunks whose `version` is not the
-  newest seen (or not the manifest's current version). It is cheap and also hides reconciliation lag.
+  newest seen (or not the manifest's current version). It is cheap, hides reconciliation lag, and belongs
+  inside the retrieval tool so no agent prompt has to remember it.
 
 ### Deleting: tombstone, fan-out, verify
 - **A delete is a fan-out, not a single call.** Targets: the vector index, the keyword (BM25) index of a
   hybrid setup, the parent-document store, LLM-generated chunk contexts or summaries, semantic answer
-  caches, and traces or logs that stored retrieved text.
+  caches, agent long-term memory that copied the text, and traces or logs that stored retrieved text.
 1. **Tombstone** the document so the query path filters it out immediately.
 2. **Delete physically**, asynchronously with retries, in every target.
 3. **Verify with a probe:** query distinctive text from the deleted document and assert nothing returns.
@@ -95,6 +111,9 @@ write-new-then-delete-old, and a reconciliation job.
   engines acknowledge a write before it is searchable.
 - **Some managed vector stores delete only by id or id prefix**, not by metadata filter, which is one
   more reason the ids must be deterministic.
+- **Agent transcripts are a derived store too.** A tool result that quoted the document sits in saved
+  conversation state and checkpoints; a resumed agent can re-read it. Include them in the fan-out or set
+  a retention limit on them.
 
 ### Guarding the delete path
 - **`deleted = manifest − listing` is only as trustworthy as the listing.** An API that times out, pages
@@ -103,7 +122,8 @@ write-new-then-delete-old, and a reconciliation job.
 - **Require a complete listing:** every page fetched, no error.
 - **Cap the blast radius:** refuse a deletion set larger than a threshold fraction of the corpus (for
   example a few percent) without a human or a second listing confirming it.
-- **Deletes are the most cautious write**, because they are the only one re-running cannot repair.
+- **Deletes are the most cautious write**, because they are the only one re-running cannot repair. A
+  wiped index shows up as every agent answering "I could not find anything".
 
 ### Consistency inside the index
 - **One index, one embedding model.** Vectors from two models live in different spaces, so a partial
@@ -116,10 +136,11 @@ write-new-then-delete-old, and a reconciliation job.
 ### Superseded is not the same as deleted
 - **Version ids only handle in-place edits.** The common enterprise case is a *different* replacement
   document: "Travel Policy 2025.pdf" next to "Travel Policy 2024.pdf", both live, near-identical text.
-  Similarity cannot break the tie.
+  Similarity cannot break the tie, and neither can the agent.
 - **The fix is metadata, not embeddings.** Capture `effective_from` / `superseded_by` (or a
   `status: current | archived` field) at ingestion, filter archived documents out by default, and keep
-  them reachable for explicitly historical questions ("what was the policy last year?").
+  them reachable for explicitly historical questions ("what was the policy last year?"). Expose that as a
+  tool parameter, such as an `include_archived` flag, so the agent can ask for history deliberately.
 - **A softer alternative is a recency prior:** `score = similarity × exp(−age / τ)`. It prefers newer text
   without hiding older text: right for news-like corpora, wrong for reference material, where a
   ten-year-old standard can still be authoritative.
@@ -142,8 +163,9 @@ lag = detection delay (webhook latency or poll interval)
   re-embedding cost per day as a proxy for how well change detection works.
 
 ## Diagram
-Follow a source change from detection to a verified index: edits take the write-new-then-delete-old path,
-deletes take the tombstone and fan-out path, and reconciliation catches whatever the incremental path missed.
+Follow a source change from detection to a verified index that the agent's search tool reads: edits take
+the write-new-then-delete-old path, deletes take the tombstone and fan-out path, and reconciliation
+catches whatever the incremental path missed.
 
 ```mermaid
 flowchart TD
@@ -152,14 +174,44 @@ flowchart TD
     W --> F["Flip manifest to new version"]
     F --> O["Delete old version by doc_id filter"]
     D -->|"deleted at source"| T["Tombstone doc_id on query path"]
-    T --> X["Fan-out delete: vector, BM25, parent store, caches"]
+    T --> X["Fan-out delete: vector, BM25, caches, memory"]
     X --> P["Probe: search distinctive text, expect nothing"]
     O --> I[("Index serves one version")]
     P --> I
-    R["Scheduled reconciliation: manifest vs index"] -.->|"repair orphans both ways"| I
+    R["Scheduled reconciliation"] -.->|"repair orphans both ways"| I
+    I --> A["Agent search tool with version guard"]
 ```
 
 ## Examples
+### Agent scenario: a search tool that guards versions and reports freshness
+The agent never sees raw index hits. The tool drops tombstoned and superseded chunks, then returns
+`version` and `modified_at` with each passage so the agent can cite them and your evals can check them.
+
+```python
+def search_docs(query: str, k: int = 5, include_archived: bool = False,
+                *, index, manifest, tombstones, doc_meta) -> list[dict]:
+    """Tool exposed to the agent. Over-fetch, then filter, so stale hits do not eat the k slots."""
+    hits = index.search(query, k=k * 3)
+    out, seen = [], set()
+    for h in hits:
+        d, v = h.meta["doc_id"], h.meta["version"]
+        if d in tombstones or manifest.get(d) != v:       # deleted, or an old version still lingering
+            continue
+        meta = doc_meta[d]
+        if meta["status"] == "archived" and not include_archived:
+            continue                                      # superseded policy: hidden unless asked for
+        out.append({"doc_id": d, "version": v, "modified_at": meta["modified_at"],
+                    "text": h.text, "superseded_by": meta.get("superseded_by")})
+        seen.add(d)
+        if len(out) == k:
+            break
+    return out                                            # log len(hits) - len(out) as "dropped" per call
+
+# Tool schema description shown to the model (plain words, no hidden policy):
+# "Searches current company documents. Results include modified_at. Set include_archived=true only
+#  when the user asks about a past version of a policy."
+```
+
 ### Versioned upsert, fan-out delete and reconciliation
 Runs against a generic vector store and keyword index. Any engine that supports upsert by id and delete by
 metadata filter (or by id prefix) fits this shape.
@@ -234,8 +286,9 @@ upsert_versioned("policy", "v1", v1); upsert_versioned("policy", "v2", v2)
 print(len(index), all(v.startswith("new") for v in index.values()))  # 7 True
 ```
 
-### Worked scenario: a freshness lag budget
-A pricing page must be correct in retrieval within 10 minutes of an edit (illustrative SLO).
+### Worked scenario: a freshness lag budget for a support agent
+A support agent quotes prices from a pricing page that must be correct in retrieval within 10 minutes of
+an edit (illustrative SLO).
 
 | Term | Poll design | Webhook design |
 |---|---|---|
@@ -245,27 +298,35 @@ A pricing page must be correct in retrieval within 10 minutes of an edit (illust
 | Worst case | ≈ 5.5 min: meets the SLO | well under 1 min |
 | If embeddings go through an hourly batch queue | ≈ 65 min: misses it | ≈ 60 min: misses it |
 
-The lesson: the slowest term owns the lag, so measure each term before tuning the poll interval.
+The lesson: the slowest term owns the lag, so measure each term before tuning the poll interval. During
+that window every agent run that quotes the price uses the old one.
 
 ## Production patterns
 - **Canary freshness probes.** On a schedule, write a canary document containing a unique token, poll
   retrieval until it appears, then delete it and poll until it vanishes. Emit both delays as metrics and
   alert when p95 exceeds the content class's freshness SLO.
 - **Deleted-document leak probes.** Keep a list of distinctive phrases from documents deleted in the
-  last N days; query them in CI and hourly against every retrieval leg (vector, BM25, answer cache).
-  Any hit pages the owner; track hits per leg to find the store missing from the fan-out.
+  last N days; query them in CI and hourly against every retrieval leg (vector, BM25, answer cache,
+  agent memory). Any hit pages the owner; track hits per leg to find the store missing from the fan-out.
 - **Mass-delete circuit breaker.** Apply reconciliation deletes only when the listing completed every
   page without error and the set is under a fraction such as `max_frac=0.05`; otherwise stop and alert.
   Monitor deletion-set size per run and listing completeness.
-- **Read-time version guard.** After retrieval, keep only chunks whose `version` equals the manifest's
-  current version for their `doc_id`, and drop tombstoned ids. Count dropped chunks per query; a rising
-  count means reconciliation or delete fan-out is lagging.
-- **Reconcile and compact on a schedule.** Run the manifest-versus-index diff at a fixed cadence, repair
-  orphans both ways, and, where a compliance SLA requires physical erasure, schedule the engine's
-  compaction or optimization afterwards and re-run the probe. Track orphan count over time.
+- **Read-time version guard inside the tool.** After retrieval, keep only chunks whose `version` equals
+  the manifest's current version for their `doc_id`, and drop tombstoned ids, in the tool code rather
+  than the prompt. Count dropped chunks per call; a rising count means reconciliation is lagging.
+- **Freshness in tool results and evals.** Return `modified_at` with each passage, and add eval cases
+  that edit a source document, wait for the SLO, then run the agent and assert it uses the new value.
+  Track the pass rate of these "changed fact" cases per release.
+- **Use the framework's sync helper, then verify it.** LangChain's indexing API keeps a record manager of
+  document hashes keyed by a source id and can clean up chunks of changed or vanished sources ("incremental"
+  or "full" cleanup); LlamaIndex ingestion pipelines can attach a docstore for upsert-and-delete behaviour.
+  Both are a manifest you did not write, so still run leak probes against every store.
 - **Default-filter archived documents.** Set `status: current | archived` at ingestion and apply
   `status = current` as a default filter, lifting it only when the query is explicitly historical.
   Monitor how often both a document and its `superseded_by` successor appear in one result set.
+- **Reconcile and compact on a schedule.** Run the manifest-versus-index diff at a fixed cadence, repair
+  orphans both ways, and, where a compliance SLA requires physical erasure, schedule the engine's
+  compaction or optimization afterwards and re-run the probe. Track orphan count over time.
 
 ## Trade-offs
 - **Incremental upserts vs full rebuild.** Upserts give minutes-level freshness but add a manifest,
@@ -281,14 +342,19 @@ The lesson: the slowest term owns the lag, so measure each term before tuning th
   on handling missed ones. Polling is more robust and simpler but burns API quota and is capped by the
   poll interval.
 - **Post-retrieval dedup vs result count.** Deduping by `doc_id` keeping the newest version hides
-  mixed-version windows cheaply, at the cost of occasionally returning fewer than k distinct passages.
+  mixed-version windows cheaply, at the cost of occasionally returning fewer than k distinct passages;
+  over-fetching in the tool (for example 3k) recovers most of them for a little latency.
+- **Live retrieval vs agent memory copies.** Letting an agent save facts to long-term memory saves
+  repeated searches, but every copy is another store to keep fresh and delete. Store a `doc_id` reference
+  with the memory, not just the text, when the fact can change.
 
 ## Pitfalls
 - **Overwriting chunks by position (`doc_id:index`) instead of by version.** Symptom: retrieval returns
   paragraphs that no longer exist, which users report as "that is not in the file". Fix: versioned ids and
   delete-by-filter.
 - **Leaving stores out of the delete fan-out.** Symptom: a deleted document is still cited, often only via
-  the BM25 leg of hybrid search or a cached answer. Fix: list every derived store as a fan-out target.
+  the BM25 leg of hybrid search, a cached answer or an agent memory. Fix: list every derived store as a
+  fan-out target.
 - **Treating the delete acknowledgement as proof of removal.** Symptom: a probe still retrieves the text
   minutes later because the delete is lazy or awaits a refresh. Fix: verify with a probe.
 - **Changing embedding models and upserting only changed documents.** Symptom: recall collapses for older
@@ -303,16 +369,19 @@ The lesson: the slowest term owns the lag, so measure each term before tuning th
 - **Confusing chunk-level `indexed_at` with document-level `modified_at` in recency filters.** Symptom: a
   re-indexed old document is treated as "new" by date-sorted retrieval. Fix: store the source's
   `modified_at` or `effective_from` on every chunk and sort or decay on that.
+- **Putting freshness rules in the prompt.** Symptom: "prefer the newest document" works in demos but the
+  agent still mixes versions when two passages look equally current. Fix: enforce the version guard and
+  archive filter in tool code, and show `modified_at` only as supporting evidence.
 
 ## When to use
 Every production index needs a freshness tier, a deletion contract and a reconciliation loop; what changes
 is how strict each is.
 - **Strict tier:** pricing, policy, HR and legal content usually needs minutes-level freshness and
-  provable deletion.
+  provable deletion, especially when an agent acts on it (refunds, quotes, approvals).
 - **Relaxed tier:** static manuals can tolerate a daily crawl.
 - **Decide per content class**, write the numbers down as SLOs, and measure them.
 - **Measure:** staleness lag via canaries, deleted-document leak probes, orphan counts from
-  reconciliation, and re-embedding cost per day.
+  reconciliation, dropped-chunk counts in the retrieval tool, and re-embedding cost per day.
 - **Day to day:** this is the stage where the ingestion pipeline earns its complexity.
 - **Interviews:** "what happens when a document is deleted?" separates people who have run RAG in
   production from people who have demoed it. Expected answer: fan-out, tombstone, verification and
@@ -351,6 +420,15 @@ monitoring so the next leak pages someone instead of waiting for a customer.
 - **Deterministic ids also matter for stores that delete only by id or id prefix**, since there is no
   metadata filter to fall back on.
 
+### Your support agent issued a refund under last year's policy, citing it as current. How do you debug and fix it?
+- **Read the trace first:** check the `search_docs` tool result for that step. Did it return the 2024
+  document alone, both versions, or an old chunk of an edited one? That separates a superseded-document
+  problem from a versioning or deletion bug.
+- **Superseded case:** add `superseded_by` and `status: current | archived` at ingestion and filter
+  archived documents in the tool by default, with an explicit flag for historical questions.
+- **Lock it in** with a "changed fact" eval case that runs the agent against the policy question and
+  asserts the current document is cited.
+
 ### Your nightly reconciliation job just deleted 80% of the index. What happened and how do you stop it recurring?
 - **Most likely the source listing failed silently:** a timeout, broken paging or a revoked token returned
   an empty or truncated list, so `deleted = manifest − listing` covered almost everything.
@@ -367,15 +445,16 @@ monitoring so the next leak pages someone instead of waiting for a customer.
 - **Not when freshness matters:** a rebuild caps freshness at the rebuild interval (hours) and its cost
   scales with the whole corpus even when a fraction of a percent changed.
 
-### A compliance team asks you to prove an erased customer record is gone from the RAG system. What do you show them?
+### A compliance team asks you to prove an erased customer record is gone from your agent platform. What do you show them?
 - **The fan-out list:** vector index, keyword index, parent-document store, generated chunk contexts,
-  semantic answer caches and any traces or logs that stored retrieved text.
+  semantic answer caches, agent long-term memory, saved conversation state, and any traces or logs that
+  stored retrieved text.
 - **Probe results:** queries for distinctive text from the record against every retrieval leg returning
   nothing, because a delete acknowledgement is not proof on engines that delete lazily.
 - **Physical erasure evidence:** if the SLA demands it, the scheduled compaction or optimization run after
   the delete, followed by a repeated probe.
 
-### How do you set and measure a freshness SLO for a pricing page?
+### How do you set and measure a freshness SLO for a pricing page an agent quotes from?
 - **Break lag into three terms:** detection delay, processing, and engine visibility; the slowest term owns
   the total.
 - **Worked number:** a five-minute poll plus a thirty-second pipeline is about 5.5 minutes worst case, which

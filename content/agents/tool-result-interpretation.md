@@ -5,7 +5,8 @@ name: Tool-result interpretation
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/tool-calling
   - agents/typed-tool-contracts
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-A tool result is a prompt the model reads. Its shape decides whether the model understands success,
+A tool result is a prompt your agent reads. Its shape decides whether the model understands success,
 failure, "nothing found" and "more available", and whether it mistakes retrieved content for
 instructions, so design results for that reader.
+
+## For agent builders
+- **Why it matters for agents.** The model's next step is only as good as its reading of the last result.
+  An empty list, a silent truncation or an injected instruction in a fetched page each send the loop
+  somewhere wrong, and results are also the biggest driver of transcript growth and cost.
+- **Where it shows up in your stack.** `tool_result` blocks and `is_error` on the Claude API, `role:
+  "tool"` messages on OpenAI, LangChain's `ToolMessage` (whose content-and-artifact tool format keeps raw
+  data out of the model's view), LangGraph's `ToolNode` error handling, and MCP's `content`,
+  `structuredContent` and `isError`.
+- **What you control.** The normalizer every handler passes through: explicit status, counts and
+  truncation flags, a size budget, `as_of` and `source` fields, labelling of untrusted content, and when
+  old results are cleared.
+- **What you can skip.** Clever prose formatting. Small, consistent, explicit structure beats it.
 
 ## Why it exists
 - **The model never sees your return value, only text in a user turn.** That gap produces a recognizable
@@ -298,6 +312,13 @@ eval set so a regression is caught before it ships.
 - **Give it the means:** each result carries `as_of` and `source`, such as billing versus CRM.
 - **Instruct it** to prefer the system of record or the newer value and to say which it used.
 - **Without those fields** it picks whichever it read last or blends them into an answer neither system gave.
+
+### A tool returns a 2 MB API payload and the agent's cost per run tripled. What do you change?
+- **Normalize before the model sees it:** project the fields the task needs, cap list length, and add a
+  count and a truncation flag so the model knows more exists.
+- **Keep the raw payload outside the transcript,** for example as a framework artifact or in a store
+  keyed by id, and give the model a handle to fetch more.
+- **Enforce the per-result budget in the harness** and watch result tokens per tool in traces.
 
 ## Quiz
 ### Q: Why should a search tool return an explicit "empty" status instead of an empty list?

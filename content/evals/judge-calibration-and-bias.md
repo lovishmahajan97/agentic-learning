@@ -5,7 +5,8 @@ name: Judge calibration & bias
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/llm-as-a-judge
   - evals/rubrics
@@ -21,17 +22,31 @@ sources:
 ---
 
 ## TL;DR
-An LLM judge is an instrument with systematic errors: it favours the first answer, the longer one, its
-own style, and bunches scores high. Measure those errors against human labels before trusting it, then
-change the protocol to shrink them.
+The judge that grades your agent's traces is an instrument with systematic errors: it favours the
+first answer, the longer one, its own family's style, and scores high. Measure it against human labels
+before it gates an agent release.
+
+## For agent builders
+- **Why it matters for agents.** Most agent quality checks that are not assertions (did it resolve the
+  ticket, was the reply grounded in the tool results, was the plan sensible) end up with an LLM judge.
+  An uncalibrated judge turns "the agent got wordier" into "the agent got better".
+- **Where it shows up in your stack.** Evaluators in LangSmith, Braintrust, promptfoo or Inspect,
+  online scoring of sampled production traces, and critic or reflection steps inside the agent that
+  approve a draft before it is sent.
+- **What you control.** What slice of the trace the judge sees (final reply only, or tool calls and
+  results too), the judge family relative to the agent's model, order swapping, the pinned judge
+  version, and the TPR/TNR bar a judge must clear before it may block a deploy.
+- **What you can skip.** Judging anything checkable: final sandbox state, tool-argument schema, step
+  counts, test results. Assert those in code and calibrate the judge only for the rest.
 
 ## Why it exists
 - **Judges are cheap, so they get trusted.** A judge model scales to thousands of outputs, which makes it
   attractive, but like every instrument it has two kinds of error.
 - **Variance averages away; bias does not.** *Variance* is noise: run twice, get slightly different
   numbers, so repeat and average. *Bias* is a systematic tilt that no amount of repetition removes.
-- **Bias manufactures wins.** If the judge likes long answers and a new prompt makes answers 30% longer,
-  it reports an improvement users may never feel, and every repeat confirms the same wrong conclusion.
+- **Bias manufactures wins.** If the judge likes long answers and a new agent prompt makes replies 30%
+  longer (or adds tool calls that change nothing), it reports an improvement users may never feel, and
+  every repeat confirms the same wrong conclusion.
 - **"Use the strongest model and trust it" fails.** Stronger judges still show these biases, just less,
   and without human labels you cannot tell how much.
 - **Biases are invisible in an aggregate score.** They must be probed deliberately with controlled
@@ -50,8 +65,22 @@ change the protocol to shrink them.
 | **Knowledge-gap leniency** | a fluent but wrong proof passes when the judge cannot do the math either | practitioner experience |
 | **Anchoring** | any hint in the prompt (a reference answer, a label like "improved version") pulls the verdict | practitioner experience |
 
+### How the biases look on agent traces
+Practitioner experience, not a published taxonomy; probe each one on your own traces.
+
+| Bias on a trajectory | What it looks like | Probe |
+|---|---|---|
+| **Taking the agent's word** | the final reply says "I've issued the refund", the judge passes it, but the tool call returned an error | label traces where claimed and actual tool outcomes differ |
+| **Effort as merit** | longer trajectories with more tool calls score higher, even when a 2-step run solved the task | compare judge and human preference on short-vs-long runs that both succeed |
+| **Shared family** | the agent and the judge run on the same model family, so the agent's phrasing reads as "correct" | re-judge the same traces with a judge from another family |
+| **Leniency on silence** | an agent that asks a needless clarifying question, or stops early, is rarely failed | seed the calibration set with should-have-acted traces |
+
+- **The fix for most of them is input design:** show the judge the tool calls and results it needs,
+  not only the final message, and ask one criterion per call.
+
 ### Step 1: build a calibration set
-1. **Sample real inputs**, on the order of 100–300 items (illustrative).
+1. **Sample real inputs**, on the order of 100–300 items (illustrative). For an agent these are whole
+   traces from production or the eval harness, stratified by task type and outcome.
 2. **Have humans label them with the exact rubric** the judge will use.
 3. **Seed it with bias-exposing cases:** correct-but-terse answers, wrong-but-eloquent ones, pairs that
    differ only in formatting, and genuine ties.
@@ -134,12 +163,13 @@ where p is the true (human) pass rate.
   is an unlabeled gauge.
 
 ## Diagram
-The calibration loop: a judge earns the right to gate only after its agreement with humans is close to
-human–human agreement; every bias found feeds a protocol change and a re-measure.
+The calibration loop for an agent's judge: it earns the right to gate a deploy only after its agreement
+with humans on real traces is close to human–human agreement; every bias found feeds a protocol change
+and a re-measure.
 
 ```mermaid
 flowchart TD
-    S["Sample 100-300 real inputs"] --> H["Humans label with the rubric"]
+    S["Sample 100-300 agent traces"] --> H["Humans label with the rubric"]
     H --> IAA["Human-human agreement: the ceiling"]
     H --> J["Judge labels the same items"]
     J --> M["Agreement, TPR, TNR vs humans"]
@@ -235,24 +265,66 @@ print(bootstrap(judge, human, p_obs=0.82))     # roughly (0.75, 0.85) on this se
   (it scales with 1/√n), and the corrected interval widens with it. The 0.05 floor on TPR + TNR − 1 is an illustrative guard, not a
   standard.
 
+### Agent scenario: a "ticket resolved" judge that read only the final reply
+A support agent calls `lookup_order`, `issue_refund` and `send_email` tools. The team calibrates a
+"ticket resolved" judge on 300 human-labeled traces (200 human-pass, 100 human-fail), first showing the
+judge only the final reply, then the reply plus every tool call and result. Numbers are illustrative.
+
+| Judge input | Passes of 200 human-pass | Fails of 100 human-fail | TPR | TNR | TPR + TNR − 1 |
+|---|---|---|---|---|---|
+| Final reply only | 192 | 60 | 0.96 | 0.60 | 0.56 |
+| Reply plus tool calls and results | 190 | 85 | 0.95 | 0.85 | 0.80 |
+
+- **Why TNR was low:** most of the 40 missed failures were replies that claimed an action ("your
+  refund is on its way") whose tool call had returned an error. The judge took the agent's word.
+- **What it does to a release decision:** agent v2 truly resolves 80% of tickets versus 75% for v1.
+
+| Judge | Shows v1 | Shows v2 | Visible gap |
+|---|---|---|---|
+| Final reply only | 0.96 × 0.75 + 0.40 × 0.25 = 82% | 84.8% | 2.8 points |
+| With tool results | 0.95 × 0.75 + 0.15 × 0.25 = 75% | 79% | 4 points |
+
+```python
+def judge_view(trace, include_tools=True):
+    """Render the slice of an agent trace the judge sees. trace: list of step dicts."""
+    lines = []
+    for step in trace:
+        if step["type"] == "tool_call" and include_tools:
+            lines.append(f"TOOL CALL {step['name']}({step['args']})")
+        elif step["type"] == "tool_result" and include_tools:
+            lines.append(f"TOOL RESULT {step['name']}: {step['output']}")   # errors included verbatim
+        elif step["type"] == "assistant":
+            lines.append(f"AGENT: {step['text']}")
+    return "\n".join(lines)
+# Calibrate each view on the same labeled traces; keep the one whose TNR clears your bar.
+```
+
 ## Production patterns
-- **Calibration job in CI.** When the judge model, judge prompt or task changes, re-run the judge on the
-  versioned human-labeled set and fail the build if kappa or TNR falls below a threshold set relative to
-  human–human agreement. Monitor agreement, TPR and TNR per release.
+- **Calibration job in the agent's CI.** When the judge model, judge prompt, the agent's tools or the
+  task changes, re-run the judge on the versioned set of human-labeled traces and fail the build if
+  kappa or TNR falls below a threshold set relative to human–human agreement. Monitor agreement, TPR
+  and TNR per release.
+- **Give the judge the evidence, not the claim.** Render tool calls and results into the judge input
+  for any criterion about actions taken, and assert final state in code where the sandbox exposes it.
+  Monitor TNR on traces where the agent's reply and its tool results disagree.
 - **Pin the judge by dated snapshot.** Call a dated model version rather than a moving alias and store the
   judge prompt hash with every score. Monitor for step changes in historical trends on days your system
   did not change.
 - **Swap-and-tie for pairwise gates.** Judge each pair in both orders, count flips as ties, and log the
   flip rate as its own metric. If it rises above what you measured at calibration, re-calibrate before
   trusting the win rate.
-- **Cross-family judge panel for model selection.** When the candidates include the judge's own family,
-  use two or three judges from different families and take a majority vote. Monitor how often panel
-  members disagree.
+- **Cross-family judge panel for agent model swaps.** When the candidate agent models include the
+  judge's own family, use two or three judges from different families and take a majority vote.
+  Monitor how often panel members disagree.
 - **Route low-confidence verdicts to humans.** Use the confidence buckets from Step 2b to send verdicts
   below a chosen confidence to a review queue. Monitor queue volume and human–judge agreement on the
   routed items.
-- **Ongoing human spot checks.** Sample a small fixed share of production-judged items each week for
-  human labels, and add them to the calibration set. Monitor agreement over time to catch drift.
+- **Ongoing human spot checks on live traces.** Sample a small fixed share of production-judged agent
+  traces each week for human labels, and add them to the calibration set. Monitor agreement over time
+  to catch drift as users and tools change.
+- **Calibrate in-agent critics too.** A reflection or critic step that approves the agent's draft is a
+  judge on the serve path; measure its TPR and TNR on the same labeled traces before trusting it.
+  Monitor how often it triggers a revision and whether revisions pass the offline judge more often.
 
 ## Trade-offs
 - **Bias removal vs cost.** Position swapping removes the largest pairwise bias but doubles judge cost;
@@ -287,10 +359,13 @@ print(bootstrap(judge, human, p_obs=0.82))     # roughly (0.75, 0.85) on this se
   when the labels are swapped while the content stays the same. Fix: strip identifiers.
 - **Judging in one fixed order.** Symptom: a leaderboard that reorders when candidate A and B are
   exchanged. Fix: both-order judging.
+- **Judging an agent from its final message.** Symptom: high judged resolution rate while users report
+  refunds or bookings that never happened. Fix: include tool calls and results in the judge input, and
+  seed the calibration set with claimed-but-failed traces.
 
 ## When to use
-- **Use when a judge gates a decision:** prompt releases, model swaps, fine-tune selection, vendor
-  comparisons. Calibrate once per combination of judge model, judge prompt and task, and again whenever
+- **Use when a judge gates a decision:** agent prompt or tool releases, model swaps, fine-tune
+  selection, vendor comparisons, and any critic step inside the agent loop. Calibrate once per combination of judge model, judge prompt and task, and again whenever
   any of the three changes.
 - **Measure three numbers:** position inconsistency rate, agreement with humans next to human–human
   agreement (split into TPR and TNR for pass/fail judges), and the judge's length preference relative to
@@ -353,7 +428,15 @@ controls, ship behind an online A/B to confirm.
   and small real improvements fall inside the noise.
 - **Bootstrap the correction** over the calibration set, because TPR and TNR are themselves estimates.
 
-### How do you keep a judge trustworthy over months in production?
+### Your support agent's judged resolution rate is 90%, but refunds users were promised never happened. What is wrong with the judge?
+- **It is probably taking the agent's word:** it sees the final reply ("refund issued") and not the
+  `issue_refund` result, so claimed-but-failed actions pass and TNR is low.
+- **Measure it:** label traces where the reply and the tool results disagree and compute TPR and TNR
+  separately; a single agreement number hides this because most traces pass.
+- **Fix the input and the oracle:** render tool calls and results into the judge prompt, and assert the
+  refund in the sandbox or order system state in code wherever that is possible.
+
+### How do you keep an agent's judge trustworthy over months in production?
 - **Pin a dated judge model and version the judge prompt,** storing both with every score.
 - **Re-run the calibration set in CI** whenever the judge, its prompt or the task changes, and fail the
   build if agreement or TNR drops below the agreed threshold.

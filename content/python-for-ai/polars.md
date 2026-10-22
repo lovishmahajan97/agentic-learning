@@ -5,7 +5,8 @@ name: polars
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/pandas
   - python-for-ai/pyarrow
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-Polars is a Rust DataFrame library on Arrow memory. Its lazy mode optimizes a query plan, pushing
-filters and columns into the scan, and uses all cores, so recurring or multi-gigabyte pipelines
-typically run much faster than in pandas; the API is stricter.
+Polars is a Rust DataFrame library on Arrow memory for agent traces, evals and RAG corpora that outgrow
+pandas. Lazy mode pushes filters and columns into the scan and uses all cores, so recurring
+multi-gigabyte jobs typically run much faster; the API is stricter.
+
+## For agent builders
+- **Why it matters for agents.** A production agent fleet writes one row per step, with prompts and tool
+  outputs attached; that reaches tens of gigabytes quickly. Daily cost per model, error rate per tool,
+  steps per run, and "turn last month's good traces into a fine-tuning set" are scheduled jobs over it.
+- **Where it shows up in your stack.** Nightly rollups over trace Parquet or JSONL exports, eval
+  aggregation across thousands of runs, deduplicating and filtering documents before chunking and
+  embedding for RAG, and cleaning SFT data built from agent transcripts.
+- **What you control.** Lazy scans with explicit schemas, which columns the plan touches (skip the big
+  prompt text when you only need token counts), file layout for skipping, and deterministic ordering.
+- **What you can skip.** The streaming-engine internals and most of the API surface. Expressions,
+  `scan_*` plus `collect`, `explain()` and `group_by` are the working set.
 
 ## Why it exists
 - **pandas was designed for one core and a few hundred megabytes.** Each operation runs eagerly,
@@ -56,7 +69,8 @@ typically run much faster than in pandas; the API is stricter.
 | `pl.scan_parquet` (also `scan_csv`, `scan_ndjson`) | `LazyFrame` | Nothing until `.collect()`; each call adds a node to a logical plan |
 
 Before executing, the optimizer applies rules such as:
-- **Projection pushdown:** only columns referenced anywhere in the plan are read from disk.
+- **Projection pushdown:** only columns referenced anywhere in the plan are read from disk, so the large
+  prompt and tool-output columns of a trace are never touched by a cost rollup.
 - **Predicate pushdown:** filters move into the scan, so Parquet row groups whose statistics rule them
   out can be skipped.
 - **Simplification and common-subexpression elimination**, so repeated expressions are computed once.
@@ -65,7 +79,7 @@ Before executing, the optimizer applies rules such as:
 
 ### Memory and parallelism
 - **Arrow-style buffers with a validity bitmap.** `null` is distinct from a float `NaN`, and an integer
-  column with missing values stays an integer column.
+  column with missing values stays an integer column (a step with no token count stays an integer).
 - **Multi-threaded Rust, outside the GIL.** A group-by uses all cores without multiprocessing.
 - **Parallel group-by works like a distributed one.** Threads hash rows into partitions, build partial
   aggregates independently, and merge them.
@@ -78,7 +92,8 @@ Before executing, the optimizer applies rules such as:
 ### No index, strict types
 - **No row index, no label alignment.** Rows are positions, and joins are explicit.
 - **Strict schemas.** Mixing types in a column or comparing incompatible dtypes raises an error rather
-  than silently becoming `object`.
+  than silently becoming `object`. Agent traces are prone to this, because a tool's result field can be a
+  number in one step and an error string in the next.
 - **The deliberate trade:** fewer silent surprises, more errors up front.
 
 ### Interop
@@ -87,25 +102,25 @@ Before executing, the optimizer applies rules such as:
   Polars frames directly now, but not all.
 
 ## Diagram
-A lazy query is only a plan until `.collect()`; the optimizer pushes columns and filters into the scan
-before the parallel engine runs, and group order is not guaranteed unless you ask for it.
+A lazy trace rollup is only a plan until `.collect()`; the optimizer pushes columns and filters into the
+scan before the parallel engine runs, and group order is not guaranteed unless you ask for it.
 
 ```mermaid
 flowchart TD
-    S["scan_parquet returns a LazyFrame, nothing read"] --> P["filter, with_columns, group_by add plan nodes"]
-    P --> O["collect: optimizer rewrites the plan"]
-    O --> PP["Projection pushdown: read only referenced columns"]
-    O --> PR["Predicate pushdown: skip row groups using statistics"]
-    PP --> X["Multi-threaded Rust: partial aggregates per thread, then merged"]
+    S["scan_parquet on traces, nothing read"] --> P["filter, with_columns, group_by"]
+    P --> O["collect: optimizer rewrites plan"]
+    O --> PP["Projection pushdown: needed columns"]
+    O --> PR["Predicate pushdown: skip row groups"]
+    PP --> X["Rust threads: partial aggregates, merged"]
     PR --> X
-    X --> Q{"Does output order matter?"}
+    X --> Q{"Output order matters?"}
     Q -->|"yes"| SO["sort or maintain_order=True"]
-    Q -->|"no"| R["DataFrame, or sink_parquet straight to disk"]
+    Q -->|"no"| R["DataFrame or sink_parquet"]
     SO --> R
 ```
 
 ## Examples
-### Daily token usage from trace files, read lazily
+### Daily token usage from agent trace files, read lazily
 Daily token usage per model from a directory of trace files, read lazily.
 
 ```python
@@ -141,44 +156,69 @@ Suppose the trace files hold 40 columns, including large prompt and completion t
 | Rows read | All, filtered afterwards | Row groups whose `ts` statistics fall before October are skipped |
 | Bytes read | The whole dataset | Can be a small fraction of it |
 
-### Clean a fine-tuning set with an explicit schema
-Raw JSONL with a field that is "always an integer" until it is not. An explicit schema fails fast and
-predictably, and the dedupe runs in parallel native code.
+### Per-tool health and steps per run, from step-level traces
+Two rollups an agent team watches: which tools fail, and whether runs are getting longer.
 
 ```python
 import polars as pl
 
-schema = {"id": pl.String, "prompt": pl.String, "completion": pl.String,
-          "source": pl.String, "quality": pl.Float64}
+steps = pl.scan_parquet("traces/*.parquet").filter(pl.col("ts") >= pl.datetime(2026, 10, 1))
 
-lf = (
-    pl.scan_ndjson("raw/sft.jsonl", schema=schema)       # no inference from the first rows
-      .filter(pl.col("quality") >= 0.7)
-      .with_columns(pl.col("prompt").str.strip_chars().str.to_lowercase().alias("key"))
-      .unique(subset=["key"], keep="first", maintain_order=True)   # deterministic output order
-      .drop("key")
-)
-clean = lf.collect()
-print(clean.height, clean.null_count())                  # rows kept, nulls per column
-clean.write_parquet("clean/sft.parquet")
+per_tool = (steps.filter(pl.col("tool").is_not_null())
+                 .group_by("tool")
+                 .agg(pl.len().alias("calls"),
+                      (pl.col("status") == "error").mean().alias("error_rate"),
+                      pl.col("latency_ms").quantile(0.95).alias("p95_ms"))
+                 .sort("error_rate", descending=True))
+
+per_run = (steps.group_by("run_id")
+                .agg(pl.len().alias("n_steps"),
+                     pl.col("input_tokens").sum().alias("in_tokens"))
+                .select(pl.col("n_steps").mean().alias("mean_steps"),
+                        pl.col("n_steps").quantile(0.95).alias("p95_steps"),
+                        pl.col("in_tokens").mean().alias("mean_in_tokens")))
+
+print(pl.collect_all([per_tool, per_run]))   # both plans share one optimized execution pass
 ```
+
+- **What to act on:** a tool at the top of `error_rate` with many calls, or a p95 step count creeping
+  toward your loop's step budget, which means runs are hitting the cap instead of finishing.
+
+### Worked scenario: turning agent transcripts into a clean fine-tuning set
+Raw JSONL with a field that is "always an integer" until it is not. The pipeline:
+1. **Scan with a schema:** `scan_ndjson("raw/sft.jsonl", ...)` with an explicit `schema=` (`id`,
+   `prompt`, `completion`, `source` as `pl.String`, `quality` as `pl.Float64`).
+2. **Filter:** keep `quality >= 0.7`.
+3. **Normalise:** `str.strip_chars()` and `str.to_lowercase()` on the prompt into a `key`.
+4. **Dedupe and write:** `unique(subset=["key"], keep="first", maintain_order=True)`, then
+   `clean/sft.parquet`.
+
+| Stage | Rows (illustrative) | Why |
+|---|---|---|
+| Raw agent transcripts | 120,000 | Every successful run last month |
+| `quality >= 0.7` (judge or human score) | 54,000 | Keep only runs graded as good |
+| Dedupe on normalised prompt | 31,000 | Popular requests repeat; duplicates overweight them |
 
 - **No `map_elements`:** normalisation uses built-in string expressions, so it stays parallel.
 - **`maintain_order=True`** keeps reruns diffable, at some speed cost.
 
 ## Production patterns
-- **Lazy scan, then read the plan.** Build pipelines from `scan_parquet`/`scan_ndjson` and review
-  `lf.explain()` whenever a pipeline changes, checking that filters and projections sit in the scan.
-  Monitor bytes read and peak memory per run; a sudden jump usually means an early `.collect()` crept in.
+- **Lazy scan, then read the plan.** Build trace and eval pipelines from `scan_parquet`/`scan_ndjson` and
+  review `lf.explain()` whenever a pipeline changes, checking that filters and projections sit in the
+  scan. Monitor bytes read and peak memory per run; a sudden jump usually means an early `.collect()`
+  crept in.
 - **Explicit schemas at ingestion.** Pass `schema=` to scans of JSONL, or `schema_overrides=` for CSV, for
-  every source you do not control. Track ingestion failures by source; a type error there beats a
-  silently wrong column downstream.
+  every source you do not control, including traces exported from a tracing vendor. Track ingestion
+  failures by source; a type error there beats a silently wrong column downstream.
+- **Split hot and cold trace columns.** Keep token counts, latencies, status and tool names in one set of
+  files and prompt and tool-output text in another, joined by step ID, so dashboards never scan the text.
+  Watch bytes read per dashboard query.
 - **Deterministic outputs.** End report pipelines with an explicit `.sort(...)` (or `maintain_order=True`
   where order matters) before writing or diffing. Monitor flaky report diffs and tests; they usually
   trace back to group order.
-- **Lay out Parquet for skipping.** Sort or partition files by the common filter key (date, customer)
-  before `write_parquet`, so row-group statistics are tight and predicate pushdown can skip data. Watch
-  row groups read versus total in your profiling.
+- **Lay out Parquet for skipping.** Sort or partition files by the common filter key (date, customer,
+  agent version) before `write_parquet`, so row-group statistics are tight and predicate pushdown can skip
+  data. Watch row groups read versus total in your profiling.
 - **Pin the version and fail on deprecations.** Pin Polars in the lockfile and treat deprecation warnings
   as errors in CI, because names such as `groupby` became `group_by` and other APIs evolved quickly.
   Convert with `to_pandas()` or to Arrow only at library boundaries.
@@ -188,7 +228,8 @@ clean.write_parquet("clean/sft.parquet")
   debugging means reading a query plan instead of inspecting intermediate frames; for small exploratory
   data, eager mode or pandas is just as quick to write.
 - **Strictness vs ingestion friction.** Strict types and no index remove pandas' silent alignment and
-  dtype drift, at the cost of more upfront casting and errors on messy JSON or CSV.
+  dtype drift, at the cost of more upfront casting and errors on messy JSON or CSV, which agent traces
+  usually are.
 - **Performance vs ecosystem.** Faster and leaner than pandas on most analytical workloads, yet younger,
   so some libraries still expect pandas and you pay a conversion at the boundary.
 - **No server vs no governance.** An in-process engine needs no server, but has no concurrency control,
@@ -207,12 +248,13 @@ clean.write_parquet("clean/sft.parquet")
   the same data, because groups come back in a different order each run. Fix: sort explicitly or pass
   `maintain_order=True`.
 - **Wide JSONL with inferred schemas.** Symptom: a type error deep in the file when an always-integer
-  field suddenly holds a string. Fix: pass an explicit schema.
+  field suddenly holds a string, typically a tool result that returned an error message. Fix: pass an
+  explicit schema.
 
 ## When to use
 - **Use when:** data is in the gigabytes; a transformation runs on a schedule (token and cost rollups,
-  eval aggregation, dataset deduplication and filtering before fine-tuning); or pandas is running out of
-  memory or time. Use lazy scans over Parquet whenever possible.
+  eval aggregation, dataset deduplication and filtering before fine-tuning, corpus cleaning before RAG
+  ingestion); or pandas is running out of memory or time. Use lazy scans over Parquet whenever possible.
 - **Stay with pandas when:** small notebooks, code leaning on pandas-only libraries, or team skills make
   it the cheaper choice.
 - **Consider DuckDB when:** the team prefers SQL; it occupies similar ground.
@@ -247,6 +289,14 @@ streaming engine.
 - **The escape hatch costs the same:** `map_elements` with a Python function drops back to interpreter
   speed and one core.
 
+### Design the nightly job that turns raw agent traces into a cost and reliability dashboard.
+- **Ingest with a schema:** lazy `scan_parquet` or `scan_ndjson` with explicit types, filtered to the
+  previous day, so a tool that returned a string where a number was expected fails loudly at ingestion.
+- **Read only hot columns:** token counts, latency, status, tool, model and run ID; never the prompt or
+  output text, which projection pushdown leaves on disk.
+- **Roll up and order:** group by model and by tool for cost, error rate and p95 latency, and per run for
+  step counts; sort before writing so diffs are stable. Monitor bytes read and peak memory per run.
+
 ### A daily report diff fails intermittently on identical input. What is the likely cause?
 - **Group order:** a parallel `group_by` hashes rows into partitions per thread and merges partial
   aggregates, so groups come back in a different order from run to run.
@@ -273,8 +323,7 @@ streaming engine.
   skills make pandas cheaper; conversion with `to_pandas()` at each boundary also costs time.
 - **Pick DuckDB:** when the team prefers SQL for the same in-process analytical work.
 - **Move to a warehouse:** when many users share data and need concurrency control, durability or
-  access management.
-- **Decide with numbers:** measure wall time and peak memory on real data before migrating.
+  access management; decide with wall time and peak memory measured on real data.
 
 ## Quiz
 ### Q: What does projection pushdown do in a Polars lazy query over Parquet?

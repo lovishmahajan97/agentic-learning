@@ -5,7 +5,8 @@ name: Package structure & import design
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/dependency-injection-and-interface-boundaries
   - python-for-ai/protocols-generics-structural-typing
@@ -22,13 +23,27 @@ sources:
 ---
 
 ## TL;DR
-Your import graph is your architecture: it decides what tests alone, what runs at startup and what breaks
-when a dependency changes. Use a `src/` layout, one-way imports (domain ← services ← adapters ←
-entrypoints), and keep heavy SDKs and import-time side effects at the edges.
+An agent repo's import graph decides whether the agent loop tests without a model, how fast a worker
+cold-starts and whether tools can be swapped. Use a `src/` layout, one-way imports (domain ← services ←
+adapters ← entrypoints), and keep heavy SDKs at the edges.
+
+## For agent builders
+- **Why it matters for agents.** Agent code has natural cycles: the agent needs its tools, tools want the
+  agent's types, and both want the LLM client. Without a direction, you get partial-init `ImportError`s
+  and an agent package that imports `torch` and three vendor SDKs just to list its tools.
+- **Where it shows up in your stack.** LangChain ships provider integrations as separate packages
+  (`langchain-openai` and similar) so you import only what you use; your repo should follow the same
+  idea, with LangGraph graphs and agent loops in `services/`, tool and model clients in `adapters/`, and
+  the FastAPI app or queue worker in `entrypoints/`.
+- **What you control.** The layer contract, where tool registries and prompt templates live, which
+  imports are lazy on cold-start paths (serverless tools, autoscaled agent workers), and whether CI tests
+  the built wheel so prompt files actually ship.
+- **What you can skip.** Namespace packages and multi-distribution monorepos, until several teams ship
+  agent components independently.
 
 ## Why it exists
-- **Notebooks grow into tangles.** One notebook becomes a `utils.py`, then forty modules where everything
-  imports everything. Three failures follow, one per bullet below.
+- **Notebooks grow into tangles.** One agent notebook becomes a `utils.py`, then forty modules where
+  everything imports everything. Three failures follow, one per bullet below.
 - **Circular imports.** `agent.py` imports `tools.py`, which imports `agent.py` for a type, until Python
   raises `ImportError: cannot import name 'Agent' from partially initialized module`.
 - **Slow, fragile startup.** Importing the package pulls in `torch`, `transformers` and three vendor SDKs,
@@ -230,6 +245,21 @@ with mock.patch("rag.call", return_value="fake"):
     print(rag.answer())           # fake: patched where it is looked up
 ```
 
+### Agent scenario: an agent worker whose cold start hid in imports
+An autoscaled queue worker runs a tool-calling agent. New pods took too long to pick up jobs during a
+traffic spike. The team captured `python -X importtime` and traced the cost (figures are illustrative,
+from one team's profile, not a benchmark).
+
+| Finding | Cause | Fix |
+|---|---|---|
+| Most startup spent importing `torch` | `myapp/__init__.py` re-exported the local embedder used by one tool | minimal `__init__.py`, lazy import inside the embedder |
+| Every vendor SDK imported at boot | tool registry module imported all adapters at top level | registry maps tool names to adapter factories, built in the composition root |
+| Tests failed without `OPENAI_API_KEY` | module-level `client = OpenAI()` in the planner | client built in the root and injected into the agent |
+| Prompt templates missing in prod | flat layout, templates never declared as package data | src layout plus a CI job that tests the built wheel |
+
+After the change, `import myapp.entrypoints.worker` loads only the agent loop and the adapters that
+worker's tools need, and unit tests run the agent with a scripted fake model.
+
 ### Layer contract as a CI check
 An `import-linter` contract in `pyproject.toml`; `lint-imports` fails the build when a lower layer imports a
 higher one. Layers are listed from highest to lowest; forbidding third-party packages such as `openai`
@@ -258,6 +288,13 @@ forbidden_modules = ["openai", "anthropic", "torch"]
 ```
 
 ## Production patterns
+- **Tools as adapters behind a registry.** Keep each tool's backend client in `adapters/`, expose it to
+  the agent through a Protocol or a typed function, and register tools in the composition root. The agent
+  loop then imports no SDK, and adding a tool touches one adapter file and the root. Monitor which tools
+  each worker actually loads at boot.
+- **Prompts and tool schemas as package data.** Store prompt templates and JSON tool schemas inside
+  `src/myapp/` and load them with `importlib.resources`, so they ship in the wheel and version with the
+  code. Check for them in the wheel-install CI job.
 - **Test the built wheel, not the checkout.** In CI, build the wheel (`uv build` or `python -m build`),
   install it into a fresh environment without `-e`, and run the test suite against it. Catches missing
   package data and undeclared dependencies; monitor CI for `ModuleNotFoundError` on this job only.
@@ -287,6 +324,9 @@ forbidden_modules = ["openai", "anthropic", "torch"]
   layers usually does not need.
 
 ## Pitfalls
+- **One tools module importing every tool backend.** Symptom: an agent worker that serves two tools pays
+  the import cost and credential checks of all twelve, and one missing optional SDK breaks every agent.
+  Fix: register tools per entrypoint in the composition root, with lazy imports in each adapter.
 - **Clients or models created at module top level.** Symptom: tests fail at collection with a missing API
   key, or a CLI `--help` takes several seconds. Fix: build them in the composition root.
 - **Moving an import into a function without fixing the shared concept.** Symptom: the same cycle reappears
@@ -304,8 +344,8 @@ forbidden_modules = ["openai", "anthropic", "torch"]
   after deployment, because package data was never declared.
 
 ## When to use
-- **Use when:** code leaves the notebook and gets a `pyproject.toml`; use a src layout for anything
-  installed, deployed or shared.
+- **Use when:** agent code leaves the notebook and gets a `pyproject.toml`; use a src layout for anything
+  installed, deployed or shared, such as an agent service, a tool server or a shared tools library.
 - **Avoid when:** it is a one-off script; keep a flat layout.
 - **Add explicit layers when:** you have more than one implementation of an external dependency, or tests
   start patching module globals to avoid network calls.
@@ -353,13 +393,6 @@ the network or environment at import time.
   layers.
 - **Run `lint-imports` in CI** on every pull request, so a stray adapter import in `domain/` fails the build
   rather than relying on reviewers.
-
-### When would you prefer eager imports over lazy ones?
-- **Lazy imports suit cold-start paths:** CLIs, serverless handlers and autoscaled workers, where
-  `python -X importtime` shows `torch` or SDK imports dominating startup.
-- **Eager imports suit long-running servers:** importing adapters in the lifespan or app factory makes a
-  missing optional dependency fail the deploy health check instead of the first user request.
-- **The cost of lazy:** `ImportError` moves from startup to first use.
 
 ### Your test patches `myapp.adapters.llm.OpenAI` but still makes real network calls. Why?
 - **Names are looked up where they are used:** `services/rag.py` did `from myapp.adapters.llm import

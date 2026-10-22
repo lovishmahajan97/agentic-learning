@@ -5,7 +5,8 @@ name: Checkpointing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/gradient-checkpointing
   - training-adaptation/distributed-training
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Checkpointing saves the full training state (weights, optimizer, scheduler, RNG, data position) durably
-so runs can resume, roll back and pick the best step. A 7B checkpoint is ~100 GB, so frequency, format
-and retention are engineering decisions. Not gradient checkpointing, which recomputes activations.
+Checkpointing saves full training state (weights, optimizer, scheduler, RNG, data position) so a
+fine-tune of your agent's model can resume, roll back and ship its best step, not its last. A 7B
+checkpoint is ~100 GB. Not gradient checkpointing, nor agent-state checkpointers.
+
+## For agent builders
+- **Why it matters for agents.** The checkpoint you deploy behind an agent should be the one that wins on
+  agent evals (tool-call validity, task success, refusals), which is often not the final step. Rollback
+  after a bad model release only works if that earlier checkpoint was kept and registered.
+- **Where it shows up in your stack.** `save_steps`, `save_total_limit` and `load_best_model_at_end` in
+  Hugging Face and TRL trainers, intermediate checkpoints of hosted fine-tuning jobs, `safetensors`
+  adapter files, and the model registry your agent's serving config points at.
+- **What you control.** Which checkpoints are kept, which agent evals run on each, what metadata is
+  stored (base model hash, data version, scores), and whether resume after a spot preemption is tested.
+- **What you can skip.** Young–Daly derivations and sharded-checkpoint internals unless you run
+  multi-GPU training. Do not confuse this with agent-run checkpointing (for example LangGraph
+  checkpointers), which persists conversation state; that is `agent-reliability/durable-execution-and-checkpointing`.
 
 ## Why it exists
 - **Long runs on failing hardware.** A single-GPU fine-tune runs for hours on a spot instance that can be
@@ -44,7 +58,18 @@ and retention are engineering decisions. Not gradient checkpointing, which recom
   gone), misses the peak, and leaves nothing to roll back to.
 
 ## How it works
-### What a resumable checkpoint contains
+### Two things called checkpoints in an agent stack
+| | Training checkpoint (this lesson) | Agent-run checkpoint |
+|---|---|---|
+| What is saved | model weights, optimizer, scheduler, RNG, data position | the agent's state per step: messages, tool results, graph position |
+| Keyed by | training step | thread or run id |
+| Used for | resume a fine-tune, pick the best step, roll back a model | resume a long agent run, human-in-the-loop pauses, replay |
+| Example | Hugging Face `Trainer` output directories | LangGraph checkpointers backed by memory, SQLite or Postgres |
+
+- **The same rules carry over.** Save everything the next step depends on, write atomically, and test a
+  resume on purpose before you rely on it.
+
+### What a resumable training checkpoint contains
 Resuming means continuing the exact same trajectory, so everything that influences the next step must be
 saved:
 
@@ -60,7 +85,19 @@ saved:
 - **Size arithmetic.** In mixed precision a checkpoint holds about 14 bytes per parameter: 2 for
   bf16/fp16 weights plus 12 for the fp32 master copy and the two moments.
 - **ZeRO's often-quoted 16 bytes** also counts the 2-byte gradients, which live only in memory.
-- **So a 7B model's resumable state is roughly 100 GB,** most of it fp32 optimizer state.
+- **So a 7B model's resumable state is roughly 100 GB,** most of it fp32 optimizer state. A LoRA run's
+  trainable state is far smaller, because only the adapter has optimizer moments.
+
+### Selection, averaging and formats
+- **Record the validation metric with each checkpoint,** so "best" is a lookup, not a re-evaluation. For
+  an agent model, record agent eval scores too.
+- **Average the last several checkpoints.** A cheap, old trick that often improves the final model; the
+  original Transformer paper averaged the last 5 (base) or 20 (big) checkpoints.
+- **Export as `safetensors`, not pickled `torch.save` files.** A pickle can execute arbitrary code on
+  load, which is why `torch.load` defaults to `weights_only=True` since PyTorch 2.6 and why weights from
+  untrusted sources should never be unpickled.
+- **Adapters need their base.** The checkpoint is the adapter weights plus an exact reference (name and
+  hash) to the base model they were trained on; without it the adapter is unusable.
 
 ### Frequency
 - **The basic trade.** Expected loss from a failure is half the interval; each save costs write time
@@ -72,7 +109,7 @@ saved:
 - **Incremental or differential schemes** save only what changed; they pay off mainly when much of the
   state is static, such as large sparse embedding tables.
 
-### The Young–Daly interval
+### Background: the Young–Daly interval
 If a save stalls training for *C* seconds and failures arrive with mean time *M* between them, overhead
 per unit time is roughly `C/T` (saving) plus `T/(2M)` (expected recomputation). Minimising the sum gives:
 
@@ -90,7 +127,7 @@ T_opt ≈ sqrt(2 · C · M)
 - **Caveats.** The formula ignores restart time and assumes memoryless failures. Treat it as the start,
   then save more often near the end of a run, where losing work costs the most.
 
-### Distributed layout
+### Background: distributed layout
 - **Data parallelism:** every rank holds the same state and one rank writes it.
 - **ZeRO or FSDP:** optimizer state and weights are sharded, so each rank writes its own shard in
   parallel. Fast, but it ties the checkpoint to that world size and sharding scheme.
@@ -107,19 +144,9 @@ T_opt ≈ sqrt(2 · C · M)
    pointing at incomplete data.
 4. **Object stores have no atomic directory rename.** Upload every shard first and write a small manifest
    or "latest" pointer last; readers trust only checkpoints whose manifest exists.
-5. **Retention:** keep the last *k* for resume, the best on validation for selection, and periodic ones
-   (every *n* steps or every epoch) for analysis. Delete the rest, because 100 GB per save fills any disk
-   quickly.
-
-### Selection, averaging and formats
-- **Record the validation metric with each checkpoint,** so "best" is a lookup, not a re-evaluation.
-- **Average the last several checkpoints.** A cheap, old trick that often improves the final model; the
-  original Transformer paper averaged the last 5 (base) or 20 (big) checkpoints.
-- **Export as `safetensors`, not pickled `torch.save` files.** A pickle can execute arbitrary code on
-  load, which is why `torch.load` defaults to `weights_only=True` since PyTorch 2.6 and why weights from
-  untrusted sources should never be unpickled.
-- **Adapters need their base.** The checkpoint is the adapter weights plus an exact reference (name and
-  hash) to the base model they were trained on; without it the adapter is unusable.
+5. **Retention:** keep the last *k* for resume, the best on validation for selection, every checkpoint
+   that was ever deployed for rollback, and periodic ones (every *n* steps or every epoch) for analysis.
+   Delete the rest, because 100 GB per save fills any disk quickly.
 
 ## Diagram
 One save and one resume: the GPU stalls only for the snapshot, the manifest is written last so a
@@ -135,7 +162,7 @@ sequenceDiagram
     T->>T: Continue training
     H->>S: Write shards to temp paths in the background
     H->>S: Write manifest with hashes, then update latest pointer
-    S->>S: Retention keeps last k, best on validation, periodic
+    S->>S: Retention keeps last k, best on agent evals, deployed ones
     Note over T: Preemption or hardware fault
     T->>S: Read latest pointer, verify manifest hashes
     S-->>T: Full training state
@@ -143,6 +170,36 @@ sequenceDiagram
 ```
 
 ## Examples
+### Picking the checkpoint to put behind the agent
+Every saved checkpoint of a LoRA fine-tune is scored by the agent eval harness on a frozen suite. The
+release takes the best task success among checkpoints that do not regress tool-call validity or refusals
+beyond 2 points versus the base, and registers it with the metadata a rollback needs.
+
+```python
+import json
+
+base = {"task_success": 0.70, "tool_call_validity": 0.95, "refusal_rate": 0.96}
+results = {  # checkpoint -> scores from the agent eval harness on the frozen suite
+    "ckpt-200": {"task_success": 0.74, "tool_call_validity": 0.95, "refusal_rate": 0.96},
+    "ckpt-400": {"task_success": 0.79, "tool_call_validity": 0.94, "refusal_rate": 0.95},
+    "ckpt-600": {"task_success": 0.81, "tool_call_validity": 0.89, "refusal_rate": 0.90},
+}
+
+def passes_gate(r, max_drop=0.02, guarded=("tool_call_validity", "refusal_rate")):
+    return all(r[k] >= base[k] - max_drop for k in guarded)
+
+eligible = {c: r for c, r in results.items() if passes_gate(r)}
+best = max(eligible, key=lambda c: eligible[c]["task_success"])
+record = {"checkpoint": best, "scores": eligible[best],
+          "base_model": "org/base-8b-instruct", "base_sha256": "<hash of base weights>",
+          "data_version": "agent-traces-v7", "format": "safetensors (adapter only)"}
+print(json.dumps(record, indent=1))      # ckpt-400: the final step is not the one to ship
+```
+
+- **Reading it.** `ckpt-600` has the best task success but tool-call validity fell 6 points, so the
+  release is `ckpt-400`. A keep-last-two retention rule would already have deleted `ckpt-200`, the
+  safest rollback target.
+
 ### Save and load the full state in PyTorch
 A compact pair for a single-process loop: full state, atomic rename, keep-last-*k* retention, and RNG
 restoration. The Hugging Face `Trainer` does the same through `save_steps`, `save_total_limit`,
@@ -216,28 +273,33 @@ for name, (c, m) in scenarios.items():
   preemption on average; cutting the stall is worth more than tuning the interval.
 
 ## Production patterns
+- **Agent evals on every kept checkpoint.** Run the agent eval harness (tool-call validity, sandbox task
+  success, refusals) on each saved checkpoint, store the scores with it, and promote the best that passes
+  the regression gate. Monitor how often the promoted checkpoint is not the final step.
+- **Registry entry per deployed model.** Register every checkpoint that goes behind an agent with step,
+  agent eval scores, data version and, for adapters, the base model's name and hash; point the serving
+  config at the registry version. Rollback is then a config change. Monitor time to roll back in drills.
 - **Trainer-managed checkpoints for fine-tunes.** In the Hugging Face `Trainer`, set `save_steps` from the
   interval calculation, `save_total_limit` for retention, and `load_best_model_at_end=True` with
   `metric_for_best_model` so the best checkpoint is retained. Resume with
   `trainer.train(resume_from_checkpoint=True)`. Monitor save time per checkpoint and free disk.
-- **Asynchronous sharded saves at scale.** For FSDP or ZeRO jobs, write per-rank shards with PyTorch
-  Distributed Checkpoint or DeepSpeed, using an asynchronous save so the GPU stall is only the copy to host
-  memory. Monitor stall seconds per save, host-memory headroom, and background-write failures, which
-  otherwise fail silently.
+- **Two artefacts per milestone.** Keep the full sharded training state for resume and a consolidated,
+  weights-only `safetensors` export for evaluation and serving.
 - **Manifest-last on object storage.** Upload all shards, then write a manifest listing files and hashes,
   then update a "latest" pointer. The resume logic reads only checkpoints with a valid manifest. Monitor
   for orphaned shard directories without a manifest.
-- **Two artefacts per milestone.** Keep the full sharded training state for resume and a consolidated,
-  weights-only `safetensors` export for evaluation and serving, registered with step, validation metric,
-  data version and (for adapters) the base model's name and hash.
 - **Kill-and-resume drill.** Before a long run, kill the job on purpose mid-epoch and check that the
-  resumed loss curve overlays the uninterrupted one. Monitor recovery time after the simulated
-  preemption.
+  resumed loss curve overlays the uninterrupted one. For FSDP or ZeRO jobs, also check asynchronous
+  sharded saves through PyTorch Distributed Checkpoint or DeepSpeed. Monitor recovery time after the
+  simulated preemption.
 
 ## Trade-offs
 - **Frequent saves vs write time and storage.** They bound the work lost to a failure; the balance moves
   toward more frequent saves as failure rates rise, and toward fewer as the save becomes slow relative to
   the interval.
+- **Evaluating every checkpoint vs eval cost.** Running agent tasks on each checkpoint finds the best one
+  but costs sandbox time and tokens; evaluate a cheap tool-call suite on all and the full agent suite on
+  the top few.
 - **Sharded vs consolidated.** Sharded checkpoints write in parallel and avoid gathering 100 GB onto one
   rank, but tie the artefact to a world size and need a resharding step to resume elsewhere.
 - **Weights-only vs full state.** Weights-only exports are small and serve directly but cannot resume
@@ -248,6 +310,8 @@ for name, (c, m) in scenarios.items():
   of the state and adds a failure mode in which the background write itself fails silently.
 
 ## Pitfalls
+- **Shipping the last checkpoint by default.** Symptom: the new agent model has better task loss but more
+  malformed tool calls than an earlier step would have. Fix: select on agent evals across checkpoints.
 - **Saving only weights and resuming with a fresh optimizer.** Symptom: a loss spike immediately after
   resume and a resumed run that never rejoins the original curve. Fix: save optimizer, scheduler and
   scaler state in every checkpoint.
@@ -258,9 +322,10 @@ for name, (c, m) in scenarios.items():
   checkpoint after a crash and no resumable state at all. Fix: temp path, flush, rename (or manifest last).
 - **Letting the checkpoint directory fill the disk.** Symptom: the run dies during a save, often taking
   the latest good checkpoint with it. Fix: a retention policy and a free-disk alert.
-- **A retention rule that deletes the best checkpoint because it is old.** Symptom: a final model worse
-  than one that existed an hour earlier. The Hugging Face `Trainer` retains the best checkpoint when
-  `load_best_model_at_end` is set; hand-written loops must do the same explicitly.
+- **A retention rule that deletes the best or the deployed checkpoint because it is old.** Symptom: a
+  final model worse than one that existed an hour earlier, or no rollback target. The Hugging Face
+  `Trainer` retains the best checkpoint when `load_best_model_at_end` is set; hand-written loops must do
+  the same explicitly.
 - **Saving adapters without the base model's exact version.** Symptom: an adapter that loads without error
   onto a different base and produces garbage. Fix: store the base model's name and hash with the adapter.
 - **Loading pickled checkpoints from untrusted sources.** Symptom: arbitrary code running on load. Fix:
@@ -268,7 +333,7 @@ for name, (c, m) in scenarios.items():
 
 ## When to use
 - **Always checkpoint** any training run longer than a few minutes; keep the best checkpoint by
-  validation metric for every run whose output will be deployed.
+  validation and agent eval metrics for every run whose output will be deployed behind an agent.
 - **Decide:** the interval from failure rate and save cost, the format from how the run is parallelised
   and who consumes the artefact, and retention from storage and the need for rollback.
 - **Measure:** save time as a share of step time, and recovery time after a simulated preemption.
@@ -309,6 +374,23 @@ purpose and checking that the resumed loss curve overlays the uninterrupted one.
 - **Why weights alone fail:** fresh Adam moments make the first steps badly scaled, the scheduler
   restarts warmup, and the sampler loses the epoch's order, so the run never rejoins its original curve.
 
+### A new fine-tuned model behind your agent starts producing bad tool calls in production. How does your checkpoint setup let you recover?
+- **Rollback first:** the previously deployed checkpoint is in the registry with its base model hash and
+  scores, so pointing serving back at it is a config change, not a retrain.
+- **Then diagnose:** compare agent eval scores across the new run's kept checkpoints; an earlier step that
+  passes the tool-call gate may be shippable without retraining.
+- **Prevent repeats:** gate promotion on tool-call validity across checkpoints and never let retention
+  delete a deployed checkpoint.
+
+### How is a training checkpoint different from a LangGraph checkpointer, and what carries over?
+- **Different state:** a training checkpoint holds weights, optimizer, scheduler, RNG and data position
+  keyed by step; an agent checkpointer holds the run's messages, tool results and graph position keyed by
+  thread, so a long agent run can pause and resume.
+- **Same discipline:** save everything the next step depends on, write atomically to durable storage, and
+  test resume on purpose.
+- **Different consumers:** one is read by the trainer and registry, the other by the agent runtime on each
+  step.
+
 ### How big is the checkpoint for a 7B full fine-tune, and how often would you save it?
 - **Size:** about 14 bytes per parameter in mixed precision (2 for bf16 weights plus 12 for the fp32
   master copy and two moments), so roughly 100 GB.
@@ -322,13 +404,8 @@ purpose and checking that the resumed loss curve overlays the uninterrupted one.
   only ever points at a complete file.
 - **Object stores have no atomic directory rename:** upload every shard, then write a manifest with hashes,
   then update a "latest" pointer. Resume trusts only checkpoints with a valid manifest.
-- **Monitor** for orphaned shard directories and failed background writes.
-
-### When would you not keep sharded checkpoints as your only artefact?
-- **When anything other than the same training job must read them.** Sharded ZeRO or FSDP state is tied
-  to a world size and sharding scheme, and resuming on a different GPU count needs a resharding step.
-- **So keep two artefacts:** the full sharded state for resume and a consolidated weights-only
-  `safetensors` export for evaluation, serving and the model registry.
+- **Monitor** for orphaned shard directories and failed background writes; and keep a consolidated
+  weights-only export, since sharded state is tied to one world size.
 
 ### Why should you avoid loading `.pt` checkpoints from an untrusted source?
 - **They are pickles:** a pickle can execute arbitrary code on load.

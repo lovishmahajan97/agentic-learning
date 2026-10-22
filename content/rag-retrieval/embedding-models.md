@@ -5,7 +5,8 @@ name: Embedding models
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - model-internals/embeddings
   - rag-retrieval/embedding-dimension-and-normalization
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-An embedding model maps text to a fixed-size vector so similar meanings land close together. Documents
-are embedded once, so retrieval becomes a nearest-neighbour lookup that catches synonyms keyword search
-misses. Model, prefixes and version must stay consistent, or the index silently breaks.
+An embedding model turns text into a vector so similar meanings sit close together. It powers your
+agent's search tool, its long-term memory and even tool selection. Model, prefixes and version must
+match on both sides, or retrieval breaks silently.
+
+## For agent builders
+- **Why it matters for agents.** Every semantic lookup an agent makes (knowledge search, recalling past
+  conversations, picking the few relevant tools out of hundreds) is a nearest-neighbour query over
+  embeddings. A wrong model or missing prefix degrades all of them without a single error.
+- **Where it shows up in your stack.** The `embeddings` object you pass to a LangChain or LlamaIndex
+  vector store, hosted embedding APIs (OpenAI, Cohere, Voyage, Google), open models via
+  sentence-transformers, and the memory store behind a LangGraph agent.
+- **What you control.** Which model, its query and passage prefixes, its pinned version, the reranker
+  after it, and the eval set that proves the choice on your agent's real queries.
+- **What you can skip.** Training your own embedder. Know how contrastive training works well enough to
+  read a model card; spend the effort on a bake-off and a reranker instead.
 
 ## Why it exists
 - **Keyword search misses different wording.** BM25 matches tokens, so it fails on "cancel my plan"
@@ -56,9 +69,9 @@ misses. Model, prefixes and version must stay consistent, or the index silently 
   does, keeps this right.
 - **Query and document pass through the same network independently.** That is the whole point: a
   document's vector never depends on the query, so it is computed once, stored and compared with a dot
-  product.
+  product. An agent's search call therefore costs one query embedding plus a lookup.
 
-### Training: contrastive learning
+### Background: contrastive training
 Training data is (query, positive passage) pairs. The loss (InfoNCE and relatives) pulls the positive
 toward the query and pushes negatives away. For query `q`, positive `p⁺` and candidates `p_j` that
 include `p⁺`:
@@ -72,6 +85,13 @@ L = −log( exp(s(q, p⁺)/τ) / Σ_j exp(s(q, p_j)/τ) )      s = cosine simila
 - **The temperature `τ` is small** (a few hundredths is common), because cosine lives in [−1, 1].
   Dividing by a small number sharpens the softmax so the gradient concentrates on negatives scoring
   closest to the positive.
+- **Worked case:** one positive at cosine 0.80, one hard negative at 0.75 and two easy negatives.
+
+| τ | What the softmax sees | Where the gradient goes |
+|---|---|---|
+| 1.0 | near-uniform; cosine gaps are tiny | spread over all negatives, including easy ones |
+| 0.05 | easy negatives vanish | almost entirely on the hard negative at 0.75 |
+
 - **In-batch negatives are free.** With a batch of B pairs, every query gets B − 1 negatives. More
   negatives make the task harder and the space finer, which is why models train with very large batches.
 - **Hard negatives matter more.** Passages sharing topic and vocabulary with the query but not answering
@@ -80,6 +100,8 @@ L = −log( exp(s(q, p⁺)/τ) / Σ_j exp(s(q, p_j)/τ) )      s = cosine simila
 - **Modern recipes (E5, BGE):** pretrain on hundreds of millions of weakly supervised pairs (titles and
   bodies, questions and accepted answers, near-duplicates), then fine-tune on curated retrieval datasets
   with hard negatives.
+- **Why an agent builder cares:** it explains why embeddings find "about the same topic" easily but may
+  rank a near-miss above the answer, which is the job a reranker does.
 
 ### Asymmetric models and prefixes
 - **Queries are short and question-shaped; passages are long and declarative.** Many models train with a
@@ -88,6 +110,9 @@ L = −log( exp(s(q, p⁺)/τ) / Σ_j exp(s(q, p_j)/τ) )      s = cosine simila
   instruction prepended to the query.
 - **Omit the prefix and nothing errors.** The model still returns vectors, just worse ones: a quiet
   recall drop.
+- **Agent-written queries are a third shape.** An agent often searches with terse, keyword-like strings
+  it composed itself, not the user's sentence. Evaluate on queries pulled from agent traces, not only on
+  user questions.
 
 ### Capacity limits
 - **Maximum input length:** typically 512 tokens for BERT-derived models and around 8,000 for many newer
@@ -95,7 +120,8 @@ L = −log( exp(s(q, p⁺)/τ) / Σ_j exp(s(q, p_j)/τ) )      s = cosine simila
 - **Longer inputs are truncated silently** by most local libraries (some hosted APIs reject them with an
   error instead), one reason chunking exists.
 - **Bigger models** generally give better vectors but embed more slowly and emit more dimensions, which
-  cost storage and comparison time for every chunk forever (see the dimension lesson).
+  cost storage and comparison time for every chunk forever (see the dimension lesson). Query-side
+  embedding latency also lands on every agent search step.
 
 ### Where it sits against the alternatives
 | Approach | How it scores | Role |
@@ -113,22 +139,22 @@ L = −log( exp(s(q, p⁺)/τ) / Σ_j exp(s(q, p_j)/τ) )      s = cosine simila
   ranking), input length, multilingual needs, embedding latency and cost, and whether chunk text may
   leave your environment (hosted API versus self-hosted open weights).
 - **Measure before committing:** recall@k on a few hundred labelled query–passage pairs from your own
-  corpus, because changing the model later means re-embedding everything.
+  corpus, because changing the model later means re-embedding everything, including agent memories.
 
 ## Diagram
-The document side runs once at index time; the query side runs per request through the same model,
-prefix rules and pooling, and only then meets the stored vectors.
+The document side runs once at index time; the agent's query side runs per search call through the
+same model, prefix rules and pooling, and only then meets the stored vectors.
 
 ```mermaid
 flowchart TD
     DOC["Chunk text"] -->|"prefix passage"| ENC1["Encoder, pinned version"]
     ENC1 --> POOL1["Pool and L2-normalize"]
     POOL1 --> IDX[("Vector index, model id stored")]
-    QRY["User query"] -->|"prefix query or instruction"| ENC2["Same encoder, same version"]
+    QRY["Agent search query"] -->|"prefix query or instruction"| ENC2["Same encoder, same version"]
     ENC2 --> POOL2["Pool and L2-normalize"]
     POOL2 -->|"dot product, nearest neighbours"| IDX
     IDX -->|"top 50"| CE["Cross-encoder reranker"]
-    CE -->|"top few"| OUT["Results to generator"]
+    CE -->|"top few"| OUT["Tool result to agent"]
 ```
 
 ## Examples
@@ -161,56 +187,65 @@ for q, row in zip(queries, scores):
 # three-passage toy; their cost shows up as lost recall@k over a real corpus, so measure it there.
 ```
 
-### Why the temperature is small: InfoNCE by hand
-One positive at cosine 0.80, one hard negative at 0.75 and two easy negatives. Pure Python.
+### Agent scenario: embedding tool descriptions to pick tools
+An agent platform has many tools; sending every schema on every step wastes context and confuses the
+model. Embed each tool's description once, then expose only the closest few for the current request.
 
 ```python
-import math
+from sentence_transformers import SentenceTransformer
 
-def info_nce(s_pos, s_negs, tau):
-    logits = [s_pos / tau] + [s / tau for s in s_negs]
-    m = max(logits)
-    z = sum(math.exp(l - m) for l in logits)
-    probs = [math.exp(l - m) / z for l in logits]
-    return -math.log(probs[0]), probs
+model = SentenceTransformer("intfloat/e5-base-v2")
+TOOLS = {   # name -> description; in practice, hundreds of entries
+    "issue_refund": "Refund a customer's payment for an order.",
+    "cancel_subscription": "Cancel a customer's recurring plan.",
+    "lookup_order": "Get status and items of an order by id.",
+    "reset_password": "Send a password reset link to a user.",
+}
+names = list(TOOLS)
+T = model.encode([f"passage: {TOOLS[n]}" for n in names], normalize_embeddings=True)
 
-s_pos, s_negs = 0.80, [0.75, 0.30, 0.20]       # one hard negative, two easy ones
-for tau in (1.0, 0.05):
-    loss, p = info_nce(s_pos, s_negs, tau)
-    print(f"tau={tau:<4}  loss={loss:.3f}  p(pos)={p[0]:.3f}  p(hard)={p[1]:.3f}  p(easy)={p[2]:.4f}")
-# tau=1.0   loss=1.134  p(pos)=0.322  p(hard)=0.306  p(easy)=0.1952
-# tau=0.05  loss=0.313  p(pos)=0.731  p(hard)=0.269  p(easy)=0.0000
+def select_tools(user_msg: str, k: int = 2) -> list[str]:
+    q = model.encode([f"query: {user_msg}"], normalize_embeddings=True)[0]
+    order = (T @ q).argsort()[::-1][:k]
+    return [names[i] for i in order]
+
+print(select_tools("I want my money back for order 1182"))
+# Expect issue_refund and lookup_order: only their schemas go into this step's tool list.
 ```
 
-| τ | What the softmax sees | Where the gradient goes |
-|---|---|---|
-| 1.0 | near-uniform; cosine gaps are tiny | spread over all negatives, including easy ones |
-| 0.05 | easy negatives vanish | almost entirely on the hard negative at 0.75 |
+| Setup (illustrative) | Schema tokens per step |
+|---|---|
+| 200 tools at ~150 tokens each, all sent | ~30,000 |
+| Top 8 selected by embedding | ~1,200 |
+
+- **The catch:** a missed tool is a capability the agent does not have this step. Measure tool-selection
+  recall on logged requests, and always include a small fixed core set.
 
 ## Production patterns
 - **One `embed()` with everything pinned** — wrap the model behind a single function that applies the
   prefix, normalization and a pinned version (for sentence-transformers, pass `revision=` a commit hash;
-  for APIs, a dated model id). Store the model id with every vector and assert it matches at query time.
-- **Bake-off on your own queries** — before choosing, score two or three candidates on a few hundred
-  labelled pairs from your corpus with recall@k and MRR. Monitor the same numbers on a schedule, since
-  the corpus drifts.
+  for APIs, a dated model id). Store the model id with every vector and assert it matches at query time,
+  in the search tool and in the memory store alike.
+- **Bake-off on your agent's own queries** — before choosing, score two or three candidates on a few
+  hundred labelled pairs from your corpus, including queries the agent itself wrote in traces, with
+  recall@k and MRR. Monitor the same numbers on a schedule, since the corpus drifts.
 - **Retrieve wide, rerank narrow** — bi-encoder top 50, then a cross-encoder (for example
-  sentence-transformers `CrossEncoder`) reorders to the final few. Monitor rerank latency p95 and
-  recall@50 of the first stage, which caps what reranking can recover.
+  sentence-transformers `CrossEncoder`) reorders to the final few the tool returns. Monitor rerank
+  latency p95 and recall@50 of the first stage, which caps what reranking can recover.
 - **Truncation guard at index time** — count tokens with the model's tokenizer against its
   `max_seq_length` (or the API's documented limit) and re-chunk anything over. Monitor the count of
   truncated or rejected chunks per ingestion run.
-- **Blue/green model upgrades** — embed the corpus with the new model into a new index, run both on the
-  eval set, then switch reads atomically. Never mix two models in one index; monitor recall on both until
-  the old one is retired.
+- **Blue/green model upgrades** — embed the corpus (and stored agent memories) with the new model into a
+  new index, run both on the eval set, then switch reads atomically. Never mix two models in one index;
+  monitor recall on both until the old one is retired.
 
 ## Trade-offs
 - **Precomputed lookup vs token interaction.** A bi-encoder makes retrieval a nearest-neighbour lookup
   but loses the query–document interaction a cross-encoder has; once you can afford to rerank the top
   50, most of that gap closes.
 - **Larger models vs speed and size.** Better vectors, but slower embedding and bigger vectors; it flips
-  to a cost when the corpus is small, the workload is latency-bound, or a reranker already corrects
-  first-stage mistakes.
+  to a cost when the corpus is small, the workload is latency-bound (an agent searching many times per
+  task), or a reranker already corrects first-stage mistakes.
 - **Hosted vs self-hosted.** Hosted API models (OpenAI, Cohere, Voyage, Google) remove serving work and
   are often strong, but every chunk's text leaves your network and a vendor deprecation forces a full
   re-embed; self-hosted open models (BGE, E5, GTE, Nomic) reverse both sides.
@@ -231,15 +266,17 @@ for tau in (1.0, 0.05):
 - **Choosing by leaderboard rank alone.** The model a point higher on MTEB underperforms the old one on
   your own labelled queries.
 - **Treating cosine as absolute confidence.** A threshold copied from a blog post lets nothing or
-  everything through after a model swap. Scores are model-specific.
+  everything through after a model swap, so an agent's "no relevant results" branch fires always or
+  never. Scores are model-specific.
 - **Upgrading the model in place without a re-embed plan.** Old and new vectors mix in one index, and
   quality degrades as new content arrives.
 
 ## When to use
 - **Use when:** users describe what they want in their own words and the corpus says it differently:
-  support search, document QA, code search, deduplication, clustering and recommendations.
+  support search, document QA, code search, deduplication, clustering and recommendations, plus agent
+  memory recall and tool selection.
 - **Do not expect it to replace lexical search** for exact identifiers, part numbers, error codes or rare
-  names; pair the two.
+  names; pair the two, or give the agent a separate exact-match tool.
 - **Measure:** recall@k and MRR on labelled pairs from your data, embedding time per thousand chunks, and
   vector bytes per chunk.
 - **Day to day:** pick a model, pin its version, apply its prefixes, and re-evaluate whenever the corpus
@@ -285,12 +322,19 @@ error codes, which embeddings handle badly in any language.
 - **Hard negatives** share topic and vocabulary but do not answer, teaching "answers the question" rather
   than "about the same thing".
 
-### After a deploy, recall dropped sharply with no errors in the logs. What do you check?
+### After a deploy, your agent's search tool keeps returning off-topic hits with no errors in the logs. What do you check?
 - **Model and version parity:** index and query paths must use the same model id and revision.
 - **Prefixes:** an asymmetric model such as E5 silently degrades without `query: ` and `passage: `.
 - **Pooling and normalization:** loading a raw encoder with the wrong pooling still returns vectors, just
   worse ones.
 - **Truncation:** count tokens against the model's maximum input length on the new chunks.
+
+### Your agent has 300 tools. How would you use embeddings to choose which ones it sees, and what can go wrong?
+- **Embed each tool description once,** embed the request (or current step) as a query, and expose the
+  top few plus a fixed core set, which cuts schema tokens per step sharply.
+- **Risk:** a missed tool silently removes a capability, and vague descriptions embed poorly.
+- **Operate it:** log selected tools per step, measure selection recall against tools actually needed on
+  labelled requests, and improve descriptions where recall is low.
 
 ### When would you choose a hosted embedding API over a self-hosted open model?
 - **Hosted wins** when the team cannot run GPU serving and the data may leave the network.
@@ -299,10 +343,10 @@ error codes, which embeddings handle badly in any language.
 - **Decide with a bake-off:** recall@k and MRR on a few hundred labelled pairs from your corpus, plus
   embedding cost and latency.
 
-### How do you upgrade the embedding model in production without breaking retrieval?
+### How do you upgrade the embedding model behind a production agent without breaking retrieval or memory?
 - **Never mix models in one index:** vectors from two models are unrelated even at equal dimension.
-- **Blue/green:** embed the corpus into a new index with the new model, compare both on the eval set,
-  then switch reads atomically.
+- **Blue/green:** embed the corpus and stored memories into a new index with the new model, compare both
+  on the eval set, then switch reads atomically.
 - **Budget it:** the re-embed is a full pass over every chunk, so plan time and cost before committing.
 
 ## Quiz

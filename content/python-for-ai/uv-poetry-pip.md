@@ -5,7 +5,8 @@ name: uv / poetry / pip
 kind: tool
 difficulty: intro
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
   - python-for-ai/security-scanning-and-dependency-auditing
@@ -21,9 +22,24 @@ sources:
 ---
 
 ## TL;DR
-pip installs packages; Poetry and uv manage projects: `pyproject.toml` dependencies, a lockfile,
-environments and builds. Reproducibility is the point, because "works on my machine" is usually two
-environments resolving different versions. uv covers pip, pip-tools, virtualenv, pyenv and pipx, much faster.
+pip installs packages; Poetry and uv manage projects: `pyproject.toml`, a lockfile, environments and builds.
+Agent stacks (LangChain, LangGraph, provider SDKs) move weekly, so an unlocked agent behaves differently per
+machine. uv covers pip, pip-tools, virtualenv, pyenv and pipx, much faster.
+
+## For agent builders
+- **Why it matters for agents.** An agent's behaviour depends on library versions you did not write:
+  `langchain-core`, `langgraph`, `openai`, `anthropic`, tokenizers. A minor bump can change tool-call
+  parsing, default retries or message formats, so the agent that passed evals must run on exactly the
+  versions it was evaluated with.
+- **Where it shows up in your stack.** `uv add langgraph langchain-openai langsmith` writes ranges to
+  `pyproject.toml` and exact versions to `uv.lock`; `uv sync --locked` rebuilds that environment in CI,
+  in the agent's Docker image and in eval runners. `uvx` and PEP 723 scripts give code-executing agents a
+  throwaway environment per script.
+- **What you control.** Which packages are direct dependencies, dependency groups for dev and evals,
+  per-package indexes (CUDA `torch` for a self-hosted embedder), the tool version, and when upgrades
+  happen: in their own pull request, gated on the eval suite.
+- **What you can skip.** Resolver internals beyond "constraints, markers, wheel tags". Poetry versus uv
+  arguments; pick one and lock.
 
 ## Why it exists
 - **A project needs four things.** A list of what it depends on, an exact resolved set of versions satisfying
@@ -190,6 +206,35 @@ info = httpx.get("https://pypi.org/pypi/openai/json", timeout=10).json()["info"]
 print(info["name"], info["version"])
 ```
 
+### Agent scenario: one lock for the service, the evals and the sandbox
+An agent service built on LangGraph keeps runtime, dev and eval dependencies apart, so the production image
+stays small while eval runners use the identical runtime versions. Package names are real; version ranges
+are illustrative.
+
+```toml
+[project]
+name = "support-agent"
+requires-python = ">=3.12"
+dependencies = [
+    "langgraph>=0.2",
+    "langchain-openai>=0.2",
+    "httpx>=0.27",
+    "structlog>=24",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+evals = ["langsmith>=0.1", "pandas>=2"]
+```
+
+| Where | Command | Gets |
+|---|---|---|
+| Production image | `uv sync --locked --no-dev` | runtime dependencies only, exact lock versions |
+| CI unit tests | `uv sync --locked` then `uv run pytest` | runtime plus the default `dev` group |
+| Eval runner | `uv sync --locked --group evals` | runtime plus eval tooling, same runtime versions as production |
+| Agent-generated script | `uv run --with pandas analysis.py` in the sandbox | a throwaway environment, nothing added to the service |
+| Framework upgrade | `uv lock --upgrade-package langgraph` in its own pull request | one package moved, eval suite decides whether it merges |
+
 ### Worked scenario: reading a resolution failure
 Read the explanation rather than loosening pins at random. Illustrative case:
 
@@ -203,6 +248,11 @@ Read the explanation rather than loosening pins at random. Illustrative case:
 | Fix 3 (last resort) | an override, owning the risk of running it against a version it never declared support for |
 
 ## Production patterns
+- **Upgrade agent frameworks one at a time, behind evals.** Move `langgraph`, `langchain-*` or a provider
+  SDK with a targeted lock upgrade in its own pull request, run the agent eval suite on it, and merge only
+  if task success and tool-call validity hold. Track which framework versions each deployed agent runs.
+- **Separate groups for evals and dev.** Keep eval tooling (LangSmith client, dataframes, notebooks) in a
+  dependency group so the production image stays lean while evals run the identical runtime lock.
 - **Locked installs everywhere.** CI runs `uv sync --locked` (or `poetry install` / `pip-sync` from a
   compiled file) so an edited `pyproject.toml` without a re-lock fails the build. Monitor for lock drift
   failures as a signal that developers skip `uv lock`.
@@ -234,6 +284,9 @@ Read the explanation rather than loosening pins at random. Illustrative case:
   never deploy to, which can surface conflicts (often around CUDA wheels) a single-platform lock never hits.
 
 ## Pitfalls
+- **Upgrading `langchain`, `langgraph` and provider SDKs in one sweep.** Symptom: an eval regression
+  nobody can attribute to a single package. Fix: one framework per upgrade pull request, each gated on the
+  agent eval suite.
 - **Installing into the system or base conda interpreter.** Symptom: one project's upgrade breaks another,
   permission errors on `pip install`, or (on distro and Homebrew Pythons that adopt PEP 668) pip refusing
   with `externally-managed-environment`. Fix: a project environment.
@@ -250,7 +303,7 @@ Read the explanation rather than loosening pins at random. Illustrative case:
   route `torch` to the matching PyTorch index via `[tool.uv.sources]`.
 
 ## When to use
-- **New application or service:** uv is a strong default: one tool for Python versions, environments,
+- **New agent service or application:** uv is a strong default: one tool for Python versions, environments,
   locking and running, fast enough for CI and Docker.
 - **Team already on Poetry:** keep it if used well; migrating buys speed but costs churn.
 - **Platform expects requirements files:** pip with pip-tools, or uv's pip interface.
@@ -297,6 +350,14 @@ platform mismatches stop.
 - **Avoid `--extra-index-url`** for this, because it treats both indexes as equals and opens the
   dependency-confusion path.
 
+### An agent passed evals last week, but the same commit misbehaves in a fresh deploy. How do you check whether dependencies are the cause?
+- **Compare environments:** was the deploy built with `uv sync --locked` from the committed `uv.lock`,
+  or did it resolve fresh and pick newer `langchain-core`, `openai` or tokenizer versions?
+- **Diff installed versions** between the eval runner and the image (`uv pip list` or `pip freeze` in
+  each), focusing on the framework and provider SDKs.
+- **Fix the process:** install only from the lock everywhere, and run framework upgrades as their own
+  pull requests gated on the eval suite.
+
 ### When would you not migrate a team from Poetry to uv?
 - **When Poetry is used well:** locks committed, CI installs from them, and builds are fast enough; migration
   buys speed but costs churn across repos and habits.
@@ -304,7 +365,7 @@ platform mismatches stop.
   export step matters more than the tool.
 - **Migrate when** resolution speed, Python version management or per-package indexes are real pain.
 
-### How do you keep Docker builds fast when dependencies rarely change?
+### How do you keep an agent service's Docker builds fast when dependencies rarely change?
 - **Copy only `pyproject.toml` and `uv.lock` first** and run `uv sync --locked --no-dev --no-install-project`,
   so that layer is cached until the lock changes.
 - **Copy the source afterwards** and run the final sync, so code edits do not reinstall packages.

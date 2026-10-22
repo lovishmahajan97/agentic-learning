@@ -5,7 +5,8 @@ name: Async cancellation & exception propagation
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-await
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Cancelling an asyncio task does not kill it: it schedules a `CancelledError` at its next `await`, so
-`finally` blocks can release connections. `TaskGroup` and `asyncio.timeout` build on this one mechanism, so swallowing
-`CancelledError` silently breaks deadlines, sibling cleanup and shutdown.
+Stopping an agent turn (user hit Stop, deadline passed, a tool failed) means cancelling tasks. asyncio
+throws `CancelledError` at the next `await` so `finally` closes streams; `TaskGroup` and `asyncio.timeout`
+depend on it, so swallowing it breaks deadlines and leaves tools running.
+
+## For agent builders
+- **Why it matters for agents.** An agent turn is a tree of concurrent awaits: a model stream, parallel
+  tool calls, a retrieval query, maybe sub-agents. Cancellation is how that tree stops when the user
+  leaves, a step budget runs out or one tool fails, without leaking tokens or half-done side effects.
+- **Where it shows up in your stack.** Client disconnects on streaming FastAPI routes, per-tool and
+  per-turn `asyncio.timeout`, `TaskGroup` around parallel tool calls, and the async run and stream methods
+  of agent frameworks, which cancel your tool coroutines when the run is cancelled.
+- **What you control.** Re-raising `CancelledError` in every tool, releasing resources in `finally` or
+  `async with`, choosing fail-fast (`TaskGroup`) or best-effort (`gather(return_exceptions=True)`) per
+  step, and shielding only short critical writes such as an audit record.
+- **What you can skip.** The internals of `Task.uncancel()` bookkeeping and the pre-3.12 `wait_for`
+  implementation. Know the contract, the TaskGroup versus gather table and how to test it.
 
 ## Why it exists
 - **Concurrent work must stop cleanly.** An agent turn runs three tool calls and a retrieval query; then
@@ -33,9 +47,10 @@ Cancelling an asyncio task does not kill it: it schedules a `CancelledError` at 
   billing), a connection never returns to the pool, a checkpoint store gets a half-written row.
 - **Killing from outside is unsafe.** Interrupting a thread or coroutine at an arbitrary instruction
   leaves locks held and sockets half-written, which is why Python offers no safe way to kill a thread.
-- **A `stop` flag only works if every piece of code checks it**, and library code you call never will.
+- **A `stop` flag only works if every piece of code checks it**, and library code you call (provider SDKs,
+  framework internals) never will.
 - **Ignored background errors are worse.** A task that raised but was never awaited loses its exception
-  until garbage collection logs "Task exception was never retrieved", long after the request returned a
+  until garbage collection logs "Task exception was never retrieved", long after the agent returned a
   wrong answer.
 
 **asyncio's answer:** cooperative cancellation delivered as an exception. A coroutine can only be
@@ -48,7 +63,8 @@ concurrency (`TaskGroup`) then supplies rules for siblings when one child fails.
 `task.cancel()` does three things:
 1. **Cancel what it waits on.** If the task is suspended on a future, it cancels *that* future. If it
    was awaiting another task (`await other_task`), the inner task is cancelled too, so the request
-   travels **down** the await chain to whatever is actually waiting on I/O.
+   travels **down** the await chain to whatever is actually waiting on I/O (the model stream, the tool's
+   HTTP call).
 2. **Wake the task.** Cancelling the future wakes the task on the next loop iteration, exactly as a
    result would.
 3. **Throw.** On resume, `CancelledError` is thrown into the coroutine at the suspended `await`, and
@@ -74,7 +90,8 @@ cancellation failed or never happened.
 
 - **`asyncio.wait_for`** is built on `asyncio.timeout` since 3.12. Before that it ran the awaitable as a
   separate inner task and cancelled that task, with the same cancel-then-translate shape.
-- **Hence the bug:** a swallowed cancellation inside a timeout block makes the deadline silently not fire.
+- **Hence the bug:** a swallowed cancellation inside a timeout block makes the deadline silently not fire,
+  so an agent with a 30-second turn budget can run for minutes.
 - **Telling cancellations apart.** Python 3.11 added `Task.cancelling()` and `Task.uncancel()` so these
   constructs can distinguish their own cancellation from one requested from outside.
 
@@ -85,18 +102,20 @@ cancellation failed or never happened.
 - **Otherwise it is lost for a while.** The loop logs "Task exception was never retrieved" when the task
   object is garbage-collected, which may be minutes later or never.
 - **So every task needs an owner:** something that awaits it, a TaskGroup, or a done-callback that logs.
+  A background memory write or trace upload without an owner fails invisibly.
 - **`asyncio.wait` follows the same rule:** it never raises children's exceptions; it hands you `done`
   tasks whose results you must still check.
 
 ### Propagation: gather versus TaskGroup
-| Construct | When a child fails | Other children | Error you see |
+| Construct | When a child (tool) fails | Other children | Error you see |
 |---|---|---|---|
 | `asyncio.gather(*aws)`, default `return_exceptions=False` | First exception propagates to the caller | Keep running, orphaned | The first exception |
 | `gather(..., return_exceptions=True)` | Exceptions returned as list items | Keep running | None raised; inspect every result |
 | Cancelling the gather itself | — | All cancelled | `CancelledError` |
 | `asyncio.TaskGroup` (3.11+) | Group cancels remaining children (and the `async with` body if still running), waits for them to unwind | Cancelled, cleanup runs | `ExceptionGroup` of every child failure |
 
-- **No child outlives the block** in a TaskGroup; that is structured concurrency.
+- **No child outlives the block** in a TaskGroup; that is structured concurrency, and it means no tool
+  writes to a CRM after the turn already returned.
 - **Cancelled children are not reported as failures**, *because* the group itself caused them.
 - **Handle the group with `except*`**, which matches by type inside the group, *because* concurrent code
   can genuinely fail in several ways at once and a single exception would hide the others.
@@ -109,31 +128,31 @@ cancellation failed or never happened.
   `CancelledError` while the inner work continues.
 - **Keep a reference to the inner task**, or it can be garbage-collected once nobody awaits it.
 - **Use it narrowly**, for work that must complete even when the requester is gone, such as committing an
-  audit record.
+  audit record or a usage row for billing.
 
 ## Diagram
-A timeout firing: the cancel request travels down the await chain, `CancelledError` travels back up
-through `finally`, and the timeout block converts it to `TimeoutError` only if nobody swallowed it.
+A turn deadline firing: the cancel request travels down to the model stream, `CancelledError` travels back
+up through `finally`, and the timeout block converts it to `TimeoutError` only if nobody swallowed it.
 
 ```mermaid
 sequenceDiagram
     participant TO as asyncio.timeout block
     participant T as Task (agent turn)
-    participant I as Inner await (HTTP stream)
+    participant I as Inner await (model stream)
     participant L as Event loop
     TO->>T: deadline reached, task.cancel()
     T->>I: cancel the future it is waiting on
     L->>T: wake task on next iteration
     I-->>T: CancelledError thrown at the await
-    Note over T: finally and async with exits run, connection released
+    Note over T: finally and async with exits run, stream closed
     T-->>TO: CancelledError re-raised up the stack
     Note over TO: recognises its own cancel, converts it
     TO-->>T: TimeoutError raised to the caller
-    Note over T,TO: if the task swallowed CancelledError, the block exits normally and no TimeoutError appears
+    Note over T,TO: if the task swallowed CancelledError, no TimeoutError appears
 ```
 
 ## Examples
-### Fail-fast fan-out with a deadline
+### Fail-fast parallel tool calls with a turn deadline
 ```python
 import asyncio
 
@@ -180,6 +199,18 @@ cancellation to its children, the LLM call unwinds, and the caller sees `Timeout
 belongs to `agent_turn`, not the child. But the cancelled child would then report success, and the same
 swallow in the task that owns a timeout makes the block exit normally, so no `TimeoutError` is ever raised.
 
+### Worked scenario: the Stop button that did not stop
+A support agent streams its answer while two tools run. The user clicks Stop 2 seconds in. Figures are
+illustrative.
+
+| Implementation | What keeps running after Stop | Effect |
+|---|---|---|
+| `gather` and a tool that wraps its call in a bare `except:` returning `None` | The model stream finishes its remaining tokens; the swallowing tool completes its CRM write | Tokens billed for an answer nobody reads, and a side effect the user cancelled |
+| `TaskGroup`, every tool re-raises, stream iterated inside `async with` | Nothing; each child unwinds through `finally` within one loop iteration of its next await | Connections back in the pool, no late writes |
+| Same, plus the usage row written under `asyncio.shield` | Only the short usage write | Billing and audit stay correct |
+
+The test below is how you prove the second row before shipping.
+
 ### Test that cancellation actually cleans up
 A test that cancels mid-call and checks resources are back to idle catches swallowed cancellations
 before production does. Runs on Python 3.8+.
@@ -217,29 +248,32 @@ asyncio.run(cancel_mid_call(swallow=True))    # cancelled=False, in_flight=0
 ```
 In both runs the `finally` releases the resource, but only the correct version reports
 `cancelled=True`; the swallowing one looks like a normal return to whoever cancelled it. Assert on
-`t.cancelled()` in tests.
+`t.cancelled()` in tests of every tool wrapper.
 
 ## Production patterns
-- **Nested deadline budget.** Give each turn an outer `asyncio.timeout(...)` and each tool or model call a
-  shorter inner one, so inner deadlines fire first with a specific error. Monitor timeout counts per layer;
-  outer timeouts firing means an inner one is missing or too long.
-- **Owner for every task.** Put fan-out in a `TaskGroup`; for true background work, add a done-callback
-  that logs `t.exception()` when `not t.cancelled()`. Alert on "Task exception was never retrieved" in logs.
-- **Close the upstream stream on disconnect.** In a streaming endpoint, iterate the provider stream inside
-  `async with` so cancellation closes it, and check `await request.is_disconnected()` (Starlette) in the
-  loop. Monitor upstream tokens generated after client disconnect.
-- **Bound cleanup awaits.** Inside `finally`, wrap slow cleanup in its own `asyncio.timeout(...)` so a hung
-  close cannot stall shutdown. Monitor shutdown duration against the process manager's kill timeout.
+- **Nested deadline budget per agent run.** Give each run and each turn an outer `asyncio.timeout(...)`
+  and each tool or model call a shorter inner one, so inner deadlines fire first with a specific error the
+  agent can report to the model. Monitor timeout counts per layer; outer timeouts firing means an inner one
+  is missing or too long.
+- **Owner for every task.** Put parallel tool calls in a `TaskGroup`; for true background work (trace
+  upload, memory consolidation), add a done-callback that logs `t.exception()` when `not t.cancelled()`.
+  Alert on "Task exception was never retrieved" in logs.
+- **Close the upstream stream on disconnect.** In a streaming agent endpoint, iterate the provider stream
+  inside `async with` so cancellation closes it, and check `await request.is_disconnected()` (Starlette)
+  in the loop. Monitor upstream tokens generated after client disconnect.
+- **Bound cleanup awaits.** Inside `finally`, wrap slow cleanup (checkpoint flush, sandbox teardown) in its
+  own `asyncio.timeout(...)` so a hung close cannot stall shutdown. Monitor shutdown duration against the
+  process manager's kill timeout.
 - **Shield only short, critical writes.** Create the audit or billing write as its own task, keep it in a
   set, and `await asyncio.shield(task)`. Monitor the number of shielded tasks in flight during incidents.
 
 ## Trade-offs
 - **Fail-fast vs partial results.** TaskGroup stops wasted work and guarantees no orphans, but one flaky
-  optional tool cancels the whole fan-out. When partial results are acceptable, catch errors inside each
-  child.
+  optional tool cancels the whole fan-out. When partial results are acceptable (the model can work with
+  two of three tool results), catch errors inside each child and return them as tool messages.
 - **Keep everything vs manual inspection.** `gather(return_exceptions=True)` keeps every result and never
   cancels siblings, at the cost of manual inspection. It is the better choice when children are
-  independent and best-effort.
+  independent and best-effort, such as an eval batch.
 - **Safe cleanup vs reach.** Cooperative cancellation keeps cleanup safe and predictable, but cannot
   interrupt CPU-bound or blocking code. Such work must run in a thread or process, where cancellation only
   abandons the wait.
@@ -247,14 +281,14 @@ In both runs the `finally` releases the resource, but only the correct version r
   request and can pile up during an incident. It is only safe when the shielded work is short and bounded.
 
 ## Pitfalls
-- **Swallowing cancellation.** A bare `except:` or `except BaseException:` without re-raise (or
-  `except Exception` on Python 3.7 and earlier). Symptom: timeouts that never fire and shutdowns that hang.
-  Fix: re-raise.
+- **Swallowing cancellation in a tool wrapper.** A bare `except:` or `except BaseException:` without
+  re-raise (or `except Exception` on Python 3.7 and earlier). Symptom: turn timeouts that never fire and
+  shutdowns that hang. Fix: re-raise.
 - **Fire-and-forget `asyncio.create_task(...)`** without keeping a reference or awaiting it. Symptom:
   "Task exception was never retrieved" in logs and occasionally tasks garbage-collected mid-flight.
   Fix: keep tasks in a set with a done-callback that discards and logs them, or use a `TaskGroup`.
-- **Assuming a `gather` failure stops the other calls.** Symptom: token spend and tool side effects
-  continue after the request already returned an error. Fix: `TaskGroup`.
+- **Assuming a `gather` failure stops the other tool calls.** Symptom: token spend and tool side effects
+  continue after the agent already returned an error. Fix: `TaskGroup`.
 - **Unbounded awaits in `finally` during cancellation.** A slow cleanup call can itself hang, so shutdown
   stalls until the process manager kills it. Fix: a timeout around cleanup.
 - **Expecting cancel to stop a blocking `requests.get` or a tight loop.** Symptom: a task that stays
@@ -263,12 +297,12 @@ In both runs the `finally` releases the resource, but only the correct version r
   cancelling there only abandons the wait while the thread keeps running.
 
 ## When to use
-- **You meet it whenever** code starts more than one task or has a deadline, which in an AI backend is
-  almost always: per-request timeouts on model calls, client disconnects on streaming endpoints, parallel
-  tool calls, graceful shutdown.
+- **You meet it whenever** an agent starts more than one task or has a deadline, which is almost always:
+  per-request timeouts on model calls, client disconnects on streaming endpoints, parallel tool calls,
+  step budgets, graceful shutdown.
 - **Defaults:** `TaskGroup` for fan-out where all results matter, `asyncio.timeout` for deadlines,
   `gather(return_exceptions=True)` for best-effort batches.
-- **Resources:** every coroutine that holds a resource releases it in `finally` or `async with`.
+- **Resources:** every tool coroutine that holds a resource releases it in `finally` or `async with`.
 - **Test it:** cancel mid-call and assert the connection pool and locks are back to idle.
 - **Interviews:** explain why `CancelledError` is a `BaseException` and how TaskGroup differs from gather
   when one child fails.
@@ -300,22 +334,31 @@ or a compensating action.
   so connections and locks are released.
 - **Code between awaits runs to completion**, so a CPU loop with no await cannot be cancelled.
 
-### A service's 30-second request timeout sometimes never fires. How do you debug it?
+### An agent's 30-second turn timeout sometimes never fires. How do you debug it?
 - **Suspect a swallowed cancellation.** `asyncio.timeout` works by cancelling the task and converting
-  the `CancelledError` at block exit; a bare `except:` or `except BaseException:` without re-raise
-  leaves nothing to convert.
+  the `CancelledError` at block exit; a bare `except:` or `except BaseException:` without re-raise in a
+  tool or retry wrapper leaves nothing to convert.
 - **Grep for broad handlers** and retry wrappers in the call path, and add a test that cancels mid-call
   and asserts `t.cancelled()` is true.
-- **Also check for blocking calls** such as `requests.get`, which keep the task cancelling until they
-  return on their own.
+- **Also check for blocking calls** such as `requests.get` in a tool, which keep the task cancelling until
+  they return on their own.
 
-### When would you choose gather with return_exceptions=True over a TaskGroup?
+### When would you choose gather with return_exceptions=True over a TaskGroup for tool calls?
 - **Independent, best-effort children:** a batch of embedding calls or optional enrichment tools where
-  one failure should not cancel the rest.
+  one failure should not cancel the rest, and the model can reason over partial results.
 - **The cost is manual inspection.** Exceptions come back as list items, siblings are never cancelled,
   and you must check every result yourself.
 - **Choose TaskGroup** when every result matters or a failure makes the others pointless, because it
   cancels siblings and reports an `ExceptionGroup`.
+
+### A user presses Stop on a streaming agent. What must happen, and how do you verify it?
+- **The route's task is cancelled** when the client disconnects, and the cancellation must reach the
+  provider stream and every running tool, so iterate the stream inside `async with` and run tools in a
+  `TaskGroup`.
+- **Every tool re-raises `CancelledError`** and releases its connection in `finally`; only a short usage
+  or audit write runs under `asyncio.shield`.
+- **Verify with metrics and tests:** upstream tokens generated after disconnect should be near zero, and a
+  test that cancels mid-call should see `t.cancelled()` true and an idle pool.
 
 ### What does asyncio.shield protect, and what are the risks in production?
 - **It protects inner work from outer cancellation.** The outer `await` still raises `CancelledError`,

@@ -5,7 +5,8 @@ name: Graceful shutdown & worker draining
 kind: practice
 difficulty: advanced
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/uvicorn-gunicorn-workers
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-On SIGTERM (every deploy, scale-down or drain) a worker stops taking traffic, finishes in-flight requests,
-closes resources and exits. LLM streams can outlast the default 30-second grace, so draining needs a
-budget, a readiness flip and a plan for unfinishable work.
+Every deploy sends SIGTERM to workers mid agent run. A graceful worker stops taking
+traffic, finishes or checkpoints in-flight work, closes resources and exits before SIGKILL. Agent runs
+outlast the default 30-second grace, so drain needs a budget and a plan.
+
+## For agent builders
+- **Why it matters for agents.** A killed agent run is worse than a killed request: paid model calls are
+  lost, a tool side effect (ticket created, email sent) may have happened with no record, and the user
+  sees a run that just stops. Shutdown is when that happens, many times a day.
+- **Where it shows up in your stack.** The pod spec (`terminationGracePeriodSeconds`, `preStop`), the
+  Uvicorn or Gunicorn drain timeout, the Dockerfile `CMD`, your readiness endpoint, and the agent loop
+  itself, which must check a drain flag between steps and checkpoint.
+- **What you control.** The grace budget, where long runs execute (request path or durable worker), how
+  often the loop checkpoints, and what the client sees when a stream is cut (a reconnect event, a run id
+  to resume).
+- **What you can skip.** Signal-handling internals of Uvicorn and Gunicorn. Know the SIGTERM-to-SIGKILL
+  timeline and the budget formula.
 
 ## Why it exists
 - **Processes are stopped far more often than they crash.** Every rolling deploy, autoscaler scale-down,
@@ -57,7 +71,7 @@ budget, a readiness flip and a plan for unfinishable work.
      polls `/readyz` does not know.
    - The app does not learn about SIGTERM until lifespan shutdown, which runs only *after* draining.
    - So the hook can also tell the app it is draining (for example a local `POST /internal/drain` that sets
-     a flag): readiness then fails, and long streams know a cutoff is coming.
+     a flag): readiness then fails, and long streams and agent loops know a cutoff is coming.
    - An in-memory flag is per process; with several workers in one pod, one request reaches only one of
      them. Run one worker per pod, or have the hook touch a file (`/tmp/draining`) every worker's readiness
      check reads.
@@ -67,7 +81,8 @@ budget, a readiness flip and a plan for unfinishable work.
      bound to SIGKILL.
    - Under Gunicorn, the master forwards the signal and `--graceful-timeout` bounds the workers' drain.
 3. **Run lifespan shutdown.** After requests drain, the code after `yield` runs: close the HTTP client
-   pool, dispose the DB engine, flush telemetry exporters, release GPU memory.
+   pool, dispose the DB engine, flush telemetry exporters (including the agent's trace spans), release GPU
+   memory.
 4. **Exit before SIGKILL**, with margin, so step 3 actually happens.
 
 ### The budget
@@ -83,10 +98,19 @@ strategies, in order of robustness:
 1. **Move it out of the request.** Long jobs go to a durable queue; the API returns a job id and the client
    polls or subscribes. The queue survives the worker.
 2. **Make it resumable.** Persist progress (tokens generated, steps completed) and let the client reconnect
-   with an id, so a cut stream can continue elsewhere.
+   with an id, so a cut stream can continue elsewhere. For agents this is a checkpoint after every step:
+   transcript so far, pending tool call, and which side effects already ran.
 3. **End it cleanly.** Once draining, a stream that will not finish inside the budget sends a final
    "reconnect" event and closes, so the client retries instead of rendering a truncated answer. This must
    happen before the server's drain timeout; after that the connection is just closed.
+
+### The agent loop's part
+- **Check the flag at step boundaries, never mid-tool-call.** Between steps the state is consistent: the
+  last tool result is recorded, the next model call has not been made.
+- **Checkpoint, then stop.** Write the run's state, mark it `interrupted`, emit a reconnect or resume event
+  with the run id, and return. A worker on the new version picks it up.
+- **Side-effecting tools need idempotency keys,** because a run resumed after a kill may repeat the last
+  call if the checkpoint was written before the side effect completed.
 
 ### Draining that is not pod termination
 - **Recycling and reloads drain too.** Gunicorn's `--max-requests` recycling and a `SIGHUP` reload retire
@@ -107,8 +131,8 @@ strategies, in order of robustness:
   tini.
 
 ## Diagram
-Read it top to bottom as one grace budget: preStop, then SIGTERM and drain, then lifespan cleanup, all
-of which must finish before SIGKILL arrives at the end of `terminationGracePeriodSeconds`.
+Read it top to bottom as one grace budget: preStop, then SIGTERM and drain (agent loops checkpoint at the
+next step), then lifespan cleanup, all before SIGKILL at the end of `terminationGracePeriodSeconds`.
 
 ```mermaid
 sequenceDiagram
@@ -120,9 +144,8 @@ sequenceDiagram
     U->>LB: readiness returns 503 via drain flag
     LB-->>U: stops routing new requests
     K->>U: SIGTERM after preStop returns
-    Note over U: close listening socket, finish in-flight requests
+    Note over U: finish in-flight, agent loops checkpoint at next step
     U-->>U: streams past cutoff send event reconnect
-    Note over U: bounded by the Uvicorn graceful shutdown timeout
     U->>A: run code after yield
     Note over A: close HTTP pool, dispose engine, flush telemetry
     A-->>K: process exits before the deadline
@@ -130,6 +153,57 @@ sequenceDiagram
 ```
 
 ## Examples
+### Agent scenario: a loop that checkpoints and yields on drain
+The agent loop checks the shared drain file between steps. If draining, it saves the run and tells the
+client to resume elsewhere instead of being killed mid-tool-call.
+
+```python
+import json
+from pathlib import Path
+
+DRAIN_FILE = Path("/tmp/draining")             # touched by the preStop hook
+
+async def run_agent(run_id: str, store, llm, tools, max_steps: int = 30):
+    state = await store.load(run_id)           # {"messages": [...], "step": n}
+    while state["step"] < max_steps:
+        if DRAIN_FILE.exists():                # step boundary: state is consistent
+            await store.save(run_id, state, status="interrupted")
+            yield f"event: resume\ndata: {json.dumps({'run_id': run_id})}\n\n"
+            return
+        reply = await llm.complete(state["messages"], tools=tools.schemas())
+        state["messages"].append(reply.message)
+        if not reply.tool_calls:
+            await store.save(run_id, state, status="done")
+            yield f"event: done\ndata: {json.dumps({'text': reply.text})}\n\n"
+            return
+        for call in reply.tool_calls:
+            # idempotency key: a resumed run that repeats this call does not repeat the side effect
+            result = await tools.call(call.name, call.arguments, idempotency_key=f"{run_id}:{call.id}")
+            state["messages"].append({"role": "tool", "tool_call_id": call.id, "content": result})
+        state["step"] += 1
+        await store.save(run_id, state, status="running")   # checkpoint every step
+        yield f"event: step\ndata: {json.dumps({'step': state['step']})}\n\n"
+```
+
+- **`store`, `llm` and `tools` are your own interfaces** (a Postgres or Redis checkpoint store, a provider
+  client, a tool registry); the shape, not a library API, is the point.
+- **The client treats `resume` like `reconnect`:** it calls a resume endpoint with the run id and lands on
+  a pod that is not draining.
+
+### Worked scenario: what one deploy costs a research agent
+Illustrative numbers: runs take ~20 steps of ~6 s each (about 120 s), each step costs about $0.02 in model
+calls, and 40 runs are in flight when a rolling deploy starts.
+
+| Setup | What happens to the 40 runs | Lost model spend | Side effects |
+|---|---|---|---|
+| Defaults: grace 30 s, run in request, no checkpoints | most are SIGKILLed mid-run and restart from step 0 | ~40 × 10 steps × $0.02 ≈ $8 per deploy | unknown: some tool calls ran, none recorded |
+| Grace 150 s, no checkpoints | runs near the start still exceed the budget; deploys take minutes | lower, not zero | still unknown for the cut runs |
+| Drain flag plus per-step checkpoints | each run stops at its next step boundary (within ~6 s) and resumes on a new pod | at most the in-flight step per run | recorded, and idempotency keys stop duplicates |
+
+- **Ten deploys a day at the default setup** is ~$80 a day of discarded model calls, before counting
+  user-visible failures.
+- **Checkpointing beats a longer grace** because the budget only has to cover one step, not one run.
+
 ### Worked timeline: SSE chat on a rolling deploy
 Answers take up to 50 seconds. **Defaults first:** grace 30 s, no preStop, Uvicorn waits indefinitely.
 
@@ -226,6 +300,12 @@ async def chat_stream():
 ```
 
 ## Production patterns
+- **Long agent runs as durable jobs.** Anything that can exceed the budget or performs side effects runs
+  in a queue worker that checkpoints between tool calls, and the API only starts runs and streams their
+  events. Monitor: jobs retried after worker termination and duplicate side effects.
+- **Checkpoint per step, resume by run id.** For runs that stay in the request path, save state at each
+  step boundary and stop at the next boundary once draining, as above. Monitor: runs ending as
+  `interrupted` per deploy and the share that resume successfully.
 - **Exec-form entrypoint, always.** Use `CMD ["uvicorn", ...]`, `exec uvicorn ...` in scripts, or tini as
   PID 1. Monitor: termination duration per pod; shutdowns that take exactly the grace period mean the
   signal never reached the server.
@@ -233,18 +313,13 @@ async def chat_stream():
   and `--timeout-graceful-shutdown` (or Gunicorn's `--graceful-timeout`) next to each other in the
   manifest and check grace ≥ preStop + drain + cleanup. Monitor: request-duration p99 against the drain
   timeout, alerting when long requests approach it.
-- **Delay-only preStop without curl.** When the image is slim and only a delay is needed, use the built-in
-  sleep action on recent Kubernetes (`preStop: {sleep: {seconds: 5}}`), or a Python one-liner to call the
-  drain endpoint. Monitor: `FailedPreStopHook` events on pods.
-- **Align the load balancer's drain.** Set the target group deregistration delay (300 s by default on an
-  AWS ALB) just above the server's drain timeout rather than leaving the default. Monitor: deploy duration
-  and 502s at the balancer during rollouts.
+- **Delay-only preStop and an aligned balancer.** When the image is slim and only a delay is needed, use
+  the built-in sleep action on recent Kubernetes (`preStop: {sleep: {seconds: 5}}`), or a Python one-liner
+  to call the drain endpoint; set the target group deregistration delay (300 s by default on an AWS ALB)
+  just above the server's drain timeout. Monitor: `FailedPreStopHook` events and 502s during rollouts.
 - **Record why each stream ended.** Count stream completions by reason (`done`, `reconnect`, client
   disconnect, server error) as a metric. Monitor: `reconnect` and errors spiking at deploy time, which
   says the budget or the workload placement is wrong.
-- **Long agent runs as durable jobs.** Anything that can exceed the budget or performs side effects runs
-  in a queue worker that checkpoints between tool calls. Monitor: jobs retried after worker termination
-  and duplicate side effects.
 
 ## Trade-offs
 - **Long grace vs rollout speed.** A long grace period lets long streams finish, but it slows rollouts and
@@ -257,6 +332,8 @@ async def chat_stream():
   long requests.
 - **Resumable streams vs build cost.** They avoid lost work on any shutdown, but require persisted
   generation state and client support, worth building only when long generations are core to the product.
+- **Checkpoint every step vs write load.** Per-step checkpoints bound lost work to one step, but add one
+  store write per step; for 30-step runs at high volume, checkpoint after side-effecting steps only.
 
 ## Pitfalls
 - **Shell-form `CMD` in the Dockerfile.** Symptom: every shutdown takes exactly the grace period and ends
@@ -272,6 +349,9 @@ async def chat_stream():
   action that recent Kubernetes versions provide when only a delay is needed.
 - **Agent runs treated as ordinary requests.** Symptom: half-completed side effects (tickets created,
   emails sent) with no record, because the run was killed between tool calls.
+- **Checking the drain flag inside a tool call.** Symptom: runs interrupted after a side effect but before
+  its result was recorded, so the resumed run repeats it. Fix: check only at step boundaries and pass an
+  idempotency key to side-effecting tools.
 
 ## When to use
 Every production service needs a deliberate shutdown, because deploys guarantee terminations.
@@ -309,6 +389,14 @@ must be cut. Very long generations should become resumable or move to a job queu
   bound, runs lifespan cleanup and exits before SIGKILL.
 - **Why it matters more:** a cut CRUD call is retried in 50 ms, but a cut LLM stream loses a 40-second
   answer, and a killed agent run loses paid tool calls or leaves half-done side effects.
+
+### Your agents run for 2 to 5 minutes inside the request. How do you make deploys safe for them?
+- **Do not stretch the grace period to 5 minutes:** every rollout and scale-down would wait that long, and
+  node loss would still kill runs.
+- **Checkpoint at step boundaries and stop on drain:** the loop reads a drain flag before each model call,
+  saves state, emits a resume event with the run id, and a pod on the new version continues.
+- **Protect side effects:** idempotency keys on side-effecting tools, so a resumed step cannot send the
+  email twice. Longer term, move runs to a durable job worker.
 
 ### Every pod shutdown takes exactly 30 seconds and the app logs nothing. What do you check?
 - **Suspect the signal never arrived:** a shell-form `CMD` makes `/bin/sh -c` PID 1, and the shell does

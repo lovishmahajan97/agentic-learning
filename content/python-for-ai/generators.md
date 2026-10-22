@@ -5,7 +5,8 @@ name: Generators
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/async-await
   - python-for-ai/context-managers-resource-cleanup
@@ -22,16 +23,29 @@ sources:
 ---
 
 ## TL;DR
-A generator `yield`s values one at a time, pausing with its state intact. A 10 GB JSONL corpus or an
-endless token stream becomes a lazy pipeline holding one item or batch at a time; async generators do
-the same for LLM token streams.
+A generator `yield`s values one at a time, pausing with its state intact. Agents use them everywhere:
+streaming tokens and step events to the UI with async generators, and lazy pipelines that chunk a 10 GB
+corpus for RAG one batch at a time.
+
+## For agent builders
+- **Why it matters for agents.** Users expect to watch an agent think: tokens, "calling search...", tool
+  results, the final answer. An async generator that yields those events is the natural shape of a
+  streaming agent loop, and plain generators keep RAG ingestion and eval runs at flat memory.
+- **Where it shows up in your stack.** Provider SDK streaming (`async for` over chunks), FastAPI's
+  `StreamingResponse` for SSE, agent-framework streaming APIs (LangGraph's `stream` and `astream` yield
+  step updates), and ingestion pipelines feeding an embedding API in batches.
+- **What you control.** The event schema your agent loop yields, closing upstream streams with
+  `contextlib.aclosing()` when the user stops, batch size at the API boundary, and checkpoint positions so
+  long ingestion or eval jobs resume.
+- **What you can skip.** Hand-written iterator classes and generator-based coroutines (pre-`async`). Know
+  laziness, single-pass behaviour, `yield from` and async-generator cleanup.
 
 ## Why it exists
-- **AI data is too big or too slow to materialise:** a corpus to chunk and embed, an eval set of 50,000
-  prompts, a vector store export, server-sent events from a model.
+- **Agent data is too big or too slow to materialise:** a corpus to chunk and embed, an eval set of 50,000
+  prompts, a vector store export, server-sent events from a model, a long agent run's event stream.
 - **Lists fail three ways.** Read every line, parse every document, chunk everything, then embed: memory
   grows with the dataset, the first embedding call waits for the whole corpus, and a crash at item
-  900,000 loses all work in flight.
+  900,000 loses all work in flight. For an agent, a list means the user sees nothing until the run ends.
 - **Hand-written iterator classes are inside-out.** `__iter__`, `__next__` and explicit state fields
   ("which file, which line, which chunk offset") turn a simple nested loop into an error-prone state
   machine.
@@ -83,7 +97,7 @@ executed instruction). An ordinary call discards its frame on return; a generato
 | `yield from sub` (PEP 380) | Delegates to a sub-generator, forwarding sends and throws, evaluating to its return value |
 
 - **`yield from` exists** *because* refactoring a generator into helpers would otherwise need hand-written
-  forwarding.
+  forwarding. Async generators have no `yield from`; re-yield with `async for x in sub: yield x`.
 - **Ancestor of coroutines.** This send-and-suspend machinery is where `async`/`await` came from:
   generator-based coroutines.
 
@@ -95,10 +109,10 @@ executed instruction). An ordinary call discards its frame on return; a generato
   open.
 - **Async generators** (PEP 525): `async def` with `yield`, consumed with `async for`. Their `finally` may
   need to await, so handle early exit with `contextlib.aclosing()` (3.10+) to close deterministically rather
-  than leaving cleanup to the event loop's finaliser.
+  than leaving cleanup to the event loop's finaliser. This is the Stop-button path of every streaming agent.
 
 ## Diagram
-One pull through the embedding pipeline below: each `next()` travels up the chain, one line is read,
+One pull through the RAG embedding pipeline below: each `next()` travels up the chain, one line is read,
 and each stage suspends at `yield` again with its state intact. Nothing moves until the consumer asks.
 
 ```mermaid
@@ -113,15 +127,64 @@ sequenceDiagram
     K->>R: next() for a document
     R->>F: read one line
     F-->>R: line text
-    R-->>K: yield parsed doc (frame suspended, file still open)
-    K-->>B: yield (id, chunk) and suspend mid-loop
+    R-->>K: yield parsed doc (file still open)
+    K-->>B: yield (id, chunk) and suspend
     Note over B,K: repeats until 64 chunks or end of input
     B-->>C: tuple of 64 chunks
-    Note over C: slow embedding API means slow pulls, which is backpressure with no queue
+    Note over C: slow embedding API means slow pulls, backpressure with no queue
 ```
 
 ## Examples
-### A lazy embedding pipeline
+### A streaming agent loop as an async generator
+The loop yields typed events (tokens, tool start and end, final answer) that a UI or SSE endpoint renders
+as they happen. The model and tool are stubs so it runs offline.
+
+```python
+import asyncio
+from contextlib import aclosing
+
+async def model_stream(messages):              # stub for a provider's streaming call
+    if messages[-1]["role"] == "tool":
+        for tok in ["Your order", " shipped", " today."]:
+            await asyncio.sleep(0.01); yield {"type": "token", "text": tok}
+    else:
+        yield {"type": "tool_call", "name": "lookup_order", "args": {"id": 42}}
+
+async def lookup_order(id):
+    await asyncio.sleep(0.05); return f"order {id}: shipped"
+
+async def run_agent(question, max_steps=4):
+    messages = [{"role": "user", "content": question}]
+    for step in range(max_steps):
+        call, text = None, []
+        async with aclosing(model_stream(messages)) as stream:   # closed even if our consumer stops
+            async for ev in stream:
+                if ev["type"] == "token":
+                    text.append(ev["text"]); yield ev            # stream tokens straight through
+                else:
+                    call = ev
+        if call is None:
+            yield {"type": "final", "text": "".join(text), "steps": step + 1}
+            return
+        yield {"type": "tool_start", "name": call["name"]}
+        result = await lookup_order(**call["args"])
+        yield {"type": "tool_end", "name": call["name"], "result": result}
+        messages.append({"role": "tool", "content": result})
+
+async def main():
+    async with aclosing(run_agent("Where is order 42?")) as events:
+        async for ev in events:
+            print(ev)
+
+asyncio.run(main())
+```
+
+- **One generator, many consumers.** The same `run_agent` feeds a CLI, an SSE endpoint
+  (`StreamingResponse` over formatted events) or an eval harness that collects only `final` events.
+- **Stopping is closing.** If the client disconnects, closing `run_agent` runs `aclosing` on the inner
+  model stream, so the upstream connection is released at a known point.
+
+### A lazy embedding pipeline for the agent's index
 ```python
 import itertools, json
 from collections.abc import Iterator
@@ -201,6 +264,12 @@ Without `aclosing`, "connection closed" would print only when the event loop fin
 which under load means connections held open well past the request.
 
 ## Production patterns
+- **Yield typed agent events, not raw text.** Have the agent loop yield small dicts or Pydantic models
+  (`token`, `tool_start`, `tool_end`, `final`, `error`) with a step number, and format them as SSE only at
+  the HTTP edge. Monitor time to first event and events per run.
+- **Stream responses with an async generator.** Pass an async generator to FastAPI's `StreamingResponse`,
+  open the upstream stream inside it with `aclosing`, and release it in `finally`. Monitor open upstream
+  connections and stream duration after client disconnects.
 - **Batch at the boundary to the API.** Feed generator stages into `itertools.batched(it, n)` (3.12+), or on
   older Pythons `while batch := tuple(islice(it, n)): ...`, sized to the provider's max inputs per call.
   Monitor peak RSS and items per second.
@@ -209,12 +278,9 @@ which under load means connections held open well past the request.
   Monitor checkpoint age.
 - **Count and quarantine bad records.** Replace the `print` in `read_jsonl` with a counter and a write to a
   dead-letter file. Alert on malformed-record rate, because a spike usually means an upstream format change.
-- **Stream responses with an async generator.** Pass an async generator to FastAPI's `StreamingResponse`,
-  open the upstream stream inside it, and release it in `finally`. Monitor open upstream connections and
-  stream duration after client disconnects.
-- **Paginate APIs as a generator.** Wrap cursor pagination in a generator that yields items and fetches the
-  next page only when the consumer needs it, so `islice(items(), 100)` stops after the pages it used. Monitor
-  pages fetched per job.
+- **Paginate tool APIs as a generator.** Wrap cursor pagination in a generator that yields items and fetches
+  the next page only when the consumer needs it, so `islice(items(), 100)` stops after the pages it used.
+  Monitor pages fetched per job.
 
 ## Trade-offs
 - **Flat memory vs single pass.** Lazy pipelines keep memory flat and deliver first results early, but each
@@ -222,22 +288,26 @@ which under load means connections held open well past the request.
   source.
 - **Plain-loop readability vs late errors.** Streaming code reads like a plain loop, but errors surface at
   consumption time, not at the call, so a traceback may point at the consumer far from the faulty stage.
+  In a streaming agent, an exception after the first event cannot change the HTTP status, so yield an
+  `error` event instead.
 - **Negligible overhead vs numeric hot loops.** Per-item overhead is negligible for I/O-bound work, but over
   millions of small values vectorised NumPy or Polars operations are far faster than yielding Python objects.
 - **Natural streams vs cleanup.** Async generators expose network streams naturally, at the cost of trickier
-  cleanup when consumers stop early. For complex flows, a bounded `asyncio.Queue` between tasks can be clearer.
+  cleanup when consumers stop early. For complex flows (several producers, sub-agents streaming at once), a
+  bounded `asyncio.Queue` between tasks can be clearer.
 
 ## Pitfalls
 - **Iterating the same generator twice**, for example once to count and once to process. The second pass
   silently yields nothing and an eval reports zero results. Fix: materialise to a list if it fits, or
   rebuild the generator for each pass.
 - **Expecting side effects from a call.** Nothing runs until iteration, so a "write records" generator that
-  is never consumed writes nothing.
+  is never consumed writes nothing, and an agent generator nobody iterates never calls its tools.
 - **Breaking out of an async generator wrapping an HTTP stream without `aclosing`.** Symptom:
   connection-pool exhaustion or "unclosed" warnings under load. Fix: `async with aclosing(gen) as s:`.
 - **`try/except` around the generator call.** Exceptions are raised later during iteration, outside the
   handler, so the guard never triggers. Fix: wrap the consuming loop, or handle errors inside the stage.
-- **Leaving a debugging `list(gen)` in.** Memory returns to dataset-sized and the job slows on large inputs.
+- **Leaving a debugging `list(gen)` in.** Memory returns to dataset-sized and the job slows on large inputs;
+  on an agent stream it also hides every event until the run ends.
 - **Bare `next(it)` inside a generator on an iterator that may be exhausted.** Since PEP 479 the stray
   `StopIteration` becomes `RuntimeError: generator raised StopIteration` instead of silently ending the outer
   generator. Use `next(it, None)` or catch it explicitly.
@@ -246,12 +316,13 @@ which under load means connections held open well past the request.
   or put a `queue.Queue` between them.
 
 ## When to use
-- **Use when** sequences are large, slow to arrive or potentially unbounded: reading JSONL and Parquet exports
-  row by row, chunking documents for embedding, batching requests, paginating an API, streaming model output
-  to a client. FastAPI's `StreamingResponse` and most SDK streaming interfaces accept or return (async)
-  iterators.
-- **Prefer a list when** the data is small and you need it more than once.
-- **Measure:** peak memory before and after converting a list pipeline.
+- **Use when** sequences are large, slow to arrive or potentially unbounded: streaming model output and
+  agent step events to a client, reading JSONL and Parquet exports row by row, chunking documents for
+  embedding, batching requests, paginating an API. FastAPI's `StreamingResponse` and most SDK streaming
+  interfaces accept or return (async) iterators.
+- **Prefer a list when** the data is small and you need it more than once, such as the message history you
+  send to the model each step.
+- **Measure:** peak memory before and after converting a list pipeline, and time to first event for streams.
 - **Interviews:** explain laziness, single-pass behaviour, `yield from`, and how async generators relate to
   token streaming.
 
@@ -281,6 +352,14 @@ count equals the loaded count would have caught this.
   instead of the whole dataset.
 - **The kept frame is the trick:** locals, the open file and the loop position survive between items.
 
+### How would you design the streaming interface of an agent that calls tools mid-answer?
+- **Make the agent loop an async generator** that yields typed events: tokens, tool start, tool end with
+  a short result, final answer, error. The HTTP layer only formats them as SSE.
+- **Close inner streams with `aclosing`**, so a client disconnect closes the run generator, which closes
+  the model stream and releases the connection.
+- **Yield an `error` event** for failures after the first byte, because the status code is already sent,
+  and monitor time to first event.
+
 ### A streaming endpoint exhausts its HTTP connection pool when clients disconnect early. What is wrong?
 - **The async generator wrapping the upstream stream is not closed deterministically.** Breaking out
   without `contextlib.aclosing()` leaves its async `finally` to the event loop's finaliser.
@@ -296,7 +375,7 @@ count equals the loaded count would have caught this.
   Python objects.
 - **For complex multi-producer flows**, where a bounded `asyncio.Queue` between tasks can be clearer.
 
-### How would you make a 10-hour embedding job over a JSONL corpus resumable?
+### How would you make a 10-hour embedding job for a RAG index resumable?
 - **Yield the position with each item**, such as the line number or record id, alongside the data.
 - **Persist the last fully processed position every N batches**, so a crash at item 900,000 resumes
   there instead of restarting from zero.

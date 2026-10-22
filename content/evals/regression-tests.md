@@ -5,7 +5,8 @@ name: Regression tests
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-An AI regression test re-runs pinned inputs whenever prompt, model, retriever or tools change, and fails
-the change if passing cases now fail. LLM changes are non-local, so the hard part is separating real
-regressions from noise with paired, per-item comparisons.
+An agent regression test re-runs pinned tasks whenever the prompt, model, retriever or tool schemas
+change, and fails the change if passing tasks now fail. Changes are non-local, so the hard part is
+telling real regressions from noise with paired, per-item comparisons.
+
+## For agent builders
+- **Why it matters for agents.** Editing one tool description or the system prompt changes which tool
+  the agent picks on every task, and a model snapshot swap changes how strictly it fills arguments. A
+  pinned suite is the only memory that the refund bug you fixed last month stays fixed.
+- **Where it shows up in your stack.** pytest or promptfoo in CI, datasets and experiment comparison in
+  LangSmith or Braintrust, recorded tool fixtures (for example vcrpy cassettes), and a scheduled job that
+  runs with no code diff.
+- **What you control.** Case contents (input, stubbed tool responses, expected trajectory or end state),
+  grader order, *k* samples per case, the critical tag, the same-job baseline and the gate policy.
+- **What you can skip.** Exotic statistics. Flip lists, pass^k and McNemar's 3.84 threshold cover nearly
+  every gate decision an agent team makes.
 
 ## Why it exists
 - **A prompt is one shared artifact.** In ordinary code a change to function A does not alter B. A
@@ -36,6 +49,9 @@ regressions from noise with paired, per-item comparisons.
 - **The naive alternatives fail.** Re-checking the five remembered examples is biased toward the cases
   just fixed. "Full eval before release" finds regressions weeks late across dozens of commits, with no
   cheap bisect. Exact-string snapshots fail on every harmless rephrasing, so someone adds a skip flag.
+- **Agents multiply the surface.** A change can now alter tool choice, argument values, step count and
+  the final state of a backend, not only the text, so a suite that only reads the final message misses
+  most regressions.
 - **What this borrows from unit tests.** Fast, automatic, per change, but with behavioural assertions
   and judges instead of string equality, and a noise-aware baseline comparison instead of "all pass".
 
@@ -43,7 +59,8 @@ regressions from noise with paired, per-item comparisons.
 ### The suite is a golden set with a contract
 Each case holds:
 - an input, plus any context, tool stubs or conversation history;
-- one or more graders and the expected behaviour;
+- one or more graders and the expected behaviour; for an agent, the required tool calls and arguments,
+  forbidden calls, a step budget and the expected end state of the stubbed backend;
 - tags: slice, criticality, the incident it came from.
 
 | Tier | Size and graders | When it runs | Catches |
@@ -54,7 +71,8 @@ Each case holds:
 
 ### Graders ordered by determinism
 1. **Code graders first:** schema, regex, numeric tolerance, set equality on extracted entities,
-   tool-trace match.
+   tool-trace match (required calls present, forbidden calls absent, arguments correct, steps within
+   budget), and end-state checks on the stubbed backend.
 2. **Then reference-based judges**, then rubric judges.
 - **Why the order matters:** a flaky grader makes a flaky suite, and a flaky suite is ignored within weeks.
 - **Narrow judge questions.** A judge-graded case carries a reference answer and asks "does the answer
@@ -118,7 +136,7 @@ cases; the flip list, not the average, drives the gate.
 
 ```mermaid
 flowchart TD
-    PR["Prompt, model, retriever or tool change"] --> SM["Smoke tier: deterministic graders"]
+    PR["Prompt, model, retriever or tool schema change"] --> SM["Smoke tier: trajectory and schema checks"]
     SM -->|"any failure"| BL["Block"]
     SM -->|"green"| RUN["Candidate and production baseline, same job, k samples"]
     RUN --> FL["Per-item flip lists"]
@@ -132,6 +150,46 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: a trajectory case and its deterministic grader
+A smoke-tier case for a support agent. Tools are stubbed with recorded responses, so the grader checks
+which calls the agent made and the backend state it left, not the wording of its reply.
+
+```python
+# evals/cases/refund_outside_window.json (one line of regression.jsonl, pretty-printed here)
+CASE = {
+    "id": "refund-outside-window", "tags": ["critical", "INC-412", "slice:refunds"],
+    "input": "I bought this 45 days ago, refund please. Order A-1009.",
+    "tool_stubs": {"get_order": {"id": "A-1009", "days_since_purchase": 45, "total": 89.0}},
+    "graders": [
+        {"type": "must_call", "tool": "get_order", "args": {"order_id": "A-1009"}},
+        {"type": "must_not_call", "tool": "issue_refund"},      # policy: 30-day window
+        {"type": "max_steps", "value": 4},
+        {"type": "judge_ref", "question": "Does the reply state the 30-day window?"},
+    ],
+}
+
+def grade_trajectory(trace: list[dict], g: dict) -> bool:
+    calls = [s for s in trace if s["type"] == "tool_call"]
+    if g["type"] == "must_call":
+        return any(c["tool"] == g["tool"] and all(c["args"].get(k) == v for k, v in g["args"].items())
+                   for c in calls)
+    if g["type"] == "must_not_call":
+        return all(c["tool"] != g["tool"] for c in calls)
+    if g["type"] == "max_steps":
+        return len(calls) <= g["value"]
+    raise ValueError(g["type"])                  # judge graders run in the nightly tier
+```
+
+Illustrative effect of one edit to the `issue_refund` tool description ("use whenever the customer asks
+for a refund"), on a 120-case agent suite with *k* = 3:
+
+| Measure | Baseline | Candidate |
+|---|---|---|
+| Aggregate pass | 88% | 87% |
+| Pass→fail flips | – | 6, all in slice:refunds |
+| Critical flips | 0 | 2 (`must_not_call issue_refund` violated) |
+| Gate | – | Blocked: the agent now refunds outside the window |
+
 ### pytest suite over a JSONL case file
 Each case runs *k* times, critical cases must pass every time, other cases fail only if they clearly
 got worse than the recorded baseline, and the fixture writes candidate pass rates so a separate step can
@@ -219,7 +277,11 @@ Illustrative numbers. The provider's new snapshot is swapped in; the full tier h
 - **Same-job baseline.** The CI job first runs the production config, writes the baseline file, then
   runs the candidate, as in the example. Monitor flips on cases the change could not plausibly affect.
 - **Record and replay external tools.** Store tool and HTTP responses as fixtures (for example with
-  vcrpy cassettes) so cases are hermetic, plus a small live suite for integration. Monitor fixture age.
+  vcrpy cassettes) so agent cases are hermetic and never touch real refunds or emails, plus a small live
+  suite against a sandbox for integration. Monitor fixture age.
+- **Tool-schema changes trigger the suite.** Treat tool names, descriptions and JSON schemas as prompt
+  code: a change to any of them runs the smoke tier and the slices that use that tool. Monitor flips
+  concentrated in the slices of the edited tool.
 - **Flakiness budget.** Periodically run the suite twice on an identical config and count items whose
   pass rate differs; fix graders before adding cases when it exceeds the tolerance. Monitor the
   flakiness rate per grader type.
@@ -245,6 +307,9 @@ Illustrative numbers. The provider's new snapshot is swapped in; the full tier h
   way and a customer-facing case is among the losses. Fix: review the flip lists.
 - **Asserting exact output strings.** Symptom: failures on every harmless rephrasing until someone
   disables the suite. Fix: behavioural assertions and narrow judges.
+- **Asserting the exact tool sequence.** Symptom: an agent that adds a harmless lookup step fails half
+  the suite. Fix: assert required and forbidden calls, key arguments, a step budget and the end state,
+  not the full ordered list.
 - **Running only on diffs.** Symptom: a regression on a day with no commits, traced weeks later to a
   provider model update. Fix: the scheduled no-diff run.
 - **Stale expectations after an intended change.** Symptom: a permanent red test everyone ignores, which
@@ -259,7 +324,10 @@ Illustrative numbers. The provider's new snapshot is swapped in; the full tier h
 ## When to use
 - **Start:** the day the first production bug is found, with that bug as case one.
 - **Run:** the smoke tier on every change to a prompt, model setting, retriever or tool schema; the
-  full tier before any release and on a schedule regardless of commits.
+  full tier before any release and on a schedule regardless of commits. For agents, include every
+  tool name, description and argument schema in what counts as a change.
+- **Keep the suite out of the prompt and out of capability claims:** cases never double as few-shot
+  examples, and "is the new version better" belongs to a held-out golden set.
 - **Measure:** per-item flips, per-slice pass rates and the suite's own flakiness (items whose pass rate
   differs between two identical runs); if flakiness exceeds your tolerance, fix graders first.
 - **Avoid when:** measuring capability. The suite is a safety net of known behaviour; a golden set with
@@ -294,6 +362,21 @@ whether any expectations were edited in the same change, which would be a prompt
 - **Different pass rule:** each case runs *k* times and the comparison is against a noise-aware baseline,
   because outputs are not deterministic even at temperature 0.
 
+### What does a regression case for a tool-calling agent assert, and why not the final text?
+- **The trajectory:** required calls with key arguments, forbidden calls (no refund outside policy) and
+  a step budget, checked deterministically from the trace.
+- **The end state:** what the stubbed backend looks like afterwards, because a polite reply can hide a
+  wrong write.
+- **Text last:** a narrow reference judge for the one fact the reply must state, run in the nightly tier
+  because judges add noise.
+
+### Your agent's regression suite flips after a teammate rewords one tool description. How do you decide whether to merge?
+- **Read the flip list by slice:** flips concentrated in tasks that use that tool are signal, not noise.
+- **Check critical tags first:** any critical flip, such as a forbidden call now made, blocks the merge
+  regardless of the aggregate.
+- **Separate noise:** with *k* samples, drops of one sample are tolerated; McNemar on the discordant
+  pairs says whether a net change is real.
+
 ### A regression appears on a Tuesday when nothing was merged. How do you find the cause?
 - **Confirm with the no-diff run:** flips against Monday's stored baseline with no commit point at drift.
 - **Check pinned versions:** model snapshot, index version, tokenizer and dependency versions; an
@@ -314,12 +397,6 @@ whether any expectations were edited in the same change, which would be a prompt
   responses.
 - **Measure flakiness** by running an identical config twice, and fix graders before adding cases when
   it exceeds the tolerance.
-
-### What goes into the suite, and what does not?
-- **In:** every production incident, every resolved review disagreement, contractual requirements, tagged
-  with slice and criticality.
-- **Not in the prompt:** cases must never double as few-shot examples, or the score becomes meaningless.
-- **Not a capability benchmark:** "is the new version better" belongs to a held-out golden set.
 
 ## Quiz
 ### Q: Why are regression results compared per item as paired pass/fail flips rather than as two aggregate pass rates?

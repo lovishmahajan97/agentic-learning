@@ -5,7 +5,8 @@ name: Long-context vs RAG
 kind: decision
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - model-internals/context-window
   - rag-retrieval/lost-in-the-middle
@@ -20,9 +21,24 @@ sources:
 ---
 
 ## TL;DR
-Huge windows sometimes let you skip retrieval: best for small, static, reused corpora or whole-document
-reasoning. RAG wins for large, changing, permissioned or high-volume ones: tokens cost money, prefill
-grows with length, and models use long contexts less reliably than advertised.
+An agent can preload knowledge into its context or fetch it with a search tool. Preloading suits small,
+static, shared corpora and whole-document reasoning; a retrieval tool wins for large, changing,
+permissioned or high-volume ones, because agents re-send their context every step.
+
+## For agent builders
+- **Why it matters for agents.** A chat app sends the corpus once per question; an agent sends it on
+  *every step* of its loop. A 150k-token corpus in a 20-step run is 3 million input tokens before caching,
+  and it eats window the transcript needs for tool calls and results.
+- **Where it shows up in your stack.** The system prompt and preloaded documents (the cached prefix), a
+  `search` or `read_document` tool the agent calls, provider prompt caching (`cache_control` breakpoints
+  with Anthropic, automatic prefix caching with OpenAI), and context-compaction logic in your framework.
+- **What you control.** What goes in the stable prefix versus behind a tool, whether the tool returns
+  chunks or whole documents, the per-step token budget for tool results, and the triggers that move a
+  workload from preloaded to retrieved.
+- **What you can skip.** Attention-cost derivations. Know that prefill grows with input length, cached
+  tokens are cheap only while the prefix is byte-identical and warm, and recall degrades mid-context.
+- **The same decision applies to agent memory.** Keeping the full conversation history is long-context;
+  retrieving past memories on demand is RAG. The arithmetic below decides both.
 
 ## Why it exists
 - **RAG began as a necessity.** Early context windows held a few thousand tokens, so you had to select.
@@ -30,12 +46,13 @@ grows with length, and models use long contexts less reliably than advertised.
   chunking, embeddings, indexes and rerankers, each a source of failure, when the model could read everything?
 - **"Always stuff the context" is wrong.** Every token is paid for on every call, prefill time grows with
   input length, and recall of a specific fact in a very long prompt is less reliable than in a short one,
-  especially among near-duplicate distractors.
+  especially among near-duplicate distractors. An agent multiplies all three by its step count.
 - **"Always retrieve" is wrong too.** Retrieval itself fails (see retrieval failure diagnosis), chunking
   destroys cross-references, and "list every clause in this contract that conflicts with section 4" needs
   the whole document, not the top five chunks.
-- **So it is a measurable engineering decision.** Inputs: corpus size, change rate, query volume,
-  permission model, latency budget, and whether answers need local facts or global synthesis.
+- **So it is a measurable engineering decision.** Inputs: corpus size, change rate, query volume (and
+  steps per agent run), permission model, latency budget, and whether answers need local facts or global
+  synthesis.
 
 ## How it works
 ### The cost and latency model
@@ -44,9 +61,10 @@ grows with length, and models use long contexts less reliably than advertised.
 | Input tokens per query | about the corpus size *C* | retrieved budget *R* (often a few thousand) plus the question |
 | Cost ratio | about *C / R* times RAG | 1 |
 | Time to first token | grows with *C* | small and roughly constant |
+| Agent run of *S* steps | about *S × C* before caching | the transcript plus retrieved results |
 
 - **Prefill compute grows at least linearly** with input length (attention adds a quadratic term), so
-  time-to-first-token grows with *C*.
+  time-to-first-token grows with *C*. In an agent that latency is paid on every step, not once.
 - **Prompt caching changes the arithmetic.** If the corpus is an identical prefix across calls, many
   providers bill cached input tokens at a discount and skip much of the prefill.
 - **Caching only holds while the prefix is byte-identical and the cache stays warm**, so a corpus that
@@ -66,6 +84,8 @@ cost_rag  ≈ p × (R + q)                       + embedding, index and rerank c
 - **Cache writes can cost extra.** Some providers price the cache *write* above a normal input token.
 - **Busy vs sparse traffic:** a busy single-tenant workload can sit near *h* ≈ 1; a workload with few
   queries per prefix pays the write premium again and again.
+- **Agents help the hit rate within a run.** Steps of one run arrive seconds apart, so the prefix usually
+  stays warm across the loop, but a run that pauses for a human approval can outlive the TTL.
 
 ### The quality model
 - **Accepting N tokens is not using N tokens well.** Known effects:
@@ -73,11 +93,15 @@ cost_rag  ≈ p × (R + q)                       + embedding, index and rerank c
   - **Harder tasks degrade more:** multi-fact and reasoning tasks drop more than single-needle lookups.
   - **Distractors:** irrelevant but similar passages pull the model off the answer.
 - **Effective context is model- and task-specific**, so measure it on your own data, not a spec sheet.
-- **RAG has its own ceiling:** if the retriever misses the evidence, the generator never sees it.
+- **Agents fill the middle themselves.** As tool calls and results accumulate, a preloaded corpus drifts
+  toward the middle of the context, so recall of it can drop as the run gets longer.
+- **RAG has its own ceiling:** if the retriever misses the evidence, the generator never sees it. In an
+  agent, the model also has to decide to search and write a good query.
 
 ### The non-functional constraints
 - **Permissions:** with one shared prompt, every user sees every document. RAG filters per user at query
-  time; long-context needs a per-permission-set prompt, which kills cache reuse.
+  time; long-context needs a per-permission-set prompt, which kills cache reuse. For agents acting on a
+  user's behalf, the retrieval tool is the natural place to enforce that user's permissions.
 - **Freshness:** RAG updates one document's chunks; long-context rebuilds the whole prompt (and cache).
 - **Citations:** RAG returns chunk IDs naturally; long-context needs the model to cite positions, which is
   harder to verify.
@@ -87,31 +111,70 @@ cost_rag  ≈ p × (R + q)                       + embedding, index and rerank c
 - **Retrieve documents, not chunks.** Retrieve at the *document* level, then put whole retrieved
   documents into a large context. This keeps retrieval's selectivity and permission filtering, gives the
   model full sections to reason over, and tolerates imprecise ranking because the window is generous.
+  For agents this is a `search` tool that returns document IDs plus a `read_document` tool.
 - **Global questions are a third shape.** "What are the recurring complaints across 30,000 tickets?":
   top-k returns a handful of examples and calls it an answer; long-context cannot fit the corpus.
 - **Use map-reduce or precomputed summaries.** Process each document or batch independently, then
   aggregate the partial results, or build summaries retrieval can target. It is expensive per question,
-  which is why it usually runs offline or on a schedule.
+  which is why it usually runs offline or on a schedule; an agent can fan out sub-agents for it, at that cost.
 
 ## Diagram
 The decision path: answer shape first, then whether the corpus fits and stays shared and static, then
-whether volume makes per-token cost dominate.
+whether volume (questions times agent steps) makes per-token cost dominate.
 
 ```mermaid
 flowchart TD
-    Q["New workload"] --> A{"Aggregate question over a corpus that does not fit?"}
+    Q["New agent workload"] --> A{"Aggregate question over a corpus that does not fit?"}
     A -->|"yes"| MR["Map-reduce or offline summaries"]
-    A -->|"no"| F{"Fits the measured effective context with headroom?"}
-    F -->|"no"| RAG["RAG with per-user filters"]
+    A -->|"no"| F{"Fits effective context plus transcript headroom?"}
+    F -->|"no"| RAG["Search tool with per-user filters"]
     F -->|"yes"| P{"One permission scope and rare edits?"}
     P -->|"no"| RAG
     P -->|"yes"| V{"Cost within budget at measured hit rate?"}
-    V -->|"yes"| LC["Long-context with cached prefix"]
-    V -->|"no"| H["Document-level retrieval into a large window"]
+    V -->|"yes"| LC["Preload as cached prefix"]
+    V -->|"no"| H["Search plus read_document into a large window"]
     LC -.->|"triggers: growth, permissions, edits"| RAG
 ```
 
 ## Examples
+### Agent scenario: preloaded corpus vs a search tool over a 20-step run
+Illustrative prices and sizes: a 4,000-token system prompt, a 150,000-token manual, 1,500 new transcript
+tokens per step, and (for the tool variant) four searches of 3,000 tokens each, averaged as 600 per step.
+
+```python
+p = 3 / 1_000_000                          # illustrative $3 per million input tokens
+
+def run_cost(prefix, steps, new_per_step, d=0.10, cached=True):
+    """Input cost of one agent run. Each step re-sends the whole context; with caching, everything
+    seen on the previous step is billed at fraction d (warm cache, append-only transcript)."""
+    total, ctx = 0.0, prefix
+    for s in range(steps):
+        if cached and s > 0:
+            total += p * ((ctx - new_per_step) * d + new_per_step)
+        else:
+            total += p * ctx
+        ctx += new_per_step
+    return total
+
+SYS, MANUAL, STEPS = 4_000, 150_000, 20
+for name, prefix, new in [("preloaded", SYS + MANUAL, 1_500), ("search tool", SYS, 1_500 + 600)]:
+    print(f"{name:<12} uncached ${run_cost(prefix, STEPS, new, cached=False):.2f}"
+          f"  cached ${run_cost(prefix, STEPS, new):.2f} per run")
+# preloaded    uncached $10.10  cached $1.50 per run
+# search tool  uncached $1.44  cached $0.26 per run
+# Ignores cache-write premiums and embedding/vector-store costs.
+```
+
+| Per day at 1,000 runs (illustrative) | Preloaded manual | Search tool |
+|---|---|---|
+| Uncached | ≈ $10,100 | ≈ $1,440 |
+| Cached, warm through the run | ≈ $1,500 | ≈ $260 |
+| Context used at step 20 | ≈ 182k tokens | ≈ 44k tokens |
+
+- **Read it as an agent builder:** caching makes preloading viable, but the tool variant is still about
+  6× cheaper and leaves the window free for the transcript. Preloading wins only if retrieval recall is
+  poor or the task needs the whole manual at once.
+
 ### Worked scenario: a 300-page support manual
 Illustrative calculation: prices and latencies are made-up round numbers for the arithmetic, not any
 vendor's rates.
@@ -165,26 +228,29 @@ print(f"long, 50/day   : ${per_q:.3f} per question vs ${C * p * 0.10:.3f} at a p
   the forecast, which is exactly the "bill several times the forecast" pitfall below.
 
 ## Production patterns
-- **Prototype long-context, migrate on triggers.** For a corpus that fits with headroom, ship long-context
-  first to prove value, and write down the triggers that force RAG: per-user permissions, corpus growth
-  past the measured effective context, frequent edits. Monitor corpus size in tokens and edit rate.
-- **Cache-friendly prompt layout.** Put the corpus first as a byte-identical prefix and the question last;
-  with Anthropic, mark the prefix with a `cache_control` breakpoint, while OpenAI caches long prefixes
-  automatically. Monitor cached-token counts in the usage fields of each response, not an assumed hit rate.
-- **Document-level retrieval into a large window.** Retrieve with per-user filters at the document or
-  section level (parent-document retrieval), then fill a fixed token budget with whole documents. Monitor
-  input tokens per request and accuracy split by question type.
+- **Prototype preloaded, migrate on triggers.** For a corpus that fits with headroom for the transcript,
+  ship the agent with the corpus in its prefix first to prove value, and write down the triggers that
+  force a search tool: per-user permissions, corpus growth past the measured effective context, frequent
+  edits. Monitor corpus size in tokens and edit rate.
+- **Cache-friendly agent prompt layout.** Put system prompt, tool schemas and any preloaded corpus first
+  as a byte-identical prefix, then the append-only transcript; with Anthropic, mark the prefix with a
+  `cache_control` breakpoint, while OpenAI caches long prefixes automatically. Monitor cached-token counts
+  in the usage fields of each response, per step, not an assumed hit rate.
+- **Search plus read tools for document-level retrieval.** Give the agent a `search` tool that returns
+  document or section IDs with per-user filters (parent-document retrieval) and a `read_document` tool
+  bounded by a token budget. Monitor input tokens per step and accuracy split by question type.
 - **Effective-context eval before choosing a limit.** Plant known facts at the start, middle and end of
-  contexts of growing length, plus multi-fact questions with distractors, on your own documents. Cap
-  context where accuracy starts to drop and re-run on every model change.
+  contexts of growing length, plus multi-fact questions with distractors, on your own documents. For
+  agents, also test at the transcript length of a late step. Cap context where accuracy starts to drop
+  and re-run on every model change.
 - **Offline map-reduce for corpus-wide questions.** Run a scheduled job that summarises each document or
-  batch, then aggregates; store the outputs so retrieval can target them. Monitor job cost per run and the
-  age of the newest summary.
+  batch, then aggregates; store the outputs so the agent's search tool can target them. Monitor job cost
+  per run and the age of the newest summary.
 
 ## Trade-offs
 - **No retrieval failure surface vs per-token cost.** Long-context removes retrieval failures entirely,
-  but you pay per token on every call. It flips to RAG as query volume times corpus size grows past your
-  cost budget.
+  but you pay per token on every call, and an agent pays it on every step. It flips to RAG as query volume
+  times steps times corpus size grows past your cost budget.
 - **Cheap cached prefix vs fragmentation.** Prompt caching makes a large static prefix cheap, but only for
   identical prefixes. Per-user permissions, frequent edits or many tenants fragment the cache and erase
   the saving.
@@ -194,6 +260,9 @@ print(f"long, 50/day   : ${per_q:.3f} per question vs ${C * p * 0.10:.3f} at a p
 - **Short prompts vs evidence loss.** RAG keeps prompts short and latency low, but every stage can drop
   evidence. When retrieval recall on your eval set is poor and the corpus fits, long-context is the faster
   way to a working system.
+- **Agent autonomy vs a guaranteed read.** A search tool lets the agent fetch only what it needs, but it
+  may skip searching or query badly; a preloaded corpus is always there. Preload the few documents almost
+  every run needs and put the rest behind the tool.
 
 ## Pitfalls
 - **Trusting the advertised window as the usable window.** Symptom: a demo that works on the first and
@@ -203,13 +272,16 @@ print(f"long, 50/day   : ${per_q:.3f} per question vs ${C * p * 0.10:.3f} at a p
 - **Comparing approaches on a handful of easy questions.** Both look perfect; the gap only shows on
   multi-fact, distractor-heavy or cross-document questions in a proper eval set.
 - **Forgetting latency.** Symptom: time-to-first-token of many seconds on every request, because the full
-  corpus is prefilled each time without a warm cache.
+  corpus is prefilled each time without a warm cache; in an agent that delay repeats on every step.
 - **Modelling cached long-context cost at a 100% hit rate.** Symptom: a bill several times the forecast
   because traffic is bursty or low-volume and the cache keeps expiring between requests.
 - **Answering corpus-wide aggregate questions with top-k retrieval.** Symptom: confident "trends" built
   from five retrieved examples that a count over the full corpus would contradict.
 - **Building heavy RAG infrastructure for a corpus of a few documents.** Symptom: weeks spent tuning
   chunking for a problem the model could have solved by reading everything.
+- **Sizing the preloaded corpus without the transcript.** Symptom: an agent that works for five steps,
+  then hits the context limit or triggers compaction mid-task. Fix: budget corpus plus the transcript of
+  your longest expected run, with headroom.
 
 ## When to use
 - **Start with long-context when:** the corpus fits comfortably in the window with headroom, changes
@@ -217,8 +289,10 @@ print(f"long, 50/day   : ${per_q:.3f} per question vs ${C * p * 0.10:.3f} at a p
   whole document.
 - **Prefer RAG when:** the corpus exceeds the window or grows, changes frequently, needs per-user
   filtering, must cite verifiable sources, or volume makes per-token cost dominant.
-- **Measure both on the same eval set:** accuracy split by question type, cost per query, p95
-  time-to-first-token, and the real logged cache hit rate rather than an assumed one.
+- **For agents specifically:** preload only what nearly every run needs and fits beside the transcript;
+  everything else goes behind a search tool.
+- **Measure both on the same eval set:** accuracy split by question type, cost per query (or per agent
+  run), p95 time-to-first-token, and the real logged cache hit rate rather than an assumed one.
 - **Neither, when:** questions are aggregates over a corpus that does not fit; plan a map-reduce or
   offline summarisation job instead.
 - **Interviews:** the expected answer is "it depends on these five variables, here is the arithmetic",
@@ -252,6 +326,15 @@ revisit when one changes.
 - **Quality and constraints:** recall of a specific fact in a very long prompt is less reliable (lost in the
   middle, distractors), and one shared prompt cannot enforce per-user permissions.
 
+### You are building a support agent over a 150,000-token manual. Do you preload it or give the agent a search tool?
+- **Do the per-run arithmetic:** the corpus is re-sent on every step, so a 20-step run is about 3 million
+  input tokens uncached; with a warm cache roughly $1.50 per run versus about $0.26 for a search tool at
+  illustrative prices.
+- **Check the window:** corpus plus a late-step transcript (about 182k tokens at step 20) must fit the
+  measured effective context, not just the advertised one.
+- **Then constraints:** per-user permissions or frequent edits push to the tool; whole-manual reasoning or
+  poor retrieval recall pushes to preloading.
+
 ### Model the daily input cost of a 150,000-token manual answering 20,000 questions a day.
 - **No cache:** 150k × 20,000 is 3 billion tokens a day, $9,000 at an illustrative $3 per million.
 - **Cached prefix at 10% price:** about $900 a day plus cache writes, valid only if the hit rate stays near 1,
@@ -266,18 +349,18 @@ revisit when one changes.
 - **Poor retrieval recall on a corpus that fits:** long-context is the faster way to a working system while
   retrieval is fixed, provided the corpus has a single permission scope.
 
-### Your cached long-context bill came in several times the forecast. How do you debug it?
-- **Check the real hit rate:** read cached-token counts from each response's usage fields instead of the
-  assumed *h* ≈ 1.
+### Your agent's cached long-context bill came in several times the forecast. How do you debug it?
+- **Check the real hit rate:** read cached-token counts from each response's usage fields, per agent step,
+  instead of the assumed *h* ≈ 1.
 - **Look at traffic shape:** provider caches expire after a short idle period, so bursty or low-volume
-  traffic pays full price plus a cache-write premium on each miss; at 50 questions a day the cost can be
-  roughly 9× the perfect-hit figure.
+  traffic, or runs paused for human approval, pay full price plus a cache-write premium on each miss; at
+  50 questions a day the cost can be roughly 9× the perfect-hit figure.
 - **Look for prefix fragmentation:** per-tenant editions, per-permission prompts or a prefix that is not
-  byte-identical (a timestamp near the top) each break reuse.
+  byte-identical (a timestamp near the top, reordered tool schemas) each break reuse.
 
 ### What does the middle ground between the two look like?
 - **Retrieve documents, not chunks:** filter per user and rank at the document or section level, then put
-  whole documents into a large window.
+  whole documents into a large window, in agents via a search tool plus a read tool.
 - **Why it works:** it keeps retrieval's selectivity and permission filtering while giving the model full
   sections, and it tolerates imprecise ranking because the window is generous.
 - **What to monitor:** input tokens per request and accuracy split by question type.

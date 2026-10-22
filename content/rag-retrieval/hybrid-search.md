@@ -5,7 +5,8 @@ name: Hybrid search (BM25 + dense)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/dense-vs-sparse-retrieval
   - rag-retrieval/bm25-internals
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Hybrid search runs BM25 and a dense retriever on the same query and merges results, because they fail on
-different queries. Scores live on unrelated scales, so fuse by rank (RRF) or normalize per query, and
-prove the gain with recall@k.
+Hybrid search is the default retrieval tool for production agents: run BM25 and a dense retriever on the
+same query and merge, because they fail on different queries. Fuse by rank (RRF), apply one filter to
+both arms, and prove the gain with recall@k.
+
+## For agent builders
+- **Why it matters for agents.** An agent's queries mix ids copied from tool output with paraphrased
+  questions, and it cannot tell a retrieval miss from a missing fact. Hybrid raises first-stage recall,
+  which bounds every answer, plan and tool call that depends on retrieved context.
+- **Where it shows up in your stack.** LangChain's `EnsembleRetriever` (weighted rank fusion over a BM25
+  retriever and a vector retriever), hybrid modes in Elasticsearch, OpenSearch, Qdrant and Weaviate, SQL
+  RRF in Postgres, and the retrieve node of a LangGraph RAG agent. LangSmith or your tracer shows which
+  arm produced each chunk.
+- **What you control.** Arm depth, fusion method and weights, the shared tenant/ACL filter, reranker
+  depth, and whether the agent sees one fused tool or two separate ones.
+- **What you can skip.** Fusion variants beyond RRF and weighted scores. Start with RRF; tune only with
+  labels.
 
 ## Why it exists
 - **Neither retriever dominates.** BM25 misses paraphrase; dense misses exact identifiers and
@@ -32,7 +46,8 @@ prove the gain with recall@k.
   10 for 70% of queries, dense for 75%. Identical failures would cap hybrid at 75%; in practice the union
   often lands well above either, recovering identifier searches and paraphrases.
 - **Recall is the ceiling.** Generation cannot answer from a chunk that was never retrieved, so
-  first-stage recall bounds everything downstream; hybrid raises it cheaply.
+  first-stage recall bounds everything downstream; hybrid raises it cheaply. An agent that misses once
+  may also retry with similar words and miss again.
 - **Naive merging fails.** "Concatenate and sort by score" mixes an unbounded BM25 sum (often single or
   double digits for a multi-term query, depending on corpus and engine) with cosine in a narrow
   model-specific band, so you just get the BM25 list followed by the dense list.
@@ -49,7 +64,8 @@ prove the gain with recall@k.
 - **n > final k** (commonly 50 to 200 per arm for a final 5 to 10), because fusion needs overlap and
   depth, and a reranker wants a wide pool.
 - **Filters must be identical in both arms;** otherwise one arm returns documents the other was forbidden
-  to.
+  to. In a multi-tenant agent this is a data-leak bug, not a quality bug.
+- **Run the arms concurrently,** because the tool's latency is paid on every agent step that searches.
 
 ### Reciprocal rank fusion
 RRF ignores scores and uses only ranks:
@@ -99,6 +115,8 @@ RRF(d) = Σ_arms 1 / (k + rank_arm(d))        k = 60 in the original paper
   per slice.
 - **Engine knobs:** Weaviate's `alpha`, OpenSearch's normalization processors, Elasticsearch's RRF and
   weighted retrievers.
+- **The agent alternative:** let the model pass a hint (for example an `exact` flag in the tool schema)
+  and weight from it; evaluate it like any routing rule.
 
 ### Where the arms live
 | Layout | Examples | Trade |
@@ -115,7 +133,7 @@ RRF(d) = Σ_arms 1 / (k + rank_arm(d))        k = 60 in the original paper
 ### After fusion
 - Fusion yields a merged list ordered by combined evidence.
 - Most pipelines pass the top 20 to 50 to a cross-encoder reranker, which reads query and chunk together
-  and produces the final top k.
+  and produces the final top k that enters the agent's context.
 - **Hybrid is the recall stage, the reranker the precision stage, fusion the handshake between them.**
 
 ### Measuring whether it helped
@@ -124,14 +142,17 @@ RRF(d) = Σ_arms 1 / (k + rank_arm(d))        k = 60 in the original paper
 - **Inspect both directions:** queries where fusion beat the best single arm and ones where it lost.
 - **Watch small k:** adding BM25 noise to a strong dense arm can lower precision at small k while raising
   recall at large k; the reranker usually recovers it, but you need to see it.
+- **Close the loop on the agent:** also compare task success or answer correctness on an agent eval set,
+  because better recall that adds noisy context can still hurt the final answer.
 
 ## Diagram
-Watch the request lifecycle: the same query and the same filter go to both arms in parallel, each returns
-a deep top-n, fusion uses only ranks, and the reranker turns the fused pool into the final top k.
+Watch one agent tool call: the same query and the same filter go to both arms in parallel, each returns a
+deep top-n, fusion uses only ranks, and the reranker turns the fused pool into the final top k for the
+agent's context.
 
 ```mermaid
 sequenceDiagram
-    participant A as App
+    participant A as Agent tool
     participant L as BM25 arm
     participant D as Dense arm
     participant F as RRF fusion
@@ -142,10 +163,49 @@ sequenceDiagram
     D-->>F: top 50 ids with ranks
     Note over F: sum of 1 over 60 plus rank per arm
     F->>R: fused top 20 to 50
-    R-->>A: final top k for the prompt
+    R-->>A: final top k for the agent context
 ```
 
 ## Examples
+### Hybrid search tool for an agent: parallel arms, one filter, provenance
+The tool builds the filter once, runs both arms concurrently, fuses with RRF and records which arm found
+each chunk, so traces explain every result. `bm25_arm` and `dense_arm` are your async search functions.
+
+```python
+import asyncio
+from collections import defaultdict
+
+async def hybrid_search(query, tenant_id, bm25_arm, dense_arm, depth=50, k=8, rrf_k=60):
+    flt = {"tenant_id": tenant_id}                    # ONE filter object for both arms
+    lexical, semantic = await asyncio.gather(
+        bm25_arm(query, flt, depth), dense_arm(query, flt, depth))   # lists of chunk ids
+    scores, found_by = defaultdict(float), defaultdict(list)
+    for arm, ranked in (("bm25", lexical), ("dense", semantic)):
+        for rank, cid in enumerate(ranked, start=1):
+            scores[cid] += 1.0 / (rrf_k + rank)
+            found_by[cid].append(f"{arm}@{rank}")
+    top = sorted(scores, key=scores.get, reverse=True)[:k]
+    return [{"chunk_id": c, "found_by": found_by[c]} for c in top]   # log this in the trace
+```
+
+- **Trace check:** if wrong answers cluster on chunks with `found_by` from one arm only, that arm needs
+  attention; if right chunks never appear, raise depth or fix an arm.
+
+### Worked scenario: what hybrid costs an agent per task
+A research agent searches 4 times per task. Per-search timings are illustrative orders of magnitude.
+
+| Stage | Sequential arms | Parallel arms |
+|---|---|---|
+| BM25 query | 15 ms | 15 ms, overlapped |
+| Embed query + ANN | 40 ms + 10 ms | 50 ms (the longer arm) |
+| RRF fusion | ~1 ms | ~1 ms |
+| Rerank top 30 | 120 ms | 120 ms |
+| Per search | ~186 ms | ~171 ms |
+| Per task (4 searches) | ~744 ms | ~684 ms |
+
+- **The reranker, not the second arm, dominates.** Parallel arms make BM25 nearly free; depth of the
+  reranked pool is the lever that moves agent latency.
+
 ### Reciprocal rank fusion in a dozen lines
 Document 3 is the BM25 arm's top hit but absent from the dense top 10; it falls to fifth behind four
 documents both arms agreed on, including document 8, which was only rank 4 and rank 6.
@@ -218,21 +278,22 @@ A vague query. BM25's top three are a near-tie among weak matches; dense has a c
 - RRF would have treated both arms' rank 2 identically, which is the safer default when spreads vary.
 
 ## Production patterns
-- **Start with server-side RRF.** Use your engine's built-in rank fusion (for example Elasticsearch's
-  `rrf` retriever, whose rank constant defaults to 60) before writing custom fusion. Monitor recall@10
-  per arm and fused on a labeled set each release.
-- **One filter object, both arms.** Build tenant, ACL and metadata filters once and pass the same object
-  to the lexical and dense queries; add a test that runs a cross-tenant canary query and fails if any
-  foreign chunk appears. Monitor filter-mismatch test results in CI.
+- **Start with server-side or library RRF.** Use your engine's built-in rank fusion (for example
+  Elasticsearch's `rrf` retriever, whose rank constant defaults to 60) or LangChain's `EnsembleRetriever`
+  before writing custom fusion. Monitor recall@10 per arm and fused on a labeled set of real agent queries
+  each release.
+- **One filter object, both arms.** Build tenant, ACL and metadata filters once from the agent's
+  authenticated session, never from model-written arguments, and pass the same object to the lexical and
+  dense queries; add a CI canary that runs a cross-tenant query and fails if any foreign chunk appears.
 - **Size arm depth and engine limits together.** Fetch 50 to 200 per arm, and raise engine caps to match,
   such as pgvector's `hnsw.ef_search` to at least the arm's `LIMIT`. Monitor rows returned per arm versus
   requested.
 - **Reconcile the two indexes.** Write and delete through one path that updates both arms, and run a
   periodic job comparing chunk ids (or counts per document) across them. Monitor the diff count and the
   age of the oldest unreconciled document.
-- **Slice the evaluation.** Tag labeled queries by type (identifier, question, short keyword) and gate
-  releases on per-slice recall, not just the aggregate. Monitor the exact-identifier slice, which hides
-  regressions behind gains elsewhere.
+- **Slice the evaluation and log provenance.** Tag labeled queries by type (identifier, question, short
+  keyword), gate releases on per-slice recall, and record which arm found each chunk in agent traces.
+  Monitor the exact-identifier slice, which hides regressions behind gains elsewhere.
 - **Move to weighted fusion only with labels.** If one arm clearly dominates, tune α (or per-arm RRF
   weights) on labeled data and record it with the model and corpus versions. Monitor it after every
   model or corpus change, since α must be re-tuned.
@@ -247,13 +308,17 @@ A vague query. BM25's top three are a near-tie among weak matches; dense has a c
 - **One engine vs two.** Server-side fusion in one engine keeps consistency and latency simple; a search
   engine plus a vector database scale independently but make every write a two-phase problem.
 - **Deeper candidate lists** improve fusion and give the reranker more to work with, but latency and
-  reranker cost grow with depth; once recall@depth is flat, extra depth is waste.
+  reranker cost grow with depth, multiplied by every search an agent makes; once recall@depth is flat,
+  extra depth is waste.
+- **One fused tool vs model-chosen arms.** Fusion removes misrouting at the cost of running both arms
+  every call; separate tools are cheaper but depend on the model choosing well.
 
 ## Pitfalls
 - **Summing raw BM25 and cosine scores.** Symptom: results are simply the BM25 list, because its scores
   are an order of magnitude larger. Fix: RRF or per-query normalization.
 - **A metadata or ACL filter in one arm only.** Symptom: a user sees a document they should not, or a
-  filtered query returns items from the unfiltered arm.
+  filtered query returns items from the unfiltered arm; in an agent the leaked chunk may be quoted
+  straight into an answer or passed to another tool.
 - **No shared commit or reconciliation between indexes.** Symptom: "I just deleted that document and it
   still shows up" from one arm, hours after the other dropped it.
 - **Fused scores as relevance thresholds.** RRF values depend on list depth and the number of arms, so a
@@ -262,12 +327,12 @@ A vague query. BM25's top three are a near-tie among weak matches; dense has a c
   lookups) hidden by gains elsewhere. Fix: slice the evaluation by query type.
 
 ## When to use
-- **Default to hybrid** for corpora mixing prose with identifiers, names, codes or jargon (most enterprise
-  content) and for users who both search and ask questions.
+- **Default to hybrid** for agents over corpora mixing prose with identifiers, names, codes or jargon
+  (most enterprise content) and for users who both search and ask questions.
 - **Skip it when** a labeled evaluation shows one arm already captures the relevant chunk in nearly every
   case, or serving constraints rule out one arm (no GPU for embeddings, or no inverted index available).
-- **Measure:** recall@k per arm and fused, sliced by query type, plus end-to-end answer quality with and
-  without the second arm.
+- **Measure:** recall@k per arm and fused, sliced by query type, plus end-to-end answer quality or agent
+  task success with and without the second arm.
 - **Start with RRF;** move to weighted fusion only with labeled data to tune it and a process to re-tune.
 - **Interviews:** explain why scores cannot be summed, how RRF rewards agreement, and where the reranker
   sits.
@@ -316,9 +381,17 @@ time.
 - **k as a knob:** smaller k steepens the curve so top ranks count more; larger k flattens it toward
   counting agreement.
 
-### After adding hybrid, a user sees a document from another tenant. How do you debug and prevent it?
+### Design the retrieval tool for a multi-tenant support agent. What goes into it?
+- **One fused tool:** BM25 and dense arms run in parallel at depth 50 or so, fused with RRF, then a
+  reranker picks the top k that enters the agent's context.
+- **Security in the tool, not the prompt:** the tenant and ACL filter comes from the authenticated
+  session, never from model-written arguments, and is applied identically to both arms.
+- **Observability:** log arm provenance per chunk in traces and evaluate per query slice and on agent
+  task success.
+
+### After adding hybrid, an agent quotes a document from another tenant. How do you debug and prevent it?
 - **Likely cause:** the tenant or ACL filter is applied in only one arm, so that arm returns forbidden
-  chunks and a strong match carries one through fusion.
+  chunks and a strong match carries one through fusion into the agent's context.
 - **Prevent it:** build one filter object and pass it to both arms, and add a CI canary that runs a
   cross-tenant query and fails if any foreign chunk appears.
 

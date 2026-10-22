@@ -5,7 +5,8 @@ name: Tensor parallelism at inference
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/distributed-training
   - model-internals/grouped-query-attention
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Tensor parallelism splits every weight matrix across N GPUs, joined by two all-reduces per layer. It
-fits oversized models and pools bandwidth for faster decode, but needs a fast intra-node link because
-decode sends hundreds of tiny all-reduces per token.
+When you self-host a 70B-class agent model, tensor parallelism splits every weight matrix across N GPUs,
+joined by two all-reduces per layer. It fits the model and speeds each agent step, but only over a fast
+intra-node link.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a chain of sequential LLM calls, so per-token latency
+  is multiplied by steps × tokens per step. TP is the main lever that lowers per-token latency for a
+  model too big for one GPU; replicas only add parallel runs.
+- **Where it shows up in your stack.** `--tensor-parallel-size` (and `--pipeline-parallel-size`) in
+  vLLM, the GPU node shape you rent, and the TPOT you see from the endpoint your agent framework calls.
+  With a hosted API the provider makes this choice for you.
+- **What you control.** Model size and precision, TP degree versus replica count, and whether the
+  agent's slow steps (planning, long tool-call JSON) run on the big model at all.
+- **What you can skip.** Writing collectives yourself. Know that TP lives inside one NVLink node, that
+  2× GPUs buys less than 2× speed, and how to check the topology.
 
 ## Why it exists
 - **The model does not fit.** A 70B-parameter model in bf16 is about 140 GB of weights. No single 80 GB
@@ -42,7 +55,15 @@ decode sends hundreds of tiny all-reduces per token.
   That is why TP is the default within a node and why the interconnect sets its limits.
 
 ## How it works
-### Megatron-style partitioning of the MLP
+### What an agent run feels from TP
+- **Sequential steps compound TPOT.** A 15-step run that emits ~300 tokens per step decodes 4,500 tokens
+  one after another; every millisecond of TPOT becomes 4.5 s of wall-clock time per run.
+- **TP lowers TPOT; replicas raise runs in parallel.** Pick by what users wait on: one interactive run,
+  or a queue of background runs.
+- **Long agent contexts need cache room.** TP also shards the KV cache, which is often why a 70B agent
+  model runs at TP = 4 rather than TP = 2.
+
+### Background: Megatron-style partitioning of the MLP
 For a two-matrix MLP `Y = GeLU(X·A)·B`, with A of shape [h, 4h] and B of shape [4h, h]:
 1. **Split A by columns** into N pieces. Each GPU computes `GeLU(X·A_i)`, a [tokens, 4h/N] slice. No
    communication is needed *because* GeLU is elementwise, so each slice is independent.
@@ -127,8 +148,8 @@ All three are combined with TP in large deployments. At inference on a single no
 common case.
 
 ## Diagram
-One transformer layer at TP = N: each GPU computes its heads and its MLP slice locally, and two
-all-reduces per layer stitch the partial sums back together.
+One transformer layer at TP = N, run for every token of every agent step: each GPU computes its heads
+and its MLP slice locally, and two all-reduces per layer stitch the partial sums back together.
 
 ```mermaid
 flowchart TD
@@ -213,7 +234,25 @@ for n in (1, 2, 4, 8):
 # TP=2: 24.2 ms, TP=4: 13.7 ms, TP=8: 8.5 ms -> 5.0x on 8 GPUs, and the gap widens with slower links
 ```
 
+### Worked scenario: a 15-step agent on a 70B model
+Each step decodes ~300 tokens (reasoning plus a tool call). Decode only, using the step times above;
+prefill and tool time are extra. Illustrative, not a benchmark.
+
+| Deployment (8 H100-class GPUs) | TPOT | Decode per step | Decode per run (15 steps) | Runs at once |
+|---|---|---|---|---|
+| One TP = 8 replica | ≈ 8.5 ms | ≈ 2.6 s | ≈ 38 s | 1 batch |
+| Two TP = 4 replicas | ≈ 13.7 ms | ≈ 4.1 s | ≈ 62 s | 2 batches |
+
+- **Interactive agent, user watching:** TP = 8 cuts ~24 s from every run.
+- **Background agents (nightly triage, batch research):** two TP = 4 replicas finish more runs per
+  hour: two batches each step every 13.7 ms beat one batch every 8.5 ms, about 1.24× the tokens.
+- **Often better than both:** route easy steps to a smaller single-GPU model and keep the 70B for
+  planning, which shortens the chain the big model sees.
+
 ## Production patterns
+- **Pick TP from the agent's latency budget.** Multiply TPOT by tokens per step and steps per run; if
+  interactive runs miss their budget at the smallest TP that fits, raise TP; if only throughput is
+  short, add replicas. Monitor p95 run wall-clock time alongside TPOT.
 - **Smallest TP that leaves KV room.** When a model needs more than one GPU, start at the smallest power
   of two that fits weights plus a healthy cache (`--tensor-parallel-size 4` in vLLM) and scale throughput
   with replicas. Monitor KV-cache usage and preemptions per replica.
@@ -227,7 +266,8 @@ for n in (1, 2, 4, 8):
   CUDA graphs remove per-kernel launch overhead, which grows as a share of the step as TP shortens each
   rank's compute and adds collective kernels. Monitor TPOT after any engine flag change.
 - **Benchmark the TP curve per hardware SKU.** Measure tokens/s per request and aggregate tokens/s at TP =
-  1, 2, 4 (where the model fits) on the exact node type, and record where speedup flattens.
+  1, 2, 4 (where the model fits) on the exact node type, and record where speedup flattens. Replay real
+  agent traces, since multi-step runs with long contexts behave differently from single chats.
 
 ## Trade-offs
 - **Lower per-token latency vs all-reduce overhead.** Pooled bandwidth makes latency fall with TP, but
@@ -238,6 +278,9 @@ for n in (1, 2, 4, 8):
   whole replica down.
 - **TP vs data-parallel replicas.** TP gives faster single-stream decode; replicas give more total
   throughput per GPU-hour. Which wins depends on whether the SLO is per-user speed or cost.
+- **Interactive agents vs background agents.** Higher TP shortens every step of a run a user is watching,
+  but buys fewer runs per GPU-hour than replicas. The choice flips when the agent runs offline and only
+  completion count matters.
 - **TP vs pipeline parallelism.** TP has no pipeline bubble and lower latency, but demands a fast
   intra-node interconnect; pipeline parallelism tolerates slow links between nodes.
 
@@ -251,12 +294,17 @@ for n in (1, 2, 4, 8):
   against two replicas before choosing.
 - **Forgetting per-rank overhead.** Each TP rank keeps its own CUDA context, NCCL buffers and activation
   workspace, so per-GPU cache room is less than weights ÷ N suggests.
+- **Judging an agent deployment by single-request TPOT.** A 10 ms TPOT looks fine until a 15-step run
+  makes the user wait a minute. Symptom: good engine dashboards, complaints about slow agents. Fix:
+  track run-level latency and size TP or model choice from it.
 - **Mixing GPU models or driver versions in a TP group.** Collectives run at the pace of the slowest
   device, and some combinations fail to initialise at all. Keep each TP group homogeneous.
 
 ## When to use
 - **Use when** the model does not fit one GPU at an acceptable precision, or it fits but single-stream
   decode latency is the binding SLO and the GPUs share NVLink.
+- **Use for agents when** a self-hosted large model drives interactive multi-step runs and run latency,
+  not cost, is the complaint. With a hosted API this is the provider's decision.
 - **Keep the degree small:** usually the smallest power of two that leaves healthy KV room; prefer
   replicas for scaling throughput beyond that.
 - **Avoid across nodes:** use pipeline parallelism or more replicas instead.
@@ -300,9 +348,11 @@ first principles alone.
 - **Also** check whether the KV head count forces replication at TP = 8, and compare against two TP = 4
   replicas.
 
-### When would you choose replicas over tensor parallelism?
+### When would you choose replicas over tensor parallelism for an agent fleet?
 - **When the model fits one GPU** and the goal is aggregate throughput: replicas scale linearly with zero
   communication.
+- **When agents run in the background:** nobody watches a single run, so completed runs per GPU-hour
+  matters more than per-step latency.
 - **When nodes lack NVLink:** collectives over PCIe eat the bandwidth gain, so replicas of a quantized
   model are often faster and cheaper.
 
@@ -310,6 +360,14 @@ first principles alone.
 - **Cache per GPU divides by N,** because each GPU stores K and V only for its heads, so aggregate free
   memory becomes cache.
 - **GQA caps the split:** with 8 KV heads, beyond TP = 8 heads are replicated and the saving shrinks.
+
+### Your self-hosted 70B agent takes a minute per run. Would you raise TP or add replicas?
+- **Decompose the minute:** steps × (prefill + tokens per step × TPOT) + tool time. If decode dominates,
+  TPOT is the lever.
+- **Raise TP** (within one NVLink node) when interactive runs are too slow; it cuts TPOT, about 13.7 ms
+  to 8.5 ms going from TP = 4 to TP = 8.
+- **Add replicas** when runs are fast enough but too many queue. Also consider a smaller model for easy
+  steps.
 
 ### Estimate per-token decode latency for a 70B bf16 model at TP = 8 on H100-class GPUs.
 - **Memory term:** 141 GB ÷ (8 × 3.35 TB/s) ≈ 5.3 ms.

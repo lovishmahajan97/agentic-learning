@@ -5,7 +5,8 @@ name: RLHF
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: background
 related:
   - training-adaptation/dpo
   - training-adaptation/grpo
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-RLHF trains a reward model on human "which is better" comparisons, then uses RL (usually PPO) to push
-the model toward high-scoring responses, with a KL penalty to the SFT model. Its central hazard: the
-policy learns to exploit the reward model's errors.
+RLHF trains a reward model on human comparisons, then uses RL (usually PPO) with a KL leash to chase
+high scores. It shaped the models your agent runs on; its hazard, reward hacking, returns whenever you
+optimise an agent against a judge.
+
+## For agent builders
+- **Why it matters for agents.** The verbosity, sycophancy and confident tone you fight in agent prompts
+  are partly RLHF artefacts: raters and reward models preferred them. Knowing where they come from tells
+  you which you can prompt away and which need a different model or a preference fine-tune.
+- **Where it shows up in your stack.** Hosted chat and agent models are RLHF-style post-trained. Reward
+  models and LLM judges reappear in your own stack as best-of-n rerankers and as graders in agent evals,
+  where the same overoptimisation applies.
+- **What you control.** Whether to rerank agent outputs with a reward model or judge, how you guard that
+  signal (length penalty, human audit slice), and whether preference tuning of an open model should be
+  DPO rather than PPO.
+- **What you can skip.** Running PPO yourself, GAE derivations and four-model orchestration. Agent teams
+  almost never need full RLHF; know the loop, the KL leash and the overoptimisation curve.
 
 ## Why it exists
 - **SFT cannot rank.** After SFT a model answers in the right format, but the demonstration it imitated
@@ -36,14 +50,14 @@ policy learns to exploit the reward model's errors.
   ideal response is.
 - **A comparison is not a next-token target**, only a scalar notion of goodness. That is an RL problem:
   the model is a *policy* emitting a response (an action sequence), the environment returns a *reward*,
-  the objective is expected reward.
+  the objective is expected reward. An agent is the same picture with tool calls as actions.
 - **The recipe has a lineage.** Christiano et al. showed it in 2017 for control tasks: fit a reward model
   to comparisons, optimise the policy, keep collecting comparisons on the new policy. Stiennon et al. and
   InstructGPT applied it to language: the jump from "completes text" to "helps".
 - **The reward model amortises human labels.** Optimising directly against human ratings is hopeless at
   RL's data appetite: PPO scores hundreds of thousands of samples or more per run, far beyond what raters
-  could label. Tens of thousands of comparisons train a model that scores
-  every sample for free. The price: it is wrong in places, and the policy will find them.
+  could label. Tens of thousands of comparisons train a model that scores every sample for free. The
+  price: it is wrong in places, and the policy will find them.
 
 ## How it works
 ### Step 1: collect comparisons
@@ -52,7 +66,8 @@ policy learns to exploit the reward model's errors.
 3. Raters pick the better one, or rank several; rankings are decomposed into pairs.
 
 - **Rater engineering is a large part of the work:** guidelines, calibration sessions and agreement
-  measurement, because a reward model trained on inconsistent labels learns noise.
+  measurement, because a reward model trained on inconsistent labels learns noise. The same is true of
+  rubrics for your agent-eval judges.
 
 ### Step 2: train the reward model
 - **Architecture:** r_φ(x, y) is often the SFT model (or a smaller sibling, as in InstructGPT) with its
@@ -70,25 +85,24 @@ L_RM(φ) = − E_(x, y_w, y_l) [ log σ( r_φ(x, y_w) − r_φ(x, y_l) ) ]
 - **Why start from SFT:** the reward model must judge the kind of text the policy produces, and a model
   already representing that distribution learns the judgement from far fewer comparisons.
 - **Measure it** as accuracy on held-out comparison pairs, read against inter-annotator agreement on the
-  same pairs: a reward model cannot meaningfully beat the rate at which humans agree with each other.
+  same pairs: a reward model cannot meaningfully beat the rate at which humans agree with each other. Hold
+  an agent-eval judge to the same standard.
 
-### Step 3: optimise the policy with PPO
+### Step 3 (background): optimise the policy with PPO
 Expected reward with a KL penalty to the reference policy π_ref (the SFT model):
 
 ```
 J(θ) = E_x E_y~π_θ [ r_φ(x, y) − β · KL( π_θ(·|x) ‖ π_ref(·|x) ) ]
 ```
 
-**Reward shaping.** The KL term is applied per token as a shaped reward
-(−β·[log π_θ(y_t|·) − log π_ref(y_t|·)]); the reward model's score is added at the final token, because
-it judges the finished response and says nothing about individual tokens.
-
-**Credit assignment.** Which of 300 tokens earned the score? PPO uses a learned *value model* V(s_t)
-that predicts the eventual return from each prefix:
-1. TD error `δ_t = r_t + V(s_{t+1}) − V(s_t)`: did token t make the outcome look better or worse than
-   expected?
-2. Generalised advantage estimation sums these with a decay: `A_t = Σ_k (γλ)^k · δ_{t+k}`. γ is usually 1
-   for text; λ trades bias against variance.
+- **Reward shaping.** The KL term is applied per token as a shaped reward
+  (−β·[log π_θ(y_t|·) − log π_ref(y_t|·)]); the reward model's score is added at the final token, because
+  it judges the finished response and says nothing about individual tokens.
+- **Credit assignment.** Which of 300 tokens earned the score? PPO uses a learned *value model* V(s_t)
+  that predicts the eventual return from each prefix. The TD error `δ_t = r_t + V(s_{t+1}) − V(s_t)` asks
+  whether token t made the outcome look better or worse than expected.
+- **GAE.** Generalised advantage estimation sums these with a decay: `A_t = Σ_k (γλ)^k · δ_{t+k}`. γ is
+  usually 1 for text; λ trades bias against variance.
 
 **The PPO loop:**
 1. Sample responses from the current policy.
@@ -110,6 +124,8 @@ that predicts the eventual return from each prefix:
   rising while true reward peaks and then falls.
 - **β sets how far you let it go.** Tune it against held-out human evaluation, not against the reward
   model.
+- **The agent-builder version:** iterate prompts or best-of-n against one LLM judge long enough and the
+  judge score climbs while real task success stalls. The cure is the same: a held-out human signal.
 
 ### What is running during training
 | Network | State | Role |
@@ -121,13 +137,14 @@ that predicts the eventual return from each prefix:
 
 - **Memory and orchestration are the burden:** several copies of a large policy's weights, optimiser
   state for two of them, and a fast generation loop, because sampling dominates wall-clock time.
-- **This cost is the main reason DPO and GRPO exist.**
+- **This cost is the main reason DPO and GRPO exist**, and why agent teams preference-tune with DPO.
 
 ### Iteration and rejection sampling
 - **Iterate because the reward model is trusted only near its data:** after a PPO round, sample from the
   new policy, collect new comparisons, retrain the reward model, repeat.
 - **Rejection sampling fine-tuning is the cheaper cousin:** sample k responses, keep the top-scored, SFT
-  on those. Same reward model, no RL machinery, and often the first round before PPO.
+  on those. Same reward model, no RL machinery, and often the first round before PPO. At inference time
+  the same idea is best-of-n reranking of agent answers.
 
 ### Where the comparisons come from
 - **"Human feedback" is increasingly partly AI feedback.** In RLAIF a strong model ranks pairs against
@@ -138,7 +155,8 @@ that predicts the eventual return from each prefix:
 
 ## Diagram
 The three steps as one loop: comparisons train the reward model, PPO optimises the policy against it
-under a KL leash, and fresh comparisons on the new policy restart the cycle.
+under a KL leash, and fresh comparisons on the new policy restart the cycle. The dotted check is the one
+your agent evals need too.
 
 ```mermaid
 flowchart TD
@@ -220,10 +238,48 @@ print([round(a, 3) for a in gae(rewards, values)])
 - **The final score reaches early tokens** only through the value model: a bad value model gives noisy
   advantages, which is one reason PPO for LLMs is fragile and why GRPO drops it.
 
+### Best-of-n reranking in an agent, with a length guard
+The inference-time cousin of rejection sampling: draft n final answers, score them with a reward model or
+judge, return the best. The score function here is a stand-in for your reward model or judge call.
+
+```python
+def best_of_n(candidates, score, length_penalty=0.002, max_chars=1200):
+    """Pick the highest-scoring draft, penalising length so verbosity cannot win by itself."""
+    def guarded(c):
+        return score(c) - length_penalty * max(0, len(c) - max_chars // 2)
+    ranked = sorted(candidates, key=guarded, reverse=True)
+    return ranked[0], [round(guarded(c), 3) for c in ranked]
+
+def toy_judge(answer):                       # replace with a reward model or LLM-judge call
+    base = 0.6 + (0.2 if "refund issued" in answer.lower() else 0.0)
+    return base + 0.0005 * len(answer)        # the length bias you are guarding against
+
+drafts = ["Refund issued to card ending 4242; allow 5-7 business days.",
+          "Thanks so much for reaching out! " * 25 + "We are looking into it.",
+          "I checked order A-1042: refund issued, confirmation sent by email."]
+best, scores = best_of_n(drafts, toy_judge)
+print(best, scores)   # the short, correct drafts beat the padded one once length is guarded
+```
+
+### Worked scenario: an agent eval that got overoptimised
+Illustrative numbers. A team tuned a support agent's prompt and best-of-n settings against one LLM judge
+for six weeks, checking a human-audited sample only at the end.
+
+| Week | Judge score (proxy) | Mean answer length | Human-audited task success |
+|---|---|---|---|
+| 1 | 6.8 / 10 | 140 words | 71% |
+| 3 | 7.9 / 10 | 210 words | 76% |
+| 6 | 8.7 / 10 | 330 words | 69% |
+
+This is the Gao et al. curve in miniature: the proxy keeps rising while true quality peaks and falls.
+The fix was a length-controlled judge, a rotating human audit slice every week, and selecting the
+week-3 configuration.
+
 ## Production patterns
 - **Early-stop on human win rate, not reward.** Run a held-out human or strong-judge win-rate eval at
   fixed step intervals and plot it against sequence KL from the reference. Keep the checkpoint at the KL
-  where win rate peaks; alert when proxy reward rises while win rate is flat.
+  where win rate peaks; alert when proxy reward rises while win rate is flat. Do the same for agent-eval
+  judges: plot judge score against a weekly human audit.
 - **Gate the reward model before PPO.** Measure accuracy on held-out comparison pairs and on fresh samples
   from the current policy, and compare it with inter-annotator agreement on the same pairs. Do not start
   RL when accuracy on the new policy's outputs is far below the in-distribution number.
@@ -243,19 +299,22 @@ print([round(a, 3) for a in gae(rewards, values)])
   drifts past its data.
 - **On-policy PPO vs cost.** PPO adapts as the policy improves and can reach behaviours no demonstration
   contains, at the cost of four models in memory, a sampling loop and fragile hyperparameters. DPO wins
-  when the dataset is fixed and the budget small.
+  when the dataset is fixed and the budget small, which describes most agent teams.
 - **Low vs high KL coefficient.** Low allows bigger behaviour changes and faster reward gains; high
   preserves capability. The right value flips with how trustworthy the reward model is far from its data.
 - **Separate vs single reward models.** Separate helpfulness and safety models allow explicit trade-offs
   but need a combination rule and twice the comparison data. A single model is simpler and wins when the
   goals rarely conflict on your prompts.
+- **Best-of-n at inference vs latency and cost.** Reranking n agent drafts lifts quality without training,
+  but multiplies generation cost by n and inherits every bias of the scorer.
 
 ## Pitfalls
 - **Trusting the reward model's score as success.** Symptom: rising proxy reward with flat or falling
   human win rate, the overoptimisation signature. Fix: select checkpoints by held-out human or judge win
   rate.
 - **Length and sycophancy bias in comparisons.** Raters prefer longer, more agreeable answers, so the
-  policy learns verbosity and flattery, visible as answer length creeping up round over round.
+  policy learns verbosity and flattery, visible as answer length creeping up round over round. Agents
+  inherit it as needless preamble and agreeing with a user's wrong premise.
 - **Noisy or inconsistent labels.** Low inter-annotator agreement yields a reward model that cannot
   separate good from bad, and PPO then optimises noise.
 - **Reusing a reward model after the policy moved.** Trained on an old policy's comparisons, it is
@@ -267,8 +326,8 @@ print([round(a, 3) for a in gae(rewards, values)])
 ## When to use
 - **Use when** demonstrations cannot express what you want, you can collect reliable comparisons on your
   own prompt distribution, and you have the engineering capacity to run and monitor an RL loop.
-- **Prefer for most application teams:** DPO on the same comparison data, or rejection sampling with a
-  reward model; reserve full PPO for cases where on-policy iteration clearly pays.
+- **Prefer for most application and agent teams:** DPO on the same comparison data, or rejection sampling
+  with a reward model; reserve full PPO for cases where on-policy iteration clearly pays.
 - **Measure** with human or strong-judge win rates on held-out prompts, track KL from the reference, and
   run a general capability suite to catch the alignment tax.
 - **Interviews:** draw the three stages, write the Bradley–Terry loss, explain why the KL penalty exists,
@@ -305,6 +364,13 @@ own score.
 - **PPO with a KL penalty:** maximises reward while staying near the SFT reference, because the reward
   model is only trustworthy near its training data.
 
+### Your agent's LLM-judge score keeps rising across prompt iterations, but escalations from users do not fall. What is going on?
+- **It is overoptimisation against a proxy**, the same shape as RLHF reward hacking: each iteration
+  learned the judge's preferences (length, tone, keywords) rather than task success.
+- **Confirm** by scoring a fresh human-audited sample and plotting judge score against answer length.
+- **Fix:** length-controlled or rubric-based judging, a rotating human slice, end-state task checks where
+  possible, and select the configuration where human-audited success peaked.
+
 ### Why does PPO for LLMs need a value model, and what goes wrong when it is poor?
 - **Credit assignment:** the reward arrives once at the final token, so a value model V(s_t) estimates the
   return from each prefix to compute TD errors and GAE advantages.
@@ -327,11 +393,13 @@ own score.
 - **Fix** with a length penalty or length-controlled win rates, tighten rater guidelines, and raise β if
   KL from the reference is also climbing.
 
-### How do you know the reward model is good enough to start PPO?
-- **Held-out pair accuracy** compared with inter-annotator agreement on the same pairs, because it cannot
-  meaningfully beat how often humans agree.
-- **Accuracy on fresh samples from the current policy**, since that is where PPO will query it.
-- **Do not start** if accuracy on the new policy's outputs is far below the in-distribution number.
+### Would you add best-of-n reranking with a reward model to a production agent? What would you watch?
+- **It can lift answer quality without training**, but costs n times the generation and adds latency on
+  the final step, so apply it only where quality matters more than speed.
+- **The scorer's biases become the agent's**, so guard length, audit a human slice, and check the scorer's
+  agreement with humans on your own traffic.
+- **Watch** the best-versus-median score gap, cost per task and human-audited success, not the scorer's
+  own number.
 
 ## Quiz
 ### Q: Why does RLHF train a reward model instead of optimising the policy directly on human ratings?

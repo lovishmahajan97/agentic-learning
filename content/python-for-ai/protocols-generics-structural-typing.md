@@ -5,7 +5,8 @@ name: Protocols, generics and structural typing
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/type-hints
   - python-for-ai/dependency-injection-and-interface-boundaries
@@ -21,14 +22,26 @@ sources:
 ---
 
 ## TL;DR
-A Protocol says "anything with these methods is acceptable", so checkers verify duck typing without
-inheritance. Generics track element types, so `first(xs: list[Message])` returns a `Message`. Together
-they type swappable AI parts: embedders, LLM clients, vector stores, retry decorators.
+Protocols let an agent core say "any LLM client, tool or memory store with these methods works", checked
+without inheritance. Generics keep element types flowing, so `first(xs: list[Message])` returns a
+`Message`. Together they make providers, tools and test doubles swappable.
+
+## For agent builders
+- **Why it matters for agents.** An agent loop talks to parts you swap often: model providers, tools,
+  embedders, vector stores, memory. A Protocol per seam lets a scripted fake LLM drive the loop in tests
+  and a new provider drop in without touching the core.
+- **Where it shows up in your stack.** Framework base types (LangChain's chat-model and retriever
+  classes, LlamaIndex's) play the same role nominally; your own agent core can stay framework-free behind
+  `LLMClient`, `Tool` and `Store` Protocols, with each framework or SDK in an adapter.
+- **What you control.** Where the seams are, keeping protocols small and consumer-owned, and typing
+  retry and tracing decorators with `ParamSpec` so tool calls stay checked.
+- **What you can skip.** Deep variance theory. Remember "accept `Sequence`, return `list`" and that
+  `@runtime_checkable` checks names only.
 
 ## Why it exists
 - **Python code targets behaviour, not names.** "Anything with an `embed(texts)` method" is a complete
   contract. An OpenAI client, a sentence-transformers model and a test stub can all satisfy it without
-  sharing a base class.
+  sharing a base class. The same holds for "anything with `run(args)`" as an agent tool.
 - **Nominal typing forces bad choices.** Originally a value matched `Embedder` only if its class
   inherited from it. You either write adapter classes that exist only to inherit, or type the parameter
   `Any` and lose checking exactly at the seam with a vendor's code.
@@ -69,7 +82,8 @@ class Embedder(Protocol):
 - Makes `isinstance(obj, Embedder)` work.
 - It checks only that the named attributes exist, not signatures or types, *because* a full structural
   check at runtime would be slow and ambiguous.
-- Treat it as a cheap plugin-discovery check, not validation.
+- Treat it as a cheap plugin-discovery check (for example, finding tool objects in a plugin module), not
+  validation.
 
 ### Protocol versus ABC
 | | ABC (`abc.ABC` plus `@abstractmethod`) | Protocol |
@@ -85,12 +99,14 @@ class Embedder(Protocol):
 - **Settable means exact.** For the same reason as `list` invariance (below), a settable attribute must
   match its type exactly, not a subtype.
 - **Read-only consumers should say so.** Declare `@property def dim(self) -> int: ...`, which accepts
-  plain attributes, properties and subtypes alike. Ask for the least you need, here as everywhere.
+  plain attributes, properties and subtypes alike. Ask for the least you need, here as everywhere; a
+  tool's `name` is the typical case.
 
 ### Generic protocols and callback protocols
 - **Generic protocol:** `class Store[T](Protocol): def get(self, key: str) -> T | None: ...` (or
   `Protocol[T]` on older versions). A Redis-backed `Store[Session]` and an in-memory `Store[Session]` stand
-  in for each other while the checker still knows what `get` returns.
+  in for each other while the checker still knows what `get` returns. Agent memory and checkpoint stores
+  fit this shape.
 - **Callback protocol:** when an interface is one call with keyword arguments or overloads that
   `Callable[...]` cannot express (a streaming callback taking `token: str, *, final: bool`), a protocol
   defining only `__call__` types it exactly.
@@ -102,7 +118,8 @@ class Embedder(Protocol):
 - **Generic classes carry the binding across methods.** With `class Index[T]:` or
   `class Index(Generic[T]):`, `Index[Document].nearest(...)` returns a `Document`.
 - **Bound:** `T = TypeVar("T", bound=BaseModel)` allows any subclass of `BaseModel`, so the checker
-  allows `.model_dump()` on it.
+  allows `.model_dump()` on it. A `parse_output[T: BaseModel](text, schema: type[T]) -> T` helper for
+  structured outputs uses exactly this.
 - **Constrained:** `TypeVar("N", int, float)` means exactly one of those types, which is how `sum`-like
   helpers avoid accepting strings.
 
@@ -118,7 +135,7 @@ class Embedder(Protocol):
 | Function parameters | Contravariant | A callback accepting `Animal` works where one accepting `Dog` is required |
 
 - **Most common "it obviously should work" error.** The fix is almost always to accept `Sequence[T]` or
-  `Iterable[T]` for inputs.
+  `Iterable[T]` for inputs; in agents it appears as `list[ToolMessage]` rejected for `list[Message]`.
 - **Declaring variance.** With the old syntax you must state it (`TypeVar("T_co", covariant=True)`); PEP
   695 syntax infers it from how the parameter is used.
 
@@ -131,8 +148,9 @@ class Embedder(Protocol):
   subclass type rather than the base.
 
 ## Diagram
-How a checker decides whether a value can be used where an `Embedder` Protocol is expected: no
-inheritance lookup, only a member-by-member comparison, and `isinstance` at runtime checks far less.
+How a checker decides whether a value can be used where a Protocol (here an `Embedder`, but equally an
+agent's `Tool` or `LLMClient`) is expected: no inheritance lookup, only a member-by-member comparison,
+and `isinstance` at runtime checks far less.
 
 ```mermaid
 flowchart TD
@@ -147,9 +165,57 @@ flowchart TD
 ```
 
 ## Examples
+### An agent loop typed against Protocols, driven by a fake LLM
+The loop depends only on `LLMClient` and `Tool`. A scripted test double and a plain class satisfy them
+with no base class, so the loop is testable without network or vendor mocks. This passes
+`mypy --strict` on Python 3.10+.
+
+```python
+from dataclasses import dataclass, field
+from typing import Protocol
+
+@dataclass
+class Reply:
+    text: str | None = None
+    tool: str | None = None
+    args: dict[str, object] = field(default_factory=dict)
+
+class LLMClient(Protocol):
+    def complete(self, messages: list[dict[str, str]], /) -> Reply: ...
+
+class Tool(Protocol):
+    @property
+    def name(self) -> str: ...                # read-only: plain attributes also satisfy it
+    def run(self, args: dict[str, object], /) -> str: ...
+
+class Clock:                                  # a tool; no base class
+    name = "clock"
+    def run(self, args: dict[str, object], /) -> str:
+        return "2026-10-22T09:00Z"
+
+class ScriptedLLM:                            # test double: satisfies LLMClient structurally
+    def __init__(self, replies: list[Reply]) -> None: self.replies = replies
+    def complete(self, messages: list[dict[str, str]], /) -> Reply:
+        return self.replies.pop(0)
+
+def run_agent(llm: LLMClient, tools: dict[str, Tool], task: str, max_steps: int = 5) -> str:
+    messages = [{"role": "user", "content": task}]
+    for _ in range(max_steps):
+        r = llm.complete(messages)
+        if r.tool is None:
+            return r.text or ""
+        result = tools[r.tool].run(r.args) if r.tool in tools else f"unknown tool {r.tool}"
+        messages.append({"role": "tool", "content": result})
+    return "stopped: step limit"
+
+llm = ScriptedLLM([Reply(tool="clock"), Reply(text="It is 09:00 UTC.")])
+print(run_agent(llm, {"clock": Clock()}, "What time is it?"))   # It is 09:00 UTC.
+```
+
 ### Structural embedder, generic index, typed decorator
-Two unrelated classes satisfy `Embedder`, the index remembers what it stores, and the decorator keeps
-the signature. On Python 3.12+ the `Generic[T]` base can be replaced by `class Index[T]:`.
+Two unrelated classes satisfy `Embedder`, the index remembers what it stores (the retrieval half of a
+RAG tool), and the decorator keeps the signature. On Python 3.12+ the `Generic[T]` base can be replaced
+by `class Index[T]:`.
 
 ```python
 import functools, zlib
@@ -212,7 +278,8 @@ What the checker catches when you break it:
 
 ### Generic store protocol and a callback protocol (Python 3.12+)
 A memory store swaps for a Redis one without inheritance, and the streaming callback's keyword-only
-`final` is typed exactly. This passes `mypy --strict`.
+`final` is typed exactly (the shape of a token callback that streams an agent's answer to a UI). This
+passes `mypy --strict`.
 
 ```python
 from typing import Protocol
@@ -246,9 +313,13 @@ stream(["hello", "world"], printer)          # hello world
 ```
 
 ## Production patterns
-- **Consumer-owned protocols at the provider boundary.** Define `LLMClient`, `Embedder` and `Store`
-  Protocols in the agent-core package, next to the code that calls them, and keep vendor SDK imports in
-  adapter modules only. Monitor how many core modules import a vendor SDK; the target is zero.
+- **Consumer-owned protocols at the provider boundary.** Define `LLMClient`, `Embedder`, `Tool` and
+  `Store` Protocols in the agent-core package, next to the code that calls them, and keep vendor SDK and
+  framework imports in adapter modules only. Monitor how many core modules import a vendor SDK; the
+  target is zero.
+- **Scripted fake LLMs for loop tests.** Drive the agent loop in unit tests with a fake that satisfies
+  `LLMClient` and returns a fixed list of tool calls and answers. Test step limits, unknown tools and
+  error results deterministically; keep real-model runs for the eval suite.
 - **Conformance assertions in tests.** For each implementation add one line such as
   `_: Embedder = OpenAIEmbedder(client)` in a test module the checker covers. A signature drift then fails
   CI at the implementation, not at a distant call site.
@@ -256,9 +327,9 @@ stream(["hello", "world"], printer)          # hello world
   not, declare protocol method parameters positional-only
   (`def embed(self, texts: Sequence[str], /) -> list[list[float]]: ...`) so editor and CI agree. Watch
   for failures that only one checker reports.
-- **`ParamSpec` on every shared decorator.** Retry, tracing and caching decorators use
-  `Callable[P, R] -> Callable[P, R]` with `functools.wraps`. A quick audit: `reveal_type` on a decorated
-  function should show its real signature, not `(...) -> Any`.
+- **`ParamSpec` on every shared decorator.** Retry, tracing and caching decorators around model and tool
+  calls use `Callable[P, R] -> Callable[P, R]` with `functools.wraps`. A quick audit: `reveal_type` on a
+  decorated function should show its real signature, not `(...) -> Any`.
 - **Protocol for consumers, ABC for your own implementations.** Ship an ABC with shared defaults that
   in-house classes inherit, and type consumers against the Protocol, so outside classes still plug in.
 
@@ -276,6 +347,9 @@ stream(["hello", "world"], printer)          # hello world
   despite being nominal.
 - **Signature preservation vs boilerplate.** `ParamSpec` costs more code per decorator; skipping it turns
   every decorated function into `Callable[..., Any]` and silently disables checks.
+- **Own protocols vs framework base classes.** Your own small Protocols keep the core portable across
+  frameworks and providers; adopting a framework's base classes gives you its integrations for free but
+  couples the loop to its release cycle. The second wins when you lean on many of its connectors.
 
 ## Pitfalls
 - **Invariant inputs.** Declaring `list[Message]` gives callers "incompatible type list[ToolMessage]".
@@ -284,13 +358,16 @@ stream(["hello", "world"], printer)          # hello world
   a team using both sees CI disagree. Fix: match the names or make the protocol's parameters
   positional-only.
 - **`isinstance(x, SomeProtocol)` as a safety check.** It passes with the wrong signature, and the
-  failure appears later as a `TypeError` inside the call.
+  failure appears later as a `TypeError` inside the call, often mid-run in an agent tool step.
 - **A `TypeVar` used once.** In `def f(x: T) -> None` it relates nothing to anything (pyright warns about
   exactly this); usually `object` was intended.
 - **`dim: int` against read-only properties.** Symptom: "protocol member dim is not settable" on classes
   that look correct. Fix: declare it as a `@property` in the protocol.
 - **Decorators typed `Callable[..., Any]`.** mypy never catches wrong arguments to decorated LLM-call
   functions, because the signature was erased.
+- **Fat protocols.** An `LLMClient` with fifteen methods makes every fake and adapter expensive. Symptom:
+  test doubles full of `raise NotImplementedError`. Fix: split by consumer; the loop usually needs one
+  `complete` method.
 
 ## When to use
 - **Use a Protocol when the consumer defines the interface** and implementations come from elsewhere: an
@@ -334,6 +411,14 @@ implementations inherit for shared behaviour, which still satisfies the Protocol
   classes or `Any` at every vendor seam. Protocols make existing idioms such as `Iterable` and file-like
   objects checkable without changing runtime behaviour.
 
+### How would you structure an agent codebase so you can switch model providers and unit-test the loop without network calls?
+- **Define small consumer-owned Protocols** (`LLMClient.complete`, `Tool.run`, `Store.get/put`) in the
+  core, and put each SDK or framework behind an adapter that satisfies them.
+- **Test the loop with a scripted fake** that returns a fixed sequence of tool calls and answers, so step
+  limits, unknown tools and tool errors are deterministic tests.
+- **Add conformance lines** (`_: LLMClient = AnthropicAdapter(...)`) so adapter drift fails CI, and keep
+  real-model behaviour in the eval suite.
+
 ### A teammate's function takes `list[Message]` and every caller passing `list[ToolMessage]` gets an error. Explain and fix.
 - **Cause: invariance.** The function could append a plain `Message` into the caller's list, so the
   checker refuses to treat `list[ToolMessage]` as `list[Message]`.
@@ -348,7 +433,7 @@ implementations inherit for shared behaviour, which still satisfies the Protocol
   substitute for validating untrusted objects.
 - **Common compromise:** Protocol for consumers, ABC for in-house classes.
 
-### Your retry decorator makes mypy stop catching wrong arguments to decorated functions. Why, and how do you fix it?
+### Your retry decorator around tool and model calls makes mypy stop catching wrong arguments. Why, and how do you fix it?
 - **Cause:** typing the decorator `Callable[..., Any]` erases the wrapped signature, so every call through
   it is unchecked.
 - **Fix:** `P = ParamSpec("P")`, `R = TypeVar("R")`, and type it `Callable[P, R] -> Callable[P, R]` with

@@ -5,7 +5,8 @@ name: MCP authentication / authorization / transport security
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - agents/model-context-protocol
   - agents/a2a-protocol
@@ -23,9 +24,24 @@ sources:
 ---
 
 ## TL;DR
-MCP tool calls are safe only if the server knows who asks and what they may do. Local stdio
-relies on the OS process boundary; remote HTTP adds optional OAuth 2.1 with PKCE and audience-bound
-tokens. The model is never the trust boundary.
+Every tool your agent reaches over MCP acts with someone's authority. Local stdio servers rely on the
+OS process boundary; remote HTTP servers add optional OAuth 2.1 with PKCE and audience-bound tokens. The
+model is never the trust boundary.
+
+## For agent builders
+- **Why it matters for agents.** A prompt-injected agent will eventually try every tool it can reach, so
+  what a tool call may do must be decided by tokens and server-side checks, not by your system prompt.
+  Per-user tokens are also what make each agent action attributable to a person and revocable.
+- **Where it shows up in your stack.** Server side: the official MCP SDKs (Python, TypeScript) behind
+  your own middleware. Client side: hosts such as Claude Desktop, Claude Code and Cursor, LangChain's
+  MCP adapters package (`langchain-mcp-adapters`) feeding tools into LangGraph agents, and the OpenAI
+  Agents SDK's MCP server classes. Your identity provider plays the authorization server.
+- **What you control.** The transport per server (stdio or Streamable HTTP), the scope attached to each
+  tool, audience pinning in validation, where the host keeps tokens (never in the model's context), and
+  whether upstream calls use token exchange or the server's own credentials.
+- **What you can skip.** Hand-writing an OAuth client: SDKs and hosts run discovery, registration and
+  PKCE for you. Know the 401, discovery, token chain and the audience rule well enough to debug a failed
+  connection and answer a security review.
 
 ## Why it exists
 - **An MCP server has side effects.** It is a remote-procedure interface that reads a customer's CRM,
@@ -276,6 +292,10 @@ A user holds tokens for two servers: a low-risk `docs` server and a sensitive `b
   rate per tool; a persistent rate means scopes are too narrow for real tasks.
 - **Lock down local HTTP servers.** Bind to `127.0.0.1`, keep an exact `Origin` allowlist, and prefer
   stdio when only one user runs the server. Monitor rejected origins in logs.
+- **Carry the subject into agent traces.** Attach the authenticated subject, tenant and MCP server name
+  as metadata on each tool-call span in your tracing tool (LangSmith, or OpenTelemetry spans to any
+  backend), so one agent run can be read end to end with a person on every write. Monitor tool-call
+  spans missing a subject.
 
 ## Trade-offs
 - **Per-user identity vs login ceremony.** OAuth 2.1 with discovery gives per-user identity, consent and
@@ -378,6 +398,14 @@ exchanged specifically for that upstream, logging the authenticated subject on e
   the proxy hands the code to the attacker.
 - **Defense:** the proxy shows its own consent for each registered client and matches redirect URIs
   exactly.
+
+### Your agent loads tools from five remote MCP servers. How do you stop one compromised server from abusing the others?
+- **One token per server, audience-bound.** The host requests each token with that server's URI as
+  `resource` and sends it only there, so a token a bad server captures fails everywhere else.
+- **Treat its tool results as untrusted input.** A compromised server can return injected instructions;
+  write tools on the other servers still require their own scopes and, for risky actions, human approval.
+- **Watch the traces:** a tool call on server B right after an odd result from server A is the pattern
+  to alert on.
 
 ## Quiz
 ### Q: Why does the MCP authorization spec require the `resource` parameter (RFC 8707) when requesting a token?

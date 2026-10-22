@@ -5,7 +5,8 @@ name: Self-host vs API
 kind: decision
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - system-design/build-vs-buy
   - system-design/open-weight-vs-proprietary
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-An API buys capability, elasticity and no operations; self-hosting buys control, data locality and
-lower *marginal* cost, but only with busy GPUs. Start on the API unless residency, an air gap,
-customisation or sustained volume forces hosting; re-run the numbers as traffic grows.
+Agents multiply tokens: every step re-sends a growing transcript. Start on an API (capability,
+elasticity, no ops); self-host one high-volume narrow step only when residency, an air gap, adapters or
+busy GPUs justify it, and re-run the numbers as traffic grows.
+
+## For agent builders
+- **Why it matters for agents.** An agent task is 5-30 model calls, not one, and each call re-sends the
+  system prompt, tool schemas and transcript. Input tokens dwarf output tokens, so the bill and the GPU
+  sizing are dominated by prefill and by how well the prefix is cached.
+- **Where it shows up in your stack.** The `base_url` and model name in your OpenAI-compatible client,
+  LangChain chat model or LiteLLM config; vLLM or SGLang if you host; LangSmith or your own tracing for
+  per-step token counts that feed the cost model.
+- **What you control.** Which agent steps run where (planner on a frontier API, a router or extractor
+  self-hosted), a stable cacheable prefix, and keeping provider-specific tool-call formats behind one
+  interface so a step can move.
+- **What you can skip.** GPU kernel tuning and cluster scheduling until one step clearly dominates spend.
+  Know the utilisation formula and the agent token multiplier; that settles most decisions.
 
 ## Why it exists
 - **Opposite cost structures.** An API is pure variable cost: pay per token, scale to zero, someone else
@@ -33,7 +47,8 @@ customisation or sustained volume forces hosting; re-run the numbers as traffic 
 - **"Sensitive data, so self-host" is often wrong both ways.** Enterprise API terms with zero retention and
   in-region endpoints often satisfy legal. Some regulated environments genuinely cannot send data to any
   third party, which makes the API unavailable at any price.
-- **"Open models are good enough now" is a per-task claim** that only your eval set can settle.
+- **"Open models are good enough now" is a per-task claim** that only your eval set can settle. For agents
+  that includes tool-call accuracy and multi-step task success, not just answer quality.
 - **Both sides hide costs, and the answer changes over a product's life.** Self-host: engine and driver
   upgrades, security patching, peak capacity, cold starts of minutes while a model loads, re-running evals
   after every change. API: deprecation schedules you do not control, rate limits during incidents,
@@ -42,7 +57,7 @@ customisation or sustained volume forces hosting; re-run the numbers as traffic 
 ## How it works
 ### The cost model
 - **API cost** = sum over calls of tokens × price, with separate prices for input, output and (often)
-  cached input tokens.
+  cached input tokens. For an agent, "calls" means every step of every task.
 - **Self-host cost** = fixed spend divided by useful work:
 
 ```
@@ -51,9 +66,21 @@ effective_$ per 1M tokens = gpu_hourly_cost × 1e6 / (tokens_per_second × 3600 
 
 | Term | What it really means | Why it bites |
 |---|---|---|
-| `tokens_per_second` | Aggregate throughput of one GPU at *your* batch size and prompt/output mix, not a vendor headline | Decode is memory-bandwidth bound, so it rises with batching until the KV cache fills memory |
+| `tokens_per_second` | Aggregate throughput of one GPU at *your* batch size and prompt/output mix, not a vendor headline | Decode is memory-bandwidth bound, so it rises with batching until the KV cache fills memory; agent transcripts fill it fast |
 | `utilisation` | Average load ÷ provisioned capacity | Interactive traffic peaks several times its average; you provision for the peak and idle the rest of the day, unless batch work fills the valleys |
 | People | A fraction of an engineer plus on-call | A fixed cost that does not shrink with traffic |
+
+### Agent workloads change the inputs
+- **Tokens per task, not per request.** Context at step *k* is prefix + all earlier tool calls and results,
+  so input grows roughly quadratically with step count while output stays small.
+- **Prefill-heavy mix.** A 37:1 input-to-output ratio is ordinary for agents, so a cost model sized on
+  decode throughput alone underestimates GPUs; prefix caching (provider prompt caching, or
+  `enable_prefix_caching` in vLLM) is the biggest lever on both sides.
+- **Tool calling is a capability gate.** The hosted model must emit valid tool calls in the format your
+  framework parses. vLLM's OpenAI-compatible server can return tool calls, but only with a model and parser
+  configured for it; test it on your tool schemas before costing the move.
+- **Per-step placement.** A planner that needs frontier reasoning and a high-volume classifier or
+  extractor step are different decisions; most savings come from moving the narrow step.
 
 ### Break-even is a staircase, not a point
 1. **The API bill is linear:** `api = V × p_blended`. `p_blended` weights input, output and cached-input
@@ -69,8 +96,9 @@ effective_$ per 1M tokens = gpu_hourly_cost × 1e6 / (tokens_per_second × 3600 
 5. **Above it, anything that raises per-GPU throughput or lowers the peak pulls the staircase down:**
    - a smaller or quantised model;
    - larger batches;
-   - prefix caching for shared system prompts;
-   - batch jobs that fill night-time valleys, so the peak-to-average ratio falls.
+   - prefix caching for shared system prompts and tool schemas;
+   - batch jobs (offline evals, trace replays) that fill night-time valleys, so the peak-to-average ratio
+     falls.
 
 So the comparison is really about model size and utilisation, which is why two teams quoting the same GPU
 price reach opposite answers.
@@ -78,10 +106,10 @@ price reach opposite answers.
 ### The constraints that decide before cost does
 | Constraint | Self-host offers | Check first |
 |---|---|---|
-| **Data** | Residency, retention, customer contracts, air gap | What the vendor's enterprise terms and in-cloud platforms (a model served inside your cloud account's boundary) actually provide |
+| **Data** | Residency, retention, customer contracts, air gap | What the vendor's enterprise terms and in-cloud platforms (a model served inside your cloud account's boundary) actually provide; agents send tool results (customer records, files) too |
 | **Control** | Pinning a version for a year, deterministic behaviour over time, custom fine-tunes or LoRA adapters, logit access, engine-level constrained decoding | APIs offer some of these; hosting offers all of them |
-| **Latency** | No WAN hop inside your VPC; tunable time-to-first-token | A small, poorly utilised cluster has worse tail latency than a provider's large fleet |
-| **Capability** | Fine-tuned small models often match on narrow tasks (classification, extraction) | Frontier proprietary models are usually ahead on open-ended tasks; only your eval knows |
+| **Latency** | No WAN hop inside your VPC; tunable time-to-first-token | A small, poorly utilised cluster has worse tail latency than a provider's large fleet, and an agent pays it once per step |
+| **Capability** | Fine-tuned small models often match on narrow tasks (classification, extraction, routing) | Frontier proprietary models are usually ahead on open-ended planning; only your eval knows |
 | **Elasticity** | Spikes absorbed up to your headroom; a new replica means minutes of model loading | APIs absorb spikes up to your quota |
 
 ### The middle options
@@ -89,39 +117,56 @@ price reach opposite answers.
 - **Provisioned-throughput plans** from API vendors: fixed cost, no ops.
 - **Cloud model platforms** inside your account boundary.
 - **Serverless GPUs** for spiky loads.
-- **The hybrid most teams end up with:** the API for low-volume frontier tasks, self-hosted small models for
-  one or two high-volume narrow tasks that dominate spend.
+- **The hybrid most agent teams end up with:** the API for the planner and low-volume frontier steps,
+  self-hosted small models for one or two high-volume narrow steps that dominate spend.
 
 ### How the decision evolves
-1. **Prototype on the API,** because it is the fastest way to learn whether the product works.
-2. **Instrument** tokens per month per task, prompt/output ratio, peak-to-average ratio and quality on a
-   golden set.
-3. **Move one task** when a single narrow task dominates spend and an open model clears the eval bar; keep
+1. **Prototype on the API,** because it is the fastest way to learn whether the agent works at all.
+2. **Instrument** tokens per month per step, prompt/output ratio, cached-token share, peak-to-average ratio
+   and quality on a golden set.
+3. **Move one step** when a single narrow step dominates spend and an open model clears the eval bar; keep
    the long tail on the API.
 4. **Revisit quarterly,** because API prices and open-model quality both move, and the break-even point
    moves with them.
 
 ## Diagram
-Read it top to bottom: hard constraints (including a ban on any third-party processor) decide first,
-then quality on your eval, then the cost model at real peak and utilisation with people included; most
-paths end in the API or a hybrid split, not a full migration.
+Read it top to bottom for one agent step: hard constraints (including a ban on any third-party processor)
+decide first, then quality on your eval including tool calls, then the cost model at real peak and
+utilisation with people included; most paths end in the API or a hybrid split.
 
 ```mermaid
 flowchart TD
-    S["New task or quarterly review"] --> C{"Hard constraint? air gap, adapters, version pin"}
-    C -->|"yes"| H["Self-host this task"]
+    S["New agent step or quarterly review"] --> C{"Hard constraint? air gap, adapters, version pin"}
+    C -->|"yes"| H["Self-host this step"]
     C -->|"no"| T{"Do zero-retention terms or an in-cloud platform satisfy legal?"}
     T -->|"no"| H
-    T -->|"yes"| E{"Open model passes the golden-set eval?"}
+    T -->|"yes"| E{"Open model passes golden set and tool-call eval?"}
     E -->|"no"| A["Stay on the API"]
     E -->|"yes"| U{"Cheaper at real peak, people included?"}
     U -->|"no"| A
-    U -->|"yes"| HY["Hybrid: move this one task, keep the long tail on the API"]
+    U -->|"yes"| HY["Hybrid: move this step, keep the rest on the API"]
     A -.->|"revisit as volume and prices move"| S
     HY -.->|"revisit quarterly"| S
 ```
 
 ## Examples
+### Worked scenario: tokens for one support agent
+A support agent has a 6k-token prefix (system prompt plus tool schemas), runs 8 steps per task, appends
+~1.5k tokens per step and writes ~300 output tokens per step. Volume is 10,000 tasks a day. Prices are
+illustrative: $0.15 input, $0.60 output per 1M tokens, cached input at 10% of the input price.
+
+| Quantity | Value |
+|---|---|
+| Input per task | 8 × 6k + 1.5k × (0 + 1 + … + 7) = 90k tokens |
+| Output per task | 8 × 300 = 2.4k tokens (input:output about 37:1) |
+| Monthly tokens | 27B input, 0.72B output |
+| API, no prefix caching | about $4,050 input + $432 output ≈ $4,482 |
+| API, append-only transcript cached | 16.5k uncached + 73.5k cached per task ≈ $1,073 input + $432 ≈ $1,505 |
+
+- **Lesson:** a stable, append-only prefix cuts this bill about 3× before hosting is even discussed.
+- **Self-host caveat:** a GPU plan sized on 0.72B output tokens ignores 27B tokens of prefill; benchmark
+  with your real transcripts and prefix caching on.
+
 ### Break-even calculator
 Every figure is an illustrative assumption to replace with your own measurements; the point is the shape
 of the result, not the numbers.
@@ -155,52 +200,56 @@ flatten the peak ratio to 1.5.
 | 5× traffic, $1.50/h reserved, peak ratio 1.5 | $54,000 | about $29,520 | 16 | 64% | Self-host |
 
 - **Caveat:** the model ignores prefill compute, which matters when prompts are five times longer than
-  outputs. Benchmark aggregate throughput on your real traffic before trusting it.
+  outputs, and matters far more for agents at 37:1. Benchmark aggregate throughput on your real traffic
+  before trusting it.
 
-### Sweep the staircase
-Same illustrative inputs, swept across volume. Higher utilisation, not a cheaper GPU alone, moves the
-crossover.
+### Moving one agent step behind the same client
+The agent code never names a vendor; a step's entry in config decides where it runs. vLLM serves an
+OpenAI-compatible API, so the hosted step is a `base_url` and model-name change.
 
 ```python
-import math
+from openai import OpenAI
 
-def self_host(out_per_month, gpu_hourly, peak_to_avg, tps=1500, people=12000):
-    avg_tps = out_per_month / (30 * 24 * 3600)
-    gpus = max(1, math.ceil(avg_tps * peak_to_avg / tps))   # the staircase: whole GPUs only
-    return gpus, gpus * gpu_hourly * 730 + people
+STEPS = {   # per-step placement; edit config, not agent code, to move a step
+    "plan":     {"base_url": None, "model": "frontier-model"},                       # provider API
+    "classify": {"base_url": "http://vllm.internal:8000/v1", "model": "small-ft"},   # self-hosted
+}
+_clients = {}
 
-P_OUT = 5 * 0.15 + 0.60      # API $ per 1M output tokens with 5 prompt tokens per output token
-for b in (1, 8, 20, 40, 80):
-    out = b * 1e9
-    api = out / 1e6 * P_OUT
-    g1, on_demand = self_host(out, 2.50, 3.0)    # on-demand GPUs, spiky interactive traffic
-    g2, tuned = self_host(out, 1.50, 1.5)        # reserved GPUs, batch jobs fill the valleys
-    print(f"{b:>2}B/mo  API ${api:>8,.0f}  on-demand ${on_demand:>8,.0f} ({g1:>2} GPUs)"
-          f"  tuned ${tuned:>8,.0f} ({g2:>2} GPUs)")
-# 1B: API wins easily (one GPU plus people is the first step).
-# 8B: API $10,800 vs on-demand $24,775 vs tuned $16,380.
-# 20B: tuned ($20,760) beats the API ($27,000); on-demand ($41,200) never does in this range.
+def call(step, messages, tools=None):
+    cfg = STEPS[step]
+    key = cfg["base_url"] or "default"
+    if key not in _clients:
+        _clients[key] = OpenAI(base_url=cfg["base_url"]) if cfg["base_url"] else OpenAI()
+    resp = _clients[key].chat.completions.create(model=cfg["model"], messages=messages,
+                                                  **({"tools": tools} if tools else {}))
+    u = resp.usage   # log per step: this feeds the break-even model
+    print(step, cfg["model"], u.prompt_tokens, u.completion_tokens)
+    return resp.choices[0].message
 ```
 
 ## Production patterns
-- **Provider-agnostic client from day one.** When starting on an API, put every call behind one internal
-  interface that takes a task name. vLLM serves an OpenAI-compatible HTTP API, so moving a task is a base
-  URL and model-name change. Monitor tokens, cost and latency per task, not per provider.
-- **Hybrid split by task.** When one narrow task dominates spend, run it on a self-hosted small model and
-  keep the long tail on the API. Gate the move on that task's golden-set score. Monitor quality per task
-  and the share of spend still on the API.
-- **Shadow before you switch.** Before migrating, mirror a sample of production requests to the hosted
-  model asynchronously and score both outputs offline. Monitor the quality delta and the hosted p95
-  time-to-first-token at the real daily peak, not at a quiet hour.
+- **Provider-agnostic client from day one.** Put every model call behind one internal interface that takes
+  a step or task name (your own wrapper, LiteLLM, or a LangChain chat model built from config). vLLM serves
+  an OpenAI-compatible HTTP API, so moving a step is a base URL and model-name change. Monitor tokens, cost
+  and latency per step, not per provider.
+- **Hybrid split by agent step.** When one narrow step (routing, classification, extraction) dominates
+  spend, run it on a self-hosted small model and keep the planner and long tail on the API. Gate the move on
+  that step's golden-set score and tool-call validity rate. Monitor end-to-end task success, not only the
+  step's accuracy.
+- **Shadow before you switch.** Mirror a sample of production agent steps to the hosted model
+  asynchronously and score both outputs offline, including whether tool calls parse and pick the same tool.
+  Monitor the quality delta and the hosted p95 time-to-first-token at the real daily peak, not at a quiet
+  hour.
 - **Fill the valleys.** When interactive traffic has a high peak-to-average ratio, schedule offline jobs
-  (evals, backfills, embedding refreshes) on the same GPUs overnight. Monitor average utilisation and the
-  peak-to-average ratio, the two inputs that move the staircase.
-- **Benchmark on your own mix.** Before trusting `tokens_per_second`, replay your real prompt and output
-  lengths at your target concurrency with the engine's serving benchmark (vLLM ships one). Monitor
+  (agent evals, trace replays, backfills, embedding refreshes) on the same GPUs overnight. Monitor average
+  utilisation and the peak-to-average ratio, the two inputs that move the staircase.
+- **Benchmark on your own mix.** Before trusting `tokens_per_second`, replay real agent transcripts at your
+  target concurrency with the engine's serving benchmark (vLLM ships one) and prefix caching on. Monitor
   aggregate throughput and p95 latency together; one without the other misleads.
-- **Decision record with a revisit date.** Write the constraints, the cost model inputs and the
-  break-even volume into an ADR. Re-run it quarterly or after a provider price change. Monitor actual
-  monthly volume against the break-even volume.
+- **Decision record with a revisit date.** Write the constraints, the cost model inputs and the break-even
+  volume into an ADR. Re-run it quarterly or after a provider price change. Monitor actual monthly volume
+  against the break-even volume.
 
 ## Trade-offs
 - **Marginal cost vs utilisation risk.** Self-hosting lowers marginal cost per token, but only above a
@@ -208,40 +257,43 @@ for b in (1, 8, 20, 40, 80):
   cut moves the break-even point.
 - **Control vs upgrade burden.** Full control over model version and behaviour, in exchange for owning
   every upgrade. Providers deprecate on their schedule; self-hosted, you must re-evaluate each engine and
-  model change yourself.
+  model change yourself, including tool-call parsing.
 - **Data inside your boundary vs operations.** Zero-retention terms and in-cloud model platforms often meet
   the same requirement without operations. It flips only when no third-party processor is permitted at
   all.
-- **Frontier quality vs narrow-task fit.** Frontier APIs usually lead on open-ended quality. The gap
-  narrows to nothing on narrow tasks where a fine-tuned small model beats a general model on your eval,
-  which is when hosting that task pays.
+- **Frontier quality vs narrow-task fit.** Frontier APIs usually lead on open-ended planning. The gap
+  narrows to nothing on narrow steps where a fine-tuned small model beats a general model on your eval,
+  which is when hosting that step pays.
 - **Quota vs headroom.** APIs absorb spikes up to the quota you negotiated; self-hosting needs idle headroom
-  or a queue. It flips when provider rate limits themselves become the bottleneck during peaks.
+  or a queue. It flips when provider rate limits themselves become the bottleneck during peaks, which agent
+  fan-out reaches sooner than chat.
 
 ## Pitfalls
 - **Comparing list prices without utilisation.** Symptom: projected savings never appear in the bill while
   dashboards show GPUs idling at 20%. Fix: use the utilisation formula with peak provisioning.
+- **Costing an agent per request instead of per task.** Symptom: the forecast assumed one call per user
+  action and the bill is 10-30× higher. Fix: cost from traced tokens per task, step by step.
 - **Treating "sensitive data" as automatically meaning self-hosting.** Symptom: months of platform work for
   a requirement a contract addendum met. Or the reverse: learning at procurement review that data could
   never leave and the API prototype must be rebuilt. Fix: get the exact data rule in writing early.
 - **Migrating on cost alone without a golden-set eval.** Symptom: spend falls while quality complaints and
-  escalations rise within weeks.
+  escalations rise within weeks, or the hosted model emits malformed tool calls the agent retries.
 - **Omitting people and on-call from the model.** Symptom: a single engineer is the cluster's real single
   point of failure and cannot take holiday.
 - **Hard-coding provider-specific features** (tool-call formats, cache controls, response schemas) deep in
-  application code. Symptom: "we can't switch" during a price negotiation.
+  agent code. Symptom: "we can't switch" during a price negotiation.
 - **Sizing for average load instead of peak.** Symptom: queueing and time-to-first-token collapse at the
-  daily peak, exactly when the most users are present.
+  daily peak, exactly when the most users are present, and multiplied by every agent step.
 
 ## When to use
-- **Default to the API** for new products and for any task whose volume is small or whose quality bar
-  needs a frontier model.
+- **Default to the API** for new agents and for any step whose volume is small or whose quality bar needs a
+  frontier model (planning, open-ended reasoning).
 - **Self-host when a hard constraint applies:** air gap, strict residency with no acceptable in-cloud
   option, logit or adapter access, version pinning the vendor will not give you.
-- **Or self-host one task** when it has high sustained volume, an open model passes your eval, and your
+- **Or self-host one step** when it has high sustained volume, an open model passes your eval, and your
   utilisation model shows a clear margin after people cost.
-- **Measure first:** tokens per task per month, prompt/output ratio, peak-to-average ratio, p95 latency and
-  golden-set quality.
+- **Measure first:** tokens per step per month, prompt/output ratio, cached-token share, peak-to-average
+  ratio, p95 latency and golden-set quality.
 - **Interviews:** give the utilisation formula plus the constraint checklist, ending in a hybrid portfolio
   with a revisit cadence, not a one-word preference.
 
@@ -275,34 +327,44 @@ on-call, and record the decision and its assumptions in an ADR so it can be revi
 - **Peaks force over-provisioning.** You size for the daily peak, so a GPU averaging 20% of peak throughput
   delivers tokens at five times its nominal price, before adding people and on-call.
 
-### Walk me through building a break-even model for moving one task off the API.
-- **Inputs from traces:** tokens per month for that task, the prompt/output ratio, and the peak-to-average
+### How would you estimate the monthly model cost of an agent before launch?
+- **Trace a sample of tasks:** steps per task, prefix size, tokens appended per step and output per step;
+  input grows with every step, so cost per task, not per call.
+- **Apply the real price mix:** input, output and cached-input prices, with the cached share you expect
+  from an append-only transcript; the gap is often around 3×.
+- **Multiply by tasks per month and add headroom** for retries and longer-than-median tasks, then compare
+  with a self-host staircase only for the step that dominates.
+
+### Walk me through building a break-even model for moving one agent step off the API.
+- **Inputs from traces:** tokens per month for that step, the prompt/output ratio, and the peak-to-average
   ratio; a blended API price from your real input, output and cached-input mix.
-- **Throughput from a benchmark:** aggregate tokens per second per GPU on your own prompt mix at target
+- **Throughput from a benchmark:** aggregate tokens per second per GPU on your own transcripts at target
   concurrency, not a vendor headline.
 - **Model the staircase:** `ceil(peak_load / per_gpu_throughput) × gpu_hourly × 730 + people`, compared with
   the linear API bill across a range of volumes to find where it crosses.
 
 ### When would you recommend staying on the API even though the volume is high?
 - **When the open model fails the eval.** Savings mean nothing if quality complaints and escalations rise
-  within weeks.
+  within weeks, or if tool-call validity drops and the agent loops on retries.
 - **When traffic is spiky and nothing fills the valleys.** A high peak-to-average ratio keeps utilisation
   low, so the staircase stays above the API line.
 - **When the team cannot own operations.** Engine upgrades, patching, cold starts of minutes and on-call are
   real costs; a provisioned-throughput plan or managed open-weight hosting may be the better middle option.
 
-### You moved a task to self-hosted and the bill did not drop. How do you debug it?
+### You moved an agent step to self-hosted and the bill did not drop. How do you debug it?
 - **Check utilisation first:** GPUs idling at 20% on dashboards means you are paying for peak headroom all
   day; fix with batch jobs at night, reserved GPUs or fewer, larger batches.
-- **Check throughput assumptions:** measured aggregate tokens per second on real traffic may be far below
-  the benchmark, especially with long prompts, because the cost model ignored prefill compute.
-- **Check the people line:** on-call and upgrade work were often left out of the original model.
+- **Check throughput assumptions:** measured aggregate tokens per second on real transcripts may be far
+  below the benchmark, because the cost model ignored prefill compute or prefix caching was off.
+- **Check the people line and retries:** on-call and upgrade work were often left out, and malformed tool
+  calls can add hidden extra steps.
 
-### How do you keep the option to switch providers or self-host later?
-- **One internal interface keyed by task name,** so application code never calls a vendor SDK directly.
+### How do you keep an agent able to switch providers or self-host later?
+- **One internal interface keyed by step name,** so agent code never calls a vendor SDK directly.
 - **Avoid provider-specific features deep in code** (tool-call formats, cache controls, response schemas),
   or wrap them, because hard-coding them is what produces "we can't switch" during a price negotiation.
-- **Use an OpenAI-compatible engine such as vLLM,** so moving a task is a base URL and model-name change.
+- **Use an OpenAI-compatible engine such as vLLM,** so moving a step is a base URL and model-name change,
+  and keep a tool-call eval that runs against any candidate model.
 
 ## Quiz
 ### Q: Which parameter most often decides whether self-hosting beats the API on cost?

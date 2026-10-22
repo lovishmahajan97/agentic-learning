@@ -5,7 +5,8 @@ name: OpenTelemetry instrumentation
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/structured-logging
   - fastapi-for-ai/shared-httpx-asyncclient
@@ -22,9 +23,23 @@ sources:
 ---
 
 ## TL;DR
-OpenTelemetry (OTel) is a vendor-neutral API, SDK and protocol for traces, metrics and logs. In FastAPI:
-an OTLP-exporting tracer provider, auto-instrumented app and clients, and manual spans around LLM and
-retrieval steps give one cross-service trace per request, for any backend.
+OpenTelemetry (OTel) is a vendor-neutral API, SDK and protocol for traces, metrics and logs. For an
+agent, one trace per run with spans for each model call, tool call and retrieval step shows where time,
+tokens and failures went, in any OTLP backend.
+
+## For agent builders
+- **Why it matters for agents.** An agent run is a tree: the run, its steps, each model call and each tool
+  call, sometimes across services (agent API, retrieval service, MCP or tool servers). A trace is the
+  natural shape for that tree, and it is how you find the step that made a 40-second run slow or the
+  tool call that failed.
+- **Where it shows up in your stack.** The OTel SDK in the FastAPI service and agent workers,
+  instrumentors for FastAPI, httpx and SQLAlchemy, manual spans in your agent loop, a collector, and a
+  backend: a general tracing tool or an LLM observability tool that ingests OTLP (Langfuse is one).
+- **What you control.** Span names and GenAI attributes (`gen_ai.request.model`,
+  `gen_ai.usage.input_tokens`, a tool name), sampling, what content may appear in spans, and where the
+  provider is initialised (per worker).
+- **What you can skip.** Writing exporters or processors, and most of the SDK configuration surface. Use
+  the standard environment variables, the batch processor and a collector.
 
 ## Why it exists
 - **Slow requests hide their cause.** A 9-second chat request might spend it in the provider, a vector
@@ -44,8 +59,8 @@ retrieval steps give one cross-service trace per request, for any backend.
 ### Data model
 | Concept | What it is |
 |---|---|
-| **trace** | a tree of spans sharing a trace id |
-| **span** | name, start and end time, parent, status, attributes (key-value pairs) |
+| **trace** | a tree of spans sharing a trace id; for an agent, one run |
+| **span** | name, start and end time, parent, status, attributes (key-value pairs); for an agent, one step, model call or tool call |
 | **tracer** | creates spans; obtained from the global tracer provider |
 | **tracer provider** | owns the resource, the sampler and the span processors |
 | **resource** | attributes describing the service, such as `service.name` and `deployment.environment` |
@@ -55,9 +70,11 @@ retrieval steps give one cross-service trace per request, for any backend.
 1. **Inject.** The instrumented httpx client adds a W3C `traceparent` header carrying the trace id and the
    current span id.
 2. **Extract.** The receiving service's FastAPI instrumentation reads it and makes its server span a child,
-   which is how one trace spans many services.
+   which is how one trace spans many services, including tool servers your agent calls over HTTP.
 3. **In process.** The current span lives in a `contextvars`-based context, so async code keeps correct
-   parentage across `await`s.
+   parentage across `await`s, and parallel tool calls started as tasks get the right parent.
+4. **Across a queue.** Context does not ride along automatically; inject it into the job payload and
+   extract it in the worker, or the run's worker spans start a new trace.
 
 ### Auto versus manual instrumentation
 - **Auto: server spans.** `FastAPIInstrumentor.instrument_app(app)` wraps the ASGI app in middleware that
@@ -69,12 +86,16 @@ retrieval steps give one cross-service trace per request, for any backend.
   specific model with 812 input tokens. Wrap model calls, retrieval, reranking and tool execution in your
   own spans and set attributes.
 - **GenAI semantic conventions** define names such as `gen_ai.request.model` and
-  `gen_ai.usage.input_tokens`; they are still marked as in development, so pin the version you follow.
+  `gen_ai.usage.input_tokens`, plus operation names for chat and tool execution; they are still marked as
+  in development, so pin the version you follow.
+- **Framework instrumentation exists too.** Some agent frameworks and provider SDKs ship or have community
+  OTel instrumentation; check what it emits before adding your own spans, to avoid duplicates.
 - **Errors for free.** `start_as_current_span` records an exception raised inside it as a span event and
   sets the span status to error by default, so a failed provider call shows up red without extra code.
 
 ### Sampling
-- **Recording every span of every request is expensive at volume.**
+- **Recording every span of every request is expensive at volume**, and agent runs produce dozens of spans
+  each.
 - **Head sampling:** `ParentBased(TraceIdRatioBased(0.1))` keeps about 10% of new traces and follows the
   caller's decision for propagated ones, so a trace is never half-sampled across services.
 - **Tail sampling** (keep all errors and slow traces) happens in the collector, because only after a trace
@@ -87,7 +108,8 @@ retrieval steps give one cross-service trace per request, for any backend.
   attributes (a last line of defence against prompt text leaking into telemetry), performs tail sampling,
   and fans out to one or several backends.
 - **Why there:** changing backends or sampling policy becomes a config change to one deployment, not a
-  redeploy of every service.
+  redeploy of every service. Sending the same traces to a general APM and an LLM observability tool is a
+  second exporter, not new code.
 
 ### Metrics and logs
 - **Traces are sampled, so they are the wrong source for totals.** Request counts, latency histograms and
@@ -110,23 +132,81 @@ retrieval steps give one cross-service trace per request, for any backend.
   provider in each worker (a `post_fork` hook or lifespan), not in the master.
 
 ## Diagram
-Follow one trace id: the `traceparent` header stitches services into one tree, spans leave each process
-in batches, and the collector scrubs and tail-samples before any backend sees them.
+Follow one trace id through an agent run: the run span parents each model and tool span, `traceparent`
+stitches in the tool server, and the collector scrubs and tail-samples before any backend sees spans.
 
 ```mermaid
-flowchart LR
-    C["Client"] --> G["Chat API: FastAPI server span"]
-    G --> L["Manual span: chat model-a with gen_ai attributes"]
-    L -->|"httpx client span, injects traceparent"| P["LLM provider"]
-    G -->|"traceparent header"| R["Retrieval service: child server span"]
+flowchart TD
+    C["Client"] --> G["Agent API: FastAPI server span"]
+    G --> RUN["Manual span: agent run"]
+    RUN --> L["Span: chat model-a, gen_ai attributes"]
+    L -->|"httpx client span, traceparent"| P["LLM provider"]
+    RUN --> TL["Span: tool call search_orders"]
+    TL -->|"traceparent header"| TS["Tool server: child server span"]
     G -.->|"BatchSpanProcessor, OTLP 4317"| CO["Collector: scrub, tail_sampling, batch"]
-    R -.->|"OTLP"| CO
+    TS -.->|"OTLP"| CO
     G -.->|"MeterProvider, every request counted"| CO
-    CO --> B1[("Tracing backend")]
+    CO --> B1[("Tracing or LLM observability backend")]
     CO --> B2[("Metrics backend")]
 ```
 
 ## Examples
+### Agent scenario: one trace per run, spans per model and tool call
+The run span is the parent; each step's model call and tool calls are children with GenAI attributes.
+Attribute names follow the in-development GenAI conventions; pin and check the version you use.
+
+```python
+from opentelemetry import trace
+from opentelemetry.trace import Status, StatusCode
+
+tracer = trace.get_tracer("agent-api")
+
+async def run_agent(run_id: str, messages: list, llm, tools, max_steps: int = 20):
+    with tracer.start_as_current_span("invoke_agent support-agent") as run_span:
+        run_span.set_attribute("gen_ai.operation.name", "invoke_agent")
+        run_span.set_attribute("app.run_id", run_id)              # your own namespace for custom keys
+        for step in range(1, max_steps + 1):
+            with tracer.start_as_current_span("chat model-a") as span:
+                span.set_attribute("gen_ai.operation.name", "chat")
+                span.set_attribute("gen_ai.request.model", "model-a")
+                span.set_attribute("app.agent.step", step)
+                reply = await llm.complete(messages, tools=tools.schemas())   # httpx span nests here
+                span.set_attribute("gen_ai.usage.input_tokens", reply.usage.prompt_tokens)
+                span.set_attribute("gen_ai.usage.output_tokens", reply.usage.completion_tokens)
+            if not reply.tool_calls:
+                run_span.set_attribute("app.agent.steps", step)
+                return reply.text
+            messages.append(reply.message)
+            for call in reply.tool_calls:
+                with tracer.start_as_current_span(f"execute_tool {call.name}") as tspan:
+                    tspan.set_attribute("gen_ai.operation.name", "execute_tool")
+                    tspan.set_attribute("gen_ai.tool.name", call.name)
+                    result = await tools.call(call.name, call.arguments)    # exceptions mark it red
+                messages.append({"role": "tool", "tool_call_id": call.id, "content": str(result)})
+        run_span.set_status(Status(StatusCode.ERROR, "max_steps reached"))
+```
+
+- **Span names stay low-cardinality** (operation plus model or tool name); `run_id` is an attribute, never
+  part of the name.
+- **No prompt or tool content in attributes by default,** so the collector scrub is a safety net, not the
+  only defence.
+
+### Worked scenario: reading a slow agent trace
+Illustrative trace for one 14-second run, read from the span tree.
+
+| Span | Count | Total time | Share of 14 s |
+|---|---|---|---|
+| `chat model-a` | 4 | 6.8 s | 49% |
+| `execute_tool search_orders` (tool server child spans) | 3 | 4.5 s | 32% |
+| of which: tool server's SQL spans | 3 | 4.1 s | 29% |
+| `execute_tool send_reply` | 1 | 0.4 s | 3% |
+| uncovered time inside the run span | | 2.3 s | 16% |
+
+- **The tool, not the model, is the surprise:** three identical-looking searches each spend ~1.4 s in SQL,
+  so add an index or cache the lookup before touching the prompt.
+- **The 2.3 s gap** is work without spans (prompt assembly, retries with backoff, a sync SDK) and is the
+  next thing to instrument.
+
 ### Per-worker init, auto-instrumentation and a manual LLM span
 ```python
 from contextlib import asynccontextmanager
@@ -207,6 +287,9 @@ service:
       exporters: [otlp]
 ```
 
+- **`decision_wait` must cover a whole run.** At 10s, spans of a 40-second agent run arrive after the
+  decision; raise it for agent traffic, accepting more collector memory.
+
 ### Worked scenario: why totals from traces lie
 | Source | Calls counted per 1,000,000 real calls | Use for |
 |---|---|---|
@@ -218,15 +301,16 @@ Token spend computed from head-sampled traces comes out at roughly a tenth of th
 drifts whenever someone changes the sampling ratio.
 
 ## Production patterns
+- **One trace per agent run, across the queue.** Agent teams start a run span when a run begins and, when
+  the loop runs in a job worker, inject the trace context into the job payload and extract it in the
+  worker. Monitor: worker spans that start new traces instead of joining the run's.
 - **Init per worker, not in the master.** Build the tracer and meter providers in lifespan, or in
   Gunicorn's `post_fork(server, worker)` hook in `gunicorn.conf.py`, never at import with `--preload`.
   Monitor: exported spans per worker; a worker exporting zero is a fork problem.
-- **Exclude probes and noise.** Pass `excluded_urls` to `FastAPIInstrumentor.instrument_app` or set
-  `OTEL_PYTHON_FASTAPI_EXCLUDED_URLS` (for example `livez,readyz`). Monitor: span volume by route; probes
-  should not appear.
-- **Configure with standard environment variables.** Set `OTEL_SERVICE_NAME`,
-  `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_TRACES_SAMPLER` per environment instead of hard-coding them, so
-  the same image runs everywhere. Monitor: traces arriving with a missing or default service name.
+- **Exclude probes, configure with standard variables.** Pass `excluded_urls` to
+  `FastAPIInstrumentor.instrument_app` or set `OTEL_PYTHON_FASTAPI_EXCLUDED_URLS` (for example
+  `livez,readyz`), and set `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_TRACES_SAMPLER` per
+  environment. Monitor: span volume by route, and traces with a missing or default service name.
 - **Totals from metrics, examples from traces.** Record token usage with a histogram named
   `gen_ai.client.token.usage` (split by input and output) through a `MeterProvider` and
   `PeriodicExportingMetricReader`, and reconcile it daily against the provider's bill. Monitor: the gap
@@ -246,6 +330,9 @@ drifts whenever someone changes the sampling ratio.
   collector tail sampling when you need every failed or slow trace.
 - **Content in spans vs exposure.** Prompts and completions as span attributes or events help quality
   debugging, but traces are often retained and shared more widely than logs, so default to metadata only.
+- **Plain OTel vs an LLM tracing SDK.** A framework's own tracing SDK gives prompt-aware views with little
+  code but ties you to its backend; OTel spans with GenAI attributes travel to any OTLP backend, at the
+  cost of writing the spans yourself.
 
 ## Pitfalls
 - **Provider initialised before a pre-fork server forks workers.** Symptom: a service that works but
@@ -260,6 +347,9 @@ drifts whenever someone changes the sampling ratio.
   ratio of the provider's bill (about a tenth at 10%), or drifting as sampling changes.
 - **User ids or raw prompts in span names instead of attributes.** Symptom: an explosion of unique span
   names that breaks grouping and latency aggregation in the backend.
+- **Agent run split into many traces.** Symptom: each model call appears as its own root trace because the
+  loop runs in a task or worker without the run's context. Fix: start the run span first and propagate its
+  context explicitly across queues.
 
 ## When to use
 - **Use when:** a request touches more than one slow dependency or more than one service, which describes
@@ -296,6 +386,15 @@ streams, part of that time is token streaming that a manual span closed early.
   libraries call the stable API, the SDK samples and batches, an exporter ships the data.
 - **Why:** the backend becomes a deployment choice, not a code change, so switching vendors means changing
   an exporter endpoint or collector config instead of re-instrumenting every service.
+
+### How would you instrument an agent so one run is one readable trace?
+- **Structure:** a run span as the parent, a chat span per model call and an execute-tool span per tool
+  call, each with GenAI attributes (model, input and output tokens, tool name) and the run id as an
+  attribute, not in the name.
+- **Propagation:** `traceparent` via the instrumented httpx client carries the trace into tool servers;
+  inject and extract context explicitly when the run hops onto a job queue.
+- **Sampling:** tail-sample in the collector with a `decision_wait` long enough for a whole run, keeping
+  every failed or `max_steps` run.
 
 ### Your Gunicorn service with --preload exports no spans from its workers. What is wrong?
 - **The provider was created in the master before fork.** Threads do not survive `fork`, and the OTLP gRPC

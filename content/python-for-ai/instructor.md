@@ -5,7 +5,8 @@ name: Instructor
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/pydantic
   - python-for-ai/outlines
@@ -21,13 +22,27 @@ sources:
 ---
 
 ## TL;DR
-Instructor wraps an LLM client so a call takes a Pydantic model as `response_model` and returns a
-validated instance. When validation fails it sends the error back and retries, replacing the brittle
-"ask for JSON and `json.loads` it" loop every codebase rewrites.
+Agents run on typed decisions: a router's label, a planner's next step, a judge's verdict. Instructor
+takes a Pydantic `response_model`, validates the reply, and on failure sends the error back and retries,
+so every structured agent step returns a checked object.
+
+## For agent builders
+- **Why it matters for agents.** Every non-chat step in an agent (route the request, pick the next
+  action, extract tool arguments from a document, score a trace as an LLM judge) must return data your
+  code branches on. A malformed or invented value there derails the whole run, not one answer.
+- **Where it shows up in your stack.** As `instructor.from_openai(...)` or `from_anthropic(...)` around
+  the SDK client inside planner, router, extractor and eval-judge steps; frameworks offer the same idea
+  (LangChain's `with_structured_output`, the typed outputs of PydanticAI), so the concepts transfer.
+- **What you control.** The schema (field order, `Literal` labels, `Optional` fields), validators that
+  check against run state such as the tool registry, `max_retries` per step, and what happens when the
+  step still fails.
+- **What you can skip.** The provider adapter internals and every `Mode` you do not use. Know that a
+  reask is a full, longer LLM call that counts against your agent's latency and token budget.
 
 ## Why it exists
-- **Most LLM features are extraction or classification.** Pull an invoice's line items, label a
-  ticket's intent, turn an email into a calendar event. Downstream code wants a typed object, not prose.
+- **Most LLM features, and most agent sub-steps, are extraction or classification.** Pull an invoice's
+  line items, label a ticket's intent, turn an email into a calendar event, choose the next tool.
+  Downstream code wants a typed object, not prose.
 - **"Respond in JSON" plus `json.loads` fails in many distinct ways.** A Markdown fence or preamble
   around the JSON; `"twelve"` instead of `12`; an invented enum value; a missing required field; a date
   in the wrong format; JSON truncated because the output hit the token limit.
@@ -36,7 +51,7 @@ validated instance. When validation fails it sends the error back and retries, r
 - **Provider-native structured output closes only part of the gap.** JSON mode, strict schemas and
   forced tool calls can guarantee syntactically valid JSON of the schema's shape. They cannot enforce
   *business* rules: `end_date >= start_date`, a cited quote actually in the source, line items summing
-  to the total.
+  to the total, a tool name that exists in this agent's registry.
 - **Those rules live in Pydantic validators.** Only a validate-then-retry loop can use them to correct
   the model. Instructor is that loop, packaged once, across many providers.
 
@@ -44,7 +59,7 @@ validated instance. When validation fails it sends the error back and retries, r
 ### Patching the client
 - **Wrap an existing SDK client:** `instructor.from_openai(OpenAI())` or
   `instructor.from_anthropic(Anthropic())`. Recent versions also offer a `from_provider("openai/...")`
-  shortcut.
+  shortcut, handy when an agent routes steps to different providers.
 - **Same call signature, a few extra kwargs,** chiefly `response_model` and `max_retries`.
 - **It wraps rather than replaces the SDK** *because* the SDK already handles auth, HTTP, streaming and
   provider quirks; Instructor only owns the schema and validation layer.
@@ -62,7 +77,7 @@ validated instance. When validation fails it sends the error back and retries, r
    `ValidationError` text as a new message and calls again. The error is the correction signal: a
    validator raising `ValueError("end_date is before start_date")` tells the model precisely what to fix.
 5. **Give up cleanly.** After the last attempt it raises an `InstructorRetryException` carrying the
-   number of attempts and the last completion.
+   number of attempts and the last completion, which your agent loop catches and handles.
 
 | Mode | How the schema is sent |
 |---|---|
@@ -70,6 +85,15 @@ validated instance. When validation fails it sends the error back and retries, r
 | Provider tool modes | Equivalent for Anthropic and others |
 | `Mode.JSON` | The provider's JSON mode |
 | `Mode.MD_JSON` | Asks for JSON in a Markdown block, for models with no native support |
+
+### Instructor versus the agent's own tool loop
+- **Instructor forces one schema per call.** In tool mode it declares a single tool and forces it, so the
+  model cannot choose among tools or answer in prose that turn.
+- **A tool-calling agent loop is different:** the model sees many tools and decides whether and which to
+  call. That loop usually uses the provider's native tool calling directly.
+- **So use Instructor for the typed sub-steps around the loop:** routing, planning, extraction from tool
+  results, guardrail classification and eval judges. You can also model "next action" as a union schema
+  (example below) when you want validators on every decision.
 
 ### Retries and `max_retries`
 - **Retries are driven by Tenacity,** so `max_retries` accepts an integer or a full Tenacity retry policy.
@@ -82,6 +106,8 @@ validated instance. When validation fails it sends the error back and retries, r
 - **Every retry re-sends the whole prompt *and* grows it,** so retry *k* costs more input tokens than
   the first call.
 - **Long documents hurt most:** reasking over a 20k-token contract repeats the 20k tokens each time.
+- **Long agent transcripts hurt the same way.** A reask on step 15 re-sends the whole transcript so far,
+  and the failed attempt is appended to the request it sends.
 
 ### Expected retry cost
 If each attempt failed independently with probability *p* and you allow *N* attempts:
@@ -97,22 +123,25 @@ p = 0.1, N = 3  ->  ~1.11 calls, 0.1% residual failures
 - **Most retry spend lands on a small set of hard inputs.** Measure retry success rate per attempt
   number; if attempt two rarely fixes what attempt one broke, lower `max_retries` and route failures to
   review or a stronger model.
+- **In an agent, failures compound over steps.** A run with many structured steps succeeds only if every
+  step does, so a per-step residual failure rate that looks tiny matters at the run level.
 
 ### Giving validators something to check against
 - **Validators only see the data you give them.** To check an extracted quote appears in the source,
   pass the source as a context dict at call time (`context=` in recent versions, `validation_context=`
   in older ones). It reaches validators through Pydantic's `ValidationInfo.context`.
 - **This turns a prompt instruction into an enforced rule:** "the quote must be verbatim" now triggers a
-  reask.
+  reask. In an agent, pass the tool registry or the retrieved chunks so a planner cannot name a missing
+  tool and an answer cannot cite a chunk that was never retrieved.
 - **Make fields the source may omit `Optional`.** A required field forces the model to produce
   *something*, and that something is a plausible invention.
 
 ### Beyond a single object
 | Method | Returns | Use for |
 |---|---|---|
-| `create_partial` | A model whose fields fill in as tokens arrive | UIs rendering a form progressively |
+| `create_partial` | A model whose fields fill in as tokens arrive | UIs rendering a form or an agent's plan progressively |
 | `create_iterable` | A stream of objects | Every person mentioned in a document |
-| `create_with_completion` | Parsed object + raw provider response | Token usage and logging |
+| `create_with_completion` | Parsed object + raw provider response | Token usage and logging per agent step |
 
 ### What it is not
 - **Instructor does not constrain decoding.** The model can still emit anything; Instructor detects bad
@@ -121,8 +150,8 @@ p = 0.1, N = 3  ->  ~1.11 calls, 0.1% residual failures
   so invalid output is impossible, but that needs access to the logits, which hosted APIs do not expose.
 
 ## Diagram
-Follow one `create` call: the schema goes out with the prompt, and every validation failure loops back as
-a longer request until it passes or `max_retries` attempts are used up.
+Follow one structured agent step: the schema goes out with the transcript, and every validation failure
+loops back as a longer request until it passes or `max_retries` attempts are used up.
 
 ```mermaid
 flowchart TD
@@ -130,16 +159,66 @@ flowchart TD
     S --> C["LLM call: messages plus schema"]
     C --> P["Parse with model_validate_json"]
     P --> V{"Types and validators pass?"}
-    V -->|"yes"| O["Return validated instance"]
+    V -->|"yes"| O["Return validated instance to agent loop"]
     V -->|"no"| R{"Attempts left?"}
     R -->|"yes"| A["Append failed output and ValidationError text"]
     A -->|"longer prompt, full-price call"| C
-    R -->|"no"| E["Raise InstructorRetryException"]
+    R -->|"no"| E["Raise InstructorRetryException, escalate"]
 ```
 
 ## Examples
+### Agent scenario: a validated next-action step
+A planner that must either call a registered tool with the right arguments or finish. The registry is
+passed as validation context, so an invented tool name triggers a reask instead of a crash.
+
+```python
+from typing import Literal
+import instructor
+from openai import OpenAI
+from pydantic import BaseModel, Field, ValidationInfo, model_validator
+
+class NextAction(BaseModel):
+    reasoning: str = Field(description="One or two sentences: why this action now")   # first: reason, then act
+    action: Literal["call_tool", "finish"]
+    tool: str | None = Field(None, description="Tool name when action is call_tool")
+    args: dict = Field(default_factory=dict)
+    answer: str | None = Field(None, description="Final answer when action is finish")
+
+    @model_validator(mode="after")
+    def check_against_registry(self, info: ValidationInfo):
+        tools = (info.context or {}).get("tools", {})
+        if self.action == "call_tool" and self.tool not in tools:
+            raise ValueError(f"unknown tool {self.tool!r}; choose one of {sorted(tools)}")
+        if self.action == "finish" and not self.answer:
+            raise ValueError("action is finish but answer is empty; write the answer")
+        return self
+
+TOOLS = {"search_docs": lambda query: f"3 hits for {query}",
+         "get_ticket": lambda ticket_id: {"id": ticket_id, "status": "open"}}
+client = instructor.from_openai(OpenAI())
+messages = [{"role": "user", "content": "Is ticket 42 still open? Answer in one line."}]
+
+for step in range(8):                                    # hard step budget for the run
+    act = client.chat.completions.create(
+        model="gpt-4o-mini", response_model=NextAction, max_retries=2,
+        context={"tools": TOOLS}, messages=messages)
+    if act.action == "finish":
+        print(act.answer); break
+    result = TOOLS[act.tool](**act.args)                 # wrap in try/except in real code
+    messages += [{"role": "assistant", "content": act.model_dump_json()},
+                 {"role": "user", "content": f"Tool {act.tool} returned: {result}"}]
+```
+
+- **`reasoning` comes first** because field order is generation order; the decision is made after the
+  model has written why.
+- **Two checks in one validator:** the tool exists, and a finish carries an answer. Both are rules a JSON
+  schema cannot express on its own.
+- **Bad tool arguments still raise at call time.** Validate them too (for example a Pydantic model per
+  tool) or return the exception text to the model as the tool result.
+
 ### Meeting extraction with a cross-field rule
-Extracting a meeting from an email, with a business rule the schema alone cannot express.
+Extracting a meeting from an email, with a business rule the schema alone cannot express. An assistant
+agent would run this on an email a tool just fetched.
 
 ```python
 from datetime import date
@@ -182,7 +261,8 @@ print(raw.usage.total_tokens)            # recent versions sum usage across all 
   build cost reporting on it.
 
 ### Grounded quotes via validation context
-The validator rejects any quote not found verbatim in the source, which forces a reask.
+The validator rejects any quote not found verbatim in the source, which forces a reask. In a RAG agent the
+source is the retrieved chunks, so the final answer cannot cite text that was never retrieved.
 
 ```python
 from pydantic import BaseModel, ValidationInfo, field_validator
@@ -211,11 +291,11 @@ ev = client.chat.completions.create(       # client from the example above
 
 ### Worked scenario: what retries cost on a long contract
 Illustrative token counts for one 20k-token contract that fails validation on every attempt, with
-`max_retries=3`.
+`max_retries=3`. A long agent transcript behaves the same way.
 
 | Attempt | Input tokens sent | Why |
 |---|---|---|
-| 1 | ~20,000 | Prompt plus contract |
+| 1 | ~20,000 | Prompt plus contract (or the transcript so far) |
 | 2 | ~20,600 | Same, plus failed tool call (~500) and error text (~100) |
 | 3 | ~21,200 | Grows again by the second failure |
 | **Total** | **~61,800** | About 3× a single call, for an input that still fails |
@@ -223,20 +303,26 @@ Illustrative token counts for one 20k-token contract that fails validation on ev
 - **Under independence** (p = 0.1) the average would be ~1.11 calls, about 22k tokens per contract.
 - **In practice** the same hard contracts fail repeatedly, so a few inputs dominate spend; cap retries and
   escalate them.
+- **Per agent run** (illustrative): a run with 10 structured steps at ~1.11 expected calls each makes about
+  11 calls rather than 10, but one stubborn step at three attempts can cost more tokens than all the
+  others together once the transcript is long.
 
 ## Production patterns
-- **Cap retries with an explicit policy.** For long inputs pass a small integer or a Tenacity policy,
-  e.g. `max_retries=Retrying(stop=stop_after_attempt(2))` with both names imported from `tenacity`.
-  Monitor retries per request and cost per
-  successful extraction by route.
+- **Cap retries per agent step with an explicit policy.** For long inputs pass a small integer or a
+  Tenacity policy, e.g. `max_retries=Retrying(stop=stop_after_attempt(2))` with both names imported from
+  `tenacity`. Monitor retries per step type and cost per successful run, not just per call.
 - **Escalate instead of looping.** Catch `InstructorRetryException`, then send the input to a stronger
-  model or a human-review queue with the last completion attached. Monitor escalation rate and the
-  validators that triggered it.
-- **Log every attempt.** Use `create_with_completion` for usage, and Instructor's hooks (for example
-  `client.on("parse:error", handler)`) to record each failed attempt and its `ValidationError`. Reconcile monthly
-  against the provider invoice.
-- **Ground with context validators.** Pass the source via `context=` and check quotes, IDs or totals
-  against it in validators, so hallucinated values cause a reask. Monitor the rate of grounding failures.
+  model, ask the user a clarifying question, or queue it for human review with the last completion
+  attached. Monitor escalation rate and the validators that triggered it.
+- **Log every attempt into the agent trace.** Use `create_with_completion` for usage, and Instructor's
+  hooks (for example `client.on("parse:error", handler)`) to record each failed attempt and its
+  `ValidationError` as a span in your tracing tool. Reconcile monthly against the provider invoice.
+- **Ground with context validators.** Pass the source, the retrieved chunks or the tool registry via
+  `context=` and check quotes, IDs, totals or tool names against it, so hallucinated values cause a
+  reask. Monitor the rate of grounding failures per step.
+- **Type your eval judges.** Make LLM-as-judge steps return a model with a `Literal` verdict and a
+  reasoning field, so agent eval scores aggregate cleanly and a malformed judgement never silently
+  counts as a pass.
 - **Gate schema changes on an eval set.** Field names, docstrings and descriptions are prompt text; rerun a
   labelled set before merging a model change. Track first-pass validation rate, since a fall signals
   prompt or model drift.
@@ -245,21 +331,24 @@ Illustrative token counts for one 20k-token contract that fails validation on ev
 - **Less glue vs another dependency.** One `response_model` argument replaces schema, parsing and retry
   glue, but mode defaults and provider adapters change between releases; pin it and test upgrades.
 - **Arbitrary rules vs extra calls.** Validate-and-reask enforces any Python rule, at the cost of extra
-  full LLM calls. When failures are mostly syntactic, native strict structured output removes them for
-  free and the reask loop sits idle.
+  full LLM calls that add latency to every affected agent step. When failures are mostly syntactic,
+  native strict structured output removes them for free and the reask loop sits idle.
+- **Validated decisions vs model freedom.** Forcing one schema per call makes each agent decision
+  checkable, but removes the model's native choice among many tools; for an open-ended tool loop, native
+  tool calling is usually the better fit.
 - **No logit access needed vs no guarantee.** Hosted APIs work, but nothing guarantees validity. If you
   self-host and need validity on the first pass every time, constrained decoding (Outlines, vLLM guided
   decoding) wins.
 - **Rich schemas vs tokens.** Rich Pydantic schemas improve extraction quality, but deep nesting and long
-  descriptions add input tokens on every call; for high-volume classification, a flat model with a
-  `Literal` field is cheaper.
+  descriptions add input tokens on every call; for high-volume classification or routing, a flat model
+  with a `Literal` field is cheaper.
 
 ## Pitfalls
 - **High `max_retries` with no budget.** One pathological input triggers several full-price calls.
-  Symptom: a cost spike traced to a handful of requests with repeated identical errors. Fix: cap
-  attempts per route and escalate.
+  Symptom: a cost spike traced to a handful of requests or agent runs with repeated identical errors.
+  Fix: cap attempts per route and escalate.
 - **Vague validator messages like "invalid".** The model cannot act on them. Symptom: retries returning
-  the same wrong value each time. Fix: say what is wrong and how to fix it.
+  the same wrong value each time. Fix: say what is wrong and how to fix it, including the legal values.
 - **Cost reporting that misses failed attempts.** Per-call logs, or a provider adapter that does not
   accumulate usage across retries, make failed attempts vanish. Symptom: dashboards under-report against
   the provider invoice. Verify with a forced validation failure, or log each attempt through hooks.
@@ -270,15 +359,19 @@ Illustrative token counts for one 20k-token contract that fails validation on ev
   plausible but absent values (a made-up phone number, a guessed date) that pass validation.
 - **Treating a validated object as true.** Validation proves the shape and your rules, not that the facts
   are in the source. Symptom: confident, well-typed hallucinations in evals.
+- **An uncaught retry exception ending the agent run.** Symptom: whole runs crash on one hard step. Fix:
+  catch `InstructorRetryException` in the loop and choose a fallback action.
 
 ## When to use
 - **Use when:** you call hosted LLMs and need typed objects with rules beyond what a JSON schema can say,
-  especially across more than one provider.
+  especially across more than one provider: agent routers, planners, extractors and eval judges.
 - **Consider the SDK alone when:** your only need is valid JSON of a fixed shape from one provider; native
   structured output (for example OpenAI's `parse` helper) may be enough without another dependency.
+- **Prefer native tool calling when:** the model must choose freely among many tools in the main agent
+  loop.
 - **Avoid when:** you self-host and need hard guarantees or very low latency; prefer constrained decoding.
-- **Measure:** first-pass validation rate, retries per request, cost per successful extraction, and the
-  fix rate of each retry attempt. A falling first-pass rate is an early signal of prompt or model drift.
+- **Measure:** first-pass validation rate, retries per request, cost per successful extraction or run, and
+  the fix rate of each retry attempt. A falling first-pass rate is an early signal of prompt or model drift.
 - **Interviews:** explain why validation-plus-reask and constrained decoding solve different halves of
   the structured-output problem.
 
@@ -309,6 +402,14 @@ human-review path for records that still fail validation.
 - **It wraps rather than replaces the SDK,** so auth, HTTP, streaming and provider quirks stay with the
   client you already use.
 
+### Your agent's planner sometimes names a tool that does not exist and the run crashes. How do you fix it?
+- **Validate against the registry.** Make the planner return a Pydantic model and pass the tool registry
+  as `context=`; a validator raising "unknown tool, choose one of ..." turns the crash into a reask.
+- **Constrain where you can.** If the tool set is fixed, a `Literal` of tool names puts the legal values
+  in the schema itself, so strict mode or the model's training already helps.
+- **Handle the last failure.** Catch `InstructorRetryException`, then fall back to a clarifying question
+  or a stronger model, and log the step in the trace.
+
 ### Extraction retries are spiking cost on one route. How do you debug it?
 - **Find who pays.** Log every attempt with its usage and the `ValidationError` that triggered the reask,
   then group by input; a few hard documents usually dominate spend.
@@ -317,25 +418,27 @@ human-review path for records that still fail validation.
 - **Read the validator messages.** A vague "invalid" gives the model nothing to act on; rewrite it to say
   what is wrong and how to fix it.
 
-### When would you choose constrained decoding over Instructor?
+### When would you choose constrained decoding or native tool calling over Instructor?
 - **When you self-host and need validity on the first pass.** Constrained decoding (Outlines, engine
   guided decoding) masks invalid tokens, so no retry is ever needed.
 - **When latency is tight.** Every Instructor reask is another full LLM call, which multiplies tail
-  latency.
+  latency across agent steps.
+- **When the model must choose among many tools,** native tool calling fits the main agent loop better
+  than one forced schema per call.
 - **Instructor still wins on hosted APIs and business rules,** because it needs no logit access and can
   enforce any Python check, such as line items summing to the total.
 
-### How do you budget the token cost of retries on long inputs?
+### How do you budget the token cost of retries on long inputs or long agent transcripts?
 - **Retries re-send and grow the prompt.** For a 20k-token contract that fails every time with
   `max_retries=3`, illustrative input is ~20,000 + ~20,600 + ~21,200, about 61,800 tokens.
 - **Independence math is optimistic.** With p = 0.1 and three attempts the expected count is ~1.11 calls,
   but hard inputs fail repeatedly, so the real cost sits in a small tail.
-- **So** cap retries per route, catch `InstructorRetryException`, and route the input to a stronger model
+- **So** cap retries per step, catch `InstructorRetryException`, and route the input to a stronger model
   or human review instead of looping.
 
 ### How do you stop well-typed hallucinations in extracted fields?
-- **Ground validators in the source.** Pass the document as `context=` and reject any quote or ID not
-  found in it, which turns "must be verbatim" into a reask.
+- **Ground validators in the source.** Pass the document or retrieved chunks as `context=` and reject any
+  quote or ID not found in it, which turns "must be verbatim" into a reask.
 - **Make omittable fields `Optional`.** A required field forces the model to invent a plausible value.
 - **Order fields for reasoning.** Put reasoning before the answer, because field order is generation order.
 

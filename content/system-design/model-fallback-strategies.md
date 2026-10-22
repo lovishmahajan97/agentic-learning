@@ -5,7 +5,8 @@ name: Model fallback strategies
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - serving-inference/fallbacks
   - serving-inference/retry-strategies
@@ -21,16 +22,29 @@ sources:
 ---
 
 ## TL;DR
-A fallback strategy decides in advance what to call instead, in what order and on which errors, so a
-provider's bad hour is not your outage. The substitute behaves differently, retries can amplify incidents,
-and an untested fallback is a second failure.
+A fallback strategy decides in advance which model an agent step calls instead, in what order and on which
+errors, so a provider's bad hour is not your outage. Substitutes behave differently, retries amplify
+incidents, and mid-run failover can replay tool side effects.
+
+## For agent builders
+- **Why it matters for agents.** A long agent run makes dozens of calls, so it is far more likely than a
+  single chat turn to meet a 429, a 5xx or a timeout mid-task. Failing over must resume from the last
+  completed step, never replay a tool that already sent an email or wrote a record.
+- **Where it shows up in your stack.** `fallbacks` in LiteLLM's router or a Portkey fallback config,
+  `with_fallbacks` on a LangChain runnable, per-node retry policies and checkpointers in LangGraph, and
+  idempotency keys on your own tools.
+- **What you control.** The error-to-action map, the ladder order, one deadline per step and per run,
+  circuit breakers, checkpointing after each step, idempotency keys, and validating the fallback model's
+  tool calls against the same schemas.
+- **What you can skip.** Writing your own breaker if your gateway's cooldowns cover it. You cannot skip
+  equivalence testing of the fallback model on your tools and prompts.
 
 ## Why it exists
 - **Model endpoints fail in several distinct ways:** outages and hard errors (5xx, connection resets),
   throttling (429, sometimes with a `Retry-After`), latency spikes that blow the deadline when the provider
   is overloaded, capability changes (a deprecated or retired model id, behaviour shifted by a silent
   update), and regional capacity limits or exhausted quota while another region has capacity. Each reaches
-  the user as an error or a spinner that never resolves.
+  the user as an error or a spinner that never resolves; in an agent, as a run that dies halfway.
 - **The arithmetic needs a second path.** If your availability target is higher than the provider's, two
   paths that each succeed 99.5% of the time give 1 − 0.005² = 99.9975% *if their failures are
   independent*.
@@ -61,11 +75,12 @@ Every error maps to one action; the mapping is the heart of the design.
   capacity errors.
 - **Neither** for 400 invalid request, 401, content-policy refusals and context-too-long. These recur
   identically on every target, so failing over multiplies latency and cost. They say nothing about the
-  target's health, so they must not count towards its circuit breaker.
-- **Escalate on invalid output.** A response that fails schema validation after one repair attempt is a
-  legitimate reason to try the next rung, usually a stronger model. This is the cascade idea applied to
-  reliability. Count it separately from error-triggered fallback, because it signals a prompt or
-  model-fit problem rather than an outage.
+  target's health, so they must not count towards its circuit breaker. For an agent, context-too-long is a
+  cue to compact the transcript, not to switch model.
+- **Escalate on invalid output.** A response that fails schema validation (including an invalid tool call)
+  after one repair attempt is a legitimate reason to try the next rung, usually a stronger model. This is
+  the cascade idea applied to reliability. Count it separately from error-triggered fallback, because it
+  signals a prompt or model-fit problem rather than an outage.
 
 ### The ladder, ordered by behavioural distance
 1. **Same model, another deployment or region:** identical behaviour, different capacity.
@@ -73,7 +88,8 @@ Every error maps to one action; the mapping is the heart of the design.
    possibly different limits and features.
 3. **Same family, adjacent version:** small drift in style and formatting.
 4. **Comparable model from another vendor:** prompts, tool-call formats, structured output and tokeniser
-   limits must all be re-validated.
+   limits must all be re-validated, and the agent's transcript (earlier tool calls and results) must
+   translate into the new vendor's message format.
 5. **A smaller model:** a quality drop, but still the same function.
 6. **Hand off to graceful degradation:** cache, non-AI path, honest unavailability.
 
@@ -84,6 +100,8 @@ users cannot tell from normal.
 - **Each attempt has its own timeout,** and all attempts fit inside one user-facing deadline.
 - **Without that,** a 10 s primary timeout plus a 10 s fallback is a 20 s worst case nobody signed off.
 - **Pass the remaining budget down the ladder** and skip rungs that cannot complete in time.
+- **Agents need two budgets:** one per step and one for the whole run, so a slow ladder on step 3 cannot
+  starve the remaining steps.
 
 ### Circuit breakers
 1. **Closed:** per target, count failures in a window.
@@ -92,18 +110,19 @@ users cannot tell from normal.
 
 Without a breaker, every request during an outage waits the full primary timeout *before* falling back.
 Latency equals timeout plus fallback for the whole incident, and the failing provider keeps receiving
-your traffic.
+your traffic. An agent pays that penalty on every remaining step.
 
 ### Hedging for latency
 - **What:** Dean and Barroso's hedged request sends the same call to a second target after the p95 delay
   and takes whichever answers first.
 - **Cost:** it trims the tail for roughly 5% extra calls.
-- **Only for idempotent calls,** and never once a stream has been committed to the user.
+- **Only for idempotent calls,** and never once a stream has been committed to the user. An agent's model
+  call is idempotent; the tool it triggers usually is not.
 - **Switch it off when the breaker shows the primary is overloaded,** or it doubles the load that caused
   the problem.
 
 ### Equivalence is a test, not an assumption
-- **Validate outputs against a schema** regardless of which model served them.
+- **Validate outputs against a schema** regardless of which model served them, including every tool call.
 - **Keep per-model prompt variants** when formats differ.
 - **Send a small continuous slice (around 1%) through each fallback** so it is exercised in daily traffic.
 - **Run game days** where the primary is blocked on purpose.
@@ -124,16 +143,16 @@ your traffic.
 - **Both belong in the runbook** before the first outage.
 
 ## Diagram
-One request walking the ladder: the breaker and the remaining deadline decide whether a rung is tried, the
-error class decides between failing over and stopping, and the bottom of the ladder hands off to
+One agent step walking the ladder: the breaker and the remaining deadline decide whether a rung is tried,
+the error class decides between failing over and stopping, and the bottom of the ladder hands off to
 degradation.
 
 ```mermaid
 flowchart TD
-    R["Request with one user-facing deadline"] --> N{"Next rung: budget left and breaker allows?"}
+    R["Agent step with step and run deadlines"] --> N{"Next rung: budget left and breaker allows?"}
     N -->|"no, skip rung"| MORE{"More rungs?"}
     N -->|"yes"| C["Call target, timeout = min of rung timeout and remaining"]
-    C -->|"success"| OK["Return, tagged with served_by and fallback_depth"]
+    C -->|"success"| OK["Checkpoint, tag served_by and fallback_depth"]
     C -->|"400, 401, policy refusal, context too long"| STOP["Raise: same error on every rung, breaker not tripped"]
     C -->|"408, 429, 5xx, timeout"| F["Record failure on this breaker, jitter"]
     F --> MORE
@@ -142,6 +161,55 @@ flowchart TD
 ```
 
 ## Examples
+### Resuming an agent run on a fallback without replaying tools
+Each step is checkpointed after it completes; tools take an idempotency key derived from the run, step and
+arguments, so a failover that re-runs a step returns the stored result instead of acting twice.
+`complete` is the ladder below; `store` is any durable key-value store.
+
+```python
+import hashlib, json
+
+def idem_key(run_id, step, tool, args):
+    raw = json.dumps([run_id, step, tool, args], sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+async def run_tool_once(store, key, tool_fn, args):
+    if (prior := await store.get(f"tool:{key}")) is not None:
+        return prior                                   # already executed: never send the email twice
+    result = await tool_fn(**args, idempotency_key=key)  # pass the key to APIs that accept one
+    await store.set(f"tool:{key}", result)
+    return result
+
+async def run_agent(store, run_id, tools, tool_schemas, max_steps=20):
+    state = await store.get(f"ckpt:{run_id}") or {"step": 0, "messages": []}   # resume point
+    while state["step"] < max_steps:
+        resp = await complete(state["messages"], tools=tool_schemas, deadline=10.0)  # walks the ladder
+        msg = resp["message"]
+        state["messages"].append(msg)
+        if not msg.get("tool_calls"):
+            return msg["content"]
+        for tc in msg["tool_calls"]:
+            args = json.loads(tc["function"]["arguments"])   # validate against the schema here too
+            key = idem_key(run_id, state["step"], tc["function"]["name"], args)
+            out = await run_tool_once(store, key, tools[tc["function"]["name"]], args)
+            state["messages"].append({"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(out)})
+        state["step"] += 1
+        await store.set(f"ckpt:{run_id}", state)            # checkpoint after the step, not before
+    raise RuntimeError("step cap reached")
+```
+
+- **LangGraph users get the checkpoint half from a checkpointer** keyed by thread id; the idempotency half
+  is still yours, inside each tool.
+
+### Worked scenario: primary dies at step 7 of a 12-step agent run
+Illustrative: each step costs ~$0.05 and ~4 s; steps 3 and 6 send customer emails.
+
+| Recovery design | What happens after the failure | Cost and effect |
+|---|---|---|
+| Restart the run on the fallback | Steps 1-7 run again | ~$0.35 and ~28 s wasted; both emails sent twice |
+| Retry the step on the dead primary | Waits out timeouts until the run deadline | Run fails, user sees an error |
+| Checkpoint per step plus idempotency keys | Step 7 re-runs on the fallback rung | One extra call (~$0.05, ~4 s); no duplicate emails |
+
 ### Fallback ladder with breakers and a shared deadline
 Per-target circuit breakers (closed, open, half-open with a single probe), error classification and one
 deadline. `call_model`, `ModelError` (with an HTTP `status`) and `ServiceDegraded` are the adapter types
@@ -262,15 +330,22 @@ code (5 failures, 60 s cooldown).
 | Signal | Error rate looks flat | `fallback_depth` > 0 alert fires as soon as traffic shifts to the next rung |
 
 ## Production patterns
-- **Declare the ladder in the gateway.** When several services share providers, put fallbacks in gateway
-  config rather than app code: LiteLLM's `router_settings` takes `fallbacks`, and it also has separate
-  fallback lists for context-window and content-policy errors. Monitor fallback rate per rung and success
-  rate after fallback.
+- **Declare the ladder in the gateway.** When several agents and services share providers, put fallbacks
+  in gateway config rather than app code: LiteLLM's `router_settings` takes `fallbacks`, and it also has
+  separate fallback lists for context-window and content-policy errors. Monitor fallback rate per rung and
+  success rate after fallback.
+- **Checkpoint every agent step.** Persist state after each completed step (a LangGraph checkpointer, or
+  your own store keyed by run id) so a failover or crash resumes at the failed step. Monitor resumed runs,
+  steps re-executed per resume and run success after fallback.
+- **Idempotency keys on side-effecting tools.** Generate one key per logical action, store it with the
+  result, and make the tool return the stored result on a repeat. Monitor duplicate-key hits during
+  incidents; a spike shows the ladder replaying actions.
 - **Keep a live slice on every rung.** Route around 1% of normal traffic to each fallback continuously
-  with a weighted deployment or a hash of the request id. Monitor schema pass rate and judged quality per
-  serving target, so a broken fallback shows up on a quiet Tuesday, not during an outage.
+  with a weighted deployment or a hash of the request id. Monitor schema pass rate, tool-call validity and
+  judged quality per serving target, so a broken fallback shows up on a quiet Tuesday, not during an
+  outage.
 - **Game-day the primary.** In staging, then production off-peak, block the primary on purpose (an egress
-  rule or an alias pointed at an unreachable endpoint) and watch the ladder take over. Monitor
+  rule or an alias pointed at an unreachable endpoint) and watch the ladder take over mid-run. Monitor
   time-to-detect, latency by rung, error rate and on-call actions taken.
 - **Pre-provision and watch secondary headroom.** Size secondary quota for 100% failover before launch and
   load-test it. Read the provider's rate-limit response headers (OpenAI's `x-ratelimit-remaining-requests`,
@@ -278,9 +353,6 @@ code (5 failures, 60 s cooldown).
 - **Propagate the deadline.** Pass the absolute deadline from the edge to every service (a request header
   or context value), and compute each rung's timeout as `min(rung_timeout, remaining)`. Monitor rungs
   skipped for lack of budget and end-to-end p99 against the deadline.
-- **Idempotency keys on side-effecting tools.** Generate one key per logical action, store it with the
-  result, and make the tool return the stored result on a repeat. Monitor duplicate-key hits during
-  incidents; a spike shows the ladder replaying actions.
 
 ## Trade-offs
 - **Availability vs output consistency.** Consistency falls as the ladder descends to other vendors. For
@@ -294,12 +366,17 @@ code (5 failures, 60 s cooldown).
   flips from asset to liability when that vendor is not on the approved list for the data class involved.
 - **Idle quota cost vs failover that works.** Pre-provisioned secondary quota costs money while idle, but
   without it the fallback fails with 429s at the exact moment it is needed.
+- **Mid-run model switch vs coherence.** Switching vendor mid-run keeps the agent alive, but the new model
+  reads another model's plan and tool history; for short runs, restarting cleanly on one model can be more
+  reliable, provided tools are idempotent.
 
 ## Pitfalls
 - **A fallback never exercised in normal traffic.** Symptom: the first real outage reveals expired
   credentials, a wrong model id or a schema mismatch on the secondary.
 - **Retrying or failing over after a side effect.** Symptom: duplicate emails, tickets or payments during
   provider incidents.
+- **Restarting agent runs from step 0 on failover.** Symptom: cost and latency spikes during incidents and
+  repeated tool actions. Fix: checkpoint per step and resume.
 - **No circuit breaker.** Symptom: every request during an outage takes primary timeout plus fallback
   time, and the failing provider is hammered by your retries.
 - **Silent fallback with no metric.** Symptom: discovering the primary has been down for days from the
@@ -307,10 +384,11 @@ code (5 failures, 60 s cooldown).
 - **Failing over on non-retryable errors.** Symptom: a single bad request produces identical 400s from
   three providers with triple the latency and cost.
 - **Ignoring context-window and limit differences.** Symptom: context-length errors appear only on long
-  requests and only when the fallback is active.
+  requests (long agent transcripts) and only when the fallback is active.
 
 ## When to use
-- **Always:** every production call should have at least the first two rungs and a documented ladder.
+- **Always:** every production call should have at least the first two rungs and a documented ladder;
+  every agent with side-effecting tools also needs checkpoints and idempotency keys.
 - **Depth depends on** the SLO, the audit constraints on outputs and the cost you can absorb during an
   incident.
 - **Decide per use case:** the error classification, the deadline and the breaker thresholds; provision
@@ -360,6 +438,13 @@ alert on fallback share so someone is watching during the outage, not the mornin
 - **One deadline:** each attempt's timeout fits inside the user-facing budget, passed down the ladder.
 - **Protect side effects:** idempotency keys on tool calls and checkpointed agent state, so a failover resumes
   after the email instead of sending it twice.
+
+### Your agent fails over to another vendor at step 7 of 12. What can break, and how do you guard it?
+- **Transcript translation:** earlier tool calls and results must map into the new vendor's message format,
+  and the new model must parse another model's plan; test this on recorded runs.
+- **Tool-call fidelity and limits:** validate every tool call against its schema and check the fallback's
+  context window fits the transcript so far.
+- **Side effects:** resume from the step-6 checkpoint with idempotency keys so steps 3 and 6 are not replayed.
 
 ### When is hedging a bad idea?
 - **When the primary is overloaded,** because a hedge doubles load exactly when the provider is struggling;

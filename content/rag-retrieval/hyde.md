@@ -5,7 +5,8 @@ name: HyDE (Hypothetical Document Embeddings)
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - rag-retrieval/query-rewriting
   - rag-retrieval/dense-vs-sparse-retrieval
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-HyDE has an LLM write a plausible answer passage, embeds that instead of (or with) the question, and
-retrieves the real passages nearest to it. Answer-shaped text lands near real answers even with wrong
-facts; it costs one generation per query.
+HyDE embeds an LLM-written hypothetical answer instead of (or with) the question, so retrieval lands near
+real answers even with wrong facts. For an agent it is a search-tool option: a fallback generation, or a
+draft the agent writes into the tool call.
+
+## For agent builders
+- **Why it matters for agents.** When an agent's searches over a generic embedder keep returning FAQ-style
+  near misses, HyDE can lift recall without labels. Every generation it adds is paid on each search call,
+  and agents search several times per task.
+- **Where it shows up in your stack.** LangChain's `HypotheticalDocumentEmbedder`, LlamaIndex's HyDE query
+  transform, or a few lines inside your own search tool; the embedder's query and passage modes; the
+  reranker.
+- **What you control.** Whether HyDE runs always, as a fallback on weak first-pass scores, or from a draft
+  the agent writes as a tool argument; the number of samples; and keeping the hypothetical out of evidence.
+- **What you can skip.** The unsupervised-encoder details of the paper. Know when the query-passage gap is
+  already closed by your embedder, and measure.
 
 ## Why it exists
 - **Queries and passages are different shapes.** "how do I rotate an API key?" is short, interrogative,
@@ -83,9 +96,21 @@ facts; it costs one generation per query.
 - **The honest position is model- and corpus-dependent:** measure recall@k on your golden set with and
   without it.
 
+### Three places HyDE can live in an agent
+| Placement | Extra model calls per search | Risk |
+|---|---|---|
+| Inside the tool, every search | one generation (n if sampled) | latency on every agent step |
+| Inside the tool, fallback on weak first-pass scores | one generation, only on the fallback slice | a threshold to tune on the golden set |
+| Agent writes a `draft_passage` argument in its tool call | none; it is extra output tokens in the same call | the draft sits in the transcript, where the agent may later treat it as fact |
+
+- **The firewall rule still holds.** Whoever writes the hypothetical, only real passages come back as
+  the tool result, and the final answer must cite them.
+- **An agent's draft is one sample.** It cannot be averaged over several samples without extra calls, so
+  always average in the query embedding.
+
 ## Diagram
-Note where the hypothetical stops: it shapes the search vector, but only real passages reach the
-reranker and the generator, both of which see the original question.
+Note where the hypothetical stops inside the search tool: it shapes the search vector, but only real
+passages reach the reranker and the agent's tool result, and both see the original question.
 
 ```mermaid
 flowchart TD
@@ -97,7 +122,7 @@ flowchart TD
     AV --> S["Nearest-neighbour search"]
     I[("Corpus index, same encoder")] --> S
     S -->|"real passages"| RR["Rerank against the original question"]
-    RR --> A["Generator answers from real passages only"]
+    RR --> A["Tool result to agent: real passages only"]
     G -.->|"logged, never sent to the generator"| L[("Debug log")]
 ```
 
@@ -170,10 +195,52 @@ Illustrative A/B on a golden set for an internal wiki; the shape of the decision
 | Instruction-prefixed encoder, plain query | test first | none | if it matches HyDE, skip HyDE |
 | Instruction-prefixed encoder + HyDE | often flat | one generation | usually not worth it |
 
+### Agent scenario: a search tool that takes an optional draft and falls back to HyDE
+The agent may pass `draft_passage`; if it does not and the first pass is weak, the tool generates one.
+`embed`, `index.search`, `rerank_scored` and `llm` are stubs; `min_score` is tuned on the golden set.
+
+```python
+import numpy as np
+
+SEARCH_TOOL = {
+    "name": "search_wiki",
+    "description": ("Search the internal wiki. Optionally pass draft_passage: two or three sentences "
+                    "written the way a wiki page would answer. It is only used to find pages; it is "
+                    "never evidence, so cite only the passages this tool returns."),
+    "input_schema": {"type": "object",
+                     "properties": {"query": {"type": "string"},
+                                    "draft_passage": {"type": "string"}},
+                     "required": ["query"]},
+}
+
+def search_wiki(query, draft_passage=None, k=10, n=5, min_score=0.0):
+    def search(vec):
+        return rerank_scored(query, index.search(vec, k))       # rerank against the query, always
+    q_vec = embed(query, kind="query")
+    if not draft_passage:
+        first = search(q_vec)
+        if first and first[0][0] >= min_score:
+            return {"status": "ok", "passages": [c for _, c in first[:n]], "hyde": "off"}
+        draft_passage = llm(f"Write a short wiki passage that answers: {query}", max_tokens=150)
+    v = np.mean([embed(draft_passage[:2000], kind="passage"), q_vec], axis=0)   # same encoder as index
+    hits = search(v / np.linalg.norm(v))
+    return {"status": "ok" if hits else "no_evidence",         # the draft is never returned
+            "passages": [c for _, c in hits[:n]], "hyde": "on"}
+```
+
+Illustrative cost for an agent that searches 3 times per task (substitute your measured rates):
+
+| HyDE placement | Extra sequential generations per task | Added transcript tokens |
+|---|---|---|
+| Every search | 3 | none (generation stays in the tool) |
+| Fallback, 20% of searches weak | 0.6 on average | none |
+| Agent-written draft | 0 | ~100 output tokens per call, kept in the transcript |
+
 ## Production patterns
-- **HyDE as a fallback, not the default path.** Run plain retrieval first; only when the top score or
-  reranker score is below a cut-off tuned on your golden set, generate the hypothetical and search again.
-  Monitor the fallback rate and recall@k on the fallback slice.
+- **HyDE as a fallback, not the default path.** Run plain retrieval first inside the search tool; only
+  when the top score or reranker score is below a cut-off tuned on your golden set, generate the
+  hypothetical and search again. Monitor the fallback rate and recall@k on the fallback slice, and the
+  tool's p95 latency, since it adds to every agent step.
 - **Short, capped hypotheticals.** Ask for a short passage and cap generation with the provider's max
   output tokens setting, keeping it under the encoder's input limit so nothing is silently truncated.
   Monitor generation latency at p95, which dominates HyDE's cost.
@@ -183,8 +250,9 @@ Illustrative A/B on a golden set for an internal wiki; the shape of the decision
 - **Keep the original query in every leg.** Average the query embedding into the dense vector and send the
   original text (not the hypothetical) to BM25 and to the reranker. Monitor identifier-heavy queries as a
   separate slice, where dropping the query regresses first.
-- **Firewall the hypothetical.** Log it for debugging but strip it before the generation prompt; add an
-  eval check that flags answer facts found in the hypothetical but in no retrieved passage.
+- **Firewall the hypothetical.** Log it on the tool span for debugging but never return it in the tool
+  result or put it in the generation prompt; add an eval check that flags answer facts found in the
+  hypothetical (or the agent's `draft_passage`) but in no retrieved passage.
 
 ## Trade-offs
 - **Big gains on mismatched encoders vs none on matched ones.** Largest with zero-shot or out-of-domain
@@ -198,6 +266,9 @@ Illustrative A/B on a golden set for an internal wiki; the shape of the decision
   passage, and retrieval becomes generic with it.
 - **Stability vs cost of samples.** Several samples stabilise the aggregated vector at linear cost; one is
   cheaper and noisier, and the right number depends on how much the hypotheticals disagree.
+- **Agent-written draft vs tool-side generation.** A draft in the tool call costs no extra round trip,
+  but it is a single sample in the transcript that the agent may later quote; tool-side generation stays
+  hidden and can be sampled, at one more sequential call per search.
 
 ## Pitfalls
 - **Feeding the hypothetical into the answer prompt.** The symptom is fluent answers containing facts that
@@ -213,6 +284,9 @@ Illustrative A/B on a golden set for an internal wiki; the shape of the decision
   "48 hours" passage from an old version) over the true answer.
 - **Exceeding the encoder's input limit.** The symptom is silent truncation and a vector that represents
   only the opening sentences.
+- **The agent cites its own draft.** The symptom is an answer whose "fact" appears only in the
+  `draft_passage` argument of an earlier tool call. Say in the tool description that drafts are never
+  evidence, and run the cite-only-returned-passages check in the agent eval.
 
 ## When to use
 - **Use when** queries are question-shaped, the corpus is passage-shaped, and the embedder was not trained
@@ -273,12 +347,22 @@ prompt, invented details get cited. Keep it as a search key only.
 - **At high query volume over a stable corpus,** index-time question generation pays the generation cost
   once per chunk instead of once per query.
 
-### How do you keep HyDE's latency acceptable in production?
-- **Use it as a fallback:** run plain retrieval first and only generate when first-pass scores fall below a
-  cut-off tuned on the golden set.
+### Your agent searches three times per task and HyDE made every task slower. How do you keep its latency acceptable?
+- **Use it as a fallback:** run plain retrieval first inside the tool and only generate when first-pass
+  scores fall below a cut-off tuned on the golden set, so most searches pay nothing.
+- **Or let the agent write the draft:** a `draft_passage` tool argument removes the extra round trip, as
+  long as the tool never returns it and the answer cites only returned passages.
 - **Keep hypotheticals short** with a capped output length, and generate the n samples concurrently,
   because one decoded passage (several hundred milliseconds to a few seconds) precedes the search.
 - **Monitor** the fallback rate, p95 generation latency and recall@k on the fallback slice.
+
+### An agent's answer contains a number that appears in no retrieved passage. HyDE is in the search tool. Where do you look?
+- **The tool result:** confirm the hypothetical or the agent's draft is never returned as a passage; the
+  trace's tool span shows exactly what the agent received.
+- **The transcript:** if the agent wrote a `draft_passage`, its own invented number is in context and can
+  be quoted later; the tool description must say drafts are never evidence.
+- **The eval:** add a check that every answer fact appears in a returned passage, and flag facts found
+  only in drafts or hypotheticals.
 
 ### How does HyDE relate to Query2doc and doc2query?
 - **Query2doc** concatenates the original query with the generated pseudo-document, and helps sparse BM25

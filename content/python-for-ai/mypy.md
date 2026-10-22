@@ -5,7 +5,8 @@ name: mypy
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/type-hints
   - python-for-ai/protocols-generics-structural-typing
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-mypy is a static type checker: it reads your hints, infers the rest, and reports code that would pass the
-wrong type, read a missing key or call a method on `None`, without running anything. It is gradual, so
-unannotated code stays mostly unchecked.
+Agent code passes loosely shaped data everywhere: replies whose content may be `None`, tool arguments,
+step results. mypy reads your hints, infers the rest, and reports wrong types, missing keys and
+unhandled cases without running anything. Unannotated code stays mostly unchecked.
+
+## For agent builders
+- **Why it matters for agents.** The crashes that end agent runs are rarely logic errors; they are a
+  `.strip()` on a reply with no text, a misspelled tool-argument key, or a new step type the loop never
+  handles. mypy finds all three across every path, including the rare ones no test reaches.
+- **Where it shows up in your stack.** Provider SDK response types (most ship `py.typed`), `TypedDict` and
+  Pydantic models for tool arguments, a `Protocol` for the model client so fakes type-check, and a union of
+  step types the agent loop must handle exhaustively.
+- **What you control.** Strictness per module, how precisely you type the boundaries where model output
+  enters, and whether `Any` from `json.loads` leaks into the loop.
+- **What you can skip.** Typing theory beyond variance and narrowing; runtime validation of model output
+  is Pydantic's job, not mypy's.
 
 ## Why it exists
 - **Python ignores hints at runtime.** `def call_model(prompt: str) -> str` happily accepts a list and
@@ -123,6 +136,15 @@ ignore_missing_imports = true
 
 - **Pick one checker as the CI gate.**
 
+### Where types pay off in an agent
+| Agent boundary | Type it as | What mypy then catches |
+|---|---|---|
+| Model reply content | `str \| None`, narrowed before use | `.strip()` on a tool-call reply with no text |
+| Tool arguments after parsing | `TypedDict` or a Pydantic model, not `dict[str, Any]` | misspelled argument keys |
+| Step results of the loop | a union of dataclasses (tool call, final, refusal) | a new step type left unhandled |
+| Model client | a `Protocol` with the methods the loop uses | a test fake whose methods do not match |
+| `json.loads` output | parse straight into a model | `Any` silently disabling checks downstream |
+
 ## Diagram
 What mypy consumes and where checking silently stops: annotated code is checked end to end, while `Any`
 and unannotated bodies bypass the checks unless strict flags close them.
@@ -144,6 +166,61 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: an exhaustive step handler
+The loop turns each model reply into one of three step types. Check with `mypy --strict agent_step.py`;
+messages are abridged and were produced with a recent mypy.
+
+```python
+from dataclasses import dataclass
+from typing import assert_never
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: str          # a JSON string, as providers send it
+
+@dataclass
+class Final:
+    text: str | None        # a reply can arrive with no text content
+
+@dataclass
+class Refusal:
+    reason: str
+
+Step = ToolCall | Final | Refusal
+
+def run_tool(name: str, arguments: str) -> str:
+    return "ok"
+
+def handle(step: Step) -> str:
+    match step:
+        case ToolCall(name=name, arguments=args):
+            return run_tool(name, args)
+        case Final(text=text):
+            return text.strip()
+            # error: Item "None" of "str | None" has no attribute "strip"  [union-attr]
+        case Refusal():
+            return "refused"
+        case _:
+            assert_never(step)
+
+def handle_v2(step: Step) -> str:          # written before Refusal existed
+    match step:
+        case ToolCall():
+            return run_tool(step.name, step.arguments)
+        case Final():
+            return step.text or ""
+        case _:
+            assert_never(step)
+            # error: Argument 1 to "assert_never" has incompatible type "Refusal"; expected "Never"  [arg-type]
+```
+
+- **Two agent incidents prevented:** the `None` reply that would crash the final step, and the new
+  `Refusal` step type that an older handler silently mishandled.
+- **Add a step type, get a to-do list:** every `assert_never` that now fails is a place in the loop,
+  tracing or UI that must learn the new case.
+
 ### Bugs a test suite misses, and one mypy misses
 Each reported by mypy with its error code. The comments show mypy's messages (paths and line numbers
 omitted).
@@ -259,6 +336,10 @@ Illustrative counts for a 60-module service; the shape of the ratchet is what ma
 - **Measure `Any` leakage.** Run `mypy --any-exprs-report <dir>` periodically; it writes a per-module
   table of how many expressions are `Any` and why (unannotated, unimported, explicit). Model the worst
   boundaries with `TypedDict` or Pydantic.
+- **Typed agent boundaries.** Parse every tool call's arguments straight into a Pydantic model or
+  `TypedDict`, type reply content as optional, and model loop steps as a union handled with
+  `assert_never`. Run `--any-exprs-report` on the agent package first, because that is where `Any` from
+  `json.loads` concentrates. Monitor production `AttributeError` and `KeyError` in the loop.
 - **pre-commit needs its dependencies.** The `mirrors-mypy` hook runs in its own isolated environment, so
   list typed libraries and stub packages under `additional_dependencies`. Otherwise imports silently
   become `Any` and pre-commit passes code that CI rejects.
@@ -320,12 +401,13 @@ A third possibility is that runtime data violates the declared types, such as a 
 documents as present arriving as null, which only runtime validation catches.
 
 ## Interview questions
-### What does "gradual typing" mean in mypy, and why is Any called contagious?
+### Your agent reads tool arguments from json.loads. What is gradual typing, and why is that Any contagious?
 - **Gradual:** unannotated functions are not checked by default and `Any` is compatible with everything in
   both directions, so a large codebase can adopt mypy module by module.
 - **Contagious:** any value derived from an `Any` (an attribute, an index, a call result) is also `Any`, so
-  one `dict[str, Any]` response switches off checking for everything downstream.
-- **Close the gap** with `--strict`, boundary models (`TypedDict`, Pydantic) and `--any-exprs-report`.
+  one `dict[str, Any]` of tool arguments switches off checking for everything the tool does with it.
+- **Close the gap** with `--strict`, boundary models (`TypedDict`, Pydantic) that parse the arguments, and
+  `--any-exprs-report`.
 
 ### Why is list[int] rejected where list[float] is expected, and how do you fix the signature?
 - **Mutable containers are invariant** for soundness: a function taking `list[float]` could append `0.5`
@@ -333,6 +415,14 @@ documents as present arriving as null, which only runtime validation catches.
 - **State the real requirement:** if the function only reads, accept `Sequence[float]` (or
   `Mapping[str, float]`), which is covariant.
 - **Do not paper over it** with `cast` or `# type: ignore[arg-type]`; mypy's own note suggests `Sequence`.
+
+### How would you use types to make an agent loop safe to extend with new step types?
+- **Model steps as a union** of small dataclasses (tool call, final answer, refusal) instead of a dict
+  with a `type` key.
+- **Handle them with `match` and `assert_never`** in the final branch, so adding a step type makes mypy
+  report every handler that does not cover it.
+- **Type reply content as `str | None`** so the checker forces a branch for replies with no text, the
+  case that otherwise crashes the last step.
 
 ### mypy passes locally but CI reports dozens of missing-stubs errors. What happened?
 - **mypy reads types from the installed environment**, so a CI image without the project's dependencies

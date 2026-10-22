@@ -5,7 +5,8 @@ name: Data curation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/data-labeling
   - training-adaptation/synthetic-data-generation
@@ -23,9 +24,22 @@ sources:
 ---
 
 ## TL;DR
-Data curation is selecting, cleaning, deduplicating, decontaminating and mixing training data. Models learn
-whatever is in the batch, so a few thousand curated fine-tuning examples beat a hundred thousand scraped
-ones, and filtering beats extra pretraining tokens.
+For agent builders, curation means turning raw agent logs into training and eval sets: filter by outcome,
+deduplicate, decontaminate, scrub PII and balance. Models learn whatever is in the batch, so a few
+thousand curated trajectories beat a hundred thousand scraped ones.
+
+## For agent builders
+- **Why it matters for agents.** Agent logs are full of loops, failed tool calls, retries, macros and
+  tool results with customer data. Fine-tune on them raw and the agent learns to loop and leak; build
+  evals from them raw and your eval set overlaps your training set.
+- **Where it shows up in your stack.** Trace stores and observability exports (the source), JSONL
+  pipelines with `datasketch` or `datatrove` for dedup, the eval suite you decontaminate against, and
+  the RAG index, where near-duplicate chunks waste retrieval slots.
+- **What you control.** The outcome filter (task passed, user rated, resolved), trajectory hygiene rules
+  (no unrecovered tool errors, no loops), dedup thresholds, PII scrubbing of tool results, the
+  task-type and tool mix, and dataset versioning.
+- **What you can skip.** Web-scale pretraining filters and annealing schedules unless you pretrain. Know
+  MinHash and LSH, dedup before split, decontamination, and LIMA's lesson.
 
 ## Why it exists
 - **A model is a compressed copy of its training distribution.** Gradient descent learns boilerplate,
@@ -149,13 +163,31 @@ With *r* = 8, *b* = 16: about 0.95 at *J* = 0.8 and 0.06 at *J* = 0.5, threshold
 - **Version** the dataset, pin it to the model it produced, and feed eval error analysis into the next
   version.
 
+### Agent trajectories: the extra rules
+Agent logs need checks that chat data does not:
+- **Outcome first.** Keep trajectories whose task verifiably passed (tests green, ticket resolved, user
+  confirmed); a polished-looking run that failed teaches failure.
+- **Trajectory hygiene.** Drop runs with unrecovered tool errors, repeated identical tool calls (loops),
+  or step counts far above the task's norm, because the model imitates the path, not just the ending.
+- **Schema validity.** Every tool call must parse and match the current tool schemas; runs using removed
+  tools or old argument names teach stale APIs.
+- **Scrub tool results.** Tool outputs carry customer records and secrets, so PII and credential scrubbing
+  must cover them, not only user turns.
+- **Dedup by task, split by task.** Near-duplicate user requests make train and eval overlap; split by
+  user, tenant or task cluster.
+- **Balance by tool and task type**, so rare tools and hard tasks are not drowned out by the most common
+  lookup.
+- **RAG corpora too.** Near-duplicate documents in a retrieval index fill the top-k with copies; the same
+  MinHash pass applies before indexing.
+
 ## Diagram
-Cheap, high-precision filters run first and costly judgement last; every stage logs its rejects with a
-reason, and eval error analysis feeds the next dataset version.
+The same pipeline applies to web data and agent logs: cheap, high-precision filters run first and costly
+judgement last; every stage logs its rejects with a reason, and agent eval error analysis feeds the next
+dataset version.
 
 ```mermaid
 flowchart TD
-    R[("Raw crawl, logs or exports")] --> P["1. Provenance, licence, hash, PII scrub"]
+    R[("Agent logs, crawls or exports")] --> P["1. Provenance, licence, hash, PII scrub"]
     P --> X["2. Extract, language ID, one template"]
     X --> H["3. Heuristic filters"]
     H --> D["4. Dedup: exact hash, then MinHash and LSH"]
@@ -248,7 +280,54 @@ a benchmark):
 The lesson: macros dominate support logs, so near-dedup and outcome filtering remove far more than
 expected, and the eval set leaked because it was sampled from the same export.
 
+### Trajectory filter for agent logs
+Pure Python over exported traces. Each rule returns early with a reason, so the reject store explains
+every drop.
+
+```python
+import json
+
+def reject_reason(trace, tool_schemas, max_steps=25):
+    if not trace["task_passed"]:
+        return "failed_task"
+    calls = [t for t in trace["turns"] if t["role"] == "assistant" and t.get("tool_call")]
+    if len(trace["turns"]) > max_steps:
+        return "too_many_steps"
+    seen = set()
+    for c in calls:
+        name, args = c["tool_call"]["name"], c["tool_call"]["arguments"]
+        if name not in tool_schemas or not set(tool_schemas[name]) <= set(args):
+            return "stale_or_invalid_call"
+        key = name + json.dumps(args, sort_keys=True)
+        if key in seen:
+            return "repeated_call_loop"
+        seen.add(key)
+    if any(t["role"] == "tool" and t.get("error") for t in trace["turns"][-3:]):
+        return "unrecovered_tool_error"
+    return None
+
+# kept = [t for t in traces if reject_reason(t, schemas) is None]; store the rest with their reason,
+# then PII-scrub user and tool turns, dedup by user request, and split by tenant or task cluster.
+```
+
+### Worked scenario: a coding-agent trace funnel
+Illustrative numbers for 50,000 logged coding-agent runs being turned into an SFT set and a held-out eval:
+
+| Stage | Dropped | Remaining | What a reject sample showed |
+|---|---|---|---|
+| Task failed (tests red) | 19,000 | 31,000 | agent gave up or patched the wrong file |
+| Repeated call loops, over 25 steps | 4,500 | 26,500 | the same `grep` re-run with identical arguments |
+| Stale or invalid tool calls | 2,100 | 24,400 | a renamed tool from last quarter |
+| Near-duplicate user requests | 6,400 | 18,000 | the same CI-failure prompt from one bot |
+| Held out by repository for eval | 1,800 | 16,200 | split by repository, not by run |
+
+About a third of the logs survive (16,200 of 50,000), and that third is what you want the agent to
+imitate.
+
 ## Production patterns
+- **Curate agent traces with a reject store.** Run the outcome, hygiene and schema rules on every export,
+  store rejects with their reason, and sample them weekly. Monitor the share of runs dropped for loops or
+  stale tools; a rise is often a production agent regression, not a data problem.
 - **Per-stage drop dashboard plus reject sampling.** Emit counts per stage and source on every run and
   alert when a stage's drop rate shifts sharply between versions. Store each reject with its reason so
   thresholds can be tuned and audited.
@@ -261,10 +340,10 @@ expected, and the eval set leaked because it was sampled from the same export.
 - **Protected eval registry.** Every eval set, public or internal, is registered once and every training
   build is checked against it with n-gram and embedding overlap; the build fails on hits above a threshold.
   Track hits per eval set over time.
-- **Datasets versioned like code.** Record a content hash of the final JSONL, the pipeline commit and the
-  stage counts in the model's registry entry, so every model points to the exact data that made it.
-- **Scale with existing tooling.** For web-scale corpora use a pipeline library built for it, such as
-  Hugging Face's `datatrove`, which was used for FineWeb, instead of hand-rolled loops.
+- **Datasets versioned like code, on existing tooling.** Record a content hash of the final JSONL, the
+  pipeline commit and the stage counts in the model's registry entry, so every model points to the exact
+  data that made it. For web-scale corpora use a pipeline library built for it, such as Hugging Face's
+  `datatrove`, which was used for FineWeb, instead of hand-rolled loops.
 
 ## Trade-offs
 - **Quality vs volume and diversity.** Aggressive filtering raises average quality but shrinks volume and
@@ -277,6 +356,9 @@ expected, and the eval set leaked because it was sampled from the same export.
   preferences at scale, costs a classifier pass over everything, and can over-select benchmark-like prose.
 - **Decontamination vs useful data.** It protects eval validity but deletes useful documents quoted in
   benchmarks, and cannot catch paraphrased leaks without an embedding pass.
+- **Strict outcome filtering vs coverage.** Keeping only passed agent runs gives clean behaviour but
+  under-represents hard tasks the agent usually fails; supplement them with teacher-generated or
+  human-corrected trajectories rather than training on failures.
 - **Small curated SFT sets vs knowledge.** Cheap and effective for format, tone and task structure, but
   they cannot inject much new knowledge; for that, volume and pretraining-style data come back into play.
 
@@ -295,6 +377,12 @@ expected, and the eval set leaked because it was sampled from the same export.
   numbers, found by a customer or an auditor.
 - **Discarding rejects without the reason.** You cannot audit a missing behaviour, tune a threshold, or
   explain to a reviewer what was excluded.
+- **Fine-tuning on every logged agent run.** Failed runs, loops and retries look like normal trajectories.
+  Symptom: the fine-tuned agent repeats tool calls and gives up the way old runs did. Fix: filter by
+  verified outcome and trajectory hygiene first.
+- **Scrubbing user turns but not tool results.** Tool outputs hold customer records and secrets. Symptom:
+  the agent recites account details it saw in training traces. Fix: run the PII and secrets pass over
+  tool turns too.
 
 ## When to use
 Curation is not optional; what varies is the effort.
@@ -302,6 +390,8 @@ Curation is not optional; what varies is the effort.
   enforcement.
 - **Production pipeline regenerating sets from logs:** the full staged pipeline with per-stage drop
   metrics, contamination checks against every eval set, PII scrubbing and dataset versioning.
+- **Agent fine-tunes and agent evals:** the outcome, hygiene and schema rules on trajectories, split by
+  tenant or task, before any trace becomes training data or an eval case.
 - **Measure:** drop rate per stage, duplicate rate, contamination hits, inter-annotator agreement, and the
   downstream eval delta between dataset versions, the only number that matters in the end.
 - **Day to day:** scripts over JSONL, a dashboard of stage counts and a habit of reading samples.
@@ -355,11 +445,21 @@ model, which decides whether the data is ready.
 - **Hold back** when those domains matter to your product: score them separately or set per-source
   thresholds, and compare downstream evals across filter levels.
 
-### You run MinHash with 128 permutations. How do you set bands and rows for a 0.7 similarity cut?
-- **The S-curve:** P(candidate) = 1 − (1 − Jʳ)ᵇ, with threshold ≈ (1/b)^(1/r).
-- **r = 8, b = 16** puts the threshold near 0.71: about 0.95 at J = 0.8 and 0.06 at J = 0.5.
-- **Tune per source:** r = 16, b = 8 (threshold about 0.88) keeps templated contracts and forms, while
-  r = 4, b = 32 (about 0.42) catches loose paraphrases but floods you with candidates to verify.
+### You have 50,000 logged agent runs and want to fine-tune on them. Which runs do you keep?
+- **Verified outcome:** only runs whose task passed (tests green, ticket resolved), because a failed run
+  that looks fluent teaches failure.
+- **Trajectory hygiene:** drop loops (repeated identical calls), unrecovered tool errors, abnormal step
+  counts and calls to tools or arguments that no longer exist.
+- **Then the usual pipeline:** PII and secrets scrubbing including tool results, dedup by user request
+  with MinHash at a threshold near 0.7 (r = 8, b = 16 on 128 permutations), balance by tool and task type.
+
+### Your agent eval scores jumped after a fine-tune, but users see no change. What do you suspect in the data?
+- **Contamination:** eval tasks sampled from the same logs as training traces, with near-duplicate
+  requests on both sides.
+- **Split unit:** splitting by run instead of by tenant, repository or task cluster lets the same task
+  appear in train and eval.
+- **Fix:** register the agent eval suite, check every training build with n-gram and embedding overlap,
+  and re-split by group after dedup.
 
 ### A customer leaves and asks that their data be removed from future models. What does your pipeline need?
 - **Provenance from stage one:** source, licence, collection date and content hash per document, so the

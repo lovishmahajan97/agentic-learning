@@ -5,7 +5,8 @@ name: GPU sizing (VRAM math)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - model-internals/kv-cache
   - serving-inference/kv-cache-memory-estimation
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Inference VRAM is weights + KV cache + activations + overhead; training adds gradients and optimizer
-state, about 16 bytes per parameter with mixed-precision Adam. A minute of arithmetic picks card, count,
-precision and concurrency, and prevents both OOMs and half-empty 80 GB cards.
+Serving an agent's model needs weights + KV cache + activations + overhead, and agent contexts are long,
+so the cache decides how many agents run at once. Fine-tuning on agent traces adds about 16 bytes per
+parameter with mixed-precision Adam.
+
+## For agent builders
+- **Why it matters for agents.** An agent's context grows every step (system prompt, tool schemas, tool
+  results), so a card that holds a hundred 4k chats may hold only a dozen 32k-token agent sessions. VRAM
+  math turns "how many concurrent agents" into a number.
+- **Where it shows up in your stack.** vLLM or SGLang flags for the self-hosted agent model
+  (`--max-model-len`, `--max-num-seqs`, `gpu_memory_utilization`), the KV capacity line in the engine's
+  start-up log, and the card choice for LoRA or QLoRA runs on agent traces.
+- **What you control.** Precision, context cap per agent, concurrency limit, prefix stability (shared
+  system prompt and tool schemas), and adapter versus full fine-tune.
+- **What you can skip.** Exact activation formulas and ZeRO internals. Keep the weights, KV-per-token and
+  16-bytes-per-parameter rules.
 
 ## Why it exists
 - **A GPU cannot page to disk.** When the device runs out of memory the engine does not slow down
@@ -95,6 +108,15 @@ Fits, taking a 0.9 utilisation budget and ~1 GB overhead per card:
 - **Long context is the other surprise.** One 128k-token prompt on the 8B model is 128k × 128 KB = 16 GiB
   (about 17 GB) of cache, as much as the weights, and a single such request can evict everything else.
 
+### Sizing for agent sessions, not chats
+- **Size on the context at the last step.** An agent's tokens in flight are its whole transcript, which
+  peaks near the end of the run. Divide KV room by that peak, not by the opening prompt length.
+- **Shared prefixes count once.** With prefix caching, engines such as vLLM can share the KV blocks of a
+  byte-identical prefix (system prompt plus tool schemas) across concurrent requests, so a long shared
+  prefix costs memory roughly once rather than per agent.
+- **Compaction is a capacity lever.** Summarising old tool results caps the per-agent peak, which raises
+  how many agents fit as directly as a bigger card.
+
 ### The training budget
 Full fine-tuning with mixed precision and Adam keeps, per parameter (the accounting the ZeRO paper uses):
 
@@ -147,12 +169,12 @@ Reverse the order and you will size the card to a concurrency figure that the pr
 invalidates.
 
 ## Diagram
-Read it top to bottom: each decision feeds the next, and a failed fit loops back to precision or card
-count rather than to wishful concurrency targets.
+Read it top to bottom for the model behind your agents: each decision feeds the next, and a failed fit
+loops back to precision or card count rather than to wishful concurrent-agent targets.
 
 ```mermaid
 flowchart TD
-    A["Model config and target context"] --> B["Pick precision: bf16, fp8, int4"]
+    A["Model config and peak agent context"] --> B["Pick precision: bf16, fp8, int4"]
     B --> C["Weights = params x bytes"]
     C --> D["Pick card and count, per-card budget"]
     D --> E["KV room = budget - weights - overhead"]
@@ -193,9 +215,26 @@ plan("70B fp8 / 2xH100",       70.6, 80, 8, 128, 80, n_gpus=2, bytes_w=1)     # 
 plan("70B int4 / 1xH100",      70.6, 80, 8, 128, 80, bytes_w=0.55)            # ~100k tok
 ```
 
+### Worked scenario: how many coding agents fit on one H100?
+Llama-3-8B in bf16 on an 80 GB H100 leaves ≈ 55 GB of KV room, ≈ 420k tokens at 128 KB per token. Each
+agent run starts with a 6k-token prefix (system prompt plus tool schemas) and peaks at 32k tokens.
+
+| Plan | Tokens held per agent | Concurrent agents (≈ 420k ÷ per-agent) |
+|---|---|---|
+| Sized as 4k chats (the mistake) | 4k | ≈ 100, never reached in practice |
+| Agents at peak, no prefix sharing | 32k | ≈ 12 |
+| Prefix caching shares the 6k prefix once | 26k unique + 6k shared | ≈ 15 |
+| Plus compaction capping each run at 16k | 10k unique + 6k shared | ≈ 41 |
+
+- **The first row is how teams get preemption storms:** concurrency set from chat math, then agents grow
+  past the KV room mid-run and the engine evicts or re-prefills them.
+- **The last two rows** cost no hardware; they come from keeping the prefix byte-identical and
+  summarising old tool results.
+
 ### Fine-tuning budget for the 8B model, four ways
-Same model, four training set-ups, using the per-parameter accounting above. All figures exclude
-activations, which you add on top and control with batch size, sequence length and checkpointing.
+Same model, four training set-ups for tuning it on agent traces (tool calls and results), using the
+per-parameter accounting above. All figures exclude activations, which you add on top and control with
+batch size, sequence length and checkpointing; long multi-step traces make that term large.
 
 | Set-up | Bytes per parameter (state) | State for 8B | Fits one 80 GB card? |
 |---|---|---|---|
@@ -224,10 +263,14 @@ def peak_step_gb(model, batch, optimizer):
 ```
 
 ## Production patterns
+- **Size concurrency on peak agent context.** Use for any self-hosted agent model. Take the p95 of
+  tokens at the final step from agent traces, divide the KV room by it, and set `--max-num-seqs` there,
+  with `--max-model-len` at the hard context cap the agent's compaction enforces. Monitor preemptions and
+  agent step latency as runs lengthen.
 - **Read the capacity line from the engine log.** Use on every deployment change. vLLM logs the KV-cache
   size it allocated (in tokens or blocks) at start-up; compare it with the planner's estimate. Monitor
   the gap: a large shortfall means an overhead term (CUDA graphs, a co-located process) you missed.
-- **Cap the worst case explicitly.** Use whenever traffic mixes short chats and long documents. Set
+- **Cap the worst case explicitly.** Use whenever traffic mixes short chats, long documents and long agent runs. Set
   `--max-model-len` to the longest request you will accept and `--max-num-seqs` to the concurrency the
   KV room supports. Monitor KV-cache usage and preemption counts in the engine's metrics.
 - **Quantise before adding cards.** Use when weights leave too little KV room, as in the 70B bf16 on two
@@ -236,7 +279,7 @@ def peak_step_gb(model, batch, optimizer):
 - **Leave headroom on shared cards.** Use when anything else runs on the GPU (a sidecar, a second model,
   a profiler). Lower `gpu_memory_utilization` below the 0.9 default rather than raising it. Monitor
   device memory used per process and OOM restarts.
-- **Measure one training step before a long run.** Use before any fine-tune longer than an hour. Run a
+- **Measure one training step before a long run.** Use before any fine-tune longer than an hour, including LoRA runs on agent traces. Run a
   single forward, backward and optimizer step at the real batch and sequence length and record
   `torch.cuda.max_memory_allocated()`. Monitor that peak against card memory, keeping headroom.
 
@@ -252,6 +295,9 @@ def peak_step_gb(model, batch, optimizer):
 - **LoRA and QLoRA vs update capacity.** They make fine-tuning fit small cards at the cost of a smaller
   parameter update and, for QLoRA, slower steps from dequantisation. Full fine-tuning is only worth its
   multi-card cost when the adapter measurably underperforms.
+- **Longer agent context vs concurrency.** Letting agents keep every tool result raises task success on
+  long tasks but divides the number of resident agents by the extra tokens. It flips once compaction or
+  retrieval over old steps holds quality on your agent eval.
 
 ## Pitfalls
 - **Counting weights and forgetting overhead and activations.** Symptom: an OOM at start-up or on the
@@ -266,10 +312,15 @@ def peak_step_gb(model, batch, optimizer):
   "13B-class" label said was ample. Fix: size by total parameters.
 - **Treating int4 as "half of fp16".** Symptom: a card that fits the weights but throughput below the
   fp16 figure, *because* dequantisation dominates at the batch sizes used. Fix: benchmark at real batch.
+- **Sizing agents on their first-step prompt.** Symptom: load tests with fresh sessions pass, then
+  production runs slow down and get preempted around step 10 as transcripts grow. Fix: load-test with
+  replayed full-length agent traces and size on peak context.
 
 ## When to use
 - **Run the arithmetic when:** a model, card, precision, context limit or concurrency target changes,
-  and before any procurement conversation.
+  and before any procurement conversation; for agents, also when you add tools or change compaction,
+  because both move peak context.
+- **Skip it when:** the agent's model is a hosted API; then your budget is tokens and rate limits, not VRAM.
 - **Inputs are public:** parameter count and layer/head shapes from the model config, memory from the
   card datasheet.
 - **Reach for it when someone asks:** "how many users can this card serve", "why did we OOM at 2 a.m." or
@@ -319,7 +370,7 @@ contexts will be bandwidth-bound on one card, so latency targets need checking t
 - **Fix options:** fp8 weights leave ≈ 71 GB for ≈ 220k tokens; or move to four cards with TP=4.
 - **Verify** with the engine's start-up capacity line, not with "it loaded".
 
-### When would you choose LoRA or QLoRA over a full fine-tune, and when not?
+### You want to fine-tune an 8B model on agent traces. When would you choose LoRA or QLoRA over a full fine-tune?
 - **Choose adapters** when memory is the constraint: an 8B full fine-tune needs ~128 GB of state, LoRA
   about 16 GB plus activations, QLoRA about 4.5 GB, which fits a 24 GB card.
 - **Pay for full fine-tuning** only when an adapter measurably underperforms on your eval, because it needs
@@ -332,6 +383,14 @@ contexts will be bandwidth-bound on one card, so latency targets need checking t
 - **Compute by active parameters:** 12.9B active per token, so arithmetic looks like a 13B model.
 - **Bandwidth depends on batch:** batch 1 reads only active experts, serving batches read close to all of
   them, so benchmark latency at the batch you will run.
+
+### How many concurrent agent sessions can an 8B bf16 model serve on one H100, and how would you raise it?
+- **Capacity:** about 55 GB of KV room at 128 KB per token is ≈ 420k tokens; agents peaking at 32k
+  tokens give about 12 sessions, not the ≈ 100 a 4k-chat estimate suggests.
+- **Raise it without hardware:** keep the system prompt and tool schemas byte-identical so prefix
+  caching shares them, and compact old tool results to cap the peak.
+- **Then hardware levers:** an fp8 KV cache after an eval, or more replicas; verify with the engine's
+  capacity line and preemption metrics.
 
 ## Quiz
 ### Q: Why does a full fine-tune need roughly eight times the memory of serving the same model in bf16?

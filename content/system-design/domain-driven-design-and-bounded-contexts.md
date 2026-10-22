@@ -5,7 +5,8 @@ name: Domain-driven design & bounded contexts
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - system-design/modular-monolith-vs-microservices
   - system-design/event-driven-architecture
@@ -23,8 +24,22 @@ sources:
 
 ## TL;DR
 Domain-driven design splits a system along the meanings of its business language: each bounded context
-owns one consistent model, and contexts talk through explicit contracts, not a shared schema. For AI,
-contexts decide tool boundaries, data ownership and who translates meaning for the agent.
+owns one consistent model behind explicit contracts. For agents, contexts decide the tool boundaries,
+data ownership and the adapters that translate meaning so the model never has to.
+
+## For agent builders
+- **Why it matters for agents.** An enterprise agent reaches into billing, CRM and support at once. If
+  "customer", "active" or "account" means three things in its tool results, the model resolves the
+  ambiguity by guessing, and no prompt fixes that reliably.
+- **Where it shows up in your stack.** Tool groups or MCP servers per system, the adapter code behind each
+  tool, tool descriptions and system prompts written in one vocabulary, retrieval indexes tagged by
+  context, and per-context eval sets.
+- **What you control.** Which tools exist and in whose language they speak, where translation lives
+  (adapters, never the prompt), how unmapped upstream values fail, and how a multi-system action becomes
+  a saga instead of one transaction.
+- **What you can skip.** Tactical DDD ceremony (repositories, factories, layered patterns) unless you own
+  the upstream services. For agent work, bounded contexts, anticorruption layers and published languages
+  carry most of the value.
 
 ## Why it exists
 - **One word, three meanings.** Ask billing, support and sales what a "customer" is. Billing: a legal
@@ -47,6 +62,21 @@ contexts decide tool boundaries, data ownership and who translates meaning for t
   every ambiguity and resolves it by guessing.
 
 ## How it works
+### What bounded contexts decide in an agent
+- **One tool, or tool group, per bounded context,** speaking that context's published language; the
+  agent's tool list then mirrors the context map. An MCP server per context is a natural packaging.
+- **Translation lives in tool adapters (the ACL), never in the prompt.** Asking the model to reconcile
+  three meanings of "customer" at runtime is asking it to redo your architecture per request.
+- **Do not expose raw upstream APIs as tools.** Auto-generating tools from a vendor's API spec hands the
+  model the vendor's vocabulary and every field it does not need.
+- **Scope retrieval indexes and memory per context** when vocabularies conflict, or tag them with the
+  context so the prompt can say which "account" a passage refers to.
+- **Consequential actions respect aggregate boundaries:** an agent step that must update two contexts is
+  a saga with compensation, not one transaction.
+- **Evals are per context,** written in that context's language by that context's experts.
+
+The subsections below are the DDD vocabulary behind those rules.
+
 ### Ubiquitous language
 - **One vocabulary, everywhere in the area.** Developers and domain experts use the same terms, and so
   does the code: class names, tool names, event names, prompts.
@@ -119,17 +149,6 @@ domain events (event storming), then look for seams. Four signals mark one:
   which makes them safe to share and pass across boundaries.
 - **Repository.** Loads and saves whole aggregates, one per aggregate type, which keeps the invariant check
   from being bypassed by partial writes.
-
-### Applying it to an AI system
-- **One tool, or tool group, per bounded context,** speaking that context's published language; the
-  agent's tool list then mirrors the context map.
-- **Translation lives in tool adapters (the ACL), never in the prompt.** Asking the model to reconcile
-  three meanings of "customer" at runtime is asking it to redo your architecture per request.
-- **Scope retrieval indexes and memory per context** when vocabularies conflict, or tag them with the
-  context so the prompt can say which "account" a passage refers to.
-- **Consequential actions respect aggregate boundaries:** an agent step that must update two contexts is
-  a saga with compensation, not one transaction.
-- **Evals are per context,** written in that context's language by that context's experts.
 
 ## Diagram
 A context map for the support agent in the examples. The agent only speaks its own published language;
@@ -273,6 +292,10 @@ except CreditLimitExceeded as e:
 - **Tool groups that mirror the context map.** Register agent tools per context with that context's
   published language and owners, and run per-context evals written by its experts. Monitor tool-selection
   errors and eval scores by context, so a regression points at one owner.
+- **Tool results in the agent's language, checked by schema.** Validate every tool result against the
+  published schema (the `SupportCustomer` shape, as a Pydantic model or JSON Schema) before it reaches the model,
+  and reject results that carry upstream field names. Monitor schema-validation failures per tool, since
+  each one is an adapter that drifted.
 - **Coupling metrics on change.** Tag pull requests and releases by the contexts they touch, and track how
   many contexts a typical change spans and how often releases must be coordinated. A rising number means a
   seam is in the wrong place.
@@ -303,6 +326,9 @@ except CreditLimitExceeded as e:
 - **Asking the model to reconcile conflicting vocabularies at runtime.** Symptom: answers mix the billing
   and support meanings of a term, and evals cannot agree on correctness. Fix: move translation into tool
   adapters.
+- **Wrapping every upstream endpoint as an agent tool.** Symptom: dozens of near-duplicate tools with
+  vendor field names, falling tool-selection accuracy, and answers that quote internal codes such as
+  "ent". Fix: a few context tools in the agent's published language, with adapters behind them.
 - **Translation tables with catch-all defaults.** Symptom: a new upstream enum value (a new plan, a new
   status) is quietly mapped to the wrong meaning and found weeks later through customer complaints
   rather than errors. Fix: raise on unmapped values and alert.

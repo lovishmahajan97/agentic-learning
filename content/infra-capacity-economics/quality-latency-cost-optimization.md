@@ -5,7 +5,8 @@ name: Quality–latency–cost optimization
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - system-design/model-routing-cascading
   - system-design/model-selection
@@ -19,20 +20,33 @@ sources:
 ---
 
 ## TL;DR
-Every LLM feature trades answer quality, user wait and per-request cost; levers that improve one axis
-almost always degrade another, so you cannot maximize all three. Measure all three per task, discard
-dominated configurations, and choose from the Pareto frontier under hard constraints.
+Every agent run trades task success, wall-clock time and spend, each multiplied by its step count; levers
+that improve one axis usually degrade another. Measure all three per run, discard dominated
+configurations, and choose from the Pareto frontier under hard constraints.
+
+## For agent builders
+- **Why it matters for agents.** An agent multiplies every per-call number by its steps. A 300-token reply
+  at 20 ms per token is 6 s once, and about 48 s across 8 steps. Success is judged per run, so a cheap
+  model that loops, retries or fails the task is often the expensive one.
+- **Where it shows up in your stack.** The model chosen per node or step (in LangGraph, the OpenAI Agents
+  SDK or your own loop), `max_tokens` per call, prompt caching for the system prompt and tool schemas,
+  reasoning or thinking budgets, max-step limits, and tracing tools such as LangSmith or Langfuse that show
+  tokens, latency and cost per run.
+- **What you control.** Which model runs which step (tool selection, planning, final answer), output caps
+  per step, a stable cacheable prefix, the step budget, and the eval that defines a successful run.
+- **What you can skip.** Serving-side levers (quantization, speculative decoding) unless you self-host; on
+  a hosted API they are the provider's job, and you only see their effect in the latency and price.
 
 ## Why it exists
-- **The usual history.** A prototype ships on the largest model with a long, example-stuffed prompt. Then
-  three things happen at once: the bill grows linearly with traffic, a p95 of several seconds makes the
-  interface feel broken, and the first eval shows the "best" model is no better on this task than one an
-  order of magnitude cheaper, because the task saturates.
+- **The usual history.** A prototype agent ships on the largest model with a long, example-stuffed prompt.
+  Then three things happen at once: the bill grows linearly with traffic, a p95 of several seconds per
+  step makes the agent feel broken, and the first eval shows the "best" model is no better on this task
+  than one an order of magnitude cheaper, because the task saturates.
 - **"Use the best model for everything" fails on cost and latency.** Quality is task-relative and
-  plateaus, while cost and latency are paid on every single request.
+  plateaus, while cost and latency are paid on every single request, and an agent makes many per run.
 - **"Use the cheapest model" fails on quality.** A wrong answer has a cost too: a retry, a human
   escalation, a lost customer. The right denominator is cost per *successful* task, and on that measure the
-  cheap model can be the expensive one.
+  cheap model can be the expensive one; for agents, extra steps and loops make the gap wider.
 - **"Tune one axis at a time" is the most common failure.** A team trims the prompt to cut cost, quality
   quietly drops, and nobody notices until a customer does, because quality was never a number on a
   dashboard.
@@ -40,21 +54,22 @@ dominated configurations, and choose from the Pareto frontier under hard constra
   problems and more decode time and spend; more retrieved context buys grounding and more prefill; a bigger
   model buys capability and more memory bandwidth per token.
 - **So you need a method, not a hunch.** It holds all three in view, makes the exchange rate explicit, and
-  is re-run whenever a model, price or prompt changes. That is what separates features that scale from
-  features that get switched off when the invoice arrives.
+  is re-run whenever a model, price or prompt changes. That is what separates agents that scale from
+  agents that get switched off when the invoice arrives.
 
 ## How it works
 ### Make all three measurable
-Nothing below works without numbers for each axis on the *same* set of requests.
+Nothing below works without numbers for each axis on the *same* set of requests or agent tasks.
 - **Quality is a task-specific eval.** A golden set with a pass criterion: exact match for
-  classification, a rubric or LLM judge for open text, human grading for the ambiguous slice. Define it
-  first, *because* every cost or latency cut is a bet that quality survives, and bets need a scoreboard.
+  classification, a rubric or LLM judge for open text, human grading for the ambiguous slice. For an agent
+  the unit is the run: did it reach the right end state? Define it first, *because* every cost or latency
+  cut is a bet that quality survives, and bets need a scoreboard.
 - **Latency is what the user feels.** Time-to-first-token for streamed chat, end-to-end time for a
-  classifier or a tool call, and always a percentile (p95 or p99), not a mean. Means hide the tail, and the
-  tail is what users remember.
-- **Cost is cost per successful task.** Include retries, fallbacks, judge or verifier calls, cache misses
-  and the downstream cost of failures. Per-request cost is what the provider bills; per successful task is
-  what the business pays.
+  classifier, a tool call or a whole agent run, and always a percentile (p95 or p99), not a mean. Means hide
+  the tail, and the tail is what users remember.
+- **Cost is cost per successful task.** Include retries, fallbacks, judge or verifier calls, cache misses,
+  extra agent steps and the downstream cost of failures. Per-request cost is what the provider bills; per
+  successful task is what the business pays.
 
 ### Where latency and cost actually come from
 Decompose each axis before pulling levers, *because* the decomposition tells you which lever can move it:
@@ -74,11 +89,23 @@ end_to_end    ≈ TTFT + n_out · TPOT          (TPOT = time per output token)
   saves only a fraction of a second of prefill.
 - **So output caps and terse formats are often the strongest latency lever**, and prompt trimming mainly
   buys cost and TTFT.
-- **Agents and chains multiply all of it** by the number of sequential calls.
+
+### Agent runs multiply every term
+```
+run_cost    ≈ Σ over steps of cost_per_call(step)        context grows every step
+run_latency ≈ Σ over sequential steps of (TTFT + n_out · TPOT) + tool time
+```
+
+- **Context grows, so input cost grows per step.** Each step re-sends the system prompt, tool schemas and
+  the transcript so far; without prompt caching, input cost rises roughly quadratically with steps.
+- **Output length is paid once per step.** A tool call is usually a short JSON object; letting the model
+  narrate its reasoning in every step multiplies decode time by the step count.
+- **Steps are sequential.** Parallel tool calls in one step overlap tool time, but model calls in a chain
+  still add up, so step count is itself a latency lever.
 
 ### Cost per success, and when quality *is* cost
 - **With a verifier and retries:** if each attempt succeeds with probability *q*, expected attempts are
-  `1/q`, so `cost_per_success = (c_call + c_verify) / q`.
+  `1/q`, so `cost_per_success = (c_call + c_verify) / q`. For an agent, `c_call` is the whole run.
 - **Caveat:** that assumes independent attempts. In practice the same hard input tends to fail again, so
   retries recover less than `1/q` predicts.
 - **With human escalation:** `cost_per_task = c_call + (1 − q) · c_human`.
@@ -96,20 +123,22 @@ end_to_end    ≈ TTFT + n_out · TPOT          (TPOT = time per output token)
 | Lever | Quality | Latency | Cost | Note |
 |---|---|---|---|---|
 | Bigger model tier | up | up | up | coarsest lever; quality gain saturates per task |
-| Shorter prompt / less context | risk | down (prefill) | down | every token is paid on every call |
+| Shorter prompt / less context | risk | down (prefill) | down | every token is paid on every call and every agent step |
 | Capped or terser output | neutral if instructed | down (decode) | down | decode is sequential, so output length often dominates total time |
-| Reasoning / thinking budget | up on hard tasks | up a lot | up a lot | wasted on easy tasks; gate by difficulty |
-| Prompt caching (shared prefix) | none | down (TTFT) | down (input) | removes work instead of trading it |
+| Reasoning / thinking budget | up on hard tasks | up a lot | up a lot | wasted on easy tasks or steps; gate by difficulty |
+| Prompt caching (shared prefix) | none | down (TTFT) | down (input) | removes work instead of trading it; large for agents |
 | Response / semantic cache | none on hits | near zero on hits | near zero on hits | only for repeat queries; staleness risk |
-| Routing / cascade | ≈ large model | up for escalated requests | down on average | depends on escalation rate |
+| Routing / cascade | ≈ large model | up for escalated requests | down on average | depends on escalation rate; can be per agent step |
+| Step budget (max iterations) | risk if too low | down | down | caps loops; failing runs end sooner |
 | Batch / async endpoints | none | up (minutes to hours) | down sharply | for non-interactive work only |
 | Fine-tune / distill small model | up for small model | down | down | front-loaded effort; shifts the frontier |
 | Quantization, speculative decoding | small risk | down | down | serving-side; measure per model |
 | Streaming | none | perceived down | none | changes perception, not the number |
 
 - **Most levers move you *along* the frontier:** you give up some of one axis for another.
-- **A few *shift* the frontier:** caching, distillation, fine-tuning and task redesign, because they
-  remove work or make a cheaper model genuinely better at this task.
+- **A few *shift* the frontier:** caching, distillation, fine-tuning and task redesign (fewer agent steps,
+  a deterministic tool instead of a model call), because they remove work or make a cheaper model
+  genuinely better at this task.
 - **When no frontier point satisfies the constraints,** only the second group can help; more tuning of
   the first group cannot.
 
@@ -119,7 +148,8 @@ end_to_end    ≈ TTFT + n_out · TPOT          (TPOT = time per output token)
 3. **Discard dominated configurations.** A is *dominated* if some B is at least as good on all three and
    strictly better on one. What remains is the Pareto frontier.
 4. **Respect measurement noise.** A pass rate on *n* items has a standard error of about `√(q(1−q)/n)`; at
-   q = 0.92 and n = 200 that is roughly 2 points, so 0.92 and 0.93 are a statistical tie.
+   q = 0.92 and n = 200 that is roughly 2 points, so 0.92 and 0.93 are a statistical tie. Agent runs are
+   also non-deterministic, so run each task more than once.
 5. **Treat configurations inside the noise band as equal on quality.** Compare them on the same items with
    a paired test, or grow the eval, and let latency and cost decide. A p95 from a few hundred requests is
    itself noisy.
@@ -136,39 +166,83 @@ trade is worth it; they can no longer argue about facts.
 - **Pick the feasible frontier point with the best objective.** If the feasible set is empty, stop tuning
   and reach for a frontier-shifting lever.
 
-### Do it per task, not per application
+### Do it per task, and per agent step
 - **One application holds many frontiers.** Intent classification saturates on a small model;
   multi-document synthesis does not.
-- **Split traffic by task and optimize each separately.** It is usually the single largest win, which is
-  why routing comes before most other work.
+- **One agent holds many too.** Picking a tool or extracting arguments often saturates on a small model,
+  while planning and the final answer may need a large one.
+- **Split traffic by task or step and optimize each separately.** It is usually the single largest win,
+  which is why routing comes before most other work.
 
 ### Keep measuring
 - **Everything drifts.** Quality drifts when the provider updates a model or the input mix changes; prices
-  fall; traffic mix shifts; a prompt edit makes the model chattier.
-- **Re-run the frontier** on a cadence and on every change to prompt, model or retrieval.
+  fall; traffic mix shifts; a prompt edit makes the model chattier or the agent take more steps.
+- **Re-run the frontier** on a cadence and on every change to prompt, model, tools or retrieval.
 - **Alert on cost per task and p95 in production,** not just on total spend.
 
 ## Diagram
-Read it as a loop: measure the triple, prune to the frontier, filter by constraints, and either ship a
-point or reach for a lever that shifts the frontier.
+Read it as a loop: measure the triple per agent run, prune to the frontier, filter by constraints, and
+either ship a point or reach for a lever that shifts the frontier.
 
 ```mermaid
 flowchart TD
-    E["Define eval and quality floor"] --> M["Measure quality, p95, cost per success"]
+    E["Define agent eval and success floor"] --> M["Measure success, p95, cost per success"]
     M --> D["Discard dominated configs"]
     D --> F["Pareto frontier"]
     F --> C{"Any point meets constraints?"}
     C -->|"yes"| P["Pick best objective"]
-    C -->|"no"| S["Shift frontier: cache, distill, redesign"]
+    C -->|"no"| S["Shift frontier: cache, distill, fewer steps"]
     S --> M
-    P --> R["Monitor in production"]
-    R -->|"model, price or prompt change"| M
+    P --> R["Monitor runs in production"]
+    R -->|"model, price, tool or prompt change"| M
 ```
 
 ## Examples
-### Frontier step for a triage task
-A small, runnable version of the frontier step. The measurements are illustrative numbers for a
-support-ticket triage task, not benchmarks; the structure is what matters.
+### Worked scenario: what one agent run costs, and where the time goes
+An 8-step support agent: 4,000-token prefix (system prompt plus tool schemas), ~600 tokens of tool result
+per step, transcript append-only. Prices and timings are illustrative placeholders, not a provider's.
+
+```python
+P_IN, P_CACHED, P_OUT = 3.00, 0.30, 15.00   # USD per 1M tokens, illustrative
+TTFT_S, TPOT_S = 0.4, 0.020                 # held constant per step for simplicity
+
+def agent_run(steps, prefix, tool_tokens, n_out, cache):
+    cost = secs = 0.0
+    ctx = prefix                              # system prompt + tool schemas
+    for i in range(steps):
+        uncached = (prefix if i == 0 else tool_tokens + n_out) if cache else ctx
+        cost += ((uncached * P_IN + (ctx - uncached) * P_CACHED) + n_out * P_OUT) / 1e6
+        secs += TTFT_S + n_out * TPOT_S       # model time only; tool time comes on top
+        ctx += n_out + tool_tokens            # transcript is append-only
+    return cost, secs
+
+configs = {                                   # (n_out per step, prompt caching, run success rate)
+    "verbose steps, no cache": (300, False, 0.88),
+    "capped steps, no cache":  (80,  False, 0.88),
+    "capped steps, cached":    (80,  True,  0.88),
+}
+for name, (n_out, cache, q) in configs.items():
+    c, s = agent_run(steps=8, prefix=4000, tool_tokens=600, n_out=n_out, cache=cache)
+    print(f"{name:<24} ${c:.4f}/run  ${c / q:.4f}/success  {s:4.1f} s model time")
+# verbose steps, no cache  $0.2076/run  $0.2359/success  51.2 s model time
+# capped steps, no cache   $0.1627/run  $0.1849/success  16.0 s model time
+# capped steps, cached     $0.0486/run  $0.0552/success  16.0 s model time
+```
+
+| Change | Run cost | Model time | Why |
+|---|---|---|---|
+| Baseline: 300 output tokens per step | $0.2076 | 51.2 s | 8 × 300 tokens × 20 ms of decode |
+| Cap steps to 80 tokens (terse tool calls) | $0.1627 | 16.0 s | decode shrinks; growing context still dominates cost |
+| Add prompt caching on the prefix | $0.0486 | 16.0 s | re-sent transcript is billed at the cached rate |
+
+- **Output caps fix latency, caching fixes cost.** Each lever moved a different axis, exactly as the
+  decomposition predicts. In a real system caching would also cut TTFT, which this sketch holds constant.
+- **Divide by the run success rate.** `c / q` assumes independent retries; check the success rate did not
+  fall after capping output, or the cheaper run is a false win.
+
+### Frontier step for the agent's triage step
+A small, runnable version of the frontier step for the first step of a support agent, which triages the
+ticket. The measurements are illustrative numbers, not benchmarks; the structure is what matters.
 
 ```python
 from dataclasses import dataclass
@@ -221,7 +295,8 @@ print("choose:", best.name)
 
 ### Worked scenario: does the cascade pay?
 Cascade cost per task is `s + e·l` (small cost *s*, large cost *l*, escalation rate *e*), so it beats the
-large model alone only while `e < 1 − s/l`. Illustrative prices:
+large model alone only while `e < 1 − s/l`. The same holds for one agent step routed small-first.
+Illustrative prices:
 
 ```python
 def cascade_cost(s, l, e):
@@ -246,37 +321,39 @@ for s, l in [(0.001, 0.010), (0.005, 0.010)]:   # 10x and 2x price gaps
 | 2× | 50% | cascade, $0.0080 vs $0.0100 | large wins, $0.0110 vs $0.0100 |
 
 The narrower the price gap, the less escalation the gate can afford, and every escalated request also
-pays both models' latency.
+pays both models' latency, once per escalated agent step.
 
 ## Production patterns
-- **Cap output per route.** When: any interactive route, because decode time is `n_out · TPOT`. How: set
-  the API's maximum output tokens (`max_tokens` on Anthropic's Messages API) per route and instruct a
-  terse format. Monitor output-token p95 and the share of responses stopped for length.
-- **Stable prefix plus prompt caching.** When: many calls share a long system prompt or tool list. How: put
-  stable content first and variable content last; on Anthropic mark the prefix with `cache_control`, while
-  OpenAI caches long shared prefixes automatically. Monitor cached input tokens per call and TTFT.
-- **Small-first cascade with a gate.** When: traffic mixes easy and hard inputs. How: answer with the small
-  model, escalate on a verifier failure or low confidence. Monitor escalation rate against `1 − s/l` and
-  the p95 of escalated requests separately.
-- **Batch path for offline work.** When: nobody waits on the result (backfills, nightly enrichment). How:
-  send it through the provider's batch endpoint, which trades a completion window of hours for a lower
-  price. Monitor batch completion time against the downstream deadline.
-- **Three lines per feature.** When: always, once a feature has real traffic. How: tag every call with a
-  feature id and plot quality on a sampled eval, p95, and cost per successful task. Alert on bands, not on
-  the monthly total.
-- **Eval gate on every change.** When: any prompt, model or retrieval change. How: re-run the golden set in
-  CI with a paired comparison on the same items, and block the merge if quality falls under the floor or
-  p95 and cost per task leave their band.
+- **Cap output per agent step.** When: any interactive agent, because decode time is `n_out · TPOT` per
+  step. How: set the API's maximum output tokens (`max_tokens` on Anthropic's Messages API) per call type
+  and ask for terse tool calls. Monitor output-token p95 per step and the share of calls stopped for length.
+- **Stable prefix plus prompt caching.** When: every step re-sends a long system prompt and tool list. How:
+  put stable content first and variable content last; on Anthropic mark the prefix with `cache_control`,
+  while OpenAI caches long shared prefixes automatically. Monitor cached input tokens per step and TTFT.
+- **Small-first routing per step with a gate.** When: the agent mixes easy steps (tool choice, argument
+  extraction) and hard ones (planning, final answer). How: run easy steps on the small model, escalate on a
+  verifier failure or low confidence. Monitor escalation rate against `1 − s/l`, and escalated p95 apart.
+- **Step and token budgets per run.** When: every agent loop. How: a max-steps limit and a per-run token
+  budget enforced in code (LangGraph exposes a recursion limit; most SDKs have a max-turns setting). Monitor
+  steps per run p95 and the share of runs ending on the budget.
+- **Batch path for offline agent work.** When: nobody waits on the result (backfills, nightly enrichment,
+  eval sweeps). How: send it through the provider's batch endpoint, which trades a completion window of
+  hours for a lower price. Monitor batch completion time against the downstream deadline.
+- **Three lines per agent, gated on every change.** How: tag every call with agent, step and run ids and
+  plot run success on a sampled eval, run p95, and cost per successful run. Re-run the golden set in CI on
+  any prompt, model, tool or retrieval change with a paired comparison; block merges that leave a band.
 
 ## Trade-offs
 - **Cascade: lower average cost vs higher tail latency.** It also adds a confidence gate to maintain. With
   small-model cost *s*, large-model cost *l* and escalation rate *e*, it beats the large model alone only
   while `s + e·l < l`, i.e. while `e < 1 − s/l`. At a 10× price gap that is 90%; at 2× it is only 50%.
-- **Trimmed context: cheaper and faster TTFT vs quality risk.** Removing context and few-shot examples
-  lowers cost and TTFT on every call, but each removed token is a bet it was not needed. The trade flips
-  the moment the eval shows quality under the floor.
+- **Trimmed context: cheaper and faster TTFT vs quality risk.** Removing context, few-shot examples or old
+  agent turns lowers cost and TTFT on every call, but each removed token is a bet it was not needed. The
+  trade flips the moment the eval shows quality under the floor.
 - **Reasoning budget: quality on hard inputs vs waste on easy ones.** It is favourable only when gated by
-  task difficulty rather than applied uniformly.
+  task or step difficulty rather than applied uniformly to every agent step.
+- **Tight step budget: bounded cost vs unfinished runs.** A low max-steps limit stops loops cheaply, but
+  cuts off legitimate long tasks; the trade flips when runs ending on the budget start failing the eval.
 - **Fine-tuning or distillation: a shifted frontier vs front-loaded effort.** The engineering must be
   repeated when the task or base model changes. It pays only when monthly savings exceed the amortized
   effort, which is a volume threshold.
@@ -291,28 +368,29 @@ pays both models' latency.
   rising escalation and complaint rates that nobody connects to the change. Fix: define the eval and floor
   first.
 - **Reporting mean latency.** Symptom: a green dashboard while users report hangs, because the p95 nobody
-  plotted is three times the mean. Fix: plot p95 and p99.
+  plotted is three times the mean. Fix: plot p95 and p99, per step and per run.
 - **Comparing cost per request instead of per successful task.** Symptom: a "cheaper" model whose retries,
-  judge calls and human review make the total higher. Fix: divide total spend, including verifier and
-  escalation cost, by tasks that passed.
+  extra agent steps, judge calls and human review make the total higher. Fix: divide total spend, including
+  verifier and escalation cost, by tasks that passed.
 - **Evaluating on a handful of hand-picked prompts.** Symptom: a configuration that shines in the demo and
   degrades on the real traffic distribution. Fix: add a traffic replay.
 - **Reading a one- or two-point eval difference as a real win.** Symptom: the "winning" configuration swaps
   places with the runner-up every time the eval is re-run or re-sampled. Fix: paired test or a bigger eval.
 - **Leaving output length unconstrained.** Symptom: cost and decode latency creep up after a prompt or
-  model change made the model chattier. Fix: a per-route output cap and an alert on output-token p95.
+  model change made the model chattier, multiplied by every step. Fix: a per-step output cap and an alert
+  on output-token p95.
 - **Treating the frontier as static.** Symptom: a once-optimal setup became dominated after a provider
   price cut or model update that nobody re-tested. Fix: re-run the frontier on a cadence and on every
   model, price or prompt change.
 
 ## When to use
-- **Use when** a feature first approaches production scale, whenever a new model or price list appears,
-  and whenever quality, p95 or cost per task moves outside its band in monitoring.
+- **Use when** an agent first approaches production scale, whenever a new model or price list appears,
+  and whenever run success, p95 or cost per task moves outside its band in monitoring.
 - **Skip the full exercise** for throwaway prototypes and low-volume internal tools, where the cost of
   measuring exceeds the cost of being wrong. Still write down the quality floor so it exists when volume
   arrives.
-- **Day to day:** a dashboard with three lines per feature (quality on a sampled eval, p95, cost per
-  successful task) and a habit of re-running the eval on every prompt, model or retrieval change.
+- **Day to day:** a dashboard with three lines per agent (success on a sampled eval, p95, cost per
+  successful task) and a habit of re-running the eval on every prompt, model, tool or retrieval change.
 - **Interviews:** name all three axes unprompted, insist on cost per successful task, separate
   frontier-moving levers from frontier-shifting ones, and derive the cascade break-even condition from the
   escalation rate.
@@ -346,18 +424,19 @@ successful task so a regression is caught in days rather than at the next invoic
 - **Why not the best model:** quality is task-relative and saturates, while cost and latency are paid on
   every request. The best-scoring model is often tied, within eval noise, with one far cheaper and faster.
 
-### A chat feature has a 6 s p95. How do you find which lever to pull?
-- **Decompose first:** end-to-end is TTFT plus `n_out · TPOT`, and TTFT is network, queueing and prefill.
-  Log TTFT, output tokens and TPOT per request.
-- **If decode dominates** (for example 300 output tokens at 20 ms each is about 6 s), cap output and ask
-  for a terser format; trimming the prompt would barely help.
-- **If TTFT dominates,** look at queueing and prompt length, and add prompt caching for the shared prefix.
+### An agent run takes 50 s and users abandon it. How do you find which lever to pull?
+- **Decompose per step first:** each step is TTFT plus `n_out · TPOT`, and TTFT is network, queueing and
+  prefill. Log TTFT, output tokens, TPOT and tool time per step from the traces.
+- **If decode dominates** (for example 300 output tokens at 20 ms each is about 6 s per step), cap output
+  and ask for terse tool calls; trimming the prompt would barely help.
+- **If TTFT or step count dominates,** add prompt caching for the prefix, run independent tool calls in
+  parallel, and remove steps a deterministic tool could do.
 
 ### When would a small-first cascade be a bad idea?
 - **When escalation is high:** it wins on cost only while `e < 1 − s/l`; at a 2× price gap that is just
   50%, and above it every escalated request pays for both models.
 - **When the tail matters:** escalated requests pay both latencies, so p95 rises even when average cost
-  falls.
+  falls, and in an agent that penalty repeats on every escalated step.
 - **When the gate is unreliable:** a confidence signal that misses wrong answers silently lowers quality,
   so the gate needs its own eval.
 
@@ -369,10 +448,19 @@ successful task so a regression is caught in days rather than at the next invoic
 - **State the exchange rate** to the product owner, so the decision is about whether a possible point is
   worth 3× the spend.
 
+### You swapped your agent to a cheaper model and the cost per successful task went up. How?
+- **More steps per run:** a weaker model picks wrong tools, re-reads results and loops, and every extra
+  step re-sends a growing context.
+- **Lower run success:** failed runs still cost money, and retries or human escalation land in the
+  numerator while fewer successes sit in the denominator.
+- **Check in the traces:** steps per run, tokens per run and success rate before and after; per-call price
+  fell while per-run cost rose.
+
 ### How do you account for a fine-tuned small model whose per-task cost looks tiny?
-- **Add the one-off cost:** data preparation, training runs, evals and the engineering time, amortized over
-  expected volume in the payback period.
-- **Add the recurring cost:** it must be redone when the task or base model changes, so plan for repeats.
+- **Add the one-off cost:** data preparation (for agents, curating good trajectories), training runs, evals
+  and the engineering time, amortized over expected volume in the payback period.
+- **Add the recurring cost:** it must be redone when the task, the tool set or the base model changes, so
+  plan for repeats.
 - **Then compare cost per successful task,** including any human escalation, against the current point on
   the frontier at realistic monthly volume.
 

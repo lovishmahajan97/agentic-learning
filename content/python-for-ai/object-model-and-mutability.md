@@ -5,7 +5,8 @@ name: Object model and mutability
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/dataclasses
   - python-for-ai/memory-and-performance-profiling
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-A Python variable is a name bound to an object; assignment never copies. Most "the value changed by
-itself" bugs in AI code are aliasing: names, defaults, class attributes or slices sharing one mutable
-object, which can leak data across tenants.
+A Python variable is a name bound to an object; assignment never copies. In agents that means message
+histories, graph state and prompt templates are shared unless you build new ones, so one in-place edit
+can corrupt another branch, run or tenant.
+
+## For agent builders
+- **Why it matters for agents.** An agent's state is a pile of mutable lists and dicts: the transcript,
+  tool results, scratchpad, per-tenant tool lists. Forking a run, compacting history, running branches
+  in parallel or sharing a template across users all go wrong silently if two names point at one object.
+- **Where it shows up in your stack.** Message lists you pass to SDKs, graph state handed to each node
+  (LangGraph nodes return updates rather than editing the state they receive), cached tool results,
+  module-level system prompts and tool registries, and in-place tensor ops when you fine-tune.
+- **What you control.** Build per-run and per-request state fresh, keep shared templates immutable,
+  return new messages instead of editing old ones, and lint mutable defaults and class attributes.
+- **What you can skip.** CPython's small-int cache and interning rules beyond "never use `is` on values";
+  descriptor internals beyond the lookup order below.
 
 ## Why it exists
 - **Four bugs, one fact.** `def ask(question, history=[])` passes its unit test, then every production
@@ -141,6 +154,45 @@ flowchart TD
 ```
 
 ## Examples
+### Forked agent branches that share message dicts
+Two branches of one run start from the same history. Branch A compacts long tool output in place for a
+cheaper model, and branch B silently loses the full text, because `list(history)` copied only the outer
+list. The fix returns new dicts only where something changes.
+
+```python
+def compact(messages: list[dict[str, str]], limit: int = 20) -> None:
+    for m in messages:                                  # BUG: edits the dicts in place
+        if m["role"] == "tool" and len(m["content"]) > limit:
+            m["content"] = m["content"][:limit] + "...[truncated]"
+
+def fresh_history() -> list[dict[str, str]]:
+    return [{"role": "user", "content": "Summarise ticket 4521"},
+            {"role": "tool", "content": "full ticket text " * 10}]   # 170 characters
+
+history = fresh_history()
+branch_a = list(history)                    # shallow: new list, SAME message dicts
+branch_b = list(history)
+compact(branch_a)                           # branch A compacts for a cheaper model
+print(len(branch_b[1]["content"]))          # 34: branch B lost the full tool output too
+print(history[1] is branch_b[1])            # True
+
+def compacted(messages: list[dict[str, str]], limit: int = 20) -> list[dict[str, str]]:
+    return [{**m, "content": m["content"][:limit] + "...[truncated]"}
+            if m["role"] == "tool" and len(m["content"]) > limit else m
+            for m in messages]               # new dicts only where something changes
+
+history = fresh_history()
+branch_a = compacted(history)
+print(len(history[1]["content"]), len(branch_a[1]["content"]))   # 170 34
+```
+
+| Branching approach | Cost per fork | Safe if a branch edits a message? |
+|---|---|---|
+| `branch = history` | nothing | no: one list, one set of dicts |
+| `list(history)` or `history[:]` | one list of references | no: dicts shared |
+| `copy.deepcopy(history)` | O(size), every fork | yes, but slow for long transcripts |
+| Treat messages as immutable, return new ones | only what changes | yes, and cheap |
+
 ### Four aliasing bugs from real LLM code, with fixes
 A shared default leaks history between callers, a shallow-copied template leaks tools between tenants,
 `+=` differs for lists and strings, and nested-list multiplication aliases rows.
@@ -223,6 +275,10 @@ print(t)                                        # ([1, 2],)
   `MappingProxyType`, or it stays writable.
 
 ## Production patterns
+- **Append-only transcripts, new messages for edits.** Treat each message in an agent's history as
+  immutable: compaction, redaction and truncation return new lists and new dicts, and graph nodes return
+  state updates instead of mutating the state passed in. A test that forks a run, edits one branch and
+  asserts the other is byte-identical catches regressions.
 - **Lint the two classic leaks.** Enable Ruff's flake8-bugbear rule `B006` (mutable argument defaults) and
   `RUF012` (mutable class attributes without `ClassVar`) in CI. Track the violation count to zero, then
   keep it blocking.
@@ -235,9 +291,10 @@ print(t)                                        # ([1, 2],)
 - **Explicit copies around array views.** In embedding pipelines, write `emb[idx].copy()` or out-of-place
   expressions before normalising, and document any deliberate in-place op. Add a test that checksums the
   source matrix before and after a retrieval call.
-- **Hunt retained GPU memory by references.** When memory does not return after `del`, clear notebook
-  output history and stored exceptions, and inspect holders with `gc.get_referrers(obj)`. Monitor
-  allocated memory per step (for example `torch.cuda.memory_allocated()`) across a long run.
+- **Hunt retained memory by references.** When memory does not return after `del` (a GPU tensor during
+  fine-tuning, or finished agent runs kept alive by a cache or callback), clear notebook output history
+  and stored exceptions, and inspect holders with `gc.get_referrers(obj)`. Monitor allocated memory per
+  step (for example `torch.cuda.memory_allocated()`) across a long run.
 
 ## Trade-offs
 - **Immutable sharing vs allocation.** Tuples, frozen dataclasses and `MappingProxyType` are safe to share
@@ -257,6 +314,9 @@ print(t)                                        # ([1, 2],)
 - **A mutable class attribute as per-instance state.** Every `Agent` shares one `history`; symptom:
   cross-conversation contamination.
 - **Shallow-copying a nested config.** Symptom: tenant A's tools or headers appear in tenant B's requests.
+- **Editing a message in place to compact or redact history.** Symptom: a forked branch, a parallel
+  sub-agent or the stored trace shows the edited text, and a replay no longer matches what the model saw.
+  Fix: return new message dicts.
 - **`x = lst.sort()` or `cfg = d.update(...)`.** Symptom: `AttributeError: 'NoneType' object has no attribute`,
   because mutating methods return `None` by convention.
 - **Mutating a list or dict while iterating it.** Lists skip elements silently; dicts raise
@@ -319,6 +379,14 @@ small structure that actually changes and makes the sharing impossible rather th
 - **Fix and guard:** `None` default with in-body construction, per-instance state in `__init__`, and
   Ruff's `B006` and `RUF012` in CI.
 
+### Your agent forks into three parallel branches from one history, and one branch's compaction shows up in the others. Explain and fix.
+- **The fork was shallow.** `list(history)` gives each branch its own list, but every element is the same
+  message dict, so editing `m["content"]` in one branch edits it for all three and for the stored trace.
+- **Fix without deep copies:** treat messages as immutable values; compaction returns
+  `[{**m, "content": short} ...]` for the changed ones and reuses the rest, so forking costs one list.
+- **Guard it** with a fork-and-edit test, and freeze shared prefixes (system prompt, tool schemas) in
+  tuples or `MappingProxyType`.
+
 ### When would you choose `copy.deepcopy` over making the shared data immutable?
 - **Rarely.** `deepcopy` is O(size) per call and fails on objects holding locks, sockets or SDK clients.
 - **Immutable shared data plus small per-request construction** (`{**base, ...}`) costs only the part that
@@ -330,12 +398,6 @@ small structure that actually changes and makes the sharing impossible rather th
   closure, a cached traceback, a notebook `Out[]` entry) still references it.
 - **Find the holder** with `gc.get_referrers(obj)`, clear stored exceptions and output history, and
   watch allocated memory per step to confirm the release.
-
-### Explain why `t[0] += [2]` on `t = ([1],)` both raises and changes `t`.
-- **`+=` is two steps:** `list.__iadd__` extends the inner list in place, then Python tries to store the
-  result back into `t[0]`.
-- **The store fails** because tuples are immutable, raising `TypeError`, but the in-place mutation has
-  already happened, so `t` is `([1, 2],)`.
 
 ## Quiz
 ### Q: What does `def f(x, acc=[]): acc.append(x); return acc` return on the second call `f(2)` after `f(1)`?

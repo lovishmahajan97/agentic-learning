@@ -5,7 +5,8 @@ name: Request-scoped vs application-scoped resources
 kind: decision
 difficulty: core
 est_minutes: 13
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/dependency-injection
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-Application-scoped objects (model, tokenizer, provider client, DB engine, index, settings) are built once
-per worker in lifespan; request-scoped ones (session, principal, budget, span, request ID) die with the
-request. Wrong one way wastes sockets; the other leaks users' data.
+An agent service mixes three scopes: shared clients and agent definitions (once per worker), per-run
+state like messages, budget and principal (per request), and conversation memory (external store). Wrong
+one way wastes sockets; the other leaks users' data.
+
+## For agent builders
+- **Why it matters for agents.** Agents are stateful: message history, scratchpad, tool results, spend.
+  Put that state on a shared agent object and two users' runs interleave on the event loop and read each
+  other's history. Build the LLM client per run instead and every step pays a fresh TLS handshake.
+- **Where it shows up in your stack.** Lifespan and `app.state` for the provider client, vector index and
+  a compiled agent graph; `yield` dependencies for the principal, DB session and per-run budget; a
+  checkpointer or memory store (Postgres, Redis) keyed by a thread or session ID for memory across turns.
+- **What you control.** Which objects are built once, which are built per run, keeping agent classes
+  stateless (state passed in and returned, never kept on `self`), and how long DB transactions stay open
+  across 5-30 s LLM calls.
+- **What you can skip.** SQLAlchemy pool internals beyond the defaults below. Know the two questions per
+  object and the one-way flow from application to request scope.
 
 ## Why it exists
 - **Mistake one: building shareable things per request.** `httpx.AsyncClient()` inside the handler,
@@ -112,6 +126,15 @@ request scope.
 - **Conversation memory is not in-process at all.** It spans many requests and many workers, so it
   belongs in Redis or the database.
 
+### Scoping an agent service
+| Object | Scope | Because |
+|---|---|---|
+| LLM provider client, embedding client, vector index handle | application (lifespan) | expensive, pooled, concurrency-safe |
+| Compiled agent graph or agent definition (prompt, tool schemas) | application, if it holds no run state | a definition is reusable; the run's state is passed in per call |
+| Run state: messages, scratchpad, step count, spend | request (or the run) | carries one user's identity and data |
+| Principal, permitted toolset, DB session, trace span | request (`yield` dependency) | identity, transactions, teardown |
+| Conversation memory and checkpoints across turns | external store keyed by thread or session ID | spans requests and workers, survives restarts |
+
 ### The hand-off between scopes
 - **Request objects are derived from application objects:**
   - the session comes from the engine's pool;
@@ -153,6 +176,48 @@ flowchart TD
 ```
 
 ## Examples
+### Runnable: a shared agent object leaks history between users
+Pure asyncio, no server. The bad agent keeps `messages` on `self` and is created once at startup, as
+application-scoped objects are. Two users' runs overlap at the LLM `await` and each sees the other's
+messages. The good agent is stateless: the run's state is created per call and passed through.
+
+```python
+import asyncio
+
+class StatefulAgent:                                    # BAD as a singleton: run state on self
+    def __init__(self): self.messages = []
+    async def run(self, user: str, task: str) -> list[str]:
+        self.messages.append(f"{user}: {task}")
+        await asyncio.sleep(0.1)                        # LLM call: other runs interleave here
+        return list(self.messages)                      # what goes into the next prompt
+
+class StatelessAgent:                                   # GOOD: definition shared, state per run
+    async def run(self, user: str, task: str) -> list[str]:
+        messages = [f"{user}: {task}"]                  # run state lives in this call only
+        await asyncio.sleep(0.1)
+        return messages
+
+async def main():
+    for agent in (StatefulAgent(), StatelessAgent()):   # each built once, like lifespan objects
+        a, b = await asyncio.gather(agent.run("alice", "my salary?"), agent.run("bob", "hi"))
+        print(type(agent).__name__, "bob's prompt:", b)
+
+asyncio.run(main())
+# StatefulAgent bob's prompt: ['alice: my salary?', 'bob: hi']
+# StatelessAgent bob's prompt: ['bob: hi']
+```
+
+### Worked scenario: a chat agent that holds a DB transaction across every step
+One worker, SQLAlchemy defaults (15 connections). The agent loads the user's profile, then runs 4 steps
+of ~6 s each before writing the result, all in one transaction (illustrative timings).
+
+| Design | Connection held per run | Ceiling per worker |
+|---|---|---|
+| one transaction from profile read to final write | about 24 s | 15 ÷ 24 s ≈ 0.6 runs/s |
+| commit after the read, short write per step or at the end | milliseconds per transaction | set by the provider and HTTP pool, not the DB |
+
+Same fix as below: keep the session request-scoped, but keep every transaction short.
+
 ### Lifespan plus request-scoped dependencies
 Lifespan creates the application-scoped objects; dependencies derive request-scoped ones; the handler
 mixes them without ever creating a client or sharing a session.
@@ -248,6 +313,10 @@ One worker, SQLAlchemy defaults (15 connections), a 15 s provider call, traffic 
   the document can change meanwhile.
 
 ## Production patterns
+- **Stateless agent definitions, state passed per run.** Use for every agent service: build the agent or
+  graph once in lifespan with no run state on it, create run state per request, and load or save memory
+  through a checkpointer keyed by thread or session ID. Add a concurrency test that runs two users at
+  once and asserts neither prompt contains the other's messages.
 - **One shared client per upstream, with explicit limits.** Use for every provider and internal API:
   build `httpx.AsyncClient(timeout=..., limits=httpx.Limits(max_connections=...))` in lifespan, close it
   with `aclose()` at shutdown, and expose it through a one-line dependency. Monitor new connections per
@@ -296,6 +365,9 @@ One worker, SQLAlchemy defaults (15 connections), a 15 s provider call, traffic 
 - **Holding a DB transaction open across the model call.** Symptom: the database is idle and the provider
   is under quota, yet requests queue and fail with SQLAlchemy `QueuePool limit ... reached` /
   `TimeoutError` once concurrency passes the pool size.
+- **Keeping conversation history on a shared agent instance.** Symptom: under concurrent load a user's
+  answer mentions someone else's question, and the agent "forgets" context when a follow-up lands on
+  another worker. Fix: per-run state in the call, memory in an external store keyed by session ID.
 - **Sharing one DB session across requests.** Symptom: "session already in a transaction" errors and
   commits that contain other requests' changes.
 - **Expecting an in-process cache or counter on `app.state` to be global.** Symptom: rate limits enforced
@@ -342,6 +414,14 @@ shareable thing was made per request, and a per-request thing was made shared.
 - **Carries identity or a transaction, or unsafe → a `yield` dependency**: sessions, principals, budgets,
   spans. Anything shared across workers goes to Redis or the database.
 
+### Where does each piece of an agent's state live in a multi-worker FastAPI service?
+- **Application scope (lifespan):** the LLM client, embedding client, vector index handle and a
+  stateless agent or graph definition, because they are expensive and safe to share.
+- **Request scope:** the principal, permitted tools, run messages, budget and DB session, because they
+  carry one user's identity and data.
+- **External store:** conversation memory and checkpoints keyed by thread or session ID, because the
+  next turn may land on another worker or after a restart.
+
 ### The database is idle and the provider is under quota, yet requests time out with `QueuePool limit ... reached`. Debug it.
 - **Suspect a transaction held across the model call.** A session that has run a query keeps its pooled
   connection until the transaction ends, so a 15 s provider call holds one of 15 default connections.
@@ -350,7 +430,7 @@ shareable thing was made per request, and a per-request thing was made shared.
 - **Fix:** commit after the read, call the model, write in a second short transaction, with
   `expire_on_commit=False` so loaded attributes stay readable.
 
-### Each tenant needs its own provider API key. Where does that client live?
+### Each tenant's agent must call the LLM with that tenant's own provider API key. Where does that client live?
 - **Application scope, keyed by tenant:** a bounded dict of clients, not a new client per request, which
   would pay a handshake every call.
 - **Build lazily behind an `asyncio.Lock`** so two first requests for the same tenant do not create two

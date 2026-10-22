@@ -5,7 +5,8 @@ name: Property-based testing (Hypothesis)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/pytest
   - python-for-ai/pydantic
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-You state a property that must hold for every input; Hypothesis generates hundreds of inputs, biased
-toward edge cases, and shrinks any failure to a minimal counterexample. Parsing, chunking and
-serialisation bugs hide exactly there.
+Models send your agent arbitrary text and arguments. You state a property that must hold for every
+input; Hypothesis generates hundreds of edge-biased inputs and shrinks any failure to a minimal
+counterexample. Tool-argument parsing, chunking and memory bugs hide there.
+
+## For agent builders
+- **Why it matters for agents.** The model is an adversarial input generator you do not control: it
+  emits truncated JSON, wrong types, empty strings and odd Unicode as tool arguments. "The dispatcher
+  never raises on any model output" is a property, and Hypothesis checks it far better than examples.
+- **Where it shows up in your stack.** Tool-argument parsers and validators, RAG chunkers, prompt
+  templates that escape user text, JSON round-trips for tool results, and stateful pieces such as
+  conversation memory, caches and rate limiters.
+- **What you control.** The properties (round-trip, invariant, idempotence, oracle), strategies that
+  build valid inputs directly, and per-lane example budgets so the pull-request lane stays fast.
+- **What you can skip.** Judging model quality with it. Generated inputs test your deterministic code;
+  whether the model chooses well is an eval question.
 
 ## Why it exists
 - **Examples test only what the author imagined.** A chunker passes "a paragraph", "exactly one chunk
@@ -51,6 +64,11 @@ shapes, roughly in order of how often they pay off:
 | **Idempotence** | `f(f(x)) == f(x)` | normalisation, deduplication, cleaning |
 | **Oracle / differential** | fast version agrees with a slow obviously-correct one, or new agrees with old | rewritten ranker vs reference |
 | **Metamorphic** | a known input change gives a known output change | reordering documents does not change the set retrieved |
+| **Total function** | never raises, always returns a result or a typed error | tool-argument parser on any model output |
+
+- **The agent-specific shape is the last one.** A tool dispatcher that raises on bad arguments crashes
+  the loop; one that returns an error result lets the model retry. "Never raises" is cheap to state and
+  Hypothesis finds the inputs that break it.
 
 ### Strategies
 - **Primitives:** `st.integers(0, 100)`, `st.text()`, `st.lists(...)`, `st.dictionaries(...)`.
@@ -101,8 +119,9 @@ The example count is a dial between thoroughness and suite time, so set it per e
   matter, such as "insert at capacity, read the oldest key, insert again".
 
 ## Diagram
-The loop behind one `@given` test: replay saved failures first, generate edge-biased inputs, and on a
-failure shrink the choice sequence until the smallest failing input remains.
+The loop behind one `@given` test, such as a tool-argument parser property: replay saved failures
+first, generate edge-biased inputs, and on a failure shrink the choice sequence until the smallest
+failing input remains.
 
 ```mermaid
 flowchart TD
@@ -120,6 +139,53 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: a tool-argument parser that never crashes the loop
+The model's tool call arrives as a JSON string. The parser must return `{"ok": args}` or
+`{"error": message}` for any input, so the agent can feed errors back instead of crashing; valid
+arguments must survive unchanged.
+
+```python
+import json
+from hypothesis import given, strategies as st
+
+SCHEMA = {"city": str, "days": int}
+
+def parse_tool_args(raw: str) -> dict:
+    try:
+        args = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return {"error": f"arguments are not valid JSON: {e.msg}"}
+    if not isinstance(args, dict):
+        return {"error": "arguments must be a JSON object"}
+    missing = [k for k in SCHEMA if k not in args]
+    if missing:
+        return {"error": f"missing: {', '.join(missing)}"}
+    bad = [k for k, t in SCHEMA.items() if type(args[k]) is not t]   # rejects True for int
+    if bad:
+        return {"error": f"wrong type: {', '.join(bad)}"}
+    return {"ok": {k: args[k] for k in SCHEMA}}
+
+scalars = st.none() | st.booleans() | st.integers() | st.text()
+
+@given(st.text())
+def test_any_text_gives_result_or_error(raw):
+    assert set(parse_tool_args(raw)) in ({"ok"}, {"error"})
+
+@given(st.dictionaries(st.text(), scalars))
+def test_any_object_gives_result_or_error(args):
+    assert set(parse_tool_args(json.dumps(args))) in ({"ok"}, {"error"})
+
+@given(city=st.text(), days=st.integers(), extra=st.dictionaries(st.text(), scalars))
+def test_valid_args_pass_through(city, days, extra):
+    raw = json.dumps({**extra, "city": city, "days": days})
+    assert parse_tool_args(raw) == {"ok": {"city": city, "days": days}}
+```
+
+- **Total, not just correct:** the first two properties encode "the loop never crashes on model output",
+  which is the property agent incidents usually violate.
+- **Extra keys on purpose:** models add fields you did not ask for; the third property states that they
+  are dropped, not that they break the call.
+
 ### Chunker and tool-argument round-trip
 A retrieval chunker with overlap. The contract: no chunk exceeds `size`, only the last may be short,
 consecutive chunks really share `overlap` characters, and dropping each later chunk's overlap rejoins
@@ -255,8 +321,12 @@ Rough orders of magnitude for a suite of 40 property tests at ~2 ms per example 
   `@settings(deadline=None)` or a larger `timedelta`, rather than leaving deadline flakes in the suite.
   Track which tests carry such overrides.
 - **Stateful tests for anything with memory.** Caches, conversation memories and rate limiters get a
-  `RuleBasedStateMachine` against a plain dict or list model. Re-run it whenever eviction or expiry logic
-  changes.
+  `RuleBasedStateMachine` against a plain dict or list model. For agent memory, rules such as add turn,
+  summarise, trim to budget and recall check that pinned facts survive every trim. Re-run it whenever
+  eviction or expiry logic changes.
+- **A "never raises" property per tool.** Every tool the model can call gets one property feeding it
+  arbitrary argument JSON and asserting a result or a typed error. Monitor production tool exceptions
+  that escaped the dispatcher; each is a missing property.
 
 ## Trade-offs
 - **Coverage vs effort.** Properties cover far more of the input space but are harder to write; for code
@@ -286,7 +356,7 @@ Rough orders of magnitude for a suite of 40 property tests at ~2 ms per example 
 
 ## When to use
 - **Use when:** deterministic code has a large input space and an easy-to-state rule: model-output
-  parsers, chunkers and splitters, serialisers, prompt template escaping, ID and deduplication logic,
+  and tool-argument parsers, chunkers and splitters, serialisers, prompt template escaping, ID and deduplication logic,
   ranking and score normalisation, and stateful things like caches and memories.
 - **Avoid when:** judging model quality. Outputs are not deterministic and "correctness" is a graded
   judgement, which evals and metamorphic evaluation address.
@@ -321,6 +391,14 @@ that is an eval over real prompts, and replies would be recorded examples, not g
 - **Why it finds more:** examples cover only what the author imagined, while generators visit the corners
   (chunk size 1, overlap of size minus one, empty text) where parsing and chunking bugs live.
 - **Shrinking makes failures readable**, reporting `text=''` instead of a 1,400-character random string.
+
+### Your agent crashes on some tool calls the model emits. How would property-based testing help?
+- **State the property the crash violates:** for any argument string, the parser or dispatcher returns a
+  result or an error result the model can read, and never raises.
+- **Generate the inputs models produce:** arbitrary text, arbitrary JSON objects, wrong types, missing and
+  extra keys; Hypothesis shrinks a crash to the smallest such input.
+- **Pin each shrunk input** with `@example(...)` and keep the property in the PR lane, since it needs no
+  network or model.
 
 ### Which properties would you write for a retrieval chunker with overlap?
 - **Invariants:** at least one chunk, no chunk longer than `size`, only the last chunk short.

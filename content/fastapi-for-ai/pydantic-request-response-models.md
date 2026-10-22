@@ -5,7 +5,8 @@ name: Pydantic request / response models
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: core
 related:
   - python-for-ai/pydantic
   - fastapi-for-ai/response-model
@@ -21,9 +22,23 @@ sources:
 ---
 
 ## TL;DR
-FastAPI endpoints declare request and response bodies as Pydantic models. Bad input is rejected with a
-422 naming the field, and output is filtered to declared fields, so bad prompts never cost money and
-internal fields never leak.
+Pydantic models are the contracts of an agent service: the run request, the response, and the tool
+arguments the model generates. Bad input becomes a 422 naming the field before tokens are spent, and
+output is filtered so scratchpads never leak.
+
+## For agent builders
+- **Why it matters for agents.** An agent has two untrusted inputs: the client's request and the LLM's
+  own tool-call arguments. The same Pydantic models validate both, turn errors into precise messages
+  (a 422 for clients, a retry hint for the model) and bound everything that costs money, such as steps.
+- **Where it shows up in your stack.** FastAPI request and `response_model` declarations,
+  `model_json_schema()` as a tool's parameter schema, structured outputs in provider SDKs, tool and
+  state definitions in LangChain, LangGraph and the OpenAI Agents SDK, and Pydantic AI, which is built
+  around these models.
+- **What you control.** `extra="forbid"`, `Field` bounds (`max_steps`, `max_tokens`, message counts),
+  `Literal` allow-lists of tools, discriminated unions for message parts and step events, and separate
+  public and internal models so the agent's scratchpad and system prompt stay private.
+- **What you can skip.** Pydantic-core internals and custom serializer plumbing. Know lax versus strict
+  coercion, `exclude_unset`, discriminators and the 422 `loc` path.
 
 ## Why it exists
 - **AI payloads are rich and nested.** Messages with roles, optional tool definitions, sampling
@@ -107,6 +122,16 @@ nesting level.
 - **Strict where coercion would hide bugs.** Strict mode (`ConfigDict(strict=True)` or `Strict*` types)
   stops `"1"` being accepted as `1` when a client sending strings is itself the bug.
 
+### The same models validate the LLM's tool calls
+- **One class, three uses.** A tool's argument model generates the JSON Schema you send as the tool's
+  parameters (`model_json_schema()`), validates the arguments the model returns
+  (`model_validate_json`), and gives the tool function a typed instance.
+- **Errors become feedback, not 422s.** When the model emits bad arguments, `ValidationError.errors()`
+  names the field and the rule; send that back as the tool result so the model can correct itself on the
+  next step, and cap the retries.
+- **Bound agent cost at the contract.** The run request bounds `max_steps` and tool choice, because an
+  unbounded agent loop is an unbounded bill.
+
 ### Why validation lives in the framework, not the handler
 - **Dependencies see validated data too**, such as a token-budget check or a tenant quota, because
   validation runs before the handler.
@@ -133,6 +158,65 @@ flowchart LR
 ```
 
 ## Examples
+### Agent run contract plus validated tool arguments
+The run request bounds steps and restricts tools; the tool's argument model is both its schema and its
+validator. A bad tool call from the model becomes an error message the agent sees on its next step.
+
+```python
+from typing import Literal
+from fastapi import FastAPI
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+class AgentRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    task: str = Field(min_length=1, max_length=20_000)
+    max_steps: int = Field(default=8, ge=1, le=25)              # bounds the bill
+    tools: list[Literal["search_docs", "create_ticket"]] = Field(default=["search_docs"])
+
+class StepSummary(BaseModel):
+    step: int
+    tool: str | None
+    ok: bool
+
+class AgentRunResponse(BaseModel):                              # no scratchpad, no system prompt
+    answer: str
+    steps: list[StepSummary]
+
+class SearchDocsArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(min_length=3, max_length=500)
+    top_k: int = Field(default=5, ge=1, le=20)
+
+TOOL_SCHEMA = {"name": "search_docs", "parameters": SearchDocsArgs.model_json_schema()}
+
+def validate_tool_call(raw_args: str) -> SearchDocsArgs | str:
+    try:
+        return SearchDocsArgs.model_validate_json(raw_args)
+    except ValidationError as e:                                # feed back, do not crash the run
+        return "invalid arguments: " + "; ".join(
+            f"{'.'.join(map(str, err['loc']))}: {err['msg']}" for err in e.errors())
+
+print(validate_tool_call('{"query": "kv cache", "top_k": 50}'))
+# invalid arguments: top_k: Input should be less than or equal to 20
+
+app = FastAPI()
+
+@app.post("/v1/agent/run", response_model=AgentRunResponse)
+async def run(req: AgentRunRequest) -> AgentRunResponse:
+    # ... agent loop over req.max_steps using TOOL_SCHEMA; stubbed ...
+    return AgentRunResponse(answer="done", steps=[StepSummary(step=1, tool="search_docs", ok=True)])
+```
+
+### Worked scenario: what the contract saved in one week
+An internal agent API before and after adding bounds (illustrative numbers).
+
+| Problem | Before | After |
+|---|---|---|
+| Runs with no step cap that looped on a failing tool | 40 runs × ~60 steps | `max_steps` capped at 25; the worst run stops at 25 steps |
+| Bad tool arguments from the model | tool raised, run crashed (~3% of runs) | error fed back; the model fixed most of them on the next step |
+| Client typo `"max_step": 5` | silently ignored, default used | 422 with `loc` `["body", "max_step"]`, `type` `extra_forbidden` |
+| Scratchpad in responses | leaked chain-of-thought and system prompt | absent: not in `AgentRunResponse` |
+
 ### Chat endpoint with a strict, bounded contract
 A forbidding request model, bounded sampling parameters, a discriminated content union, a cross-field
 rule and a separate response model that exposes usage but not cost. Sending
@@ -221,6 +305,10 @@ print(p.model_dump(exclude_unset=True))   # {'top_p': 0.9}
 ```
 
 ## Production patterns
+- **One model per tool, used for schema and validation.** Use for every agent tool: generate the tool's
+  parameter schema from its Pydantic model and validate the model's arguments with the same class, so
+  the schema and the check cannot drift. Monitor the tool-argument validation failure rate per tool and
+  per model version; a jump after a prompt or model change is a regression.
 - **Forbid extras on every request model.** Use on anything that controls model behaviour or cost: put
   `ConfigDict(extra="forbid")` on a shared base class your request models inherit. Monitor the 422 rate
   by `loc` and `type`; a spike after a client release points at a schema mismatch.
@@ -260,6 +348,9 @@ print(p.model_dump(exclude_unset=True))   # {'top_p': 0.9}
   does, and provider metadata reaches customers.
 - **Unbounded `max_tokens` and message lists.** Symptom: a single request produces an outsized provider
   bill or a timeout, and the 422 that should have stopped it never fires.
+- **Letting a tool raise on bad model arguments.** Symptom: agent runs crash on a single malformed tool
+  call that the model would have fixed if told what was wrong. Fix: catch `ValidationError`, return its
+  field-level message as the tool result, and cap retries per step.
 - **Catching `RequestValidationError` and returning a generic "bad request".** Symptom: client teams
   cannot tell which field was wrong, and support tickets replace self-service fixes.
 
@@ -307,7 +398,7 @@ absent from the serialised response.
 - **Dependencies see validated data too**, and validation is cheap: well under a millisecond for typical
   chat payloads.
 
-### Design the request model for a chat endpoint that proxies a hosted LLM. What do you bound and why?
+### Design the request model for a chat or agent endpoint that proxies a hosted LLM. What do you bound and why?
 - **Messages:** `list[Message]` with `min_length=1, max_length=200`, roles as
   `Literal["system", "user", "assistant"]`, and content as a discriminated union of text and image parts.
 - **Sampling and cost:** `temperature` with `ge`/`le` matching the provider's range,
@@ -315,6 +406,14 @@ absent from the serialised response.
   characters.
 - **Typos:** `ConfigDict(extra="forbid")` so a misspelt parameter is a 422, and forward with
   `model_dump(exclude_unset=True)` so omitted fields keep provider defaults.
+
+### The LLM in your agent keeps sending malformed tool arguments. How do you handle it with Pydantic?
+- **Validate with the tool's model**, the same class that generated its parameter schema, using
+  `model_validate_json` on the raw argument string.
+- **Return the error, do not raise.** Send the `loc` and `msg` of each error back as the tool result so
+  the model can retry with corrected arguments; cap retries so a confused model cannot loop.
+- **Tighten the schema** (`Literal`, bounds, descriptions) when one field keeps failing, and track the
+  failure rate per tool after every prompt or model change.
 
 ### A client integration gets 422s even though it sends every required field. What would you check first?
 - **Read `loc`.** If it points at the top-level field, the nesting is probably wrong: one body model

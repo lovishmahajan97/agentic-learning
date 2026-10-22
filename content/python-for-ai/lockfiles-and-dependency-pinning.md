@@ -5,7 +5,8 @@ name: Lockfiles & dependency pinning
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/uv-poetry-pip
   - python-for-ai/security-scanning-and-dependency-auditing
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Declare what you *need* as ranges, record what you *got* as exact versions with hashes, and install only
-from that record. Every developer, CI run and container then installs the same bytes; applications must
-lock, libraries publish ranges.
+Declare what an agent *needs* as ranges, record what it *got* as exact versions with hashes, and install
+only from that record, so the agent you evaluated is the agent you ship. Applications lock; libraries
+publish ranges.
+
+## For agent builders
+- **Why it matters for agents.** Agent behaviour is an eval result, and an eval result is only valid for
+  the environment it ran in. An unlocked rebuild can move `langchain-core`, a provider SDK or a tokenizer
+  and silently change message formatting, tool-call parsing or retries.
+- **Where it shows up in your stack.** `uv.lock` or `poetry.lock` pins LangChain, LangGraph, LangSmith,
+  `openai`, `anthropic` and their transitive graph; Renovate or Dependabot opens upgrade pull requests;
+  your eval suite is the gate on each one.
+- **What you control.** Lock the service and the eval harness from one file, pin what the lock cannot
+  (dated model snapshots instead of moving aliases, prompt versions, embedding model revisions, base
+  image digests), and record all of them with every eval run.
+- **What you can skip.** PEP 440 edge cases beyond `~=` and pre-releases, and lockfile format internals.
 
 ## Why it exists
 - **The graph is mostly not yours.** A typical AI service declares perhaps fifteen direct dependencies and
@@ -106,6 +119,8 @@ exact solution.
 | interpreter version | a `requires-python` range plus a `.python-version` |
 | OS libraries (glibc, CUDA drivers), base container image | an image digest |
 | model weights | model revisions or checksums |
+| hosted model behind an alias | a dated model snapshot ID where the provider offers one |
+| prompts and tool schemas | a prompt version stored with the code |
 
 ## Diagram
 The lock is the only input to every install, hash checks guard the bytes, and changes reach the lock only
@@ -141,6 +156,21 @@ A RAG service declares `openai>=1.0` and `httpx` with no lockfile.
 - **Fix:** also upgrade the SDK to a release that supports the new client, or add a temporary upper bound
   (`httpx<0.28`) with a comment and a ticket to remove it. The failure happened in a pull request, not in
   production.
+
+### Agent scenario: same commit, different agent
+An agent's tool-call success rate on the eval set dropped between two runs of the same commit. The team
+compared what each run actually had (illustrative incident, rates from their eval set).
+
+| Pinned? | Run A (last week) | Run B (today) | Effect |
+|---|---|---|---|
+| Python packages | unlocked rebuild | unlocked rebuild | the agent framework's core package moved one minor version |
+| Hosted model | model alias | same alias, now pointing to a newer snapshot | different tool-call style |
+| Prompt | `support-v7` | `support-v7` | unchanged |
+| Tool-call success on evals | 94% | 81% | two moving parts, impossible to attribute |
+
+The fix was to lock packages with `uv sync --locked`, call a dated model snapshot, and write the lock
+hash, model ID and prompt version into each eval run's metadata. The next drop was attributable to one
+lock diff.
 
 ### What hash checking actually does
 Standard library only: the lock records a digest at resolve time, and the installer refuses a file whose
@@ -185,6 +215,12 @@ them only if nothing else matches). Do not test this with `contains("2.0.0rc1")`
 between `packaging` releases (21.x returns False, 26.x returns True).
 
 ## Production patterns
+- **Record the full agent fingerprint with every eval and trace.** Store the lockfile hash, model snapshot
+  ID, prompt version and embedding model revision as run metadata (LangSmith and similar tools accept
+  arbitrary metadata on runs). Then a quality change maps to one diff instead of a guess.
+- **Gate dependency upgrades on agent evals, not only unit tests.** Upgrade pull requests for agent
+  frameworks and provider SDKs run the eval suite; merge only when task success, tool-call validity and
+  cost per run hold.
 - **Scheduled, small upgrade PRs.** Run `uv lock --upgrade` weekly (or let Renovate or Dependabot do it, if
   they support your lock format), and use `uv lock --upgrade-package openai` for urgent single fixes. Monitor
   lock age and the number of packages behind latest.
@@ -214,6 +250,9 @@ between `packaging` releases (21.x returns False, 26.x returns True).
   conflicts in applications; testing against new releases quickly usually beats capping.
 
 ## Pitfalls
+- **Locking packages but calling a moving model alias.** Symptom: agent behaviour changes with no lock
+  diff at all. Fix: use a dated model snapshot where the provider offers one, and record the model ID with
+  every eval run.
 - **Lockfile not committed** (or in `.gitignore`). Symptom: "works locally, fails in CI" with different
   transitive versions in each environment. Fix: commit it and install with `uv sync --locked`.
 - **`pip install .` in Docker while the lock sits unused.** Symptom: images containing versions that appear
@@ -231,8 +270,8 @@ between `packaging` releases (21.x returns False, 26.x returns True).
   because the base image, CUDA runtime or model revision changed underneath.
 
 ## When to use
-- **Lock:** every application, service, notebook environment that feeds production, and evaluation harness,
-  because eval results are only comparable when the environment is fixed.
+- **Lock:** every agent service, tool server, notebook environment that feeds production, and evaluation
+  harness, because eval results are only comparable when the environment is fixed.
 - **Do not lock:** a library's published dependencies; lock its development environment for CI instead.
 - **Install with checks:** that the lock matches declared dependencies (`uv sync --locked`, `poetry install`
   with a current-lock check), and hash verification where tooling allows.
@@ -278,6 +317,14 @@ pydantic, httpx) would hit an unresolvable conflict.
 - **It means `>=1.4, ==1.*`,** so 1.9 is allowed; the number of components decides how much floats.
 - **For patch releases only,** write `~=1.4.0` or `>=1.4,<1.5`.
 - **And remember** PEP 440 defines ordering, not compatibility, and many AI-stack packages are still `0.x`.
+
+### How would you make an agent's eval results reproducible months later?
+- **Lock the code environment:** commit `uv.lock` and run evals with `uv sync --locked`, the same lock the
+  service image uses.
+- **Pin what the lock cannot:** a dated model snapshot rather than an alias, prompt and tool-schema
+  versions, embedding model revision, base image digest.
+- **Record it all per run:** store the lock hash and those IDs as eval-run metadata, so any later run can
+  be compared or rebuilt exactly.
 
 ### When does hash checking cause more friction than it is worth, and what do you do then?
 - **Missing hashes:** the lock lacks a hash for another platform's wheel.

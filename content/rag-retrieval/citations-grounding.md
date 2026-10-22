@@ -5,7 +5,8 @@ name: Citations / grounding
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - rag-retrieval/citation-correctness
   - rag-retrieval/lost-in-the-middle
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Grounding means the answer comes only from the retrieved sources; citations are machine-checkable
-pointers from each claim to its supporting span. Give sources stable IDs, require a citation per claim,
-allow abstention, and verify citations in code.
+Grounding means an agent's answer comes only from what its tools returned; citations are checkable
+pointers from each claim to a supporting span. Give every tool result a stable ID, require a citation per
+claim, allow abstention, and verify in code.
+
+## For agent builders
+- **Why it matters for agents.** An agent gathers evidence over many tool calls, then writes an answer or
+  takes an action. Without citations you cannot tell which sentence came from a search result and which
+  came from the model's memory, and you cannot audit why the agent acted.
+- **Where it shows up in your stack.** Provider citation features (Anthropic's Messages API can return
+  cited spans for documents you pass), structured-output schemas for claims, the result formatter of each
+  retrieval tool, and the final-answer validator in your agent loop.
+- **What you control.** A run-level source registry so IDs stay stable across tool calls, the claims
+  schema, the abstention path, and what the loop does when verification fails (repair, drop, or flag).
+- **What you can skip.** Building your own span-attribution model. Quote checks in code plus a sampled
+  entailment audit cover most products.
 
 ## Why it exists
 - **Retrieval does not oblige the model to use the text.** It has parametric knowledge from
@@ -48,6 +61,8 @@ allow abstention, and verify citations in code.
 - **Short because the model must reproduce them exactly;** long UUIDs get mangled.
 - **Server-side map** from short ID to real document, version and character range, because the citation
   shown to the user must resolve to the exact text the model saw, not the current version of the file.
+- **In an agent, the map lives for the whole run.** Each tool result gets the next free ID (S1 to S5 from
+  the first search, S6 to S10 from the second), so step 7 can still cite what step 2 found.
 
 ### 2. Choose the citation granularity
 | Pointer | Gain | Cost |
@@ -59,12 +74,13 @@ allow abstention, and verify citations in code.
 
 ### 3. Instruct the citation contract
 - Cite after every sentence that states a fact.
-- Cite only IDs that appear above.
+- Cite only IDs that appear above (or that any tool returned in this run).
 - Prefer quoting the supporting phrase.
 - If the sources do not contain the answer, say so instead of answering.
 
 The abstention clause is the grounding mechanism. Without a legitimate "I don't know" path, the model
-reaches for parametric knowledge and attaches the nearest-looking citation to it.
+reaches for parametric knowledge and attaches the nearest-looking citation to it. For agents, abstention
+can also be "search again with a different query" before giving up.
 
 ### 4. Constrain the output shape
 - **Free-text `[S2]` markers** are easy to read but hard to verify.
@@ -74,6 +90,8 @@ reaches for parametric knowledge and attaches the nearest-looking citation to it
 - **Provider-native citation modes:** you pass documents and the response returns the cited text with its
   location (character ranges for plain text, page numbers for PDFs; the exact shape varies by vendor).
   They remove the parsing burden but tie you to that provider's format.
+- **A final-answer tool** is a natural fit in an agent: the loop ends when the model calls
+  `submit_answer` with the claims schema, so the validator runs on structured arguments.
 
 ### 5. Generation-time vs post-hoc attribution
 | | Generation-time | Post-hoc |
@@ -86,12 +104,13 @@ Mature systems often do generation-time citation, then a post-hoc verification p
 
 ### 6. Verify and act
 Code checks after generation:
-1. Every cited ID exists in this request's source set.
+1. Every cited ID exists in this request's (or this run's) source set.
 2. Every quote is a substring (after whitespace normalisation) of its cited chunk.
 3. Every factual sentence has at least one citation.
 
 - **On failure:** a repair retry, removal of the unsupported sentence, or a visible "unverified" marker,
-  depending on the product's risk tolerance.
+  depending on the product's risk tolerance. In an agent loop, the repair is a tool error returned to the
+  model listing the failing claims.
 - **The strongest check**, whether the cited text actually entails the claim, needs an NLI model or an LLM
   judge and usually runs on a sample or in offline evals.
 
@@ -102,60 +121,71 @@ Code checks after generation:
   long context, both degrade citation quality, so grounding is a property of the whole pipeline.
 
 ## Diagram
-The citation contract end to end: addressable sources go in, structured claims with quotes come out, and
-code checks each claim before the answer reaches the UI.
+The citation contract inside an agent run: tool results get run-level IDs, the agent submits claims with
+quotes, and code checks each claim before the answer reaches the UI.
 
 ```mermaid
 flowchart TD
-    R["Retrieved chunks"] --> M["Assign short IDs S1, S2 and store server-side version map"]
-    M --> P["Prompt: cite per claim, quote verbatim, abstain if unanswerable"]
-    P --> G["Model returns claims with source_ids and quote"]
+    T["Search tool results"] --> M["Run registry: assign S1, S2 and store versions"]
+    M --> P["Context: cite per claim, quote verbatim, abstain allowed"]
+    P --> G["Agent calls submit_answer with claims"]
     G --> A{"answerable?"}
     A -->|"no"| AB["Show I cannot find that in the sources"]
     A -->|"yes"| V["Verifier: IDs exist, quote in cited chunk, every fact cited"]
     V -->|"pass"| U["UI: resolve quote to span and highlight"]
-    V -->|"fail"| F["Repair retry, drop sentence, or mark unverified"]
+    V -->|"fail"| F["Tool error back to agent, or drop or mark unverified"]
+    F --> G
     U -.->|"sampled"| E["Entailment audit with NLI or LLM judge"]
 ```
 
 ## Examples
-### Quote-backed citation contract plus a cheap verifier
-Generation with a quote-backed citation contract, then a cheap verification pass.
+### Agent loop: run-level source registry and a verified final answer
+Every retrieval tool registers its results, so IDs are stable for the whole run. The agent ends by
+calling `submit_answer`; failed claims go back as a tool error for one repair attempt.
 
 ```python
-import json, re
+import re
 
-def build_prompt(question, chunks):
-    src = "\n\n".join(f"[S{i+1}] ({c['title']}, {c['date']})\n{c['text']}"
-                      for i, c in enumerate(chunks))
-    return (f"Sources:\n{src}\n\n"
-            "Answer using ONLY the sources. Return JSON: "
-            '{"claims":[{"text":...,"source_ids":["S1"],"quote":...}], "answerable":true}. '
-            "quote must be copied verbatim from a cited source. "
-            'If the sources do not answer the question, return {"claims":[],"answerable":false}.\n\n'
-            f"Question: {question}")
+class SourceRegistry:
+    def __init__(self):
+        self.by_id = {}                                  # "S3" -> {"doc_id", "version", "text"}
+    def add(self, chunk):
+        sid = f"S{len(self.by_id) + 1}"
+        self.by_id[sid] = chunk
+        return sid
+
+def format_results(registry, chunks):                    # what the search tool returns to the model
+    return "\n\n".join(f"[{registry.add(c)}] ({c['title']}, {c['date']})\n{c['text']}" for c in chunks)
 
 def norm(s):
     return re.sub(r"\s+", " ", s).strip().lower()
 
-def verify(raw, chunks):
-    out = json.loads(raw)
-    ids = {f"S{i+1}": c for i, c in enumerate(chunks)}
+def verify(answer, registry):                            # answer = submit_answer tool arguments
     problems = []
-    if out.get("answerable") and not out["claims"]:
+    if answer.get("answerable") and not answer["claims"]:
         problems.append((None, "marked answerable but made no claims"))
-    for n, cl in enumerate(out["claims"]):
+    for n, cl in enumerate(answer["claims"]):
         if not cl.get("source_ids"):
             problems.append((n, "uncited claim"))
             continue
-        bad = [s for s in cl["source_ids"] if s not in ids]
+        bad = [s for s in cl["source_ids"] if s not in registry.by_id]
         if bad:
             problems.append((n, f"unknown source {bad}"))
             continue
-        quote = norm(cl.get("quote") or "")          # an empty quote would match any chunk
-        if not quote or not any(quote in norm(ids[s]["text"]) for s in cl["source_ids"]):
+        quote = norm(cl.get("quote") or "")              # an empty quote would match any chunk
+        if not quote or not any(quote in norm(registry.by_id[s]["text"]) for s in cl["source_ids"]):
             problems.append((n, "quote missing or not found in cited sources"))
-    return out, problems   # caller repairs, drops, or flags the claims listed in problems
+    return problems
+
+def on_submit_answer(answer, registry, attempts):
+    problems = verify(answer, registry)
+    if not problems:
+        return {"done": True, "answer": answer}
+    if attempts == 0:                                    # one repair turn, then drop failing claims
+        return {"done": False, "tool_error": f"Fix or remove these claims: {problems}"}
+    bad = {n for n, _ in problems if n is not None}
+    answer["claims"] = [c for i, c in enumerate(answer["claims"]) if i not in bad]
+    return {"done": True, "answer": answer, "dropped": sorted(bad)}
 ```
 
 ### Worked scenario: catching a fabricated quote
@@ -168,6 +198,19 @@ Three chunks are retrieved for "What is the refund window for annual plans?"; th
 
 The product regenerates, or drops claim 1 and shows only the supported sentence. No model call was needed
 to catch the fabricated quote.
+
+### Worked scenario: a support agent that acts on a citation
+A refund agent may call `issue_refund` only when a verified claim supports eligibility. Illustrative run:
+
+| Step | Event | Gate |
+|---|---|---|
+| 1 | `search_policy` returns S1 to S5 | registry holds 5 sources |
+| 2 | `get_order` returns S6 (purchase 12 days ago) | registry holds 6 |
+| 3 | agent claims "eligible: within 30 days" citing S2 and S6 with quotes | both quotes found, passes |
+| 4 | `issue_refund` is allowed, and the citations are stored on the action log | auditable |
+
+Had the quote in step 3 failed, the action tool would have refused and the agent would have escalated to
+a human.
 
 ### Resolving a quote to character offsets for the UI highlight
 The model emits a quote, not offsets; the server finds the span in the exact chunk version it sent.
@@ -189,9 +232,12 @@ print(resolve_span("partial refunds are prorated", chunk))                  # No
 ```
 
 ## Production patterns
-- **Claims-with-quotes schema.** Enforce the claims, `source_ids` and `quote` shape with your provider's
-  structured-output or JSON-schema mode, and reject non-conforming responses before verification. Monitor
-  parse-failure rate per model version.
+- **Run-level source registry.** Assign IDs as tool results arrive and keep them for the whole agent run,
+  persisted with the trace. Monitor citations to IDs that never existed; a rise means the model is
+  inventing or mangling IDs.
+- **Claims-with-quotes schema on a final-answer tool.** Enforce the claims, `source_ids` and `quote` shape
+  with your provider's structured-output or tool-schema mode, and reject non-conforming responses before
+  verification. Monitor parse-failure rate per model version.
 - **Version-pinned source map.** Persist, per request, short ID → (doc_id, version, char range) so a
   clicked citation opens the text the model saw even after the file changes. Monitor citations that fail
   to resolve.
@@ -199,13 +245,12 @@ print(resolve_span("partial refunds are prorated", chunk))                  # No
   documents with citations enabled and returns cited text with character or page locations. Map them into
   your own claim schema so the UI does not depend on one format. Monitor the share of answers with no
   citations.
-- **Risk-tiered failure policy.** High-risk surfaces (legal, policy) drop unverified sentences or abstain;
-  low-risk ones show an "unverified" marker; both log the failure. Monitor verifier pass rate and repair
-  retries per answer.
-- **Sampled entailment audit.** Run an NLI model or LLM judge on a daily sample of claim and quote pairs,
-  with human review of disagreements. Track support rate, not citation rate, as the headline metric.
-- **Unanswerable probe set.** Keep questions you know the corpus cannot answer in the eval suite and
-  require abstention. Alert when abstention on them drops.
+- **Citation-gated actions.** Tools with side effects (refunds, account changes, emails) require a
+  verified claim as an argument and log it with the action. Monitor actions blocked by the gate and
+  escalations to humans.
+- **Risk-tiered failure policy plus audits.** High-risk surfaces drop unverified sentences or abstain;
+  low-risk ones show an "unverified" marker. Run an NLI model or LLM judge on a daily sample of claim and
+  quote pairs, keep an unanswerable probe set that must abstain, and track support rate, not citation rate.
 
 ## Trade-offs
 - **Per-claim citations: trust vs friction.** They raise trust and auditability but make prose choppier,
@@ -222,12 +267,16 @@ print(resolve_span("partial refunds are prorated", chunk))                  # No
 - **Post-hoc attribution: coverage vs latency.** It catches sentences the generator never cited, at the
   cost of an extra retrieval and entailment pass per sentence, which matters when latency budgets are
   tight.
+- **Repair turns: fewer dropped claims vs extra steps.** Sending failures back to the agent often fixes
+  them, but each repair is another model call; cap it at one or two.
 
 ## Pitfalls
 - **Calling a list of retrieved documents "citations".** Symptom: users click a source, find nothing
   relevant, then ignore sources entirely.
 - **IDs that resolve to the latest version, not the chunk version the model saw.** Symptom: citations that
   "used to" support the claim after a document edit.
+- **Per-call IDs in a multi-step agent.** Every search restarts at S1, so "S2" means different chunks at
+  different steps. Symptom: citations that point at the wrong document. Fix: a run-level registry.
 - **No abstention path.** The model attaches the nearest citation to parametric knowledge; symptom:
   citations that are topically related but do not state the claimed fact.
 - **Checking only that citation IDs exist, not that the cited text supports the claim.** Symptom: evals
@@ -240,7 +289,8 @@ print(resolve_span("partial refunds are prorated", chunk))                  # No
 
 ## When to use
 - **Use when** an answer could be acted on, disputed or audited: internal knowledge assistants, customer
-  support, policy and legal Q&A, anything sold as "answers from your documents".
+  support, policy and legal Q&A, anything sold as "answers from your documents", and any agent whose
+  actions depend on retrieved facts.
 - **Skip or soften** for brainstorming, drafting and conversational tasks where sources are not the point.
 - **Measure:** the fraction of factual sentences carrying a citation, the fraction of citations that pass
   verification, and abstention rate on questions you know are unanswerable.
@@ -273,6 +323,14 @@ rather than presence. Also check retrieval recall, since missing evidence produc
   grounding inspectable: the UI can show evidence and code can verify it, which an "only use the context"
   instruction never can.
 
+### Your research agent calls search five times before answering. How do you make its citations reliable?
+- **One registry per run.** Each tool result gets a fresh, never-reused ID mapped to document and
+  version, so an ID means the same chunk at every step.
+- **Structured final answer.** The agent ends with a `submit_answer` tool call carrying claims,
+  `source_ids` and verbatim quotes, which code verifies against the registry.
+- **Bounded repair.** Failing claims go back as a tool error once; after that they are dropped or marked
+  unverified, and the run is logged for review.
+
 ### Why is a "sources" list under the answer not enough?
 - **It says what was retrieved, not what supports which sentence.** Users click, find nothing relevant,
   and learn to ignore it.
@@ -293,11 +351,11 @@ rather than presence. Also check retrieval recall, since missing evidence produc
 - **Not when latency is tight:** it adds a retrieval and entailment pass per sentence. Mature systems
   often cite at generation time and run post-hoc verification on top.
 
-### Which metrics would you put on a grounding dashboard, and which one would you not headline?
+### Which metrics would you put on a grounding dashboard for an agent, and which one would you not headline?
 - **Headline support rate:** the share of claims whose cited text entails them, from a sampled NLI or LLM
   judge audit with human review of disagreements.
-- **Also track** verifier pass rate, uncited factual sentences, and abstention on a probe set of known
-  unanswerable questions.
+- **Also track** verifier pass rate, repair turns per run, actions blocked by the citation gate, and
+  abstention on a probe set of known unanswerable questions.
 - **Do not headline citation rate.** 98% of sentences can carry a citation while one answer in six is
   unsupported, because rate measures formatting.
 

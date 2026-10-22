@@ -5,7 +5,8 @@ name: Quantization quality evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - training-adaptation/quantization
   - model-internals/perplexity
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Measure a quantized model against its own full-precision baseline on your workload. KL divergence and
-perplexity are cheap early signals and paired golden-set evals the acceptance test; long context, math,
-code, strict formats and rare languages break first, and averages hide it.
+Before a quantized model drives your agent, measure it against its full-precision baseline on agent
+work. KL and perplexity are cheap early signals; paired evals of tool calls and full runs are the
+acceptance test, because small per-step losses compound.
+
+## For agent builders
+- **Why it matters for agents.** Tool-call JSON, argument values, long transcripts and multi-step
+  reasoning are exactly what quantization breaks first, and an agent needs all of them on every step.
+  A 1-point drop per step becomes a double-digit drop in run success over 15 steps.
+- **Where it shows up in your stack.** Choosing a 4-bit or fp8 build to self-host the agent model,
+  enabling `--kv-cache-dtype fp8` in vLLM, picking a GGUF file for llama.cpp, or a provider swapping in
+  a cheaper variant behind the same name.
+- **What you control.** The baseline (re-run fp16 yourself), the eval set (your agent's tool-call and
+  trajectory tasks), paired statistics, and the gate that blocks the artifact.
+- **What you can skip.** How GPTQ and AWQ compute their scales; that is the quantization lesson. Here
+  you only need to measure the result.
 
 ## Why it exists
 - **The pressure to quantize is constant.** A 4-bit checkpoint lets a 70B model fit where a 16-bit one did
@@ -106,6 +119,8 @@ Add targeted slices *because* average scores mask them:
 - **Multilingual prompts, numbers and dates.**
 - **JSON or tool-call validity rates.**
 - **Refusal or safety behaviour,** which can shift in either direction.
+- **Agent trajectories:** tool selection, argument correctness and run completion on replayed agent
+  tasks, because per-step errors compound over a run (see the worked scenario below).
 - **Speed:** weight-only 4-bit helps bandwidth-bound decode, but some kernels slow prefill through
   dequantisation overhead, so a "faster" model can raise time to first token.
 
@@ -127,8 +142,8 @@ Add targeted slices *because* average scores mask them:
   differs from fp16.
 
 ## Diagram
-The evaluation ladder: each rung is more expensive and closer to real outcomes, and a failure at any
-gate stops the artifact before the next rung.
+The evaluation ladder for a quantized agent model: each rung is more expensive and closer to real
+agent outcomes, and a failure at any gate stops the artifact before the next rung.
 
 ```mermaid
 flowchart TD
@@ -213,7 +228,26 @@ print("read these:", paired_report(fp16, quant))
 The interval straddles zero, so the net number alone is inconclusive, yet ten specific answers broke.
 Read them: if they share a pattern (dates, long inputs, JSON), that slice is the real finding.
 
+### Worked scenario: per-step losses compound over an agent run
+Assume each step's tool call must be correct for the run to succeed and errors are independent (a
+simplification; real agents sometimes recover). Run success is per-step success raised to the number
+of steps.
+
+| Per-step tool-call success | 5-step run | 15-step run |
+|---|---|---|
+| 99.5% | 97.5% | 92.8% |
+| 99% (fp16 baseline, illustrative) | 95.1% | 86.0% |
+| 98% (quantized, illustrative) | 90.4% | 73.9% |
+
+- **One point per step is twelve points per run** at 15 steps (86.0% → 73.9%), a regression no
+  single-turn benchmark would flag.
+- **So evaluate at the run level.** Replay the same agent tasks under both models with identical tools
+  and decoding, score run success per task, and feed the paired results to the bootstrap above.
+
 ## Production patterns
+- **Agent-run gate with paired tasks.** Before a quantized model serves the agent, replay a fixed suite
+  of agent tasks against both builds with the same tools (mocked or sandboxed), prompts and decoding.
+  Gate on paired run success and tool-call validity, and read every task that broke.
 - **KL gate in CI for every artifact.** When a new quantized file is built, run a teacher-forced pass on a
   fixed domain sample (the script above, or llama.cpp's perplexity tool saving base logits and comparing
   KL). Fail the build if mean or 99th-percentile KL exceeds the threshold set from earlier good artifacts.
@@ -238,6 +272,9 @@ Read them: if they share a pattern (dates, long inputs, JSON), that slice is the
   effect.
 - **Greedy vs sampled comparison.** Greedy gives a clean comparison but is not how production runs;
   sampled comparisons are realistic but need several seeds to average out noise.
+- **Single-turn evals vs agent-run evals.** Single-turn slices are cheap and repeatable, but miss how
+  errors compound across steps; full agent replays catch compounding at much higher cost per item. The
+  balance flips toward run-level evals as runs get longer.
 - **Strict thresholds vs serving cost.** Stricter acceptance protects quality but can block a quantization
   that would have cut serving cost in half; the right threshold depends on what the task's errors cost.
 
@@ -253,6 +290,9 @@ Read them: if they share a pattern (dates, long inputs, JSON), that slice is the
   separately, since long-context failures usually trace to the cache.
 - **Calling a 0.8-point drop "within noise" or "significant"** without a confidence interval from paired
   per-item results.
+- **Accepting from single-turn scores for an agent model.** Per-call accuracy drops a point and looks
+  fine. Symptom: run completion falls sharply on long tasks after rollout. Fix: gate on replayed agent
+  runs, and slice by run length.
 - **Reporting only net accuracy.** Equal numbers of fixed and broken items cancel in the mean. Symptom: an
   eval that says "no change" followed by specific, reproducible complaints from production users. Fix:
   report broke and fixed counts and read every broken item.
@@ -264,6 +304,8 @@ Read them: if they share a pattern (dates, long inputs, JSON), that slice is the
   evaluation record. Skip the expensive steps only for throwaway experiments.
 - **Weight by business cost:** watch the categories that break first; a support bot may tolerate what a
   code assistant cannot.
+- **For agent models:** add tool-call validity and replayed run success to the mandatory gates, since
+  those are where quantization damage compounds.
 - **Interviews:** the expected answer to "how do you know 4-bit is fine?" is this ladder plus why
   perplexity alone is not enough, not a quoted benchmark number.
 
@@ -295,8 +337,8 @@ way.
 - **It ignores the rest of the distribution.** KL divergence and top-1 agreement catch shifts in
   alternative tokens, and task evals catch what actually breaks.
 
-### Your 4-bit model passes all benchmarks but users report broken JSON. How do you investigate?
-- **Reproduce with a paired slice:** run fp16 and quantized on the same structured-output prompts with
+### Your 4-bit agent model passes all benchmarks but its tool calls now return broken JSON. How do you investigate?
+- **Reproduce with a paired slice:** run fp16 and quantized on the same tool-calling prompts with
   identical decoding and compare validity rates and flips.
 - **Check what changed together:** if the KV cache was also quantized, test it separately; check the
   calibration data's domain.
@@ -320,6 +362,14 @@ way.
 - **Different recipes:** group size, per-channel versus per-tensor scales and calibration set all move the
   error, so two files can differ more from each other than from fp16.
 - **So** evaluate each artifact, and treat each as its own registered model version.
+
+### How would you decide whether a 4-bit build is good enough to drive a 15-step agent?
+- **Measure at two levels:** per-call tool-call validity and argument accuracy, and run success on
+  replayed agent tasks, both paired against fp16 with identical tools and decoding.
+- **Expect compounding:** 99% versus 98% per step is about 86% versus 74% per 15-step run, so small
+  per-call deltas matter.
+- **Read the broken runs** to find the failing step type, then fix it (an 8-bit build, constrained
+  decoding for tool calls) or reject.
 
 ## Quiz
 ### Q: Why is per-token KL divergence a better early signal of quantization damage than perplexity alone?

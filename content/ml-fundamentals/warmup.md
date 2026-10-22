@@ -5,7 +5,8 @@ name: Warmup
 kind: practice
 difficulty: core
 est_minutes: 11
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/learning-rate-schedulers
   - ml-fundamentals/optimizers
@@ -20,9 +21,21 @@ sources:
 ---
 
 ## TL;DR
-Warmup ramps the learning rate from near zero to its peak over the first few hundred or thousand
-optimizer steps, because early gradients are large and Adam's variance estimates rest on almost no data.
-A short ramp is cheap and removes most early divergence.
+Warmup ramps the learning rate from near zero to its peak over the first optimizer steps. When you
+LoRA-tune a model on agent traces, a short, correctly counted ramp prevents the early loss spike that
+wrecks small, short runs.
+
+## For agent builders
+- **Why it matters for agents.** Agent fine-tunes (tool-call format, routing, trajectory imitation) are
+  short runs of a few hundred optimizer steps at fairly high LoRA rates. A missing ramp spikes the loss in
+  the first tens of steps; a pre-training-sized ramp means the run never reaches its peak.
+- **Where it shows up in your stack.** `warmup_steps` or `warmup_ratio` in the Hugging Face Trainer and TRL
+  trainers, `num_warmup_steps` in `get_cosine_schedule_with_warmup`; hosted fine-tuning services pick it
+  for you.
+- **What you control.** Ramp length in optimizer steps, whether a new training phase gets a fresh ramp,
+  and logging grad norm from step zero so you can see whether the ramp was enough.
+- **What you can skip.** The Post-LN versus Pre-LN derivation and large-batch ImageNet history: know that
+  modern LLMs are Pre-LN and that Adam's first steps are the reason warmup exists.
 
 ## Why it exists
 - **Nothing is calibrated at init.** Activations have whatever scale the init gave them, the loss is at
@@ -31,15 +44,10 @@ A short ramp is cheap and removes most early divergence.
   different one step later. Result: loss drops, spikes, then recovers slowly or produces NaNs.
 - **Adam's early statistics are noise.** It divides each update by `√v̂`, a running average of squared
   gradients built from one sample after one step, ten after ten. A parameter whose few observed gradients
-  happened to be small gets an update far too large. RAdam showed the effective step size has divergent
-  variance in the first iterations; warmup keeps updates small until `v` can be trusted.
-- **Post-LN amplifies it.** In the original Post-LN transformer the expected gradient norm nearest the
-  output is large at init and does not shrink with depth, while Pre-LN scales roughly as `1/√L`, so a deep
-  Post-LN model's first updates are disproportionately large near the output. The paper that analysed this
-  showed Post-LN is unstable without warmup, while Pre-LN tolerates its absence.
-- **Large batches need it.** A bigger batch justifies a bigger rate only once the model has left the
-  chaotic initial region, so the ImageNet-in-one-hour recipe ramped linearly over the first five epochs
-  instead of starting at the scaled peak.
+  happened to be small gets an update far too large.
+- **RAdam quantified it.** It showed the effective step size has divergent variance in the first
+  iterations; warmup keeps updates small until `v` can be trusted. This applies to every fresh optimizer,
+  including the one you create for each LoRA adapter.
 - **A lower peak is the wrong fix.** It avoids the early blow-up, but the whole run trains too slowly and
   ends at a worse loss. Warmup separates the concerns: a conservative start and an aggressive middle.
 
@@ -70,12 +78,19 @@ takes over:
 4. **After W.** The model is in a smoother basin, moment estimates are reliable, and the main schedule
    (cosine, linear, WSD) governs.
 
+### Why LoRA needs a ramp too
+- **`B` starts at zero.** On step one only `B` gets a gradient, and Adam's sign-like first step moves every
+  element of `B` by the full rate in one batch's direction.
+- **LoRA uses higher peak rates** than full fine-tuning, so that first move is larger. A 20–50 step ramp
+  removes the first-steps loss jump.
+
 ### How long
 There is no closed form. Practical ranges:
 
 | Run | Typical warmup |
 |---|---|
-| Fine-tuning | a few percent of total steps, or a fixed 50–200 steps |
+| Fine-tuning (including agent SFT) | a few percent of total steps, or a fixed 50–200 steps |
+| LoRA adapter on traces | a 20–50 step ramp |
 | Pre-training | on the order of a thousand to a few thousand steps (Llama 2 reports 2,000) |
 | Small fine-tune, low peak | often very little |
 
@@ -91,13 +106,23 @@ modern recipes use all three. Removing one usually means asking more of the othe
 - **Warmup** shrinks the step itself.
 - **RAdam** builds the variance correction into the optimizer (it damps the adaptive step until `v` has
   enough samples), so some recipes run it with no explicit ramp. Most LLM recipes still pair AdamW with a
-  plain linear warmup, because it is simpler to reason about and tune.
+  plain linear warmup, because it is simpler to reason about and tune, and it also covers the large,
+  poorly conditioned initial gradients.
 
 ### Resuming and re-warming
 - **Resume with intact optimizer state:** do *not* repeat warmup, because `v` is already populated.
   Restore the scheduler state so the learning rate continues where it left off.
-- **New phase** (continued pre-training on new data, or fine-tuning from a base model): the optimizer
-  state is fresh, so a new warmup is needed even though the weights are trained.
+- **New phase** (continued pre-training on new data, fine-tuning from a base model, or a new adapter on
+  this month's agent traces): the optimizer state is fresh, so a new warmup is needed even though the
+  weights are trained.
+
+### Background: Post-LN and large batches
+- **Post-LN amplifies it.** In the original Post-LN transformer the expected gradient norm nearest the
+  output is large at init and does not shrink with depth, while Pre-LN scales roughly as `1/√L`. The paper
+  that analysed this showed Post-LN is unstable without warmup, while Pre-LN tolerates its absence.
+- **Large batches need it.** A bigger batch justifies a bigger rate only once the model has left the
+  chaotic initial region, so the ImageNet-in-one-hour recipe ramped linearly over the first five epochs
+  instead of starting at the scaled peak.
 
 ## Diagram
 Follow one run from initialization: the ramp covers the window where Adam's statistics are unreliable,
@@ -105,16 +130,29 @@ and a resume skips it only when optimizer state comes back with the weights.
 
 ```mermaid
 flowchart TD
-    A["Random init, empty m and v"] --> B["Step 1: update is eta times sign g"]
+    A["Fresh optimizer, empty m and v"] --> B["Step 1: update is eta times sign g"]
     B --> C["Steps 1 to 10: v from few samples"]
     C --> D["Steps 10 to W: eta rises, curvature falls"]
     D --> E["After W: main schedule"]
     E --> F{"Restart?"}
     F -->|"resume with optimizer state"| E
-    F -->|"fresh optimizer or new phase"| A
+    F -->|"new adapter or new phase"| A
 ```
 
 ## Examples
+### Worked scenario: warmup for a tool-calling LoRA adapter
+A team tunes an adapter on 2,400 tool-call traces: micro-batch 4, accumulation 4, one GPU (16 traces per
+optimizer step), 2 epochs, so 150 steps per epoch and 300 optimizer steps in total.
+
+| Warmup choice | Steps of ramp | Share of the run | What you see |
+|---|---|---|---|
+| None, peak from step one | 0 | 0% | loss jump and grad-norm spike in the first tens of steps |
+| `warmup_ratio` 0.1 | 30 | 10% | smooth start, peak reached at step 30 |
+| Copied pre-training value | 2,000 | longer than the run | rate never reaches the peak; the format is barely learned |
+
+The middle row sits inside the 20–50 step LoRA range; the third row is the pitfall of reusing a
+pre-training warmup for fine-tuning.
+
 ### Sizing warmup from the real optimizer step count
 A fine-tuning configuration where warmup is derived from the real number of optimizer steps, then checked
 by printing the learning rate at the ends of the ramp. The scheduler comes from `transformers`; the
@@ -192,18 +230,20 @@ Only a smaller `lr` on that first step shrinks the move, which is exactly what t
 - **Log grad norm from step zero.** `torch.nn.utils.clip_grad_norm_` returns the pre-clip total norm, so
   log it every step. A healthy run shows the norm falling as the rate rises; a spike in the first few
   hundred steps means the ramp is too short.
-- **Re-warm on every fresh optimizer.** Continued pre-training on new data or fine-tuning from a base
-  model starts with empty `m` and `v`, so give it its own ramp. A true resume restores optimizer and
-  scheduler state and skips it; alert if the logged rate drops at a resume step.
-- **Short ramp for LoRA.** LoRA's `B` starts at zero and LoRA uses higher peak rates, so a 20–50 step ramp
-  removes the first-steps loss jump. Watch grad norm over the first tens of steps.
+- **Short ramp for every agent adapter.** Each new LoRA adapter on tool-call or routing traces gets a 20–50
+  step ramp, because `B` starts at zero and LoRA peaks are high. Watch grad norm over the first tens of
+  steps and keep the ramp in the shared training template so teams do not drop it.
+- **Re-warm on every fresh optimizer.** Continued pre-training on new data, fine-tuning from a base model,
+  or retraining the agent model on new traces starts with empty `m` and `v`, so give it its own ramp. A
+  true resume restores optimizer and scheduler state and skips it; alert if the logged rate drops at a
+  resume step.
 - **Scale warmup with peak rate and batch.** When raising the peak learning rate or batch size, lengthen
   warmup as Goyal et al. did (a linear ramp over the first five epochs at large batch). Monitor early
   gradient-norm spikes after each change.
 
 ## Trade-offs
 - **Safety vs productive steps.** A longer warmup is safer against early divergence but spends more of a
-  short fine-tuning run below the productive rate; once the early gradient-norm spike is gone, extra ramp
+  short agent fine-tune below the productive rate; once the early gradient-norm spike is gone, extra ramp
   buys nothing, so the trade flips as soon as a shorter warmup shows a clean norm trace.
 - **Higher peak vs noisy end.** Warmup lets you use a higher peak learning rate, reaching a given loss in
   fewer steps, but the higher peak then needs a proper decay phase or the run ends noisy.
@@ -213,13 +253,13 @@ Only a smaller `lr` on that first step shrinks the move, which is exactly what t
   convenience of "just reload the weights" trades for a second unstable start.
 
 ## Pitfalls
-- **Counting warmup in the wrong unit.** Setting `warmup_steps` as if steps were micro-batches or epochs.
-  Symptom: a ramp that never finishes before the run ends, or one over after a single logging interval.
-  Fix: derive it from the optimizer-step count and print the rate at `W` before launch.
+- **Counting warmup in the wrong unit.** Setting `warmup_steps` as if steps were micro-batches, traces or
+  epochs. Symptom: a ramp that never finishes before the run ends, or one over after a single logging
+  interval. Fix: derive it from the optimizer-step count and print the rate at `W` before launch.
 - **Resuming without scheduler state.** Warmup restarts from zero at step 10,000; the loss curve shows a
   visible dip in progress for the next few hundred steps. Fix: save and restore the scheduler with the
   optimizer.
-- **Blaming data for a step-50 spike.** It is usually a warmup problem. Check the gradient norm trace
+- **Blaming the traces for a step-50 spike.** It is usually a warmup problem. Check the gradient norm trace
   first, because it jumps before the loss does.
 - **Reusing a pre-training warmup for fine-tuning.** Thousands of steps of ramp in a 500-step run means the
   model never reaches its intended learning rate.
@@ -229,11 +269,12 @@ Only a smaller `lr` on that first step shrinks the move, which is exactly what t
 
 ## When to use
 - **Use warmup** in essentially every run with an Adam-family optimizer, which is every run in modern AI
-  engineering.
+  engineering, agent fine-tunes included.
 - **Fine-tuning:** default to a few percent of total optimizer steps and verify the step count.
 - **Pre-training or large-batch training:** size it in the thousands of steps, and increase it when
   raising the peak learning rate or batch size.
-- **Skip it** only in tiny experiments where divergence is cheap to notice and restart.
+- **Skip it** only in tiny experiments where divergence is cheap to notice and restart, or when you only
+  prompt hosted models and never train.
 - **Measure:** log learning rate and gradient norm from step zero; a healthy run shows the norm falling as
   the rate rises.
 - **Interviews:** the question is rarely "what is warmup" but "why does Adam need it". The answer is the
@@ -268,13 +309,20 @@ a wasted run.
   moves by the full rate regardless of how small or noisy its gradient was.
 - **Warmup keeps η tiny** for exactly that window, then hands over to the main schedule.
 
-### A fine-tune's loss spikes around step 50 and then recovers slowly. Walk me through the diagnosis.
+### Your LoRA fine-tune on agent tool-call traces spikes around step 50 and recovers slowly. Diagnose it.
 - **Check the grad-norm trace first:** it jumps before the loss does, which points at optimization
-  stability rather than a bad data shard.
+  stability rather than a bad batch of traces.
 - **Check step accounting:** confirm warmup was counted in optimizer steps and actually ran, and that the
   peak was reached when intended.
 - **Fix:** lengthen the ramp (for example 50–200 steps for fine-tuning) or lower the peak, then rerun and
-  compare the norm trace.
+  compare the norm trace and the tool-call eval.
+
+### You retrain the agent's routing adapter every week on new traces. Does each run need warmup?
+- **Yes, if the optimizer is fresh:** a new run starts with empty `m` and `v`, so give it its own short
+  ramp even when starting from last week's adapter weights.
+- **No, on a true resume:** if a crashed run restores optimizer and scheduler state, continue from the
+  saved step instead of repeating the ramp.
+- **Keep it in the template** so every weekly run logs grad norm from step zero.
 
 ### When is it correct to skip warmup?
 - **On a true resume:** if the checkpoint restores optimizer state, `v` is populated and the scheduler
@@ -287,12 +335,6 @@ a wasted run.
 - **Fine-tuning:** a few percent of total steps or a fixed 50–200 steps.
 - **Too short:** loss or grad-norm spike in the first few hundred steps. **Too long:** a flat early loss
   curve that only starts falling when the ramp ends.
-
-### Does RAdam make explicit warmup unnecessary?
-- **It addresses the same cause:** RAdam damps the adaptive step until `v` has enough samples, so some
-  recipes run it with no explicit ramp.
-- **Why most LLM recipes still use AdamW plus linear warmup:** it is simpler to reason about and tune,
-  and it also covers the large, poorly conditioned initial gradients.
 
 ## Quiz
 ### Q: Why does Adam specifically benefit from learning-rate warmup?

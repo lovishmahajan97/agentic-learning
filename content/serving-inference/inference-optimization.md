@@ -5,7 +5,8 @@ name: Inference optimization
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/continuous-batching
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-Levers that make a fixed model cheaper or faster. Decode is bandwidth bound (each token re-reads weights
-and cache), prefill compute bound, and the bound you hit decides which lever can help: learn the
-roofline, not a list of tricks.
+Levers that make each agent step cheaper or faster on a fixed model. Decode is bandwidth bound, prefill
+compute bound, and agent traffic (long transcripts, short tool calls) leans on prefill: the bound you hit
+decides which lever helps.
+
+## For agent builders
+- **Why it matters for agents.** An agent multiplies every per-call cost by its step count. A 10-step
+  task with long prompts and 150-token tool calls spends most of its GPU time on prefill, so prefix
+  caching and prompt discipline usually beat any decode trick.
+- **Where it shows up in your stack.** Provider prompt caching and smaller-model tiers for hosted APIs;
+  vLLM or SGLang flags (`--enable-chunked-prefill`, `--kv-cache-dtype fp8`, `--quantization`) and
+  speculative decoding for self-hosted models; structured-output or tool-call constraints in both.
+- **What you control.** Fewer steps per task, shorter and stable prompts, per-step `max_tokens`, routing
+  easy steps (classify, summarize a tool result) to a small model, and one-flag-at-a-time changes gated
+  by your agent eval.
+- **What you can skip.** Writing kernels or tuning CUDA graphs yourself. Know the roofline and the regime
+  table; that tells you which lever to ask for.
 
 ## Why it exists
 - **GPUs have a fixed compute-to-bandwidth ratio.** An H100 does on the order of a thousand teraFLOPs of
@@ -67,12 +81,16 @@ time_per_step ≈ max( (W + C) / bandwidth ,  2·B·params / FLOPs )
 
 ### Levers that do less work per request
 - **Prefix caching.** Skip prefill for a prompt prefix already in cache. Cuts TTFT and compute for shared
-  system prompts, few-shot blocks and multi-turn chat.
+  system prompts, few-shot blocks, tool schemas, multi-turn chat and every step of an append-only agent
+  transcript.
 - **Prompt and output discipline.** Shorter prompts cut prefill compute linearly; a sensible `max_tokens`
-  and stop sequences stop decode from generating tokens nobody uses.
+  and stop sequences stop decode from generating tokens nobody uses. For agents, trimming verbose tool
+  results before appending them shrinks every later step.
+- **Fewer steps.** Each agent step is a full request. Parallel tool calls in one step, or a plan that
+  needs fewer round trips, removes whole prefill and decode passes.
 - **Constrained decoding.** Masking logits with a grammar or JSON schema removes retries for invalid
-  output, a request-level optimization. Computing the mask is CPU work per step, so a slow grammar engine
-  can itself bottleneck at high batch.
+  output (such as malformed tool-call arguments), a request-level optimization. Computing the mask is CPU
+  work per step, so a slow grammar engine can itself bottleneck at high batch.
 
 ### Speculative decoding
 1. **Draft.** A small draft model (or a lightweight head) proposes *k* tokens.
@@ -86,7 +104,8 @@ expected tokens per target pass = (1 − α^(k+1)) / (1 − α)      # α = per-
 α = 0.8, k = 4  ->  about 3.4 tokens per pass instead of 1, minus the draft's own cost
 ```
 
-- **When it helps:** small batch and an accurate draft. Acceptance falls on creative or unusual text.
+- **When it helps:** small batch and an accurate draft. Acceptance falls on creative or unusual text, and
+  tends to be high on predictable text such as code and structured tool-call JSON.
 - **When it hurts:** at large batch the GPU is already busy, so verification competes with real work.
 
 ### Levers that fit more work into the same bytes
@@ -112,6 +131,8 @@ expected tokens per target pass = (1 − α^(k+1)) / (1 − α)      # α = per-
 ### Levers outside the engine
 - **Route easy requests to a smaller model, cache whole responses, distill a task-specific small model, or
   precompute embeddings.**
+- **For agents:** use a small model for routing, intent classification and summarizing tool output, and
+  keep the large model for planning; cache deterministic tool results so repeated lookups skip a step.
 - **These often beat any engine knob,** because they cut the number of tokens that touch an expensive GPU
   in the first place.
 
@@ -123,13 +144,14 @@ expected tokens per target pass = (1 − α^(k+1)) / (1 − α)      # α = per-
 |---|---|---|
 | Small batch, pool far from full | Latency-bound per request | Quantize weights, add speculative decoding, trim prompts |
 | Pool full | Memory-bound | Quantize cache, enable prefix caching, choose a GQA model, add GPUs |
-| Prefill dominates, TTFT is the complaint | Compute-bound prefill | Chunked prefill, prefix caching, shorter prompts |
+| Prefill dominates, TTFT is the complaint (typical of agents) | Compute-bound prefill | Chunked prefill, prefix caching, shorter prompts |
 
 3. **Change one knob, re-measure.** Changing a knob without knowing the regime is how teams "optimize"
    into a slower system.
 
 ## Diagram
-Measure first, then let the regime pick the lever; each branch attacks a different term of the roofline.
+Measure agent steps first, then let the regime pick the lever; each branch attacks a different term of
+the roofline, and every change goes back through the agent eval.
 
 ```mermaid
 flowchart TD
@@ -140,7 +162,7 @@ flowchart TD
     P --> P1["Chunked prefill, prefix cache, shorter prompts"]
     L --> L1["Weight quant, speculative decoding, CUDA graphs"]
     C --> C1["KV quant, GQA model, paging, more GPUs"]
-    P1 --> R["Re-run load test plus quality eval"]
+    P1 --> R["Re-run load test plus agent eval"]
     L1 --> R
     C1 --> R
     R --> M
@@ -195,29 +217,61 @@ for alpha in (0.5, 0.7, 0.8, 0.9):
 # 0.9 -> [2.71, 4.1, 6.13]   predictable text (code, templates) rewards longer drafts
 ```
 
+### Agent scenario: where a 10-step task spends its GPU time
+A tool-calling agent on the 8B model above: a 6k-token prefix (system prompt plus tool schemas), ~1k
+tokens appended per step (tool call plus result), ~150 output tokens per step. Rates are illustrative
+assumptions (10,000 prefill tokens/s, the ~5.4 ms batch-1 decode floor), not a benchmark.
+
+| Quantity over 10 steps | No prefix reuse | Append-only transcript plus prefix caching |
+|---|---|---|
+| Prefill tokens | 6k + 7k + … + 15k = 105k | 6k + 9 × 1k = 15k |
+| Prefill time | ~10.5 s | ~1.5 s |
+| Decode tokens and time | 1,500 tokens, ~8.1 s | 1,500 tokens, ~8.1 s |
+| Prefill share of GPU time | ~56% | ~16% |
+
+```python
+prefix, per_step, out, steps = 6000, 1000, 150, 10
+no_reuse = sum(prefix + per_step * i for i in range(steps))      # 105,000
+reuse = prefix + per_step * (steps - 1)                          # 15,000
+decode_s = steps * out * 5.4e-3                                  # ~8.1 s
+for name, toks in (("no reuse", no_reuse), ("prefix cache", reuse)):
+    pre_s = toks / 10_000
+    print(name, toks, f"{pre_s:.1f}s prefill", f"{pre_s / (pre_s + decode_s):.0%} of GPU time")
+```
+
+- **Read it as:** for agents the first lever is a stable, append-only prompt, not a decode trick. Once
+  prefill is small, decode dominates and weight quantization or speculative decoding (high acceptance on
+  tool-call JSON) becomes the next lever.
+
 ### Worked triage: three slow deployments
 | Deployment | Measured | Regime | First lever |
 |---|---|---|---|
 | Internal copilot, 70B on 2 GPUs | Batch 3, pool 30% used, slow streaming | Bandwidth-bound decode | fp8 or 4-bit weights with an eval, then speculative decoding |
 | Support chat at peak | Pool pinned near 100%, preemptions climbing | Memory-capacity bound | fp8 KV cache, prefix caching for the shared system prompt |
 | Contract review, 30k-token prompts | TTFT is the complaint, decode fine | Compute-bound prefill | Chunked prefill, prefix caching, trimming boilerplate from prompts |
+| Research agent, 25 steps per task | Per-step TTFT grows each step, low cache hit rate | Compute-bound prefill, re-done every step | Stable prefix, append-only transcript, session-affine routing, trim tool output |
 
 ## Production patterns
 - **Load test with the production length mix.** Replay real prompt/output length distributions (for
   example 6k in / 800 out, not 500 in / 100 out) at target concurrency with a serving benchmark such as
-  vLLM's, before and after each flag. Monitor TTFT p95, TPOT p95 and tokens/s per GPU together.
-- **One flag per change, with a quality gate.** Treat quantization (`--quantization` with an AWQ, GPTQ or
-  fp8 checkpoint in vLLM) and `--kv-cache-dtype fp8` as releases: run the task eval set, especially its
-  hard tail, and roll back on regression. Monitor eval score alongside latency.
+  vLLM's, before and after each flag. For agents, replay recorded multi-step traces so later, longer
+  steps are represented. Monitor TTFT p95, TPOT p95 and tokens/s per GPU together.
+- **One flag per change, with an agent eval gate.** Treat quantization (`--quantization` with an AWQ,
+  GPTQ or fp8 checkpoint in vLLM) and `--kv-cache-dtype fp8` as releases: run the task eval set,
+  especially its hard tail and tool-call validity rate, and roll back on regression. Monitor eval score
+  alongside latency.
+- **Make the prompt cacheable before tuning the engine.** Put system prompt and tool schemas first and
+  byte-identical, append tool results instead of rewriting history, and trim tool output. Monitor
+  cached-token share per agent step.
 - **Chunked prefill for mixed traffic.** Enable it (`--enable-chunked-prefill` in vLLM, on by default in
   recent versions) and tune `--max-num-batched-tokens` to bound how much prefill rides in each step.
   Monitor TPOT p99 during long-prompt bursts.
 - **Speculative decoding only on low-batch routes.** Enable it for latency-sensitive, low-concurrency
   deployments and keep it off on high-utilization batch pools. Monitor acceptance rate and throughput; turn
   it off when acceptance drops or throughput falls.
-- **Cheap path first.** Route easy intents to a smaller model and cache whole responses for repeated
-  queries, gated by an eval proving the cheaper path meets the bar. Monitor share of traffic on the cheap
-  path and its quality score.
+- **Cheap path first.** Route easy intents and easy agent steps (routing, summarizing tool output) to a
+  smaller model and cache whole responses for repeated queries, gated by an eval proving the cheaper path
+  meets the bar. Monitor share of traffic on the cheap path and its quality score.
 
 ## Trade-offs
 - **Weight quantization vs accuracy.** Cuts bytes per step and VRAM but costs some accuracy. Flips against
@@ -229,7 +283,10 @@ for alpha in (0.5, 0.7, 0.8, 0.9):
 - **Tensor parallelism vs communication.** Spreads bandwidth across GPUs but adds inter-GPU communication
   every layer. It stops helping once the model fits comfortably and the interconnect is slow.
 - **Smaller models and response caches vs proof.** They can beat every engine knob, but only if an
-  evaluation proves the cheaper path meets the quality bar.
+  evaluation proves the cheaper path meets the quality bar; in an agent, a weaker step can cost more
+  steps later, so measure task success, not per-call accuracy.
+- **Shorter context vs agent memory.** Trimming tool output and compacting history cuts prefill on every
+  later step, but drops facts the agent may need. Flips when tasks depend on details from early steps.
 
 ## Pitfalls
 - **Tuning for batch throughput, shipping to an interactive product.** Symptom: good tokens/sec dashboards
@@ -240,6 +297,9 @@ for alpha in (0.5, 0.7, 0.8, 0.9):
   tail of the evaluation set, weeks after deployment. Fix: gate every quantized checkpoint on the task eval.
 - **Chasing kernel gains while prompts carry thousands of tokens of boilerplate.** Symptom: prefill
   dominates TTFT no matter what engine flags change. Fix: trim the prompt or cache its shared prefix first.
+- **Optimizing per-call latency while the agent takes too many steps.** Symptom: each call got faster but
+  task latency and cost barely moved. Fix: measure steps per task and cut round trips (parallel tool
+  calls, better plans) before tuning the engine.
 - **Reading vendor peak FLOPS as a throughput promise.** Symptom: utilization in the single digits and a
   purchase order for faster GPUs that do not help decode. Fix: compare GPUs on memory bandwidth for decode.
 - **Load-testing with the wrong length mix** (say, 500 in / 100 out when real traffic is 6k in / 800 out).
@@ -247,8 +307,8 @@ for alpha in (0.5, 0.7, 0.8, 0.9):
   sat in a different regime. Fix: replay length distributions sampled from production logs.
 
 ## When to use
-- **Use when a measured number misses a target:** TTFT above budget, TPOT making text feel slow, or cost
-  per million tokens above plan.
+- **Use when a measured number misses a target:** TTFT above budget, TPOT making text feel slow, agent
+  task latency above budget, or cost per million tokens above plan.
 - **Classify the regime first** (bandwidth-bound decode, compute-bound prefill, or memory-capacity-bound
   concurrency) and pick the lever that attacks it.
 - **Avoid** optimizing a workload you have not profiled, and stacking levers blindly: quantization plus
@@ -298,8 +358,9 @@ limits; there is no demand to fill them. If traffic later grows and the pool fil
   per pass, which the draft's cost can erase.
 - **Use it** for small-batch, latency-sensitive routes with predictable output.
 
-### Your pool is at 100% and preemptions are climbing. Which levers and in what order?
-- **Confirm the regime:** pool full means memory-capacity bound, not bandwidth or compute.
+### Your agent fleet's pool is at 100% and preemptions are climbing. Which levers and in what order?
+- **Confirm the regime:** pool full means memory-capacity bound, not bandwidth or compute. Long-running
+  agents with growing transcripts are the usual cause.
 - **Cheap first:** prefix caching for shared prompts, tighter `max_tokens`, fp8 KV cache after an eval.
 - **Then structural:** a GQA model, more GPUs or replicas. Weight quantization helps only by freeing VRAM
   for cache.
@@ -308,6 +369,14 @@ limits; there is no demand to fill them. If traffic later grows and the pool fil
 - **Bytes per step:** ~16 GB of weights plus the batch's cache.
 - **Floor:** 16 GB ÷ 3 TB/s ≈ 5.3 ms, so ~5.4 ms with a 2k-token cache at batch 1, about 180 tokens/s.
 - **4-bit weights** cut that to about 1.4 ms, roughly 3-4x faster, because weight bytes were the floor.
+
+### A coding agent averages 12 steps and 30 seconds per task on a self-hosted model. Where do you start?
+- **Profile the steps, not one call:** prompt tokens, cached tokens, output tokens and time per step. Long
+  prompts with short tool-call outputs mean prefill is the bulk of GPU time.
+- **Cheapest levers first:** a stable, append-only prefix with prefix caching and session-affine routing,
+  trimmed tool output, fewer steps via parallel tool calls.
+- **Then the engine:** chunked prefill, weight quantization or speculative decoding, each gated on the
+  agent eval's task success rate.
 
 ## Quiz
 ### Q: Why does weight quantization speed up single-request decode even though the GPU was not compute-limited?

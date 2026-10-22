@@ -5,7 +5,8 @@ name: LLM architecture (encoder–decoder vs decoder-only)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - model-internals/transformer
   - model-internals/attention-mechanism
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-Encoder–decoder models read input bidirectionally, then write via cross-attention; decoder-only treats
-prompt and answer as one causal stream. That won for chat: it scales on raw text and reuses its cache.
-Encoder–decoder still wins for fixed, long inputs with short outputs.
+Your agent's brain is a decoder-only model: prompt, tools, results and answer form one causal stream that
+appends and reuses its cache. Encoder–decoders (speech-to-text) and encoders (embedders, rerankers) still
+serve the agent's other components.
+
+## For agent builders
+- **Why it matters for agents.** A tool-calling loop is "append to one stream and keep going", which is
+  exactly what decoder-only models do cheaply. Knowing why tells you what breaks the economics: editing
+  history, re-encoding transcripts, or using the chat model for jobs an encoder does at a fraction of the cost.
+- **Where it shows up in your stack.** The planner or chat LLM (decoder-only), the embedding model and
+  reranker in the RAG step (encoder-only), and the speech-to-text front end of a voice agent
+  (encoder–decoder such as Whisper). Each is a separate deployment with its own cost profile.
+- **What you control.** Which family serves each component, prompt layout for a causal reader (task before
+  and after long documents), and whether bulk scoring goes to the agent LLM or a cheap encoder.
+- **What you can skip.** T5's span-corruption recipe and the zero-shot ablations in detail; remember the
+  conclusion (one causal stack scaled best) and the cost rule of thumb.
 
 ## Why it exists
 - **Seq2seq tasks have a shape.** Translation has a complete input you may read in any order, then an
@@ -44,6 +57,16 @@ Encoder–decoder still wins for fixed, long inputs with short outputs.
 - **Decoder-only answered all three with less machinery**, and at scale that simplicity compounded.
 
 ## How it works
+### The architecture map of an agent stack
+| Agent component | Family | Why that family |
+|---|---|---|
+| Planner, chat and tool-calling model | decoder-only | multi-turn, open-ended, appends to one cached stream |
+| Embedder for retrieval and memory | encoder-only (or a fine-tuned decoder with pooling) | produces a vector, no generation |
+| Reranker after retrieval | encoder-only cross-encoder | scores a pair, no generation |
+| Speech-to-text for voice agents | encoder–decoder | long fixed input, short output, encode once |
+
+The rest of this section explains why each family fits its row.
+
 ### Three families
 | Family | Examples | Attention | Trained by | Used for |
 |---|---|---|---|---|
@@ -90,7 +113,7 @@ Encoder–decoder still wins for fixed, long inputs with short outputs.
 - "T5-11B versus a 7B decoder" is therefore not an apples-to-apples cost comparison; compare FLOPs per
   token and memory, not headline size.
 
-### Why decoder-only scaled better for general use
+### Background: why decoder-only scaled better for general use
 - **Objective density.** Every position in a causal stream contributes a loss term. Span-corruption and
   masked-LM objectives compute loss on a fraction of positions, so each document yields less signal.
 - **Zero-shot behaviour.** Controlled comparisons (Wang et al., 2022) found causal decoder-only models
@@ -110,8 +133,9 @@ Encoder–decoder still wins for fixed, long inputs with short outputs.
 - **Encoder-only remains the right tool** for embeddings and rerankers, where no generation happens.
 
 ## Diagram
-Follow the two paths: the encoder output is computed once and read by every decode step, while the
-decoder-only model extends a single causal stream and its one KV cache.
+Follow the two paths: the encoder output (for example a voice agent's audio) is computed once and read by
+every decode step, while the decoder-only agent model extends a single causal stream of prompt, tool calls
+and results with its one KV cache.
 
 ```mermaid
 flowchart TD
@@ -120,7 +144,7 @@ flowchart TD
     XKV --> DD["Decoder step, causal"]
     DD -->|"next token"| DD
     DD --> O1["Output text"]
-    P["Prompt plus history"] --> PF["Prefill, same full stack"]
+    P["Prompt, tools, tool results"] --> PF["Prefill, same full stack"]
     PF --> KV[("Single KV cache")]
     KV --> DS["Decode step"]
     DS -->|"append k, v"| KV
@@ -186,7 +210,29 @@ print(reencoded, "tokens encoded vs", 300 * 10, "prefilled once with a KV cache"
 | 3,000 in, 100 out, one shot | ~6.2 TFLOP (2B split evenly) | ~12.4 TFLOP (2B) | encoder–decoder |
 | 10 turns × 300 tokens | 16,500 tokens re-encoded | 3,000 tokens prefilled, cache reused | decoder-only |
 
+### Agent scenario: a voice support agent, one family per component
+A voice agent transcribes a 5-minute call, retrieves help articles, reranks them and runs a 12-step
+tool-calling loop where each step appends ~800 tokens (tool call plus result). Token counts are
+illustrative.
+
+| Component | Family | Work per call | Note |
+|---|---|---|---|
+| Transcribe audio | encoder–decoder (Whisper-style) | audio encoded once | transcript stored as text |
+| Embed query, search | encoder-only embedder | 1 short query per search | vectors precomputed for articles |
+| Rerank 50 candidates | encoder-only cross-encoder | 50 pair scores | replaces 50 chat-model calls |
+| 12-step agent loop | decoder-only | 12 × 800 = 9,600 new tokens prefilled | cache reused step to step |
+| Same loop on an encoder–decoder | (counterfactual) | 800 × (1 + 2 + … + 12) = 62,400 tokens re-encoded | grows quadratically with steps |
+
+The agent loop belongs on the decoder-only model; everything that only reads and scores goes to cheaper
+encoders.
+
 ## Production patterns
+- **Keep the agent loop on one decoder-only stream.** Append tool calls and results instead of rebuilding
+  the prompt each step, so the cache from step one stays valid. Monitor cached versus uncached input
+  tokens per agent step from provider usage fields or engine metrics.
+- **Move read-only sub-tasks out of the agent model.** Relevance filtering, classification of tool
+  results and PII detection run on encoder models called as tools or pipeline steps. Monitor agent-model
+  tokens per task before and after.
 - **Route by task shape, not by habit.** Send scoring, classification and reranking to an encoder with a
   head or a cross-encoder; keep the decoder-only model for dialogue and agents. Monitor cost per item and
   p95 latency per route.
@@ -285,11 +331,18 @@ turn would pay prefill over it unless it is prefix-cached, so transcribing once 
 - **Plus the usual self-attention cache.** It grows by one entry per generated token, like a decoder-only
   model's cache, but covers only the output, not the source.
 
-### A team reranks ten million query–document pairs a day with a chat model and the bill exploded. What do you propose?
+### A team's RAG agent asks the chat model to rerank ten million query–document pairs a day and the bill exploded. What do you propose?
 - **Diagnose the shape.** Reranking reads a pair and emits a score; there is no generation, so a full
-  decoder pass per pair is wasted spend.
+  decoder pass per pair is wasted spend, and it also inflates the agent's latency per step.
 - **Replace it.** Use a cross-encoder reranker or an encoder with a classification head, evaluated on a
   labelled sample against the chat model's rankings, and keep the chat model for the final answer only.
+
+### Your agent's latency per step grows with conversation length even though replies are short. Which architecture facts do you check?
+- **Is the stream append-only?** Decoder-only reuse depends on nothing earlier changing; rebuilt prompts,
+  reordered tools or edited history force a full re-prefill every step.
+- **Is any component re-encoding the transcript?** An encoder–decoder or a summarizer run over the whole
+  history each turn grows cost with every step. Move it to a one-shot step or a cached prefix.
+- **Measure** prefill tokens per step; it should track the newest step's size, not the transcript.
 
 ### How would you compare the cost of T5-11B with a 7B decoder-only model?
 - **Not by headline size.** Each token passes through only one stack of an encoder–decoder, so an evenly

@@ -5,7 +5,8 @@ name: TPOT (time per output token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - serving-inference/ttft
   - serving-inference/tokens-sec
@@ -22,9 +23,21 @@ sources:
 ---
 
 ## TL;DR
-Time per output token (TPOT) is the average gap between tokens once generation starts. Each decode step
-reads all weights plus the KV cache, so TPOT has a bandwidth floor and barely rises with batch size.
-Fewer bytes per step help; extra FLOPs do not.
+Time per output token (TPOT) is the average gap between generated tokens. An agent pays it
+for every reasoning, tool-call and answer token across many sequential calls; it has a bandwidth floor,
+so fewer bytes per step help and extra FLOPs do not.
+
+## For agent builders
+- **Why it matters for agents.** Agent run time is a sum over steps, and every output token of every step
+  costs TPOT. Verbose reasoning or chatty tool-call preambles multiply it: eight calls of 300 tokens at
+  30 ms is over a minute.
+- **Where it shows up in your stack.** Output-token counts in provider usage fields, `max_tokens` per
+  agent step, model choice (a smaller model for routing steps), and vLLM `--max-num-seqs` and
+  `--quantization` when you self-host the agent's model.
+- **What you control.** How many tokens each step emits (terse tool calls, a reasoning budget, short
+  intermediate outputs), which model handles which step, and concurrency on your own replicas.
+- **What you can skip.** Deriving the compute crossover batch or tuning tensor parallelism, unless you
+  operate the GPUs. Know that decode is bandwidth-bound and that stalls show in ITL p99.
 
 ## Why it exists
 - **It dominates total time for real answers.** After the first token, total latency is
@@ -121,8 +134,19 @@ step_time ≥ (weight_bytes + Σ kv_bytes_per_sequence) / memory_bandwidth
 | Skimming, scrolling, code in blocks | Much lower TPOT, because users skim and want code to appear in blocks |
 | Agentic workloads | As low as you can afford: a planner making eight sequential calls of 300 tokens each turns a 30 ms TPOT into over a minute of waiting before anyone reads a word |
 
+### TPOT in an agent loop
+- **Output tokens are the decode bill.** Per step, decode time ≈ `(n_out − 1) × TPOT`; summed over a run,
+  it is total output tokens times TPOT, plus one TTFT per call.
+- **Steps are sequential.** A planner cannot call the tool until the tool call is fully decoded, so
+  decode time sits on the critical path of every step.
+- **Hidden reasoning counts.** Reasoning tokens are decoded at the same TPOT even when the user never
+  sees them, which is why an agent step with a large thinking budget can be slow with a tiny visible output.
+- **The cheapest lever is fewer tokens.** Terse tool-call formats, capped intermediate outputs and
+  routing simple steps to a smaller, faster model beat any serving tweak.
+
 ## Diagram
-One decode step: the weight read is shared by the whole batch, KV reads grow per sequence, and a
+One decode step, which every output token of every agent call passes through: the weight read is
+shared by the whole batch, KV reads grow per sequence (long agent transcripts make them large), and a
 prefill or preemption landing in the same step is what produces stalls.
 
 ```mermaid
@@ -192,7 +216,25 @@ for b, ctx in [(1, 4_000), (32, 4_000), (32, 32_000)]:
 - **Measured numbers will be worse** than every figure here; the point is the ratios and which term
   dominates.
 
+### Agent scenario: where a planner's minute goes
+A planner agent makes eight sequential calls; illustrative TTFT 300 ms per call, no tool time counted.
+
+| Design | Output tokens per call | TPOT | Decode time for 8 calls | Plus 8 × TTFT |
+|---|---|---|---|---|
+| Verbose reasoning before each tool call | 300 | 30 ms | 8 × 300 × 30 ms ≈ 72 s | ≈ 74 s |
+| Same, on a faster replica | 300 | 15 ms | ≈ 36 s | ≈ 38 s |
+| Terse tool calls, capped reasoning | 60 | 30 ms | ≈ 14 s | ≈ 17 s |
+| Terse calls on the faster replica | 60 | 15 ms | ≈ 7 s | ≈ 10 s |
+
+Halving TPOT halves decode time; cutting output tokens fivefold beats it, and the two multiply.
+
 ## Production patterns
+- **Budget output tokens per agent step.** Set `max_tokens` per step type (tight for tool calls and
+  routing, looser for the final answer) and ask for terse tool-call output. Monitor output tokens per
+  step and the share of steps that hit the cap, since truncated tool calls fail to parse.
+- **Route cheap steps to a faster model.** Use a smaller model for classification, routing and simple
+  tool selection, and the large model for planning and the final answer, gated by your agent eval set.
+  Monitor per-step latency and task success per model.
 - **Alert on ITL p99, not mean TPOT.** Export per-token latency as a histogram (vLLM exposes a
   time-per-output-token histogram on its metrics endpoint) and alert on p99 per route. Monitor the
   p99/p50 ratio; a jump means stalls, not slower decode.
@@ -244,6 +286,8 @@ for b, ctx in [(1, 4_000), (32, 4_000), (32, 32_000)]:
 - **Track TPOT and p99 ITL** for every surface where output length is non-trivial: chat, code
   generation, long-form drafting, and above all agent loops where total time is a sum of many decode
   phases.
+- **Budget agent output first.** Before tuning TPOT, cap output tokens per agent step; the product of
+  tokens and TPOT is what the user waits for.
 - **Set the target from the consumer.** A human reader is satisfied by a few hundred milliseconds per
   token, a code editor wants tens of milliseconds, and an orchestrator chaining calls wants the lowest
   you can afford.
@@ -300,11 +344,19 @@ more KV memory headroom fix it with no hardware change.
 - **With low acceptance**, the drafts rarely pay for the extra forward work.
 - **Also note** it makes ITL lumpy, so gap-based alerts need adjusting.
 
-### Why can long contexts hurt TPOT more than model size at scale?
-- **KV bytes scale with batch times context length**, while weight bytes are fixed per step.
+### Your self-hosted agents decode more slowly as their transcripts grow. Why, and what do you do?
+- **KV bytes scale with batch times context length**, while weight bytes are fixed per step; long agent
+  transcripts at high concurrency make KV reads, not model size, dominate the step.
 - **Example:** an 8B model at batch 32 and 32k context would read about 134 GB of KV per step against
   16 GB of weights, roughly 45 ms per step if it fit at all.
 - **Levers:** grouped-query attention, KV-cache quantisation and context caps attack that term directly.
+
+### An agent run takes 70 seconds and the team wants a bigger GPU. What do you check first?
+- **Split the run:** per-step TTFT, output tokens times TPOT, and tool time from the trace.
+- **If decode dominates,** count output tokens per step first: verbose reasoning or preambles before tool
+  calls are usually the biggest term, and cutting them is free.
+- **Only then hardware:** a GPU with more bandwidth lowers TPOT roughly by the bandwidth ratio, not the
+  FLOPs ratio, and routing simple steps to a smaller model may help more.
 
 ## Quiz
 ### Q: Why does per-request TPOT rise only slightly when the batch grows from 1 to 16 sequences?

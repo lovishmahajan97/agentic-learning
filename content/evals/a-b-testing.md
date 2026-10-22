@@ -5,7 +5,8 @@ name: A/B testing
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - evals/offline-vs-online-evaluation
   - evals/pairwise-comparison
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-An A/B test randomly assigns users to the current system or a candidate and compares a pre-declared
-outcome, so differences are caused by the change. The discipline: right randomisation unit, one primary
-metric, fixed sample size, no peeking.
+An A/B test randomly assigns users to the current agent or a candidate and compares a pre-declared
+outcome such as task completion, so differences are caused by the change. The discipline: right
+randomisation unit, one primary metric, fixed sample size, no peeking.
+
+## For agent builders
+- **Why it matters for agents.** A new planner prompt, model or tool set changes outcomes that only
+  users reveal: tasks completed, tickets that stay closed, escalations. It also moves steps per task and
+  cost per task, so a "win" can be a loss once tokens are counted.
+- **Where it shows up in your stack.** Feature-flag or experimentation services that bucket users,
+  exposure events logged with the agent version and model snapshot, outcome events keyed by
+  conversation or task ID, and analysis in your warehouse or experimentation tool.
+- **What you control.** The unit (user or tenant, never request, for multi-turn agents), the primary
+  outcome, guardrails such as steps, tool errors and cost per task, pinned model snapshots per arm,
+  per-arm cache keys, and the planned horizon.
+- **What you can skip.** Bandits and interleaving until you have a basic, correctly bucketed test
+  running; most agent teams never need them.
 
 ## Why it exists
 - **The real question is causal.** Did this prompt, model or retriever change make users better off?
@@ -117,6 +131,11 @@ n per arm ≈ 16 · p(1 − p) / δ²        δ = p₂ − p₁
 ### LLM-specific wrinkles
 - **Non-stationary models.** If model X is silently updated mid-test in "X vs Y", the comparison is
   confounded; pin snapshots or versions for the duration.
+- **Agent outcomes arrive late and span turns.** A task may finish hours after the first message, or a
+  ticket reopen days later, so fix the outcome window per task up front and keep a user in one arm for
+  the whole conversation, including any background steps.
+- **Agent cost is heavy-tailed.** A few runaway loops dominate mean tokens per task, so report a high
+  percentile and the share of runs hitting the step limit as guardrails, not the mean alone.
 - **Shared caches.** Prefix or semantic caches shared across arms leak latency and cost between them;
   isolate per arm or exclude cache hits from guardrail metrics.
 - **Judge-based primary metrics.** When outcome events are too sparse, a calibrated judge over sampled
@@ -145,6 +164,23 @@ flowchart TD
 ```
 
 ## Examples
+### Agent scenario: a new planner prompt for a booking agent
+Illustrative numbers. Primary metric: task completed (a booking confirmed) within 24 hours, per user.
+Baseline 55%, minimum effect 3 points: 16 × 0.245775 / 0.0009 ≈ 4,370 users per arm.
+
+| Metric | Control (v1) | Candidate (v2) | Reading |
+|---|---|---|---|
+| Users per arm | 4,400 | 4,400 | Sample ratio fine |
+| Task completion (primary) | 55.0% | 58.1% | About +3 points, interval excludes zero |
+| Median steps per task | 6.2 | 7.9 | Planner explores more |
+| Runs hitting the step limit | 1.1% | 2.9% | Guardrail breached (threshold 2%) |
+| Cost per completed task | – | up 28% | Needs a product call |
+| Tool error rate | 3.1% | 3.0% | Unchanged |
+
+- **Decision:** do not ship as is, despite the primary-metric win; the step-limit guardrail failed.
+- **Next hypothesis:** cap re-planning to two attempts, re-run offline, then a new test with the same
+  primary metric and its own pre-registration.
+
 ### Sample size, two-proportion test and SRM check
 Sample size for a 60% to 63% lift, the test on the resulting data, and a sample-ratio check.
 
@@ -236,8 +272,8 @@ print(f"false-positive rate with daily peeks: {peeking_false_positive_rate():.2f
   sample size and planned end date before launch, and the decision after. Monitor the share of
   experiments whose primary metric changed after launch (it should be zero).
 - **Ramp with auto-stop.** Go 1%, then 10%, then 50/50, with automatic stop when a guardrail (error rate,
-  p95 latency, cost per conversation, refusal rate) breaches its threshold. Monitor guardrails in short
-  windows during the ramp.
+  p95 latency, cost per conversation, refusal rate, and for agents the share of runs hitting the step
+  limit) breaches its threshold. Monitor guardrails in short windows during the ramp.
 - **CUPED by default.** Compute each user's pre-period value of the primary metric and apply the CUPED
   adjustment in the analysis pipeline. Monitor the achieved variance reduction per metric.
 - **Per-arm cache keys and pinned snapshots.** Include the arm in prompt or semantic cache keys and pin
@@ -310,6 +346,13 @@ guardrails (latency, cost, escalations) are checked before anyone reads the prim
 - **So the difference is effect plus noise,** and the noise can be quantified with a confidence interval.
 - **Before-and-after comparisons** cannot separate the change from a holiday, a campaign or a silent
   model update.
+
+### You are A/B testing a new model behind a tool-calling agent. What do you put on the guardrail list, and why?
+- **Cost and loop health:** cost per completed task, a high percentile of steps, and the share of runs
+  hitting the step limit, because agent cost is heavy-tailed and a "smarter" model may loop more.
+- **Tool health:** tool error and retry rates, and any unauthorised or policy-violating actions.
+- **User-facing:** p95 latency to first response and to task completion, escalations; pin both model
+  snapshots and isolate caches per arm so these are comparable.
 
 ### How would you choose the randomisation unit for a team-shared coding assistant?
 - **Not request or session:** a user would see both variants, and correlated requests inflate significance.

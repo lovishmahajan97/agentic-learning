@@ -5,7 +5,8 @@ name: pyarrow
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - python-for-ai/pandas
   - python-for-ai/polars
@@ -20,16 +21,30 @@ sources:
 ---
 
 ## TL;DR
-pyarrow binds Apache Arrow, the shared columnar memory format, and is Python's standard Parquet reader
-and writer. Arrow lets pandas, Polars, DuckDB and Hugging Face swap tables without serializing; Parquet
-stores them compressed with statistics so readers fetch only what they need.
+pyarrow binds Apache Arrow, the shared columnar memory format, and is Python's standard Parquet reader and
+writer. It is the storage layer under an agent's RAG chunks, embeddings, traces and eval sets, letting
+pandas, Polars, DuckDB and Hugging Face swap tables without serializing.
+
+## For agent builders
+- **Why it matters for agents.** The data around an agent outlives any one run: the chunk-and-embedding
+  table behind RAG, months of step-level traces, eval datasets and fine-tuning sets built from them. Stored
+  as Parquet with a schema, each is cheap to re-read selectively, for example only one tenant's vectors.
+- **Where it shows up in your stack.** Under pandas and Polars Parquet I/O, Hugging Face `datasets` (Arrow
+  files, memory-mapped), DuckDB, LanceDB (built on Arrow), and the export or backfill jobs that load a
+  vector database from a Parquet source of truth.
+- **What you control.** Explicit schemas (`large_string` for chunk text, `fixed_size_list` for
+  embeddings), partitioning by tenant or date, row-group and file sizes, compression, and conversions
+  that keep zero-copy.
+- **What you can skip.** The C Data Interface details and most of `pyarrow.compute`; let Polars or DuckDB
+  do the queries.
 
 ## Why it exists
 - **Every tool had its own memory layout.** Moving a table from a database client to pandas, then Spark,
   then a model's data loader meant converting each value at every hop: row-by-row serialization, often
   through Python objects, that could cost more than the analysis itself.
 - **Text files waste reads.** CSV and JSONL store numbers as text with no types, so every read re-parses
-  every byte and must read every column even when the query needs two.
+  every byte and must read every column even when the query needs two (say, IDs and embeddings, not the
+  chunk text).
 - **Arrow fixes memory with a shared spec.** If every library lays out a column the same way, a table
   moves from C++ to Python to Rust by passing pointers to buffers.
 - **Parquet fixes storage.** A columnar file format with types, encodings, compression and statistics, so
@@ -53,6 +68,8 @@ An Arrow array is a few contiguous buffers:
 - **Strings are three buffers,** not a million Python objects for a million strings.
 - **Embeddings fit naturally.** A fixed-size list of 768 float32 values is one contiguous float buffer
   that converts to a NumPy `(n, 768)` array without copying.
+- **Nested traces fit too.** A step's tool arguments can be a `struct` and a run's steps a `list`, though
+  most teams flatten traces to one row per step for easier querying.
 
 ### Tables, batches and chunks
 - **`RecordBatch`:** a set of equal-length arrays with a `Schema`.
@@ -72,12 +89,12 @@ An Arrow array is a few contiguous buffers:
 - **Across processes.** The Arrow IPC format (also called Feather v2 on disk) writes the in-memory layout
   directly, so a file can be memory-mapped and read with almost no decoding.
 - **Hugging Face `datasets`** stores data as Arrow files and memory-maps them, which is why a dataset
-  larger than RAM can still be indexed randomly.
+  larger than RAM can still be indexed randomly, for example an SFT set of agent transcripts.
 
 ### Parquet on disk
 1. **Row groups.** A file is split into *row groups*, each holding a *column chunk* per column.
-2. **Encoding.** Dictionary encoding for repetitive values such as tenant IDs or model names; run-length
-   and bit-packing for small integers.
+2. **Encoding.** Dictionary encoding for repetitive values such as tenant IDs, tool names or model names;
+   run-length and bit-packing for small integers.
 3. **Compression.** Snappy by default in pyarrow, Zstandard for a better ratio.
 4. **Footer.** Stores the schema and per-column-chunk statistics such as min and max.
 5. **Selective reads.** Asked for two columns with a filter, a reader reads the footer, skips row groups
@@ -93,25 +110,25 @@ as `tenant=acme/`, which prune whole files.
 - **Light work only.** For analytical queries you usually reach for Polars or DuckDB on top of Arrow.
 
 ## Diagram
-A selective Parquet read: the footer's statistics decide which row groups are fetched, only requested
-column chunks are decoded, and the resulting Arrow table moves on by pointer unless a conversion copies it.
+A selective read of a RAG chunk table: footer statistics decide which row groups are fetched, only the
+requested column chunks are decoded, and the Arrow table moves on by pointer unless a conversion copies it.
 
 ```mermaid
 flowchart TD
-    Q["read_table with columns and filters"] --> F["Read the footer: schema and min-max statistics"]
-    F --> RG{"Can this row group match the filter?"}
-    RG -->|"no"| SK["Skip the row group"]
-    RG -->|"yes"| CC["Fetch only the requested column chunks"]
-    CC --> DE["Decompress and decode into Arrow buffers"]
+    Q["read_table: columns and filters"] --> F["Footer: schema, min-max stats"]
+    F --> RG{"Row group can match?"}
+    RG -->|"no"| SK["Skip row group"]
+    RG -->|"yes"| CC["Fetch requested column chunks"]
+    CC --> DE["Decode into Arrow buffers"]
     DE --> T["Arrow Table of ChunkedArrays"]
-    T -->|"zero-copy by pointer"| L["Polars, DuckDB, NumPy for fixed-width columns"]
-    T -->|"default to_pandas"| C["Full copy: strings become Python objects"]
+    T -->|"zero-copy"| L["Polars, DuckDB, NumPy vectors"]
+    T -->|"default to_pandas"| C["Full copy: Python strings"]
 ```
 
 ## Examples
 ### A RAG chunk-and-embedding table in Parquet
-Storing chunk text and embeddings for a RAG corpus in Parquet with an explicit schema, then reading back
-only what retrieval needs.
+Storing chunk text and embeddings for an agent's retrieval corpus in Parquet with an explicit schema, then
+reading back only what retrieval needs.
 
 ```python
 import numpy as np
@@ -151,9 +168,25 @@ What the read skips depends on layout:
 | Sorted by tenant before writing | Skipped | `t1` occupies rows 3,334 to 6,666 (0-based), in the 2nd, 3rd and 4th groups, so min/max statistics skip the other 2 of 5 |
 | Partitioned (`tenant=t1/` directories) | Skipped | Only `t1`'s files; the two-thirds of data for other tenants is never opened |
 
+### Worked scenario: rebuilding a tenant's vector index after an embedding-model change
+The agent's retriever moves to a new embedding model. Parquet is the source of truth; the vector
+database is rebuilt from it, one tenant at a time. The production version of the third row above: write
+one directory per tenant with `ds.write_dataset(table, "chunks/", format="parquet",
+partitioning=["tenant"], partitioning_flavor="hive", existing_data_behavior="overwrite_or_ignore")`.
+
+| Step | What is read | Why |
+|---|---|---|
+| Re-embed tenant `t1` | `doc_id`, `chunk` from `chunks/tenant=t1/` only | New vectors need the text; other tenants' directories are never opened |
+| Write new vectors | A new `embedding_v2` column or a new dataset version | Old and new vectors are not comparable, so never mix them |
+| Load the vector DB | `doc_id`, `embedding_v2` | The large chunk text is skipped by projection |
+| Recall check | A sample of eval queries | Compare top-k against exact search before switching the agent over |
+
+- **The partition column lives in the path,** not in the files, and is restored on read.
+- **Watch cardinality.** Partition by a column with tens to thousands of values; one directory per
+  document would recreate the tiny-files problem.
+
 ### Partitioned dataset for per-tenant reads
-The production version of the third row: write one directory per tenant, then read one tenant with a
-filter that prunes whole files.
+Read one tenant with a filter that prunes whole files.
 
 ```python
 import pyarrow.dataset as ds
@@ -168,19 +201,18 @@ t1 = dset.to_table(columns=["doc_id", "embedding"],
 print(t1.num_rows)                                                    # 3333
 ```
 
-- **The partition column lives in the path,** not in the files, and is restored on read.
-- **Watch cardinality.** Partition by a column with tens to thousands of values; one directory per
-  document would recreate the tiny-files problem.
-
 ## Production patterns
+- **Parquet as the source of truth for RAG.** Keep chunks, metadata and embeddings (with the embedding
+  model's name per column or dataset version) in Parquet, and treat the vector database as a rebuildable
+  serving index. Monitor row counts in Parquet versus the index after each load.
 - **Explicit schema on every write.** Define a `pa.schema` per table (with `large_string` for big text and
   `pa.list_(pa.float32(), d)` for embeddings) and pass it to `pa.table` or the writer. Monitor write-time
   type errors; they replace dataset reads failing weeks later on one odd file.
 - **Partition by the dominant filter.** Use `ds.write_dataset(..., partitioning=["tenant"],
   partitioning_flavor="hive")` for tenant or date filters, and sort within partitions by the next filter
   key. Watch files opened and bytes read per query.
-- **Compact small files on a schedule.** Streaming writers produce many tiny files; a periodic job
-  rewrites them with `ds.write_dataset` using its `max_rows_per_file` and `min_rows_per_group` limits.
+- **Compact small trace files on a schedule.** Streaming trace writers produce many tiny files; a periodic
+  job rewrites them with `ds.write_dataset` using its `max_rows_per_file` and `min_rows_per_group` limits.
   Monitor file count and average file size per partition.
 - **Keep Arrow types across hand-offs.** Convert with `to_pandas(types_mapper=pd.ArrowDtype)`, or hand the
   table to Polars or DuckDB, instead of default `to_pandas()` on text-heavy tables. Track peak memory
@@ -191,20 +223,23 @@ print(t1.num_rows)                                                    # 3333
 
 ## Trade-offs
 - **Cheap selective reads vs immutability.** Parquet's compression and column pruning make selective
-  reads cheap, but files are immutable and poor at single-row updates; frequently mutated data belongs in
-  a database or a table format on top.
+  reads cheap, but files are immutable and poor at single-row updates; frequently mutated data, such as
+  live agent memory or session state, belongs in a database or a table format on top.
 - **Free hand-offs vs type matching.** Zero-copy only holds when types match; nulls, string columns or
   non-contiguous chunks can force a copy when converting to NumPy or pandas.
 - **Large vs small row groups.** Large ones compress better and scan faster; small ones allow finer
   skipping and lower memory when reading. The right size depends on whether workloads scan or seek.
 - **Explicit schemas vs maintenance.** They catch type drift at write time but must evolve with fields;
   inference is convenient until two files disagree and a dataset read fails.
+- **Parquet store vs vector database.** Parquet is cheap, portable and exact to rebuild from, but has no
+  ANN index; serve queries from a vector database built from it.
 
 ## Pitfalls
 - **Many tiny Parquet files from a streaming job.** Symptom: slow reads dominated by opening files and
   parsing footers. Fix: compact into fewer, larger files.
 - **32-bit-offset `string` for huge text columns.** Symptom: an offset overflow error once one array's
-  text exceeds about 2 GB. Fix: `large_string` or smaller chunks.
+  text exceeds about 2 GB, common with long documents or full tool outputs. Fix: `large_string` or smaller
+  chunks.
 - **Expecting filters to skip data on unsorted files.** Symptom: a "filtered" read takes as long as a full
   scan, because row-group statistics overlap every predicate. Fix: sort or partition first.
 - **Letting schemas be inferred per file.** Symptom: a dataset read fails because one file has an int
@@ -250,6 +285,14 @@ not the serving layer; build an ANN index per tenant from it.
 - **pyarrow bridges them:** Parquet is small on disk and selectively readable, Arrow is fast to compute
   on, and pyarrow converts efficiently between the two.
 
+### How would you store the corpus behind a multi-tenant RAG agent so you can rebuild the vector index safely?
+- **Parquet as source of truth:** one dataset of chunk ID, tenant, text, metadata and embeddings, with an
+  explicit schema and the embedding model recorded per column or version.
+- **Partition by tenant:** `tenant=x/` directories, so re-embedding or reloading one tenant never opens
+  another's files, which also helps isolation audits.
+- **Rebuild, then verify:** load the vector database from the ID and embedding columns only, compare
+  counts, and run an exact-search recall check on eval queries before switching the agent over.
+
 ### Peak memory is several times `table.nbytes` after converting to pandas. Why, and what do you do?
 - **Default `to_pandas()` copies strings:** each Arrow string becomes a Python object in an `object`
   column, a full copy that is often several times larger.
@@ -258,7 +301,7 @@ not the serving layer; build an ANN index per tenant from it.
 - **Check other copies too:** `to_numpy()` on columns with nulls or several chunks also copies or fails;
   `combine_chunks()` and null handling come first.
 
-### A streaming ingestion job produces thousands of tiny Parquet files and reads are slow. What happened?
+### Your agent's trace-ingestion job produces thousands of tiny Parquet files and dashboards are slow. What happened?
 - **Cause:** each file has its own footer to open and parse, so per-file overhead dominates and row
   groups are too small to compress well or skip usefully.
 - **Fix:** a scheduled compaction job that rewrites partitions with `ds.write_dataset` using its

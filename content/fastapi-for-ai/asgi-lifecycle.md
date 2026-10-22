@@ -5,7 +5,8 @@ name: ASGI lifecycle
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - fastapi-for-ai/lifespan
   - fastapi-for-ai/middleware-ordering
@@ -21,9 +22,22 @@ sources:
 ---
 
 ## TL;DR
-ASGI is the message protocol between an async server (Uvicorn, Hypercorn) and your app: one
-`async def app(scope, receive, send)` called once per connection, plus one `lifespan` connection per
-process. FastAPI's lifespan, middleware, streaming and disconnect detection are all moves in it.
+An agent run is a long, streaming, cancellable HTTP connection. ASGI is the message protocol that makes
+that cheap: one `async def app(scope, receive, send)` per connection plus one `lifespan` connection per
+process, under every FastAPI agent server.
+
+## For agent builders
+- **Why it matters for agents.** An agent run holds one connection for many LLM calls and tool calls,
+  often a minute or more, while streaming step events. ASGI parks that connection on `await` instead of
+  a thread, and tells you, as a message, when the user closed the tab.
+- **Where it shows up in your stack.** Uvicorn or Hypercorn under FastAPI, `StreamingResponse` for SSE
+  step and token events, WebSockets for voice or interactive agent UIs, and lifespan for loading clients,
+  tool registries and checkpointers. LangServe and most hand-rolled LangGraph servers sit on this stack.
+- **What you control.** Where startup work runs (lifespan, never import time), whether the agent loop
+  checks for disconnect between steps, whether errors are caught before the stream starts, and whether
+  middleware and proxies pass stream chunks through untouched.
+- **What you can skip.** Writing raw ASGI apps day to day. Know the message sequence well enough to debug
+  a buffered stream, an agent that keeps running after the user left, or a 200 that ends mid-step.
 
 ## Why it exists
 - **WSGI holds a thread per request.** The previous contract, `app(environ, start_response)`, is a
@@ -55,7 +69,7 @@ process. FastAPI's lifespan, middleware, streaming and disconnect detection are 
 - **`receive`** is an async callable returning the next event from the server; **`send`** pushes an
   event back.
 - **One call per connection.** For HTTP/1.1 keep-alive, every request on the socket is its own call with
-  a fresh scope, so nothing leaks between requests unless you create it.
+  a fresh scope, so nothing leaks between requests (or between two users' agent runs) unless you create it.
 
 ### The lifespan connection
 1. **Worker starts.** The server opens one connection with `scope["type"] == "lifespan"` and calls the app.
@@ -65,7 +79,7 @@ process. FastAPI's lifespan, middleware, streaming and disconnect detection are 
 4. **Shutdown.** It runs teardown and answers `lifespan.shutdown.complete`.
 
 - **FastAPI's `lifespan` context manager** is literally the code before and after the `yield` in this
-  exchange.
+  exchange. For an agent server that is where the LLM client, tool registry and checkpoint store open.
 - **State without globals.** The lifespan scope carries a `state` dict. Whatever startup puts there
   (Starlette does this when your lifespan yields a dict) is shallow-copied into the `state` of every later
   HTTP and WebSocket scope, so a model loaded once reaches `request.state` in every request.
@@ -82,28 +96,30 @@ process. FastAPI's lifespan, middleware, streaming and disconnect detection are 
    why a body can be read only once.
 3. **Response.** The app sends exactly one `http.response.start` with `status` and `headers`, then one
    or more `http.response.body` events. `more_body: True` keeps the response open, which is how
-   `StreamingResponse` emits tokens as they arrive; the final event has `more_body: False`.
+   `StreamingResponse` emits tokens and agent step events as they arrive; the final event has
+   `more_body: False`.
 4. **Disconnect.** If the client goes away, the next `receive()` returns `http.disconnect`.
 
-| Rule | Because | Consequence |
+| Rule | Because | Consequence for an agent run |
 |---|---|---|
-| Start before body, status fixed | HTTP/1.1 writes the status line and headers before any body bytes | once `http.response.start` is out, the status cannot change |
+| Start before body, status fixed | HTTP/1.1 writes the status line and headers before any body bytes | once `http.response.start` is out, the status cannot change, even if step 4 fails |
 | Mid-stream exception | the 200 is already on the wire | the server can only cut the connection; the client sees a 200 with a truncated body |
-| Disconnect is a message, not cancellation | only the app knows whether work should stop (abandon an LLM call) or must finish (write the audit row, record usage) | someone has to read that event |
+| Disconnect is a message, not cancellation | only the app knows whether work should stop (abandon an LLM call) or must finish (write the audit row, record usage) | someone has to read that event, or the agent keeps calling tools for nobody |
 
 ### Disconnect handling in practice
 - **ASGI spec 2.4:** a server may also raise an `OSError` subclass from a `send()` on a closed connection.
 - **`StreamingResponse` uses whichever applies.** On older-spec servers it listens for `http.disconnect`
   in a parallel task and cancels the generator; on 2.4 servers the next `send` fails.
-- **Non-streaming handlers get no help.** One that awaits a 60-second completion and then returns runs
-  to the end unless it polls `request.is_disconnected()` or races the call against it.
+- **Non-streaming handlers get no help.** One that awaits a 60-second completion (or a whole agent run)
+  and then returns runs to the end unless it polls `request.is_disconnected()` or races the call against it.
 
 ### WebSockets
 - A `websocket` scope begins with a `websocket.connect` event; the app answers `websocket.accept`
   (optionally with a subprotocol) or `websocket.close`.
 - Frames flow as `websocket.receive` / `websocket.send` events with `text` or `bytes`, until
   `websocket.disconnect`.
-- Same callable signature, which is why one FastAPI process serves REST and WebSocket routes.
+- Same callable signature, which is why one FastAPI process serves REST agent endpoints and a WebSocket
+  voice-agent route.
 
 ### Where FastAPI sits in the chain
 - **FastAPI subclasses Starlette**, whose `__call__` builds a stack on first use:
@@ -117,11 +133,12 @@ process. FastAPI's lifespan, middleware, streaming and disconnect detection are 
 - `uvicorn --workers 4` (or Gunicorn with a Uvicorn worker class) starts four processes (Uvicorn spawns
   them, Gunicorn forks them). Each runs its own lifespan handshake and holds its own copies of anything
   loaded there.
-- **"Load once" means once per worker**, which matters when the thing loaded is a multi-gigabyte model.
+- **"Load once" means once per worker**, which matters when the thing loaded is a multi-gigabyte model,
+  and means in-memory agent sessions on worker 1 are invisible to worker 2.
 
 ## Diagram
-Read top to bottom: the lifespan handshake finishes before any HTTP traffic, then one request streams
-body chunks with `more_body: True` until the client either reads the final chunk or disconnects.
+Read top to bottom: the lifespan handshake finishes before any HTTP traffic, then one agent run streams
+step events with `more_body: True` until the client either reads the final chunk or disconnects.
 
 ```mermaid
 sequenceDiagram
@@ -129,20 +146,59 @@ sequenceDiagram
     participant A as ASGI app
     participant C as Client
     S->>A: lifespan.startup
-    Note over A: load model, fill state
+    Note over A: open LLM client and tools
     A->>S: lifespan.startup.complete
     Note over S: only now accept connections
-    C->>S: POST /chat
+    C->>S: POST /agent/run
     S->>A: http.request (body chunk, more_body False)
     A->>S: http.response.start (status 200, now fixed)
-    A->>S: http.response.body (token, more_body True)
-    S->>C: token bytes
+    A->>S: http.response.body (step event, more_body True)
+    S->>C: step event bytes
     C-->>S: client closes socket
     S->>A: http.disconnect on next receive
-    Note over A: app decides to cancel or finish
+    Note over A: stop the loop or finish bookkeeping
 ```
 
 ## Examples
+### Agent run as an SSE stream that stops when the user leaves
+Validate before the stream starts (so bad input is a real 4xx), check for disconnect between agent
+steps, and emit an explicit error event if a step fails after the 200 is out. `run_step` is a stand-in
+for one LLM call plus its tool call.
+
+```python
+import asyncio, json
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+MAX_STEPS = 8
+
+async def run_step(task: str, i: int) -> dict:
+    await asyncio.sleep(5)                      # stand-in: one LLM call plus one tool call
+    return {"step": i, "tool": "search", "done": i == 3}
+
+@app.post("/agent/run")
+async def agent_run(request: Request, body: dict):
+    task = body.get("task", "").strip()
+    if not task:                                # fail BEFORE http.response.start: a real 422
+        raise HTTPException(422, "task is required")
+
+    async def events():
+        for i in range(MAX_STEPS):
+            if await request.is_disconnected(): # user left: stop spending tokens and tool calls
+                return
+            try:
+                ev = await run_step(task, i)
+            except Exception as e:              # status is already 200: send an error event
+                yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+                return
+            yield f"data: {json.dumps(ev)}\n\n"
+            if ev["done"]:
+                return
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+```
+
 ### Raw ASGI app: lifespan, body, streamed response
 No framework. Run it with `uvicorn asgi_demo:app --lifespan on` and `curl -N -d "the kv cache stores keys"
 localhost:8000` to watch words arrive one at a time. FastAPI's `lifespan=` and `StreamingResponse`
@@ -209,6 +265,17 @@ async def complete(request: Request, body: dict):
     return Response(status_code=499)         # nginx's "client closed request"; nobody reads it
 ```
 
+### Worked scenario: abandoned agent runs with and without a disconnect check
+An agent averages 8 steps of ~5 seconds each (illustrative numbers). 30% of users close the tab during
+step 3.
+
+| Per 1,000 runs | No disconnect check | Check between steps |
+|---|---|---|
+| Steps for completed runs (700 × 8) | 5,600 | 5,600 |
+| Steps for abandoned runs (300 users) | 300 × 8 = 2,400 | 300 × 3 = 900 (stops at the next check) |
+| Total LLM plus tool steps | 8,000 | 6,500 |
+| Steps after the user left | 300 × 5 = 1,500 (about 19% of spend) | 0 beyond the in-flight step |
+
 ### Worked trace: a stream that fails halfway
 A chat stream validates the prompt lazily inside its generator, and the provider errors after 3 tokens.
 
@@ -223,26 +290,30 @@ Fix: run checks that can fail before returning the `StreamingResponse`, and send
 inside the stream for failures after it starts.
 
 ## Production patterns
-- **Load models in lifespan and gate readiness on it.** Use when startup is slow (model weights,
-  warm-up). Run `uvicorn --lifespan on` so a missing or broken handler fails loudly, and size the
-  orchestrator's startup probe above the measured load time. Monitor startup duration and restart counts.
+- **Check disconnect at every agent step boundary.** Use for any multi-step agent endpoint. Call
+  `request.is_disconnected()` before each LLM or tool call, and let in-flight bookkeeping (usage, audit
+  row) finish. Monitor steps executed after disconnect and provider tokens billed versus runs delivered.
+- **Load clients and models in lifespan and gate readiness on it.** Use when startup is slow (model
+  weights, warm-up, tool registry). Run `uvicorn --lifespan on` so a missing or broken handler fails
+  loudly, and size the orchestrator's startup probe above the measured load time. Monitor startup
+  duration and restart counts.
 - **Race long non-streaming calls against disconnect.** Use for any endpoint that awaits a full LLM
-  completion. Wrap the call in a task and `asyncio.wait` it against a `request.is_disconnected()` poller,
-  as above. Monitor provider tokens billed versus responses actually delivered.
-- **Pure ASGI middleware on streaming routes.** Use when you add headers, metrics or limits to token
-  streams. Wrap `send` and pass every `more_body` chunk through untouched instead of collecting the
+  completion or a whole agent run. Wrap the call in a task and `asyncio.wait` it against a
+  `request.is_disconnected()` poller, as above. Monitor provider tokens billed versus responses delivered.
+- **Pure ASGI middleware on streaming routes.** Use when you add headers, metrics or limits to token or
+  step streams. Wrap `send` and pass every `more_body` chunk through untouched instead of collecting the
   response. Monitor time to first byte at the client versus at the app.
 - **Turn off proxy buffering for streams.** Use behind nginx-style gateways: set `proxy_buffering off`
   for the route or send an `X-Accel-Buffering: no` response header. Verify with `curl -N` against each hop
   outward; monitor client-side time to first token.
-- **Measure event-loop lag.** Use on every async service: schedule a no-op task every second and record
-  how late it runs as a metric. Alert when lag climbs under load, because it means something is blocking
-  the loop.
+- **Measure event-loop lag.** Use on every async agent service: schedule a no-op task every second and
+  record how late it runs as a metric. Alert when lag climbs under load, because it means something
+  (often a sync tool or SDK) is blocking the loop.
 
 ## Trade-offs
 - **Cheap idle connections vs one shared loop.** One event loop serves thousands of idle connections
   cheaply, but a single blocking call anywhere stalls all of them; the win flips into a loss the moment
-  CPU-bound inference runs on the loop.
+  CPU-bound inference or a sync tool runs on the loop.
 - **Rich protocol vs correct layers.** Messages give you streaming, WebSockets and disconnect events, but
   every middleware must handle `send`/`receive` correctly; a sloppy middleware can buffer a token stream
   into one lump.
@@ -251,6 +322,9 @@ inside the stream for failures after it starts.
   usually wins.
 - **Safe startup vs slow readiness.** A failing startup keeps a broken worker off the network, but a slow
   model load delays readiness; orchestrators need startup probes tuned to the load time.
+- **Streaming the run vs a clean status code.** SSE shows agent progress immediately, but every failure
+  after the first event must be an in-band error event; a job queue with polling keeps real status codes
+  at the cost of latency to first feedback.
 
 ## Pitfalls
 - **Draining `receive()` in a pure ASGI middleware without replaying it.** Reading the body to log it
@@ -265,15 +339,16 @@ inside the stream for failures after it starts.
   lazily there is too late: the 200 and headers were already sent. Symptom: HTTP 200 with a stream that
   stops mid-sentence, traceback in the server log. Fix: check before returning the `StreamingResponse`,
   and send an explicit error event for failures after it starts.
-- **Treating `app.state` as shared memory across workers.** Each worker has its own, so caches and
-  counters diverge. Symptom: rate limits or cache hit rates that look random under `--workers 4`.
+- **Treating `app.state` as shared memory across workers.** Each worker has its own, so caches, counters
+  and in-memory agent sessions diverge. Symptom: rate limits or cache hit rates that look random under
+  `--workers 4`, or "session not found" on a follow-up turn. Fix: keep agent state in a shared store.
 - **Loading models at import time.** Tests, migrations and CLI tools that import the module pay the load,
   and a failure surfaces as an import error with no `startup.failed` message. Symptom: twenty-second test
   collection. Fix: move it into the lifespan handshake.
 
 ## When to use
 - **Choose per service, not per endpoint.** Anything that streams, holds long connections or awaits
-  remote models is ASGI.
+  remote models (every agent server) is ASGI.
 - **Reach for protocol knowledge at the edges:** a streaming response that arrives all at once, a
   disconnect nobody noticed, a startup that hangs under Gunicorn, a body that reads as empty.
 - **Measure:** event-loop lag (how late a no-op task scheduled every second actually runs) under load; it
@@ -315,6 +390,14 @@ forwards the client close upstream, and race long provider calls against the dis
 - **Bonus:** WSGI has no WebSocket, server-push or lifecycle semantics, which is why model loading had
   nowhere clean to live.
 
+### Users close the tab mid-run, but your agent keeps calling tools for another minute. Why, and how do you fix it?
+- **Disconnect is a message.** The server does not cancel the handler; the app learns of the close only
+  through `http.disconnect` on `receive()` (or a failed `send` on spec-2.4 servers).
+- **Where it hides:** a loop that awaits LLM and tool calls without ever reading that event, or a
+  non-streaming endpoint that returns only when the whole run finishes.
+- **Fix:** check `request.is_disconnected()` at each step boundary, or race the run against a disconnect
+  poller and cancel it, while letting usage and audit writes complete. Measure steps run after disconnect.
+
 ### A worker loads a 20-second model at startup. What does the client see during those 20 seconds, and why?
 - **Nothing from that worker.** Uvicorn completes the lifespan handshake before accepting connections,
   so a loading worker simply is not serving yet: the client waits, is refused, or is served by another
@@ -323,12 +406,13 @@ forwards the client close upstream, and race long provider calls against the dis
 - **Operationally:** set the orchestrator's startup probe above the measured load time, or the platform
   kills the worker mid-load and it restart-loops.
 
-### Your stream returns HTTP 200 but stops mid-sentence, and there is a traceback in the server log. Explain.
+### Your agent's SSE stream returns HTTP 200 but stops mid-step, and there is a traceback in the server log. Explain.
 - **The status was already sent.** `http.response.start` goes out before the first body chunk, and HTTP/1.1
   cannot change the status after that.
-- **So a generator error can only cut the connection**; the client sees a 200 with a truncated body.
+- **So a generator error can only cut the connection**; the client sees a 200 with a truncated body and
+  cannot tell a crashed step from a slow one.
 - **Fix:** do the checks that can fail before returning the `StreamingResponse`, and emit an explicit
-  error event inside the stream for failures that happen after it starts.
+  error event inside the stream for step failures that happen after it starts.
 
 ### When would you write a pure ASGI middleware instead of using `BaseHTTPMiddleware` or a decorator?
 - **When it touches streams.** A pure ASGI layer wraps `send` and can pass each `more_body` chunk through
@@ -340,10 +424,11 @@ forwards the client close upstream, and race long provider calls against the dis
 
 ### With `uvicorn --workers 4` and a 6 GB model loaded in lifespan, what does that cost and what would you change?
 - **Memory:** each worker runs its own lifespan, so the model is loaded four times, about 24 GB in total.
-- **State:** `app.state` caches and counters also diverge per worker, so in-process rate limits are per
-  worker, not per service.
+- **State:** `app.state` caches, counters and in-memory agent sessions also diverge per worker, so
+  in-process rate limits are per worker, not per service.
 - **Change:** past one or two workers, move the model to a dedicated model server and keep the API
-  workers thin, or run fewer workers and rely on async concurrency within each.
+  workers thin, or run fewer workers and rely on async concurrency within each; keep agent state in a
+  shared store.
 
 ## Quiz
 ### Q: When does Uvicorn start accepting HTTP connections for a FastAPI app with a lifespan handler?

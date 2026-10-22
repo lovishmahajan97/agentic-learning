@@ -23,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-FastAPI and uvicorn impose no per-request time limit, so a slow LLM call holds a connection, memory and
-a concurrency slot indefinitely. Timeouts turn that hang into a fast, known error: phase timeouts per
-call, one request deadline, innermost firing first.
+An agent run chains many LLM and tool calls, and FastAPI and uvicorn impose no per-request time limit,
+so one stalled step holds a connection and concurrency slot indefinitely. Timeouts turn hangs into
+known errors: phase timeouts per call, one run deadline, innermost first.
+
+## For agent builders
+- **Why it matters for agents.** One agent request is 5-20 sequential model and tool calls, so a single
+  stalled step stalls the whole run, and per-call waits add up. Without a run deadline, a looping agent
+  keeps paying for tokens long after the user's proxy has returned a 504.
+- **Where it shows up in your stack.** `httpx.Timeout` on the shared client your tools use, the `timeout`
+  and `max_retries` arguments of provider SDKs, `asyncio.timeout` around the agent loop and each tool,
+  plus the proxy in front of FastAPI.
+- **What you control.** A wall-clock budget for the run, a step cap, a per-tool limit that is the minimum
+  of its own number and the budget left, and what the model sees when a tool times out (an error result,
+  not a crashed run).
+- **What you can skip.** Tuning uvicorn keep-alive or gunicorn worker timeouts; they do not bound request
+  duration, so they rarely explain an agent hang.
 
 ## Why it exists
 - **An LLM endpoint is mostly waiting.** On the model provider, the vector store, a tool's API. Most
@@ -122,16 +135,38 @@ call, one request deadline, innermost firing first.
 - **Service-to-service:** pass the remaining budget along so the downstream service doesn't start work
   its caller has already abandoned. gRPC does this natively with deadlines; over HTTP a header carrying
   the remaining milliseconds works, relative so that clock skew between hosts doesn't matter.
+- **Database at the pool:** set Postgres `statement_timeout` per connection (asyncpg accepts it through
+  `server_settings`, and `command_timeout` bounds the client side), so a SQL tool an agent calls cannot
+  hold a pool connection past the run. Monitor pool wait time and statements cancelled by timeout.
+
+### Budgets for an agent loop
+An agent request is a loop, so it needs limits a single call does not:
+
+| Limit | Bounds | Why |
+|---|---|---|
+| **Run deadline** | wall clock for the whole loop | the proxy and the user wait for the run, not for one call |
+| **Step cap** | number of model turns | a model that keeps calling tools never trips a per-call timeout |
+| **Per-tool timeout** | one tool execution, `min(tool limit, budget left)` | a slow tool must not eat the model's last turn |
+| **Model-call timeout** | one LLM turn, capped by budget left | the final answer needs time too |
+
+- **A tool timeout is data for the model.** Catch it inside the loop and append an error tool result
+  ("search timed out after 5 s"), so the model can retry, pick another tool or answer with what it has.
+- **A run deadline is the backstop.** When it fires, return a partial answer or your own 504 with the
+  step reached, and log the trace so you can see which step ate the budget.
+- **Reserve time for the last turn.** Stop starting new tool calls when the budget left is below a
+  typical final model call, or the run times out one step before it would have answered.
+- **Long runs belong in a job.** If a run legitimately needs minutes, return 202 with a run id and stream
+  or poll progress, instead of stretching every proxy timeout.
 
 ## Diagram
-Follow one request inward: each layer's limit is shorter than the one outside it, and every call takes
-the smaller of its own limit and the budget left.
+Follow one agent request inward: each layer's limit is shorter than the one outside it, and every tool
+or model call in the loop takes the smaller of its own limit and the budget left.
 
 ```mermaid
 flowchart TD
     C["Client waits"] --> P["Proxy read or idle timeout, e.g. 60 s"]
     P --> A["App deadline via asyncio.timeout, a few s under the proxy"]
-    A --> R["Retrieval call: min of 1.5 s and budget left"]
+    A --> R["Tool or retrieval call: min of 1.5 s and budget left"]
     R --> G["LLM call: phase timeouts, read capped by budget left"]
     G -->|"answers in time"| OK["200 response"]
     G -->|"connect fails fast"| E3["Your 503 with Retry-After"]
@@ -233,6 +268,54 @@ print(asyncio.run(consume(gap_limit=1.0, total=2.0)))  # deadline hit after 6 ch
 print(asyncio.run(consume(gap_limit=0.1, total=2.0)))  # stalled after 0 chunks (no chunk for 0.1s)
 ```
 
+### Agent loop with a run budget, a step cap and per-tool timeouts
+`llm` and `tools` are your own async callables; the point is where the limits sit. Requires Python 3.11+.
+
+```python
+import asyncio, json
+
+RUN_BUDGET = 25.0      # proxy read timeout is 30 s
+TOOL_TIMEOUT = 5.0
+FINAL_TURN_RESERVE = 4.0
+MAX_STEPS = 8
+
+async def run_agent(llm, tools: dict, messages: list) -> str:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + RUN_BUDGET
+    left = lambda: max(0.0, deadline - loop.time())
+    async with asyncio.timeout(RUN_BUDGET):              # backstop for the whole run
+        for step in range(MAX_STEPS):
+            reply = await llm(messages, timeout=left())   # model turn capped by budget left
+            messages.append(reply)
+            if not reply.get("tool_calls"):
+                return reply["content"]
+            for call in reply["tool_calls"]:
+                if left() < FINAL_TURN_RESERVE:            # keep time for the answer
+                    result = {"error": "budget exhausted, answer with what you have"}
+                else:
+                    try:
+                        async with asyncio.timeout(min(TOOL_TIMEOUT, left() - FINAL_TURN_RESERVE)):
+                            result = await tools[call["name"]](**call["args"])
+                    except TimeoutError:                   # tool timeout becomes data for the model
+                        result = {"error": f"{call['name']} timed out after {TOOL_TIMEOUT}s"}
+                messages.append({"role": "tool", "tool_call_id": call["id"],
+                                 "content": json.dumps(result)})
+    return "stopped: step limit reached"
+# The route maps a TimeoutError escaping run_agent to its own 504 (or a partial answer) and logs the step.
+```
+
+Illustrative timeline for one run:
+
+| Elapsed | Event | Budget left |
+|---|---|---|
+| 2.1 s | model turn 1 asks for `search` | 22.9 s |
+| 7.1 s | `search` hits its 5 s limit, error result appended | 17.9 s |
+| 9.0 s | model turn 2 asks for `fetch_doc` instead | 16.0 s |
+| 10.2 s | `fetch_doc` returns | 14.8 s |
+| 13.5 s | model turn 3 answers | 11.5 s spare, user got an answer |
+
+Without the tool limit, the stalled `search` would have held the run until the proxy's 30 s 504.
+
 ### Worked scenario: the hidden retry multiplier
 Illustrative numbers for one call during a provider incident, using the worst-case formula above.
 
@@ -246,9 +329,13 @@ Only the last row respects a request deadline; the first also sends three times 
 of the second.
 
 ## Production patterns
-- **Deadline under the proxy** — for every HTTP route. Set the app budget a few seconds below the proxy
-  read or idle timeout (for example 27 s under a 30 s proxy) with `asyncio.timeout`. Monitor
-  proxy-generated 504s versus app 504s; any proxy 504 means the ordering is wrong.
+- **Run deadline under the proxy** — for every agent route. Set the run budget a few seconds below the
+  proxy read or idle timeout (for example 27 s under a 30 s proxy) with `asyncio.timeout` around the
+  whole loop, plus a step cap. Monitor proxy-generated 504s versus app 504s; any proxy 504 means the
+  ordering is wrong.
+- **Tool timeouts returned to the model** — for every tool the agent can call. Wrap each tool in
+  `asyncio.timeout(min(limit, budget left))` and append an error tool result on timeout instead of
+  raising. Monitor timeouts per tool name and how often the run still finishes after one.
 - **SDK calls driven by the remaining budget** — whenever you call a provider SDK. Pass the remaining
   seconds as the SDK's `timeout` and `max_retries=0`, then retry yourself only while budget remains.
   Monitor upstream request count divided by your request count; it should stay near 1 outside incidents.
@@ -256,15 +343,12 @@ of the second.
   `httpx.ReadTimeout`, `httpx.WriteTimeout` and `httpx.PoolTimeout` separately per dependency, because a
   pool timeout points at your concurrency while a connect timeout points at the provider. Alert on
   rising rates.
-- **Database timeouts at the pool** — for any SQL dependency. Set Postgres `statement_timeout` per
-  connection (asyncpg accepts it through `server_settings`, and `command_timeout` bounds the client side).
-  Monitor pool wait time and statements cancelled by timeout.
 - **Streaming-aware proxy settings** — for SSE or chunked routes. Raise the proxy read or idle timeout
   only on streaming routes, disable buffering there (nginx `proxy_buffering off`), and send periodic SSE
   comment lines (`: ping`) so idle timers see bytes. Monitor streams ending without a final event.
-- **Budget propagation between services** — for internal fan-out. Send remaining milliseconds in a
-  request header of your choosing and have the callee start its own deadline from it. Monitor
-  downstream work started after the caller's deadline.
+- **Budget propagation to tools and sub-agents** — for internal fan-out. Send remaining milliseconds in a
+  request header of your choosing and have the tool service or sub-agent start its own deadline from it.
+  Monitor downstream work started after the caller's deadline.
 
 ## Trade-offs
 - **Short vs long timeouts.** Short ones free capacity quickly and surface outages early, but cut off
@@ -276,6 +360,9 @@ of the second.
 - **Retry vs duplicate cost.** Retrying after a timeout raises success rates on transient stalls, but can
   double cost and side effects when the first attempt actually finished, so it only pays off with
   idempotent calls.
+- **Tight tool timeouts vs agent success rate.** Short per-tool limits keep the run inside its budget and
+  let the model route around a slow tool, but a limit below the tool's normal p99 makes the agent fail or
+  retry tasks that would have succeeded. Set each limit from that tool's measured latency.
 - **Streaming vs operational complexity.** Streaming keeps a long total time while catching stalls with
   a short read timeout, at the cost of proxy configuration (idle timeouts, buffering) and error handling
   after the 200 is sent.
@@ -296,12 +383,19 @@ of the second.
 - **Your retry loop around an SDK that still retries internally.** Symptom: upstream request counts
   several times your own during a provider incident, and latencies clustered at multiples of the SDK
   timeout.
+- **Letting a tool timeout crash the agent run.** Symptom: one slow tool turns into a 500 for the whole
+  request, though the model could have answered without it. Fix: catch the timeout per tool and append an
+  error tool result.
+- **No step cap on the loop.** Symptom: runs that end only at the proxy's timeout, with traces showing
+  the model calling the same tool again and again. Fix: a step cap plus a run deadline.
 - **Timing out the HTTP call but not the database.** Symptom: pool-exhaustion errors on unrelated
   endpoints while slow queries hold connections far past any request deadline.
 
 ## When to use
 - **Always.** Every outbound call in a FastAPI service needs explicit timeouts, and every request needs a
   deadline shorter than whatever sits in front of it.
+- **Agent loops especially.** Every agent route needs a run deadline, a step cap and per-tool limits,
+  because loops multiply every missing timeout by the number of steps.
 - **Write the layer chain down** (client, CDN, proxy, app deadline, per-call) with the number for each,
   and check that the numbers shrink as you go inward.
 - **Pick numbers from measured latency:** a per-call timeout a bit above that dependency's observed p99,
@@ -346,7 +440,15 @@ retries within the remaining budget.
 - **A slow-but-steady stream trips none of them**, because read is per chunk; only an application
   deadline caps total duration.
 
-### p99 latency on your chat endpoint is three times your configured timeout during a provider incident. How do you debug it?
+### Design the time budgets for a tool-calling agent behind a 30-second proxy.
+- **Run deadline first:** about 27 s with `asyncio.timeout` around the loop, plus a step cap, so the app
+  always fails before the proxy and can log which step ate the budget.
+- **Per call:** each tool gets `min(its limit, budget left)` and each model turn is capped by the budget
+  left, keeping a reserve for the final answer.
+- **On a tool timeout**, append an error tool result so the model can retry or answer without it; move
+  runs that need minutes to a background job with a run id.
+
+### p99 latency on your agent endpoint is three times your configured timeout during a provider incident. How do you debug it?
 - **Suspect stacked retries.** Compare upstream request counts with your own request count; a ratio well
   above 1 means your loop and the SDK's internal retries are multiplying.
 - **Check the budget logic.** Worst case is roughly `(retries + 1) × per-attempt timeout + total

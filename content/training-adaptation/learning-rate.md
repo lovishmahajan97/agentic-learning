@@ -5,7 +5,8 @@ name: Learning rate
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/learning-rate-schedulers
   - ml-fundamentals/warmup
@@ -23,9 +24,21 @@ sources:
 ---
 
 ## TL;DR
-The learning rate is the optimiser's step size, its most sensitive hyperparameter: a gradient gives
-direction, not a safe distance. Too large diverges, too small crawls. Peak, warmup and decay are set
-together; fine-tuning runs far lower to stay near the pretrained weights.
+The learning rate is the optimiser's step size, the first knob to check when an agent fine-tune
+misbehaves: too high and the model forgets its tool-call format or diverges, too low and LoRA learns
+nothing. Peak, warmup and decay are set together.
+
+## For agent builders
+- **Why it matters for agents.** When you fine-tune a model on agent trajectories (tool selection,
+  argument formatting, a house style for final answers), the rate decides how far the model moves from
+  the instruction-tuned base. Too far and it loses the general skills and chat format your agent relies on.
+- **Where it shows up in your stack.** A learning-rate multiplier on hosted fine-tuning jobs (OpenAI's
+  API calls it `learning_rate_multiplier`), `learning_rate`, `warmup_ratio` and `lr_scheduler_type` in
+  Hugging Face and TRL trainers, and the rate you pick for LoRA adapters you serve behind the agent.
+- **What you control.** The peak rate per parameterisation (full fine-tune versus LoRA), the warmup as a
+  share of a short run, and a small grid scored on held-out tool-call accuracy and a general suite.
+- **What you can skip.** Deriving schedules and μP in depth. Know the 2/λ intuition, that Adam makes η
+  roughly a per-parameter step, and the full fine-tune versus LoRA starting points.
 
 ## Why it exists
 - **A gradient is local.** Gradient descent is `θ ← θ − η·∇L(θ)`. The gradient says which direction is
@@ -41,11 +54,26 @@ together; fine-tuning runs far lower to stay near the pretrained weights.
   ten times too small ends with the loss of a much shorter run. It also tends to generalise worse, an
   empirical regularity whose explanation is still debated.
 - **"Large to go fast" breaks things.** Loss spikes, NaNs, and pretrained features destroyed in the first
-  hundred steps. So the learning rate is a trajectory, not a constant: warmup, peak and decay, each
-  answering a different failure.
+  hundred steps, which in an agent model shows up as broken tool-call JSON. So the learning rate is a
+  trajectory, not a constant: warmup, peak and decay, each answering a different failure.
 
 ## How it works
-### What η means under SGD versus Adam
+### Fine-tuning rates for agent models
+| Setting | Typical peak (starting point, not a law) | Why |
+|---|---|---|
+| Full fine-tune of an LLM | low 1e-5 range | every weight moves, and large moves erase pretrained knowledge (see catastrophic forgetting) |
+| LoRA and other adapters | around ten times higher | the trainable set is small and its contribution starts at zero (LoRA's B matrix is zero-initialised), so the update must grow from nothing within the run |
+| Hosted fine-tuning API | a multiplier on a provider-chosen base | you never see the absolute rate, so grid the multiplier the same way |
+
+- **The exact ratio is empirical.**
+- **LoRA's α/r interacts with η.** LoRA's output is multiplied by a scaling factor α/r, so changing the
+  rank or α changes the effective step on the model's outputs at the same nominal η. That is one reason
+  a LoRA rate rarely transfers between configurations unchanged.
+- **What a wrong rate looks like in an agent.** Too high: malformed tool calls, ignored system prompts,
+  regressions on a general suite. Too low on LoRA: the adapter barely changes behaviour and the agent
+  acts like the base model.
+
+### Background: what η means under SGD versus Adam
 | Optimiser | Update | Consequence |
 |---|---|---|
 | SGD | `Δθ = −η·g` | step scales with gradient magnitude, which differs across layers by orders of magnitude, so a good rate is specific to the architecture and even the initialisation |
@@ -87,17 +115,6 @@ mechanism lives in `ml-fundamentals/warmup`.
 - **Adam:** the right exponent is contested; square-root scaling is often recommended.
 - **Either way,** a rate copied from a run with a different batch size is a different hyperparameter.
 
-### Fine-tuning rates
-| Setting | Typical peak (starting point, not a law) | Why |
-|---|---|---|
-| Full fine-tune of an LLM | low 1e-5 range | every weight moves, and large moves erase pretrained knowledge (see catastrophic forgetting) |
-| LoRA and other adapters | around ten times higher | the trainable set is small and its contribution starts at zero (LoRA's B matrix is zero-initialised), so the update must grow from nothing within the run |
-
-- **The exact ratio is empirical.**
-- **LoRA's α/r interacts with η.** LoRA's output is multiplied by a scaling factor α/r, so changing the
-  rank or α changes the effective step on the model's outputs at the same nominal η. That is one reason
-  a LoRA rate rarely transfers between configurations unchanged.
-
 ### One rate or several
 - **Discriminative (layer-wise) rates** give a freshly initialised head a higher rate than the pretrained
   body, because the head starts from nothing while the body only needs nudging. Optimisers take this as
@@ -109,7 +126,8 @@ mechanism lives in `ml-fundamentals/warmup`.
 ### Finding the rate
 1. **Range test.** Increase η exponentially over a short run and plot loss. The usable region ends just
    before the loss explodes; the best peak sits somewhat below that edge.
-2. **Coarse grid.** ×3 spacing (1e-5, 3e-5, 1e-4) resolves most fine-tuning questions.
+2. **Coarse grid.** ×3 spacing (1e-5, 3e-5, 1e-4) resolves most fine-tuning questions. For an agent model,
+   pick on held-out tool-call accuracy and a general suite, not training loss.
 3. **Read the diagnostics:**
 
 | Symptom | Meaning |
@@ -117,10 +135,11 @@ mechanism lives in `ml-fundamentals/warmup`.
 | spikes or NaN | too high |
 | slow, monotone descent that ends above the baseline | too low |
 | gradient clipping firing on most steps | the rate is leaning on the clip rather than being right |
+| tool-call validity falls while task loss improves | too high: the model is drifting from its base format |
 
 ## Diagram
 The path to a usable rate: pick a starting band by parameterisation, probe it, then read the curves and
-move the peak or warmup until neither spikes nor a flat plateau appears.
+agent evals and move the peak or warmup until neither spikes nor a flat plateau appears.
 
 ```mermaid
 flowchart TD
@@ -129,17 +148,68 @@ flowchart TD
     F --> G["Range test or x3 grid around the start"]
     L --> G
     G --> T["Trajectory: warmup few percent, peak, cosine or linear decay"]
-    T --> R["Short run: loss, gradient norm, clip rate"]
-    R --> D{"What does the curve show?"}
-    D -->|"spikes or NaN"| H["Lower peak or lengthen warmup"]
+    T --> R["Short run: loss, grad norm, tool-call evals"]
+    R --> D{"What does the run show?"}
+    D -->|"spikes, NaN or broken tool calls"| H["Lower peak or lengthen warmup"]
     D -->|"slow descent above baseline"| U["Raise peak"]
     D -->|"clip fires on most steps"| H
     H --> R
     U --> R
-    D -->|"stable, validation improving"| OK["Record peak, warmup, schedule, batch size"]
+    D -->|"stable, evals improving"| OK["Record peak, warmup, schedule, batch size"]
 ```
 
 ## Examples
+### A ×3 grid for a LoRA agent fine-tune, scored on tool calls
+The grid is judged on what the agent needs: held-out tool calls that parse, name a real tool and carry
+every required argument. `finetune_lora` and `generate_calls` stand in for the team's training and
+inference helpers; the scorer is runnable as written.
+
+```python
+import json
+
+TOOLS = {"search_orders": {"required": ["customer_id"]},
+         "issue_refund": {"required": ["order_id", "amount"]}}
+
+def tool_call_validity(outputs, tools=TOOLS):
+    """Share of predicted tool calls that parse, name a real tool and include all required args."""
+    ok = 0
+    for out in outputs:
+        try:
+            call = json.loads(out)
+            ok += all(k in call["arguments"] for k in tools[call["name"]]["required"])
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+    return ok / len(outputs)
+
+print(tool_call_validity([
+    '{"name": "search_orders", "arguments": {"customer_id": "c-42"}}',
+    '{"name": "issue_refund", "arguments": {"order_id": "o-9"}}',      # missing amount
+    'I will now call issue_refund',                                    # not a tool call at all
+]))                                                                    # 0.333...
+
+# The grid itself, around the usual adapter starting point (about 10x a full fine-tune rate):
+# for lr in (3e-5, 1e-4, 3e-4):
+#     adapter = finetune_lora(base, train_traces, lr=lr, warmup_ratio=0.03, scheduler="cosine")
+#     print(lr, tool_call_validity(generate_calls(adapter, heldout_prompts)), run_suite(adapter))
+```
+
+In a Hugging Face fine-tune the same ideas appear as `learning_rate=2e-5`, `warmup_ratio=0.03` and
+`lr_scheduler_type="cosine"`; the peak, the ramp and the decay are three settings of one trajectory.
+
+### Worked scenario: reading the grid
+Illustrative numbers (shape only, not a benchmark) for LoRA on 3,000 support-agent trajectories, scored on
+200 held-out tool calls and a general instruction-following suite.
+
+| Peak LR | End train loss | Tool-call validity | General suite |
+|---|---|---|---|
+| 3e-5 | 0.71 | 86% | 70 |
+| 1e-4 | 0.44 | 95% | 69 |
+| 3e-4 | 0.21 | 93% | 64 |
+| 1e-3 | spiky | 61% | 52 |
+
+- **Reading it.** Training loss keeps falling as the rate rises, but tool-call validity peaks at 1e-4
+  and the general suite drops sharply above it. Pick 1e-4; 3e-4 buys loss, not agent behaviour.
+
 ### The stability bound and Adam's normalisation
 The bound is easiest to see on the quadratic, and Adam's normalisation by feeding it two gradients that
 differ by 1000× and watching the parameter move by the same amount.
@@ -170,9 +240,6 @@ for scale in (1.0, 1000.0):
     opt.step()
     print(f"gradient={scale:>6}: moved by {1.0 - w.item():.6f}")   # both ~0.001
 ```
-
-In a Hugging Face fine-tune the same ideas appear as `learning_rate=2e-5`, `warmup_ratio=0.03` and
-`lr_scheduler_type="cosine"`; the peak, the ramp and the decay are three settings of one trajectory.
 
 ### A learning-rate range test in plain Python
 Minibatch SGD on a one-weight regression, with η ramped exponentially from 1e-4 to 10 and the run stopped
@@ -220,25 +287,27 @@ A team fine-tunes on 2,400 examples at batch 16 for 2 epochs and copies a fixed 
   dataset size change.
 
 ## Production patterns
+- **Score the grid on agent behaviour.** For a new agent fine-tune, run a short ×3 grid (1e-5, 3e-5, 1e-4
+  for full fine-tunes, or ten times higher for LoRA, or three multipliers on a hosted job) and pick on
+  held-out tool-call validity and a general suite. Monitor for spikes at the top and a flat curve at the
+  bottom.
 - **Record the trajectory as one unit.** In every training config and experiment record, store peak
   `learning_rate`, warmup (`warmup_ratio` or steps), `lr_scheduler_type`, effective batch size and
   optimiser together. Log the actual learning rate per step (the Hugging Face `Trainer` logs it) and
   check it matches the plan.
-- **Short ×3 grid before the full run.** For a new task or parameterisation, run 1e-5, 3e-5 and 1e-4 (or
-  ten times higher for LoRA) for a fraction of the budget and pick on the validation metric. Monitor for
-  spikes at the top of the grid and a flat curve at the bottom.
 - **Gradient-norm and clip-rate dashboard.** Keep clipping on (`max_grad_norm=1.0` is the Hugging Face
   default) but chart the pre-clip gradient norm and the fraction of steps clipped. A clip rate near 100%
   means the rate is too high, not that clipping is working.
-- **Separate parameter groups for head and body.** When a new head is attached, give it a higher rate:
+- **Separate parameter groups for head and body.** When a new head is attached (for example a router or
+  reward head), give it a higher rate:
   `torch.optim.AdamW([{"params": body_params, "lr": 1e-5}, {"params": head_params, "lr": 1e-4}])`.
   Monitor per-group update norms so the body is not drifting more than intended.
 - **Spike rollback.** On a loss spike or NaN in a long run, restore the last good checkpoint and resume
   with a lower peak or longer warmup rather than pushing through. Monitor loss spikes per thousand steps
   and alert on the first NaN.
-- **Re-tune on any structural change.** Treat a new batch size, optimiser, LoRA rank or α, or model width
-  as invalidating the old rate; rerun the grid. Track the rate alongside these settings so drift in one is
-  visible.
+- **Re-tune on any structural change.** Treat a new batch size, optimiser, LoRA rank or α, base model or
+  model width as invalidating the old rate; rerun the grid. Track the rate alongside these settings so
+  drift in one is visible.
 
 ## Trade-offs
 - **Higher peak vs stability.** A higher peak reaches a lower loss within a fixed budget and often
@@ -250,14 +319,17 @@ A team fine-tunes on 2,400 examples at batch 16 for 2 epochs and copies a fixed 
 - **Decay to near zero vs extensibility.** It gives the best final weights but a finished run cannot be
   extended; a constant phase with a late decay keeps that option at the cost of a slightly less settled
   endpoint.
-- **Low fine-tuning rate vs underfitting.** It preserves pretrained knowledge and reduces forgetting but
-  may underfit the new task; the balance shifts toward a higher rate when the task is far from the
-  pretraining distribution.
+- **Low fine-tuning rate vs underfitting.** It preserves pretrained knowledge, chat format and general
+  tool use, and reduces forgetting, but may underfit the new task; the balance shifts toward a higher rate
+  when the task is far from the pretraining distribution.
 
 ## Pitfalls
 - **Copying a rate across optimisers, batch sizes or parameterisations** (SGD versus AdamW, full
   fine-tune versus LoRA). Symptom: a run that diverges immediately or one that barely moves in the
   budget. Fix: re-run a short grid for the new setup.
+- **Choosing the rate on training loss for an agent model.** Symptom: the lowest-loss run emits more
+  malformed tool calls and ignores system prompts. Fix: select on held-out tool-call validity and a
+  general suite.
 - **Changing step count while the schedule is defined in steps** (epochs, dataset size). Symptom: two
   "identical" configs with different effective rates at the same step and incomparable results. Fix:
   define warmup as a ratio and log the per-step rate.
@@ -273,8 +345,9 @@ A team fine-tunes on 2,400 examples at batch 16 for 2 epochs and copies a fixed 
 
 ## When to use
 Every training run sets a learning rate; the decision is how to choose it and its trajectory.
-- **New fine-tuning task:** start from a common rate for your parameterisation, run a short range test or
-  a ×3 grid, and read the loss curve for spikes (too high) or a flat, early plateau (too low).
+- **New agent fine-tuning task:** start from a common rate for your parameterisation, run a short range
+  test or a ×3 grid, and read the loss curve for spikes (too high) or a flat, early plateau (too low)
+  alongside tool-call and general evals.
 - **Pair and record:** a peak with a warmup of a few percent of the steps and a decay that fits the run
   length; record all three with the batch size.
 - **Measure:** the gradient norm alongside the loss. A healthy run has a stable norm, not one rescued by
@@ -314,6 +387,21 @@ training loss alone.
   along flat ones. Too large diverges, too small spends the budget crawling, so small changes in η move
   the outcome more than most other settings.
 
+### After fine-tuning your agent model, tool calls are more often malformed than with the base model. Is it the learning rate?
+- **Likely suspect:** a peak too high (or too many steps) moves the model away from the base's format
+  skills; check whether the regression grows with the rate across your grid.
+- **Check the data too:** training traces formatted differently from the serving chat template, or
+  without tool calls, push the format away whatever the rate.
+- **Fix:** lower the rate or use LoRA, mix in general tool-use data, and gate on held-out tool-call
+  validity measured against the base model's own number.
+
+### Your hosted fine-tuning job only exposes a learning-rate multiplier. How do you tune it?
+- **Treat it like any rate:** you do not see the absolute value, so run a ×3 grid of multipliers on a
+  fraction of the data or budget.
+- **Pick on agent evals:** held-out tool-call validity, task success on a small sandbox set and a general
+  suite, not the training loss the job reports.
+- **Re-tune when anything structural changes:** base model, dataset size, epochs or batch size.
+
 ### Why do we warm up the learning rate, and what goes wrong if you copy a warmup from pretraining?
 - **Warmup exists because** Adam's second-moment estimate is built from very few samples at the start,
   and early gradients (for example from a new random head) are large and uninformative.
@@ -333,14 +421,8 @@ training loss alone.
   warmup.
 - **Diagnose with the gradient norm** and clip rate around the spike: a norm that climbs before the spike,
   or clipping firing on most steps, says the rate is too high for that phase.
-- **Monitor afterwards:** loss spikes per thousand steps and an alert on the first NaN.
-
-### Why does AdamW weight decay change when you change the learning rate?
-- **In PyTorch's AdamW and most framework implementations** the decay step is multiplied by η:
-  `θ ← θ·(1 − η·λ)`.
-- **So raising η also strengthens regularisation,** and weights can shrink faster than intended, producing
-  underfitting that looks like a data problem.
-- **Practical rule:** when sweeping η, keep the product in mind and re-check λ if the best rate moves a lot.
+- **Monitor afterwards:** loss spikes per thousand steps and an alert on the first NaN; and remember AdamW
+  decay scales with η, so re-check weight decay if the new peak differs a lot.
 
 ## Quiz
 ### Q: For the loss L = ½λθ² with λ = 4, which learning rate makes plain gradient descent diverge?

@@ -23,8 +23,8 @@ sources:
 ---
 
 ## TL;DR
-An agent run takes many seconds of model calls and tool calls; `StreamingResponse` sends each token or
-step event as it exists, so users see progress at once. Status and headers freeze at the first byte, so
+Agent runs span many seconds of model and tool calls; `StreamingResponse` sends each token or step
+event as it exists, so users see progress at once. Status and headers freeze at the first byte, so
 mid-run errors go in-band and nothing may buffer.
 
 ## For agent builders
@@ -181,9 +181,10 @@ sequenceDiagram
 ```
 
 ## Examples
-### NDJSON token stream with early validation
-Validation runs before the response object exists, the loop stops when the client has gone, and a
-failure after the first byte becomes a typed error line instead of a truncated body.
+### Agent run streamed as typed NDJSON events
+A tool-calling loop emits step, tool and delta records. Validation runs before the response object
+exists, the loop stops when the client has gone, and a failure after the first byte (a tool raising
+mid-run) becomes a typed error line instead of a truncated body.
 
 ```python
 import asyncio, json
@@ -193,43 +194,57 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 app = FastAPI()
+MAX_STEPS = 8
 
 class Ask(BaseModel):
     prompt: str
 
-async def model_stream(prompt: str):
-    # Stand-in for your SDK's async streaming iterator; both major vendor SDKs expose one.
-    for word in "Streaming keeps the user reading while the model is still decoding.".split():
-        await asyncio.sleep(0.05)
-        yield word + " "
+async def search_orders(q: str) -> str:                   # a tool; real ones hit a DB or an API
+    await asyncio.sleep(0.5)
+    return "order 1042: shipped"
 
-@app.post("/answer")
-async def answer(body: Ask, request: Request):
+async def agent_loop(prompt: str):
+    # Stand-in for your loop over an async SDK stream (or a framework's streaming iterator).
+    for step in range(1, MAX_STEPS + 1):
+        yield {"type": "step", "n": step}
+        if step == 1:                                     # model asked for a tool
+            yield {"type": "tool_call", "name": "search_orders"}
+            result = await search_orders(prompt)
+            yield {"type": "tool_result", "name": "search_orders", "summary": result[:80]}
+            continue
+        for word in "Your order 1042 has shipped.".split():  # final answer, token by token
+            await asyncio.sleep(0.05)
+            yield {"type": "delta", "text": word + " "}
+        return
+
+@app.post("/agent/run")
+async def run(body: Ask, request: Request):
     if len(body.prompt) > 8000:
         raise HTTPException(413, "prompt too long")      # fail BEFORE any byte of the stream is sent
 
     async def ndjson():
         try:
-            # aclosing() closes the upstream stream deterministically when we stop early
-            async with aclosing(model_stream(body.prompt)) as stream:
-                async for piece in stream:
+            # aclosing() closes the loop (and its upstream model stream) when we stop early
+            async with aclosing(agent_loop(body.prompt)) as events:
+                async for ev in events:
                     if await request.is_disconnected():
-                        return                            # stop paying for tokens nobody will read
-                    yield json.dumps({"delta": piece}) + "\n"
-            yield json.dumps({"done": True}) + "\n"
+                        return                            # stop paying for steps nobody will read
+                    yield json.dumps(ev) + "\n"
+            yield json.dumps({"type": "done"}) + "\n"
         except Exception as exc:                          # headers are gone: signal the error in-band
-            yield json.dumps({"error": type(exc).__name__}) + "\n"
+            yield json.dumps({"type": "error", "error": type(exc).__name__}) + "\n"
 
     return StreamingResponse(ndjson(), media_type="application/x-ndjson",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 # Check it really streams through your ingress, not just locally:
-#   curl -N -X POST http://localhost:8000/answer -H 'content-type: application/json' -d '{"prompt":"hi"}'
+#   curl -N -X POST http://localhost:8000/agent/run -H 'content-type: application/json' -d '{"prompt":"hi"}'
 ```
 
 ### A client that survives framing
-The consumer side: `httpx` reads the body as it arrives and `aiter_lines()` re-splits on newlines, so
-glued or split chunks still yield whole NDJSON records.
+The consumer side (a UI backend, an eval harness, or a supervisor agent calling this one as a tool):
+`httpx` reads the body as it arrives and `aiter_lines()` re-splits on newlines, so glued or split chunks
+still yield whole NDJSON records.
 
 ```python
 import asyncio, json
@@ -238,36 +253,47 @@ import httpx
 async def consume(prompt: str) -> str:
     text = []
     async with httpx.AsyncClient(timeout=None) as client:
-        async with client.stream("POST", "http://localhost:8000/answer",
+        async with client.stream("POST", "http://localhost:8000/agent/run",
                                  json={"prompt": prompt}) as r:
             r.raise_for_status()                    # only pre-stream failures (e.g. 413) land here
             async for line in r.aiter_lines():      # buffers until "\n", so TCP boundaries do not matter
                 if not line:
                     continue
                 msg = json.loads(line)
-                if "error" in msg:
-                    raise RuntimeError(f"stream failed mid-way: {msg['error']}")
-                if msg.get("done"):
+                if msg["type"] == "error":
+                    raise RuntimeError(f"agent run failed mid-way: {msg['error']}")
+                if msg["type"] == "done":
                     return "".join(text)
-                text.append(msg["delta"])
+                if msg["type"] == "tool_call":
+                    print(f"[tool] {msg['name']}")    # progress, not answer text
+                elif msg["type"] == "delta":
+                    text.append(msg["text"])
     raise RuntimeError("stream ended without a done record")  # truncation detected in-band
 
 print(asyncio.run(consume("hi")))
 ```
 
-### Worked scenario: buffered vs streamed answer
-The 600-token answer at ~40 tokens/s from above (illustrative figures), behind a load balancer with an
-illustrative 60-second idle timeout.
+### Worked scenario: buffered vs streamed agent run
+The 600-token answer at ~40 tokens/s from above, produced after the agent made tool calls, behind a load
+balancer with an illustrative 60-second idle timeout (all figures illustrative).
 
 | Metric | Buffered `JSONResponse` | `StreamingResponse` |
 |---|---|---|
-| Time to first visible text | ~15 s (whole answer) | the model's TTFT |
-| Bytes idle on the connection | ~15 s of silence | a chunk every ~25 ms |
+| Time to first visible text | ~15 s (whole answer) plus every tool call | the first step event, then the model's TTFT |
+| Bytes idle on the connection | ~15 s of silence | a chunk every ~25 ms while answering |
 | 3,000-token answer (~75 s) | idle timeout fires, 504 | keeps flowing |
+| A 70 s silent research tool | 504, the run is lost | 504 too, unless a heartbeat is sent |
 | Server-side duration | ~15 s | ~15 s (unchanged) |
 | Capacity planning unit | requests per second | concurrent open streams |
 
+- **The tool row is the agent-specific trap.** Streaming tokens is not enough; a silent tool phase longer
+  than the idle timeout still kills the run, so emit heartbeats or tool progress events during tools.
+
 ## Production patterns
+- **One typed event protocol for every agent.** Agent teams define one schema (step, tool_call,
+  tool_result, delta, done, error, each with a run id) and reuse it across agents, so the UI, eval
+  harness and trace viewer parse one format. Monitor the share of runs that end without a done or error
+  record, which means truncation.
 - **Peek the first chunk before committing headers.** When upstream errors (auth, rate limit, bad model
   name) usually surface on the first read, call `first = await anext(stream)` before returning the
   response, so they become real 4xx/5xx statuses. Then yield `first` and the rest. Monitor the share of
@@ -278,9 +304,9 @@ illustrative 60-second idle timeout.
 - **Heartbeat during silent phases.** When a tool call or retrieval step can go quiet longer than the
   load balancer's idle timeout, yield a small keepalive record (for example `{"ping": true}`) on a timer
   well below that timeout. Monitor 504 rate and stream duration percentiles.
-- **Cancel upstream on disconnect.** Wrap the SDK stream in `aclosing()`, check
-  `await request.is_disconnected()` per chunk and release resources in `finally`. Monitor the fraction
-  of streams cancelled and tokens billed after disconnect.
+- **Cancel upstream on disconnect.** Wrap the SDK stream (or the whole agent loop) in `aclosing()`, check
+  `await request.is_disconnected()` per chunk and release resources in `finally`, including in-flight
+  tool calls. Monitor the fraction of streams cancelled and tokens billed after disconnect.
 - **Cap concurrent streams, not request rate.** Bound open streams per worker (uvicorn's
   `--limit-concurrency` returns 503 beyond the limit) and size workers by expected concurrent streams.
   Monitor an open-streams gauge and thread-pool saturation if any sync generators remain.
@@ -295,11 +321,17 @@ illustrative 60-second idle timeout.
 - **Partial output vs protocol burden.** In-band error chunks let the client keep partial output, but
   every consumer must parse a protocol instead of checking a status code. For third-party integrators
   expecting REST semantics, offer a non-streaming variant too.
+- **Live agent progress vs no take-backs.** Streaming the answer as it is generated feels fast, but text
+  already on screen cannot pass a later output guardrail. Buffer the final answer behind the check when
+  policy violations are costly; stream step and tool events either way.
 - **No rewrite vs thread hops.** A sync generator works without rewriting a blocking source, but every
   chunk costs a thread hop: fine for reading a file in 64 KB blocks, wasteful for thousands of token-sized
   chunks per second.
 
 ## Pitfalls
+- **Streaming only the final answer of an agent.** Symptom: users see nothing during, say, 20 seconds of tool
+  calls, then text appears all at once, and long research runs hit 504s. Fix: emit step and tool events
+  as they happen, plus a heartbeat during slow tools.
 - **Raising `HTTPException` inside the generator.** Symptom: client-side "incomplete chunked encoding" or
   a truncated body while the server log shows an exception after a 200 was sent. Fix: validate before
   returning, and emit typed error chunks after.
@@ -316,11 +348,11 @@ illustrative 60-second idle timeout.
   sync generator.
 
 ## When to use
-- **Use when** output is produced incrementally and the consumer benefits from seeing it early: LLM token
-  streams, long agent runs that emit progress, large exports generated row by row, proxying an upstream
-  streaming API.
-- **Avoid when** responses are small, a CDN should cache them, or the work must survive a disconnect (use
-  a job queue instead).
+- **Use when** output is produced incrementally and the consumer benefits from seeing it early: agent runs
+  that emit steps, tool calls and answer tokens, LLM token streams, large exports generated row by row,
+  proxying an upstream streaming API.
+- **Avoid when** responses are small, a CDN should cache them, or the agent run must survive a disconnect
+  (minutes-long or scheduled agents belong in a job queue that the stream merely reports on).
 - **Measure** time to first byte at the client, bytes in flight per connection, and the fraction of
   streams cancelled by disconnects.
 - **Interviews:** the ASGI message sequence, why headers are frozen, how disconnects and backpressure
@@ -353,11 +385,12 @@ not accidentally setting `Content-Length`, and add periodic keepalive chunks for
 - **You lose FastAPI's help.** `response_model` validation and JSON encoding are bypassed, so you own the
   framing (NDJSON or SSE) and the error protocol.
 
-### An upstream model call fails after 200 tokens were streamed. What does the client see, and how would you design for it?
+### Your agent streamed 200 tokens, then a tool call or the model call failed. What does the client see, and how would you design for it?
 - **The status is already 200.** Headers were frozen at the first chunk, so raising now only truncates the
   body; the client sees an incomplete chunked response.
-- **Design an in-band protocol.** Catch exceptions in the generator and yield a typed error record, end
-  successful streams with an explicit done record, and treat a stream with neither as truncated.
+- **Design an in-band protocol.** Catch exceptions in the agent loop and yield a typed error record (with
+  the failed step and tool name), end successful runs with an explicit done record, and treat a stream
+  with neither as truncated.
 - **Move common failures earlier.** Validate and peek the first upstream chunk before returning the
   response, so auth and rate-limit errors still become real status codes.
 
@@ -383,6 +416,13 @@ not accidentally setting `Content-Length`, and add periodic keepalive chunks for
 - **A slow source holds a slot while it waits for the next token,** so a few dozen slow streams exhaust
   the pool and every sync endpoint and dependency queues behind them. Use an async generator over the
   async SDK instead.
+
+### Design the streaming protocol for a tool-calling agent endpoint. What goes in it and why?
+- **Typed records, not raw text.** Step, tool_call, tool_result (a summary, never raw sensitive output),
+  delta, done and error, each with a run id, so UIs, eval harnesses and other agents parse one format.
+- **Explicit termination.** A done or error record ends every run; a stream with neither is truncated.
+- **Liveness during tools.** Heartbeats or tool progress events keep idle timeouts from killing silent
+  tool phases, and disconnects cancel the loop and in-flight tools.
 
 ## Quiz
 ### Q: Why can a StreamingResponse not change its status code to 500 when the generator fails halfway?

@@ -5,7 +5,8 @@ name: scikit-learn basics
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: agentic
+agent_relevance: useful
 related:
   - ml-fundamentals/train-test-leakage
   - ml-fundamentals/classification
@@ -22,9 +23,22 @@ sources:
 ---
 
 ## TL;DR
-scikit-learn puts classical ML behind one interface: estimators with `fit`, then `predict` or
-`transform`. Pipelines learn preprocessing from training data only, so evaluation stays honest. It is the
-fastest route to baselines and embedding classifiers, often good enough that no LLM call is needed.
+scikit-learn gives agent builders cheap classifiers and honest metrics behind one `fit`/`predict`
+interface: an intent router in front of the agent, a guardrail classifier, and the F1 and agreement
+scores inside agent evals. Often good enough that no LLM call is needed.
+
+## For agent builders
+- **Why it matters for agents.** Not every decision in an agent needs a model call. Routing a request to
+  the right agent or tool set, flagging abuse before the loop starts, or deciding "answer from FAQ vs run
+  the agent" can be a logistic regression on embeddings: milliseconds, no tokens, and measurable.
+- **Where it shows up in your stack.** A router or guardrail step before the agent graph (for example a
+  LangGraph conditional edge that calls a classifier), quality classifiers over agent outputs, and
+  `sklearn.metrics` inside eval harnesses for tool-choice accuracy, per-class F1 and judge agreement.
+- **What you control.** The pipeline (so evaluation is leak-free), grouped splits by user or
+  conversation, the confidence threshold for falling back to the LLM, calibration, and the pinned
+  version of the artifact you ship.
+- **What you can skip.** Most of the algorithm zoo. Pipelines, logistic regression, splitters, metrics
+  and `DummyClassifier` cover the agent use cases.
 
 ## Why it exists
 - **The same chores in every project.** Scale features, encode categories, vectorize text, fit a model,
@@ -39,8 +53,8 @@ fastest route to baselines and embedding classifiers, often good enough that no 
   methods, learned state is separate from configuration, and pipelines, cross-validators and grid searches
   treat any estimator uniformly. With preprocessing inside a pipeline, the library refits it per fold, so
   the honest procedure becomes the easy one.
-- **The AI questions recur.** Is the LLM router better than a TF-IDF classifier? Can a logistic regression
-  on embeddings replace a per-request LLM call for intent detection?
+- **The agent questions recur.** Is the LLM router better than a TF-IDF classifier? Can a logistic
+  regression on embeddings replace a per-request LLM call for intent detection or tool-set selection?
 
 ## How it works
 ### The estimator contract
@@ -60,7 +74,7 @@ fastest route to baselines and embedding classifiers, often good enough that no 
 - **`ColumnTransformer`** applies different preprocessing per column: one-hot encode `plan_tier`, scale
   `tokens_used`, TF-IDF the `text`.
 - **Why one object.** Cross validation and deployment use exactly the same preprocessing, and nothing is
-  fit on held-out data.
+  fit on held-out data; the router your agent calls in production is the one you evaluated.
 
 ### Honest evaluation
 | Tool | What it guarantees |
@@ -73,7 +87,7 @@ fastest route to baselines and embedding classifiers, often good enough that no 
 The concepts (leakage, splits, imbalance) are covered in depth in the ML fundamentals module; here the
 point is that the library encodes them.
 
-### What the standard text baseline computes
+### Background: what the standard text baseline computes
 Knowing the math tells you what the baseline can and cannot learn.
 
 - **`TfidfVectorizer`** turns each document into a sparse vector with one dimension per vocabulary term
@@ -105,7 +119,8 @@ p_k = exp(z_k) / Σ_j exp(z_j)        (multiclass softmax; predict returns the a
 ### Metrics and baselines
 - **`sklearn.metrics`** provides `classification_report`, `confusion_matrix`, `f1_score`,
   `roc_auc_score`, `precision_recall_curve` and regression metrics; many LLM eval harnesses call them
-  underneath rather than reimplementing them.
+  underneath rather than reimplementing them. In agent evals they score tool choice (predicted tool vs
+  expected tool), refusal decisions, and LLM-judge labels against human labels.
 - **`DummyClassifier`** gives the majority-class baseline every result should beat.
 
 ### What it is not
@@ -115,25 +130,71 @@ p_k = exp(z_k) / Σ_j exp(z_j)        (multiclass softmax; predict returns the a
 - **`skops`** exists to load models without arbitrary code execution when artifacts cross a trust boundary.
 
 ## Diagram
-Honest evaluation with a pipeline: preprocessing is refit on the training folds only, every fold is scored
-against a dummy baseline, and the test set is touched once at the end.
+Honest evaluation of an agent's intent router: preprocessing is refit on the training folds only, every
+fold is scored against a dummy baseline, and the test set is touched once at the end.
 
 ```mermaid
 flowchart TD
-    D[("Labelled tickets")] --> S["train_test_split with stratify=y"]
+    D[("Labelled requests")] --> S["train_test_split, stratify=y"]
     S -->|"20 percent"| TE["Test set, held back"]
     S -->|"80 percent"| CV["StratifiedKFold or GroupKFold"]
     CV --> TR["Training folds"]
     CV --> VA["Validation fold"]
-    TR --> FIT["Pipeline.fit: vectorizer learns vocabulary and idf, model learns coef_"]
-    FIT --> PR["Pipeline.predict: transform only, then predict"]
+    TR --> FIT["Pipeline.fit on training folds"]
+    FIT --> PR["Pipeline.predict: transform, predict"]
     VA --> PR
-    PR --> M["Macro-F1 per fold vs DummyClassifier"]
+    PR --> M["Macro-F1 vs DummyClassifier"]
     M --> FF["Final fit on all training data"]
     FF -->|"score once"| TE
 ```
 
 ## Examples
+### A router in front of the agent: classifier first, LLM agent on low confidence
+The classifier handles confident, simple intents; only uncertain or complex requests reach the
+tool-calling agent.
+
+```python
+import numpy as np
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split
+
+# X: (n_samples, dim) float32 embeddings of past requests; y: routed intent labels
+rng = np.random.default_rng(0)
+X = rng.standard_normal((4000, 384)).astype(np.float32)
+y = rng.choice(["billing", "faq", "order_status", "needs_agent"], size=4000)
+
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=0.2, stratify=y, random_state=42)
+router = CalibratedClassifierCV(
+    LogisticRegression(max_iter=1000, class_weight="balanced"), cv=5).fit(X_tr, y_tr)
+print(classification_report(y_te, router.predict(X_te)))
+
+THRESHOLD = 0.8          # choose from a precision-vs-coverage curve on validation data
+
+def route(embedding: np.ndarray) -> str:
+    p = router.predict_proba(embedding.reshape(1, -1))[0]
+    label, conf = router.classes_[p.argmax()], p.max()
+    if label == "needs_agent" or conf < THRESHOLD:
+        return "agent"           # full tool-calling loop
+    return label                 # cheap handler: FAQ answer, status lookup, billing form
+```
+
+- **Random data here, real embeddings in practice:** with random features the classifier learns nothing,
+  which is itself a useful sanity check that the baseline catches.
+
+### Worked scenario: what the router saves
+10,000 requests a day; an agent run averages 4 model calls at an illustrative $0.01 per call.
+
+| Setup | Requests reaching the agent | Model-call cost per day |
+|---|---|---|
+| Every request runs the agent | 10,000 | 10,000 × 4 × $0.01 = $400 |
+| Router handles 60% confidently | 4,000 | 4,000 × 4 × $0.01 = $160 |
+| Router precision above threshold | 0.95 (measured) | 5% of the 6,000 routed are wrong: 300 bad answers a day to review |
+
+The decision is the threshold: raising it sends more traffic to the agent (cost) and fewer wrong cheap
+answers (quality). Monitor both.
+
 ### Intent classifier baseline for support tickets
 An intent classifier for support tickets, the kind of baseline you build before deciding an LLM router
 is needed.
@@ -180,7 +241,9 @@ Suppose 4,000 tickets across 6 intents, with `billing` at 40% of them:
 - **The decision.** If the pipeline reaches a macro-F1 close to an LLM prompt on the same test set, the
   classifier is the cheaper, faster router.
 - **Swapping in embeddings is a small change:** drop `TfidfVectorizer` and pass the `(n_samples, dim)`
-  embedding matrix as `X`; splits, scoring and baseline stay identical.
+  embedding matrix as `X`; splits, scoring and baseline stay identical. For grouped evaluation on
+  precomputed embeddings, use `cross_validate(clf, X, y, groups=groups, cv=GroupKFold(n_splits=5),
+  scoring=["f1_macro", "accuracy"])` keyed on customer ID, with `C=1.0`.
 
 ### Worked TF-IDF weights
 Four training documents (`n` = 4), default `smooth_idf=True`:
@@ -194,27 +257,10 @@ Four training documents (`n` = 4), default `smooth_idf=True`:
 With `sublinear_tf=True`, a term used 10 times weighs `1 + ln(10)` ≈ 3.30 times its idf before row
 normalization, not 10 times.
 
-### Grouped evaluation on precomputed embeddings
-Same task with sentence embeddings, evaluated so one customer's tickets never sit on both sides of a
-split.
-
-```python
-import numpy as np
-import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import GroupKFold, cross_validate
-
-df = pd.read_parquet("tickets_embedded.parquet")   # columns: customer_id, intent, embedding
-X = np.vstack(df["embedding"].to_numpy()).astype(np.float32)   # (n_samples, dim)
-y, groups = df["intent"].to_numpy(), df["customer_id"].to_numpy()
-
-clf = LogisticRegression(C=1.0, max_iter=1000, class_weight="balanced")
-res = cross_validate(clf, X, y, groups=groups, cv=GroupKFold(n_splits=5),
-                     scoring=["f1_macro", "accuracy"])
-print(res["test_f1_macro"].mean(), res["test_f1_macro"].std())
-```
-
 ## Production patterns
+- **Classifier gate before the agent loop.** Route confident, simple intents to cheap handlers and send
+  the rest to the tool-calling agent, with the threshold set from a validation precision-coverage curve.
+  Monitor fallback rate, per-class precision above the threshold, and cost per request.
 - **Ship the whole pipeline as one artifact.** Persist the fitted `Pipeline` (vectorizer and model
   together) with `joblib.dump`, and record `sklearn.__version__` beside it. Pin that version in the
   serving image; watch for `InconsistentVersionWarning` at load. Use `skops` when artifacts cross a trust
@@ -225,10 +271,9 @@ print(res["test_f1_macro"].mean(), res["test_f1_macro"].std())
 - **Group and time-aware holdouts.** Split with `GroupKFold` keyed on customer or conversation, and keep a
   holdout of the most recent tickets (`TimeSeriesSplit` for time-ordered data). Monitor the gap between
   offline and live metrics; a widening gap signals leakage or drift.
-- **Confidence threshold with an LLM fallback.** Route tickets whose top `predict_proba` is below a
-  threshold to the LLM, after calibrating with `CalibratedClassifierCV` (needed if you used
-  `class_weight="balanced"`). Monitor fallback rate, per-class precision above the threshold, and cost per
-  ticket.
+- **Calibrate before thresholding.** Route requests whose top `predict_proba` is below a threshold to the
+  LLM agent, after calibrating with `CalibratedClassifierCV` (needed if you used
+  `class_weight="balanced"`). Re-check the threshold whenever the model is retrained.
 - **Watch prediction mix in production.** Log predicted intent counts per day and compare with the
   training distribution. A class that suddenly dominates or vanishes is the cheapest drift alarm.
 
@@ -237,12 +282,15 @@ print(res["test_f1_macro"].mean(), res["test_f1_macro"].std())
   in-memory, tabular `X`; data beyond RAM or GPU-scale deep learning needs PyTorch or a distributed
   framework.
 - **Fast linear models vs capability ceiling.** Linear models on TF-IDF or embeddings train in seconds and
-  are easy to inspect, but cap out on tasks needing reasoning or long context, where an LLM or fine-tuned
-  model wins despite cost.
+  are easy to inspect, but cap out on tasks needing reasoning, multi-step tool use or long context, where
+  an LLM agent or fine-tuned model wins despite cost.
 - **Cross validation vs compute.** It gives a far more honest estimate than one split, at k times the
   training time; for slow models or huge data, a single well-built validation split is acceptable.
 - **`class_weight="balanced"` vs calibrated scores.** It raises recall on rare intents but shifts
   predicted probabilities, so scores used as confidence thresholds need recalibration.
+- **Classifier router vs LLM router.** A classifier costs nothing per request and is deterministic, but
+  needs labelled data and retraining when intents change; an LLM router adapts from a prompt edit at a
+  per-request cost.
 
 ## Pitfalls
 - **Fitting a scaler or vectorizer on all data before splitting.** Symptom: cross-validation scores clearly
@@ -255,13 +303,17 @@ print(res["test_f1_macro"].mean(), res["test_f1_macro"].std())
   experiments while live metrics stay flat. Fix: tune by cross validation, touch the test set once.
 - **Loading a pickled model with a different scikit-learn version.** Symptom: inconsistent-version
   warnings or subtly different predictions. Fix: pin versions with the artifact.
+- **Training the router on the agent's own past routing decisions.** Symptom: the router copies earlier
+  mistakes and offline scores look great. Fix: label from outcomes or human review, not from what the
+  previous system did.
 
 ## When to use
 - **Use when:** classification, regression or clustering on features you already have: TF-IDF text,
   embeddings, tabular usage data.
-- **In AI products:** intent routing, spam or abuse filters, quality classifiers over LLM outputs, and
-  baselines any LLM solution must beat on cost and accuracy.
-- **Inside LLM evals:** use its metrics and splitters even when the model is an LLM.
+- **In agent products:** intent routing in front of the agent, spam or abuse filters, quality classifiers
+  over agent outputs, and baselines any LLM solution must beat on cost and accuracy.
+- **Inside agent evals:** use its metrics and splitters even when the model is an LLM, for tool-choice
+  accuracy, per-class F1 and judge-vs-human agreement.
 - **Avoid when:** training neural networks or data that does not fit in memory.
 - **Interviews:** explain pipelines and leakage, and justify a baseline before proposing an LLM.
 
@@ -293,6 +345,14 @@ real score will be lower but will predict production.
 - **Why it matters:** pipelines, cross-validators and grid searches treat any estimator uniformly, so
   swapping logistic regression for a random forest is a one-line change.
 
+### Would you put a classical classifier in front of a tool-calling agent? How would you design it?
+- **Yes, for frequent simple intents:** a logistic regression on request embeddings answers in
+  milliseconds with no tokens, and sends only uncertain or complex requests into the agent loop.
+- **Design the fallback:** calibrate with `CalibratedClassifierCV`, pick the threshold from a validation
+  precision-coverage curve, and include an explicit "needs agent" class.
+- **Operate it:** log fallback rate, per-class precision above the threshold and cost per request, and
+  retrain when the daily prediction mix drifts from the training distribution.
+
 ### Would you build a classical baseline before an LLM router for ticket intents? Why?
 - **Yes, first:** a TF-IDF plus logistic regression pipeline trains in seconds, runs on CPU and costs
   nothing per request, and it is the number any LLM solution must beat on cost and accuracy.
@@ -301,6 +361,14 @@ real score will be lower but will predict production.
 - **Decide on one test set:** if macro-F1 is close to the LLM prompt's, the classifier is the cheaper,
   faster router.
 
+### How would you use scikit-learn to evaluate an agent's tool selection and an LLM judge?
+- **Tool choice as classification:** for each eval case compare the tool the agent called first with the
+  expected tool, then read `classification_report` and `confusion_matrix` to see which tools get confused.
+- **Judge agreement:** score the LLM judge's labels against a human-labelled sample with per-class F1 or
+  an agreement statistic, before trusting the judge on the full set.
+- **Same discipline as any model:** a frozen test set, a dummy baseline, and per-class numbers, not one
+  average.
+
 ### Your classifier reports 90% accuracy on imbalanced intents. Is that good?
 - **Not by itself:** with `billing` at 40% of 4,000 tickets, a `DummyClassifier` that always predicts it
   already scores 40% accuracy, so accuracy hides classes never predicted.
@@ -308,20 +376,14 @@ real score will be lower but will predict production.
   near 0.1, which exposes the failure.
 - **Report per-class F1** from `classification_report` against the dummy baseline, not just the mean.
 
-### How do you ship a scikit-learn model to production safely?
-- **One artifact:** persist the fitted `Pipeline`, vectorizer and model together, with `joblib.dump`, so
-  serving applies exactly the training preprocessing.
-- **Pin the version:** pickles are tied to the scikit-learn version that saved them, so record
-  `sklearn.__version__` beside the artifact and watch for `InconsistentVersionWarning` at load.
-- **Mind trust boundaries:** loading an untrusted pickle executes code; use `skops` when artifacts come
-  from elsewhere.
-
-### You route low-confidence tickets to an LLM using `predict_proba`. What can go wrong?
-- **Shifted probabilities:** `class_weight="balanced"` raises recall on rare intents but distorts
-  predicted probabilities, so a fixed threshold no longer means what you think.
-- **Calibrate first:** wrap the model in `CalibratedClassifierCV` before choosing the threshold.
-- **Monitor:** fallback rate, per-class precision above the threshold, cost per ticket, and the daily
-  mix of predicted intents against the training distribution.
+### How do you ship a scikit-learn model to production safely, and what can go wrong with `predict_proba` thresholds?
+- **One artifact:** persist the fitted `Pipeline` with `joblib.dump`, record `sklearn.__version__`
+  beside it, and watch for `InconsistentVersionWarning` at load; use `skops` when artifacts come from
+  elsewhere, because loading an untrusted pickle executes code.
+- **Shifted probabilities:** `class_weight="balanced"` distorts predicted probabilities, so a fixed
+  threshold no longer means what you think; calibrate with `CalibratedClassifierCV` first.
+- **Monitor:** fallback rate, per-class precision above the threshold, cost per ticket, and the daily mix
+  of predicted intents.
 
 ## Quiz
 ### Q: Why does scikit-learn require that constructors only store hyperparameters and never touch data?

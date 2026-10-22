@@ -5,7 +5,8 @@ name: Hallucination evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/faithfulness-groundedness
   - model-internals/hallucination
@@ -22,14 +23,29 @@ sources:
 ---
 
 ## TL;DR
-Hallucination evaluation measures how often a system asserts unsupported or false things. It splits
-outputs into atomic claims, verifies each against a reference, and reports claim precision,
-response-level rate and abstention per slice, including unanswerable items.
+Hallucination evaluation measures how often your agent asserts things its tools, documents and trace do
+not support, including actions it never took. Split answers into atomic claims, verify each against
+evidence, and report claim precision, response rate and abstention per slice.
+
+## For agent builders
+- **Why it matters for agents.** An agent's evidence is its trace: retrieved chunks and tool results. It
+  can contradict them, invent an order ID, or say "I've issued your refund" when no refund call
+  succeeded. Users act on these claims, so the fabrication rate is a release number, not a vibe.
+- **Where it shows up in your stack.** Groundedness or faithfulness evaluators in LangSmith, Braintrust,
+  Ragas or promptfoo, a custom decompose-and-verify step in your eval harness, and sampled audits of
+  production traces.
+- **What you control.** The reference (tool outputs, retrieved context, a versioned KB), the verifier
+  model, the unanswerable and false-premise slices, and the gate pair: fabrication rate plus a ceiling
+  on false abstention.
+- **What you can skip.** The taxonomy debates in the survey literature. Know intrinsic vs extrinsic,
+  the three reference regimes and the four numbers; that is enough to evaluate a production agent.
 
 ## Why it exists
 - **The failure is fluent and expensive.** Confident, well-structured text with one wrong number, a
   citation that does not exist, a quote attributed to the wrong person or an API parameter the library
   never had. Whole-response grading hides it, because the answer still reads as correct.
+- **Agents add action hallucinations.** A final message claiming a tool call happened, or reporting a
+  field the tool never returned, is the agent-specific form, and only the trace can disprove it.
 - **Models produce it by design.** When the model lacks the fact, the most probable continuation is still
   a plausible-looking fact; nothing in next-token prediction prefers "I do not know" over a well-formed
   guess. The reader only sees the error by checking every claim, the slow step the model was meant to save.
@@ -52,14 +68,16 @@ response-level rate and abstention per slice, including unanswerable items.
 | **Extrinsic** hallucination | Cannot be verified from that source at all | The source |
 | RAG failure | "Unsupported by context", even when true in the world | Retrieved context (overlaps faithfulness, its own lesson) |
 | Closed-book failure | False in the world | A trusted corpus approximating the world |
+| Action hallucination (agents) | Claims a tool call or result the trace does not contain | The agent's tool-call log |
 
 - **Non-claims are excluded.** Opinions, hedges and questions back to the user do not count, because the
   metric is about asserted facts.
 
 ### Choose the reference
 Three regimes, in decreasing order of reliability:
-1. **Context-grounded.** Reference = the documents in the prompt. A verifier (an entailment model, or an
-   LLM judge required to quote its evidence) labels each claim supported, contradicted or unverifiable.
+1. **Context-grounded.** Reference = the documents in the prompt; for an agent, every retrieved chunk and
+   tool result in the trace. A verifier (an entailment model, or an LLM judge required to quote its
+   evidence) labels each claim supported, contradicted or unverifiable.
 2. **Corpus-grounded.** Reference = a trusted source: product docs, an internal KB, a versioned API spec,
    an encyclopedia. FActScore is the template: decompose into atomic facts, retrieve passages per fact,
    judge each supported or not, score the fraction supported. It is a *precision* measure: how much of
@@ -77,6 +95,8 @@ Three regimes, in decreasing order of reliability:
   - Response rate tracks "how often does a user receive something wrong".
 - **Decomposer.** A model prompted to emit atomic, self-contained statements with pronouns resolved,
   because "it was founded then" cannot be verified alone.
+- **Route by claim type in agents.** Fact claims go to the verifier with tool outputs and retrieved
+  evidence; action claims ("I cancelled it") are checked deterministically against successful tool calls.
 - **Verify.** Each claim goes to the verifier with its retrieved evidence.
 
 ### The metrics
@@ -84,7 +104,7 @@ Three regimes, in decreasing order of reliability:
 - **Response hallucination rate:** fraction of responses with at least one contradicted claim (strict
   variant: at least one unsupported claim).
 - **Severity weighting:** numbers, names, dates, citations and legal or medical statements weigh more
-  than descriptive filler, because that is where the cost lives.
+  than descriptive filler, because that is where the cost lives. For agents, add claimed actions.
 - **Fabrication on unanswerable items:** for a question whose answer is absent from the context, or a
   false premise ("why did the 2019 merger fail" when there was none), the right behaviour is to say so.
   Confident answers here are the purest signal, which is why SQuAD 2.0-style unanswerable questions and
@@ -98,13 +118,13 @@ Three regimes, in decreasing order of reliability:
 A golden set of only answerable, well-covered questions underestimates the rate badly. Add slices:
 - questions answerable only from context;
 - questions answerable from general knowledge;
-- questions whose answer is missing from the context;
+- questions whose answer is missing from the context (for agents: the tool returns empty or an error);
 - false-premise questions;
-- questions about entities that do not exist;
+- questions about entities that do not exist (an order ID the lookup tool cannot find);
 - questions about facts past the model's training cutoff.
 
-Fabrication concentrates in the last four, so that is where the metric moves when you change the prompt
-or add retrieval.
+Fabrication concentrates in the last four, so that is where the metric moves when you change the prompt,
+the tool descriptions or the retrieval step.
 
 ### Size the slices before trusting a difference
 - **Critical slices are small and noisy.** A 10% fabrication rate on 50 unanswerable items has a 95%
@@ -119,24 +139,70 @@ or add retrieval.
   false beliefs and agree with each other's fabrications.
 
 ## Diagram
-Each response is split into claims, each claim is checked against evidence, and the labels roll up into
-four numbers reported per slice.
+Each agent answer is split into claims; fact claims are checked against evidence, action claims against
+the tool-call log, and the labels roll up into four numbers reported per slice.
 
 ```mermaid
 flowchart TD
-    I["Eval item: question, answerable flag"] --> G["Generator response"]
+    I["Eval task: request, answerable flag"] --> G["Agent run: answer plus trace"]
     G --> AB{"Abstained?"}
     AB -->|"yes"| R1["Count toward abstention metrics"]
     AB -->|"no"| D["Decompose into atomic claims"]
-    D --> S["Retrieve evidence per claim"]
-    S --> V["Verifier from another model family"]
-    V --> L["Supported, contradicted, unverifiable"]
+    D --> T{"Action claim?"}
+    T -->|"yes"| TL["Match against successful tool calls"]
+    T -->|"no"| V["Verifier from another family, with evidence"]
+    TL --> L["Supported, contradicted, unverifiable"]
+    V --> L
     L --> M["Claim precision and response rate"]
     R1 --> RP["Per-slice report: 4 numbers"]
     M --> RP
 ```
 
 ## Examples
+### Agent scenario: grounding a support agent's answer in its own trace
+The reference is the trace itself. Fact claims are verified against tool results; action claims must
+match a tool call that succeeded. `call_model` is a verifier from a different model family.
+
+```python
+import json
+
+def call_model(prompt: str) -> str: ...      # verifier, different family from the agent
+
+ACTIONS = {"refund": "issue_refund", "cancel": "cancel_order", "email": "send_email"}
+CLASSIFY = ("Split the agent's final message into atomic claims. For each, return "
+            '{{"claim": str, "action": one of {acts} or null}}. JSON list only.\n\n{text}')
+VERIFY = ("Tool results:\n{evidence}\n\nClaim: {claim}\nAnswer with exactly one word: "
+          "SUPPORTED, CONTRADICTED or UNVERIFIABLE.")
+
+def score_agent_answer(final_text: str, trace: list[dict]) -> dict:
+    ok_calls = {s["tool"] for s in trace if s["type"] == "tool_call" and s["status"] == "ok"}
+    evidence = "\n---\n".join(json.dumps(s["output"]) for s in trace if s["type"] == "tool_result")
+    claims = json.loads(call_model(CLASSIFY.format(acts=list(ACTIONS), text=final_text)))
+    labels = []
+    for c in claims:
+        if c["action"]:                          # deterministic: did the call actually succeed?
+            labels.append("SUPPORTED" if ACTIONS[c["action"]] in ok_calls else "CONTRADICTED")
+        else:
+            labels.append(call_model(VERIFY.format(evidence=evidence, claim=c["claim"])).strip(" .\n").upper())
+    n = len(labels)
+    return {"n_claims": n,
+            "claim_precision": labels.count("SUPPORTED") / n if n else None,
+            "hallucinated": "CONTRADICTED" in labels,
+            "action_hallucination": any(c["action"] and l == "CONTRADICTED" for c, l in zip(claims, labels))}
+```
+
+Illustrative run on 300 support-agent traces (not a benchmark), before and after making the final-answer
+step quote tool results:
+
+| Metric | Before | After |
+|---|---|---|
+| Responses with a contradicted claim | 51 (17%) | 24 (8%) |
+| Action hallucinations ("refund issued", no successful call) | 9 | 1 |
+| Claims marked UNVERIFIABLE | 14% | 6% |
+
+- **Action hallucinations are the headline.** Nine customers told a refund happened when it did not is
+  a support incident, which is why they get their own count and a zero-tolerance alert.
+
 ### Claim-level pipeline against a trusted corpus
 `call_model` is any chat model (not the one that wrote the responses) and `search` retrieves from your
 own knowledge source, not the open web. The output separates claim precision, response-level rate,
@@ -222,14 +288,17 @@ for n in (50, 100, 400):
 
 ## Production patterns
 - **Unanswerable slice as a release gate.** Keep a few hundred unanswerable, false-premise and
-  nonexistent-entity items in the golden set; gate on fabrication rate there together with a ceiling on
-  false abstention. Monitor both per release, never one alone.
+  nonexistent-entity tasks (empty tool results, unknown IDs) in the agent's golden set; gate on
+  fabrication rate there together with a ceiling on false abstention. Monitor both per release.
+- **Action claims checked against the tool log.** Parse every final message for claimed actions and
+  match them to successful tool calls in the same trace, deterministically, on 100% of production
+  traffic. Alert on any mismatch, because it is cheap and each one is a user-facing incident.
 - **Cross-family verifier with its own calibration set.** Pin the verifier model version, keep a few
   hundred human-labelled claims, and re-measure Cohen's kappa whenever the verifier or generator changes.
   Monitor kappa and the share of UNVERIFIABLE labels.
-- **Sampled offline audits of live traffic.** Log responses with their retrieved context, run the
-  decompose-and-verify pipeline asynchronously on a fixed daily sample, and trend the response
-  hallucination rate per route. Monitor sudden jumps after prompt, model or index changes.
+- **Sampled offline audits of live traces.** Log answers with their tool results and retrieved context,
+  run the decompose-and-verify pipeline asynchronously on a fixed daily sample, and trend the response
+  hallucination rate per route. Monitor sudden jumps after prompt, model, tool or index changes.
 - **Severity-tagged claims.** Tag claims containing numbers, dates, names or citations (a regex or NER
   pass is enough) and alert on any contradicted high-severity claim, not on the average. Monitor the
   count of contradicted high-severity claims per week.
@@ -239,7 +308,8 @@ for n in (50, 100, 400):
 
 ## Trade-offs
 - **Precision of claim decomposition vs cost.** Precise, actionable numbers, but several model calls per
-  response; affordable on a 500-item set run nightly, not on every PR, so tier it like any eval.
+  response; affordable on a 500-item set run nightly, not on every PR, so tier it like any eval. Action
+  checks against the tool log cost nothing and can run everywhere.
 - **Corpus grounding vs corpus quality.** Only as good as the corpus: an out-of-date internal KB turns
   correct new answers into "contradicted" and hides the model's real errors behind retrieval noise.
 - **Reference-free checks vs systematic errors.** No labels or corpus and they catch random
@@ -254,6 +324,9 @@ for n in (50, 100, 400):
 ## Pitfalls
 - **Measuring only answerable questions.** Symptom: near-zero hallucination in the eval and a stream of
   invented policies in production, because fabrication was never provoked. Fix: add the four risky slices.
+- **Grading the final message without the trace.** Symptom: "I've updated your address" passes the
+  judge although the update tool returned an error. Fix: give the verifier the tool results and check
+  action claims against the call log.
 - **Using the generating model as verifier.** Symptom: high "supported" rates on claims a human later
   finds false, since the verifier shares the generator's beliefs. Fix: a different model family.
 - **Claim precision without response-level rate.** Symptom: a 95% score while one in three answers
@@ -266,10 +339,11 @@ for n in (50, 100, 400):
   whenever the model is wrong. Fix: keep three labels.
 
 ## When to use
-- **Use when:** the system asserts facts a user might act on: contract or medical-record summaries,
-  support answers about policy, code that names APIs, analytics narratives with numbers.
-- **Pick the reference:** context-grounded for RAG, corpus-grounded for closed-book assistants over a
-  domain you own, consistency-based when you have neither and need a monitoring signal.
+- **Use when:** the agent asserts facts or actions a user might act on: contract or medical-record
+  summaries, support answers about policy, code that names APIs, analytics narratives with numbers,
+  confirmations of refunds or bookings.
+- **Pick the reference:** context-grounded for RAG and tool-using agents, corpus-grounded for closed-book
+  assistants over a domain you own, consistency-based when you have neither and need a monitoring signal.
 - **Measure:** claim precision, response-level rate, fabrication on unanswerable items and false
   abstention together, per slice; gate releases on the pair that matters for the product.
 - **Avoid when:** creative or opinion tasks where "unsupported" is the point; skip the heavy pipeline.
@@ -305,6 +379,21 @@ different model. Finally gate on false abstention too, or the fix will be a mode
 - **They diverge sharply:** twelve claims with one false is 92% precision but a 100% hallucinated
   response, so a 95% precision headline can hide one bad answer in three.
 
+### Your support agent tells users "your refund has been issued" when the refund tool failed. How do you catch this systematically?
+- **Treat it as an action hallucination:** extract claimed actions from the final message and match
+  each to a successful tool call in the same trace, deterministically rather than with a judge.
+- **Run it on all traffic:** it is a log lookup, so it is cheap enough to alert on every mismatch, not a
+  sample.
+- **Fix at the source too:** have the answer step read tool statuses explicitly and add failing-tool
+  tasks to the golden set so the regression is gated.
+
+### How would you evaluate hallucination for a RAG agent that calls several tools per task?
+- **Reference is the whole trace:** every retrieved chunk and tool result, not only the last retrieval.
+- **Route claims:** fact claims to a cross-family verifier with that evidence, action claims to the
+  tool-call log, and report both rates per slice.
+- **Provoke it:** include tasks where tools return empty results, errors or unknown IDs, because that is
+  where agents invent plausible values.
+
 ### Your prompt change cut fabrication on unanswerable items from 41% to 12%. Ship it?
 - **Check false abstention first:** in the worked example it rose from 3% to 9%, about 24 answerable
   questions now refused, a product trade-off rather than a free win.
@@ -319,11 +408,6 @@ different model. Finally gate on false abstention too, or the fix will be a mode
   the samples contradict, SelfCheckGPT style.
 - **Know the gap:** consistency checks miss beliefs the model holds firmly but wrongly, so they triage
   rather than gate.
-
-### Why can the generator not verify its own claims?
-- **Shared beliefs:** the knowledge that produced a confident fabrication will defend it just as readily.
-- **Shared training data across a family:** related models agree with each other's errors, so use a
-  different family and measure agreement with human claim labels (Cohen's kappa) before trusting it.
 
 ### Hallucination rate jumped overnight with no model change. How do you debug it?
 - **Split the labels:** if UNVERIFIABLE rose rather than CONTRADICTED, suspect the reference corpus or

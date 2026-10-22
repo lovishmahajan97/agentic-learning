@@ -5,7 +5,8 @@ name: pass@k
 kind: metric
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: core
 related:
   - evals/benchmarking
   - evals/eval-harness
@@ -20,9 +21,22 @@ sources:
 ---
 
 ## TL;DR
-pass@k is the probability that at least one of k sampled solutions passes an executable check, averaged
-over problems. Estimate it from n ≥ k samples with the unbiased combinatorial estimator; for k > 1 it is
-an oracle number, not what a user sees.
+pass@k is the chance at least one of k agent runs or samples passes an executable check; pass^k is the
+chance all k do. Estimate both from n ≥ k runs per task: pass@k is retry headroom, pass^k the
+reliability users feel.
+
+## For agent builders
+- **Why it matters for agents.** Agents are stochastic: the same task passes on some runs and fails on
+  others. One run per task hides that. pass@k says what retries plus a verifier could deliver; pass^k
+  says how often a user who runs the task every day gets a working result every time.
+- **Where it shows up in your stack.** Repeated-trial settings in agent eval harnesses, τ-bench-style
+  reliability reports, best-of-n or retry-until-tests-pass loops in coding agents, and the sandbox that
+  resets state between runs.
+- **What you control.** Runs per task (n), the sampling temperature you ship with, whether retries are
+  safe (idempotent tools or a sandbox), whether a cheap verifier exists to pick the passing run, and
+  which k matches your reliability promise.
+- **What you can skip.** Proving the estimator. Use the product form for pass@k and C(c, k) / C(n, k)
+  for pass^k, average per task, never pool.
 
 ## Why it exists
 - **Some tasks can be checked by running the output.** Code generation has a property most LLM tasks
@@ -103,13 +117,24 @@ pass@k ≈ 1 − Π_{i = n − c + 1}^{n} (1 − k / i)
 - **For multi-step agents, "pass" means the final state checks out.** Retrying k times only makes sense
   when side effects are idempotent, so pass@k for agents assumes a sandbox or safe rollback.
 
+### Which number an agent design actually delivers
+| Agent design | Deliverable number | Condition |
+|---|---|---|
+| One run, answer shown to the user | pass@1 | none |
+| Retry until a check passes (tests, schema, state assertion) | close to pass@k, at k× worst-case cost | a cheap, trustworthy verifier and safe retries |
+| Best-of-n runs ranked by an LLM judge | between pass@1 and pass@k | the judge's accuracy at picking the passing run |
+| The same workflow run every day by one user | pass^k over the days | none; this is the reliability promise |
+
+- **Measure per task, not just overall.** pass^k is dominated by flaky tasks: a task at p = 0.95 keeps
+  pass^8 ≈ 0.66, while one at p = 0.6 drops to about 0.02.
+
 ## Diagram
-The evaluation pipeline: sample n per problem at a fixed temperature, verify in a sandbox, estimate per
-problem, then average. The dotted path is the pooled shortcut that overestimates.
+The evaluation pipeline for an agent or a code model: run n times per task at a fixed temperature,
+verify each final state in a sandbox, estimate per task, then average. The dotted path is the pooled shortcut that overestimates.
 
 ```mermaid
 flowchart TD
-    P["Problem set with hidden tests"] --> S["Sample n per problem at temperature T"]
+    P["Agent tasks with hidden checks"] --> S["Run n times per task at temperature T"]
     S --> X["Run each sample in a sandbox"]
     X --> C["Count c passes per problem"]
     C --> E1["pass@k = 1 - C(n-c,k) / C(n,k)"]
@@ -182,6 +207,42 @@ for k in (1, 2, 4, 8):
   replacement, which makes it unbiased for p^k. Plugging the observed rate into p̂^k is biased upward,
   because x^k is convex.
 
+### Agent scenario: a per-task reliability report from repeated runs
+A support agent's eval harness runs each task 10 times from a fresh sandbox and asserts the final
+state. The report puts pass@1, pass@3 and pass^3 per task side by side.
+
+```python
+from math import comb
+
+def pass_at_k(n, c, k):
+    return 1.0 if n - c < k else 1 - comb(n - c, k) / comb(n, k)
+
+def pass_hat_k(n, c, k):
+    return comb(c, k) / comb(n, k)
+
+# 10 runs per task from a fresh sandbox; c = runs whose final state passed the assertions
+runs = {"refund_simple": (10, 10), "refund_partial": (10, 8),
+        "change_address": (10, 9), "cancel_after_ship": (10, 4)}
+k = 3
+print(f"{'task':18s} pass@1  pass@{k}  pass^{k}")
+for task, (n, c) in runs.items():
+    print(f"{task:18s} {c/n:6.2f} {pass_at_k(n, c, k):7.2f} {pass_hat_k(n, c, k):7.2f}")
+mean = lambda f: sum(f(n, c) for n, c in runs.values()) / len(runs)
+print(f"{'mean':18s} {mean(lambda n, c: c / n):6.2f} {mean(lambda n, c: pass_at_k(n, c, k)):7.2f} "
+      f"{mean(lambda n, c: pass_hat_k(n, c, k)):7.2f}")
+# refund_simple        1.00    1.00    1.00
+# refund_partial       0.80    1.00    0.47
+# change_address       0.90    1.00    0.70
+# cancel_after_ship    0.40    0.83    0.03
+# mean                 0.78    0.96    0.55
+```
+
+| Reading | Consequence |
+|---|---|
+| pass@3 = 0.96 overall | only reachable if the agent can retry safely and something checks each attempt |
+| pass^3 = 0.55 overall | a user doing three such tasks a week sees all succeed about half the time |
+| cancel_after_ship at pass^3 = 0.03 | one flaky task drags the reliability number; fix it first |
+
 ### Worked scenario: why concavity matters
 Two problems, k = 5. Problem 1 has p = 0.9; problem 2 has p = 0.
 
@@ -207,6 +268,12 @@ Two problems, k = 5. Problem 1 has p = 0.9; problem 2 has p = 0.
 - **pass^k for agent releases.** Run each agent task k times from a fresh sandbox state and gate on
   pass^k at the k that matches the usage promise. Monitor tasks whose individual success rate falls,
   since one flaky task dominates pass^k.
+- **Retry loops only behind a verifier and idempotent tools.** A coding agent may loop "edit, run tests,
+  retry" up to a fixed attempt cap; an agent that sends emails or moves money must not retry blindly.
+  Monitor attempts per task, cost per solved task and the share of tasks solved only on a retry.
+- **Flaky-task triage from the per-task table.** Sort tasks by individual success rate and read the
+  failed traces of the flakiest ones first; they are usually ambiguous instructions or a tool that
+  returns inconsistent data. Monitor how many tasks sit between always-pass and always-fail.
 - **Protocol stamped on every result.** Store model version, temperature, n, k and test-suite version
   with each score, and refuse comparisons across protocols. Monitor a private held-out set for
   contamination gaps against public benchmark numbers.
@@ -237,8 +304,8 @@ Two problems, k = 5. Problem 1 has p = 0.9; problem 2 has p = 0.
   of equivalent difficulty. Fix: keep a private set.
 
 ## When to use
-- **Use for any task with executable verification:** code against tests, SQL against expected result
-  sets, math with checkable answers, agent tasks with state assertions.
+- **Use for any task with executable verification:** agent tasks with state assertions, code against
+  tests, SQL against expected result sets, math with checkable answers.
 - **Report by purpose:** pass@1 as the user-facing number, pass@k for headroom analysis when considering a
   sample-and-verify design, and pass^k when repeated reliability is the product promise.
 - **Protocol:** fix the temperature, use n ≥ k samples, keep tests hidden, and check for contamination
@@ -295,6 +362,14 @@ rerun similar queries daily, report pass^k as well, since reliability is what th
   the user experiences pass@1 per attempt and pass^k over days.
 - **Then report pass@1 and pass^k,** for example a task with p = 0.6 has pass^4 = 0.6^4 ≈ 13% for a
   four-run reliability promise.
+
+### Your coding agent solves 78% of tasks on one run and 96% "within 3 tries". What do you put on the release report?
+- **pass@1 as the user-facing number,** unless the product really retries: a test-gated "edit, run tests,
+  retry" loop with an attempt cap does approach pass@k, at up to 3× the cost.
+- **pass^k for the reliability promise,** computed per task from repeated runs with C(c, k) / C(n, k);
+  in the per-task example above it is 0.55 at k = 3.
+- **The per-task table,** because one flaky task (pass^3 = 0.03) dominates the reliability number and is
+  the first thing to fix.
 
 ### How would you budget samples for a 500-problem benchmark?
 - **For a pass@1 trend in CI,** a few samples per problem at the shipping temperature is enough when the

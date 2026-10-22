@@ -5,7 +5,8 @@ name: Prefill vs decode
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp-verified
+status: agentic
+agent_relevance: useful
 related:
   - model-internals/kv-cache
   - serving-inference/ttft
@@ -21,9 +22,21 @@ sources:
 ---
 
 ## TL;DR
-Every LLM request has two phases with opposite hardware profiles. Prefill runs the whole prompt at once,
-is compute-bound and sets TTFT. Decode makes one token per step, is bandwidth-bound and sets TPOT. Mixing
-them on one GPU causes interference.
+Every agent step has two phases with opposite hardware profiles. Prefill reads the whole transcript at
+once, is compute-bound and sets TTFT; decode writes the tool call token by token, is bandwidth-bound and
+sets TPOT. Agents are prefill-heavy.
+
+## For agent builders
+- **Why it matters for agents.** An agent step is usually a long prompt (system prompt, tool schemas,
+  transcript) and a short output (a tool call). So prefill, not decode, is most of each step's GPU work,
+  and it grows every step unless the prefix is reused.
+- **Where it shows up in your stack.** Provider usage fields that report input, cached-input and output
+  tokens separately and price them differently; TTFT and TPOT histograms and `--enable-chunked-prefill`
+  on self-hosted engines such as vLLM.
+- **What you control.** Prompt length per step (trim tool output, compact history), prefix stability so
+  caching skips prefill, per-step `max_tokens`, and whether intermediate steps stream at all.
+- **What you can skip.** Disaggregated serving internals and KV transfer protocols unless you run a large
+  self-hosted fleet. The intensity argument and the two cost formulas are enough.
 
 ## Why it exists
 - **The split falls out of autoregression, not design.** The prompt is known in full, so all its tokens go
@@ -40,7 +53,8 @@ them on one GPU causes interference.
   same as a short prompt with a long answer; the second occupies the GPU far longer. It also predicts
   batching helps uniformly, when batching rescues decode and does almost nothing for prefill.
 - **Every serving metric belongs to one phase.** TTFT, TPOT and throughput are each a statement about
-  prefill or decode, and you cannot tune what you have not separated.
+  prefill or decode, and you cannot tune what you have not separated. An agent's per-step latency is
+  mostly TTFT, because its outputs are short.
 
 ## How it works
 ### The two phases side by side
@@ -58,6 +72,8 @@ them on one GPU causes interference.
 - **Cost** scales with *P* for the matmuls and with *P²* for attention, mitigated by fused attention
   kernels that avoid materializing the full matrix.
 - **Compute-bound,** so TTFT grows roughly linearly with prompt length and shrinks with more FLOPs.
+- **In an agent loop** the prompt at step *n* is everything from steps 1 to *n−1*, so without prefix
+  reuse each step's TTFT is larger than the last, even when the new tool result is tiny.
 
 ### Decode
 - **Per step** the GPU reads all weights plus the request's entire KV cache:
@@ -87,18 +103,20 @@ step_time ≈ (weight_bytes + cache_bytes) / bandwidth
 | **Chunked prefill** | Split long prompts into fixed-size chunks (a token budget per iteration) run alongside the decode batch. Decode tokens ride along at near-zero marginal cost because the iteration was compute-bound anyway, and no single iteration becomes a stall | Slightly longer TTFT for the long prompt |
 | **Prefill vs decode priority** | Scheduler policy: prefill-first minimizes TTFT, decode-first smooths TPOT | Depends on the product |
 | **Disaggregated serving** | Prefill on one GPU pool, decode on another, KV cache transferred over the interconnect. Each pool is tuned for its phase (prefill wants FLOPs, decode wants bandwidth and memory) and one phase cannot spike the other | The transfer and a more complex system; pays at scale |
-| **Prefix caching** | Reuse an already-computed KV prefix so part of prefill is skipped | The biggest TTFT lever when prompts share a long system prompt |
+| **Prefix caching** | Reuse an already-computed KV prefix so part of prefill is skipped | The biggest TTFT lever when prompts share a long system prompt, and for every step of an append-only agent transcript |
 | **Speculative decoding** | Turns several decode steps into one verification pass | Uses the slack compute bandwidth-bound decode leaves idle |
 
 ### What the metrics mean
 - **TTFT** ≈ queue wait + prefill time (+ a cache transfer in disaggregated setups).
 - **TPOT** ≈ decode step time, which rises with batch size and with the total cache the batch reads.
 - **Throughput** in tokens/sec is dominated by decode batching. Prefill throughput is a separate number,
-  and it is what a long-document, short-answer workload actually consumes.
+  and it is what a long-document, short-answer workload (and most agent traffic) actually consumes.
+- **Agent step latency** ≈ TTFT + output tokens × TPOT + tool time. With 50 to 200 output tokens per tool
+  call, the TTFT term is often the one to attack.
 
 ## Diagram
-One request's path: prefill fills the cache once, then decode loops, and an unchunked long prompt from
-another user can stall that loop.
+One agent step's path: prefill fills the cache once, then decode loops until the tool call is complete,
+and an unchunked long prompt from another agent can stall that loop.
 
 ```mermaid
 flowchart TD
@@ -109,8 +127,8 @@ flowchart TD
     KV --> D
     D -->|"append k, v"| KV
     D -->|"not done, each gap is TPOT"| D
-    D -->|"EOS or max_tokens"| E["Done, free cache"]
-    L["Long prompt from another user"] -.->|"unchunked, stalls the step"| D
+    D -->|"EOS or max_tokens"| E["Tool call done, free cache"]
+    L["Long prompt from another agent"] -.->|"unchunked, stalls the step"| D
     L -.->|"chunked, rides along"| C["Chunk plus decode batch"]
 ```
 
@@ -160,7 +178,35 @@ Request A: 4,000-token prompt, 50-token answer. Request B: 200-token prompt, 1,0
 - **With chunked prefill at a 512-token budget,** A's prefill spreads over 8 iterations of ~15 ms each. A's
   TTFT becomes ~120 ms instead of ~100 ms, and nobody else stalls.
 
+### Agent scenario: one late step of a tool-calling agent
+Same illustrative 8B setup. At step 10 the agent's transcript is 20,000 tokens and it emits a 100-token
+tool call. Only the last ~1,000 tokens (the newest tool result) are new.
+
+| | No prefix reuse | Prefix cached, 1,000 new tokens |
+|---|---|---|
+| Prefill | 2 × 8e9 × 20,000 ≈ 320 TFLOPs, ~356 ms | ~18 ms |
+| Decode step (16 GB + 20,000 × 128 KB ≈ 2.6 GB of cache) | ~6.2 ms | ~6.2 ms |
+| Decode total, 100 tokens | ~0.62 s | ~0.62 s |
+| Prefill share of the step | ~36% | ~3% |
+
+```python
+step = dict(prompt=20_000, new=1_000, out=100)
+pre_full = prefill_s(step["prompt"])                 # ~0.356 s
+pre_cached = prefill_s(step["new"])                  # ~0.018 s
+dec = sum(decode_step_s(step["prompt"] + i) for i in range(step["out"]))   # ~0.62 s
+print(f"TTFT {pre_full*1e3:.0f} ms -> {pre_cached*1e3:.0f} ms, decode {dec:.2f} s")
+```
+
+- **Read it as:** a single step looks decode-heavy, but prefill grows every step while decode stays flat.
+  Without reuse, a 12-step run prefills ~171,000 tokens (~3 s) for a 6k prefix plus 1.5k per step; with
+  reuse it prefills roughly the transcript once.
+- **Shorter tool calls help less than you think.** Halving output tokens saves ~0.3 s here; a stable prefix
+  saves ~0.34 s on this step and more on every later one.
+
 ## Production patterns
+- **Treat agent steps as prefill-heavy traffic.** Keep the prefix stable and append-only, trim tool
+  results before appending, and route by agent run id so the cached prefix is on the same replica.
+  Monitor cached versus uncached input tokens per step; uncached should stay near the newest step's size.
 - **Chunked prefill with a deliberate budget.** For mixed workloads enable chunked prefill
   (`--enable-chunked-prefill` in vLLM, on by default in recent versions) and set the per-iteration token
   budget with `--max-num-batched-tokens`: smaller favours TPOT, larger favours TTFT and prefill throughput.
@@ -173,7 +219,9 @@ Request A: 4,000-token prompt, 50-token answer. Request B: 200-token prompt, 1,0
   move to full prefill/decode disaggregation (supported in frameworks such as SGLang and NVIDIA Dynamo)
   only when interference is measurable at scale.
 - **Meter input and output tokens separately.** Bill and budget per phase, with output priced well above
-  input, as public API price lists do. Monitor GPU-seconds per input token and per output token per tenant.
+  input, as public API price lists do. Agents consume far more input than output tokens, so input volume
+  often dominates their bill despite the lower unit price. Monitor GPU-seconds per input token and per
+  output token per tenant.
 - **Reproduce stutter on purpose.** In load tests, inject a long prompt into a loaded replica and confirm
   TPOT of the other streams stays within budget. Monitor the per-iteration step time during the injection.
 
@@ -202,6 +250,9 @@ Request A: 4,000-token prompt, 50-token answer. Request B: 200-token prompt, 1,0
   unchanged, because bandwidth did not change much. Fix: compare GPUs on memory bandwidth for decode.
 - **Reporting prefill and decode throughput as one "tokens/sec".** Symptom: capacity estimates off by an
   order of magnitude when the input/output mix shifts. Fix: track input and output tokens/sec separately.
+- **Sizing an agent fleet from chat benchmarks.** Symptom: chat-shaped load tests (short prompt, long
+  answer) look fine, then agents with 20k-token transcripts and 100-token outputs saturate prefill and
+  TTFT climbs every step. Fix: load-test with replayed agent traces.
 
 ## When to use
 This split is the first thing to apply when a latency or cost number looks wrong.
@@ -210,6 +261,8 @@ This split is the first thing to apply when a latency or cost number looks wrong
 - **Size hardware:** summarizing long documents wants FLOPs and prefill throughput; chat with long answers
   wants bandwidth and memory.
 - **Price and budget:** count input and output tokens separately, because they cost different resources.
+- **Agents:** when per-step latency grows over a run, look at prefill (prompt growth, cache misses) before
+  decode.
 - **Interviews:** explaining why decode is bandwidth-bound and prefill compute-bound, with the
   arithmetic-intensity reasoning, is the baseline for any serving question.
 
@@ -253,6 +306,13 @@ overcharge the summarizer.
   user's TPOT spikes.
 - **Fix:** enable chunked prefill with a token budget, or route long-document traffic to its own pool.
 
+### Your agent's per-step latency grows from 0.7 s at step 1 to 2 s at step 15, though tool results are small. Why?
+- **Prefill is growing.** Each step's prompt contains the whole transcript, so without prefix reuse TTFT
+  rises roughly linearly with step number while decode time per step stays flat.
+- **Check** cached versus uncached input tokens per step and whether steps land on the same replica.
+- **Fix:** stable byte-identical prefix, append-only history, session-affine routing, trimmed tool output,
+  and compaction at a boundary when the transcript gets long.
+
 ### When would you not disaggregate prefill and decode?
 - **Below the scale where interference is measurable.** Chunked prefill gets most of the benefit on one
   pool without KV transfer.
@@ -266,9 +326,9 @@ overcharge the summarizer.
   more.
 - **So** meter and price them separately; blended per-token pricing misprices both workloads.
 
-### A team doubles GPU FLOPs. Which workloads benefit and which do not?
-- **Benefit:** long-prompt, short-output workloads (summarization, classification over documents), because
-  prefill and TTFT are compute-bound.
+### A team doubles GPU FLOPs for its agent platform. Which workloads benefit and which do not?
+- **Benefit:** long-prompt, short-output workloads (summarization, classification over documents, most
+  tool-calling agent steps), because prefill and TTFT are compute-bound.
 - **Barely benefit:** chat with long answers, because decode tracks memory bandwidth, which did not change
   much. Measure TTFT and per-user tokens/sec separately to show it.
 
