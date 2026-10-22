@@ -247,6 +247,57 @@ TAXONOMY = [
   ("MCP security in practice (tool poisoning, injection through tool results, consent, least privilege)", ""),
   ("MCP ecosystem (registries, popular servers, when not to use MCP)", "decision: when MCP beats direct tool calling and when it does not"),
  ]),
+ ("practice-use-cases", 1, "Agent use cases to practice", [
+  ("customer support agent (triage, retrieval, refunds with approval)", "usecase"),
+  ("coding agent (repo navigation, edits, tests in a sandbox)", "usecase"),
+  ("deep research agent (search, read, cite, synthesise)", "usecase"),
+  ("data analyst agent (text-to-SQL, charts, guarded queries)", "usecase"),
+  ("document processing agent (extraction, validation, human review)", "usecase"),
+  ("sales and CRM agent (lead research, enrichment, email drafts)", "usecase"),
+  ("IT and SRE ops agent (alerts, runbooks, safe remediation)", "usecase"),
+  ("voice agent (speech in, tools, speech out, latency budget)", "usecase"),
+  ("browser and computer-use agent (forms, web tasks, safety)", "usecase"),
+  ("internal knowledge assistant (enterprise RAG with ACLs)", "usecase"),
+  ("contract and compliance review agent (clauses, risk flags, citations)", "usecase"),
+  ("multi-agent workflow (planner, specialists, reviewer)", "usecase"),
+ ]),
+ ("mini-project-ideas", 1, "Mini project ideas", [
+  ("tool-calling CLI assistant with three real tools", "project"),
+  ("RAG over your own notes with citations and an eval set", "project"),
+  ("MCP server for a personal API (calendar, GitHub or files)", "project"),
+  ("LangGraph agent with checkpoints and human approval", "project"),
+  ("structured extraction pipeline with Pydantic validation and retries", "project"),
+  ("LLM-as-judge eval harness for a small agent", "project"),
+  ("agent tracing dashboard (OpenTelemetry or Langfuse)", "project"),
+  ("prompt-injection red-team suite for a tool-using agent", "project"),
+  ("semantic cache and model router to cut cost", "project"),
+  ("streaming chat backend with FastAPI and SSE", "project"),
+  ("memory layer for a chat agent (summaries, facts, deletion)", "project"),
+  ("text-to-SQL agent over a sample database", "project"),
+  ("multimodal receipt or invoice reader", "project"),
+  ("background job runner for long agent tasks", "project"),
+  ("small fine-tune for tool-call formatting (LoRA)", "project"),
+ ]),
+ ("slm-for-agents", 1, "Small language models (SLMs) for agents", [
+  ("when an SLM is enough (task fit, cost, latency, privacy)", ""),
+  ("choosing an SLM (Llama, Qwen, Phi, Gemma, Mistral small models)", "decision: a selection checklist rather than a leaderboard"),
+  ("running SLMs locally (Ollama, llama.cpp, vLLM)", "tool"),
+  ("quantized SLMs (GGUF, AWQ, quality vs memory)", ""),
+  ("tool calling and structured output with SLMs", ""),
+  ("fine-tuning an SLM for an agent task (LoRA, QLoRA, data)", ""),
+  ("distilling a large-model agent into an SLM", ""),
+  ("SLM-LLM cascades and routing", ""),
+  ("on-device and edge agents with SLMs", ""),
+  ("evaluating SLMs on your agent tasks", ""),
+ ]),
+ ("portfolio-projects", 1, "Portfolio projects", [
+  ("production support agent end to end", "project"),
+  ("agentic RAG platform with evals and observability", "project"),
+  ("multi-agent research and report system", "project"),
+  ("self-hosted SLM agent with fine-tuning and routing", "project"),
+  ("enterprise agent with SSO, RBAC tools and audit logs", "project"),
+  ("MCP tool hub for a team", "project"),
+ ]),
 ]
 
 TIER_INFO = {
@@ -288,6 +339,8 @@ def main():
             t = {"id": s, "key": f"{mid}/{s}", "name": name}
             if hint.startswith("tool"):
                 t["kind_hint"] = "tool"
+            if hint in ("usecase", "project"):
+                t["kind_hint"] = hint
             if hint.startswith("caveat"):
                 t["caveat"] = hint.split(":", 1)[1].strip()
             if hint.startswith(("orientation", "decision")):

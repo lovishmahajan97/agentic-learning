@@ -74,6 +74,17 @@
     "delivery-ownership",
     "adoption"
    ]
+  },
+  {
+   "id": "practice",
+   "title": "Practice lab",
+   "blurb": "Agent use cases to practise, mini project ideas, small language models and portfolio projects.",
+   "modules": [
+    "practice-use-cases",
+    "mini-project-ideas",
+    "slm-for-agents",
+    "portfolio-projects"
+   ]
   }
  ]
 }

@@ -3235,5 +3235,268 @@
     "note": "when MCP beats direct tool calling and when it does not"
    }
   ]
+ },
+ {
+  "module": "practice-use-cases",
+  "module_title": "Agent use cases to practice",
+  "tier": 1,
+  "index": 0,
+  "topics": [
+   {
+    "id": "customer-support-agent",
+    "name": "customer support agent (triage, retrieval, refunds with approval)",
+    "kind_hint": "usecase"
+   },
+   {
+    "id": "coding-agent",
+    "name": "coding agent (repo navigation, edits, tests in a sandbox)",
+    "kind_hint": "usecase"
+   },
+   {
+    "id": "deep-research-agent",
+    "name": "deep research agent (search, read, cite, synthesise)",
+    "kind_hint": "usecase"
+   },
+   {
+    "id": "data-analyst-agent",
+    "name": "data analyst agent (text-to-SQL, charts, guarded queries)",
+    "kind_hint": "usecase"
+   },
+   {
+    "id": "document-processing-agent",
+    "name": "document processing agent (extraction, validation, human review)",
+    "kind_hint": "usecase"
+   },
+   {
+    "id": "sales-and-crm-agent",
+    "name": "sales and CRM agent (lead research, enrichment, email drafts)",
+    "kind_hint": "usecase"
+   }
+  ]
+ },
+ {
+  "module": "practice-use-cases",
+  "module_title": "Agent use cases to practice",
+  "tier": 1,
+  "index": 1,
+  "topics": [
+   {
+    "id": "it-and-sre-ops-agent",
+    "name": "IT and SRE ops agent (alerts, runbooks, safe remediation)",
+    "kind_hint": "usecase"
+   },
+   {
+    "id": "voice-agent",
+    "name": "voice agent (speech in, tools, speech out, latency budget)",
+    "kind_hint": "usecase"
+   },
+   {
+    "id": "browser-and-computer-use-agent",
+    "name": "browser and computer-use agent (forms, web tasks, safety)",
+    "kind_hint": "usecase"
+   },
+   {
+    "id": "internal-knowledge-assistant",
+    "name": "internal knowledge assistant (enterprise RAG with ACLs)",
+    "kind_hint": "usecase"
+   },
+   {
+    "id": "contract-and-compliance-review-agent",
+    "name": "contract and compliance review agent (clauses, risk flags, citations)",
+    "kind_hint": "usecase"
+   },
+   {
+    "id": "multi-agent-workflow",
+    "name": "multi-agent workflow (planner, specialists, reviewer)",
+    "kind_hint": "usecase"
+   }
+  ]
+ },
+ {
+  "module": "mini-project-ideas",
+  "module_title": "Mini project ideas",
+  "tier": 1,
+  "index": 0,
+  "topics": [
+   {
+    "id": "tool-calling-cli-assistant-with-three-real-tools",
+    "name": "tool-calling CLI assistant with three real tools",
+    "kind_hint": "project"
+   },
+   {
+    "id": "rag-over-your-own-notes-with-citations-and-an-eval-set",
+    "name": "RAG over your own notes with citations and an eval set",
+    "kind_hint": "project"
+   },
+   {
+    "id": "mcp-server-for-a-personal-api",
+    "name": "MCP server for a personal API (calendar, GitHub or files)",
+    "kind_hint": "project"
+   },
+   {
+    "id": "langgraph-agent-with-checkpoints-and-human-approval",
+    "name": "LangGraph agent with checkpoints and human approval",
+    "kind_hint": "project"
+   },
+   {
+    "id": "structured-extraction-pipeline-with-pydantic-validation-and-retries",
+    "name": "structured extraction pipeline with Pydantic validation and retries",
+    "kind_hint": "project"
+   },
+   {
+    "id": "llm-as-judge-eval-harness-for-a-small-agent",
+    "name": "LLM-as-judge eval harness for a small agent",
+    "kind_hint": "project"
+   },
+   {
+    "id": "agent-tracing-dashboard",
+    "name": "agent tracing dashboard (OpenTelemetry or Langfuse)",
+    "kind_hint": "project"
+   },
+   {
+    "id": "prompt-injection-red-team-suite-for-a-tool-using-agent",
+    "name": "prompt-injection red-team suite for a tool-using agent",
+    "kind_hint": "project"
+   }
+  ]
+ },
+ {
+  "module": "mini-project-ideas",
+  "module_title": "Mini project ideas",
+  "tier": 1,
+  "index": 1,
+  "topics": [
+   {
+    "id": "semantic-cache-and-model-router-to-cut-cost",
+    "name": "semantic cache and model router to cut cost",
+    "kind_hint": "project"
+   },
+   {
+    "id": "streaming-chat-backend-with-fastapi-and-sse",
+    "name": "streaming chat backend with FastAPI and SSE",
+    "kind_hint": "project"
+   },
+   {
+    "id": "memory-layer-for-a-chat-agent",
+    "name": "memory layer for a chat agent (summaries, facts, deletion)",
+    "kind_hint": "project"
+   },
+   {
+    "id": "text-to-sql-agent-over-a-sample-database",
+    "name": "text-to-SQL agent over a sample database",
+    "kind_hint": "project"
+   },
+   {
+    "id": "multimodal-receipt-or-invoice-reader",
+    "name": "multimodal receipt or invoice reader",
+    "kind_hint": "project"
+   },
+   {
+    "id": "background-job-runner-for-long-agent-tasks",
+    "name": "background job runner for long agent tasks",
+    "kind_hint": "project"
+   },
+   {
+    "id": "small-fine-tune-for-tool-call-formatting",
+    "name": "small fine-tune for tool-call formatting (LoRA)",
+    "kind_hint": "project"
+   }
+  ]
+ },
+ {
+  "module": "slm-for-agents",
+  "module_title": "Small language models (SLMs) for agents",
+  "tier": 1,
+  "index": 0,
+  "topics": [
+   {
+    "id": "when-an-slm-is-enough",
+    "name": "when an SLM is enough (task fit, cost, latency, privacy)"
+   },
+   {
+    "id": "choosing-an-slm",
+    "name": "choosing an SLM (Llama, Qwen, Phi, Gemma, Mistral small models)",
+    "note": "a selection checklist rather than a leaderboard"
+   },
+   {
+    "id": "running-slms-locally",
+    "name": "running SLMs locally (Ollama, llama.cpp, vLLM)",
+    "kind_hint": "tool"
+   },
+   {
+    "id": "quantized-slms",
+    "name": "quantized SLMs (GGUF, AWQ, quality vs memory)"
+   },
+   {
+    "id": "tool-calling-and-structured-output-with-slms",
+    "name": "tool calling and structured output with SLMs"
+   }
+  ]
+ },
+ {
+  "module": "slm-for-agents",
+  "module_title": "Small language models (SLMs) for agents",
+  "tier": 1,
+  "index": 1,
+  "topics": [
+   {
+    "id": "fine-tuning-an-slm-for-an-agent-task",
+    "name": "fine-tuning an SLM for an agent task (LoRA, QLoRA, data)"
+   },
+   {
+    "id": "distilling-a-large-model-agent-into-an-slm",
+    "name": "distilling a large-model agent into an SLM"
+   },
+   {
+    "id": "slm-llm-cascades-and-routing",
+    "name": "SLM-LLM cascades and routing"
+   },
+   {
+    "id": "on-device-and-edge-agents-with-slms",
+    "name": "on-device and edge agents with SLMs"
+   },
+   {
+    "id": "evaluating-slms-on-your-agent-tasks",
+    "name": "evaluating SLMs on your agent tasks"
+   }
+  ]
+ },
+ {
+  "module": "portfolio-projects",
+  "module_title": "Portfolio projects",
+  "tier": 1,
+  "index": 0,
+  "topics": [
+   {
+    "id": "production-support-agent-end-to-end",
+    "name": "production support agent end to end",
+    "kind_hint": "project"
+   },
+   {
+    "id": "agentic-rag-platform-with-evals-and-observability",
+    "name": "agentic RAG platform with evals and observability",
+    "kind_hint": "project"
+   },
+   {
+    "id": "multi-agent-research-and-report-system",
+    "name": "multi-agent research and report system",
+    "kind_hint": "project"
+   },
+   {
+    "id": "self-hosted-slm-agent-with-fine-tuning-and-routing",
+    "name": "self-hosted SLM agent with fine-tuning and routing",
+    "kind_hint": "project"
+   },
+   {
+    "id": "enterprise-agent-with-sso-rbac-tools-and-audit-logs",
+    "name": "enterprise agent with SSO, RBAC tools and audit logs",
+    "kind_hint": "project"
+   },
+   {
+    "id": "mcp-tool-hub-for-a-team",
+    "name": "MCP tool hub for a team",
+    "kind_hint": "project"
+   }
+  ]
  }
 ]
