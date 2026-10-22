@@ -5,7 +5,7 @@ name: Inference optimization
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/continuous-batching
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-Inference optimization is the set of levers that make a fixed model cheaper or faster. Nearly all attack
-one of two bounds: decode is memory-bandwidth bound (each token re-reads weights and cache), prefill is
-compute bound. Learn the roofline that tells them apart.
+Levers that make a fixed model cheaper or faster. Decode is bandwidth bound (each token re-reads weights
+and cache), prefill compute bound, and the bound you hit decides which lever can help: learn the
+roofline, not a list of tricks.
 
 ## Why it exists
 - **GPUs have a fixed compute-to-bandwidth ratio.** An H100 does on the order of a thousand teraFLOPs of

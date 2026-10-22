@@ -23,9 +23,10 @@ sources:
 ---
 
 ## TL;DR
-A secret is any value that lets someone act as your system. Secrets management keeps secrets out of code,
-images, logs and prompts, stores them encrypted, delivers them via platform identity, and keeps them
-short-lived and rotatable, so leaks stay small.
+A secret is any value that lets someone act as your system (database passwords, provider API keys,
+signing keys). Secrets management keeps them out of code, images, logs and prompts, stores them encrypted,
+delivers them via platform identity, and keeps them short-lived, scoped and rotatable, so the inevitable
+leak stays small.
 
 ## Why it exists
 - **Secrets leak through boring paths.** A `.env` committed "just once", an `ENV API_KEY=` line in a
@@ -35,7 +36,8 @@ short-lived and rotatable, so leaks stay small.
 - **For AI teams a provider key is a billing key.** Keys pushed to public repositories are routinely found
   and abused by scanners within minutes (illustrative; the exact window varies), turning into unexpected
   bills, exhausted quotas and rate limits for your real traffic. Unless you create narrower project- or
-  workspace-scoped keys, one key often reaches a whole organisation's quota and data.
+  workspace-scoped keys, one key often reaches a whole organisation's quota and data, so one leak exposes
+  every project.
 - **Environment variables are delivery, not storage.** They are inherited by every child process, readable
   from `/proc/<pid>/environ`, and dumped into crash reports.
 - **Encrypted repo files are only a middle ground.** sops or git-crypt work, but the decryption key is itself
@@ -103,7 +105,7 @@ out is identity the platform attests without a stored secret:
 ### 4. Deliver to the process
 | Option | Pros | Cons |
 |---|---|---|
-| Fetch through the SDK at startup | Simple | Needs network and identity; cache with a TTL |
+| Fetch through the SDK at startup | Simple | Needs network and identity at boot; must cache with a TTL to pick up rotations |
 | Mount as files on a tmpfs volume | Preferred on Kubernetes: the manager rewrites the file, the app re-reads without a restart | App must re-read |
 | Inject as environment variables | Universal | Frozen for the process life and leaky as above |
 
@@ -244,6 +246,8 @@ RUN --mount=type=secret,id=pip_token \
 ```
 
 ```yaml
+on:
+  push: {branches: [main]}   # the role's trust policy accepts only this branch
 permissions:
   id-token: write        # lets the job request an OIDC token
   contents: read
@@ -255,6 +259,7 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::123456789012:role/deploy-main   # trusts only repo:org/app:ref:refs/heads/main
           aws-region: us-east-1
+      - run: aws sts get-caller-identity   # temporary credentials (1 hour by default)
 ```
 
 ## Production patterns

@@ -5,7 +5,7 @@ name: BullMQ & durable jobs
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - node-ts-for-ai/redis
   - node-ts-for-ai/graceful-shutdown
@@ -218,10 +218,11 @@ in-flight jobs on `SIGTERM` instead of leaving them to the stall checker.
 
 ```ts
 import { Queue, Worker } from "bullmq";
+// conn() is the ioredis factory from the previous example
 
 const evalQueue = new Queue("evals", { connection: conn() });
 await evalQueue.upsertJobScheduler("nightly-regression",
-  { pattern: "0 2 * * *" },                                         // 02:00 every day
+  { pattern: "0 2 * * *", tz: "UTC" },                               // 02:00 every day; set tz explicitly
   { name: "run-suite", data: { suite: "regression" }, opts: { attempts: 2 } });
 
 const evalWorker = new Worker("evals", runSuite, { connection: conn(), concurrency: 1 });

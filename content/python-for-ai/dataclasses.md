@@ -5,7 +5,7 @@ name: dataclasses
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/type-hints
   - python-for-ai/pydantic

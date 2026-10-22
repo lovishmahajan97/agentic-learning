@@ -5,7 +5,7 @@ name: Softmax
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - model-internals/logits
   - model-internals/attention-mechanism
@@ -220,17 +220,19 @@ print(online([1000.0, 0.0]))                     # [1.0, 0.0]: no overflow eithe
 
 ## Pitfalls
 - **Exponentiating in half precision or without subtracting the max.** Symptom: NaN or inf probabilities
-  on long or confident rows, often only on some batches.
+  on long or confident rows, often only on some batches. Fix: subtract the row max and normalize in fp32.
 - **Masking after the softmax.** Multiplying probabilities by zero instead of adding `−∞` before leaves rows
   that no longer sum to one. The sibling bug, masking with a large finite negative such as −1e4 that
-  underflows to nothing in fp16, shows up as attention leaking to masked positions.
+  underflows to nothing in fp16, shows up as attention leaking to masked positions. Fix: add the mask
+  before the softmax, using `−∞` or the dtype's own minimum.
 - **Treating "99% probability" as 99% correctness.** Softmax outputs are scores shaped by training;
-  calibration must be measured rather than assumed.
+  calibration must be measured rather than assumed. Fix: measure calibration error on labelled data and
+  apply temperature scaling if needed.
 - **A fully masked row.** For example a padding query whose every key is masked: the row is all `−∞`,
   softmax computes `0/0`, and NaNs appear only in batches with padding. Kernels guard this case
   explicitly, and hand-written attention must too.
 - **Evicting the first tokens of a long context.** To save KV memory; attention that used to land on the
-  sink is redistributed and output quality degrades sharply.
+  sink is redistributed and output quality degrades sharply. Fix: pin the first few tokens in the cache.
 - **Mixing up the two temperatures.** Reusing an output-layer temperature inside attention or vice versa;
   they are separate knobs with separate meanings.
 

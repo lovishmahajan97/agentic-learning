@@ -5,7 +5,7 @@ name: Type hints
 kind: concept
 difficulty: intro
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/mypy
   - python-for-ai/protocols-generics-structural-typing
@@ -181,7 +181,7 @@ Run `mypy` on the file above after each edit.
 |---|---|---|
 | Delete the `if text is None` branch | Error: the optional string has no attribute `strip` | The value proposition, delivered before the first API call |
 | Keep it deleted and also delete `first_text`'s return annotation | Silent | A missing return annotation defaults to `Any` (a fully unannotated function is not checked at all); `Any.strip()` is accepted |
-| Call `GenConfig(model="x", temperature="0.2")` directly | Runs fine (Pydantic coerces) | A checker that understands Pydantic's `__init__` through `dataclass_transform` flags the `str` argument |
+| Call `GenConfig(model="x", temperature="0.2")` directly | Error: `str` where `float` expected (the call still runs, because Pydantic coerces) | A checker that understands Pydantic's `__init__` through `dataclass_transform` flags the `str` argument |
 | Same call with Pydantic's mypy plugin enabled | Silent by default | The plugin deliberately types `__init__` parameters as `Any` unless you set `init_typed = True` |
 
 - **The first error is the whole point:** `str | None` has no attribute `strip`, reported before any
@@ -217,9 +217,11 @@ print(describe(ToolTurn("search", {"q": "kv cache"})))   # call search
 ```
 
 ## Production patterns
-- **Strict at the edges, gradual inside.** Turn on `strict = true` under `[tool.mypy]` for the packages
-  that touch SDKs and tool handlers, and use `[[tool.mypy.overrides]]` with a `module` pattern to relax
-  legacy code. Track the count of overridden modules and shrink it each sprint.
+- **Strict at the edges, gradual inside.** Set `strict = true` under `[tool.mypy]` (it is a global-only
+  option, so it cannot be scoped to one package), then add `[[tool.mypy.overrides]]` with a `module`
+  pattern for legacy code that relaxes it, for example `ignore_errors = true` or
+  `disallow_untyped_defs = false`. SDK wrappers and tool handlers stay strict. Track the count of
+  overridden modules and shrink it each sprint.
 - **Validate at the boundary.** Parse every `json.loads` result or raw SDK dict with
   `Model.model_validate(...)` (or `TypeAdapter(list[Message]).validate_python(...)`) in the first
   function that receives it. Monitor validation-error rate per provider; a spike means an API changed
@@ -320,7 +322,8 @@ that third-party stubs are installed so SDK calls are not silently `Any` either.
 - **Gradual by design:** unannotated code is `Any`, so you can start with zero errors and tighten module
   by module.
 - **Order:** type the boundaries first (SDK wrappers, tool handlers, serialized models), set
-  `strict = true` for those packages, and relax legacy modules with `[[tool.mypy.overrides]]`.
+  `strict = true` globally, and relax untouched legacy modules with `[[tool.mypy.overrides]]`
+  (`strict` itself cannot be set per module).
 - **Track progress** by the number of overridden modules and the `Any` surface, not by the share of
   functions with annotations.
 

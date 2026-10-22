@@ -5,7 +5,7 @@ name: Scaling laws
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - model-internals/small-language-models
   - model-internals/mixture-of-experts
@@ -227,15 +227,18 @@ for name, n, d in [("Gopher", 280, 300), ("Chinchilla", 70, 1_400),
 ## Pitfalls
 - **Treating 20 tokens per parameter as a law of nature.** It is a fit for Chinchilla's data and objective;
   the ratio for a model you will deploy is set by inference economics, often in the hundreds or thousands.
+  Fix: pick the ratio from lifetime cost, `6ND + 2NT`.
 - **Expecting downstream accuracy to follow the smooth loss curve.** Symptom: a benchmark flat near zero
   across several scales and then jumping, leading either to "emergence" claims or to abandoning a
-  capability one scale too early.
+  capability one scale too early. Fix: track a smooth metric such as correct-answer probability as well.
 - **Counting parameters inconsistently.** With or without embeddings, or active versus total for MoE.
-  Symptom: fits that disagree with published ones by a large factor, especially at the small end.
+  Symptom: fits that disagree with published ones by a large factor, especially at the small end. Fix:
+  state the counting rule and apply it to every rung.
 - **One learning-rate schedule for runs of every length.** Symptom: long runs look worse than they are,
-  biasing the fit toward bigger models, which is a large part of the Kaplan/Chinchilla discrepancy.
+  biasing the fit toward bigger models, which is a large part of the Kaplan/Chinchilla discrepancy. Fix:
+  decay each run's schedule to its own length.
 - **Counting repeated epochs as fresh tokens.** Beyond a few repetitions returns fall off sharply, so the D
-  in your formula is not the D the model effectively saw.
+  in your formula is not the D the model effectively saw. Fix: count unique tokens and epochs separately.
 
 ## When to use
 Most practitioners never fit a scaling law; they use its implications.

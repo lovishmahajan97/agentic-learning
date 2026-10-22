@@ -5,7 +5,7 @@ name: safetensors
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/pytorch
   - python-for-ai/hugging-face
@@ -177,8 +177,8 @@ A `[4096, 4096]` BF16 projection split row-wise for tensor parallelism:
 - **Reject external pickles at the door.** CI or the model registry blocks `.bin`/`.pt`/`.pkl` artifacts
   from outside sources unless converted in a sandbox (as above). Monitor rejection counts and who tried.
 - **Force safetensors at load.** Pass `use_safetensors=True` to `from_pretrained` so Transformers errors
-  instead of silently falling back to a pickle file in the repo. Alert on any load error that someone
-  "fixes" with `weights_only=False`.
+  instead of silently falling back to a pickle file in the repo. Fail CI on any `weights_only=False`
+  in the codebase, because that is the usual "fix" for a load error.
 - **Stage weights on local NVMe.** Copy checkpoints from network or object storage to local disk before
   memory-mapped loading. Monitor cold-start time to first token per storage path.
 - **Stamp provenance in metadata.** Write source repo, revision and training run into `__metadata__`

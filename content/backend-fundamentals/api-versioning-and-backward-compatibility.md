@@ -5,7 +5,7 @@ name: API versioning & backward compatibility
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/rest-graphql-api-design
   - fastapi-for-ai/openapi-contract-testing
@@ -251,15 +251,15 @@ Rename `summary` to `text` on an endpoint with three integrators. Dates are illu
 
 ## Pitfalls
 - **A field rename shipped as a "small cleanup".** Symptom: a partner integration fails days later with
-  `KeyError` on a field you removed.
+  `KeyError` on a field you removed. Fix: expand and contract, gated by a schema diff in CI.
 - **Forking the codebase per version.** Symptom: a bug fixed in v2 still ships in v1, and a security
-  patch reaches only one of them.
+  patch reaches only one of them. Fix: one implementation, versions rendered at the edge.
 - **Announcing a deprecation without measuring usage.** Symptom: v1 is removed on the date and the
-  largest customer turns out to be still on it.
+  largest customer turns out to be still on it. Fix: per-client version telemetry before the sunset.
 - **Treating model or prompt updates as invisible.** Symptom: downstream parsers break because the new
-  model stopped emitting the code fence the old one always produced.
+  model stopped emitting the code fence the old one always produced. Fix: pin and eval before switching.
 - **Clients switching exhaustively on an enum.** Symptom: a crash the day a new status value is added,
-  even though no field changed.
+  even though no field changed. Fix: document enums as open and map unknowns to a fallback.
 
 ## When to use
 - **Every change to a published interface:** review each diff of a request or response model against the

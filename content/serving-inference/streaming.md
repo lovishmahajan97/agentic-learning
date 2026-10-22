@@ -5,7 +5,7 @@ name: Streaming (SSE)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/ttft
   - serving-inference/tpot
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 Streaming sends each token as it is decoded, so users feel time-to-first-token, not total time.
-Server-Sent Events (SSE) is the usual transport: plain one-way HTTP. The price: errors and usage arrive
-in-band, and no hop may buffer.
+Server-Sent Events (SSE) is the usual transport: plain one-way HTTP. The price: errors, usage and tool
+calls arrive piecemeal, and no hop may buffer.
 
 ## Why it exists
 - **Total time is long; the first token is early.** Decoding produces one token at a time, so total
@@ -118,8 +118,8 @@ Two consequences follow:
   server cannot replay generation from an id, so a dropped stream is a cancel-and-restart.
 - **`EventSource` only issues `GET` without custom headers.** Real clients consume the provider's
   `POST` stream with `fetch` and a `ReadableStream` reader.
-- **Connection limits bite.** On HTTP/1.1 browsers allow six connections per origin, which runs out
-  if every tab holds a stream open.
+- **Connection limits bite.** On HTTP/1.1 most browsers allow six connections per origin, which runs
+  out if every tab holds a stream open; HTTP/2 multiplexes streams over one connection.
 
 ## Diagram
 The 200 is committed before the first token. After that, tokens, heartbeats and the terminal event
@@ -133,12 +133,14 @@ sequenceDiagram
     participant E as Engine
     C->>P: POST /v1/answer
     P->>S: forward request
-    S-->>C: 200 text/event-stream plus connected comment
+    S-->>P: 200 text/event-stream plus connected comment
+    P-->>C: headers and comment, passed straight on
     E->>S: one token per decode step
     S-->>P: event delta, flushed now
     P-->>C: event delta, unbuffered
-    S-->>C: keep-alive comment while idle
-    S-->>C: event done or event error
+    S-->>P: keep-alive comment while idle
+    S-->>P: event done or event error
+    P-->>C: terminal event, then close
     Note over C: no terminal event means partial answer
 ```
 
@@ -280,22 +282,25 @@ generation ran at normal speed, but an intermediary held the bytes.
 
 ## Pitfalls
 - **A proxy or middleware buffers the body.** Symptom: a stream that works on localhost and arrives
-  all at once in production after the full generation time.
+  all at once in production after the full generation time. Fix: walk the hops with `curl -N` and
+  turn buffering and compression off on each.
 - **Browser `EventSource` against an authenticated `POST` endpoint.** Symptom: 401 or 405 errors,
   because `EventSource` can only `GET` without custom headers. Fix: `fetch` with a stream reader.
 - **No heartbeats during long prefill or thinking pauses.** Symptom: streams dying at a fixed interval
-  (often exactly 60 s) with no error from either end.
+  (often exactly 60 s) with no error from either end. Fix: comment heartbeats below the idle timer.
 - **Treating the `200` as success.** Ignoring in-band `error` events or stop reasons shows up as
-  truncated answers logged as successes and never retried.
+  truncated answers logged as successes and never retried. Fix: require a terminal event.
 - **Rendering each delta straight into Markdown.** Symptom: flickering, half-open code fences and
-  broken links until the closing token arrives.
+  broken links until the closing token arrives. Fix: re-render the accumulated text, or hold back an
+  unclosed fence or link.
 - **Counting SSE chunks as tokens.** Servers may coalesce or split, so usage numbers disagree with the
-  provider's bill.
+  provider's bill. Fix: use the reported usage fields.
 - **Treating each network read as one event.** Symptom: intermittent JSON parse errors or garbled
   non-ASCII characters only on slow or distant networks, where reads split events differently than
-  on localhost.
+  on localhost. Fix: an incremental decoder and a buffer up to the blank line, as in the parser above.
 - **Assuming a disconnect stops generation.** It does not unless you propagate the stop. Symptom: GPU
-  time and provider spend that stay flat when traffic drops.
+  time and provider spend that stay flat when traffic drops. Fix: cancel the producer and close the
+  upstream stream on disconnect.
 
 ## When to use
 - **Stream by default** for anything a human reads that is longer than a sentence, and for long-running

@@ -5,7 +5,7 @@ name: Batch size
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/gradient-accumulation
@@ -36,7 +36,8 @@ learning rate and steps are one decision.
 - **Hardware pushes bigger.** GPUs are efficient only on large matrices, and batch × sequence length is
   what makes activations large. A few hundred tokens leave most of the chip idle and make the step
   memory-bandwidth bound, because weights are read once per step regardless of batch. Doubling until
-  compute-bound is close to free per example; data parallelism adds each GPU's examples to the batch.
+  compute-bound is close to free in wall-clock per example; data parallelism usually adds each GPU's
+  examples to the batch rather than splitting a fixed batch finer.
 - **Optimization pushes back.** Once the gradient is accurate, a batch twice as large gives essentially
   the same update: same steps, twice the tokens. That is wasted compute, and for a fixed dataset fewer
   epochs' worth of unique signal.
@@ -249,12 +250,13 @@ past the noise scale, hardware buys little time and costs a lot of data.
   delivers no speed-up; through more GPUs it costs hardware but actually shortens the run.
 
 ## Pitfalls
-- **Doubling batch or GPUs, not the learning rate.** The run trains noticeably slower per token and the
-  team blames the larger batch instead of the untouched learning rate.
+- **Doubling the batch (or GPUs) but not the learning rate.** The run trains noticeably slower per token
+  and the team blames the larger batch instead of the untouched learning rate. Fix: rescale the rate, then
+  re-tune it.
 - **Quoting batch in sequences across context lengths.** Two runs with "batch 64" at 2k and 8k context see
   4× different numbers of tokens per gradient.
 - **Sizing the schedule in steps, then changing the batch.** Warmup and decay now cover a different
-  fraction of the data than intended.
+  fraction of the data than intended. Fix: recompute steps from the token budget after every batch change.
 - **Pushing utilization past the noise scale.** Loss-per-token flattens: more tokens for the same loss,
   visible only when runs are plotted against tokens rather than steps.
 - **Assuming batch is irrelevant for small fine-tunes.** With a few thousand examples, a batch of 128 may

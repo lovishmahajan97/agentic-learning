@@ -5,7 +5,7 @@ name: Gradient accumulation
 kind: practice
 difficulty: core
 est_minutes: 11
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/batch-size
   - ml-fundamentals/gradient-clipping
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-Gradient accumulation sums gradients from several micro-batches before one optimizer step, giving the
-optimizer the recipe's batch while memory holds one micro-batch of activations. It costs no memory and
-changes no optimization, but buys no speed.
+Gradient accumulation sums gradients from several micro-batches before one optimizer step. Because
+gradients are linear in the examples, the optimizer sees the recipe's batch while memory holds one
+micro-batch. It costs no memory but buys no speed: every micro-batch still runs.
 
 ## Why it exists
 - **Memory has a fixed part.** Weights, gradients and optimizer moments are set by parameter count: with
@@ -161,6 +161,10 @@ def train_step(model, opt, sched, micro_batches, max_norm=1.0):
 #   With per-micro-batch means (loss.mean() / k) a micro-batch holding 300 real tokens would weigh
 #   the same as one holding 8,000, so the gradient would differ from a true batch of 128.
 ```
+
+Under DDP, `n_tokens` here is this rank's count, so the result is a mean of per-rank means. For exact
+per-token weighting across ranks, all-reduce the count once and multiply the loss by the world size, as
+described under "When the sum is not the big-batch gradient".
 
 ### Checking the identity, and the token-weighting bug, in pure Python
 No dependencies. Part 1 shows the accumulated gradient equals the big-batch gradient for a 1-D linear
@@ -309,11 +313,12 @@ agreement is the bug.
 - **Memory is flat:** only one micro-batch of activations is alive at a time.
 - **What actually helps:** a larger micro-batch until the GPU is compute-bound, or more GPUs.
 
-### Your training loss changes when you change the accumulation count. Where do you look?
-- **Loss normalization first:** per-micro-batch means divided by `k` over-weight short micro-batches on
-  variable-length data; sum token losses and divide by the window's token count.
-- **Then step accounting:** a scheduler stepping per micro-batch gives different rates at the same "step".
-- **Then the loop:** clipping or `zero_grad()` inside it, or a BatchNorm layer.
+### A single 32k-token sequence does not fit even at micro-batch 1. Does accumulation help?
+- **No:** accumulation only splits a batch across sequential passes; the smallest unit it can split down
+  to is one sequence, so that sequence's activations must still fit.
+- **Use gradient checkpointing:** it stores only some activations and recomputes the rest in backward,
+  roughly one extra forward pass, shrinking per-sequence activation memory.
+- **Combine them:** checkpointing makes one sequence fit, then accumulation reaches the target batch.
 
 ### Under FSDP, should you delay gradient reduction until the end of the window?
 - **Benefit:** fewer reduce-scatters, so less communication per optimizer step.

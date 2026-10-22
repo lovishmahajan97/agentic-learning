@@ -5,7 +5,7 @@ name: Protocols, generics and structural typing
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/type-hints
   - python-for-ai/dependency-injection-and-interface-boundaries

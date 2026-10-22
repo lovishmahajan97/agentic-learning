@@ -5,7 +5,7 @@ name: Mixed precision
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/gradient-clipping
   - ml-fundamentals/gradient-accumulation
@@ -327,9 +327,10 @@ answer is that this recipe wants bf16 hardware, and the saving on T4s is not rea
 - **fp32 where it matters:** master weights, the optimizer update and long reductions (softmax, norms,
   loss) stay fp32, because small updates and long sums round away in 16 bits.
 
-### A fine-tune after model.half() plateaus early but never NaNs. What is wrong?
+### A fine-tune after model.to(torch.bfloat16) plateaus early but never NaNs. What is wrong?
 - **No master weights:** with bf16 weights, updates below about 2^-8 of a weight's magnitude round to no
-  change, so many parameters stop moving.
+  change, so many parameters stop moving. (`model.half()` gives fp16, where the floor is about 2^-11 and
+  overflow NaNs are the more common symptom.)
 - **Confirm:** compare against an autocast run with fp32 parameters; the loss curves separate early.
 - **Fix:** keep parameters fp32 and use `torch.autocast`; do not cast the model or optimizer.
 

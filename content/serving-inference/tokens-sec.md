@@ -5,7 +5,7 @@ name: Tokens per second
 kind: metric
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/tpot
   - serving-inference/throughput-vs-latency
@@ -23,7 +23,7 @@ sources:
 ## TL;DR
 "Tokens per second" names two numbers that move in opposite directions with concurrency: one stream's
 decode speed (what a user sees) and a server's aggregate output (what you pay for). A figure means
-nothing without tokens counted, concurrency, lengths, hardware and percentile.
+nothing without tokens counted, concurrency, lengths, hardware, precision and tokenizer.
 
 ## Why it exists
 - **Serving is selling tokens per GPU-second.** The business, the capacity plan and the user experience
@@ -240,17 +240,18 @@ print(f"${cost_per_million(3.0, 200):.2f} per million at c=1 (200 tok/s)")
 
 ## Pitfalls
 - **Comparing tokens/s across different tokenizers.** Symptom: the "faster" model takes longer to finish
-  the same paragraph.
+  the same paragraph. Fix: compare characters per second or task time.
 - **Benchmarking at concurrency 1 and dividing a fleet by that.** Symptom: capacity wildly under- or
-  over-provisioned depending on which number was used.
+  over-provisioned depending on which number was used. Fix: size from goodput at the deployed
+  concurrency.
 - **Counting streamed chunks as tokens.** Symptom: tokens/s that disagrees with usage and with the bill,
-  since servers coalesce or split tokens per event.
+  since servers coalesce or split tokens per event. Fix: read the usage fields.
 - **Closed-loop load tests only.** Symptom: a capacity estimate that collapses in production when
-  arrivals burst and queues form.
+  arrivals burst and queues form. Fix: add an open-loop run at fixed arrival rates.
 - **Ignoring prompt tokens in capacity math.** Symptom: a RAG workload saturating prefill compute while
-  the output tokens/s dashboard says the GPU has headroom.
-- **Averaging per-request tokens/s.** Divide total tokens by wall time instead; the average is inflated
-  by short requests and no capacity model can reproduce it.
+  the output tokens/s dashboard says the GPU has headroom. Fix: track input tokens/s alongside output.
+- **Averaging per-request tokens/s.** Symptom: an "aggregate" figure that short requests skew and that
+  no capacity model can reproduce. Fix: divide total output tokens by wall time.
 
 ## When to use
 - **Use for capacity or cost questions:** how many replicas for a launch, what a GPU-hour yields,

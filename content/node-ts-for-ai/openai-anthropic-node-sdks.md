@@ -295,25 +295,32 @@ console.log({
 
 ## Pitfalls
 - **Matching on `error.message` strings instead of `instanceof` and `status`.** Symptom: retry logic stops
-  working after an SDK or API wording change.
+  working after an SDK or API wording change. Fix: branch on the error class, most specific first, then `status`.
 - **Passing the timeout in seconds as in Python.** Symptom: every request times out after a few
-  milliseconds and is retried twice (three attempts) before failing.
+  milliseconds and is retried twice (three attempts) before failing. Fix: pass milliseconds (`60_000`).
 - **Forgetting the `signal` on streaming calls.** Symptom: completions keep running, and billing, long after
-  the HTTP client disconnected.
+  the HTTP client disconnected. Fix: abort a request-scoped `AbortController` on disconnect and pass its
+  `signal` as a request option.
 - **Treating `function.arguments` as an object on OpenAI, or `input` as a string on Anthropic.** Symptom: a
-  `TypeError` or `[object Object]` inside a tool.
+  `TypeError` or `[object Object]` inside a tool. Fix: `JSON.parse` OpenAI arguments, use Anthropic's
+  `input` as is, and validate both with the tool's schema.
 - **Text before the `tool_result` blocks, the wrong role, or another turn between the `tool_use` and its
   result.** Symptom: a 400 saying `tool_use` ids were found without `tool_result` blocks immediately after.
-  Splitting parallel results across messages is a quieter mistake that discourages parallel tool calls.
+  Fix: echo the assistant turn unchanged, then send one `user` message that starts with every `tool_result`
+  block for that turn. Splitting parallel results across messages is a quieter mistake that discourages
+  the model from making parallel tool calls.
 - **Reading `response.content[0].text` on Anthropic without narrowing.** Symptom: a compile error at best,
-  and at worst a runtime `undefined` when the first block is `tool_use` or `thinking`.
+  and at worst a runtime `undefined` when the first block is `tool_use` or `thinking`. Fix: filter or narrow
+  on `block.type === "text"`.
 - **Omitting `max_tokens` on Anthropic or setting it too low.** Symptom: a 400 on the former and truncated
-  JSON with `stop_reason: "max_tokens"` on the latter.
+  JSON with `stop_reason: "max_tokens"` on the latter. Fix: always set it, size it for the longest valid
+  answer, and treat `max_tokens` as a failure branch.
 - **A non-streaming request with a very large `max_tokens` through a proxy with a short idle timeout.**
   Symptom: 504s or `APIConnectionTimeoutError` on long answers only, then retries that may pay for the same
   long generation again. Stream long generations.
 - **Verifying caching by vibes.** Symptom: a system prompt with a timestamp in it, a cache hit rate of zero
-  and a bill that never drops.
+  and a bill that never drops. Fix: move variable content after the breakpoint and alert on
+  `cache_read_input_tokens`.
 
 ## When to use
 - **Use the native SDK** whenever you commit to a provider and want its full surface: streaming helpers,
@@ -368,6 +375,8 @@ chain, and record the request ID from the response for the inevitable support ti
 - **Mechanism:** passing `signal` as a request option; aborting rejects with `APIUserAbortError` and closes
   the socket, so the provider stops generating.
 - **Billing:** tokens already produced are still billed, so abort promptly on client disconnect.
+- **Wiring:** create an `AbortController` per request, abort it when the incoming HTTP request closes, and
+  pass the same signal to every model call that request makes.
 
 ### When would you choose OpenAI's Responses API over Chat Completions?
 - **Choose Responses** for typed `output` items, named stream events and server-side state via

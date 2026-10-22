@@ -5,7 +5,7 @@ name: Learning-rate schedulers
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/warmup
   - ml-fundamentals/optimizers
@@ -32,8 +32,8 @@ ones when it is not. It is defined over total optimizer steps, so plan it with b
   plus noise, and `θ ← θ − η·g` carries that noise into the weights. In a quadratic bowl the iterates
   bounce around the minimum with a spread proportional to `η × noise variance`; halve η and the spread
   shrinks, so η must eventually be small.
-- **A small η from the start is wasteful.** Early gradients are large and consistently pointed, so small
-  steps need many more iterations to cover the same distance, and a very small rate can leave the model
+- **A small η from the start is wasteful.** Early gradients are large and consistently pointed and the
+  model is far from any minimum, so small steps need many more iterations to cover the same distance, and a very small rate can leave the model
   stuck in a poor flat region a bigger step would carry it past.
 - **Adam does not remove the tension.** It normalizes step sizes per parameter, but the global scale is
   still η and the same noise-floor argument applies. "Pick a medium η and train longer" pays twice: no
@@ -172,8 +172,9 @@ The same shape is available as `transformers.get_cosine_schedule_with_warmup`, a
 `get_wsd_schedule`; the hand-written version is here so the numbers can be checked by eye.
 
 ### Worked comparison: where each shape spends its steps
-Peak 3e-4, floor 10%, measured as progress through the decay phase. WSD here holds the peak for the first
-80% and decays over the last 20%.
+Peak 3e-4, floor 10%, measured as the fraction of post-warmup steps completed. Cosine and linear decay
+across that whole span; WSD holds the peak for the first 80% and decays linearly over the last 20%, so it
+is still at the peak at 0.75.
 
 | Decay progress | Cosine | Linear to floor | WSD |
 |---|---|---|---|
@@ -192,7 +193,7 @@ Peak 3e-4, floor 10%, measured as progress through the decay phase. WSD here hol
 - **Print the plan before launch.** Before any long run, evaluate the schedule at step 0, end of warmup,
   midpoint and `T`, and assert they match the plan. Then log the rate each step (PyTorch
   `scheduler.get_last_lr()`) next to the loss so a bad curve can be attributed.
-- **Derive the horizon from optimizer steps.** Compute `num_training_steps` as micro-batches ÷
+- **Derive the horizon from optimizer steps.** Compute `num_training_steps` as micro-batches per epoch ÷
   accumulation steps × epochs, and set warmup from it (for example the Trainer's `warmup_ratio`). Monitor
   the logged rate at the final step; it should sit at the planned floor.
 - **Checkpoint scheduler state with the model.** Save `scheduler.state_dict()` alongside optimizer and
@@ -221,12 +222,14 @@ Peak 3e-4, floor 10%, measured as progress through the decay phase. WSD here hol
   (or vice versa). Symptom: a rate stuck at the warmup value, or collapsing to near zero within the first
   epoch. Fix: step once per optimizer step.
 - **Sizing the schedule in micro-batches.** Computing `num_training_steps` from micro-batches with
-  gradient accumulation on, so the schedule finishes early and the second half trains near zero.
+  gradient accumulation on, so the schedule finishes early and the second half trains near zero. Fix:
+  divide the micro-batch count by the accumulation steps before building the scheduler.
 - **Resuming without scheduler state.** Warmup restarts or the decay resets; the loss curve shows a jump
   at the resume point that was not there before. Fix: restore the scheduler with the optimizer.
 - **Extending a cosine run without re-planning.** Clamped, the extra steps run at the floor and barely
   move the model ("more data did not help"); unclamped, the rate climbs back towards the peak and the
-  loss rises. Either way the logged learning rate shows it.
+  loss rises. Either way the logged learning rate shows it. Fix: re-plan `T` for the full length, or build
+  a new short re-warm and decay for the extra steps.
 - **Reading the decay-phase drop as insight.** The sharp loss drop during decay is the noise floor
   shrinking as η falls, not the model suddenly "getting it"; it appears in every well-scheduled run.
 

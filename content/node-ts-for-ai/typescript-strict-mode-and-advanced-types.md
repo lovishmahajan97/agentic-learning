@@ -5,7 +5,7 @@ name: TypeScript strict mode & advanced types
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - node-ts-for-ai/runtime-schema-validation
   - node-ts-for-ai/promises-and-async-error-propagation
@@ -45,7 +45,7 @@ provider responses, so mismatches fail at compile time, not as mid-stream `undef
 |---|---|---|
 | **`noImplicitAny`** | An untyped parameter or variable is an error, not silently `any` | `any` is viral: one untyped parameter turns everything derived from it into `any` |
 | **`strictNullChecks`** | `null` and `undefined` are their own types; a `string \| null` must be narrowed before `.trim()` | Turns "Cannot read properties of undefined" from a runtime surprise into a compile error |
-| **`strictFunctionTypes`** | Parameters of function-typed values are checked contravariantly | A handler typed to accept `TextEvent` would receive events it cannot handle if passed where a handler of `StreamEvent` is expected |
+| **`strictFunctionTypes`** | Parameters of function-typed values are checked contravariantly, so a handler typed to accept only `TextEvent` cannot be passed where a handler of `StreamEvent` is expected | It would receive events it cannot handle |
 | **`strictPropertyInitialization`** | Class fields must be initialised at declaration or in the constructor | No half-built objects |
 | **`strictBindCallApply`** | `.call/.apply` are type-checked | Dynamic calls stay checked |
 | **`noImplicitThis`** | `this` must have a known type | No accidental global `this` |
@@ -247,8 +247,9 @@ now return no text.
   `noUncheckedIndexedAccess` and `exactOptionalPropertyTypes`, and CI runs `tsc --noEmit` on every PR.
   Monitor the error count when bumping the TypeScript version, since new releases can add strict flags.
 - **Lint bans on escape hatches.** Enable `@typescript-eslint/no-explicit-any` and
-  `consistent-type-assertions` as errors, with reviewed per-line disables. Track the count of `any` and `as`
-  over time as a debt metric.
+  `@typescript-eslint/consistent-type-assertions` with `assertionStyle: "never"` as errors (the rule's
+  default only enforces `as` syntax, it does not ban casts), with reviewed per-line disables. Track the count
+  of `any` and `as` over time as a debt metric.
 - **`unknown` at the edge, parse once.** Wrap `JSON.parse`, request bodies, webhook payloads and model tool
   arguments so they return `unknown`, then run one schema parse that yields a typed value. Monitor
   boundary validation-failure rates per source.
@@ -283,13 +284,16 @@ now return no text.
 - **Leaving `strict: false` and trusting the red squiggles.** Symptom: implicit `any` everywhere, so renaming
   a field breaks nothing at compile time and everything at runtime. Fix: enable `strict`.
 - **Forgetting the `never` default branch** in a `switch` over a union. Symptom: a new event type silently
-  dropped, often noticed as "the stream ends early for tool calls".
+  dropped, often noticed as "the stream ends early for tool calls". Fix: add the `never` assignment in
+  `default` so the next variant breaks the build.
 - **Annotating instead of using `satisfies`,** so a config map loses its literal keys. Symptom:
-  `keyof typeof config` becomes `string` and typos in model names compile cleanly.
+  `keyof typeof config` becomes `string` and typos in model names compile cleanly. Fix:
+  `as const satisfies Record<string, Spec>`.
 - **Treating `catch (e: any)` as harmless.** Symptom: `e.message` is `undefined` because a library threw a
   string or non-Error object, hiding the real failure in logs. Fix: keep `e: unknown` and narrow.
 - **A guard that checks less than it claims** (`x is ToolCall` after only checking `typeof x === "object"`).
-  Symptom: a crash on a field the guard "proved" existed, with no cast anywhere to grep for.
+  Symptom: a crash on a field the guard "proved" existed, with no cast anywhere to grep for. Fix: check
+  every field the predicate claims, or derive the guard from a schema.
 
 ## When to use
 - **Day one:** turn on `strict` in any Node AI service and add `noUncheckedIndexedAccess`; the cost of

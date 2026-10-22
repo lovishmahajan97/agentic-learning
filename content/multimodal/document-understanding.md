@@ -5,7 +5,7 @@ name: Document understanding
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: reviewed
+status: crisp
 related:
   - multimodal/ocr
   - multimodal/vision-language-models
@@ -23,45 +23,49 @@ sources:
 ---
 
 ## TL;DR
-Document understanding is turning pages (invoices, contracts, forms, reports) into structured,
-verifiable information: classified, with fields extracted, tables recovered and questions answered.
-It exists because text alone is not the document; meaning lives in layout, position and tables, and
-OCR-plus-regex pipelines break on every new template. The modern mechanism is a model that reads text,
-position and pixels together, wrapped in a pipeline that validates and routes what it cannot verify.
+Document understanding turns pages (invoices, contracts, forms, reports) into structured, verifiable
+data: classified, fields extracted, tables recovered, questions answered. Meaning lives in layout, so
+models read text, position and pixels together inside a pipeline that validates and routes.
 
 ## Why it exists
-A purchase order is not a paragraph. "Total" means the number in the box to the right of the word, on
-the last page, after the line items, not the first number that follows the word "total" in a text
-dump. A contract's clause numbering, a form's checkboxes, a bank statement's columns: in each case the
-information is encoded in *where* things are as much as in what they say. Flatten the page to a string
-and that encoding is gone.
-
-The first generation of document automation accepted this and fought it with templates: for each
-vendor's invoice layout, hand-written coordinates or regexes that located each field. It works until
-the vendor changes its layout, a new vendor appears, or a scan is slightly skewed, which in practice
-means it is always breaking somewhere, and the maintenance cost scales with the number of templates. The
-"zonal OCR" business existed because of this treadmill.
-
-The second naive alternative arrived with LLMs: OCR the page and ask the model to extract fields from
-the text. Better, but the LLM now reasons over a reading order that OCR guessed, over tables that have
-become interleaved numbers, with no idea which value sat in which column. It also returns answers with
-total confidence and no mechanism to say a field was absent. Document understanding as a discipline
-exists to put layout back into the model's input and to put verification around the model's output.
+- **Text alone is not the document.** A purchase order is not a paragraph. "Total" means the number in
+  the box to the right of the word, on the last page, after the line items, not the first number after
+  "total" in a text dump. Flatten the page to a string and that encoding is gone.
+- **Layout carries meaning everywhere.** A contract's clause numbering, a form's checkboxes, a bank
+  statement's columns: the information is encoded in *where* things are as much as in what they say.
+- **Templates are a treadmill.** First-generation automation used hand-written coordinates or regexes
+  per vendor layout. It breaks when the vendor changes layout, a new vendor appears or a scan is
+  slightly skewed, so it is always breaking somewhere; maintenance scales with template count. The
+  "zonal OCR" business existed because of this.
+- **OCR-then-LLM is better but blind.** The LLM reasons over a reading order OCR guessed and tables
+  turned into interleaved numbers, with no idea which value sat in which column. It answers with total
+  confidence and no way to say a field was absent.
+- **What the discipline buys.** It puts layout back into the model's input and puts verification around
+  the model's output.
 
 ## How it works
 ### Three model families
-1. **OCR plus layout-aware encoder (LayoutLM family).** OCR provides words and bounding boxes. The model
-   embeds each token with its text, its 2-D position and, in later versions, image patch features of
-   the page. Concretely, box coordinates are normalised to a 0–1000 grid regardless of page size, and
-   learned embeddings for x0, y0, x1, y1 (plus width and height in v2) are summed with the token
-   embedding: `e = E_tok(w) + E_x(x0) + E_y(y0) + E_x(x1) + E_y(y1) + E_pos(i)`. Normalising to a grid
-   is a deliberate choice, because it makes "top-right corner" mean the same thing on an A4 scan and a
-   phone photo, and summing rather than concatenating lets self-attention compare positions with the
-   same dot products it uses for meaning. Pretraining masks text and image regions
-   so the model learns to associate words with positions and appearance. Fine-tuned heads then do token
-   classification for key information extraction (label each word as invoice_number, total, none),
-   page classification, or extractive question answering. It inherits OCR's errors but also its
-   confidences and boxes, which is why it remains common in regulated extraction.
+| Family | Input | Keeps | Loses |
+|---|---|---|---|
+| OCR plus layout-aware encoder (LayoutLM) | words, boxes, page image | per-word confidence and boxes | inherits OCR errors, needs labelled fine-tuning |
+| OCR-free end-to-end (Donut, Pix2Struct) | page image | no reading-order errors, one model | per-word confidence, fine print (fixed resolution) |
+| General VLM with structured prompt | page image, often OCR text, schema | zero-shot across templates | highest per-page cost, invents missing values |
+
+1. **OCR plus layout-aware encoder (LayoutLM family).** OCR provides words and bounding boxes. Each
+   token is embedded with its text, its 2-D position and, in later versions, image patch features of the
+   page.
+   - **Position encoding.** Box coordinates are normalised to a 0–1000 grid regardless of page size, and
+     learned embeddings for x0, y0, x1, y1 (plus width and height in v2) are summed with the token
+     embedding.
+   - **Why a grid.** It makes "top-right corner" mean the same on an A4 scan and a phone photo.
+   - **Why summing, not concatenating.** Self-attention can compare positions with the same dot products
+     it uses for meaning.
+   - **Pretraining.** Text and image regions are masked so the model learns to associate words with
+     positions and appearance.
+   - **Fine-tuned heads.** Token classification for key information extraction (label each word as
+     invoice_number, total, none), page classification, or extractive question answering.
+   - **Why it persists.** It inherits OCR's errors but also its confidences and boxes, which is why it
+     remains common in regulated extraction.
 2. **OCR-free end-to-end (Donut, Pix2Struct).** A vision encoder reads the page image and a text decoder
    generates the output directly, trained to emit a serialised JSON of the fields. No OCR stage means no
    reading-order errors and one model to run, but also no per-word confidence and a fixed resolution
@@ -69,58 +73,98 @@ exists to put layout back into the model's input and to put verification around 
 3. **General vision-language models with structured prompts.** A VLM receives the page image (and often
    the OCR text as extra context) and a schema, and returns JSON. Zero-shot across templates, strong on
    irregular layouts, highest per-page cost and the strongest tendency to invent a value when the field
-   is missing. Document parsers (cloud Document AI services, open-source layout toolkits) sit beside
-   these as pre-processors that emit text, blocks, tables and reading order the VLM can consume.
+   is missing.
+   - **Document parsers sit beside them.** Cloud Document AI services and open-source layout toolkits act
+     as pre-processors that emit text, blocks, tables and reading order the VLM can consume.
+
+```
+e = E_tok(w) + E_x(x0) + E_y(y0) + E_x(x1) + E_y(y1) + E_pos(i)
+```
+The LayoutLM token embedding: `e = E_tok(w) + E_x(x0) + E_y(y0) + E_x(x1) + E_y(y1) + E_pos(i)`.
 
 ### The pipeline around the model
-The model is one stage. A production path looks like: ingest and classify the file type; render PDF
-pages to images at a resolution that preserves small text (around 150–200 DPI is a common starting
-point, tuned per corpus); detect whether a text layer exists so born-digital pages skip OCR; run OCR
-where needed; run layout analysis to find blocks (title, paragraph, table, figure, header, footer) and
-reading order; recover table structure (rows, columns, spanning cells) separately, because tables fail
-differently from prose; split multi-document packets by page classification; extract against an explicit
-schema; validate; route. Each stage exists because a failure there has a distinct signature, and
+The model is one stage. Each stage exists because a failure there has a distinct signature, and
 isolating stages is what makes the failure diagnosable.
+1. **Ingest and classify the file type.**
+2. **Render PDF pages to images** at a resolution that preserves small text: around 150–200 DPI is a
+   common starting point, tuned per corpus.
+3. **Detect a text layer** so born-digital pages skip OCR.
+4. **Run OCR** where needed.
+5. **Run layout analysis** to find blocks (title, paragraph, table, figure, header, footer) and reading
+   order.
+6. **Recover table structure** (rows, columns, spanning cells) separately, because tables fail
+   differently from prose.
+7. **Split multi-document packets** by page classification.
+8. **Extract against an explicit schema.**
+9. **Validate, then route.**
 
 ### Schema-driven extraction and validation
-Extraction is only useful when the output is typed and checkable. Define the schema with explicit
-nullability so the model can say "absent" instead of guessing, request structured output, and validate
-with code: types and formats (dates, currency), cross-field arithmetic (line item quantities × unit
-prices summed against the subtotal, subtotal plus tax against the total), referential checks against
-systems of record (a vendor ID that exists), and consistency across pages. Each failed check becomes a
-reason to route the document to review. This is the layer that converts a probabilistic model into a
-process with a known error budget, and the straight-through-processing rate (documents needing no human
-touch) is the business metric that falls out of it.
+Extraction is only useful when the output is typed and checkable.
+- **Explicit nullability** in the schema, so the model can say "absent" instead of guessing; request
+  structured output.
+- **Types and formats** checked in code: dates, currency.
+- **Cross-field arithmetic:** line item quantities × unit prices summed against the subtotal, subtotal
+  plus tax against the total.
+- **Referential checks** against systems of record (a vendor ID that exists).
+- **Consistency across pages.**
+- **Each failed check is a review reason.** This layer converts a probabilistic model into a process
+  with a known error budget. The straight-through-processing rate (documents needing no human touch) is
+  the business metric that falls out of it.
 
 ### Getting a confidence signal back
-Families 2 and 3 return values without confidence, and review routing needs one. Practical substitutes,
-in rising cost: ask for provenance (the page number and the verbatim source text or box for each field)
-and check that the quoted text really exists in the OCR or text layer, which catches most invented
-values cheaply; read token log-probabilities for the value tokens where the serving stack exposes them;
-run two extractions (two prompts, two models, or VLM versus OCR-plus-layout) and treat disagreement as
-low confidence. None of these is calibrated out of the box, so plot error rate against the signal on a
-labelled sample before choosing a routing threshold.
+Families 2 and 3 return values without confidence, and review routing needs one. Substitutes, in rising
+cost:
+1. **Ask for provenance:** the page number and the verbatim source text or box for each field, then check
+   the quoted text really exists in the OCR or text layer. This catches most invented values cheaply.
+2. **Read token log-probabilities** for the value tokens where the serving stack exposes them.
+3. **Run two extractions** (two prompts, two models, or VLM versus OCR-plus-layout) and treat
+   disagreement as low confidence.
+- **None is calibrated out of the box.** Plot error rate against the signal on a labelled sample before
+  choosing a routing threshold.
 
 ### Evaluation
-Field-level exact match or F1 for extraction, with per-field breakdown because "total" and "notes" do
-not matter equally. For question answering on document images the standard metric is ANLS, a
-normalised edit-distance score that tolerates minor OCR-style spelling differences. For tables, TEDS
-measures structural similarity as a tree edit distance over cell structure. Build the evaluation set
-from real customer documents with reviewer labels, stratified by template and scan quality, because
-public benchmarks will not contain your vendors' layouts.
+| Task | Metric | Note |
+|---|---|---|
+| Extraction | field-level exact match or F1 | break down per field, because "total" and "notes" do not matter equally |
+| QA on document images | ANLS | normalised edit-distance score that tolerates minor OCR-style spelling differences |
+| Tables | TEDS | structural similarity as a tree edit distance over cell structure |
+- **Build the eval set from real customer documents** with reviewer labels, stratified by template and
+  scan quality, because public benchmarks will not contain your vendors' layouts.
 
 ### Retrieval over documents
-For "find the clause about termination in these 3,000 PDFs", the same choices recur at index time: chunk
-OCR text with layout-aware boundaries so a table and its header stay together, or embed page images
-directly with a document-screenshot embedder and let retrieval happen over pixels. The deep treatment
-of chunking, parsing and ingestion lives in the retrieval and data-architecture modules; this lesson is
-about getting trustworthy structure out of a page.
+- **Same choices recur at index time.** For "find the clause about termination in these 3,000 PDFs",
+  either chunk OCR text with layout-aware boundaries so a table and its header stay together, or embed
+  page images directly with a document-screenshot embedder and retrieve over pixels.
+- **Scope.** Chunking, parsing and ingestion are treated deeply in the retrieval and data-architecture
+  modules; this lesson is about getting trustworthy structure out of a page.
 
-## Example
+## Diagram
+Follow a page from file to either the straight-through path or the review queue; validation, not the
+model, decides which.
+
+```mermaid
+flowchart TD
+    F["PDF or scan"] --> R["Render page, 150-200 DPI"]
+    R --> T{"Text layer present?"}
+    T -->|"yes"| X["Use exact text"]
+    T -->|"no"| O["Run OCR"]
+    X --> L["Layout and table analysis"]
+    O --> L
+    L --> S["Split packet by page class"]
+    S --> E["Extract to nullable schema"]
+    E --> V{"Checks pass?"}
+    V -->|"yes"| P["Straight-through to ledger"]
+    V -->|"no, with reason"| H["Human review queue"]
+```
+
+## Examples
+### Extract one invoice page with validation and review routing
 A minimal extraction path for one invoice page: detect whether the PDF already has text (skip OCR if
 so), render the page, ask a VLM served behind an OpenAI-compatible API for a schema-shaped JSON with
 explicit nulls, then validate with pydantic including the arithmetic check that catches most
-hallucinated amounts. Review routing is the output, not just the fields.
+hallucinated amounts.
+
+Review routing is the output, not just the fields.
 
 ```python
 import base64, json, fitz                     # PyMuPDF
@@ -167,43 +211,112 @@ inv, issues = extract("po_2024_0417.pdf")
 print(inv.total if inv else None, issues)
 ```
 
+### Validation that catches an invented tax line (pure Python, runnable)
+The invented tax keeps subtotal + tax = total consistent, so arithmetic alone passes it; the provenance
+check fails it because the amount is printed nowhere on the page.
+
+```python
+def check_invoice(fields, page_text, tol=0.01):
+    """Return review reasons; an empty list means straight-through."""
+    reasons = []
+    lines, sub, tax, total = fields["lines"], fields["subtotal"], fields["tax"], fields["total"]
+    if lines and sub is not None and abs(sum(l["qty"] * l["unit_price"] for l in lines) - sub) > tol:
+        reasons.append("line items do not sum to subtotal")
+    if None not in (sub, tax, total) and abs(sub + tax - total) > tol:
+        reasons.append("subtotal + tax != total")
+    flat = page_text.replace(",", "")
+    for name in ("subtotal", "tax", "total"):
+        v = fields[name]
+        if v is not None and f"{v:.2f}" not in flat:
+            reasons.append(f"{name} {v:.2f} not found on page")   # provenance: value must be printed
+    if tax is None and "tax" in page_text.lower():
+        reasons.append("page mentions tax but field is null")
+    return reasons
+
+page = "INVOICE 0417\nWidget 2 x 49.50 = 99.00\nCable 1 x 1,200.00 = 1,200.00\nSubtotal 1,299.00\nTotal 1,299.00"
+good = {"lines": [{"qty": 2, "unit_price": 49.5}, {"qty": 1, "unit_price": 1200.0}],
+        "subtotal": 1299.0, "tax": None, "total": 1299.0}
+bad = dict(good, tax=103.92, total=1402.92)        # invented tax line
+print(check_invoice(good, page))   # []
+print(check_invoice(bad, page))    # ['tax 103.92 not found on page', 'total 1402.92 not found on page']
+```
+
+### Worked scenario: accuracy versus escaped errors
+Illustrative numbers for an accounts-payable feed of 2,000 invoices a day where the total field is wrong
+on 2% of documents (40 a day).
+
+| Configuration | Wrong totals caught | Wrong totals escaping to ledger | Sent to review |
+|---|---|---|---|
+| Model only, no checks | 0 | 40 | 0 |
+| + arithmetic invariants | most line-item and tax slips | the internally consistent errors | flagged docs plus false alarms |
+| + provenance check on money fields | invented amounts | only misreads that also appear on the page | slightly more |
+| + dual extraction on totals | disagreements | a small residue | most of the queue growth |
+
+- **The lesson.** Model accuracy is unchanged in every row; what changes is how many errors are visible.
+  Track escaped-error rate by auditing a random sample of straight-through documents.
+
+## Production patterns
+- **Text-layer fast path.** For born-digital PDFs, use the embedded text (for example a length check on
+  PyMuPDF `page.get_text()`) and skip OCR, because that text is exact. Monitor the share of pages that
+  fall back to OCR per source; a sudden rise usually means a sender switched to scanning.
+- **Split before you extract.** Classify each page and cut multi-invoice packets into documents before
+  extraction, so a stapled scan cannot yield a total from the wrong invoice. Monitor pages per document
+  against expected ranges per document class.
+- **Validation as routing, not rejection.** Every failed rule emits a named reason to the review queue,
+  and reviewers see the reason and the source region. Monitor straight-through rate, reviewer minutes
+  per document and the top review reasons weekly.
+- **Provenance on every money field.** Require the page number and verbatim source text per field, and
+  fail fields whose quote is absent from the text layer or OCR output. Monitor the provenance-miss rate
+  per model version.
+- **Audit the straight-through path.** Sample a fixed percentage of auto-approved documents for human
+  re-check, because unflagged errors are invisible otherwise. Report escaped-error rate per field, with
+  the total weighted as the acceptance criterion.
+- **Treat documents as untrusted input.** Run extraction with no tools or side-effecting actions
+  available, and pass page text as data in a clearly delimited block. Monitor for outputs that contain
+  instructions or fields outside the schema.
+
 ## Trade-offs
-- Layout-aware encoders on OCR output keep confidences and boxes for audit, but inherit OCR errors and
-  need labelled fine-tuning per task; VLMs skip labelling and lose the confidence signal.
-- OCR-free models remove reading-order failures and run as one stage, yet their fixed input resolution
-  loses fine print, which flips the decision on dense statements and engineering drawings.
-- Schema-driven extraction with validation raises straight-through rates and catches hallucinated
-  amounts, but every rule is maintenance; keep rules to checks the business can state as invariants.
-- Higher render resolution and tiling improve small-text accuracy at multiplied token cost per page;
-  find the plateau on your corpus and render at that, not at maximum.
+- **Audit trail vs labelling.** Layout-aware encoders on OCR output keep confidences and boxes for audit,
+  but inherit OCR errors and need labelled fine-tuning per task; VLMs skip labelling and lose the
+  confidence signal.
+- **One stage vs fine print.** OCR-free models remove reading-order failures and run as one stage, yet
+  their fixed input resolution loses fine print, which flips the decision on dense statements and
+  engineering drawings.
+- **Straight-through rate vs rule maintenance.** Schema-driven extraction with validation raises
+  straight-through rates and catches hallucinated amounts, but every rule is maintenance; keep rules to
+  checks the business can state as invariants.
+- **Resolution vs token cost.** Higher render resolution and tiling improve small-text accuracy at
+  multiplied token cost per page; find the plateau on your corpus and render at that, not at maximum.
 
 ## Pitfalls
-- Rendering pages at screen resolution; the symptom is correct headers and wrong digits, because small
-  numerals fall below the encoder's effective resolution.
-- Letting the model fill absent fields; the symptom is invoices with a plausible tax amount that does not
-  appear anywhere on the page, found only when the ledger does not reconcile.
-- Treating multi-page packets as one document; the symptom is a total extracted from the wrong invoice in
-  a stapled scan, fixed by page classification and splitting before extraction.
-- Flattening tables before extraction; the symptom is quantities and prices swapped between columns, or
-  line items merged, especially on tables with wrapped descriptions.
-- Measuring an average accuracy only; the symptom is a release that improved overall F1 while getting
-  worse on the one field, the total, that drives the business outcome.
-- Accepting VLM-extracted values with no provenance; the symptom is reviewers spending minutes hunting
-  for where a field came from, and invented values that pass every format check because nothing ties
-  them to a location on the page.
-- Assuming the document is trustworthy input; the symptom is an extraction agent obeying instructions
-  printed in a submitted PDF, the document-borne form of prompt injection.
+- **Rendering pages at screen resolution.** The symptom is correct headers and wrong digits, because
+  small numerals fall below the encoder's effective resolution.
+- **Letting the model fill absent fields.** The symptom is invoices with a plausible tax amount that does
+  not appear anywhere on the page, found only when the ledger does not reconcile.
+- **Treating multi-page packets as one document.** The symptom is a total extracted from the wrong
+  invoice in a stapled scan, fixed by page classification and splitting before extraction.
+- **Flattening tables before extraction.** The symptom is quantities and prices swapped between columns,
+  or line items merged, especially on tables with wrapped descriptions.
+- **Measuring an average accuracy only.** The symptom is a release that improved overall F1 while
+  getting worse on the one field, the total, that drives the business outcome.
+- **Accepting VLM-extracted values with no provenance.** The symptom is reviewers spending minutes
+  hunting for where a field came from, and invented values that pass every format check because nothing
+  ties them to a location on the page.
+- **Assuming the document is trustworthy input.** The symptom is an extraction agent obeying
+  instructions printed in a submitted PDF, the document-borne form of prompt injection.
 
 ## When to use
-Use a document-understanding pipeline when the output must be structured and acted upon: accounts
-payable, claims, KYC onboarding, contract review, forms processing, and any RAG system over scanned
-material where tables carry the answers. For a handful of pages a human reads anyway, a plain VLM call
-is enough; for regulated extraction at volume, the full pipeline with validation and review routing is
-the product. Decide the model family by whether you need confidences and audit trails (layout-aware on
-OCR) or zero-shot coverage across unknown templates (VLM), and often use both: VLM for breadth,
-validation for trust. Measure per-field accuracy, straight-through rate, and reviewer time per
-document. In interviews, be ready to explain why layout matters, what validation catches that models
-cannot, and how you would evaluate on a customer's own documents.
+- **Use when** the output must be structured and acted upon: accounts payable, claims, KYC onboarding,
+  contract review, forms processing, and any RAG system over scanned material where tables carry the
+  answers.
+- **Avoid the full pipeline when** it is a handful of pages a human reads anyway; a plain VLM call is
+  enough. For regulated extraction at volume, the full pipeline with validation and review routing is
+  the product.
+- **Choose the family by need:** confidences and audit trails (layout-aware on OCR) or zero-shot coverage
+  across unknown templates (VLM). Often use both: VLM for breadth, validation for trust.
+- **Measure** per-field accuracy, straight-through rate, and reviewer time per document.
+- **Interviews:** be ready to explain why layout matters, what validation catches that models cannot,
+  and how you would evaluate on a customer's own documents.
 
 ## Role lens
 - **Engineer:** Implements rendering, text-layer detection, schema-driven extraction and the validation
@@ -226,6 +339,47 @@ check to human review with the reason attached, and report straight-through rate
 instead of average accuracy. Then stratify evaluation by field, with the total weighted as the
 acceptance criterion. Finance accepts a system whose failures are visible and bounded; raising model
 accuracy alone would still leave silent errors.
+
+## Interview questions
+### Why isn't running OCR and sending the text to an LLM enough for document extraction?
+- **Layout is lost in the flattening.** Meaning sits in position: which number is in the total box,
+  which column a price belongs to. A text dump keeps the characters but discards that structure.
+- **Reading order is a guess.** OCR's order on multi-column pages and tables can interleave values, so
+  the LLM reasons over a corrupted sequence and swaps quantities and prices.
+- **No signal of absence or confidence.** A plain prompt fills required slots with plausible values;
+  you need nullable schemas, provenance and validation to make errors detectable.
+
+### Design an invoice pipeline for many vendors whose templates you have never seen.
+- **Breadth from a VLM, trust from checks.** Use a VLM with a nullable schema for zero-shot coverage,
+  with the text layer or OCR text supplied as grounding.
+- **Stages before the model.** Render at 150–200 DPI, skip OCR for born-digital pages, analyse layout and
+  tables, and split packets by page classification.
+- **Stages after the model.** Arithmetic invariants, provenance quotes, vendor master-data lookups and
+  duplicate detection, each emitting a review reason; report straight-through and escaped-error rates.
+
+### When would you choose a LayoutLM-style model over a general VLM?
+- **When audit needs confidences and boxes.** Token classification on OCR output gives per-word
+  confidence and coordinates, which regulated review workflows rely on.
+- **When volume and templates are stable.** Labelled fine-tuning pays off for a fixed set of document
+  classes at high volume, and per-page cost is far below a large VLM call.
+- **When not.** For long-tail or unknown templates with no labels, the VLM's zero-shot coverage usually
+  wins; pair it with validation rather than trusting its output.
+
+### Totals are correct on born-digital PDFs but often wrong on scans. How do you debug it?
+- **Stratify the errors first.** Split by text-layer presence, source and scan quality to confirm the
+  failure is in the image path, not the extraction prompt.
+- **Check render resolution.** Correct headers with wrong digits point to small numerals below the
+  encoder's effective resolution; raise DPI or tile and find the plateau on your corpus.
+- **Check OCR and tables.** Compare OCR output against the page for the total region, and test whether
+  table recovery is merging wrapped rows before the model ever sees them.
+
+### How do you choose the confidence threshold that sends documents to human review?
+- **Pick a signal and calibrate it.** Provenance hits, value log-probabilities or dual-extraction
+  agreement; none is calibrated out of the box, so plot error rate against it on a labelled sample.
+- **Set it from business limits.** Choose the threshold that keeps escaped errors on money fields under
+  the agreed budget, then read off the straight-through rate and reviewer load it implies.
+- **Keep auditing.** Sample auto-approved documents continuously, because drift in vendors or scan
+  quality silently moves the curve.
 
 ## Quiz
 ### Q: Why does the LayoutLM family add 2-D position embeddings to each OCR token?

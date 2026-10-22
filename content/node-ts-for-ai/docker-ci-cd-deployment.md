@@ -24,7 +24,7 @@ sources:
 ## TL;DR
 Ship a Node AI service as a multi-stage image of compiled JavaScript and production deps, run Node as PID
 1 so `SIGTERM` drains streams, inject keys at runtime, and gate on typecheck and tests, with evals beside
-the gate.
+the gate, not inside it.
 
 ## Why it exists
 - **TypeScript does not run as written.** It must be compiled (or type-stripped), its dependency tree is
@@ -236,8 +236,9 @@ A chat service caps completions at 120 seconds by policy (an illustrative value;
   short `sleep` (a few seconds), flip readiness on `SIGTERM`, and size `terminationGracePeriodSeconds` from
   the longest allowed completion. Monitor 502s and connection resets during each rollout; the target is zero.
 - **Scheduled rebuild of a pinned major.** Keep `FROM node:22-slim` and add an `on: schedule` cron trigger
-  to the workflow that rebuilds weekly, so base-image security patches land without unpinning. Watch
-  image scan findings and image size over time.
+  to the workflow that rebuilds weekly, so base-image security patches land without unpinning. Give the
+  rebuild its own tag (for example the SHA plus a date) rather than overwriting the SHA tag, so one tag
+  keeps meaning one digest. Watch image scan findings and image size over time.
 - **Audit images for leaked secrets.** Run `docker history --no-trunc <image>` (or a scanner in CI) on
   release images to confirm no key appears in build args or layers. Alert on any match and rotate the key
   immediately, since registry copies cannot be recalled.
@@ -261,20 +262,22 @@ A chat service caps completions at 120 seconds by policy (an illustrative value;
 
 ## Pitfalls
 - **Shell-form `CMD` or an entrypoint script that does not `exec`.** Symptom: pods always take the full grace
-  period to stop and users' streams cut off at every deploy.
+  period to stop and users' streams cut off at every deploy. Fix: exec-form `CMD`, or `exec node …` as the
+  script's last line, plus a `SIGTERM` handler.
 - **Copying the whole source before `npm ci`.** Symptom: a dependency install on every commit and a
-  ten-minute build for a one-line change.
+  ten-minute build for a one-line change. Fix: copy only the manifests, run `npm ci`, then copy the source.
 - **Passing the provider key as a build `ARG` or `ENV`.** Symptom: the key is readable in image history
-  (`docker history`) and in every registry the image was pushed to.
+  (`docker history`) and in every registry the image was pushed to. Fix: inject it at runtime and rotate the
+  leaked key.
 - **Leaving the heap limit to the default heuristic.** Symptom: kernel OOM kills under load (exit code 137)
-  with no JavaScript heap error in the logs.
+  with no JavaScript heap error in the logs. Fix: set `--max-old-space-size` below the container limit.
 - **Running `npm install` instead of `npm ci`.** Symptom: a dependency version in production that no
-  developer machine or CI run ever tested.
+  developer machine or CI run ever tested. Fix: `npm ci` (or the frozen-lockfile equivalent) everywhere.
 - **Readiness green while draining, or the listener closed the instant `SIGTERM` arrives with no `preStop`
   delay.** Symptom: a burst of 502s or connection resets at every rollout even though the drain code looks
-  correct.
+  correct. Fix: flip readiness on `SIGTERM` and sleep in `preStop` before `server.close()`.
 - **Deploying prompt or model-id changes with no eval.** Symptom: users report a quality regression days
-  after a deploy that "only touched a text file".
+  after a deploy that "only touched a text file". Fix: a budgeted eval that blocks promotion, plus a canary.
 
 ## When to use
 - **The floor, for any Node AI service beyond a laptop:** a multi-stage Dockerfile, `npm ci`, exec-form

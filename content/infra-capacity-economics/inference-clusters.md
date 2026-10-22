@@ -24,8 +24,8 @@ sources:
 
 ## TL;DR
 An inference cluster is a fleet of model-server replicas (vLLM, TGI, TensorRT-LLM, Triton) behind a
-router, on GPU nodes, scaled on LLM-specific signals. One GPU box caps out early, and long-lived,
-stateful requests break round-robin balancing and CPU autoscaling.
+router, on GPU nodes, scaled on LLM-specific signals. One GPU box caps out on memory and bandwidth,
+and long-lived, variable-length, stateful requests break round-robin and CPU autoscaling.
 
 ## Why it exists
 - **One replica has a hard ceiling.** Weights plus KV cache must fit in VRAM, decode is bound by memory
@@ -260,8 +260,10 @@ so one node hosts 4 replicas.
   promises N× the throughput a TP group actually delivers. Fix: load-test the replica shape.
 - **Wrong node pool for the replica.** Scheduling onto a node with the wrong GPU type or too little host
   RAM for weight loading. Symptom: CrashLoopBackOff with OOM during model load rather than at serving time.
+  Fix: a node selector or affinity plus taints per GPU type, and node pools sized for host-side loading.
 - **No readiness gate that waits for the engine's warm-up.** Symptom: a wave of errors and timeouts right
-  after every scale-up or rollout because traffic hits a replica still loading weights.
+  after every scale-up or rollout because traffic hits a replica still loading weights. Fix: a readiness
+  probe on the engine's health endpoint and a startup probe long enough for loading and warm-up.
 
 ## When to use
 - **Use when** one replica cannot meet peak demand within the latency budget, when you need to survive a

@@ -5,7 +5,7 @@ name: uv / poetry / pip
 kind: tool
 difficulty: intro
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
   - python-for-ai/security-scanning-and-dependency-auditing
@@ -23,7 +23,7 @@ sources:
 ## TL;DR
 pip installs packages; Poetry and uv manage projects: `pyproject.toml` dependencies, a lockfile,
 environments and builds. Reproducibility is the point, because "works on my machine" is usually two
-environments resolving different versions; uv replaces pip, pip-tools, virtualenv, pyenv and pipx, much faster.
+environments resolving different versions. uv covers pip, pip-tools, virtualenv, pyenv and pipx, much faster.
 
 ## Why it exists
 - **A project needs four things.** A list of what it depends on, an exact resolved set of versions satisfying

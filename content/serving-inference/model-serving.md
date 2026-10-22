@@ -5,7 +5,7 @@ name: Model serving
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/engines
   - serving-inference/prefill-vs-decode
@@ -36,10 +36,10 @@ decides what the hardware delivers.
 - **The loop is stateful.** Each step needs the KV cache of every earlier token, so the state lives on the
   GPU for the life of the request and grows every step. Memory, not compute, usually caps how many
   requests a card can hold.
-- **GPUs are efficient only when busy.** A single decode request reads all weights per token: for an 8B
-  model in fp16 that is ~16 GB per token, so ~3 TB/s of bandwidth caps it near 200 tokens/s no matter how
-  many FLOPs the GPU has, with the arithmetic units idle. Put 32 requests in the same step and the weights
-  are still read once, so the same ~16 GB yields 32 tokens.
+- **GPUs are efficient only when busy with large matmuls.** A single decode request reads all weights per
+  token: for an 8B model in fp16 that is ~16 GB per token, so ~3 TB/s of bandwidth caps it near 200
+  tokens/s no matter how many FLOPs the GPU has, with the arithmetic units almost idle. Put 32 requests in
+  the same step and the weights are still read once, so the same ~16 GB yields 32 tokens.
 - **Batching loops is a scheduling problem.** Variable-length, variable-lifetime loops are something the
   one-request-one-pass model never had to solve. The whole module works through these three facts; this
   lesson is the map.

@@ -5,7 +5,7 @@ name: Lockfiles & dependency pinning
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/uv-poetry-pip
   - python-for-ai/security-scanning-and-dependency-auditing
@@ -31,7 +31,7 @@ lock, libraries publish ranges.
   installs well over a hundred, each allowing a range of its own dependencies, with new releases daily.
 - **Ranges alone drift.** `pip install` on Tuesday and on Friday can produce different environments from the
   same source tree.
-- **The failure is quiet.** It appears later as a changed default, a removed keyword argument or a new
+- **The failure is rarely loud at install time.** It appears later as a changed default, a removed keyword argument or a new
   validation rule, in a package nobody on the team chose directly.
 - **Pinning nothing** ("always get the latest fixes") makes every build a new, untested combination, so a
   green CI run on Monday says nothing about Friday's deploy.

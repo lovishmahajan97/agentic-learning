@@ -5,7 +5,7 @@ name: PostgreSQL transactions & isolation levels
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/sql
@@ -23,7 +23,7 @@ sources:
 
 ## TL;DR
 A transaction makes statements atomic and durable; the isolation level decides what concurrent
-transactions see. PostgreSQL's MVCC never blocks readers, but default READ COMMITTED permits lost updates
+transactions see. With MVCC, readers and writers do not block each other, but READ COMMITTED permits lost updates
 and write skew; fix them with atomic updates, row locks, or SERIALIZABLE plus retries.
 
 ## Why it exists
@@ -339,8 +339,8 @@ statement and avoids retries entirely.
 ### How does MVCC let readers and writers avoid blocking each other in PostgreSQL?
 - **Updates create new versions** stamped with `xmin`/`xmax` instead of overwriting, so the old version
   stays readable.
-- **Each transaction reads from a snapshot** of committed transaction ids, so a long `SELECT` sees a
-  stable view while `UPDATE`s proceed.
+- **Each transaction reads from a snapshot** of committed transaction ids (a fresh one per statement at
+  READ COMMITTED), so a long `SELECT` sees a stable view while `UPDATE`s proceed.
 - **The cost is cleanup:** `VACUUM` must reclaim dead versions, and old open snapshots prevent it.
 
 ### Two concurrent requests both pass a budget check and overspend. Walk through your fix.

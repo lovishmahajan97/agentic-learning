@@ -5,7 +5,7 @@ name: Typed tool contracts
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - agents/tool-schemas-and-argument-validation
   - agents/tool-result-interpretation
@@ -61,6 +61,10 @@ and the model always reads results of a stable shape.
 | `permission_denied` | Give up and explain |
 | `transient` | Wait and retry |
 | `rate_limited` | Wait and retry, more slowly |
+| `internal` | Report the failure; the harness alerts, because the bug is in the tool, not the call |
+
+- **Keep the enum small and shared.** The example below implements a subset (`not_found`,
+  `invalid_argument`, `transient`, `internal`); a real registry defines every kind once for all tools.
 
 ### Making write retries safe
 - **The contract says how a retry is made safe.** The harness derives an idempotency key (for example

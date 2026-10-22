@@ -5,7 +5,7 @@ name: TTFT (time to first token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/prefill-vs-decode
   - serving-inference/streaming
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-Time to first token (TTFT) is queueing wait plus prefill over the whole prompt, so it grows with prompt
-length and load, not answer length. It is the latency a streaming user feels; cut it with shorter
-prompts, prefix caching, admission control and scheduling.
+Time to first token (TTFT) is the delay from sending a request to the first generated token: queueing
+wait plus prefill over the whole prompt. It grows with prompt length and load, not answer length, and
+is the latency a streaming user feels.
 
 ## Why it exists
 - **End-to-end latency mixes two phases with different physics.** Prefill processes every prompt token
@@ -49,8 +49,8 @@ From the client's clock, TTFT is the sum of:
 | Term | Size |
 |---|---|
 | Network to the server, plus TCP and TLS handshakes (several round trips) unless the client reuses a pooled connection | Small, fixed |
+| Tokenisation (before admission, because the scheduler needs the prompt length) | Small |
 | Waiting for admission: a free batch slot and free KV-cache memory | **Large, variable** |
-| Tokenisation | Small |
 | Prefill forward pass over all prompt tokens | **Large, variable** |
 | Sampling the first token from the logits of the last prompt position | Small |
 | Serialisation and the first flush of the response | Small |
@@ -71,8 +71,9 @@ From the client's clock, TTFT is the sum of:
   "we added RAG and TTFT went from 300 ms to 2 s" is not a bug.
 
 ### Queueing under continuous batching
-- **Admission needs a slot and KV memory.** When either is exhausted, the request waits for others to
-  finish or be preempted, and that wait lands entirely in TTFT.
+- **Admission needs a slot and KV memory.** A continuous-batching engine admits a request only when it
+  has a scheduling slot and enough KV memory for its prompt. When either is exhausted, the request
+  waits for others to finish or be preempted, and that wait lands entirely in TTFT.
 - **TTFT p99 is a capacity signal.** If it climbs while prompt lengths have not changed, you are
   queueing.
 - **Prefill stalls running streams.** A long prompt entering the batch makes that step expensive,
@@ -113,9 +114,9 @@ the admission queue and prefill, are where almost all of TTFT goes.
 ```mermaid
 flowchart TD
     A["Client sends request"] --> B["Network and TLS handshake"]
-    B --> C["Admission queue"]
-    C -->|"slot and KV memory free"| D["Tokenise prompt"]
-    D --> E["Prefill: all prompt tokens"]
+    B --> D["Tokenise prompt"]
+    D --> C["Admission queue"]
+    C -->|"slot and KV memory free"| E["Prefill: all prompt tokens"]
     E --> F["Sample first token"]
     F --> G["Serialise and flush"]
     G --> H["First content delta at client"]
@@ -185,12 +186,13 @@ Real numbers will be worse once queueing and attention overhead are added; the r
 ## Production patterns
 - **Stable prefix first, cached.** Put the system prompt, tool schemas and shared documents first and
   byte-identical, with timestamps and user fields after them, and run the engine with automatic prefix
-  caching on (vLLM `--enable-prefix-caching`). Monitor prefix-cache hit rate and TTFT per route.
+  caching on (vLLM `--enable-prefix-caching`, already the default in the V1 engine). Monitor prefix-cache hit rate and TTFT per route.
 - **Cap concurrency and fail fast.** Set the per-replica limit (vLLM `--max-num-seqs`) from a load test
   and return a fast 429 with `Retry-After` beyond it. Monitor the engine's waiting-queue length, which
   vLLM exports as `vllm:num_requests_waiting`.
 - **Chunked prefill for mixed traffic.** When long prompts share a replica with live streams, enable
-  chunked prefill and tune the per-step token budget (`--max-num-batched-tokens`). Monitor p99
+  chunked prefill (vLLM `--enable-chunked-prefill`, always on in V1) and tune the per-step token
+  budget (`--max-num-batched-tokens`): smaller protects streams, larger favours TTFT. Monitor p99
   inter-token latency for running streams and TTFT for the longest prompt bucket.
 - **Bucketed TTFT SLOs.** Alert on TTFT p95 per prompt-length bucket (for example under 1k, 1k-8k,
   over 8k tokens) and per concurrency band, so you know whether a breach is prompt size or capacity.
@@ -217,19 +219,21 @@ Real numbers will be worse once queueing and attention overhead are added; the r
 
 ## Pitfalls
 - **Measuring to the first SSE frame.** Symptom: a TTFT that looks great and does not move when prompt
-  length triples. Fix: stop at the first content token.
+  length triples. Fix: stop the clock at the first non-empty content delta.
 - **Reporting mean TTFT.** Symptom: a green dashboard while users complain, because queueing shows up
-  only in p95 and p99.
+  only in p95 and p99. Fix: report p50, p95 and p99 per prompt-length bucket.
 - **Blaming the model when it is queueing.** The tell: TTFT correlates with concurrency, not with
-  prompt length, and drops at night.
+  prompt length, and drops at night. Fix: cap concurrency and scale on queue depth.
 - **Load-testing with short prompts, shipping long contexts.** Symptom: a product that "got slow when
-  we added RAG" with no change in the serving stack.
+  we added RAG" with no change in the serving stack. Fix: load-test with the production prompt-length
+  distribution.
 - **Ignoring hidden reasoning tokens.** TTFT is fine but the user sees a blank screen for ten seconds,
   so measure time to first visible token separately.
 - **A new HTTPS connection per request from a distant region.** Symptom: a TTFT floor of a few hundred
   milliseconds even for tiny prompts, which disappears with a reused client.
 - **Counting cold starts inside TTFT.** Model load on a fresh replica or serverless GPU wake-up shows
-  up as a p99 dominated by a handful of 30-second outliers after each scale-out.
+  up as a p99 dominated by a handful of 30-second outliers after each scale-out. Fix: tag cold-start
+  requests and track them separately, and keep warm capacity ahead of scale-out.
 
 ## When to use
 - **Set a target per surface before launch.** A chat UI usually aims for well under a second at p95,

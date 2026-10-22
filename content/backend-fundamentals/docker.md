@@ -219,7 +219,7 @@ diagnosis.
 |---|---|---|---|
 | 0 | none | Clean exit after handling SIGTERM | Nothing to fix |
 | 137 | 9 (SIGKILL) | Memory over `--memory` (OOM killer), or SIGTERM ignored until the grace period ended | Raise the limit above real peak, or add a handler and exec-form `CMD` |
-| 143 | 15 (SIGTERM) | Process died from SIGTERM with default handling | Add a handler that drains before exiting |
+| 143 | 15 (SIGTERM) | Terminated by SIGTERM without draining: default handling in a process that is not PID 1 (for example under `--init`), or a handler that exits 128 + 15 | Add a handler that drains before exiting 0 |
 | 1 | none | Application error | Read `docker logs` for the traceback |
 
 - **Telling the two 137 cases apart:** `docker inspect` reports `OOMKilled: true` for memory kills; a stop

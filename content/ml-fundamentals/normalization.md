@@ -5,7 +5,7 @@ name: Normalization (LayerNorm, RMSNorm)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/residual-connections
   - ml-fundamentals/warmup
@@ -42,8 +42,8 @@ placement decides training stability.
 - **LayerNorm (2016) normalizes per token, across features.** Each token uses only its own `d_model`
   numbers, so the result is identical at batch size 1 and 1,024, in training and inference, and
   independent of padding.
-- **The function is not optional.** Careful init plus a low learning rate trains shallow transformers but
-  does not scale; norm-free attempts use substitutes (zero-initialized scalar gates per branch, bounded
+- **The function is not optional, even if the layer is.** Careful init plus a low learning rate trains
+  shallow transformers but does not scale; norm-free attempts use substitutes (zero-initialized scalar gates per branch, bounded
   element-wise functions) to recover the same stability.
 
 ## How it works

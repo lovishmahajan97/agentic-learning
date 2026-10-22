@@ -89,7 +89,8 @@ at decision time and the trigger for revisiting.
 - **Decision rights are recorded.** The Deciders line says who could accept it.
 - **Two workable models.** Route every significant decision through an architect, or use an advice
   process: anyone may decide after consulting those affected and those with expertise, and the ADR is the
-  evidence that advice was sought. What fails is an unstated rule that surfaces as a veto after merge.
+  evidence that advice was sought. Either works if it is written down; what fails is an unstated rule that
+  surfaces as a veto after merge.
 - **Unchecked decisions decay quietly.** Six months later someone imports the provider SDK directly "just
   for this one feature", and the gateway decision is void without anyone deciding so.
 - **MADR's confirmation section exists for this.** Prefer an automated check, what *Building Evolutionary
@@ -260,19 +261,25 @@ The triggers make the review a checklist instead of a debate. Observed values ar
 
 ## Pitfalls
 - **Writing the ADR after the decision to justify it.** Symptom: one option, no negative consequences, and
-  a context section that reads like a sales pitch.
+  a context section that reads like a sales pitch. Fix: open the ADR as *Proposed* in the pull request
+  while options are still live, and require at least two considered options and one negative consequence.
 - **Editing an accepted ADR when the decision changes.** Symptom: `git blame` shows the decision text
-  rewritten with no superseding record and no explanation of what changed.
+  rewritten with no superseding record and no explanation of what changed. Fix: a code-owner rule on
+  `docs/adr/` and a review norm that only the status line of an accepted record may change.
 - **Recording decisions about trivia.** Symptom: eighty ADRs in a year and no one able to find the five
-  that matter.
+  that matter. Fix: apply the significance test (expensive to reverse, or someone will ask why) and log
+  smaller choices in the PR description instead.
 - **Omitting evidence and assumptions in AI decisions.** Symptom: a team still on a model two generations
-  old because "there is an ADR", with no way to tell whether its reasons still hold.
+  old because "there is an ADR", with no way to tell whether its reasons still hold. Fix: an evidence
+  section with eval version, scores, cost and latency, and every assumption dated.
 - **No revisit trigger.** Same symptom, discovered only when a competitor's cost per conversation is a
-  third of yours.
+  third of yours. Fix: write numeric revisit triggers and wire them to dashboard alerts.
 - **Accepting a decision with no confirmation mechanism.** Symptom: code contradicting an accepted ADR (a
-  direct provider call, a second vector store) discovered months later during an incident.
+  direct provider call, a second vector store) discovered months later during an incident. Fix: a
+  confirmation section backed by an automated check (import rule, CI test, policy-as-code).
 - **Storing ADRs in a wiki away from the code.** Symptom: nobody updates status, and engineers learn about
-  a decision from the code rather than the record.
+  a decision from the code rather than the record. Fix: keep them in `docs/adr/` in the repository and
+  publish a generated index for non-engineers.
 
 ## When to use
 - **Write one whenever a choice shapes structure, cost, risk or data flow** and would be expensive to
@@ -319,7 +326,8 @@ the cost achieves parity", which would have made this review routine rather than
 - **Yes:** anything expensive to reverse or likely to be questioned: vector store, tenancy model, gateway,
   retrieval strategy, model tier per workload, eval release gate, residency approach.
 - **No:** cheap, reversible, local choices such as a log formatter.
-- **Calibrate:** an ADR a week means you are logging tasks; three a year means you are missing decisions.
+- **Calibrate:** an ADR a week probably means you are logging tasks; three after a year probably means you
+  are missing decisions.
 
 ### Code in production contradicts an accepted ADR. What happened and what do you change?
 - **Likely cause:** the decision had no confirmation mechanism, so a "just this once" shortcut, such as a

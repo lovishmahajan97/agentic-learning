@@ -5,7 +5,7 @@ name: Regression tests
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -61,8 +61,8 @@ Each case holds:
   state the 30-day window?", not "is this good".
 
 ### Handle nondeterminism explicitly
-- **Temperature 0 is not deterministic.** Batched inference, floating-point ordering and provider
-  changes all move outputs.
+- **Temperature 0 reduces variance but does not remove it.** Batched inference, floating-point ordering
+  and provider changes all still move outputs.
 - **Run each case *k* times** and record a pass rate. For a critical case "pass" means all *k* passed
   (pass^k, the reliability reading of pass@k).
 - **Read flips against noise.** 3 of 5 before and 3 of 5 after is no regression; 5/5 to 2/5 is.

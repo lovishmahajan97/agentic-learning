@@ -290,7 +290,9 @@ print("unfiltered:", len(find_leaks(unfiltered, tenants, markers, qs)), "leaks")
   required tenant parameter in the retrieval client, and no direct SDK calls.
 - **Reading through views or `SECURITY DEFINER` functions owned by a superuser or a `BYPASSRLS` role.**
   Symptom: a reporting view returns every tenant's rows although the base table has a policy, because a
-  view checks policies as its owner unless created with `security_invoker` (PostgreSQL 15+).
+  view checks policies as its owner unless created with `security_invoker` (PostgreSQL 15+). Fix: create
+  views `WITH (security_invoker = true)` and own views and definer functions by a role without
+  `BYPASSRLS`.
 - **Assuming RLS hides everything.** Unique and foreign-key checks bypass row security, so "this email is
   already registered" on a globally unique column tells tenant A a value exists in tenant B. Symptom: an
   enumeration finding in a pen test. Fix: scope unique constraints to `(tenant_id, …)`.

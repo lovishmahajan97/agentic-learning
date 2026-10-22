@@ -5,7 +5,7 @@ name: CPU offloading
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/gpu-memory-optimization
   - serving-inference/kv-cache-paging-and-eviction
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-CPU offloading keeps some weights or KV cache in host RAM or NVMe, trading GPU memory for PCIe bandwidth
-roughly 50–100× slower. Decode touches every weight per token, so it suits fitting, offline throughput
-and parking idle KV cache, not low-latency serving.
+CPU offloading keeps weights or KV cache in host RAM or NVMe, behind PCIe 50–100× slower than HBM.
+Decode reads every weight per token, so offloaded weights wreck latency unless the share is tiny or
+batches huge; it suits fitting, offline jobs, idle KV.
 
 ## Why it exists
 - **The model does not fit.** A 70B model is about 140 GB in bf16 and about 40 GB at 4-bit, and the GPU on
@@ -211,7 +211,8 @@ print("fully resident on GPU:", set(placement.values()))
   VRAM is nearly full with your target context, then back off one or two layers for headroom. Monitor
   tokens/s and VRAM at the longest context you allow.
 - **Park MoE experts in host RAM.** For a large MoE model on one GPU, use llama.cpp's tensor-override
-  option (`--override-tensor`) to keep expert FFN tensors on CPU and everything else on GPU. Monitor
+  option (`--override-tensor`, for example a pattern matching the `ffn_.*_exps` tensors set to CPU) to
+  keep expert FFN tensors on CPU and everything else on GPU. Monitor
   tokens/s as concurrency rises, since batching erodes the win.
 - **Use pinned buffers and side streams for custom streaming.** Allocate host buffers with
   `pin_memory=True`, copy with `non_blocking=True` on a separate CUDA stream, and prefetch layer i+1.
@@ -233,13 +234,14 @@ print("fully resident on GPU:", set(placement.values()))
 ## Pitfalls
 - **`device_map="auto"` silently placing layers on CPU** when the GPU is slightly too small. Symptom: a
   model that "works" at one or two tokens per second with the GPU at 5% utilization and host RAM full.
+  Fix: set `max_memory` explicitly and fail the load if any module is off the GPU.
 - **Streaming from pageable instead of pinned memory.** It halves effective bandwidth and adds CPU copy
-  overhead, visible as transfer time far above the PCIe spec.
+  overhead, visible as transfer time far above the PCIe spec. Fix: allocate host buffers pinned.
 - **Swap space too small for the long-context tail.** Depending on the engine, preemptions then fail
   outright or fall back to recomputation. Symptom: aborted requests, or a throughput cliff with
   prefill-heavy GPU traces, when concurrency rises.
 - **Benchmarking on a Gen5 x16 workstation** and deploying to a cloud instance whose GPU sits on a shared
-  or narrower link: identical settings, half the speed.
+  or narrower link: identical settings, half the speed. Fix: benchmark on the target instance type.
 - **Treating offloading as an alternative to quantization.** Quantizing from fp16 to 4-bit removes 75% of
   the bytes with modest quality cost; offloading 75% of the bytes multiplies latency by tens.
 

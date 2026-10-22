@@ -5,7 +5,7 @@ name: Metamorphic testing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - evals/property-based-testing
   - evals/regression-tests
@@ -215,7 +215,8 @@ print(swap_violation_rate(longer_wins, pairs))   # 0.0: symmetric (verbosity bia
 - **Order-swapped pairwise judging.** Run every pairwise judgment in both orders and count a verdict that
   does not swap as a tie. Monitor the swap-violation rate as the judge's position-bias metric.
 - **Compute the base output once.** Cache *f(x)* per question and reuse it across relations, paying one
-  extra call per relation plus one for identity. Monitor total calls per run against the budget.
+  extra call per relation (identity included) instead of two, as the example above does. Monitor total
+  calls per run against the budget.
 - **Triage queue into regressions.** Send violated pairs to a reviewer or correctness judge; promote the
   wrong side to a labelled regression case. Monitor the queue size and promotion rate.
 - **Customer-sourced transforms.** Build paraphrase and template transforms from real phrasing variants

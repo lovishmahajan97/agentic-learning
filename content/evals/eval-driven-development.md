@@ -5,7 +5,7 @@ name: Eval-driven development
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -179,6 +179,9 @@ def test_every_slice_above_floor():
 
 - **Baseline update:** when the gate passes and the change is accepted, the new per-item scores are
   written to `baseline_v7.json`, so the next change is compared against what actually shipped.
+- **Same items on both sides:** `test_mean_did_not_drop` averages the baseline over its own ids, so after
+  adding items (like the six above) compare means over the shared ids, or re-baseline first; otherwise
+  the gate measures the new items' difficulty, not the change.
 - **Sizing `TOLERANCE`:** re-run the unchanged system a handful of times and look at the spread of the
   mean. Rough guide below; a 0.03 band can still trip on pure noise now and then, and a larger set or a
   paired per-item test narrows it.
@@ -305,11 +308,14 @@ latency or benign refusals exceed budget, or if the judge cannot yet be trusted 
 - **Two differences:** the checks are probabilistic and graded with thresholds and *k* samples, and the
   suite grows from production traces and error analysis, not from the specification alone.
 
-### Your CI eval gate fails every third run with no code change. What do you do?
-- **Diagnose noise:** re-run the unchanged system several times and measure the spread of the mean.
-- **Fix the gate:** run *k* samples per item, compare against the last accepted baseline with a tolerance
-  band of roughly 2-3 standard deviations, and list per-item regressions.
-- **Do not** lower the bar or allow re-runs until green, because that trains the team to ignore the gate.
+### The team ships prompt changes daily. How do you structure eval gates so they do not slow it down?
+- **Tier by cost:** deterministic graders on every commit, a judge-graded smoke subset per pull request,
+  the full set nightly, human review or an online A/B before release, because a gate that takes an
+  hour gets skipped.
+- **Make it trustworthy:** *k* samples per item, a tolerance band sized from repeated baseline runs
+  (roughly 2-3 standard deviations), per-slice floors and a list of regressed items, so it does not flake.
+- **Promote judges carefully:** a judge blocks merges only after its agreement with human labels is
+  measured; until then it informs review.
 
 ### When would you not write evals before building?
 - **A one-day throwaway spike** whose purpose is to learn what the task even is; there is no stable

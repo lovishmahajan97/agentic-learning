@@ -156,7 +156,7 @@ Four positives and six negatives give 24 positive–negative pairs.
   the confusion-matrix sweep behind the curve.
 - **Then two datasets with identical separation** (unit-variance Gaussians two standard deviations apart,
   theoretical AUC Φ(√2) ≈ 0.92) at prevalences of 50% and 1%: ROC-AUC barely moves while average precision
-  collapses.
+  collapses (one run: ROC-AUC 0.921 and 0.914, average precision 0.92 and 0.26).
 
 ```python
 import numpy as np
@@ -250,7 +250,8 @@ that fits the review budget.
   `roc_auc_score` and `average_precision_score`, and gate promotion on a paired bootstrap interval of the
   difference excluding zero. Monitor both on a labelled production sample each refresh.
 - **Ship on TPR at the FPR budget.** When a false-block budget exists, compare candidates on TPR at that FPR
-  (read off `roc_curve`) or partial AUC; `roc_auc_score` accepts `max_fpr` for a standardized partial AUC.
+  (read off `roc_curve`) or partial AUC; for binary problems `roc_auc_score` accepts `max_fpr` and returns
+  a standardized (McClish-corrected) partial AUC, where 0.5 still means random.
   Monitor the realised false-block rate on legitimate traffic.
 - **Translate to daily volume before launch.** Convert the chosen (TPR, FPR) point to alerts per day at
   production prevalence and agree it with the team working the queue. Monitor alert volume; a jump with no
@@ -275,17 +276,17 @@ that fits the review budget.
 
 ## Pitfalls
 - **Reading AUC as accuracy or as "the probability a flag is right".** Symptom: stakeholders expecting 90% of
-  alerts to be true because the AUC was 0.9.
+  alerts to be true because the AUC was 0.9. Fix: quote precision and alerts per day at the threshold.
 - **Celebrating 0.98 AUC on 0.1%-prevalence data.** Symptom: a review queue that is 95% false alarms once the
-  threshold is low enough to catch most positives.
+  threshold is low enough to catch most positives. Fix: read the PR curve at production prevalence.
 - **Judging temperature scaling by AUC.** Symptom: "calibration did nothing", because AUC is invariant to
-  monotone maps by construction.
+  monotone maps by construction. Fix: judge it by ECE or Brier.
 - **Passing hard 0/1 predictions instead of scores.** Symptom: a two-point curve whose AUC equals
-  (TPR + TNR)/2, so every model looks similar and worse than it is.
+  (TPR + TNR)/2, so every model looks similar and worse than it is. Fix: pass `predict_proba` scores.
 - **Macro one-vs-rest AUC on a heavily imbalanced multi-class problem.** Symptom: a class with three test
-  examples swinging the headline number between runs.
+  examples swinging the headline number between runs. Fix: report per-class AUC with support.
 - **Treating a 0.003 AUC gain as progress without an interval.** Symptom: the gain reverses on the next data
-  refresh.
+  refresh. Fix: a paired bootstrap or DeLong's test.
 
 ## When to use
 - **Use when** choosing between scorers, tracking whether a retrained model still ranks as well, or comparing

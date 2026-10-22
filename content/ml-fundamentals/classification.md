@@ -5,7 +5,7 @@ name: Classification
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/regression
   - ml-fundamentals/loss-functions
@@ -117,7 +117,8 @@ Routers, guardrails, intent detectors and LLM-as-judge pass/fail checks are all 
 the same rigour: a held-out set, a confusion matrix, and a threshold chosen from costs.
 
 ## Diagram
-Scoring and deciding are separate stages; the threshold is where business cost enters.
+Scoring and deciding are separate stages; the threshold is where business cost enters. Sigmoid or softmax
+outputs are not calibrated automatically, so check calibration before the decision rule uses them.
 
 ```mermaid
 flowchart TD
@@ -126,7 +127,7 @@ flowchart TD
     Z --> SH{"Label shape?"}
     SH -->|"binary or multilabel"| SG["Sigmoid per logit"]
     SH -->|"exactly one class"| SM["Softmax over classes"]
-    SG --> P["Calibrated probabilities"]
+    SG --> P["Probabilities, calibration checked"]
     SM --> P
     P --> D{"Decision rule"}
     C["Cost of FP vs FN"] -->|"sets threshold"| D

@@ -5,7 +5,7 @@ name: Speculative decoding
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - model-internals/kv-cache
   - model-internals/sampling-strategies
@@ -243,15 +243,19 @@ print(f"alpha={alpha:.2f} predicted={(1 - alpha**(gamma + 1)) / (1 - alpha):.2f}
 
 ## Pitfalls
 - **Enabling it on a heavily batched server.** Throughput falls: verification tokens compete for compute
-  that was no longer idle, so per-GPU tokens/second drops even as a lone request speeds up.
+  that was no longer idle, so per-GPU tokens/second drops even as a lone request speeds up. Fix: enable it
+  only on low-concurrency pools, measured at real batch size.
 - **A draft model with a different tokenizer.** Symptom: near-zero acceptance or outright errors, because
-  draft token ids do not mean the same thing to the target.
+  draft token ids do not mean the same thing to the target. Fix: use a drafter from the same family with
+  the identical tokenizer.
 - **Benchmarking on greedy code completion only.** Assuming the speedup holds for creative writing at
-  temperature 1; acceptance falls with entropy and the gain shrinks or inverts.
+  temperature 1; acceptance falls with entropy and the gain shrinks or inverts. Fix: measure acceptance
+  per route at each route's real sampling settings.
 - **Forgetting to roll back rejected KV entries.** Symptom: corrupted continuations that reference text
-  the model never emitted.
+  the model never emitted. Fix: truncate both caches to the last accepted position every cycle.
 - **Treating a reported speedup as a property of the method.** It belongs to the draft–target pair and the
-  workload; the same engine setting can help one customer and hurt another.
+  workload; the same engine setting can help one customer and hurt another. Fix: benchmark on the
+  customer's own prompts before promising a number.
 
 ## When to use
 - **Use when** per-request latency (time per output token) matters more than aggregate throughput:

@@ -5,7 +5,7 @@ name: FlashAttention
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - model-internals/self-attention
   - model-internals/multi-head-attention
@@ -143,13 +143,13 @@ rescaled each time, and only the final output goes back to HBM.
 ```mermaid
 flowchart TD
     Q["Load query block Q_i into SRAM"] --> INIT["Init running max m, sum l, output O"]
-    INIT --> LOAD["Load next K_j, V_j tile"]
-    LOAD --> SKIP{"Tile fully in the future?"}
-    SKIP -->|"yes, causal skip"| MORE
-    SKIP -->|"no"| S["Score tile Q_i times K_j in SRAM"]
+    INIT --> SKIP{"Next K/V tile fully in the future?"}
+    SKIP -->|"yes, causal skip, never loaded"| MORE
+    SKIP -->|"no"| LOAD["Load K_j, V_j tile into SRAM"]
+    LOAD --> S["Score tile Q_i times K_j in SRAM"]
     S --> UP["Rescale O and l by new max"]
     UP --> MORE{"More K/V tiles?"}
-    MORE -->|"yes"| LOAD
+    MORE -->|"yes"| SKIP
     MORE -->|"no"| OUT["Write O divided by l to HBM"]
     OUT --> LSE["Save one log-sum-exp per row"]
 ```
@@ -274,11 +274,14 @@ tracks IO, not FLOPs.
   dimension or an explicit dense mask. Symptom: memory that scales with n² and no speedup. Force the
   backend with `sdpa_kernel` during testing so it fails loudly.
 - **Passing an explicit causal mask tensor instead of `is_causal=True`.** Symptom: the same n² memory
-  curve, because the kernel cannot use the fast path.
+  curve, because the kernel cannot use the fast path. Fix: pass `is_causal=True` (or the kernel's
+  sliding-window parameter) and drop the mask tensor.
 - **Comparing flash and eager outputs with fp32-level tolerances.** Symptom: spurious "mismatch" alarms
-  caused by the different summation order under fp16 rounding.
+  caused by the different summation order under fp16 rounding. Fix: compare with fp16-level tolerances
+  such as `atol=2e-3`, or against an fp32 reference.
 - **Leaving `output_attentions=True` or an eager attention implementation in a production config.**
-  Symptom: throughput that collapses and OOMs at lengths the model handled in testing.
+  Symptom: throughput that collapses and OOMs at lengths the model handled in testing. Fix: pin
+  `attn_implementation` in the serving config and assert it at startup.
 - **Padding batches to the longest sequence and running flash on dense tensors.** Symptom: GPU time that
   scales with the longest prompt rather than the total number of real tokens. Use variable-length
   (packed) attention or a continuous-batching engine.

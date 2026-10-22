@@ -5,7 +5,7 @@ name: Adversarial evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - evals/red-teaming
   - prompting/prompt-injection
@@ -48,15 +48,13 @@ release next to over-refusal, because average-case evals miss the worst case.
 ### Start from a threat model
 Decide who attacks, what they want and through which channel, because the suite is organised by that.
 
-| Channels | Goals |
-|---|---|
-| Direct user input | Harmful content |
-| Indirect input via retrieved documents, tool results, web pages, emails, calendar entries (prompt injection) | Data exfiltration |
-| Multi-turn setups that build context slowly | Unauthorised actions by an agent |
-| Multimodal carriers, such as text inside an image | Business-rule violations (discounts, refunds, access) |
-| | Brand damage, resource exhaustion |
-
-Each (channel, goal) cell gets its own attack set and its own number.
+- **Channels:** direct user input; indirect input through retrieved documents, tool results, web pages,
+  emails or calendar entries (prompt injection); multi-turn setups that build context slowly; multimodal
+  carriers such as text inside an image.
+- **Goals:** harmful content, data exfiltration, unauthorised actions by an agent, business-rule
+  violations (discounts, refunds, access), brand damage, and resource exhaustion.
+- **Cross them into cells.** Each (channel, goal) cell gets its own attack set and its own number,
+  because a clean score in one cell says nothing about its neighbours.
 
 ### Four sources of attacks
 1. **Human red-team findings.** Highest quality, lowest volume. Generalise each into a template with

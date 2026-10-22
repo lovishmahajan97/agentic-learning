@@ -5,7 +5,7 @@ name: pass@k
 kind: metric
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - evals/benchmarking
   - evals/eval-harness
@@ -178,6 +178,10 @@ for k in (1, 2, 4, 8):
 | "Succeeds within 4 tries" | pass@4 ≈ 99% | only if retries are free, safe and someone checks each one |
 | "Works every day for a 4-day week" | pass^4 ≈ 10% | the reliability promise; far lower |
 
+- **Why 0.102 and not 0.6^4 ≈ 0.13:** C(c, k) / C(n, k) draws k of the 20 observed runs without
+  replacement, which makes it unbiased for p^k. Plugging the observed rate into p̂^k is biased upward,
+  because x^k is convex.
+
 ### Worked scenario: why concavity matters
 Two problems, k = 5. Problem 1 has p = 0.9; problem 2 has p = 0.
 
@@ -226,7 +230,7 @@ Two problems, k = 5. Problem 1 has p = 0.9; problem 2 has p = 0.
   `inf` or a NaN in the report. Python's exact-integer `math.comb` avoids this, but the product form is
   simpler and vectorises.
 - **Comparing pass@1 across protocols.** Symptom: a model "winning" by a margin that vanishes when both
-  use the same temperature and sample count.
+  use the same temperature and sample count. Fix: re-run both models under one stamped protocol.
 - **Describing agent reliability with pass@k.** Symptom: pass@5 = 90% on the slide while customers who
   get one attempt see failures most of the time. Fix: report pass@1 and pass^k.
 - **Public benchmark contamination.** Symptom: pass@1 far above what the model achieves on a private set

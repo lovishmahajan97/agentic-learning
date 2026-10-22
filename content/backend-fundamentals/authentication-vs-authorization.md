@@ -5,7 +5,7 @@ name: Authentication vs authorization
 kind: concept
 difficulty: intro
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/oauth-2-0-oidc
   - backend-fundamentals/rbac
@@ -25,7 +25,7 @@ sources:
 ## TL;DR
 Authentication verifies *who* is calling; authorization decides whether that principal may do *this
 action* on *this resource*. 401 means "I do not know who you are", 403 means "I know, and no". Most
-access-control bugs assume the first implies the second.
+serious access-control bugs assume the first implies the second.
 
 ## Why it exists
 - **The second user forces it.** With one user, "logged in" and "allowed" are the same. With two, a request
@@ -134,8 +134,8 @@ form is an ownership check, `resource.owner_id == principal.user_id`, and its ab
   to stay within the user's permissions, the model can be talked into fetching what the user may not see.
 - **Fix:** carry the user's identity into every tool call (token exchange, or passing the principal to the
   tool) and let the tool's authorization layer decide, which also makes retrieval permission-aware.
-- **Approval gates** for consequential actions are authorization decisions made at a different time, by a
-  different decider.
+- **Human approval gates** for consequential actions are authorization decisions made at a different time,
+  by a different decider.
 
 ## Diagram
 One request, two separate gates: the middleware turns a token into a principal or returns 401, and only
@@ -269,8 +269,9 @@ The `DELETE /documents/{doc_id}` endpoint above, called by different principals.
   endpoint returns 404 or 403 for the other tenant's ids, including list and search endpoints. Monitor 403
   and 404 spikes per principal in production as an enumeration signal.
 - **Database backstop for tenancy.** Set the tenant per transaction (for example `SET LOCAL app.tenant_id`)
-  and enforce PostgreSQL row-level security policies on tenant tables, so a forgotten `WHERE` returns
-  nothing. Monitor policy-denied queries in tests and logs.
+  and enforce PostgreSQL row-level security policies on tenant tables (with `FORCE ROW LEVEL SECURITY` if
+  the app connects as the table owner), so a forgotten `WHERE` returns nothing. Reads are filtered
+  silently, so cover it with a test that queries as another tenant and expects zero rows.
 - **Short tokens, fast deprovisioning.** Keep access tokens to minutes, rotate refresh tokens on use, and
   revoke sessions when the identity provider deprovisions a user (for example via SCIM). Monitor active
   sessions or tokens belonging to disabled users; the target is zero.

@@ -5,7 +5,7 @@ name: Worker threads for CPU-bound tasks
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/bullmq-and-durable-jobs
@@ -42,7 +42,7 @@ or share large data.
 - **`new Worker(file, { workerData })`** starts an OS thread with its own V8 isolate and its own event loop.
 - **Nothing is shared by default:** separate heap and global scope, so no variables, module instances or open
   sockets are shared with the parent.
-- **Why:** V8's heap is not thread-safe. Isolating heaps is *because* of that, it is what makes parallel
+- **Why:** heaps are isolated *because* V8's heap is not thread-safe. Isolation is what makes parallel
   JavaScript possible at all, and it is why you cannot "just call a function on another thread".
 - **Cost:** each worker has its own heap and copies of loaded modules, and pays startup time to load and
   compile its script, which is why workers are pooled and reused rather than created per request.
@@ -111,7 +111,8 @@ or share large data.
 - **Cap them:** `new Worker(file, { resourceLimits: { maxOldGenerationSizeMb } })` makes one runaway document
   parse kill that worker (an `'error'` the pool can handle) instead of pushing the process into the
   container's out-of-memory killer.
-- **Budget:** container memory = main heap + N × worker heap + shared buffers.
+- **Budget:** container memory = main heap + N × worker heap + shared buffers. The cap covers the old
+  generation only (young generation, code and native buffers come on top), so leave headroom.
 
 ### Workers versus `cluster` and child processes
 | Option | What it scales | Isolation | Cost |
@@ -155,6 +156,9 @@ of cloning it.
 The embedding matrix lives in a `SharedArrayBuffer`: passing an ordinary `Float32Array` as
 `workerData` would structured-clone the whole ~1.2 GB matrix into every worker. The worker file and the pool
 live in separate modules; this listing shows both with the worker guarded by `isMainThread`.
+
+The idle workers keep the process alive after the result prints, so a real pool needs a `close()` that
+calls `worker.terminate()` on shutdown.
 
 ```ts
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
@@ -234,7 +238,7 @@ Illustrative numbers for an ingestion service that also answers chat.
 | Item | Choice | Memory |
 |---|---|---|
 | Main thread heap (HTTP, streaming) | 1 thread | ~0.5 GB |
-| Worker pool | 4 CPUs − 1 = 3 workers, `maxOldGenerationSizeMb: 512` each | ≤ 1.5 GB |
+| Worker pool | 4 CPUs − 1 = 3 workers, `maxOldGenerationSizeMb: 512` each | ≤ 1.5 GB old generation, plus per-worker overhead |
 | Shared embedding matrix | 200k × 1536 × 4 B in a `SharedArrayBuffer` | ~1.2 GB, once |
 | Total budget | main + 3 × worker + shared | ~3.2 GB, leaving headroom under 4 GB |
 | If the pool were sized from 64 host cores | 63 workers | Thrashing, and up to ~32 GB of worker heap allowed |
@@ -275,19 +279,21 @@ Illustrative numbers for an ingestion service that also answers chat.
 
 ## Pitfalls
 - **A new `Worker` per request.** Symptom: latency dominated by worker startup and memory spikes under load,
-  often worse than running the job inline.
+  often worse than running the job inline. Fix: a long-lived pool created at startup.
 - **Large buffers without the transfer list.** Symptom: the main thread stalls on the copy, the very problem
-  the worker was meant to solve.
+  the worker was meant to solve. Fix: `postMessage(job, [buf.buffer])`.
 - **Reading a `TypedArray` after transferring its buffer.** Symptom: zero-length arrays or `TypeError`s about
-  detached buffers far from the `postMessage` call.
+  detached buffers far from the `postMessage` call. Fix: copy what you still need first, or use the result.
 - **Workers for I/O-bound steps** like calling the model API. Symptom: no throughput gain plus extra memory and
-  harder debugging.
+  harder debugging. Fix: keep I/O on the main loop.
 - **Forgetting workers have their own globals.** Symptom: missing logs and traces, or a database client
-  initialized twice because the module was loaded again in the worker.
+  initialized twice because the module was loaded again in the worker. Fix: keep worker modules free of
+  side-effecting imports and forward telemetry with `threadId`.
 - **Not handling `'error'` and `'exit'`.** Symptom: a pool that silently shrinks after a worker crashes and
-  eventually hangs with all jobs queued.
+  eventually hangs with all jobs queued. Fix: reject the job and spawn a replacement on both events.
 - **Expecting a timeout or abort to stop a worker mid-computation.** Symptom: the request returns an error
-  while the worker's CPU stays at 100% and its pool slot stays busy until the job finishes.
+  while the worker's CPU stays at 100% and its pool slot stays busy until the job finishes. Fix: a shared
+  cancel flag, or `terminate()`.
 
 ## When to use
 - **Use when** a code path does sustained synchronous computation (more than a few tens of milliseconds,

@@ -5,7 +5,7 @@ name: State machines
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - agents/agent-loop
   - agents/workflows-vs-agents
@@ -37,8 +37,8 @@ tests pass" hold, and (state, data) can be checkpointed and resumed.
   side effects; restarting from the last message assumes the model can infer its position from a log.
 - **It breaks observability too.** You cannot plot "time spent in verification" or "failure rate by
   phase" if phases do not exist.
-- **The middle ground.** A hand-coded pipeline enforces everything but cannot branch on judgement; a free
-  loop branches on anything but enforces nothing. A state machine fixes the *set* of next steps in code
+- **The middle ground.** A hand-coded pipeline enforces everything but cannot branch on judgement, so it
+  only solves cases its author foresaw; a free loop branches on anything but enforces nothing. A state machine fixes the *set* of next steps in code
   and lets the model make the *choice*, the move protocol and UI designers made long ago because states
   can be checked, tested, drawn and resumed.
 
@@ -129,8 +129,9 @@ stateDiagram-v2
     APPLY --> VERIFY: run_tests
     VERIFY --> APPLY: retry
     VERIFY --> DONE: finish if tests_passed
-    VERIFY --> FAILED: attempts reach 3
-    APPLY --> FAILED: too many rejections
+    VERIFY --> FAILED: third retry or rejection budget spent
+    APPLY --> FAILED: rejection budget spent
+    INVESTIGATE --> FAILED: rejection budget spent
     DONE --> [*]
     FAILED --> [*]
 ```
@@ -146,6 +147,9 @@ stateDiagram-v2
 - **An edit clears `tests_passed`**, so a stale pass cannot satisfy the guard.
 - **Bounded failure:** the third retry and repeated illegal calls both end in FAILED. The rejection count
   is checkpointed with the state, so a crash cannot reset the budget.
+- **Simplification to know about:** the idempotency key is per step, but on resume the model is asked
+  again and may pick a different call under the same key. A production version checkpoints the pending
+  call before executing it and replays that exact call on resume.
 
 ```python
 from enum import Enum
@@ -341,6 +345,8 @@ NEEDS_HUMAN state for approvals.
   had, not by re-reading the transcript.
 - **Re-issue the in-flight call with the same idempotency key** (derived from run and step), so if the
   edit already landed the tool returns the earlier result instead of applying twice.
+- **Replay the recorded call, not a fresh model decision:** persist the intended call before executing
+  it, because a re-prompted model may choose a different call that would then reuse the old key.
 - **Validate the data schema version** first, migrating if the deploy changed it.
 
 ### When would you not use a state machine for an agent?

@@ -5,7 +5,7 @@ name: Rubrics
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - evals/llm-as-a-judge
   - evals/judge-calibration-and-bias
@@ -231,8 +231,8 @@ print(aggregate(graded, gates={"no_fabrication"}))
   JSON file, tag a version, and write that version into every eval result row. Monitor that comparisons
   only ever join results with the same rubric version.
 - **Per-criterion dashboards, gate rate separate.** Chart each criterion's pass rate over its applicable
-  items plus the gate-failure rate, rather than one blended score. Alert when a gate rate moves at all or
-  a criterion drops beyond its bootstrap interval.
+  items plus the gate-failure rate, rather than one blended score. Alert when a gate rate rises above its
+  baseline or a criterion drops beyond its bootstrap interval.
 - **One judge call per high-stakes criterion.** Run gates and domain-correctness checks as separate,
   parallel judge calls with structured PASS/FAIL output; batch low-stakes format checks into one call.
   Monitor judge–human agreement per criterion after any batching change.

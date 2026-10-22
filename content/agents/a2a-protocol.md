@@ -5,7 +5,7 @@ name: A2A protocol (Agent2Agent)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -278,15 +278,18 @@ belong on push.
   ambiguous requests when it was asking a reasonable question. Fix: surface the question and reply on the
   same task id.
 - **Trusting the Agent Card without verifying server identity and TLS.** Symptom: an agent happily hands
-  customer data to whoever answers at that hostname.
+  customer data to whoever answers at that hostname. Fix: fetch cards only over verified HTTPS from an
+  allowlisted domain and authenticate the server before sending data.
 - **Losing the task id or `contextId` between turns.** Symptom: the remote agent starts from scratch every
-  message, with no memory of earlier clarifications.
+  message, with no memory of earlier clarifications. Fix: persist both and send them on every follow-up.
 - **Assuming field names are stable across protocol versions.** Symptom: clients break when a server
   upgrades, because part type keys or well-known paths moved. Fix: read `protocolVersion` first.
 - **Feeding a peer's artifacts into your model as trusted text.** Symptom: your agent takes actions that
-  trace back to instructions inside a remote agent's reply.
+  trace back to instructions inside a remote agent's reply. Fix: pass artifacts as delimited data and
+  confirm side effects that trace back to them.
 - **Accepting push notifications without verifying the sender.** Symptom: task "completions" in your logs
-  that `tasks/get` on the real server does not confirm.
+  that `tasks/get` on the real server does not confirm. Fix: check the registration token or signature,
+  then re-read the task with `tasks/get`.
 
 ## When to use
 - **Use A2A when** the other side reasons rather than merely executes: it may take long, ask back, return

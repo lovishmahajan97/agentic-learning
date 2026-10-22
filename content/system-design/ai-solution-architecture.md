@@ -227,10 +227,9 @@ print(f"mid ${mid:.5f}  cheap ${cheap:.5f} per successful task")
   friction. The flip point is the cost of a wrong action: low-stakes drafting needs far fewer gates than
   money movement.
 - **Full tracing vs data exposure.** Tracing prompts and outputs makes evaluation possible but creates a
-  store of sensitive data; retention, redaction and access policies are designed with it, not after.
-- **Where tracing flips.** The flip is data class: for regulated data, keep redacted traces by default
-  and a small sampled full-fidelity set under tighter access, accepting slower debugging for a smaller
-  breach surface.
+  store of sensitive data, so retention, redaction and access policies are designed with it, not after.
+  The flip is data class: for regulated data, keep redacted traces by default and a small sampled
+  full-fidelity set under tighter access, accepting slower debugging for a smaller breach surface.
 
 ## Pitfalls
 - **Prompt-as-architecture.** A 4,000-token system prompt holding business rules, data and formatting.

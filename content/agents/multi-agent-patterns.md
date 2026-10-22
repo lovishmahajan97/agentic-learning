@@ -5,7 +5,7 @@ name: Multi-agent patterns (orchestrator-worker, handoffs)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - agents/task-decomposition
   - agents/planning
@@ -294,9 +294,11 @@ The `gaps` list is what drives a follow-up worker or an honest "could not verify
 - **Handing off the entire history including tool noise.** Symptom: specialists answer the triage agent's
   internal notes rather than the user. Fix: filter at the boundary.
 - **Treating worker output as trusted.** Symptom: an orchestrator following instructions that arrived
-  inside a worker's web search result.
+  inside a worker's web search result. Fix: wrap results as delimited data and validate them against the
+  output schema.
 - **Reaching for multi-agent first.** Symptom: a fragile system whose single-agent baseline was never
-  measured and would have sufficed.
+  measured and would have sufficed. Fix: build and measure the single agent first, then split only where
+  it fails.
 
 ## When to use
 - **Use orchestrator-worker when** a task decomposes into parallel, mostly independent pieces whose value
@@ -340,11 +342,13 @@ rate and transfer loops before and after.
 - **And the value justifies the bill:** published figures put a multi-agent research system around 15x a
   chat turn's tokens versus about 4x for a single agent. Otherwise one well-built agent is the default.
 
-### Orchestrator-worker or handoffs for a customer-support assistant? Why?
-- **Handoffs,** because the conversation is user-facing and sequential, and a specialist that sees the
-  dialogue answers better than one fed a summary.
-- **Orchestrator-worker** fits when one owner must fan out parallel research and synthesise; it can sit
-  behind a specialist for a single deep question.
+### When do you call a specialist as a tool rather than hand off to it?
+- **Agent-as-tool when the caller should keep the next user-facing turn:** the specialist works in its
+  own context, returns a structured result, and the caller continues; several can run in parallel.
+- **Handoff when the specialist must talk to the user directly,** because it answers better seeing the
+  dialogue than a summary. The price is no parallelism and a history-filtering decision.
+- **Watch the failure modes:** agent-as-tool loses detail in synthesis; handoffs lose context or
+  ping-pong.
 
 ### Two agents keep transferring a conversation back and forth. How do you debug and prevent it?
 - **Read the trace:** check each agent's prompt and tool descriptions for overlapping ownership, and what

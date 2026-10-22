@@ -5,7 +5,7 @@ name: Rate limiting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/backpressure
   - serving-inference/retry-strategies
@@ -119,6 +119,8 @@ Several replicas share one provider quota, so state must be shared or the quota 
 - **A global bucket** from the provider quota minus a safety margin: running at around 80% leaves room
   for retries and bursts.
 - **Priority borrowing:** high-priority traffic borrows from the global bucket before low-priority does.
+- **Refund across layers:** if the tenant bucket admits but the global bucket then rejects, return the
+  tenant's reservation, or the tenant is charged for work that never ran.
 - **More quota:** multiple keys, workspaces or regions multiply quota when a single bucket is not enough.
 
 ## Diagram
@@ -210,6 +212,8 @@ r = redis.Redis()
 reserve = r.register_script(RESERVE)
 
 def try_reserve(key, capacity, rate, cost):
+    if cost > capacity:                    # can never fit: non-retryable error, not an endless Retry-After
+        raise ValueError("request larger than bucket capacity")
     return float(reserve(keys=[key], args=[capacity, rate, cost]))   # 0.0 means admitted
 
 def settle(key, reserved, actual):

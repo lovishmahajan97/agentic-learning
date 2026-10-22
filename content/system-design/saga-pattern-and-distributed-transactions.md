@@ -24,8 +24,8 @@ sources:
 
 ## TL;DR
 A saga replaces one cross-service transaction with local transactions, each paired with a compensating
-action. It gives atomicity and durability but not isolation, so order steps around the irreversible pivot
-and make every step idempotent. An agent calling several tools is a saga.
+action. It gives atomicity and durability but not isolation, so order steps around the irreversible pivot,
+mark in-flight state and make every step idempotent. An agent calling several tools is a saga.
 
 ## Why it exists
 - **No shared transaction across systems.** "Place order" reserves stock in inventory, charges the card
@@ -145,21 +145,26 @@ Countermeasures named in Richardson's treatment:
 
 ## Diagram
 An orchestrated saga: business checks come first, the pivot is gated, failures before the pivot unwind in
-reverse, and failures after it are retried forward.
+reverse (refund, then release), a timeout is reconciled by key before deciding, and failures after the
+pivot are retried forward.
 
 ```mermaid
 flowchart TD
-    S["Start saga, write log"] --> T1["T1: hold seat"]
-    T1 --> T2["T2: fraud check"]
+    T1["T1: hold seat"] --> T2["T2: fraud check"]
     T2 --> T3["T3: charge card"]
     T3 --> G{"Approval gate"}
     G -->|"approved"| P["Pivot: book hotel"]
     P --> R["Retriable: send itinerary"]
-    R -->|"fails"| R
+    R -->|"fails, retry forward"| R
     R --> D["Completed"]
     T2 -->|"declined"| C1["C1: release seat"]
     T3 -->|"declined"| C1
-    T3 -.->|"timeout"| Q["Query participant by key"]
+    T3 -.->|"timeout"| Q["Query payments by key"]
+    Q -.->|"charged"| G
+    Q -.->|"no charge"| C1
+    G -->|"rejected"| C3["C3: refund charge"]
+    P -->|"fails cleanly"| C3
+    C3 --> C1
     C1 --> X["Compensated"]
 ```
 
@@ -266,7 +271,7 @@ The travel saga above, failing at each step in turn.
 |---|---|---|---|
 | Fraud check declines | seat hold | release hold | nothing |
 | Charge declined | seat hold | release hold | a declined payment |
-| Charge times out | seat hold, charge unknown | query payments by `order:charge_card` key, then refund or continue | nothing extra, if reconciled |
+| Charge times out | seat hold, charge unknown | query payments by the `{saga_id}:charge_card` key, then continue if charged, release the hold if not | nothing extra, if reconciled |
 | Hotel API fails cleanly | hold, charge | refund, release hold | a refund on the statement |
 | Itinerary email fails | hold, charge, hotel (pivot) | retry the email forward, never compensate | a delayed email |
 

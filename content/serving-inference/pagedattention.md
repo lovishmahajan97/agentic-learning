@@ -5,7 +5,7 @@ name: PagedAttention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - model-internals/kv-cache
   - serving-inference/kv-cache-memory-estimation
@@ -232,12 +232,13 @@ print(a.table, b.table, "free:", len(pool.free))   # [7, 6, 4] [7, 6, 5] free: 4
 - **Cap context per route.** When long-document chats share a deployment with short Q&A, lower
   `max_model_len` (or route long requests to their own deployment) so a few long chats cannot drain the
   pool. Monitor block usage per route and p95 prompt length.
-- **Design prompts for block sharing.** Turn on prefix caching (`--enable-prefix-caching` in vLLM) and
+- **Design prompts for block sharing.** Turn on prefix caching (`--enable-prefix-caching` in vLLM; the V1
+  engine enables it by default) and
   keep the system prompt and tool definitions byte-identical and first, with dates and user IDs after
   them. Monitor the prefix-cache hit rate and time to first token.
 - **Stretch the pool with an FP8 cache.** When block usage is the bottleneck, set the KV-cache dtype to
   fp8 (`--kv-cache-dtype fp8` in vLLM) and run your eval set before rollout. It roughly doubles tokens
-  of capacity per GPU.
+  of capacity per GPU versus an fp16 cache.
 
 ## Trade-offs
 - **Recovered memory vs kernel speed.** You recover most memory lost to reservation and fragmentation,
@@ -254,12 +255,12 @@ print(a.table, b.table, "free:", len(pool.free))   # [7, 6, 4] [7, 6, 5] free: 4
   request length shrinks.
 
 ## Pitfalls
-- **Reading the gain as "a faster attention kernel".** The kernel is slightly slower; the 2–4× comes from
-  batching more sequences. If your batch is already small, you will not see it.
+- **Reading the gain as "a faster attention kernel".** The kernel is slightly slower; the paper's 2–4×
+  throughput gain comes from batching more sequences. If your batch is already small, you will not see it.
 - **Ignoring preemption metrics.** A pool slightly too small shows up as a throughput cliff and jittery
   latency under load, not as an OOM, because sequences are silently swapped or recomputed.
 - **Expecting prefix caching to share partially identical prompts.** Only whole blocks with identical
-  content and prefix are shared, so a timestamp in the first line of the system prompt defeats it. The
+  content and prefix are shared, so a timestamp in the first line of the system prompt defeats it entirely. The
   symptom is a prefix-cache hit rate near zero for prompts that look identical.
 - **Setting `gpu_memory_utilization` to 0.98 for more blocks.** It then OOMs when another process, a CUDA
   graph or a larger-than-profiled activation peak needs the headroom.
@@ -302,13 +303,14 @@ share a long system prompt, enabling prefix caching recovers blocks too.
 - **Analogy:** like OS paging, logical blocks map through a per-request table to physical blocks anywhere
   in the pool, so contiguity is no longer needed and any free block fits any request.
 
-### Your vLLM deployment shows latency spikes under load but no OOMs. How do you debug it?
-- **Check KV-cache usage and preemption counters first.** Usage pinned near 100% with rising preemptions
-  means the pool is too small for the traffic mix.
-- **Then look at demand.** Compare prompt-length and output-length distributions before and after the
-  spikes; a shift to long documents drains blocks.
-- **Fix by shrinking demand or growing supply:** lower `max_model_len`, cap concurrent sequences, enable
-  an fp8 cache or prefix caching, or add GPUs.
+### How does paging make parallel sampling (n > 1) cheap, and what happens when two samples diverge?
+- **Shared blocks by reference count:** all n samples point their block tables at the same prompt blocks,
+  so the prompt's KV is stored once instead of n times.
+- **Copy-on-write at divergence:** when a sample must write into a block another sample still references
+  (the partially filled tail), the engine copies that block first and decrements the old one's count,
+  like `fork()` in an OS.
+- **Cost:** only the diverging tail blocks are duplicated, so memory grows with generated tokens per
+  sample, not with prompt length times n.
 
 ### When would PagedAttention give you little or no benefit?
 - **Small batches.** The win comes from fitting more sequences; one long request alone on a GPU only pays

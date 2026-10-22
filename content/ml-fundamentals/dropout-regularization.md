@@ -22,8 +22,8 @@ sources:
 
 ## TL;DR
 Regularization makes a model fit training data worse so it generalizes better: weight penalties, injected
-noise (dropout) or early stopping. Use it when the model can memorize, as in small fine-tunes; skip
-dropout for single-epoch pretraining.
+noise (dropout) or early stopping. Use it when the model can memorize, as in small fine-tunes; usually
+skip dropout for single-epoch pretraining.
 
 ## Why it exists
 - **Big networks memorize.** With more parameters than training examples a network can reach zero training
@@ -110,6 +110,8 @@ y = m ⊙ x / (1 − p)
   split: the more checkpoints you pick among, the more optimistic that split's score becomes.
 
 ### Why the data regime decides
+Regularization trades fit for generalization, so it only pays when the model can overfit.
+
 | Regime | Can it memorize? | Regularization |
 |---|---|---|
 | Fine-tune on 5,000 examples for three epochs | yes | dropout and weight decay do real work |
@@ -200,7 +202,8 @@ L2 multiplies by 0.95 each step, so nothing reaches zero. L1 subtracts 0.05 each
 hit exactly zero and stay there, while the large one only loses a fixed 1.0.
 
 ### Worked scenario: reading a fine-tune's curves
-A LoRA fine-tune on 4,000 tickets, eval-mode losses per epoch (illustrative numbers):
+A LoRA fine-tune on 4,000 tickets (illustrative numbers). Train loss is the running average logged during
+training, so dropout is on; val loss is computed in eval mode at the end of each epoch.
 
 | Epoch | Train loss | Val loss | Reading | Action |
 |---|---|---|---|---|
@@ -216,14 +219,17 @@ raise the adapter rank.
   gains) in a group with `weight_decay` 0.0, as in the example above. Monitor the weight-norm curve per
   group, and log the group sizes at startup so a refactor cannot silently merge them.
 - **Early stopping on an eval-mode metric.** In Hugging Face `Trainer`, set `load_best_model_at_end=True`
-  and `metric_for_best_model="eval_loss"`, and add `EarlyStoppingCallback(early_stopping_patience=3)`.
-  Monitor the best step versus the final step; stopping at step 1 usually means a broken split.
+  and `metric_for_best_model="eval_loss"`, and add `EarlyStoppingCallback(early_stopping_patience=3)`;
+  the evaluation and save strategies must match so a checkpoint exists at every evaluation. Monitor the best
+  step versus the final step: a best checkpoint at the very first evaluation means the run overfit or
+  diverged at once, so check the learning rate and train/val duplicates.
 - **Adapter dropout for small fine-tunes.** With PEFT, set `lora_dropout` in `LoraConfig` (values such as
   0.05 or 0.1 are common starting points) and tune it with weight decay on the validation set. Monitor
   the train/val gap per epoch.
 - **Eval-mode guards in serving and tests.** Call `model.eval()` and run under `torch.inference_mode()` in
   every eval and serving path, and add a unit test that two forward passes on the same input are
-  identical. Monitor prediction variance on repeated canary inputs.
+  identical (within a tight tolerance on GPU, where some kernels are non-deterministic). Monitor prediction
+  variance on repeated canary inputs.
 - **Monte Carlo dropout for cheap uncertainty.** When a model has dropout and you need an uncertainty
   signal, switch only the dropout modules back to train mode, run T passes, and use the spread. Monitor
   added latency, which grows roughly with T.
@@ -248,17 +254,18 @@ raise the adapter rank.
 
 ## Pitfalls
 - **Forgetting `model.eval()` before validation or serving.** Dropout stays on. Symptom: noisy,
-  non-reproducible predictions and a validation loss worse than it should be.
+  non-reproducible predictions and a validation loss worse than it should be. Fix: an eval-mode assertion.
 - **Reading train-mode loss as a measure of fit.** Loss computed under dropout is systematically
-  pessimistic, which is why validation loss sometimes looks *lower* than training loss early on.
+  pessimistic, which is why validation loss sometimes looks *lower* than training loss early on. Fix:
+  compare eval-mode losses on both splits.
 - **Passing `weight_decay` to `torch.optim.Adam` and expecting AdamW.** Adam implements it as L2 in the
   gradient, so heavily-updated weights are barely regularized and results differ. Use AdamW.
 - **Decaying LayerNorm gains and biases.** Symptom: a small, persistent accuracy loss that disappears when
   those parameters move to the no-decay group.
 - **Adding dropout to an under-fitting model.** Training and validation loss are both high and close
-  together; more noise only widens the capacity shortfall.
+  together; more noise only widens the capacity shortfall. Fix: lower dropout or add capacity.
 - **Dropout immediately before BatchNorm.** Activation variance differs between train and eval mode, so
-  BatchNorm's running statistics are wrong at inference.
+  BatchNorm's running statistics are wrong at inference. Fix: put dropout after the last BatchNorm layer.
 
 ## When to use
 - **Diagnose first.** Training loss falling while validation loss rises is overfitting, and regularization
@@ -300,12 +307,15 @@ trigger on a leak.
   1−p, so the expected activation equals the un-dropped value.
 - **Why it matters:** at inference you run the full deterministic network and the next layer sees inputs on
   the same scale it trained on, so no test-time weight rescaling is needed.
+- **Contrast:** the original paper left training activations unscaled and multiplied the weights by (1−p) at
+  test time; equivalent in expectation, but it puts a rescaling step into inference code.
 
 ### Your fine-tuned model gives different answers to the same prompt in production. How do you debug it?
 - **First suspect dropout left on:** check that the serving path calls `model.eval()`; noisy,
   non-reproducible outputs with otherwise sane quality are the classic symptom.
-- **Prove it:** run the same input twice with sampling disabled; if logits differ, some module is in train
-  mode. Then rule out sampling settings and non-deterministic kernels.
+- **Prove it:** run the same input twice with sampling disabled (greedy decoding); if logits differ by more
+  than float noise, some module is in train mode. Small differences point instead at non-deterministic
+  kernels or batch-dependent numerics.
 - **Prevent it:** add a determinism unit test and an eval-mode assertion at model load.
 
 ### Why is weight decay with Adam not the same as AdamW, and does it matter?

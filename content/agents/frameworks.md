@@ -5,7 +5,7 @@ name: Frameworks (LangGraph, LangChain, LlamaIndex, Pydantic AI, DSPy)
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -23,9 +23,10 @@ sources:
 ---
 
 ## TL;DR
-Agent frameworks package the plumbing around model calls. LangChain integrates, LangGraph runs typed
-resumable state machines, LlamaIndex handles data and retrieval, Pydantic AI is small and type-first,
-DSPy compiles prompts against a metric. Choose by the plumbing problem you actually have.
+Agent frameworks package the plumbing. LangChain integrates, LangGraph runs typed resumable state
+machines, LlamaIndex handles data and retrieval, Pydantic AI is small and type-first, DSPy compiles
+prompts against a metric. Each trades speed for abstraction you must understand, so choose by your
+plumbing problem.
 
 ## Why it exists
 - **A production agent is mostly not model calls.** It is the loop, tool schemas and dispatch, argument
@@ -68,7 +69,7 @@ Answering those three tells you most of what a framework will be like to debug.
 - **Composition primitives:** prompt templates, output parsers, and the Runnable pipe syntax (LCEL) for
   chaining them with streaming, batching and async handled uniformly.
 - **Under the hood:** each integration is an adapter to a provider SDK, so swapping providers or vector
-  stores is a one-line change.
+  stores is ideally a one-line change (prompts and provider-specific features may still need work).
 - **History:** its early agent abstractions (a ReAct loop driven by parsing the model's text) pushed the
   project toward LangGraph for anything stateful.
 - **Sharp edges:** deep class hierarchies, prompts embedded in components you did not write, and a
@@ -153,7 +154,9 @@ flowchart TD
     T -->|"yes"| PA["Pydantic AI or hand-rolled loop"]
     T -->|"no"| P{"Fragile prompts, metric and labels?"}
     P -->|"yes"| DS["DSPy compiled module"]
-    P -->|"no"| LC["LangChain integrations only"]
+    P -->|"no"| I{"Many providers or stores to wire?"}
+    I -->|"yes"| LC["LangChain integrations only"]
+    I -->|"no"| H["Hand-rolled loop"]
     DS -.->|"can run inside"| LG
     LI -.->|"retrievers as tools"| PA
 ```

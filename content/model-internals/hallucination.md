@@ -5,7 +5,7 @@ name: Hallucination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - model-internals/sampling-strategies
   - model-internals/small-language-models
@@ -80,9 +80,9 @@ verify claims, and allow abstention.
 | Method | How | Cost and limits |
 |---|---|---|
 | Sampling consistency (SelfCheckGPT) | sample N answers; known facts are stable, fabrications vary | N× compute; misses confident, consistent errors |
-| Semantic entropy | cluster samples by meaning, compute entropy over clusters | flags unreliable answers better than token-level entropy, because paraphrases of one answer no longer count as disagreement |
+| Semantic entropy | cluster samples by meaning, compute entropy over clusters | N× samples plus meaning checks (an NLI model); flags unreliable answers better than token-level entropy, because paraphrases of one answer no longer count as disagreement |
 | Token-level signals | low log-probability on entity and number tokens | cheap flag, but miscalibrated after RLHF, so thresholds must be tuned per model |
-| Claim-level verification | split the answer into atomic claims, check each against retrieved passages with an NLI model or LLM judge, report an unsupported-claim rate | the faithfulness metric in evals; most actionable because it names the claim that failed |
+| Claim-level verification | split the answer into atomic claims, check each against retrieved passages with an NLI model or LLM judge, report an unsupported-claim rate | one extraction call plus one call per claim, and the judge can err; the faithfulness metric in evals, most actionable because it names the claim that failed |
 | Tool-based verification | run the code, call the API, look up the citation | cheapest and most reliable wherever a checker exists |
 
 ### Reduction mechanisms
@@ -246,17 +246,20 @@ breakdown like this (illustrative counts, the shape is typical):
 
 ## Pitfalls
 - **Blaming the model for a retrieval failure.** Symptom: hallucinations cluster on questions whose top-k
-  passages have low relevance scores or whose answers are not in the corpus at all.
+  passages have low relevance scores or whose answers are not in the corpus at all. Fix: log retrieval
+  scores and label whether the answer passage was retrieved before touching the prompt.
 - **Reporting a rate from an uncalibrated LLM judge.** Symptom: a judge that shares the generator's priors
-  and a dashboard reading 2% while SMEs find 15%.
+  and a dashboard reading 2% while SMEs find 15%. Fix: measure judge agreement on SME labels first.
 - **Treating temperature 0 as "hallucination off".** Symptom: deterministic, repeatable fabrications that
-  look like facts precisely because they are consistent.
+  look like facts precisely because they are consistent. Fix: grounding and verification, not decoding.
 - **Scoring "I don't know" as a failure in evals and demos.** Symptom: after a round of prompt or
-  fine-tuning iteration, abstentions vanish and confident errors rise.
+  fine-tuning iteration, abstentions vanish and confident errors rise. Fix: score abstention as correct on
+  unanswerable items.
 - **Fine-tuning on unseen domain facts to "teach it the knowledge".** Symptom: a model that learned the
-  format and a few facts and now fabricates fluently about the rest.
+  format and a few facts and now fabricates fluently about the rest. Fix: supply the facts by retrieval.
 - **Accepting a cited answer without checking the citation.** Symptom: real document titles attached to
-  statements they do not contain, since citation hallucination survives retrieval.
+  statements they do not contain, since citation hallucination survives retrieval. Fix: verify each quoted
+  span appears in the cited passage.
 - **Letting an agent invent tool names or arguments.** Symptom: "function not found" errors or calls with
   parameters that do not exist. Fix: validate every call against the live schema and reflect the error back.
 

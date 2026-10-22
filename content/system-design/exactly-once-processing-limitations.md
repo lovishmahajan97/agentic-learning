@@ -136,7 +136,7 @@ sequenceDiagram
     D-->>C: conflict, already processed
     C->>B: ack, no second effect
     Note over C,X: a call to X before the commit is outside the transaction
-    C->>X: send with idempotency key run:step
+    C->>X: send with key from run_id and step_id
 ```
 
 ## Examples

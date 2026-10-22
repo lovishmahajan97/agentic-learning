@@ -5,7 +5,7 @@ name: sentence-transformers
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/hugging-face
   - python-for-ai/pytorch

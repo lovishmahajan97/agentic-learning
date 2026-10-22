@@ -5,7 +5,7 @@ name: Engines (vLLM, SGLang, TGI, TensorRT-LLM, Ollama, llama.cpp)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/model-serving
   - serving-inference/continuous-batching
@@ -179,6 +179,10 @@ vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192 \
 ollama pull llama3.1:8b && ollama serve
 ```
 
+- **Order matters for Ollama:** `ollama pull` talks to a running server, so on a headless Linux box start
+  `ollama serve` first (in another shell or as a service); the desktop app on macOS and Windows already
+  runs it.
+
 ```python
 from openai import OpenAI
 
@@ -332,12 +336,13 @@ fixed.
 - **Paged KV cache** avoids allocating every request at maximum length, so far more sequences fit, and
   fused and quantized kernels cut time per step.
 
-### vLLM admits only a handful of sequences even though `--max-num-seqs` is 128. What do you check?
+### vLLM runs far fewer sequences than `--max-num-seqs` 128 and keeps preempting. What do you check?
 - **The KV pool size in the startup log:** `--gpu-memory-utilization` × GPU memory minus weights and
   activations, divided by bytes per token.
 - **The live context lengths:** with long sequences the pool fills well before 128; on an 80 GB GPU with
   an 8B GQA model only about 48 fit at 8,192 tokens.
-- **Fix** with shorter `--max-model-len` per route, a quantized cache or model, or more GPUs.
+- **Fix** with a lower `--max-model-len` (sending long-context traffic to a separate deployment), an FP8
+  KV cache (`--kv-cache-dtype fp8`) or a quantized model, or more GPUs.
 
 ### When would you not pick TensorRT-LLM despite its higher ceiling?
 - **When the model list is long or changing,** because every model, GPU type and limit change needs a

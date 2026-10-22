@@ -5,7 +5,7 @@ name: Warmup
 kind: practice
 difficulty: core
 est_minutes: 11
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/learning-rate-schedulers
   - ml-fundamentals/optimizers
@@ -21,8 +21,8 @@ sources:
 
 ## TL;DR
 Warmup ramps the learning rate from near zero to its peak over the first few hundred or thousand
-optimizer steps, because early steps are the most dangerous. A short ramp costs almost nothing and removes
-most early-training divergence.
+optimizer steps, because early gradients are large and Adam's variance estimates rest on almost no data.
+A short ramp is cheap and removes most early divergence.
 
 ## Why it exists
 - **Nothing is calibrated at init.** Activations have whatever scale the init gave them, the loss is at
@@ -34,8 +34,9 @@ most early-training divergence.
   happened to be small gets an update far too large. RAdam showed the effective step size has divergent
   variance in the first iterations; warmup keeps updates small until `v` can be trusted.
 - **Post-LN amplifies it.** In the original Post-LN transformer the expected gradient norm nearest the
-  output is large at init and does not shrink with depth, while Pre-LN scales roughly as `1/√L`. The paper
-  that analysed this showed Post-LN is unstable without warmup, while Pre-LN tolerates its absence.
+  output is large at init and does not shrink with depth, while Pre-LN scales roughly as `1/√L`, so a deep
+  Post-LN model's first updates are disproportionately large near the output. The paper that analysed this
+  showed Post-LN is unstable without warmup, while Pre-LN tolerates its absence.
 - **Large batches need it.** A bigger batch justifies a bigger rate only once the model has left the
   chaotic initial region, so the ImageNet-in-one-hour recipe ramped linearly over the first five epochs
   instead of starting at the scaled peak.
@@ -214,8 +215,10 @@ Only a smaller `lr` on that first step shrinks the move, which is exactly what t
 ## Pitfalls
 - **Counting warmup in the wrong unit.** Setting `warmup_steps` as if steps were micro-batches or epochs.
   Symptom: a ramp that never finishes before the run ends, or one over after a single logging interval.
+  Fix: derive it from the optimizer-step count and print the rate at `W` before launch.
 - **Resuming without scheduler state.** Warmup restarts from zero at step 10,000; the loss curve shows a
-  visible dip in progress for the next few hundred steps.
+  visible dip in progress for the next few hundred steps. Fix: save and restore the scheduler with the
+  optimizer.
 - **Blaming data for a step-50 spike.** It is usually a warmup problem. Check the gradient norm trace
   first, because it jumps before the loss does.
 - **Reusing a pre-training warmup for fine-tuning.** Thousands of steps of ramp in a 500-step run means the

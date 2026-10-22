@@ -5,7 +5,7 @@ name: Tool schemas & argument validation
 kind: practice
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - agents/tool-calling
   - agents/typed-tool-contracts

@@ -5,7 +5,7 @@ name: Async cancellation & exception propagation
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-await
@@ -21,8 +21,8 @@ sources:
 ---
 
 ## TL;DR
-Cancelling an asyncio task schedules a `CancelledError` at its next `await`, so `finally` blocks can
-release connections. `TaskGroup` and `asyncio.timeout` build on this one mechanism, so swallowing
+Cancelling an asyncio task does not kill it: it schedules a `CancelledError` at its next `await`, so
+`finally` blocks can release connections. `TaskGroup` and `asyncio.timeout` build on this one mechanism, so swallowing
 `CancelledError` silently breaks deadlines, sibling cleanup and shutdown.
 
 ## Why it exists
@@ -252,12 +252,15 @@ In both runs the `finally` releases the resource, but only the correct version r
   Fix: re-raise.
 - **Fire-and-forget `asyncio.create_task(...)`** without keeping a reference or awaiting it. Symptom:
   "Task exception was never retrieved" in logs and occasionally tasks garbage-collected mid-flight.
+  Fix: keep tasks in a set with a done-callback that discards and logs them, or use a `TaskGroup`.
 - **Assuming a `gather` failure stops the other calls.** Symptom: token spend and tool side effects
   continue after the request already returned an error. Fix: `TaskGroup`.
 - **Unbounded awaits in `finally` during cancellation.** A slow cleanup call can itself hang, so shutdown
   stalls until the process manager kills it. Fix: a timeout around cleanup.
 - **Expecting cancel to stop a blocking `requests.get` or a tight loop.** Symptom: a task that stays
-  "cancelling" until the blocking call returns on its own.
+  "cancelling" until the blocking call returns on its own. Fix: use an async client, or run the call in
+  `asyncio.to_thread` with its own timeout (for example `requests.get(url, timeout=10)`), because
+  cancelling there only abandons the wait while the thread keeps running.
 
 ## When to use
 - **You meet it whenever** code starts more than one task or has a deadline, which in an AI backend is

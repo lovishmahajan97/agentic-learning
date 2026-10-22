@@ -5,7 +5,7 @@ name: Message queues (Kafka, SQS, RabbitMQ)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/background-jobs-durable-workers
   - backend-fundamentals/redis
@@ -24,7 +24,7 @@ sources:
 
 ## TL;DR
 A message queue is a durable buffer between producers and consumers, so they need not be up or scaled
-together. Delivery is at-least-once, so consumers must be idempotent. Kafka is a replayable log, SQS a
+together. Reliable delivery is at-least-once, so consumers must be idempotent. Kafka is a replayable log, SQS a
 managed queue, RabbitMQ a routing broker.
 
 ## Why it exists
@@ -266,10 +266,11 @@ CREATE TABLE outbox (
 BEGIN;
 INSERT INTO documents (id, tenant_id, status) VALUES ($1, $2, 'uploaded');
 INSERT INTO outbox (topic, key, payload)
-VALUES ('document.uploaded', $1, jsonb_build_object('document_id', $1, 'tenant_id', $2));
+VALUES ('document.uploaded', $1, jsonb_build_object('document_id', $1::uuid, 'tenant_id', $2::uuid));
 COMMIT;
 
 -- In the relay: lock a batch, publish each row to the broker, then mark them sent.
+-- The transaction stays open while publishing, so keep batches small and the broker timeout short.
 BEGIN;
 SELECT id, topic, key, payload FROM outbox
 WHERE  sent_at IS NULL
@@ -391,7 +392,8 @@ older than the current state. Add a DLQ so poison messages do not block either p
 - **Diagnose:** the partition key is the tenant id, so all its traffic lands on one partition and one consumer.
 - **Fix:** key by a finer entity (document or conversation id) when per-tenant order is not needed, or add
   a sub-key suffix for that tenant; raise partitions to allow more consumers.
-- **Trade-off:** order is then preserved only per finer key.
+- **Trade-off:** order is then preserved only per finer key, and adding partitions remaps keys to new
+  partitions, so per-key order is not guaranteed across the change.
 
 ### A backlog of 120,000 messages builds while arrivals are 400/s. How many consumers do you need?
 - **Arithmetic:** draining in 5 minutes needs 120,000 ÷ 300 = 400/s of extra capacity on top of the 400/s

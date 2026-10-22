@@ -5,7 +5,7 @@ name: SQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/postgresql-transactions-and-isolation-levels
@@ -342,7 +342,8 @@ volume, which is why plans must be checked against production-sized data.
 - **Use `pg_stat_statements` sorted by total time,** because a fast query called millions of times often
   costs more than a slow rare one.
 - **Then read the plan** with `EXPLAIN (ANALYZE, BUFFERS)` on production-sized data, checking scan types and
-  estimated versus actual rows; a gap of 10× or more points to stale statistics.
+  estimated versus actual rows; a gap of 10× or more points to stale statistics or a predicate the
+  planner cannot estimate.
 
 ## Quiz
 ### Q: Why can WHERE date(created_at) = '2026-10-20' not use a B-tree index on created_at?

@@ -5,7 +5,7 @@ name: OpenAI SDK
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/anthropic-sdk
   - python-for-ai/litellm
@@ -317,8 +317,9 @@ because they need different fixes.
 - **Generation is not idempotent:** if the timeout fires after the server started work, the SDK's retry
   starts a second, separately billed generation.
 - **So short timeouts on long outputs raise cost as well as latency**, and the first attempt still bills.
-- **Fix:** size timeouts to the output length per path, stream long responses so progress is visible, and
-  for queued jobs set `max_retries=0` so the queue owns backoff.
+- **Fix:** size timeouts to the output length per path, and stream long responses: the client's read
+  timeout then measures the gap between chunks, not the whole generation. For queued jobs set
+  `max_retries=0` so the queue owns backoff.
 
 ### When would you choose Chat Completions over the Responses API?
 - **Portability:** Chat Completions is the shape vLLM, Ollama and gateways copied, so the same client

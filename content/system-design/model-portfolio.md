@@ -21,8 +21,8 @@ sources:
 
 ## TL;DR
 A model portfolio is a small, governed set of models, each with a role, owner, eval baselines, cost
-card and retirement plan. One model everywhere overpays on easy work; unmanaged per-team choices create
-sprawl nobody can evaluate, secure or exit.
+card, approved data classes and retirement plan. One model everywhere overpays on easy work; per-team
+choices create sprawl nobody can evaluate, secure or exit.
 
 ## Why it exists
 - **Failure mode 1: one model for everything.** The frontier model classifies support intents at

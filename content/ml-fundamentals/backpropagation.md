@@ -5,7 +5,7 @@ name: Backpropagation
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/loss-functions

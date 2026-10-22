@@ -5,7 +5,7 @@ name: Computer use
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - agents/sandboxing
   - agents/tool-calling
@@ -140,6 +140,7 @@ flowchart TD
     G -->|"yes"| AP["Approval gate"]
     G -->|"no"| A["Scale coords and act"]
     AP -->|"approved"| A
+    AP -->|"rejected, model told why"| O
     A --> W["Wait for UI to settle"]
     W --> B{"Step budget left?"}
     B -->|"yes"| O

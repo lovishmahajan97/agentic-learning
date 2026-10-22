@@ -5,7 +5,7 @@ name: Structured / constrained generation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - prompting/structured-outputs-json-mode
   - prompting/function-tool-calling
@@ -23,8 +23,8 @@ sources:
 ---
 
 ## TL;DR
-Constrained decoding masks the logits of grammar-violating tokens at every step, so output matches a
-schema, regex, grammar or choice set by construction. It removes retry loops but guarantees
+Constrained decoding masks the logits of illegal tokens each step, so output matches a
+schema, regex, grammar or choice set by construction. It removes parse-and-retry loops but guarantees
 shape, not truth, costs a grammar compile, and can shift what the model says.
 
 ## Why it exists
@@ -272,7 +272,9 @@ print(ticket.category, ticket.priority)
 ## Production patterns
 - **Native structured outputs, not hand-rolled processors.** When output feeds code, pass a JSON Schema
   via `response_format` (or the engine's grammar or choice mode) and let the engine's backend, such as
-  XGrammar in vLLM, do the masking. Monitor validity rate; it should sit at 100%.
+  XGrammar in vLLM, do the masking. Monitor validity rate; it should sit at 100%, and anything less
+  usually means output truncated at `max_tokens` (check `finish_reason`) or a schema feature the backend
+  does not enforce.
 - **Static schemas, cached grammars.** Keep schemas versioned in code and identical across requests, with
   no request ids or dates inside enums, so compiled grammars are reused. Monitor TTFT for first-seen
   schemas versus cached ones.
@@ -299,13 +301,14 @@ print(ticket.category, ticket.priority)
 
 ## Pitfalls
 - **Trusting schema-valid output as correct.** Symptom: clean JSON with invented identifiers or wrong
-  numbers that no parser will ever flag.
+  numbers that no parser will ever flag. Fix: semantic validators and lookups after parsing.
 - **Answer field first, `reasoning` last.** The model commits to an answer before it has "thought";
-  accuracy on reasoning tasks drops compared with unconstrained prompting.
+  accuracy on reasoning tasks drops compared with unconstrained prompting. Fix: reasoning field first.
 - **A fresh, slightly different schema per request** (a timestamp or request id baked into an enum).
-  Symptom: high time to first token from grammar compilation on each call.
+  Symptom: high time to first token from grammar compilation on each call. Fix: static, versioned schemas.
 - **JSON Schema features the backend ignores** (`format: date`, `minimum`, `pattern` in some modes),
-  discovered in production when out-of-range values come through.
+  discovered in production when out-of-range values come through. Fix: a CI compatibility test, and
+  re-validate with Pydantic.
 - **Forgetting whitespace is part of the grammar.** Unbounded whitespace between tokens lets a model loop
   on spaces or newlines until `max_tokens`; forbidding it forces minified JSON the model rarely saw in
   training. Set the whitespace pattern deliberately.

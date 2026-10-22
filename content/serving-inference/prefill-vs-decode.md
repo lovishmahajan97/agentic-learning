@@ -5,7 +5,7 @@ name: Prefill vs decode
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - model-internals/kv-cache
   - serving-inference/ttft
@@ -84,7 +84,7 @@ step_time ≈ (weight_bytes + cache_bytes) / bandwidth
 ### Techniques that manage the collision
 | Technique | How | Cost |
 |---|---|---|
-| **Chunked prefill** | Split long prompts into fixed-size chunks (a token budget per iteration) run alongside the decode batch. Decode tokens ride along at near-zero marginal cost because the iteration was compute-bound anyway | Slightly longer TTFT for the long prompt |
+| **Chunked prefill** | Split long prompts into fixed-size chunks (a token budget per iteration) run alongside the decode batch. Decode tokens ride along at near-zero marginal cost because the iteration was compute-bound anyway, and no single iteration becomes a stall | Slightly longer TTFT for the long prompt |
 | **Prefill vs decode priority** | Scheduler policy: prefill-first minimizes TTFT, decode-first smooths TPOT | Depends on the product |
 | **Disaggregated serving** | Prefill on one GPU pool, decode on another, KV cache transferred over the interconnect. Each pool is tuned for its phase (prefill wants FLOPs, decode wants bandwidth and memory) and one phase cannot spike the other | The transfer and a more complex system; pays at scale |
 | **Prefix caching** | Reuse an already-computed KV prefix so part of prefill is skipped | The biggest TTFT lever when prompts share a long system prompt |
@@ -191,15 +191,17 @@ Request A: 4,000-token prompt, 50-token answer. Request B: 200-token prompt, 1,0
 
 ## Pitfalls
 - **Benchmarking "latency" as a single number.** Symptom: fine average latency, but users complain about
-  the pause before text appears or about stuttering mid-stream.
+  the pause before text appears or about stuttering mid-stream. Fix: report TTFT and TPOT separately.
 - **Assuming cost is proportional to total tokens.** Symptom: a pricing or capacity model wildly wrong for
-  long-output workloads, because output tokens cost far more GPU time than input tokens.
+  long-output workloads, because output tokens cost far more GPU time than input tokens. Fix: model input
+  and output tokens with separate unit costs.
 - **Leaving chunked prefill off on a mixed workload.** Symptom: periodic TPOT spikes across all users that
-  coincide with the arrival of long prompts, not with request rate.
+  coincide with the arrival of long prompts, not with request rate. Fix: enable chunked prefill with a
+  per-iteration token budget.
 - **Expecting a GPU upgrade to speed up chat decode.** Symptom: TTFT improves while tokens/sec per user is
-  unchanged, because bandwidth did not change much.
+  unchanged, because bandwidth did not change much. Fix: compare GPUs on memory bandwidth for decode.
 - **Reporting prefill and decode throughput as one "tokens/sec".** Symptom: capacity estimates off by an
-  order of magnitude when the input/output mix shifts.
+  order of magnitude when the input/output mix shifts. Fix: track input and output tokens/sec separately.
 
 ## When to use
 This split is the first thing to apply when a latency or cost number looks wrong.

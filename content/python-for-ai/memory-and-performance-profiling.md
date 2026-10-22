@@ -5,7 +5,7 @@ name: Memory & performance profiling
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/gil
   - python-for-ai/asyncio-vs-threads-vs-multiprocessing
@@ -24,8 +24,8 @@ sources:
 
 ## TL;DR
 Profiling replaces guessing: CPU profilers show which functions consume time, memory profilers which lines
-allocated the bytes still alive. AI services often wait on network or GPU and hold native buffers Python
-cannot see, so pick the tool by the question.
+allocated the bytes still alive. AI services often wait on network or GPU and hold native buffers Python's
+own tools cannot see, so pick the tool by the question.
 
 ## Why it exists
 - **Two tickets dominate.** "The pipeline is slow" and "the worker gets OOM-killed after a few hours", and

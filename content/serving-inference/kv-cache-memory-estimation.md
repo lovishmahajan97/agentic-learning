@@ -5,7 +5,7 @@ name: KV-cache memory estimation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - model-internals/kv-cache
   - model-internals/grouped-query-attention
@@ -80,7 +80,7 @@ pool_bytes        = gpu_memory × utilization_fraction − weight_bytes − acti
 max_concurrency   ≈ pool_bytes / cache_per_request
 ```
 
-Four refinements matter in practice (the fifth item is a constraint on the fourth):
+Four refinements matter in practice, plus one constraint on the fourth:
 
 1. **Weights.** Parameters × bytes per parameter: 8B × 2 = 16 GB in fp16, 8 GB at int8, ~4.5 GB at 4-bit
    (plus a little for scales). Quantizing weights frees cache space, often its biggest payoff.
@@ -186,7 +186,8 @@ grows:
 
 ### Worked scenario: a model with interleaved sliding-window layers
 A hypothetical shape for illustration: 32 layers, of which 8 are full attention and 24 use a 4,096-token
-window, 8 KV heads, head_dim 128, fp16 (32 KB per layer per token).
+window, 8 KV heads, head_dim 128, fp16 (2 × 8 × 128 × 2 = 4 KB per layer per token, 128 KB across all 32
+layers).
 
 | Sequence length | Cache per request | Average bytes per token |
 |---|---|---|
@@ -226,15 +227,18 @@ window, 8 KV heads, head_dim 128, fp16 (32 KB per layer per token).
 
 ## Pitfalls
 - **Using the attention-head count instead of the KV-head count.** Symptom: a capacity estimate four or
-  eight times too pessimistic for GQA models, and a purchase of GPUs you did not need.
+  eight times too pessimistic for GQA models, and a purchase of GPUs you did not need. Fix: read
+  `num_key_value_heads` from the config.
 - **Forgetting that output tokens also need cache.** Symptom: OOM or preemption on long generations even
-  though every prompt fit comfortably in the estimate.
+  though every prompt fit comfortably in the estimate. Fix: size on prompt plus `max_tokens`.
 - **Trusting the formula over the engine's startup log.** Symptom: a pool 10–20% smaller than planned,
-  because activation workspace and allocator overhead were not budgeted.
+  because activation workspace and allocator overhead were not budgeted. Fix: plan from the logged block
+  count.
 - **Estimating with mean sequence length and promising that concurrency.** Symptom: latency collapse the
-  first time a batch of long-context requests arrives together.
+  first time a batch of long-context requests arrives together. Fix: promise concurrency at p95/p99 length.
 - **The standard formula on latent or sliding-window attention.** Symptom: an estimate off by a large
-  factor in either direction, because the cache layout is different.
+  factor in either direction, because the cache layout is different. Fix: read the architecture and use its
+  own cache formula.
 
 ## When to use
 - **Do the arithmetic at four moments:** choosing a model and GPU before any code exists; setting

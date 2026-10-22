@@ -5,7 +5,7 @@ name: Sampling strategies (temperature, top-k / top-p, greedy vs beam)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - model-internals/logits
   - model-internals/softmax
@@ -216,15 +216,18 @@ grow.
 
 ## Pitfalls
 - **Expecting identical outputs at temperature 0.** Across runs or deployments, the symptom is flaky golden
-  tests that fail on near-tied tokens after an engine or batch-size change.
+  tests that fail on near-tied tokens after an engine or batch-size change. Fix: assert on parsed fields
+  or semantic similarity, not exact strings.
 - **Greedy or beam for long free-form generation.** Symptom: paragraphs that repeat a sentence or phrase
-  verbatim, sometimes indefinitely until the token limit.
+  verbatim, sometimes indefinitely until the token limit. Fix: sample with top-p or min-p truncation.
 - **Raising temperature to "make the model more creative" on extraction or code.** Symptom: more malformed
-  output and invented fields, which evaluation then attributes to the prompt.
+  output and invented fields, which evaluation then attributes to the prompt. Fix: keep these endpoints
+  near 0 and change the prompt or data instead.
 - **Tuning temperature and top-p simultaneously.** Results move but it is unclear which knob did it, and
-  settings copied between models behave differently because logit scales differ.
+  settings copied between models behave differently because logit scales differ. Fix: sweep one knob per
+  model on a labelled set.
 - **A strong repetition penalty on structured output.** Symptom: JSON that avoids repeating a required key
-  or closing bracket because the token was penalized.
+  or closing bracket because the token was penalized. Fix: turn penalties off on structured endpoints.
 
 ## When to use
 - **One right answer and a downstream parser:** temperature at or near 0, optionally with constrained

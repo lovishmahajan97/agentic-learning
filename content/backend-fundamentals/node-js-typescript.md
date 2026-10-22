@@ -5,7 +5,7 @@ name: Node.js / TypeScript
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: crisp
+status: crisp-verified
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/runtime-schema-validation
@@ -106,7 +106,8 @@ sequenceDiagram
     P-->>G: stream chunk
     G-->>B: res.write chunk
     Note over G: write returns false, wait for drain
-    B-->>G: drain, client caught up
+    B-->>G: reads buffered bytes
+    Note over G: drain fires, resume reading upstream
     P-->>G: next chunk
     B--xG: tab closed, close event
     G--xP: ac.abort cancels upstream
@@ -236,11 +237,11 @@ reads ~10. Figures are illustrative.
 - **Validating model output with a cast (`as ToolCall`).** Symptom: a runtime
   `undefined is not a function` far from the boundary that produced the bad data. Fix: `safeParse`.
 - **Buffering the whole model stream before writing.** Symptom: time-to-first-token equals total
-  generation time, and memory spikes under concurrent chats.
+  generation time, and memory spikes under concurrent chats. Fix: relay chunk by chunk and honour `drain`.
 - **Not propagating client disconnects upstream.** Symptom: token spend exceeds what users received, and
-  open upstream connections outnumber open client connections.
+  open upstream connections outnumber open client connections. Fix: abort the upstream `fetch` on `close`.
 - **Sync tokenization or large JSON transforms in a route handler.** Symptom: every concurrent request's
-  latency rises together, visible as event-loop lag.
+  latency rises together, visible as event-loop lag. Fix: a worker thread or the Python core.
 - **A hand-written TypeScript client drifting from the Python API.** Symptom: a field rename on one side
   surfaces as silent `undefined` on the other. Fix: generate it from OpenAPI.
 
@@ -293,12 +294,14 @@ language costs a build step rather than a translation team.
 - **Confirm with a heap snapshot** under a slow-client load test, then add the `drain` wait and the
   `AbortController` wiring and re-run.
 
-### When would you not put an AI feature's backend in Node?
-- **When it touches weights, tokenizers or eval datasets:** that tooling is Python-first, and ports lag.
-- **When per-request CPU work is heavy:** the single JavaScript thread blocks everyone, and Node has no
-  NumPy-class native ecosystem to offload to.
-- **When serverless limits bite:** long agent loops or big streams hit platform timeouts and body-size
-  limits.
+### A route needs CPU work per request. When do you use `worker_threads`, and when do you send it to the Python core?
+- **`worker_threads` for small, self-contained JavaScript work** (hashing, a large JSON transform), where a
+  network hop would cost more than the work; use a pool sized to cores, because arguments and results are
+  copied between threads unless you transfer buffers.
+- **The Python core for anything needing ML libraries** (embedding, reranking, model tokenizers), because
+  Node has no NumPy-class native ecosystem and the core already scales separately.
+- **Neither, if it is cheap:** measure with `monitorEventLoopDelay` first; work that keeps loop delay to a
+  few milliseconds can stay inline.
 
 ### How would you keep a TypeScript frontend and a Python AI service in sync as both evolve?
 - **Single source of truth:** the Python service's Pydantic models generate its OpenAPI schema.

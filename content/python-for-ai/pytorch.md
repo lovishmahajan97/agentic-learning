@@ -5,7 +5,7 @@ name: PyTorch (tensors, autograd, nn.Module, DataLoader, device)
 kind: tool
 difficulty: core
 est_minutes: 20
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/numpy
   - python-for-ai/hugging-face
@@ -42,7 +42,7 @@ the graph is built by running plain Python.
 - **Define-by-run fixes it, and is now the lingua franca.** The graph is recorded as Python executes,
   every iteration, so control flow is just Python and you debug with print statements and `pdb`, not a
   separate graph compiler; that is why it won.
-- **Literacy is the payoff today.** Every Hugging Face model, LoRA adapter, embedding model
+- **Literacy is the payoff today, more than writing loops from scratch.** Every Hugging Face model, LoRA adapter, embedding model
   and most local inference stacks are PyTorch modules; when one OOMs, produces NaNs or runs on the CPU by
   accident, you need to know which of the five pieces is responsible.
 

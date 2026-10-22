@@ -16,9 +16,9 @@ related:
 ---
 
 ## TL;DR
-A demo is a decision instrument, not a performance. Cherry-picked LLM inputs look magical while typical
-inputs fail, so a good demo uses real workflow and data, pairs the story with eval numbers, shows a
-failure and labels what is built.
+A demo is a decision instrument that helps a specific audience decide something. Cherry-picked LLM inputs
+look magical while typical inputs fail, so a good demo uses real data, pairs the story with eval numbers,
+shows a failure and labels what is built.
 
 ## Why it exists
 - **Decision-makers judge by what they see.** Most people who fund, approve or adopt an AI system will never
@@ -198,21 +198,24 @@ For a legal operations team deciding whether to run a six-week pilot of a contra
   for a different audience usually answers the wrong question and should prompt a rebuild.
 
 ## Pitfalls
-- **Hand-picked inputs easier than real traffic.** The symptom is a pilot whose users say the system "worked
-  better in the demo".
+- **Demoing on hand-picked inputs easier than real traffic.** The symptom is a pilot whose users say the
+  system "worked better in the demo". Fix: draw inputs from the eval set and quote its aggregate.
 - **Unlabeled mocked integrations or UI.** They become commitments; the symptom is a statement of work that
-  includes features nobody estimated.
+  includes features nobody estimated. Fix: label stubs on screen and on a slide.
 - **Synthetic or public data instead of the customer's own.** The audience cannot judge relevance and the
-  hard cases never appear; the symptom is polite approval and no follow-up.
+  hard cases never appear; the symptom is polite approval and no follow-up. Fix: get permission to use
+  their real records early.
 - **Rehearsing only on a fast office network.** Then presenting through a customer VPN or proxy; the symptom
-  is timeouts or long spinners during the live segment.
+  is timeouts or long spinners during the live segment. Fix: rehearse on the network you will present from.
 - **Treating the demo as the evaluation.** No aggregate number behind it; the symptom is stakeholders
-  quoting a single impressive example as the expected performance.
+  quoting a single impressive example as the expected performance. Fix: show the eval number beside the
+  examples.
 - **Special-casing the demo inputs in code.** A hard-coded lookup, or a prompt tuned to those three
   documents; the symptom is the same inputs behaving differently once the pilot build replaces the demo
-  branch.
+  branch. Fix: demo from the pilot build.
 - **Letting demo screens become the specification.** The symptom is change requests and SOW lines that cite
-  "as shown in the demo" for behavior nobody designed or estimated.
+  "as shown in the demo" for behavior nobody designed or estimated. Fix: review the SOW for such lines and
+  estimate or remove them.
 
 ## When to use
 - **Use at decision points:** after discovery to confirm you understood the workflow, at the end of a PoC to

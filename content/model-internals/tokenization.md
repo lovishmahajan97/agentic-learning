@@ -5,7 +5,7 @@ name: Tokenization (BPE, SentencePiece)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - model-internals/embeddings
   - model-internals/context-window
@@ -251,19 +251,25 @@ recall per language.
 ## Pitfalls
 - **Counting tokens with the wrong tokenizer**, such as `cl100k_base` for a Llama model. Symptom:
   context-overflow errors or silently truncated prompts in production although the estimate said they fit.
+  Fix: count with the serving model's own tokenizer on the rendered template.
 - **Ending a prompt with a trailing space or stitching completions at a non-token boundary.** Symptom: a
-  first generated token that starts mid-word, doubles a space or is otherwise odd.
+  first generated token that starts mid-word, doubles a space or is otherwise odd. Fix: strip trailing
+  whitespace and let the model emit the space with the next word.
 - **Chunking documents by a fixed characters-per-token ratio.** Symptom: code or non-English chunks that
-  exceed the embedding model's limit and get truncated without error.
+  exceed the embedding model's limit and get truncated without error. Fix: chunk by token count with the
+  embedding model's tokenizer.
 - **Resizing the vocabulary for new special tokens without initializing the new rows sensibly.** Symptom:
-  a loss spike in the first steps of fine-tuning.
+  a loss spike in the first steps of fine-tuning. Fix: initialize new rows from the mean of existing
+  embeddings rather than at random.
 - **Asking the model for character-level work** (letter counts, exact string reversal, regex-like
-  validation). Symptom: confident, inconsistent answers that no prompt reliably fixes.
+  validation). Symptom: confident, inconsistent answers that no prompt reliably fixes. Fix: hand that work
+  to code or a tool call.
 - **Streaming output by decoding each token id on its own.** A multi-byte UTF-8 character (accented
   letters, CJK, emoji) can span two byte-level tokens, so the symptom is `U+FFFD` replacement characters
   in streamed text that disappear when the full response is decoded at once. Buffer incomplete bytes.
 - **Mismatched chat-template special tokens between training and serving.** Symptom: a fine-tuned model
-  that ignores its system prompt or never emits a stop token.
+  that ignores its system prompt or never emits a stop token. Fix: render both with the same
+  `apply_chat_template` and check the stop-token ids in the serving config.
 
 ## When to use
 You do not choose a tokenizer per request, but it shapes several decisions you do make.

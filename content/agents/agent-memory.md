@@ -5,7 +5,7 @@ name: Agent memory (short-term, long-term, episodic)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - agents/memory-retrieval-update-deletion-policies
   - agents/context-compaction-summarization
@@ -245,8 +245,8 @@ for flag in (False, True):
 ### Worked scenario: one 40k tool result in a 128k window
 | Without slot caps | With slot caps |
 |---|---|
-| System 3k + memories 2k + plan 1k + history 90k fill the window | Same starting point |
-| A 40k log dump arrives; the oldest content (retrieved memories, early constraints) is truncated | Tool-result slot is capped; the log is summarised or stored with a reference |
+| System 3k + memories 2k + plan 1k + history 90k = 96k, plus 8k reserved for output | Same starting point |
+| A 40k log dump arrives: 144k needed against 128k, so the oldest turns (with early constraints) are truncated | Tool-result slot is capped; the log is summarised or stored with a reference |
 | The agent forgets "staging DB is read-only" and tries a write | Memories and plan stay in their reserved slots |
 | Compaction then fires mid-tool call under pressure | Compaction fired earlier, near 70–80%, at a turn boundary |
 

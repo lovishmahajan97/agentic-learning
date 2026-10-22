@@ -5,7 +5,7 @@ name: Error analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - evals/golden-dataset
   - evals/eval-harness
@@ -34,15 +34,15 @@ and which fix buys the most.
   prompt fixes grow into a two-thousand-token prompt of special cases that nobody dares to delete.
 - **Classical ML already had the answer.** Ng's advice for a misbehaving classifier: read about a hundred
   misclassified dev-set examples by hand, tally the categories, work on the largest one, because an
-  afternoon of counting beats a month of optimizing the wrong thing.
+  afternoon of counting beats a month of optimizing the wrong thing. For LLM systems too, an afternoon
+  with a few dozen to a hundred traces (illustrative) usually reorders the roadmap.
 - **LLM systems make it more necessary, not less.** Outputs are free text, pipelines have several stages
   (retrieval, prompt, model, tools, post-processing), and failure modes are open-ended: you cannot define
   a metric for a failure you have not yet seen.
 - **The naive alternatives all skip the reading.** "Trust the judge score" fails because a judge grades
-  only the criteria you gave it, and Shankar et al. found people's criteria drift as they read outputs.
-  "Fix what you notice" is whack-a-mole. "Collect thumbs-down" is biased toward failures users notice and
-  report. An afternoon with a few dozen to a hundred traces (illustrative) usually reorders the roadmap.
-
+  only the criteria you gave it and cannot see a failure mode you did not name; Shankar et al. found
+  people's criteria drift as they read outputs. "Fix what you notice" is whack-a-mole with regressions
+  elsewhere. "Collect thumbs-down" is biased toward failures users notice and bother to report.
 ## How it works
 ### 1. Sample traces, not just outputs
 - **Pull whole traces:** input, retrieved context, tool calls and results, intermediate steps, final
@@ -324,7 +324,8 @@ and slices, not the aggregate, to the product owner.
 
 ### Your agent's task success dropped five points overnight. How do you debug it?
 - **Diff first:** join yesterday's and today's runs on item id and pull the items that flipped in both
-  directions.
+  directions. If nothing was deployed, suspect a provider model update, a changed tool or data source,
+  or drifted traffic, and check which of those the flips line up with.
 - **Read whole traces** and record the first wrong step: wrong tool, wrong arguments, misread tool
   result, stopped early, looped.
 - **Count by step and slice,** then fix the top category and re-measure on the same items before

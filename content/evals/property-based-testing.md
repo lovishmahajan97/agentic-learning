@@ -5,7 +5,7 @@ name: Property-based testing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/property-based-testing
   - evals/metamorphic-testing
@@ -207,7 +207,7 @@ class HistoryMachine(RuleBasedStateMachine):
         assert not self.saw_user or any(role == "user" for role, _ in self.h.turns)
 
 TestHistory = HistoryMachine.TestCase
-# Fails latest_user_turn_kept, shrunk to four steps, e.g. user_turn(tokens=1),
+# Fails latest_user_turn_kept, shrunk to a short sequence (typically four steps), e.g. user_turn(tokens=1),
 # tool_result(tokens=1500), tool_result(tokens=3000), tool_result(tokens=3000):
 # 500 + 1 + 1500 + 3000 + 3000 = 8001 > 8000, so the trimmer drops the only user turn.
 ```

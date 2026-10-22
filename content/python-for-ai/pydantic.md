@@ -5,7 +5,7 @@ name: Pydantic
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/type-hints
   - python-for-ai/dataclasses
@@ -106,9 +106,9 @@ For one `model_validate(data)` call, knowing the pipeline tells you where custom
 | Option | Validation | Schema | Use for |
 |---|---|---|---|
 | Stdlib `dataclasses` | None; lighter | No | Internal records you construct yourself |
-| `TypedDict` | Static only; data stays dicts | Via `TypeAdapter` | Wire shapes that must stay dicts |
+| `TypedDict` | Static only; data stays dicts (validate with a `TypeAdapter` if needed) | Via `TypeAdapter` | Wire shapes that must stay dicts |
 | `attrs` | Validators | No schema generation | Rich internal classes |
-| `msgspec` | Yes, faster | Smaller feature set | Hot-path decoding |
+| `msgspec` | Yes, faster | Yes, but a smaller feature set overall | Hot-path decoding |
 | Pydantic | Yes | Yes | One definition serving checker, validator, serializer and schema, which is why the AI ecosystem standardized on it |
 
 Settings management lives in the separate `pydantic-settings` package.
@@ -133,7 +133,7 @@ flowchart TD
     MB --> F["For each field in declaration order"]
     F --> FB["field_validator mode before on raw value"]
     FB --> CORE["Core type check and lax coercion, in Rust"]
-    CORE --> CON["Constraints: ge, min_length, Literal"]
+    CORE --> CON["Constraints: ge, min_length"]
     CON --> FA["field_validator mode after on typed value"]
     FA --> COL{"Any field errors collected?"}
     COL -->|"yes"| VE["ValidationError: list of loc, msg, type"]

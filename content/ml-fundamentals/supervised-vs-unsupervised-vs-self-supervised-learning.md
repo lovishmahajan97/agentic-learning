@@ -5,7 +5,7 @@ name: Supervised vs unsupervised vs self-supervised learning
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/regression
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-The three paradigms differ only in where the training signal comes from: a human label (supervised), a
+The paradigms differ only in where the training signal comes from: a human label (supervised), a
 property of the data (unsupervised), or a label manufactured from the input (self-supervised). LLMs exist
-because self-supervision turned the internet into free labels.
+because self-supervision made the internet free labels, with human supervision added last.
 
 ## Why it exists
 - **Every loss needs a target.** Every learning algorithm minimises a loss, and a loss needs something to
@@ -202,9 +202,9 @@ print(in_batch_contrastive_loss(q, d))          # random embeddings: loss near l
 - **Cluster, then stratify the labelling queue.** Embed the corpus with a pre-trained encoder, run k-means
   (for example scikit-learn `KMeans`), and sample a fixed number per cluster for experts. Monitor per-class
   counts in the labelled set and per-class recall on the held-out set.
-- **Measure inter-annotator agreement first.** Double-label a few hundred examples and compute agreement
-  (for example Cohen's kappa via scikit-learn `cohen_kappa_score`) before training. Treat the agreement
-  rate as the accuracy ceiling when reading model scores.
+- **Measure inter-annotator agreement first.** Double-label a few hundred examples before training and
+  report both the raw agreement rate and Cohen's kappa (scikit-learn `cohen_kappa_score`), which corrects
+  for chance agreement. Treat the raw agreement rate as the accuracy ceiling when reading model scores.
 - **Fine-tune a public checkpoint instead of pre-training.** For a narrow domain, start from an open
   pre-trained model and, if needed, run a short continued pre-training pass on in-domain raw text before
   supervised fine-tuning. Monitor a general-capability eval alongside the task metric to catch forgetting.
@@ -298,11 +298,13 @@ categories theirs; the unsupervised step makes the labelling cheap.
 - **Middle ground:** short continued pre-training on in-domain text, then supervised fine-tuning.
 - **Cost of the proxy:** a low next-token loss does not guarantee instruction following or task accuracy.
 
-### How would you use 2 million unlabelled tickets and budget for 5,000 labels?
-- **Embed and cluster** all tickets to find the real structure and missing categories.
-- **Stratify the 5,000 labels** across clusters so rare categories get enough examples.
-- **Fine-tune** a pre-trained encoder or model on those labels, optionally after continued pre-training
-  on the tickets, and evaluate at the natural class distribution.
+### In contrastive training, where do the labels come from, and why does batch size matter?
+- **Labels from construction:** in a batch of N (query, document) pairs, row i's correct partner is
+  column i of the similarity matrix, so the target is known without annotation.
+- **Batch size sets difficulty:** each query is scored against N − 1 in-batch negatives, so larger
+  batches make the matching task harder and the learned embedding more discriminative.
+- **False negatives are the risk:** a duplicate or a second valid answer in the same batch is trained
+  as an impostor; deduplicate before batching.
 
 ### Is pseudo-labelling safe? How do you control it in production?
 - **Only if confident predictions are mostly right;** otherwise the model trains on its own mistakes and

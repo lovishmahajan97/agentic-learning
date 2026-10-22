@@ -5,7 +5,7 @@ name: Pagination, rate limits & API quotas
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/rest-graphql-api-design
   - backend-fundamentals/api-and-sdk-integration
@@ -233,15 +233,17 @@ def allow(tenant: str, limit: int = 100, window_s: int = 60) -> bool:
 Remember the boundary burst: this admits up to 2 × `limit` in a two-second span across a window edge,
 so put a token bucket in front of anything fragile.
 
-### Worked scenario: a 1,000-document batch against a TPM limit
-Provider limit: 500 RPM and 200,000 TPM. Each request carries a ~20,000-token prompt.
+### Worked scenario: sizing a client bucket for a nightly batch
+A nightly job classifies 5,000 tickets. Provider limit: 1,000 RPM and 400,000 TPM, debited at admission
+as prompt plus `max_tokens`. Each prompt is ~3,000 tokens with `max_tokens` = 500. Figures are illustrative.
 
 | Quantity | Value |
 |---|---|
-| Requests per minute allowed by TPM | 200,000 / 20,000 = 10 |
-| Requests per minute allowed by RPM | 500, irrelevant |
-| Total tokens in the batch | 1,000 × 20,000 = 20 million |
-| Best-case drain time | 20,000,000 / 200,000 = 100 minutes |
+| Admission charge per request | 3,000 + 500 = 3,500 tokens |
+| Requests per minute allowed by TPM | 400,000 / 3,500 ≈ 114 (RPM of 1,000 never binds) |
+| Client bucket at 90% of TPM | 360,000 tokens per minute ≈ 102 requests per minute |
+| Drain time | 5,000 × 3,500 = 17.5 million / 360,000 ≈ 49 minutes |
+| `max_tokens` cut to 200 (labels are short) | 5,000 × 3,200 = 16 million / 360,000 ≈ 44 minutes |
 | Without a client bucket | 429s within seconds, retries make it worse |
 
 ## Production patterns
@@ -279,21 +281,21 @@ Provider limit: 500 RPM and 200,000 TPM. Each request carries a ~20,000-token pr
 
 ## Pitfalls
 - **Offset pagination on a growing table.** Symptom: page latency climbs with page number, and users
-  report duplicated or missing items while the list is being written to.
+  report duplicated or missing items while the list is being written to. Fix: keyset or cursor pages.
 - **A non-unique sort column without a tie-breaker.** Symptom: rows vanish or repeat exactly at page
-  boundaries when many rows share a timestamp.
+  boundaries when many rows share a timestamp. Fix: add `id` to the sort and the cursor.
 - **A fixed-window counter guarding a fragile downstream.** Symptom: overload incidents clustered around
-  minute boundaries, at twice the nominal limit.
+  minute boundaries, at twice the nominal limit. Fix: a token bucket or sliding window.
 - **Retrying 429 immediately or without jitter.** Symptom: a retry storm in which the 429 rate climbs
-  instead of clearing, sometimes ending with the provider disabling the key.
+  instead of clearing, sometimes ending with the provider disabling the key. Fix: honour `Retry-After`.
 - **Counting requests when the provider counts tokens.** Symptom: 429s at a small fraction of the request
-  limit, because each request carries a 40k-token prompt.
+  limit, because each request carries a 40k-token prompt. Fix: a token-weighted client bucket.
 - **Charging quota only after the response.** Symptom: tenants exceed their cap by one burst of concurrent
-  requests, and failed streaming calls are never accounted for.
+  requests, and failed streaming calls are never accounted for. Fix: reserve, then reconcile.
 - **Rate-limiting long streams without a concurrency cap.** Symptom: the model server or connection pool
-  saturates while every tenant is under its requests-per-minute limit.
+  saturates while every tenant is under its requests-per-minute limit. Fix: in-flight leases per tenant.
 - **A readable cursor.** Symptom: integrations break after a release that changed the sort order, because
-  clients had been hand-building cursors.
+  clients had been hand-building cursors. Fix: opaque, signed cursors.
 
 ## When to use
 - **Pagination:** default to cursor pagination for any list that can grow or is ordered by time; keep

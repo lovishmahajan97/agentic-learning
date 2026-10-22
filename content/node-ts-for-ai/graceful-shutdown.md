@@ -230,6 +230,8 @@ spec:
 
 ### Worked scenario: budgeting a 30-second grace period
 How the numbers in the example fit together, measured from the moment the pod is marked terminating.
+The 22-second split between draining and closing is illustrative; only the 5 s hook, the 20 s deadline
+and the 3 s flush cap come from the configuration.
 
 | Time | Event | Budget used |
 |---|---|---|

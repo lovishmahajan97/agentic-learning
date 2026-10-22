@@ -5,7 +5,7 @@ name: Cancellation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/timeouts
   - serving-inference/streaming
@@ -22,9 +22,8 @@ sources:
 ---
 
 ## TL;DR
-An abandoned generation still holds a decode slot, KV memory and token spend until `max_tokens`.
-Cancellation carries "stop" through every hop, browser to engine, so the sequence is aborted and its
-memory freed. Each layer must notice the disconnect and close the next connection.
+An abandoned generation holds a decode slot, KV memory and token spend until `max_tokens`.
+Cancellation carries "stop" through every hop, browser to engine, so the engine aborts the sequence. Each layer must notice the disconnect and close the next connection; streaming makes that visible.
 
 ## Why it exists
 - **LLM requests are expensive, long and often abandoned.** Users close tabs, hit stop, or send a new
@@ -121,8 +120,8 @@ sequenceDiagram
     Note over A: next write fails, task cancelled
     A->>G: finally closes upstream stream
     G->>E: abort request
-    Note over E: drop sequence, free KV blocks
-    E-->>G: slot available for queued requests
+    Note over E: drop sequence at next step, free KV blocks
+    Note over E: queued requests take the freed slot
 ```
 
 ## Examples
@@ -271,20 +270,22 @@ users make the problem grow.
 
 ## Pitfalls
 - **No disconnect handling at all.** Symptom: GPU utilisation and provider spend that stay flat when
-  users leave, and TTFT that rises during periods of many abandoned requests.
+  users leave, and TTFT that rises during periods of many abandoned requests. Fix: wire the chain
+  above, hop by hop.
 - **Catching `CancelledError` and continuing.** On Python before 3.8 a plain `except Exception` did this
-  silently, since it was not yet a `BaseException`. Symptom: tasks that never finish and `finally`
-  cleanup that never runs.
+  silently, since it was not yet a `BaseException`; a bare `except:` still does. Symptom: tasks that
+  never finish and `finally` cleanup that never runs. Fix: clean up in `finally` and re-raise.
 - **Closing your own response but not the upstream stream.** Symptom: provider usage higher than your
-  logs can account for.
+  logs can account for. Fix: close the provider stream in `finally` or a context manager.
 - **A proxy that keeps the upstream connection alive after the client aborts.** Symptom: the serving
-  layer never sees a disconnect even though clients clearly left.
+  layer never sees a disconnect even though clients clearly left. Fix: check settings such as nginx
+  `proxy_ignore_client_abort`.
 - **Assuming non-streaming endpoints cancel on disconnect.** Symptom: a 2-minute generation completing
-  for a client that left after 5 seconds.
+  for a client that left after 5 seconds. Fix: race generation against a disconnect watcher.
 - **Cancelling an agent mid-tool-call with no idempotency.** Symptom: duplicated emails or orders when
-  the user retries after hitting stop.
+  the user retries after hitting stop. Fix: idempotency keys or two-phase tools.
 - **Reporting cancelled requests as errors.** Symptom: a noisy error rate that masks real failures and
-  panics on-call.
+  panics on-call. Fix: a separate "cancelled" status and metric.
 
 ## When to use
 - **Always, for services fronting a model:** cancellation on disconnect, timeout and supersede is not

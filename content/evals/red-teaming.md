@@ -5,7 +5,7 @@ name: Red teaming
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - evals/adversarial-evaluation
   - evals/regression-tests
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-Red teaming is a deliberate, goal-driven attempt to make your AI system leak data, obey injected
-instructions, cause harm, act without authorisation or invent policy. Ordinary evals test expected
-inputs; costly failures come from inputs an adversary chooses.
+Red teaming is a deliberate, goal-driven attempt to make your AI system leak data or its prompt, obey
+injected instructions, cause harm, act without authorisation or invent policy, because costly failures
+come from inputs an adversary chooses. Each success becomes a permanent regression test.
 
 ## Why it exists
 - **Golden sets sample expected use; incidents are off-distribution and chosen on purpose.** A user who
@@ -34,7 +34,8 @@ inputs; costly failures come from inputs an adversary chooses.
   system passing 99% of its golden set can still do all of these, because nothing in the golden set tried.
 - **The attack surface is larger than the chat box.** Anything that becomes tokens is an input: user
   turn, history, retrieved documents, tool results, uploaded files, text inside images, messages from
-  other agents. Indirect prompt injection targets channels the user never types into.
+  other agents. Indirect prompt injection targets channels the user never types into, so a test plan
+  built from "what might a user type" misses them entirely.
 - **"The vendor already red-teamed the model"** is true for generic harms, but the vendor never saw your
   system prompt, tools, data or policies. The behaviours that hurt you (an unauthorised discount, a
   cross-tenant leak, an invented refund policy) are application-specific.
@@ -230,7 +231,8 @@ print(k_needed(0.05), k_needed(0.01))   # 59 299
 ## Production patterns
 - **Canary tokens with live alerting.** Plant a unique random string in the system prompt and in canary
   customer records, then scan every production output and outbound tool argument for it. Alert on any
-  hit, because a canary in output is an exfiltration with no false positives. Monitor canary hits per day
+  hit, because a unique random string has no legitimate reason to appear in output, so false positives
+  are close to zero. Monitor canary hits per day
   and the route they came from.
 - **Adversarial suite as a CI gate.** Store each finding as a case with its deterministic or judge
   grader and run it on every prompt, model, tool or guardrail change (Promptfoo's red-team mode, for
@@ -353,12 +355,14 @@ change.
   attackers retry.
 - **Temperature zero hides stochastic attacks,** so testing at zero overstates safety.
 
-### Your fix took attack success from 30% to 0%. What else must you report?
-- **Benign refusal rate** on a parallel set of legitimate requests, because refusing everyone is the
-  cheapest way to stop every attack.
-- **Attempts generated,** since an attacker model that refused produces a clean-looking report.
-- **Human review of judge positives and negatives,** because judge errors can make 40% look like 5% or
-  the reverse.
+### A red-team report shows 0% attack success. Why might you not trust it?
+- **Too few attempts:** an attacker model that refused to write attacks produces a clean-looking report,
+  so check attempts generated per objective, not just successes.
+- **Wrong sampling:** attacks run once or at temperature zero miss stochastic ones; a 1% attack needs
+  about 299 samples for 95% detection.
+- **Grader blind spots:** a regex that ignores encodings, or an unreviewed judge, can score real
+  breaches as failures, so spot-check judge negatives by hand.
+- **Benign refusal rate:** if it rose, the zero was bought by refusing legitimate users.
 
 ## Quiz
 ### Q: Why is red teaming the deployed application different from red teaming the base model?

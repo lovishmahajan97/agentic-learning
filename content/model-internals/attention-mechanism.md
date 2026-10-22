@@ -5,7 +5,7 @@ name: Attention mechanism
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - model-internals/self-attention
   - model-internals/multi-head-attention
@@ -234,13 +234,17 @@ lengths a retriever that selects a few thousand tokens is the hard top-k version
 
 ## Pitfalls
 - **Reading attention weights as feature importance.** Symptom: explanations that change with the random
-  seed or disagree with gradient-based attribution for the same prediction.
+  seed or disagree with gradient-based attribution for the same prediction. Fix: use attribution or
+  ablation for explanations, and retrieval ids for provenance.
 - **Omitting the √d_k scaling** in a from-scratch implementation. Symptom: attention maps nearly one-hot
-  from the first steps and a training loss that plateaus early.
+  from the first steps and a training loss that plateaus early. Fix: divide scores by √d_k, or call a
+  library kernel that does it.
 - **Applying softmax along the wrong axis**, so weights sum to one across queries rather than across keys.
-  Symptom: outputs whose magnitude changes with sequence length.
+  Symptom: outputs whose magnitude changes with sequence length. Fix: softmax over the key axis and
+  assert each row of weights sums to one.
 - **Forgetting to mask padding positions.** Symptom: the same input producing different outputs depending
-  on how much padding its batch-mates needed.
+  on how much padding its batch-mates needed. Fix: mask padded keys to `-inf` before softmax and test
+  alone-vs-batched equality.
 
 ## When to use
 You rarely instantiate attention as a standalone primitive, but you meet the pattern constantly.
@@ -296,7 +300,8 @@ plateaus, and performance that gets worse, not better, as you increase the head 
 - **Hardware fit.** All scores for all queries come from one matrix–matrix product, which runs on tensor
   cores; additive scoring needs a small MLP per (query, key) pair.
 - **Quality parity once scaled.** The original paper found them similar at small d_k, with unscaled
-  dot-product falling behind at larger d_k, which the √d_k scaling fixed.
+  dot-product falling behind at larger d_k; the authors attributed that to large scores saturating the
+  softmax, which motivated the √d_k scaling.
 
 ### How does a vector database relate to the attention mechanism?
 - **Same operation, different form.** Attention softly weights every key; vector search takes the hard

@@ -5,7 +5,7 @@ name: Faithfulness / groundedness
 kind: metric
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - evals/hallucination-evaluation
   - evals/retrieval-evaluation
@@ -117,6 +117,7 @@ flowchart TD
     V --> NF["Not found"]
     S --> AG["Faithfulness = supported / total"]
     NF --> AG
+    C --> AG
     C --> G["Gate: any contradiction fails"]
     AG --> T["Report with relevance and abstention rate"]
     G --> T
@@ -246,11 +247,13 @@ An eval run over 400 answers (illustrative numbers).
 - **Collapsing NOT_FOUND and CONTRADICTED into one "unsupported" bucket.** Symptom: an answer that
   directly contradicts policy shipping with a respectable 0.8. Fix: three-way verdicts and a gate.
 - **A judge that uses its own knowledge.** Symptom: faithfulness staying high when the context is
-  shuffled or emptied, which the sanity test catches.
+  shuffled or emptied, which the sanity test catches. Fix: tighten the "context only" instruction,
+  require a quoted span, and recalibrate on the labeled claim set.
 - **Decomposition that is too fine.** Symptom: scores inflating as answers get wordier because trivial
   claims are all supported. Fix: a decomposition prompt with examples of the intended granularity.
 - **Reporting faithfulness as if it were accuracy.** Symptom: a stakeholder reading 0.9 as "90% of
-  answers are correct" when the context itself was never checked.
+  answers are correct" when the context itself was never checked. Fix: label it "supported by context"
+  and report correctness separately.
 
 ## When to use
 - **Use for any system that generates from supplied context:** RAG question answering, summarisation,

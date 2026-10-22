@@ -183,6 +183,8 @@ print("micro", f1_score(yt, yp, average="micro"), "macro", round(f1_score(yt, yp
 - **Why precision is so low:** the score distributions are two standard deviations apart (a ROC-AUC around
   0.92), but at 5% prevalence there are nineteen negatives per positive, so the negatives' overlapping tail
   fills the queue. Average precision of about 0.5 says the same in one number.
+- **The spec, not F1, picks the point.** In one run "recall ≥ 0.90" lands at τ ≈ 0.42 with precision ≈ 0.14:
+  about seven flags reviewed per hallucination caught, which is the number to agree with the review team.
 
 ### F-beta and retrieval at k, in plain Python
 How β reweights the same (P, R) pair, and how k acts as the threshold for a retriever.
@@ -209,7 +211,7 @@ for k in (1, 3, 5, 8):
 ```
 
 - **F2 rewards this detector, F0.5 punishes it,** because its strength is recall.
-- **Recall@k only rises with k;** precision@k wanders. If recall@5 is 0.67, one relevant chunk never reaches a
+- **Recall@k never falls as k grows;** precision@k wanders. If recall@5 is 0.67, one relevant chunk never reaches a
   top-5 generator, whatever the prompt says.
 
 ## Production patterns
@@ -241,17 +243,17 @@ for k in (1, 3, 5, 8):
 
 ## Pitfalls
 - **Reporting F1 at the default 0.5 threshold.** Symptom: "the model only has 0.3 recall" when lowering τ to
-  0.2 would give 0.85 recall at an acceptable precision.
+  0.2 would give 0.85 recall at an acceptable precision. Fix: sweep τ on validation.
 - **Choosing the threshold on the test set.** Symptom: the promised precision/recall pair is not reproduced
-  on the next batch, because the selection leaked test labels into the decision.
+  on the next batch, because the selection leaked test labels into the decision. Fix: pick on validation.
 - **Comparing precision across datasets with different prevalence.** Symptom: a model that "degraded" when it
-  moved from a 50/50 benchmark to 2% production traffic without changing at all.
+  moved from a 50/50 benchmark to 2% production traffic without changing at all. Fix: compare (TPR, FPR).
 - **Choosing the positive class by convention rather than by what the product detects.** Symptom: an F1 that
   changes sharply when someone relabels the classes, because F1 ignores true negatives.
 - **Quoting macro-F1 with classes of support one to five.** Symptom: the metric swinging by 0.1 between runs
-  with no model change.
+  with no model change. Fix: print support and track micro alongside.
 - **Blaming the generator when recall@k is the problem.** Symptom: weeks of prompt tuning while the right
-  chunk is not in the top-k at all.
+  chunk is not in the top-k at all. Fix: measure recall@k before touching prompts.
 - **Token F1 on free-text LLM answers against one gold phrasing.** Symptom: correct paraphrases marked wrong.
   Normalise aggressively or use a judge for anything non-extractive.
 

@@ -5,7 +5,7 @@ name: Race conditions & synchronization primitives (asyncio.Lock, Semaphore)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -260,13 +260,13 @@ asyncio.run(main())
 - **Creating a primitive at import time and using it from different loops**, as tests often do. Since 3.10
   a primitive binds to the loop on which it first has to wait and raises `RuntimeError` ("bound to a
   different event loop") when it must wait on another. The failure appears only under contention and
-  looks flaky.
+  looks flaky. Fix: create primitives in app startup or per test.
 - **Using a semaphore to enforce a requests-per-minute quota.** Symptom: 429s return when provider latency
   drops, because the same concurrency then produces more requests per minute.
 - **Re-acquiring the same `asyncio.Lock` in a nested call.** The coroutine waits on itself forever and the
-  request hangs with no error.
+  request hangs with no error. Fix: take the lock once at the outer level and call an unlocked inner helper.
 - **Holding a lock or semaphore across a call with no timeout.** One hung upstream request starves every
-  waiter behind it.
+  waiter behind it. Fix: `async with asyncio.timeout(...)` inside the gate.
 
 ## When to use
 - **Lock when** a coroutine reads shared state, awaits, then writes based on what it read: token and
@@ -320,12 +320,14 @@ by a gateway, with the semaphore kept only to bound memory and connections. Retr
 - **The reverse also holds:** asyncio primitives are not thread-safe, so code shared with real threads
   needs thread-safe hand-off such as `loop.call_soon_threadsafe`.
 
-### When is a semaphore the wrong tool for protecting a provider?
-- **When the limit is a rate, not concurrency.** A requests- or tokens-per-minute quota needs a token
-  bucket, because throughput is concurrency divided by latency and rises when latency falls.
-- **When you scale out**, because each process has its own semaphore: `Semaphore(8)` on 2 workers allows
-  16 calls. Fleet-wide limits belong in a shared store such as Redis or a gateway.
-- **When work arrives continuously**, a bounded `asyncio.Queue` with fixed workers is often clearer.
+### When would you use a bounded asyncio.Queue with workers instead of a semaphore around each task?
+- **When work arrives continuously** (an ingest pipeline, a crawler): producers block on `put` once
+  `Queue(maxsize=N)` is full, so memory stays bounded. A semaphore over `gather` still creates every task
+  up front and only gates the call itself.
+- **When you want a fixed, visible concurrency level:** N worker tasks means N calls in flight, and each
+  worker owns its retries and error handling.
+- **Not for a one-off batch of known size**, because the queue costs more structure (worker loops,
+  shutdown via sentinels or cancellation, collecting results); a semaphore around each call is simpler.
 
 ### How many semaphore slots do you need to sustain 20 requests per second at 1.5 seconds latency?
 - **Little's law:** N ≈ λ × W, so 20 × 1.5 ≈ 30 slots.

@@ -5,7 +5,7 @@ name: LiteLLM
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/anthropic-sdk
@@ -55,16 +55,23 @@ can hide or lag provider-specific features.
   convenient and dangerous in equal measure.
 
 ### What translation actually does (OpenAI format to `anthropic/...`)
-| OpenAI side | Anthropic side |
+Request, OpenAI format in, Anthropic request out:
+
+| You send (OpenAI) | LiteLLM sends (Anthropic) |
 |---|---|
 | `system` message in `messages` | top-level `system` field |
 | `max_tokens` omitted | a value is supplied, because Anthropic requires it |
 | `tools[].function` | `name`/`description`/`input_schema` tool |
 | assistant `tool_calls` | `tool_use` blocks |
 | `role: "tool"` message | `tool_result` block inside a user message |
-| `tool_calls` with `arguments` re-serialised as a JSON string | `tool_use` blocks (on the way back) |
-| `finish_reason`: `stop`, `tool_calls`, `length` | `stop_reason`: `end_turn`, `tool_use`, `max_tokens` |
-| `prompt_tokens` / `completion_tokens` | `input_tokens` / `output_tokens` |
+
+Response, Anthropic reply in, OpenAI shape out:
+
+| Anthropic returns | You receive (OpenAI) |
+|---|---|
+| `tool_use` blocks | `tool_calls` with `arguments` re-serialised as a JSON string |
+| `stop_reason`: `end_turn`, `tool_use`, `max_tokens` | `finish_reason`: `stop`, `tool_calls`, `length` |
+| `input_tokens` / `output_tokens` | `prompt_tokens` / `completion_tokens` |
 
 - **Every mapping is a fidelity risk.** A feature with no OpenAI equivalent (thinking blocks, cache
   breakpoints, citations) must ride in an extra field or is lost, which is why translation fidelity is the
@@ -209,8 +216,9 @@ Illustrative settings, during an outage where every upstream call fails:
 | Groups tried: "chat", then "chat-backup" | × 2 |
 | **Upstream calls for one user request** | **18** |
 
-That is more than the "dozen" that already hurts, sent exactly when the provider is rate limiting. With
-retries owned only by the router, the same request makes 3 × 2 = 6 calls.
+Eighteen calls for one user request, sent exactly when the provider is already rate limiting you. With
+retries owned only by the router (`max_retries=0` on the app client), the same request makes 3 × 2 = 6
+calls.
 
 ## Production patterns
 - **Own retries in one layer.** Set `num_retries` and `timeout` in the router or proxy, and `max_retries=0`

@@ -317,7 +317,8 @@ forwards the client close upstream, and race long provider calls against the dis
 
 ### A worker loads a 20-second model at startup. What does the client see during those 20 seconds, and why?
 - **Nothing from that worker.** Uvicorn completes the lifespan handshake before accepting connections,
-  so a loading worker simply is not serving yet.
+  so a loading worker simply is not serving yet: the client waits, is refused, or is served by another
+  worker that is already ready, depending on who owns the listening socket.
 - **If startup fails**, the app sends `lifespan.startup.failed` and the worker never receives traffic.
 - **Operationally:** set the orchestrator's startup probe above the measured load time, or the platform
   kills the worker mid-load and it restart-loops.

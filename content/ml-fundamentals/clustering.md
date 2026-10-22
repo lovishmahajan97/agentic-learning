@@ -5,7 +5,7 @@ name: Clustering
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/supervised-vs-unsupervised-vs-self-supervised-learning
   - ml-fundamentals/classification
@@ -180,7 +180,7 @@ for c in np.argsort(-sizes)[:5]:                               # five largest cl
         print("  -", texts[i][:100])
 ```
 
-### Bad seeds in ten lines of pure Python
+### Bad seeds in pure Python
 The hand-worked example from How it works, runnable with no libraries. Same algorithm, same data; only the
 starting centroids differ.
 

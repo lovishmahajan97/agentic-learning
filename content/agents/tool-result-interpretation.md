@@ -5,7 +5,7 @@ name: Tool-result interpretation
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - agents/tool-calling
   - agents/typed-tool-contracts
@@ -211,8 +211,10 @@ print([m["content"][0]["content"][:40] for m in msgs])   # t0, t1 stubbed; t2-t4
 - **Write tools return the new state.** For every mutating tool; return the record as stored after the write,
   so the model never answers from a pre-write read. Monitor answers that contradict the latest write in evals.
 - **Scheduled compaction of old results.** For runs of many steps; clear or summarize results older than the
-  last few, keeping a summary or reference. Monitor context size per step and the cache-read share after
-  compaction.
+  last few, keeping a summary or reference, either in your harness as above or server-side with the
+  Claude API's context editing (its tool-result clearing strategy). Clear in large batches at a threshold,
+  not every turn, because each clearing invalidates the cache from the first edited block. Monitor context
+  size per step and the cache-read share after compaction.
 
 ## Trade-offs
 - **Projection vs hidden fields.** Projecting to the task's fields saves tokens and improves accuracy, but

@@ -5,7 +5,7 @@ name: Embeddings
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - model-internals/tokenization
   - model-internals/transformer
@@ -38,8 +38,10 @@ tracks meaning, which powers semantic search.
   from scratch for every token.
 - **A learned dense vector fixes both.** It is a few hundred to several thousand dimensions, trained by
   gradient descent on the task (next-token prediction). Tokens that behave similarly in context land in
-  similar places, and that geometry is free information for every later layer. Learning transfers too: a
-  gradient step from a sentence about "cat" moves a vector that sits near "kitten".
+  similar places, and that geometry is free information for every later layer.
+- **Learning transfers between neighbours.** A gradient step from a sentence about "cat" moves a vector
+  that sits near "kitten", so evidence about one token partly informs similar tokens instead of being
+  locked in one orthogonal axis.
 - **The same idea works one level up.** Comparing strings fails on paraphrase when you look for the most
   relevant document. Comparing learned vectors succeeds, because they were trained so that meaning, not
   spelling, determines distance.
@@ -240,11 +242,13 @@ for dim in (384, 1_536, 3_072):
   similarity scores cluster in a narrow band and nearest neighbours are dominated by length and frequent
   words. Fix: use a contrastively trained embedding model.
 - **Forgetting asymmetric prefixes.** Dropping the query/passage prefixes a model was trained with makes
-  recall drop silently, often by a lot, with no error anywhere.
+  recall drop silently, often by a lot, with no error anywhere. Fix: apply the prefixes from the model
+  card in one shared embedding function used by both indexing and querying.
 - **Mixing cosine and dot product on unnormalized vectors.** Cosine in one place, dot product in another,
-  and rankings disagree between offline evaluation and the production index.
+  and rankings disagree between offline evaluation and the production index. Fix: L2-normalize at write
+  time, after which the two metrics give identical rankings.
 - **Embedding chunks longer than the input limit.** The tail is truncated silently and content past the
-  cut is never retrievable.
+  cut is never retrievable. Fix: count tokens with the embedder's tokenizer and split before embedding.
 - **Copying a similarity threshold from another model.** "Treat cosine > 0.8 as relevant" does not
   transfer: score distributions differ by model and some put unrelated pairs well above zero. Symptom: a
   filter that passes everything or nothing. Fix: calibrate thresholds per model on labelled pairs.

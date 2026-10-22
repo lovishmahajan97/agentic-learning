@@ -276,9 +276,9 @@ API key despite the patch.
   and fails on the first real response wrapped in markdown fences.
 - **Mutating a session-scoped fixture.** Symptom: tests that pass alone and fail depending on order, or
   only under parallel runs.
-- **Plain `Mock` for an async client.** Awaiting it raises
-  `TypeError: object Mock can't be used in 'await' expression`, or, worse, code that never awaits passes silently. Use `AsyncMock` or autospec,
-  which creates async methods for coroutine functions.
+- **Plain `Mock` for an async client.** Awaiting its result raises
+  `TypeError: object Mock can't be used in 'await' expression`, or, worse, code that never awaits passes
+  silently. Use `AsyncMock` or autospec, which creates async methods for coroutine functions.
 
 ## When to use
 - **Use doubles at the process boundary:** model APIs, HTTP services, databases, clocks and randomness.

@@ -5,7 +5,7 @@ name: Task decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - agents/planning
   - agents/multi-agent-patterns
@@ -100,7 +100,8 @@ Three numbers decide whether a decomposition pays. Sketch them for a proposed gr
 | **Cost follows the edges** | Total tokens ≈ Σ (task brief + own inputs + upstream results passed in) | A fat transcript on one edge is paid by every consumer of that edge |
 
 - **Why each subtask needs a verifier and a retry:** a step that is checked and retried once fails only
-  when both attempts fail, roughly (1 − p)² if failures are independent, which lifts the chain back up.
+  when both attempts fail, roughly (1 − p)² if failures are independent (and the check catches them),
+  which lifts the chain back up.
 - **Why a long chain is worse than a wide fan-out of the same size:** fewer multiplied failure points on
   any one path, and a shorter critical path.
 
@@ -201,7 +202,8 @@ print(critical_path(fan, dict.fromkeys(fan, 20)))       # 40 seconds
 ```
 
 ### Worked scenario: restructuring a one-shot vendor analysis
-Illustrative numbers for a five-subtask job where each subtask takes about 20 seconds.
+Illustrative numbers. Reliability rows assume 95% success per step and a check that catches every
+failure; latency rows assume about 20 seconds per subtask.
 
 | Design | End-to-end success | Wall-clock | Checkable seams |
 |---|---|---|---|
@@ -310,11 +312,13 @@ raw text when needed. Measure recall per clause type before and after, and token
 - **Keep the shared brief short,** pass references for raw data, cache subtasks by input hash, and give
   cheap models the narrow subtasks while the strongest model does decomposition and merge.
 
-### Design the decomposition for a contract-review agent that compares a contract against a policy playbook.
-- **Cut by data:** one subtask per clause type or section, each with the relevant playbook rule and the
-  definitions section in a shared brief.
-- **Contracts:** each returns present or absent, the clause text reference and a pass or deviate verdict.
-- **Merge:** a strongest-model step resolves conflicts and drafts the redline; measure recall per clause type.
+### Design the decomposition for an agent that migrates 300 files to a new logging library.
+- **Cut by data and verification:** one subtask per module or file group, each with `done_when` set to
+  "module builds and its tests pass", because tests give each piece its own check.
+- **Order by the import graph:** shared utilities first, then their dependants, so the DAG follows real
+  dependencies and independent modules run as a bounded-concurrency fan-out.
+- **Contract and merge:** each subtask returns a diff plus its test result; a final step runs the full
+  suite and resolves conflicts in shared files. Measure per-module pass rate and tokens per file.
 
 ## Quiz
 ### Q: Which boundary is the best place to cut a task into subtasks?

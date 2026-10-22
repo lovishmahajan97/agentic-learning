@@ -5,7 +5,7 @@ name: Memory retrieval / update / deletion policies
 kind: practice
 difficulty: advanced
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - agents/agent-memory
   - agents/context-compaction-summarization
@@ -306,19 +306,22 @@ or the index drifts from the source of truth.
 ## Pitfalls
 - **Scoring across all users and filtering afterwards.** Symptom: users with few memories get thin or empty
   recall because the global top-k was filled by other users' entries, and any bug in that post-filter
-  becomes a cross-user leak.
+  becomes a cross-user leak. Fix: pass scope as a filter inside the vector query.
 - **Append-only updates.** Symptom: two addresses, two plans or two names retrieved together and the agent
-  choosing the wrong one.
+  choosing the wrong one. Fix: an add/update/ignore decision that supersedes.
 - **Storing memories from retrieved documents or web pages.** Symptom: an instruction-shaped memory that
-  appeared after a single browsing task and now influences every session.
+  appeared after a single browsing task and now influences every session. Fix: gate writes by source.
 - **Deleting from the vector index but not the raw store, or the reverse.** Symptom: retrievals that
-  reference missing ids, or erased facts reappearing after a reindex.
+  reference missing ids, or erased facts reappearing after a reindex. Fix: delete by the same ids in
+  both and rebuild the index from the raw store.
 - **Forgetting compaction summaries and consolidated facts during erasure.** Symptom: a "deleted" user's
-  detail resurfacing from a session summary months later.
+  detail resurfacing from a session summary months later. Fix: list every derived store in the erasure
+  routine and verify each by count.
 - **No audit log of memory writes.** Symptom: being unable to explain why the agent believes something,
-  which is exactly what a customer will ask.
+  which is exactly what a customer will ask. Fix: log every mutation with user, source and id.
 - **Handling "forget this" as a soft supersede.** Symptom: a user's export or a data-subject request still
-  shows the fact they asked the agent to forget, marked inactive.
+  shows the fact they asked the agent to forget, marked inactive. Fix: hard-delete it everywhere and
+  keep only a keyed-hash tombstone.
 
 ## When to use
 - **Apply these policies** the moment memories persist across sessions for more than a handful of users.
@@ -373,11 +376,12 @@ inspect.
 - **Always for "forget this" requests,** because keeping an inactive row is exactly the retention the user
   refused; hard-delete and keep only a keyed-hash tombstone.
 
-### How do you prove a user's erasure is complete?
-- **Enumerate every copy:** raw records including superseded ones, index entries and payloads, summaries,
-  consolidated facts, caches, logs and backups.
-- **Delete by id and user id,** write a tombstone checked on the write path and replayed after restores,
-  then verify with counts per store, not a similarity search, and record it in an audit entry.
+### After restoring last week's backup, memories you erased are back. What went wrong, and how do you prevent it?
+- **The backup predates the erasure,** so restoring it reinstated the deleted rows; the tombstones were
+  not replayed against the restored data.
+- **Prevent it:** make tombstone replay a mandatory step of the restore runbook, delete matching ids from
+  the store and the index, and re-run the per-store count check before reopening traffic.
+- **Also check the write path** consults tombstones, so old transcripts cannot re-extract the memories.
 
 ### Your memory extraction runs on millions of turns a day. How do you keep update decisions affordable?
 - **Threshold first:** clearly new candidates are added and exact duplicates ignored by embedding

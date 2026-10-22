@@ -5,7 +5,7 @@ name: Database design
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/sql
   - backend-fundamentals/nosql
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 The schema outlives every version of the code, so encode the facts that must stay true (keys,
-constraints, ownership). Normalize so each fact lives once, denormalize only where a measured read needs
-it, and design indexes from real queries.
+constraints, ownership), not the shape of today's screens. Normalize so each fact lives once, denormalize
+only where a measured read needs it, and index real queries.
 
 ## Why it exists
 - **Data outlives code.** Code is rewritten every year; the data it produced is still there a decade
@@ -111,8 +111,8 @@ A table describes one kind of thing, and every non-key column depends on the who
 - **Equality first, range or sort last,** *because* the B-tree sorts by the first column, then the second
   within ties. Equality on the leading column narrows to one contiguous slice already ordered by the next.
   Put the range column first and one conversation's entries scatter across the whole range.
-- **Index foreign-key columns.** Joins and cascading deletes look rows up by them, and PostgreSQL does not
-  create one automatically on the referencing side.
+- **Index foreign-key columns (usually).** Joins and cascading deletes look rows up by them, and
+  PostgreSQL does not create one automatically on the referencing side.
 
 ### Evolving the schema
 The schema changes while old code still runs, so every change must work with both versions for the length
@@ -248,7 +248,7 @@ The team wants `messages.content` renamed to `body` on a large, hot table while 
 | 2. Dual write | app v2 | writes `content` and `body`; still reads `content` |
 | 3. Backfill | job | copy `content` into `body` in small batches by primary-key range |
 | 4. Move reads | app v3 | reads `body`, still writes both |
-| 5. Contract | app v4 + migration | stop writing `content`, then drop it |
+| 5. Contract | migration, app v4, migration | drop `NOT NULL` on `content` first (otherwise v4 inserts fail), stop writing it, then drop it |
 
 A one-step `ALTER TABLE ... RENAME COLUMN` would have broken every v1 instance still serving traffic.
 
@@ -263,8 +263,9 @@ A one-step `ALTER TABLE ... RENAME COLUMN` would have broken every v1 instance s
   `tenant_id = current_setting('app.tenant_id')::uuid`, set per request. Table owners bypass policies
   unless you also `FORCE ROW LEVEL SECURITY`. Monitor with a CI test that tries a cross-tenant read.
 - **Index review from statistics.** Periodically list indexes with `idx_scan = 0` in
-  `pg_stat_user_indexes` (candidates to drop) and slow statements from `pg_stat_statements` (candidates
-  for a composite index). Monitor write latency on tables you add indexes to.
+  `pg_stat_user_indexes` (candidates to drop, except those backing a primary key or unique constraint,
+  and check replicas too, because the counters are per server) and slow statements from
+  `pg_stat_statements` (candidates for a composite index). Monitor write latency on tables you index.
 - **Keep big payloads out of the hot table.** Full prompts and document text go in a side table or object
   storage keyed by message id, so the hot table's working set fits in cache. Monitor table size with
   `pg_total_relation_size` and cache hit ratio.

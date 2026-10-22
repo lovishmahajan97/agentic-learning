@@ -5,7 +5,7 @@ name: Gradient clipping
 kind: practice
 difficulty: core
 est_minutes: 11
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/backpropagation
   - ml-fundamentals/optimizers
@@ -38,8 +38,9 @@ corrupt optimizer statistics.
   hundreds of steps and shrinks later updates. The run quietly learns slower; the loss shows an
   unexplained plateau.
 - **A lower learning rate is the blunt fix.** It penalizes every normal step to survive a rare one;
-  clipping bounds only outliers. Theory caught up: clipped descent converges faster than fixed-step descent
-  when smoothness varies with gradient magnitude, the regime deep networks live in.
+  clipping bounds only outliers. Theory later caught up: clipped descent can be shown to converge faster
+  than fixed-step descent on functions whose smoothness varies with gradient magnitude, the regime deep
+  networks live in.
 
 ## How it works
 ### Global norm clipping
@@ -182,8 +183,11 @@ ignoring `m`).
 
 - **With β2 = 0.999** the parameter learns at roughly half speed for hundreds of steps: the "plateau
   nobody can explain".
-- **With clipping at 1.0** the spike's gradient is scaled by about 1/50 before it reaches `v`, so the moment
-  estimates never see it.
+- **With clipping at 1.0**, if the global norm spikes by the same factor as this parameter (typical norm
+  about 1, spike about 50), the clip scales the gradient by about 1/50 before it reaches `v`, so `v` sees
+  an ordinary-sized value instead of a 2,500× outlier.
+- **With β2 = 0.95** the hit is deeper but shorter: updates drop to 0.09× at once and recover within a
+  few hundred steps, while 0.999 takes a milder hit that lasts thousands of steps.
 
 ## Production patterns
 - **Clip by default, log the norm always.** Set `max_norm = 1.0` (the Hugging Face Trainer's
@@ -220,7 +224,8 @@ ignoring `m`).
 - **Clipping after `optimizer.step()` or before `backward()`.** The call succeeds, does nothing useful,
   and the first real gradient spike still corrupts the run.
 - **Clipping each micro-batch.** In an accumulation loop this changes the direction of the summed gradient
-  and makes the effective threshold depend on the accumulation count.
+  and makes the effective threshold depend on the accumulation count. Fix: clip once, after the last
+  backward of the window.
 - **The plain utility on FSDP1 shards.** Using it instead of FSDP1's `clip_grad_norm_` method computes the
   norm over the local shard only, so clipping behaves differently on every rank.
 - **Papering over divergence.** Clipping a too-high learning rate or missing warmup makes the clip fire on

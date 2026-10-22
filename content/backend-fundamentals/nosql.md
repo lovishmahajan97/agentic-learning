@@ -5,7 +5,7 @@ name: NoSQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/database-design
   - backend-fundamentals/sql
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-NoSQL stores give up general joins and cross-record transactions to partition data by key and serve it
-with predictable latency at any size. You design around exact queries and accept weaker consistency on
-some reads; choose one for a known access pattern at scale.
+NoSQL stores give up joins and cross-record transactions to partition data by key with predictable
+latency at any size. You design around exact queries and accept weaker reads. Choose one for a known,
+narrow access pattern at scale, not because "schemaless" sounds easier.
 
 ## Why it exists
 - **One machine has a ceiling.** A relational database answers any SQL question, but only within one
@@ -230,7 +230,8 @@ for w, r in [(1, 1), (1, 2), (2, 1), (2, 2), (3, 1)]:
 
 ### Worked scenario: one tenant melts one partition
 A DynamoDB table takes 5,000 writes per second overall; one tenant produces 40% of them and `tenant_id`
-is the partition key. Ceiling figure from the per-partition limit above; arithmetic only, not a benchmark.
+is the partition key. Items are under 1 KB, so each write costs one write unit. Ceiling figure from the
+per-partition limit above; arithmetic only, not a benchmark.
 
 | Key design | Writes/s on hottest partition | Against 1,000 write units/s ceiling |
 |---|---|---|

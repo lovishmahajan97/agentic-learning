@@ -5,7 +5,7 @@ name: Anthropic SDK
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/litellm

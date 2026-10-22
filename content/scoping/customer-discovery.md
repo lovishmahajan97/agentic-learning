@@ -178,10 +178,10 @@ claims-system admin.
 
 | Finding | Source | Evidence |
 |---|---|---|
-| A typical claim takes about 40 minutes of hands-on work | Adjusters walking through their last three claims | Repeated across all three |
+| A typical claim takes about 40 minutes of hands-on work | Adjusters | Each walked through their last three claims; the pattern repeated |
 | Roughly 15 of those minutes go to finding which clauses apply | Adjusters | Wordings live in a store organised by product version; adjusters match the policy's issue date to the right version |
-| About 120 claims a day, so lookup is 120 × 15 = 1,800 minutes, or 30 person-hours, daily | Team lead | Volume report |
-| Wrong-version lookups are a known cause of payment leakage | Team lead | Supervisors spot-check 10% of claims |
+| About 120 claims a day, so lookup is 120 × 15 = 1,800 minutes, or 30 person-hours, daily | Interviews | Daily team volume |
+| Wrong-version lookups are a known cause of payment leakage | Team lead | Supervisors already spot-check 10% of claims |
 | Nobody asked for a chat interface | Adjusters | They live in the claims screen and do not want another tab |
 | Policy issue date and product code are available | Claims-system admin | Exposed through the claims system's API |
 
@@ -196,7 +196,7 @@ claims-system admin.
 ## Production patterns
 - **Standard interview guide per role** — when running more than a handful of interviews, keep one guide
   per role on the stakeholder map: past-event prompts, the four follow-ups, and the error-cost question.
-  Store notes in one shared template so findings are comparable. Monitor how many guides end with a
+  Store notes in one shared template so findings are comparable. Monitor how many interviews end with a
   concrete frequency and a concrete workaround.
 - **Saturation tracker** — after each interview, log new pains, workarounds and exceptions per role in a
   simple table. Stop a role after two or three consecutive interviews add nothing new. Monitor coverage:
@@ -234,9 +234,11 @@ claims-system admin.
 - **Skipping the decision process.** Symptom: a successful pilot that stalls because security, legal or the
   budget holder were never asked what they needed to see. Fix: ask who decides, early.
 - **Asking leading questions or pitching mid-interview.** Symptom: notes full of quotes that agree with the
-  original idea and almost no concrete descriptions of past events, frequencies or workarounds.
+  original idea and almost no concrete descriptions of past events, frequencies or workarounds. Fix: never
+  describe your idea until the interview ends, and ask for the last occurrence instead.
 - **Letting the first solution idea become the spec.** Symptom: every later conversation is about features
-  of the chatbot rather than whether claims get processed faster or more accurately.
+  of the chatbot rather than whether claims get processed faster or more accurately. Fix: keep the idea as
+  one hypothesis and steer each conversation back to the outcome in the problem statement.
 
 ## When to use
 - **Use at the start of every engagement**, and again whenever scope changes materially, such as a new

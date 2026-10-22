@@ -5,7 +5,7 @@ name: Transformer
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - model-internals/attention-mechanism
   - model-internals/self-attention
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-A transformer stacks identical blocks: attention lets positions exchange information, then a
-per-position MLP transforms each. Positions run in parallel and any two are one step apart, which made
-web-scale training affordable. Nearly every LLM is a decoder-only variant.
+A transformer stacks identical residual blocks: attention lets positions exchange information, then a
+per-position MLP transforms each. All positions run in parallel and any two are one attention step
+apart, which made web-scale training affordable. Nearly every current LLM is decoder-only.
 
 ## Why it exists
 - **Recurrence is sequential.** Before 2017 sequence models were recurrent. An LSTM reads token *t* only
@@ -214,7 +214,9 @@ for n in (2_000, 8_000, 32_000):
     print(f"n={n:>6}: attention scores add {extra/(2*N):.0%} on top of 2N")
 # attention 67.1M, MLP 135.3M per layer, total 6.74B
 # inference ~13.5 GFLOP/token, training ~40.4 GFLOP/token
-# n=2000: +8%   n=8000: +31%   n=32000: +124%
+# n=  2000: attention scores add 8% on top of 2N
+# n=  8000: attention scores add 31% on top of 2N
+# n= 32000: attention scores add 124% on top of 2N
 ```
 
 ### Worked scenario: a cost model that broke at long context
@@ -271,9 +273,11 @@ chunked summarization instead of one giant prompt.
   produces a model that runs and emits fluent garbage. Fix: load through the matching config and test.
 - **Using the wrong layout for the task.** Assuming an encoder-only model can be prompted to generate, or
   that a decoder-only model gives good bidirectional embeddings out of the box. Symptom: puzzlingly weak
-  results on a task the architecture was never trained to do.
+  results on a task the architecture was never trained to do. Fix: match layout to task, or use a model
+  trained for embeddings.
 - **Reading attention maps as explanations.** Many heads over many layers plus the MLP path mean a single
-  map rarely tells you why the model answered as it did.
+  map rarely tells you why the model answered as it did. Fix: treat a map as a hint and confirm a claim
+  by ablating the component.
 
 ## When to use
 You rarely choose *whether* to use a transformer; you choose which layout and size.

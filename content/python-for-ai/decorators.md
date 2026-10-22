@@ -5,7 +5,7 @@ name: Decorators
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/tenacity
   - python-for-ai/async-await
@@ -267,11 +267,15 @@ asyncio.run(search_docs("refund policy"))        # search_docs took 120 ms (abou
 - **Omitting `functools.wraps`.** Symptom: every tool in an agent's schema named `wrapper` with no
   description, or FastAPI dependencies resolving the wrong parameters.
 - **A sync wrapper on an `async def`.** Latency metrics show microseconds and retries never fire, because the
-  error only appears when the coroutine is awaited elsewhere.
+  error only appears when the coroutine is awaited elsewhere. Fix: branch on
+  `inspect.iscoroutinefunction(fn)` and return an `async def` wrapper that awaits the call.
 - **`lru_cache` or `cache` on a method.** The cache holds a reference to `self` in every key, so instances
-  stay alive while cached (forever under `cache`). Symptom: steadily growing memory.
-- **Retry and timeout stacked the wrong way round.** Traces show either one timeout killing all retries or
-  retries continuing far past the deadline.
+  stay alive while cached (forever under `cache`). Symptom: steadily growing memory. Fix: cache a
+  module-level function keyed on plain values, or keep a bounded cache on the instance.
+- **Retry and timeout stacked against your intent.** Timeout outside retry is one deadline for all
+  attempts; retry outside timeout gives each attempt its own. Symptom: traces show either one timeout
+  killing all retries or retries continuing far past the deadline. Fix: choose the order on purpose, and
+  add an outer deadline when retries are per-attempt.
 - **Expensive work in the decorator body instead of the wrapper.** It runs once at import, which slows
   startup or freezes a value that should be read per call.
 - **A framework's registration decorator below your wrappers.** The framework registers the bare function.

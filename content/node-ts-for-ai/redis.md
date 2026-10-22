@@ -5,7 +5,7 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/redis
   - fastapi-for-ai/redis-caching
@@ -132,7 +132,7 @@ flowchart TD
     L -->|"yes or Redis down"| C{"Cache hit?"}
     C -->|"yes"| H["Return cached text"]
     C -->|"no or Redis down"| F{"Won fill key NX PX?"}
-    F -->|"yes"| M["Call the model"]
+    F -->|"yes or Redis down"| M["Call the model"]
     M --> S["SET key EX ttl plus jitter"]
     S --> H
     F -->|"no"| P["Poll cache briefly"]
@@ -223,7 +223,7 @@ Illustrative numbers for a completion cache, using the entry size from the trade
 | Memory for a million cached prompts at 20 KB each | 1,000,000 × 20 KB | ~20 GB of RAM, before overhead |
 | Same traffic with a 1-hour TTL, if only 100,000 distinct prompts arrive per hour | 100,000 × 20 KB | ~2 GB resident |
 | A popular entry expires while 200 identical requests are in flight | no single-flight: each misses | 200 paid completions |
-| Same expiry with the `NX` fill key | 1 caller fills, 199 poll | 1 paid completion |
+| Same expiry with the `NX` fill key | 1 caller fills, 199 poll | 1 paid completion, if the fill lands before the pollers time out |
 
 ## Production patterns
 - **Separate instances by role.** Run the cache with `maxmemory-policy allkeys-lru` and no persistence,

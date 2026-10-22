@@ -5,7 +5,7 @@ name: Tool calling
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - agents/agent-loop
   - agents/tool-schemas-and-argument-validation
@@ -219,7 +219,8 @@ Illustrative assumption: about 100 tokens per tool declaration. Measure your own
   the Claude API's token-count endpoint (`client.messages.count_tokens`) with and without `tools` and
   record the difference. Monitor fixed tokens per request per route.
 - **Defer rarely used tools.** For large catalogues; keep a small core set always loaded and expose the
-  rest through a tool-search step or deferred loading so only relevant declarations enter context. Monitor
+  rest through a tool-search step or deferred loading so only relevant declarations enter context (on the
+  Claude API, the tool search tool plus `defer_loading: true` on the long-tail declarations). Monitor
   selection accuracy and how often the search step is used.
 - **Central dispatcher with errors as results.** In every harness; one `dispatch` function as above, with
   the tool name, latency and `is_error` logged per call. Monitor error rate per tool; a spike usually means

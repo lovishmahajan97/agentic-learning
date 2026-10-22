@@ -5,7 +5,7 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/redis-caching
   - node-ts-for-ai/redis
@@ -140,8 +140,10 @@ flowchart TD
     O -->|"no"| G["GET cache key from hash of params"]
     G --> H{"Hit?"}
     H -->|"yes"| A["Return cached answer"]
-    H -->|"no"| L["SET lock NX PX"]
-    L --> M["Call model provider"]
+    H -->|"no"| L{"SET lock NX PX succeeded?"}
+    L -->|"no, another caller is filling"| W["Wait briefly, re-read cache"]
+    W --> G
+    L -->|"yes"| M["Call model provider"]
     M --> S["SET cache key with TTL"]
     S --> U["Release lock if token matches"]
     U --> A
@@ -357,7 +359,8 @@ a durable broker or a database-backed queue.
 - **Size:** average response size × distinct cached prompts within the TTL, plus overhead; set
   `maxmemory` below the instance's RAM and an `allkeys-lfu` or `allkeys-lru` policy.
 - **Monitor:** hit ratio, evicted keys, memory usage, slow-log entries and per-node network for hot keys.
-  A falling hit ratio with rising evictions means the cache is too small or the TTL too long.
+  A falling hit ratio with rising evictions means the working set no longer fits in `maxmemory`: add
+  memory or stop caching entries that are rarely reused.
 
 ## Quiz
 ### Q: Why can a plain INCR in Redis be used as a correct rate-limit counter across many application servers?

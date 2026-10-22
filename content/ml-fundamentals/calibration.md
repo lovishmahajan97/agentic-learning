@@ -24,8 +24,8 @@ sources:
 
 ## TL;DR
 A calibrated model's confidence matches its hit rate: of everything it calls "90%", about 90% is right.
-Decisions such as thresholds, abstention and escalation need this; ranking does not. Measure it on held-out
-data and fix it post hoc, usually with temperature scaling.
+Thresholds, abstention and escalation need this; ranking does not. Modern networks are usually
+overconfident: measure on held-out data, fix post hoc, usually with temperature scaling.
 
 ## Why it exists
 - **A score and a probability are different contracts.** A score only promises an ordering. A probability
@@ -238,12 +238,16 @@ def calibrate_and_report(X_train, y_train, X_test, y_test):
     return cal, brier_score_loss(y_test, p), worst_gap   # store and alert on both
 ```
 
+The exact fitted T in the previous example varies slightly with the PyTorch version (a recent run gave 2.02
+and ECE 0.167 to 0.014); what matters is T near 2 and an order-of-magnitude drop in ECE.
+
 Use `method="sigmoid"` instead when the calibration data is small, because isotonic overfits on few points.
 
 ## Production patterns
 - **Ship the calibrator with the model.** Fit T (or the isotonic map) in the training pipeline on the
   validation split, save it in the same artefact, and apply it inside the serving code so no consumer sees
-  raw logits. Monitor that the deployed T matches the artefact's recorded value.
+  raw logits. Add a serving test that a fixed input's served probability equals the calibrated value
+  recorded at training, which catches a calibrator silently dropped in a refactor.
 - **ECE as a scheduled monitor.** Label a fresh production sample weekly, compute ECE with equal-mass bins
   and a fixed bin count, per class, plus Brier. Alert when ECE rises past a reviewed bound or mean predicted
   probability departs from the observed rate.
@@ -266,7 +270,7 @@ Use `method="sigmoid"` instead when the calibration data is small, because isoto
 - **Proper scoring rules vs ECE.** Proper rules reward calibration and sharpness in one number but cannot say
   which moved; ECE isolates calibration but depends on binning and is biased on small samples. Report both
   when someone downstream will act on the probability.
-- **A labelled calibration split vs training data.** Worth it whenever a threshold, cascade, human escalation
+- **A labelled calibration split vs training data.** The split costs training data; worth it whenever a threshold, cascade, human escalation
   or user-facing confidence consumes the probability; pointless when only the ranking is consumed.
 - **Sampling confidence vs cost for LLMs.** It is the most reliable black-box signal but costs n calls per
   answer; flip to token log-probabilities when the API exposes them and the output format is constrained
@@ -274,18 +278,20 @@ Use `method="sigmoid"` instead when the calibration data is small, because isoto
 
 ## Pitfalls
 - **Fitting the calibrator on training data.** Symptom: ECE looks fine offline while production
-  overconfidence persists untouched.
+  overconfidence persists untouched. Fix: a calibration split the model never trained on.
 - **Fitting and reporting on the same split.** Symptom: an optimistic ECE, worst with isotonic regression,
-  that does not reproduce on new data.
+  that does not reproduce on new data. Fix: report on a third split.
 - **Shipping raw probabilities after class-weighting or resampling.** Symptom: mean predicted probability far
-  above the observed base rate and a flooded queue at any sensible threshold.
+  above the observed base rate and a flooded queue at any sensible threshold. Fix: prior-correct or
+  recalibrate at deployment prevalence.
 - **Assuming better AUC means better probabilities, or vice versa.** Symptom: a calibration fix judged
   useless because AUC did not move, or a new model trusted because AUC rose.
 - **Trusting verbalised LLM confidence as a probability.** Symptom: a reliability diagram flat at 85–95%
   confidence across correct and incorrect answers alike.
-- **Ten equal-width bins on 200 examples.** Symptom: ECE moving by 0.05 when you change the bin count.
+- **Ten equal-width bins on 200 examples.** Symptom: ECE moving by 0.05 when you change the bin count. Fix:
+  fewer, equal-mass bins and a bootstrap interval.
 - **Reporting only the average ECE.** Symptom: a badly overconfident minority class hiding behind a
-  calibrated majority.
+  calibrated majority. Fix: per-class ECE.
 
 ## When to use
 - **Calibrate whenever something consumes the probability rather than the ranking:** a cost-based threshold,

@@ -46,6 +46,7 @@ idempotent retries, quorums, fenced leases, consensus, tracing.
   effects and overload: five layers retrying three times each fan one failure into up to 4⁵ ≈ 1,000
   attempts. "Make everything strongly consistent" costs round trips, and with even one crashed process no
   deterministic protocol can guarantee agreement terminates in an asynchronous network (the FLP result).
+  Working systems live between those poles.
 
 ## How it works
 ### System models: what you assume can go wrong
@@ -248,8 +249,9 @@ rather than its own default timeout.
 | Without deadline propagation | 6 s + a fresh 6 s retry | negative | client already gave up; the retry's tokens are wasted |
 
 ## Production patterns
-- **Deadline propagation on every hop.** Carry the remaining budget with the request (gRPC deadlines do this
-  natively; over HTTP pass it in a header or context) and set each client's timeout to the smaller of its
+- **Deadline propagation on every hop.** Carry the remaining budget with the request (gRPC sends the deadline
+  on the wire and propagates it when you pass the incoming context to outgoing calls; over HTTP pass it in
+  a header) and set each client's timeout to the smaller of its
   own cap and what is left. Monitor timeout rate per dependency and requests that start with under a
   minimum budget.
 - **One retry layer with a budget.** Retry at a single layer, with jittered exponential backoff (for example

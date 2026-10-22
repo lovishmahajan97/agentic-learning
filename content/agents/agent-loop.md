@@ -5,7 +5,7 @@ name: Agent loop
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - agents/tool-calling
   - agents/workflows-vs-agents
@@ -205,6 +205,9 @@ Same assumptions as above: 3,000 stable tokens, 1,500 new tokens per step (illus
 - **The transcript ends at ~33k tokens, but the run paid for ~375k.** That 11x gap is the quadratic term.
 - **With caching**, everything except each call's new 1,500-token tail can be a cache read; on the Claude
   API cache reads are billed at roughly a tenth of the base input rate.
+- **Illustrative caching maths:** steps 2 to 20 read 342k cached tokens and write 33k new ones in total.
+  At 0.1x for reads and 1.25x for 5-minute cache writes that is about 34k + 41k ≈ 75k base-token
+  equivalents instead of 375k, roughly 5x cheaper.
 - **One in-place edit at step 3** would force every later call to reprocess from step 3 onward.
 
 ## Production patterns
@@ -216,7 +219,8 @@ Same assumptions as above: 3,000 stable tokens, 1,500 new tokens per step (illus
   flat completion points at tools or instructions.
 - **Cache the stable prefix.** For any multi-step agent; keep system prompt and tool definitions
   byte-identical and first, and mark the end of that prefix with a `cache_control` breakpoint on the Claude
-  API. Monitor cache-read tokens against total input tokens.
+  API. Put a second breakpoint on the newest message each turn, because a breakpoint only on the static
+  prefix leaves the growing history uncached. Monitor cache-read tokens against total input tokens.
 - **Graceful exhaustion.** Whenever a budget trips; make the tools-off report call shown above and return
   `budget_exhausted` with the report. Monitor how often callers can resume from the report.
 - **Repetition guard.** For long-running agents; hash each call's tool name plus canonical JSON arguments
@@ -309,8 +313,10 @@ transcript from the model.
 ### Estimate the input tokens for a 20-step run and how you would cut the bill.
 - **Arithmetic:** with 3,000 stable tokens and 1,500 per step, step *k* sends 3,000 + 1,500·*k*; twenty
   steps total about 375k input tokens for a ~33k final transcript.
-- **Levers:** prompt caching on the append-only prefix, smaller structured tool results, explicit
-  compaction of old results, and a budget so stuck runs stop paying.
+- **Biggest lever is caching:** at 0.1x for cache reads and 1.25x for writes, the same run costs about
+  75k base-token equivalents, roughly 5x less, provided nothing edits the prefix.
+- **Then shrink growth:** smaller structured tool results, explicit compaction of old results, and a
+  budget so stuck runs stop paying.
 
 ### What should the loop return when a budget trips?
 - **Not a bare exception,** because it discards every paid-for step.

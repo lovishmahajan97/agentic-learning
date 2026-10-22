@@ -5,7 +5,7 @@ name: Idempotency
 kind: concept
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/retry-strategies
   - serving-inference/timeouts
@@ -188,11 +188,12 @@ RETURNING attempt_id;
 -- No row returned: SELECT the existing row and answer 422, replay, or 409.
 
 -- Heartbeat during long work, and completion: both only for the lease holder.
+-- (Each statement numbers its own parameters: $1 scope, $2 key, $3 this attempt's id.)
 UPDATE idempotency_keys SET lease_until = now() + interval '120 seconds'
-WHERE scope = $1 AND key = $2 AND attempt_id = $4 AND status = 'in_progress';
+WHERE scope = $1 AND key = $2 AND attempt_id = $3 AND status = 'in_progress';
 
-UPDATE idempotency_keys SET status = 'completed', response = $5
-WHERE scope = $1 AND key = $2 AND attempt_id = $4;
+UPDATE idempotency_keys SET status = 'completed', response = $4
+WHERE scope = $1 AND key = $2 AND attempt_id = $3 AND status = 'in_progress';
 -- 0 rows updated: the lease was lost, so another attempt owns the outcome.
 ```
 

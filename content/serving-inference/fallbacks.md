@@ -5,7 +5,7 @@ name: Fallbacks
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - system-design/model-fallback-strategies
   - reliability/circuit-breakers

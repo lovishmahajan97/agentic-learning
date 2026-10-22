@@ -5,7 +5,7 @@ name: Residual connections
 kind: concept
 difficulty: core
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/normalization
   - ml-fundamentals/backpropagation
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-A residual connection adds a layer's input to its output, `y = x + F(x)`, so each layer learns a
-correction, not a replacement. The identity path keeps gradients alive through depth; in transformers it
-is the residual stream all heads and MLPs share.
+A residual connection adds a layer's input to its output, `y = x + F(x)`, so each layer starts as "do
+nothing" and learns a correction. The identity path carries gradients through depth; in
+transformers it is the residual stream that heads and MLPs share.
 
 ## Why it exists
 - **Deeper was supposed to be at least as good.** The 2014–2015 expectation: a 56-layer network can
@@ -207,7 +207,8 @@ A drift of just 5% in `α` either way shrinks the direct gradient path about 12�
   near the embedding scale.
 - **Monitor branch-to-stream ratios.** Register forward hooks (`module.register_forward_hook`) on each
   block to log the branch-output norm next to the stream norm. A branch at 1% of the stream is a layer
-  doing little; a ratio exploding late predicts instability.
+  doing little; a ratio that climbs sharply mid-run is worth lining up against the loss and grad-norm
+  traces.
 - **Debug with the logit lens.** Apply the final norm and unembedding to intermediate streams on a fixed
   prompt set and track how early the right token appears. Use it to locate where a fine-tune changed
   behaviour.
@@ -313,12 +314,13 @@ leave the skip path clean.
 - **Fix:** divide those weights' init by the square root of the number of residual layers, as GPT-2 does.
 - **Also check** that the final norm exists and that nothing multiplicative sits on the skip path.
 
-### Why not make the shortcut learnable or gated for flexibility?
-- **It compounds:** a learned `α` puts `Π α_l` on the identity path; over 48 layers, 0.95 gives about 0.085
-  and 1.05 about 10.4.
-- **Evidence:** identity-mappings experiments found every scaled, gated or projected shortcut trained
-  worse, increasingly so with depth.
-- **Better:** put any scale on the branch, initialized at zero, and keep the skip clean.
+### What is the residual stream, and why does it matter when you hook or adapt a model?
+- **A shared additive bus:** every head and MLP reads `x` through input projections and adds its output
+  back, so the stream at layer k is the sum of all earlier writes.
+- **Techniques that rely on the sum:** the logit lens decodes intermediate streams, steering adds a vector
+  at one layer, and LoRA adds a low-rank term to a projection, each with a predictable downstream shift.
+- **Hook the right tensor:** read the branch output for one layer's own contribution; the stream gives
+  the cumulative sum.
 
 ### Why can you often drop layers from a trained transformer for latency?
 - **The output is a sum:** each layer writes an increment into the stream, and any prefix is a usable, if

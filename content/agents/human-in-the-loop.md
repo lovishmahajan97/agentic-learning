@@ -5,7 +5,7 @@ name: Human-in-the-loop
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - agents/approval-gates-for-consequential-actions
   - agents/state-machines
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 Human-in-the-loop places a person before, during or after an agent's actions, because models err and
-people hold authority and information agents lack. Attention is scarce, so put review where it cuts most
-risk and keep each decision cheap and genuine.
+people hold authority and information agents lack. Attention is scarce, so review where it cuts most risk
+and make each decision cheap, informed and genuine.
 
 ## Why it exists
 - **Small error rates are large at volume.** An agent right 97% of the time is wrong 30 times per
@@ -205,7 +205,7 @@ for n in (140, 500):
   reviewer and per class; alert when it drops.
 - **Per-class autonomy table with automatic tightening.** When graduating autonomy. Keep a config row
   per action class (mode: block, audit or auto; audit rate; agreement threshold; window size) and a job
-  that flips a class back to block when rolling audit agreement crosses the threshold. Monitor agreement
+  that flips a class back to block when rolling audit agreement falls below the threshold. Monitor agreement
   per class over a window of several hundred audits.
 - **Effect-first review payloads.** For every reviewable tool. Require a dry-run function that returns
   the diff, affected rows or rendered email, and render that, not the transcript. Monitor median

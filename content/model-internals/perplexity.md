@@ -5,7 +5,7 @@ name: Perplexity
 kind: metric
 difficulty: core
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/loss-functions
   - model-internals/tokenization
@@ -247,15 +247,17 @@ for name, n_tokens in [("32k vocab", 300), ("128k vocab", 200)]:
 - **Comparing per-token perplexity across tokenizers.** Symptom: a model with a 32k vocabulary "beats" one
   with 128k on the same text purely because its tokens are shorter. Fix: bits per byte.
 - **Reporting without dataset, tokenizer, window and stride.** Symptom: numbers nobody can reproduce, which
-  drift by double-digit percentages between evaluations.
+  drift by double-digit percentages between evaluations. Fix: check the recipe into the repository.
 - **Using perplexity to choose a chat model.** Symptom: a base model "wins" and then cannot follow
-  instructions.
+  instructions. Fix: choose on task evals and preference.
 - **Evaluating on text that was in the training set.** Symptom: an implausibly low number that does not
-  predict generalisation, which is the contamination test seen from the other side.
+  predict generalisation, which is the contamination test seen from the other side. Fix: evaluate on text
+  written after the training cutoff.
 - **Mixing nats and bits.** Symptom: a "loss of 2.0" reported as perplexity 4 (2²) rather than 7.39 (e²),
-  or the reverse.
+  or the reverse. Fix: exponentiate in the base the loss was measured in, and label the unit.
 - **Scoring padding tokens or forgetting the one-position label shift.** Symptom: a perplexity near 1
-  (padding predicted perfectly) or an absurdly high one.
+  (padding predicted perfectly) or an absurdly high one. Fix: set padding labels to `-100` and let the
+  library shift labels.
 
 ## When to use
 - **Use when** the question is "how well does this model fit this distribution of text": pre-training and

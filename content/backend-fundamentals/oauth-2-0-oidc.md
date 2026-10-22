@@ -254,8 +254,9 @@ def authorize(auth_header: str, needed_scope: str) -> dict:
   failures; a spike right after provider rotation means a stale or pinned key.
 - **Token exchange for downstream and agent tool calls.** Instead of forwarding the user's token, POST to
   `/token` with `grant_type=urn:ietf:params:oauth:grant-type:token-exchange`, the user's token as
-  `subject_token`, and the target audience. Log audience and scope per issued token to spot over-broad
-  grants.
+  `subject_token` (with its `subject_token_type`, for example
+  `urn:ietf:params:oauth:token-type:access_token`), and the target `audience` and narrower `scope`. Log
+  audience and scope per issued token to spot over-broad grants.
 - **Exact redirect URIs per environment.** Register `https://app.example.com/callback` and the staging and
   localhost equivalents separately, never a wildcard. Review the registered list in the provider console
   as part of each release that touches login.
@@ -281,15 +282,17 @@ def authorize(auth_header: str, needed_scope: str) -> dict:
   Symptom: a token issued to app A logs the same user into app B. Fix: require an ID token and check `aud`
   and `nonce`.
 - **Omitting or not checking `state`.** Symptom: login CSRF, where a victim's browser completes the
-  attacker's login and the victim then uploads data into the attacker's account.
+  attacker's login and the victim then uploads data into the attacker's account. Fix: a fresh random
+  `state` per login, stored server-side and compared on the callback.
 - **Keying users on `email` instead of `(iss, sub)`.** Symptom: duplicate accounts after a rename, account
   takeover at providers that re-issue addresses, or a second, multi-tenant issuer letting anyone assert an
-  email they do not own.
+  email they do not own. Fix: key on `(iss, sub)` and treat email as a display attribute.
 - **Registering wildcard or prefix-matched redirect URIs** ("any path under app.example.com"). Symptom:
   codes delivered to an open-redirect or user-content page on your own domain, from where an attacker
   reads them out of the URL. Fix: register exact URIs only.
 - **Decoding the JWT without pinning `algorithms`, `audience` and `issuer`.** Symptom: any token from the
-  same provider for any other app is accepted, or an `alg: none` token passes.
+  same provider for any other app is accepted, or an `alg: none` token passes. Fix: always pass all three,
+  as both code examples above do.
 - **Storing tokens in browser `localStorage`.** Symptom: one XSS exfiltrates every user's tokens. Fix: a
   backend-for-frontend with an HttpOnly session cookie, tokens server-side.
 - **Handing an agent or integration a broad, long-lived refresh token "to be safe".** Symptom: one

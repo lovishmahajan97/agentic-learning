@@ -39,7 +39,8 @@ most AI work goes async, or streams when someone watches.
 - **Capacity scales with run time, not work.** By Little's law, in-flight requests ≈ arrival rate × time
   in system. At 10 requests per second averaging 30 seconds, the fleet holds about 300 open connections,
   each with a goroutine, thread or coroutine, buffers and partial state. Double the run time and the count
-  doubles though useful work is unchanged; a deploy that restarts an instance drops every run it held.
+  doubles though useful work is unchanged. Scale-out is then driven by connection count, not useful work,
+  and a deploy that restarts an instance drops every run it held.
 - **Synchronous work is lost on restart.** If the process restarts mid-request the run vanishes; the client
   only learns the socket closed. There is no record the work existed, so nothing to resume.
 - **"Raise every timeout to ten minutes" only hides it.** Long-lived connections pile up, one deploy drops

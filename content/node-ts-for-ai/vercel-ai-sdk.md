@@ -132,7 +132,8 @@ sequenceDiagram
     participant T as Tool execute
     B->>R: POST messages
     R->>P: Step 1: system, messages, tool schemas
-    P-->>R: tool call, args validated by Zod
+    P-->>R: tool call with argument fragments
+    Note over R: validate args with Zod
     R-->>B: tool card: input available
     R->>T: execute with typed input
     T-->>R: result
@@ -231,7 +232,7 @@ export async function classifySafe(text: string) {
 - **Cross-cutting policy in middleware.** Wrap the shared model once with `wrapLanguageModel` for logging,
   default settings or a guardrail, and export that wrapped model to every route. Monitor latency added by
   the middleware and keep per-route exceptions out of it.
-- **Per-call tracing.** Turn on `experimental_telemetry` for production calls so each call and step emits an
+- **Per-call tracing.** Pass `experimental_telemetry: { isEnabled: true }` on production calls so each call and step emits an
   OpenTelemetry span with token usage. Track p95 time to first token, tool-call counts and cost per route
   in the same dashboards as the HTTP spans.
 - **Provider comparison as an eval job.** Run the golden set through the same code with the model line set
@@ -255,18 +256,23 @@ export async function classifySafe(text: string) {
 
 ## Pitfalls
 - **Assuming `generateObject` removes failure handling.** Symptom: an unhandled schema validation error in
-  production when the model returns a value outside the enum.
+  production when the model returns a value outside the enum. Fix: catch `NoObjectGeneratedError`, log the
+  raw text and return a counted fallback.
 - **A generous `stopWhen` limit, or an agent abstraction with a high default, with no budget.** Symptom: a
-  request makes a dozen tool calls, times out at the proxy and bills for every round.
-- **Omitting `stopWhen` entirely.** Symptom: the tool runs but the reply ends with no answer text.
+  request makes a dozen tool calls, times out at the proxy and bills for every round. Fix: a small
+  `stepCountIs(n)` and an alert on steps per request.
+- **Omitting `stopWhen` entirely (the opposite mistake).** Symptom: the tool runs but the reply ends with no
+  answer text. Fix: set `stopWhen` on every call that passes executable tools.
 - **Forgetting to pass `abortSignal` from the request.** Symptom: server logs show completions finishing
-  minutes after users closed the tab.
+  minutes after users closed the tab. Fix: `abortSignal: req.signal` on every streaming call.
 - **Upgrading `ai` on the server without the client package.** Symptom: the UI renders nothing or shows raw
-  protocol lines because the stream format changed.
+  protocol lines because the stream format changed. Fix: bump `ai` and the UI package in the same PR.
 - **Reaching for `providerOptions` without checking the provider.** Symptom: a cache or thinking setting is
-  silently ignored after switching models, and cost and latency change unexpectedly.
+  silently ignored after switching models, and cost and latency change unexpectedly. Fix: set options for
+  each provider you route to and check cache or reasoning token counts in `usage`.
 - **Treating the model string as configuration-free.** Symptom: a provider swap passes tests with the fake
-  and fails on tool schemas the new provider rejects.
+  and fails on tool schemas the new provider rejects. Fix: run the tool schemas against each candidate
+  provider before switching.
 
 ## When to use
 - **Use when** you want to compare or switch providers, a browser UI needs streamed text, tool state or
@@ -318,7 +324,8 @@ provider-specific economics.
 - **Control it** with a step limit, a short system prompt or provider caching, and monitor `totalUsage`, not `usage`.
 
 ### When would you not use the AI SDK?
-- **One provider, deep features:** explicit prompt caching, batch jobs or server-side tools favour the native SDK.
+- **One provider, deep features:** batch jobs, server-side tools or a new feature not yet exposed through
+  `providerOptions` favour the native SDK.
 - **Byte-level control:** auditing or caching that needs the exact request body.
 - **Writing a library:** consumers should not inherit your abstraction and its version churn.
 

@@ -5,7 +5,7 @@ name: Planning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - agents/agent-loop
   - agents/task-decomposition
@@ -178,11 +178,13 @@ The deliberate choices:
 | 1. Bump the dependency | lockfile shows the new version | pass |
 | 2. Fix compile errors | build exits 0 | pass |
 | 3. Update deprecated token call sites | grep finds no old API | fails twice: the "deprecated" call has no direct replacement, contradicting the plan's assumption |
-| Replan (sees steps 1 and 2 done plus failure history) | | returns: add an adapter function, migrate call sites to it, then the test step |
+| Replan (sees steps 1 and 2 done plus failure history) | | returns two new steps followed by the test step |
+| 3a. Add an adapter function | (new step) | pass |
+| 3b. Migrate call sites to the adapter | (new step) | pass |
 | 4. Run tests | suite green | pass |
 
-Total: two planner calls and about seven executor calls, versus a reactive loop that would likely have
-kept patching call sites one compile error at a time.
+Total: two planner calls and about seven executor calls (1 + 1 + 2 failed tries + 3 after the replan),
+versus a reactive loop that would likely have kept patching call sites one compile error at a time.
 
 ### Scheduling a structured plan into parallel waves
 Runnable pure Python: because steps carry `depends_on`, code (not the model) decides what can run

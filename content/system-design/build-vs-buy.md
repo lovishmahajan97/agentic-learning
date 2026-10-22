@@ -108,8 +108,8 @@ TCO_buy   = licence over 3 years (at projected seats or usage) + integration
   to make "buy" credible by showing the integration path, the exit path and a transparent quality loop.
 
 ## Diagram
-Run this path once per stack layer, not once per project: compliance can force the answer before cost
-is compared, and every outcome ends behind a seam you own.
+Run this path once per stack layer, not once per project: compliance (may this data reach the vendor?)
+can force a build before cost is compared, and every outcome ends behind a seam you own.
 
 ```mermaid
 flowchart TD
@@ -118,7 +118,7 @@ flowchart TD
     D -->|"yes"| M{"Is the layer moving fast?"}
     M -->|"yes"| TB["Build thin and switchable"]
     M -->|"no"| BU["Build"]
-    B --> C{"Can the data go to the vendor under compliance rules?"}
+    B --> C{"Data allowed to reach the vendor?"}
     C -->|"no"| BU
     C -->|"yes"| T["Compare three-year TCO including exit"]
     TB --> T
@@ -132,14 +132,21 @@ flowchart TD
 2,000 employees over wikis, tickets and documents; one source is restricted and cannot be sent to third
 parties. Three options over three years, all figures **illustrative** and in abstract units.
 
-| Option | Cost build-up | Total | Notes |
-|---|---|---|---|
-| **A. Buy a vertical SaaS product** | 20 units per seat per month × 2,000 seats × 36 months = 1,440,000, plus about two engineer-months of connector and SSO integration | ≈ 1,440,000 + integration | no differentiation, restricted source excluded, evaluation loop is the vendor's |
-| **B. Build on managed components** (rented model API, managed vector database, open-source gateway and tracing) | build: two engineers for four months, 8 engineer-months at 15,000 each = 120,000; maintenance at roughly 25% of build per year ≈ 90,000 over three years; infrastructure ≈ 2,000 per month = 72,000; usage ≈ 50,400 | ≈ 332,000 | team owns the eval set, the access-control filter that lets the restricted source in, and the model seam |
-| **C. Fully self-host open weights** | B without API usage, plus a 24/7 GPU footprint at 8,000 per month = 288,000, plus extra operations effort of perhaps 180,000 over three years: 332,000 − 50,400 + 288,000 + 180,000 | ≈ 750,000 | GPUs cost almost six times the tokens they replace |
+| Option | Three-year cost | Notes |
+|---|---|---|
+| **A. Buy a vertical SaaS product** | 20 per seat per month × 2,000 seats × 36 months = 1,440,000, plus integration | no differentiation, restricted source excluded, evaluation loop is the vendor's |
+| **B. Build on managed components** | build 120,000 + maintenance 90,000 + infrastructure 72,000 + usage 50,400 ≈ 332,000 | team owns the eval set, the access-control filter that lets the restricted source in, and the model seam |
+| **C. Fully self-host open weights** | 332,000 − 50,400 + 288,000 + 180,000 ≈ 750,000 | GPUs cost almost six times the tokens they replace |
 
+- **A's integration.** About two engineer-months of connector and SSO integration.
+- **B's components.** Rented model API, managed vector database, open-source gateway and tracing.
+- **B's build and running costs.** Two engineers for four months, 8 engineer-months at 15,000 each =
+  120,000; maintenance at roughly 25% of build per year ≈ 90,000 over three years; infrastructure
+  ≈ 2,000 per month = 72,000.
 - **B's usage line.** 2,000 users × 10 queries per day × 20 workdays × 36 months = 14.4M queries at
   about 3,500 tokens each ≈ 50 billion tokens, at 1 unit per million ≈ 50,400.
+- **C's extra costs.** B without the API usage, plus a 24/7 GPU footprint at 8,000 per month = 288,000,
+  plus extra operations effort of perhaps 180,000 over three years.
 - **C is justified only if residency rules forbid the API,** which they do not here.
 - **Decision: B.**
 

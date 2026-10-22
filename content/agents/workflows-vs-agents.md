@@ -5,7 +5,7 @@ name: Workflows vs agents
 kind: decision
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -101,8 +101,9 @@ exception rate.
   it with code where it is not.
 
 ## Diagram
-The decision path for one step of a system; most steps exit left as workflow, and the agentic exits
-always carry a budget, restricted tools and gates.
+The decision path for one step of a system: most steps end as workflow code, every agentic exit
+carries a budget and restricted tools (plus gates when errors are costly), and traces feed repeated
+paths back into code.
 
 ```mermaid
 flowchart TD
@@ -143,7 +144,7 @@ Runs with stubs. The agentic island is budgeted, read-only, and its output is a 
 through approval.
 
 ```python
-def process_invoice(inv, extract, po_db, exception_agent, approve):
+def process_invoice(inv, extract, po_db, exception_agent, request_approval):
     fields = extract(inv)                            # model call 1: structured output, schema-validated
     problems = po_db.validate(fields)                # code, not a model: fixed and unit-testable
     if not problems:
@@ -152,7 +153,8 @@ def process_invoice(inv, extract, po_db, exception_agent, approve):
                                tools=["ocr", "po_lookup", "vendor_lookup"])   # read-only agentic island
     if proposal is None:                             # budget exhausted: hand to a person, do not guess
         return {"route": "manual_queue", "fields": fields}
-    return {"route": "pending_approval", "proposal": approve(proposal)}
+    request_id = request_approval(proposal)          # a person approves before anything is paid or changed
+    return {"route": "pending_approval", "proposal": proposal, "request": request_id}
 ```
 
 ### Mining traces to move the boundary

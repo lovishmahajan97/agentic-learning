@@ -241,6 +241,11 @@ def match_shapes(acts, steps_known, person_waiting, needs_corpus, persistent_sta
 for line in match_shapes(acts=True, steps_known=True, person_waiting=False,
                          needs_corpus=True, persistent_state=False, many_teams=True):
     print("-", line)
+# - approval gate + validation contract on the action path
+# - workflow (4)
+# - batch extraction (2) + review queue
+# - retrieval (1)
+# - platform layer (6) underneath
 ```
 
 ## Production patterns

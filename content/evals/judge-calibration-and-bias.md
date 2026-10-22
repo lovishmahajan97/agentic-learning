@@ -5,7 +5,7 @@ name: Judge calibration & bias
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - evals/llm-as-a-judge
   - evals/rubrics

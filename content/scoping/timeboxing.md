@@ -5,7 +5,7 @@ name: Timeboxing
 kind: practice
 difficulty: core
 est_minutes: 11
-status: crisp
+status: crisp-verified
 related:
   - scoping/rapid-prototyping-poc
   - scoping/problem-decomposition
@@ -65,7 +65,7 @@ worth boxing if   cost of box  <  P(answer changes the decision) × cost of deci
 | PoC | a few weeks |
 | Open-ended | almost never |
 
-- **Sprints are timeboxes too, but for delivery cadence.** The discovery-style box here differs in that
+- **Scrum sprints are timeboxes too, but for delivery cadence.** The discovery-style box here differs in that
   "stop" is an expected, legitimate outcome.
 
 ### 3. Write the exit criteria before starting
@@ -212,13 +212,17 @@ pre-written rule stops the team from chasing indefinitely.
 - **Silently extending the box.** "Just two more days" until the PoC has run for months; the symptom is a
   status update that says "almost there" three times in a row. Fix: extensions only as a new box.
 - **Timeboxing an activity instead of a question.** The box ends with work done but no decision; the
-  symptom is a closing meeting where nobody can say whether to proceed.
+  symptom is a closing meeting where nobody can say whether to proceed. Fix: rewrite the box as one
+  question with a yes/no or numeric answer before day 1.
 - **Tuning prompts before building the evaluation set.** Progress is judged by eyeballing outputs; the
-  symptom is accuracy claims that collapse when someone runs a held-out sample.
+  symptom is accuracy claims that collapse when someone runs a held-out sample. Fix: label the eval set
+  first and make it the must-have of days 1-2.
 - **Sizing the box by feel.** Setting length by how long the work feels like it should take rather than by
-  the value of the answer shows up as two-week investigations into decisions worth a day.
+  the value of the answer shows up as two-week investigations into decisions worth a day. Fix: run the
+  value-of-information test and shrink or skip boxes whose answer would not change the decision.
 - **Treating "stop" as a team failure.** Nobody ever recommends stopping; the symptom is an organisation
-  whose boxes all end in "promising, continue" and never in a stop.
+  whose boxes all end in "promising, continue" and never in a stop. Fix: name "stop" as a legitimate
+  outcome in the exit rule and credit the team for a well-evidenced stop.
 
 ## When to use
 - **Use when:** the outcome is uncertain and the work could expand without limit: feasibility checks, PoCs,

@@ -5,7 +5,7 @@ name: Generators
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/async-await
   - python-for-ai/context-managers-resource-cleanup
@@ -229,13 +229,14 @@ which under load means connections held open well past the request.
 
 ## Pitfalls
 - **Iterating the same generator twice**, for example once to count and once to process. The second pass
-  silently yields nothing and an eval reports zero results.
+  silently yields nothing and an eval reports zero results. Fix: materialise to a list if it fits, or
+  rebuild the generator for each pass.
 - **Expecting side effects from a call.** Nothing runs until iteration, so a "write records" generator that
   is never consumed writes nothing.
 - **Breaking out of an async generator wrapping an HTTP stream without `aclosing`.** Symptom:
-  connection-pool exhaustion or "unclosed" warnings under load.
+  connection-pool exhaustion or "unclosed" warnings under load. Fix: `async with aclosing(gen) as s:`.
 - **`try/except` around the generator call.** Exceptions are raised later during iteration, outside the
-  handler, so the guard never triggers.
+  handler, so the guard never triggers. Fix: wrap the consuming loop, or handle errors inside the stage.
 - **Leaving a debugging `list(gen)` in.** Memory returns to dataset-sized and the job slows on large inputs.
 - **Bare `next(it)` inside a generator on an iterator that may be exhausted.** Since PEP 479 the stray
   `StopIteration` becomes `RuntimeError: generator raised StopIteration` instead of silently ending the outer

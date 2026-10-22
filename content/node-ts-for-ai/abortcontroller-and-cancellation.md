@@ -5,7 +5,7 @@ name: AbortController & cancellation
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - node-ts-for-ai/promises-and-async-error-propagation
   - node-ts-for-ai/streams-and-backpressure
@@ -20,8 +20,8 @@ sources:
 
 ## TL;DR
 Promises cannot be cancelled, so JavaScript cancels cooperatively: an `AbortController`'s `AbortSignal` is
-passed to every operation that should stop together. It is how AI services stop paying for generation after
-the user leaves, and how a 30-second timeout becomes a real stop.
+passed to every operation that should stop together. It stops paid generation when users leave (if the
+provider stops on disconnect) and makes a 30-second timeout a real stop.
 
 ## Why it exists
 - **Model calls are the most expensive thing a Node service does:** seconds of latency, tokens billed as they
@@ -144,9 +144,12 @@ flowchart TD
 
 ## Examples
 ### Request-scoped signal through a streaming model call
-A request-scoped signal combining client disconnect, a hard timeout, and an agent-step cancellation, passed
-through a streaming model call, with the abort reason used to decide whether the error is retryable. The
-listener cleanup in `withResource` shows the pattern for resources that have no signal-aware API.
+A request-scoped signal combining client disconnect and a hard timeout, passed through a streaming model
+call, with the abort reason used to decide whether the error is retryable. An agent-step signal joins the
+same way, as a third entry in the `AbortSignal.any` list.
+
+The listener cleanup in `withResource` shows the
+pattern for resources that have no signal-aware API.
 
 ```ts
 import { setTimeout as sleep } from "node:timers/promises";
@@ -269,19 +272,23 @@ Gateway deadline 30 s; each hop subtracts elapsed time and a 500 ms margin (illu
 
 ## Pitfalls
 - **`Promise.race` with a timer as a "timeout".** Symptom: the request returns 504 while the provider keeps
-  streaming and the token bill keeps growing.
+  streaming and the token bill keeps growing. Fix: pass `AbortSignal.timeout(ms)` to the call itself.
 - **Not wiring `res.on('close')` to a controller.** Symptom: upstream connections and token spend continue for
-  minutes after users closed their tabs, visible as open sockets outliving requests.
+  minutes after users closed their tabs, visible as open sockets outliving requests. Fix: one root
+  controller per request, aborted on close.
 - **Adding `'abort'` listeners to a long-lived signal without removing them.** Symptom:
-  `MaxListenersExceededWarning` and memory growth proportional to calls made under that signal.
+  `MaxListenersExceededWarning` and memory growth proportional to calls made under that signal. Fix:
+  `removeEventListener` in a `finally`.
 - **Retrying on every rejection, including `AbortError`.** Symptom: duplicate model calls after cancellation
-  and bills that do not match request counts.
+  and bills that do not match request counts. Fix: check `signal.aborted` or the error name first.
 - **Using the response stream after `abort()`.** Symptom: confusing `ERR_STREAM_PREMATURE_CLOSE` errors
-  reported as failures rather than expected cancellations.
+  reported as failures rather than expected cancellations. Fix: stop writing once the signal fires, and
+  classify errors after an abort as cancellations.
 - **Forgetting `AbortSignal.timeout` counts from creation.** Symptom: a timeout that fires early because the
-  signal was created long before the request it guards.
+  signal was created long before the request it guards. Fix: create it right where the guarded work starts.
 - **`throwIfAborted()` in a synchronous loop that never awaits.** Symptom: cancellation "works" in tests with
-  I/O but does nothing for a CPU-heavy step, which runs to completion after the client has left.
+  I/O but does nothing for a CPU-heavy step, which runs to completion after the client has left. Fix: yield
+  with `setImmediate` between slices, or run it in a terminable worker.
 
 ## When to use
 - **Always:** one controller per inbound request, its signal passed into every model call, tool call, stream

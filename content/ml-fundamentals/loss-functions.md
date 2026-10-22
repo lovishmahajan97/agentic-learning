@@ -5,7 +5,7 @@ name: Loss functions (cross-entropy, contrastive)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/regression
@@ -100,7 +100,7 @@ sim(anchor, negative) for every negative.
 the match", with the label known because you built the pair. Contrastive learning is classification with
 a free label, which is why it counts as self-supervised.
 
-### Three design choices that follow
+### Design choices that follow
 - **In-batch negatives.** A batch of N pairs gives an N×N similarity matrix: the diagonal holds the
   positives and the off-diagonal entries are N(N − 1) negatives for free. Larger batches make the matching
   task harder and the gradient more informative, which is why SimCLR and CLIP use very large batches. CLIP
@@ -190,9 +190,9 @@ for p in (0.9, 0.5, 0.1, 0.01):
     print(p, logit_grads(p))          # (-0.009, -0.1) ... (-0.0098, -0.99)
 ```
 
-Reading the table: squared error's gradient peaks near p = 0.5 and shrinks again as the model gets more
-wrong, so a confidently wrong example barely moves the weights. Cross-entropy's gradient grows
-monotonically with the error.
+Reading the table: squared error's gradient magnitude, (1 − p)²·p, peaks at p = 1/3 (about 0.148) and
+shrinks again as the model gets more wrong, so a confidently wrong example barely moves the weights.
+Cross-entropy's gradient, 1 − p in magnitude, grows monotonically with the error.
 
 ## Production patterns
 - **Pass logits, never probabilities, to the loss.** Use the fused op (PyTorch `F.cross_entropy` or
@@ -301,11 +301,12 @@ absent from the training data. Only after these would I suspect the data itself.
   targets.
 - **Measure** calibration error and accuracy with and without it on the same held-out set.
 
-### An SFT loss of 0.3 nats: what perplexity is that, and does it mean the model is good?
-- **Perplexity** is exp(0.3) ≈ 1.35; at the start of that run, exp(2.1) ≈ 8.2.
-- **Not necessarily good:** if prompt tokens are unmasked, or the data is small and memorised, the training
-  loss is low while held-out quality is flat.
-- **Compare only within a tokeniser,** since the loss depends on the vocabulary.
+### Model A scores 2.0 nats per token and model B 1.8, with different tokenisers. Which is better?
+- **Per-token numbers do not compare:** perplexities are exp(2.0) ≈ 7.4 and exp(1.8) ≈ 6.0, but a token
+  covers a different amount of text in each vocabulary, so B's lower loss may only mean shorter tokens.
+- **Normalise by text, not tokens:** total nats = loss × token count; divide by bytes. If A averages 4
+  bytes per token and B 3 (illustrative), A is 0.5 nats per byte and B 0.6, so A is better.
+- **Report bits per byte** (divide nats by ln 2) on the same held-out text when comparing across models.
 
 ## Quiz
 ### Q: With softmax output q and true class y, what is the gradient of cross-entropy with respect to logit k?

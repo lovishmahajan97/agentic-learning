@@ -5,7 +5,7 @@ name: Logits
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - model-internals/softmax
   - model-internals/sampling-strategies
@@ -94,15 +94,16 @@ The sampler sees logits, not text, so steering is arithmetic:
 
 ## Diagram
 Every control knob sits between the unembedding and the sampler; logprobs are read off the same vector.
+The order shown (penalties and bias, then masks, then temperature) is a common one; engines differ.
 
 ```mermaid
 flowchart TD
     H["Final hidden state h, last position"] --> U["z = W_U times h"]
     U --> Z["Logits, one per vocab entry"]
-    Z --> T["Divide by temperature"]
-    T --> B["Add logit bias, penalties"]
+    Z --> B["Add logit bias, penalties"]
     B --> M["Mask disallowed to minus infinity"]
-    M --> S["Softmax in fp32"]
+    M --> T["Divide by temperature"]
+    T --> S["Softmax in fp32"]
     S --> SM["Sampler picks token"]
     Z -.->|"log_softmax"| L["Logprobs, perplexity"]
     G["Grammar or JSON schema"] -->|"mask per step"| M
@@ -204,15 +205,18 @@ for b in (1.0, 5.0, -100.0):
 
 ## Pitfalls
 - **Reading logits as probabilities.** Or comparing absolute values across prompts. Symptom: "confidence"
-  numbers that make no sense, since only differences within one vector are meaningful.
+  numbers that make no sense, since only differences within one vector are meaningful. Fix: convert with
+  `log_softmax` and compare logprobs.
 - **Softmax or cross-entropy in fp16.** Symptom: NaN losses or probabilities that collapse to exactly 0
-  and 1, especially for long sequences.
+  and 1, especially for long sequences. Fix: cast to fp32 first.
 - **Biasing only the first piece of a multi-token word.** Symptom: the model starts the word and then
-  veers off.
+  veers off. Fix: tokenize the full word and its variants, and bias or mask every piece.
 - **Using top-1 logprob as a hallucination detector without calibration.** Instruction-tuned models are
-  often confidently wrong, so high probability does not imply correctness.
+  often confidently wrong, so high probability does not imply correctness. Fix: set thresholds on
+  labelled data and pair them with grounding checks.
 - **Copying token ids across tokenizers.** The token you bias must exist in the vocabulary of *this*
-  tokenizer; an id copied from another model points at an unrelated token.
+  tokenizer; an id copied from another model points at an unrelated token. Fix: derive ids at runtime
+  from the deployed tokenizer.
 
 ## When to use
 - **Use when** you need control or measurement prompting cannot give: forcing a classification into a fixed

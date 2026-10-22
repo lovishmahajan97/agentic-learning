@@ -249,6 +249,10 @@ The fix that teams use is the xdist docs pattern: guard startup with a file lock
 `tmp_path_factory.getbasetemp().parent`, which all workers share, and isolate data per worker with the
 `worker_id` fixture (for example a collection name suffixed with it).
 
+- **Teardown is the hard part.** No worker knows when the others have finished, so the lock pattern
+  suits read-only data you can leave behind; for a container, many teams start it once outside pytest
+  (a CI service container or `docker compose up`) and pass its address in.
+
 ## Production patterns
 - **Lane split with strict markers.** Register `integration` and `e2e` under `markers`, set
   `addopts = "-ra --strict-markers"`, run `-m "not integration and not e2e"` on every pull request and

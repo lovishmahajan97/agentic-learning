@@ -5,7 +5,7 @@ name: Caching (semantic, prompt)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/prefix-caching
   - prompting/prompt-caching

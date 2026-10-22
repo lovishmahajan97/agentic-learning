@@ -212,19 +212,22 @@ Two comparable queues are baselined over the same 8 weeks; one gets the assistan
 
 ## Pitfalls
 - **Using management-report numbers as the baseline.** Symptom: a "before" figure nobody can reproduce
-  from raw data, and a dispute at review about what it included.
+  from raw data, and a dispute at review about what it included. Fix: recompute from raw case data with
+  the metric spec's definitions.
 - **Baselining only speed and not quality.** Symptom: the customer holds the AI to a near-perfect accuracy
-  bar the human process was never measured against.
+  bar the human process was never measured against. Fix: a blind retrospective audit on the AI's rubric.
 - **Ignoring case mix.** Symptom: an overall improvement that disappears when results are broken down by
-  category, because the pilot queue received easier work.
+  category, because the pilot queue received easier work. Fix: stratify the baseline and re-weight.
 - **Changing the metric definition after launch,** for example by excluding a newly "out of scope" case
-  type. Symptom: an improvement that appears exactly when the definition changed.
-- **Announcing the measurement, then using that period as the baseline.** Symptom: unusually good baseline
-  numbers (an observer, or Hawthorne, effect) that regress once observation ends, which makes the AI look
-  worse than it is.
+  type. Symptom: an improvement that appears exactly when the definition changed. Fix: freeze
+  definitions, and re-baseline if one truly must change.
+- **Announcing the measurement to the team being measured, then using that period as the baseline.**
+  Symptom: unusually good baseline numbers (an observer, or Hawthorne, effect) that regress once
+  observation ends, which makes the AI look worse than it is. Fix: prefer retrospective system data.
 - **Picking the pilot team or queue because its recent numbers are the worst.** Symptom: a large
   "improvement" that the holdout, or the same team's longer history, shows would have happened anyway,
   because an unusually bad period tends to be followed by a more ordinary one (regression to the mean).
+  Fix: select pilot groups on other grounds and keep a holdout.
 
 ## When to use
 - **Use when:** any metric in the success spec, before any pilot user sees the system, ideally during
@@ -279,8 +282,10 @@ where review should stay mandatory.
 ### How many audited cases do you need before the human error rate can set the bar?
 - **Use the proportion formula:** n ≈ z²·p(1−p)/e². With 11 errors in 120 tickets the 95% Wilson interval is
   roughly 5% to 16%, too wide to set a sharp bar.
+- **Worked size:** to pin a rate near 9% to within ±3 points at 95%, n ≈ 1.96² × 0.09 × 0.91 / 0.03² ≈ 350
+  audited cases, about three times the 120 above.
 - **Decide the acceptable interval width first,** then size the audit per high-risk segment rather than
-  overall.
+  overall, because each segment needs its own bar.
 
 ### What is regression to the mean and how does it bite pilot selection?
 - **Definition:** an unusually bad period tends to be followed by a more ordinary one, whatever you do.

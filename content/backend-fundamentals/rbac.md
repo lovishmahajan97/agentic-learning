@@ -24,8 +24,8 @@ sources:
 
 ## TL;DR
 Role-based access control attaches permissions to roles and assigns callers roles within a scope; a
-request is allowed only if some role grants that permission there. Direct per-user grants do not scale,
-and the same check must bound agents.
+request is allowed only if some role grants that permission there. Direct per-user grants explode, defeat
+access reviews and leak at offboarding; the same check must bound agents.
 
 ## Why it exists
 - **Every request after login asks "may they do this".** Authentication answers "who is calling". The
@@ -65,7 +65,8 @@ allow (u, p)  iff  there exists a role r with (u, r) ∈ UA and (r, p) ∈ PA
 
 - **Default deny.** Anything not explicitly allowed is denied, *because* a default-allow system cannot be
   reasoned about: every missing rule is a hole rather than a lock.
-- **Decision rule in words.** Assignments are `UA ⊆ subjects × roles` and `PA ⊆ roles × permissions`. The decision is: allow `(u, p)` iff some role `r` has `(u, r) ∈ UA` and `(r, p) ∈ PA`.
+- **Read the rule as one hop through a role.** Allow `(u, p)` iff some role `r` has `(u, r) ∈ UA` and
+  `(r, p) ∈ PA`; the user never holds a permission directly.
 
 ### NIST refinements
 - **Hierarchical RBAC.** A senior role inherits a junior role's permissions (`admin ⊇ editor ⊇ viewer`),
@@ -93,8 +94,8 @@ allow (u, p)  iff  there exists a role r with (u, r) ∈ UA and (r, p) ∈ PA
 - **Roles apply downward.** A role granted at a scope applies to everything beneath it, because that is how
   delegation works: the org admin administers every project.
 - **Kubernetes implements exactly this split.** `Role` and `RoleBinding` are namespaced; `ClusterRole` and
-  `ClusterRoleBinding` apply cluster-wide; binding a ClusterRole inside a namespace restricts it to that
-  namespace.
+  `ClusterRoleBinding` apply cluster-wide; binding a ClusterRole with a namespaced `RoleBinding` grants it
+  only inside that namespace, so one role definition can be reused per team.
 
 ### Where the decision runs
 Separate the *decision* (given subject, permission, scope, return allow/deny) from *enforcement*
@@ -247,7 +248,9 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
 ```
 
-Verify a decision without guessing: `kubectl auth can-i list pods --as=alice -n team-a`.
+Verify a decision without guessing. The binding names a group, so impersonate the group too:
+`kubectl auth can-i list pods --as=alice --as-group=team-a-devs -n team-a` should print `yes`, and the
+same command with `-n team-b` should print `no`.
 
 ## Production patterns
 - **Permission-named guards, enforced in review.** Every endpoint declares `require("documents:delete")`;
@@ -282,20 +285,22 @@ Verify a decision without guessing: `kubectl auth can-i list pods --as=alice -n 
 
 ## Pitfalls
 - **Comparing role strings in code** (`if user.role == "admin"`) instead of checking permissions. Symptom: a
-  new "support" role works nowhere until twenty endpoints are edited, and some are missed.
+  new "support" role works nowhere until twenty endpoints are edited, and some are missed. Fix:
+  permission-named guards.
 - **Forgetting scope.** Symptom: an editor in one tenant can edit in every tenant, found by a penetration
-  test or, worse, a customer.
+  test or, worse, a customer. Fix: every assignment and every check carries a scope.
 - **Taking the scope from the request** (a path or body `project_id`) instead of the stored resource.
   Symptom: changing one ID in a URL reaches another project's object while every permission check still
-  passes.
+  passes. Fix: load the resource first and check against its stored owner.
 - **Enforcing only at the HTTP layer** while the retrieval query or background job reads the index
-  unfiltered. Symptom: the assistant quotes a document the user cannot open in the source system.
+  unfiltered. Symptom: the assistant quotes a document the user cannot open in the source system. Fix:
+  the same decision as a filter inside the query.
 - **Running the agent under a privileged service account** instead of the user's delegated roles. Symptom:
-  a prompt-injected agent deletes or reads what the asking user never could.
+  a prompt-injected agent deletes or reads what the asking user never could. Fix: run tools as the user.
 - **Role explosion:** hundreds of near-duplicate roles. Symptom: "who can do X?" needs a script and
-  quarterly access reviews are rubber-stamped.
+  quarterly access reviews are rubber-stamped. Fix: an owned role catalogue, and ReBAC for per-object cases.
 - **Stale claims after a role change.** Symptom: "I removed their access an hour ago and they are still
-  deleting things", because the token has not expired.
+  deleting things", because the token has not expired. Fix: resolve sensitive permissions server-side.
 
 ## When to use
 - **Use when** a multi-user system has a stable set of job functions: admin panels, SaaS workspaces,

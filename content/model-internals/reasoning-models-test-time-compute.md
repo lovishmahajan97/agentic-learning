@@ -5,7 +5,7 @@ name: Reasoning models / test-time compute
 kind: concept
 difficulty: core
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - prompting/chain-of-thought
   - model-internals/sampling-strategies
@@ -24,8 +24,8 @@ sources:
 
 ## TL;DR
 Test-time compute spends more inference per query: longer chains of thought, several attempts with a vote
-or verifier, or search. Reasoning models are RL-trained to do this in a thinking trace, often buying more
-accuracy per dollar than a bigger model.
+or verifier, or search. A transformer does fixed compute per token, so hard problems need more tokens;
+reasoning models are RL-trained to spend them thinking.
 
 ## Why it exists
 - **Compute per token is fixed.** A decoder-only transformer spends L layers, one pass, on every token.
@@ -89,8 +89,8 @@ accuracy per dollar than a bigger model.
 3. **The policy is pushed** toward above-average responses and away from below-average ones.
 
 - **Why the group baseline matters.** PPO needs a learned value network as large as the policy to estimate
-  "how good was this state". GRPO replaces it with the other samples for the same prompt, which halves the
-  models in memory and avoids training a critic on long, sparse-reward traces.
+  "how good was this state". GRPO replaces it with the other samples for the same prompt, which removes a
+  policy-sized model from memory and avoids training a critic on long, sparse-reward traces.
 - **Why rule-based rewards.** A learned scorer can be gamed over long RL runs, while "does the answer equal
   42" or "do the tests pass" cannot.
 
@@ -230,7 +230,8 @@ print([round((r - mu) / sd, 2) for r in (1, 0)])   # advantage of a correct and 
   return the first that passes. Monitor pass@1 against pass@N and track flaky or missing tests, because
   weak tests let wrong patches through.
 - **Account for thinking tokens explicitly.** Log thinking and answer tokens separately in cost dashboards,
-  and keep earlier traces out of agent history unless the next step needs them, so they do not fill the
+  and keep earlier traces out of agent history unless the API requires them (Anthropic, for example,
+  needs the thinking block passed back with tool results inside the same turn), so they do not fill the
   context window.
 - **Evaluate with repeated runs.** Run each eval item several times and report pass@k for verifier-backed
   flows and pass^k for one-shot user-facing flows, with means over seeds rather than a single run.
@@ -253,20 +254,22 @@ print([round((r - mu) / sd, 2) for r in (1, 0)])   # advantage of a correct and 
 
 ## Pitfalls
 - **Turning reasoning on for every request.** Symptom: cost per request rises several-fold and p95 latency
-  explodes with no measurable quality change on the simple tasks that dominate traffic.
+  explodes with no measurable quality change on the simple tasks that dominate traffic. Fix: enable it per
+  route where the eval shows a gain.
 - **Treating the thinking trace as an explanation.** Symptom: a trace that reads soundly while the answer
-  was driven by a bias the trace never mentions.
+  was driven by a bias the trace never mentions. Fix: audit inputs, outputs and decisions directly.
 - **Majority-voting free-text answers.** Symptom: near-zero agreement because no two strings match. Fix:
   normalise the answer or use a judge.
 - **Evaluating with a single run.** Symptom: swings of several points between runs of the "same" eval.
   Fix: report means over several seeds or pass^k.
 - **Forgetting the trace in context budgeting.** Symptom: truncated answers or length errors deep in agent
-  loops as thinking tokens fill the window.
+  loops as thinking tokens fill the window. Fix: budget context for trace plus answer and drop old traces.
 - **Loading a reasoning model's prompt with chain-of-thought instructions and reasoning few-shots.**
-  Several vendors advise against it because it can degrade results; keep the prompt plain and let the model
-  think.
+  Several vendors advise against it because it can degrade results. Fix: keep the prompt plain and let the
+  model think.
 - **Assuming the budget knob is linear in quality.** Symptom: paying for 4× the tokens and getting the
-  accuracy of 2× because nobody measured the accuracy-versus-tokens curve on the real task.
+  accuracy of 2× because nobody measured the accuracy-versus-tokens curve on the real task. Fix: measure
+  the curve per route and set the budget at the knee.
 
 ## When to use
 - **Use when** the task has multi-step structure and a checkable, or at least judgeable, answer: maths, code
@@ -318,7 +321,8 @@ Decide on pass@1, pass@5 and cost per solved task measured on their task set.
 
 ### How does GRPO differ from PPO, and why did DeepSeek-R1 use rule-based rewards?
 - **Baseline:** PPO trains a value network as large as the policy; GRPO scores each response against the
-  mean and standard deviation of a group of samples for the same prompt, which halves the models in memory.
+  mean and standard deviation of a group of samples for the same prompt, so no critic has to be held in
+  memory or trained.
 - **No critic on sparse traces:** long reasoning traces with one final reward are hard for a critic to
   learn.
 - **Rule-based rewards** such as "the answer equals 42" or "the tests pass" cannot be gamed the way a learned

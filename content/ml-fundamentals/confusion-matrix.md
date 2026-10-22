@@ -98,7 +98,8 @@ lower precision when positives are rarer, because the FP column fills from a lar
 - **Off-diagonal *mass* is the diagnostic.** One dense cell means two classes are not separable with the
   current features or prompt, and the fix is local to that pair.
 - **In LLM systems** this is the matrix of an intent router, a guardrail classifier, or an LLM judge scored
-  against human labels. A too-lenient judge shows a heavy FP cell; a too-strict one, a heavy FN cell.
+  against human labels. With "pass" as the positive class, a too-lenient judge shows a heavy FP cell (failures
+  passed); a too-strict one, a heavy FN cell (good outputs failed).
 
 ### One matrix is one threshold
 - **A probabilistic model becomes a classifier only after you pick a threshold.**
@@ -258,16 +259,21 @@ for n, a, p in sorted(off, reverse=True)[:3]:        # the pairs worth reading f
 ## Pitfalls
 - **Reading a rows-as-actual matrix with the predictions-as-rows convention.** FP and FN swap. Symptom:
   precision and recall exchange values, and "the model misses everything" turns into "the model over-flags".
+  Fix: name both axes on every printed matrix.
 - **Reporting accuracy on an imbalanced table.** Symptom: a model with 97.7% accuracy that loses to the
-  constant classifier at 99%.
-- **Omitting `labels=` when a class is absent from `y_true` or `y_pred`.** The matrix silently shrinks or
-  reorders and `.ravel()` unpacks the wrong cells, so every derived metric uses the wrong numbers.
+  constant classifier at 99%. Fix: report the four counts, prevalence and MCC or recall and precision.
+- **Omitting `labels=` when a class can be missing from a batch.** Without it the label set is the union of
+  `y_true` and `y_pred`, so a class absent from both (common in small eval slices) silently drops out:
+  indices shift, `.ravel()` unpacks the wrong cells or fails, and derived metrics use the wrong numbers.
+  Fix: always pass the full label list.
 - **Treating the matrix at threshold 0.5 as "the" performance of a probabilistic model.** Symptom: a model
-  declared to have terrible recall when nobody tried a lower threshold.
+  declared to have terrible recall when nobody tried a lower threshold. Fix: sweep the threshold on validation.
 - **Collapsing a multi-class matrix into macro-F1 before looking at confused pairs.** Symptom: weeks spent
-  adding data to a class whose errors come from label ambiguity with its neighbour.
+  adding data to a class whose errors come from label ambiguity with its neighbour. Fix: read the top
+  off-diagonal cells first.
 - **Scoring an LLM judge only by agreement rate.** Symptom: a judge that "agrees 96%" because it passes nearly
-  everything, and the 4% it misses are exactly the failures you built it to catch.
+  everything, and the 4% it misses are exactly the failures you built it to catch. Fix: recall on the failure
+  class.
 
 ## When to use
 - **Always first:** every time you evaluate a classifier, before any single-number metric, and every time

@@ -5,7 +5,7 @@ name: Dependency injection & interface boundaries
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/protocols-generics-structural-typing
   - python-for-ai/test-doubles-mocks-fixtures
@@ -34,7 +34,7 @@ providers, for the price of one thin layer of indirection.
   skipped.
 - **Swapping and configuration break.** Evaluating Anthropic, a self-hosted vLLM endpoint or a cheaper
   model means vendor shapes scattered through forty files. Reading `OPENAI_API_KEY` at import time makes
-  a script that only wanted a helper crash or talk to the wrong environment.
+  a script that only wanted a helper either crash or silently talk to the wrong environment.
 - **The naive fixes fail.** `unittest.mock.patch("app.summarize.client")` breaks when a refactor moves the
   module, because it couples to an internal path, not a contract. `if os.getenv("FAKE_LLM")` puts test
   branches in production. A global registry (`get_llm_client()`) hides the dependency one hop away:

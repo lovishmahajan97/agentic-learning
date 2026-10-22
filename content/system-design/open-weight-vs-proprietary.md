@@ -21,8 +21,8 @@ sources:
 
 ## TL;DR
 Open-weight models publish parameters you can run, inspect and fine-tune under a licence; proprietary
-weights stay with the provider as a service. It decides lifecycle control, data flow, customisation and
-cost shape, and is separate from self-host versus API.
+weights stay with the provider. It decides lifecycle control, data flow, customisation and cost shape,
+separately from self-host versus API: open weights can be rented, proprietary reached privately.
 
 ## Why it exists
 - **The real question is why anyone runs open weights.** The proprietary frontier usually leads on raw
@@ -109,19 +109,23 @@ weights (hosted or self-hosted, often fine-tuned) for high-volume narrow tasks, 
 the split can move as the models do.
 
 ## Diagram
-The decision runs constraints first, then capability, cost and lifecycle; note that the isolation
-question picks a deployment, not just a weight type.
+The decision runs constraints first (isolation, customisation, licence), then capability, cost and
+lifecycle for every surviving candidate. Note that the isolation question picks a deployment, not just
+a weight type, and the licence check applies to every open-weight path.
 
 ```mermaid
 flowchart TD
-    S["Task family"] --> I{"Isolation requirement: legal or architectural?"}
+    S["Task family"] --> I{"Isolation: legal or architectural?"}
     I -->|"architectural: only hosts you operate"| OW["Open weights, self-hosted, pinned by hash"]
-    I -->|"legal: contract and network path suffice"| L{"Licence fits how you ship? Customisation needed?"}
-    L -->|"deep customisation or on-device"| OWH["Open weights, self-hosted or hosted API"]
-    L -->|"prompting suffices"| CAP["Measure capability on your eval"]
-    OWH --> CAP
+    I -->|"legal: contract and network path suffice"| L{"Deep customisation or on-device?"}
+    L -->|"yes"| OWH["Open weights, self-hosted or hosted API"]
+    L -->|"no, prompting suffices"| CAP["Measure candidates on your eval"]
+    OW --> LIC{"Licence fits how you ship?"}
+    OWH --> LIC
+    LIC -->|"yes"| CAP
+    LIC -->|"no"| NX["Try another open-weight candidate"]
+    NX --> LIC
     CAP --> COST["Cost at real utilisation"]
-    OW --> COST
     COST --> LIFE["Lifecycle risk and exit cost"]
     LIFE --> P["Portfolio entry behind one gateway"]
     P -.->|"model release or deprecation notice"| CAP

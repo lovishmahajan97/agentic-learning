@@ -5,7 +5,7 @@ name: logging / structlog
 kind: tool
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - observability/logging
   - fastapi-for-ai/structured-logging
@@ -198,6 +198,9 @@ handle_request("u_42", "Summarize this contract ...")
 # (keys follow processor order: call kwargs, then contextvars, level, timestamp; pass
 #  JSONRenderer(sort_keys=True) if your pipeline wants a stable alphabetical order)
 ```
+
+- **Do not rely on key order among context fields:** `request_id` and `user_id` can come out in either
+  order, because `merge_contextvars` reads an unordered context mapping. Query by key, or use `sort_keys=True`.
 
 ### Watch request context vanish in a thread pool
 Standard library only. Two concurrent requests each set a `ContextVar`; `asyncio.to_thread` keeps it,

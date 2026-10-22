@@ -5,7 +5,7 @@ name: Exceptions and custom exception hierarchies
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/tenacity
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -76,7 +76,7 @@ LLMError(Exception)              one base per subsystem: "anything from the LLM 
 ├── Transient                    safe to retry
 │   └── RateLimited              .retry_after seconds
 ├── Permanent                    do not retry
-└── Recoverable                  retry only after changing something
+└── Recoverable                  optional: retry only after changing something
     └── ContextTooLong           .tokens, .limit
 ```
 
@@ -239,6 +239,11 @@ asyncio.run(main())
 # stop: ['crm: 403 forbidden']
 ```
 
+- **Why both failures appear:** both tasks fail in the same event-loop step. After the first failure a
+  `TaskGroup` cancels its remaining tasks, so a sibling that would have failed later is cancelled and
+  never shows up in the group; collect results with `gather(..., return_exceptions=True)` if you need
+  every outcome.
+
 ## Production patterns
 - **Retry by class, not by catch-all.** With tenacity, use `retry=retry_if_exception_type(Transient)` plus
   `stop_after_attempt(3)` and exponential waits, so `Permanent` and your own bugs fail on the first
@@ -324,11 +329,14 @@ propagate to a single top-level handler that logs once with the full chain and m
 - **Vendor neutrality:** translating once in the adapter means adding a fallback provider touches one
   module, not every call site, and handlers never depend on vendor message wording.
 
-### Your provider bill tripled after a deploy, but error rates look flat. What would you check?
-- **A catch-all retry:** `except Exception` around a paid call retries permanent failures and your own
-  bugs, so a new `KeyError` in parsing costs three requests while eventual failure looks like one error.
-- **Evidence:** retries per exception class, and the same trace appearing several times per request.
-- **Fix:** retry only `Transient`, let bugs escape on the first attempt, and log once at the top.
+### After a refactor, Ctrl-C no longer stops your agent worker and shutdown hangs on cancelled tasks. What do you look for?
+- **A handler that is too broad:** a bare `except:` or `except BaseException:` around the agent loop or an
+  `await`. `KeyboardInterrupt` and `asyncio.CancelledError` hang off `BaseException`, not `Exception`,
+  so only those forms swallow them.
+- **Fix:** catch `Exception` (or your `LLMError` base) instead; if cleanup really must see every exit,
+  use `finally` or re-raise with a bare `raise` after the cleanup.
+- **Verify** by sending SIGINT in staging and checking that `TaskGroup` or `task.cancel()` completes
+  within your shutdown timeout.
 
 ### When would you use an attribute such as `retryable` instead of a new subclass?
 - **When handling depends on data,** for example the same `ProviderHTTPError` is retryable for 503 but

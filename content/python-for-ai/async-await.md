@@ -5,7 +5,7 @@ name: async / await
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/asyncio
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -137,7 +137,7 @@ sequenceDiagram
     OS-->>L: both sockets readable at about 1 s
     L->>A: resolve Future, resume after await
     L->>B: resolve Future, resume after await
-    Note over A,B: a blocking call in A would stop B from ever being run
+    Note over A,B: a blocking call in A delays B until A finishes
 ```
 
 ## Examples
@@ -190,14 +190,15 @@ asyncio.run(main())
   start.
 
 ### Worked numbers: the same 20 calls under different settings
-Each call waits 0.2 to 0.6 s (mean 0.4 s), measured with the fan-out above.
+Each call waits 0.2 to 0.6 s (mean 0.4 s), measured with the fan-out above. Times are random, so
+expect run-to-run spread of a few tenths of a second.
 
 | Setting | Wall time (approx.) | Peak in flight | Why |
 |---|---|---|---|
-| Semaphore of 1 (sequential) | ~8 s | 1 | 20 × 0.4 s of waits, one after another |
-| Semaphore of 5 | ~1.7-2.0 s | 5 | Four "waves" of waits overlap |
+| Semaphore of 1 (sequential) | ~7.5-8 s | 1 | 20 × 0.4 s of waits, one after another |
+| Semaphore of 5 | ~1.7-2.2 s | 5 | Each slot serves about 4 calls: 20 × 0.4 / 5 = 1.6 s, plus waiting for the last slow call |
 | No cap (all 20 at once) | ~0.6 s | 20 | Bounded by the slowest call, and by the provider's patience |
-| Cap of 5 but `time.sleep` inside | ~8 s or more | 1 | The loop never regains control |
+| Cap of 5 but `time.sleep` inside | ~7.5-8 s | 1 | The loop never regains control, so it degrades to sequential |
 
 - **The last row is the production incident:** the code looks concurrent and the profile shows idle CPU.
 

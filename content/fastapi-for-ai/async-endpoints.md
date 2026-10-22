@@ -323,8 +323,9 @@ than by CPU time spent on the loop.
 - **`def` endpoint:** at most 40 in flight, so 40 ÷ 10 s = 4 requests/s however idle the CPU.
 - **`async def` endpoint:** bounded by the client's connection pool; `httpx` defaults to 100 connections,
   so 100 ÷ 10 s = 10 requests/s per client, cheap to raise because a parked coroutine costs kilobytes.
-- **A blocking call of *b* seconds on the loop** caps the worker at 1 ÷ *b*: 40 ms of sync work means
-  25 requests/s.
+- **A blocking call of *b* seconds on the loop** caps the worker at 1 ÷ *b*, whatever the provider
+  latency: 20 ms of sync work per request means at most 50 requests/s, with every other request stalled
+  while it runs.
 
 ### What does fanning out calls with `asyncio.gather` buy you, and what does it cost?
 - **Gain:** latency becomes the maximum of the calls instead of their sum, for example a completion and a

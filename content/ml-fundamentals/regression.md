@@ -5,7 +5,7 @@ name: Regression
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/classification
   - ml-fundamentals/loss-functions

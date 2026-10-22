@@ -5,7 +5,7 @@ name: Inter-annotator agreement
 kind: metric
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - evals/golden-dataset
   - evals/rubrics
@@ -170,9 +170,9 @@ print("pilot 2: p_o=%.2f p_e=%.3f kappa=%.2f" % cohen_kappa(A2, B2))  # 0.92 0.8
 
 | | Pilot 1 | Pilot 2 |
 |---|---|---|
-| Pass rates | A 62, B 58 | both 94% |
-| Chance agreement p_e | 0.62 × 0.58 + 0.38 × 0.42 ≈ 0.519 | 0.887 |
-| Raw agreement p_o | 0.80 | 92% |
+| Pass labels | A marks 62 pass, B marks 58 | both raters pass 94% |
+| Chance agreement p_e | 0.62 × 0.58 + 0.38 × 0.42 ≈ 0.519 | 0.94 × 0.94 + 0.06 × 0.06 ≈ 0.887 |
+| Raw agreement p_o | 0.80 | 0.92 (92%) |
 | κ | (0.80 − 0.519) / (1 − 0.519) ≈ 0.58 | 0.29 |
 
 - **Look at the failures, which are what the eval cares about.** In pilot 2 the two raters flagged ten
@@ -271,7 +271,8 @@ Same label mix as pilot 1 (50/30/12/8 per 100), different sizes; 95% bootstrap i
 - **Annotators who are not independent** (one sees the other's labels, or they confer during the pilot).
   Symptom: a high pilot kappa followed by a much lower production kappa. Fix: hide labels, no conferring.
 - **Comparing an LLM judge with labels from a single annotator.** Symptom: a judge that "beats humans",
-  which often means it matches one person's habits and is unverified against everyone else.
+  which often means it matches one person's habits and is unverified against everyone else. Fix: score
+  it against an adjudicated or majority label from two or more annotators.
 - **Small pilots without intervals.** Symptom: κ = 0.7 on 30 items followed by 0.45 on the next batch
   with no change in process. Fix: bootstrap intervals and a larger pilot.
 

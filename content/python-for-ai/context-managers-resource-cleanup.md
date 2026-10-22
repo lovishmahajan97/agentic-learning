@@ -5,7 +5,7 @@ name: Context managers / resource cleanup
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/generators
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -266,8 +266,9 @@ Illustrative numbers for one worker using a shared `httpx.AsyncClient` (100 conn
 - **Keep streams open exactly as long as they are consumed.** Put `async with client.stream(...)` inside
   the async generator you hand to `StreamingResponse`, so the stream closes when iteration ends or the
   client disconnects. Monitor open upstream connections after client disconnects.
-- **Make leaks loud in tests.** Run the suite with `python -W error::ResourceWarning` (or `-X dev`), since
-  `ResourceWarning` is ignored by default, and fail on "unclosed" warnings. Add error-injection tests that
+- **Make leaks loud in tests.** `ResourceWarning` is ignored by default, so run the suite with
+  `-W error::ResourceWarning` (pytest accepts the same flag), or `python -X dev` to at least show them,
+  and treat "unclosed" warnings as failures. Add error-injection tests that
   assert the pool is idle afterwards.
 - **Bound cleanup that does I/O.** Wrap awaited cleanup in `__aexit__` or `finally` with
   `asyncio.timeout(...)`, and log rather than raise if it fails, so a hung close neither stalls shutdown
@@ -292,21 +293,23 @@ Illustrative numbers for one worker using a shared `httpx.AsyncClient` (100 conn
 
 ## Pitfalls
 - **Creating an `httpx.AsyncClient` inside each request with `async with`.** Cleanup is correct but there is
-  no connection reuse. Symptom: high latency from repeated TLS handshakes.
+  no connection reuse. Symptom: high latency from repeated TLS handshakes. Fix: one client per process,
+  opened in the lifespan.
 - **Returning a lazy stream or generator from inside a `with` block.** The resource closes on return.
   Symptom: the consumer later fails with "stream closed" or reads nothing.
 - **Writing `@contextmanager` teardown after `yield` without `finally`.** It runs in tests on the happy path
-  and silently does not run when the block raises.
+  and silently does not run when the block raises. Fix: wrap the `yield` in `try/finally`.
 - **An `__exit__` that returns `True` by accident** (e.g. returning the result of a cleanup call).
-  Symptom: exceptions vanish and callers see `None` results with no traceback.
+  Symptom: exceptions vanish and callers see `None` results with no traceback. Fix: return `None`
+  explicitly unless suppression is the manager's purpose.
 - **Relying on `__del__` to close connections.** Symptom: "unclosed client session" warnings and pool
   exhaustion that varies with garbage-collection timing.
 - **Acquiring a second resource in `__enter__` after the first without guarding it.** When the second
   fails, `__exit__` never runs, and the first leaks only on that rare setup-failure path. Symptom: slowly
-  climbing open connections after upstream outages.
+  climbing open connections after upstream outages. Fix: an `ExitStack` in `__enter__`, as above.
 - **A cleanup step in `__exit__` or `finally` that can raise** (closing an already-broken stream). Symptom:
   the traceback reports the cleanup error and the real cause is buried under "During handling of the above
-  exception".
+  exception". Fix: log and swallow the cleanup's own error so the original propagates.
 
 ## When to use
 - **Use for anything with an acquire-and-release pair:** clients and connection pools, streams, DB sessions

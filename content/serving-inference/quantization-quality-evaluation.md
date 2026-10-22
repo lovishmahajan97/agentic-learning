@@ -5,7 +5,7 @@ name: Quantization quality evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/quantization
   - model-internals/perplexity
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-Measure a quantized model against its own full-precision baseline on the work you serve. KL divergence
-and perplexity are cheap early signals; paired golden-set evals are the acceptance test. Long context,
-math, code, strict formats and rare languages break first.
+Measure a quantized model against its own full-precision baseline on your workload. KL divergence and
+perplexity are cheap early signals and paired golden-set evals the acceptance test; long context, math,
+code, strict formats and rare languages break first, and averages hide it.
 
 ## Why it exists
 - **The pressure to quantize is constant.** A 4-bit checkpoint lets a 70B model fit where a 16-bit one did
@@ -245,7 +245,8 @@ Read them: if they share a pattern (dates, long inputs, JSON), that slice is the
 - **Comparing against a published fp16 score.** Re-run the fp16 model yourself under identical prompts and
   settings; otherwise the "regression" is really a harness difference.
 - **Judging by chat impressions.** Fluency survives quantization long after arithmetic, code and
-  long-context recall have degraded, so the demo looks fine and the eval does not.
+  long-context recall have degraded, so the demo looks fine and the eval does not. Fix: run the ladder,
+  starting with the weak-spot slices.
 - **Ignoring the calibration set.** A GPTQ or AWQ file calibrated on English web text can degrade
   noticeably on code or another language. The tell is a domain KL far above the WikiText KL.
 - **Quantizing weights and KV cache at once** and attributing any loss to the weights. Test them
@@ -253,7 +254,8 @@ Read them: if they share a pattern (dates, long inputs, JSON), that slice is the
 - **Calling a 0.8-point drop "within noise" or "significant"** without a confidence interval from paired
   per-item results.
 - **Reporting only net accuracy.** Equal numbers of fixed and broken items cancel in the mean. Symptom: an
-  eval that says "no change" followed by specific, reproducible complaints from production users.
+  eval that says "no change" followed by specific, reproducible complaints from production users. Fix:
+  report broke and fixed counts and read every broken item.
 
 ## When to use
 - **Run the full ladder** whenever a quantized artifact is a production candidate: a new checkpoint, a new
@@ -303,8 +305,10 @@ way.
 
 ### How many golden-set items do you need to detect a 2-point drop?
 - **Independent runs** at 80% accuracy on 300 items give about ±6.4 points, far too wide.
-- **Paired analysis** with ~5% disagreement gives about ±2.5 on the same 300 items, so 300 is borderline
-  and more items, or a lower disagreement rate, are needed for a confident 2-point call.
+- **Paired analysis** with ~5% disagreement gives about ±2.5 on the same 300 items, still wider than the
+  effect, so 300 is not enough.
+- **Solve for n:** a ±2-point half-width needs 0.05 × (1.96 ÷ 0.02)² ≈ 480 items; detecting a 2-point drop
+  with 80% power needs roughly 0.05 × ((1.96 + 0.84) ÷ 0.02)² ≈ 980, fewer if disagreement is lower.
 
 ### When would you accept a measurable quality drop from quantization?
 - **When the error cost is low and the saving is large:** for example a support bot where halving serving

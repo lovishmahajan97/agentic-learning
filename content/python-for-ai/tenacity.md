@@ -5,7 +5,7 @@ name: tenacity
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/retry-strategies
   - reliability/circuit-breakers
@@ -189,9 +189,9 @@ Worst-case latency of this policy, because the budget is checked between attempt
 
 | Component | Bound |
 |---|---|
-| Failures until the budget fires | just under 30 s |
+| An attempt fails just before the budget, so the stop check passes | just under 30 s elapsed |
 | One more wait | at most 8 s (five attempts allow only four waits, windows 1, 2, 4 and 8 s) |
-| One more attempt timeout | 20 s |
+| One more attempt, running to its timeout | 20 s |
 | Total | just under a minute |
 
 Need a strict ceiling? Shrink the per-attempt timeout or enforce an outer deadline.

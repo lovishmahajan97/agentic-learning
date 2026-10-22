@@ -5,7 +5,7 @@ name: MCP authentication / authorization / transport security
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - agents/model-context-protocol
   - agents/a2a-protocol
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-MCP tool calls are safe only if the server knows who asks and what they may do. Local stdio servers
-rely on the OS process boundary; remote HTTP servers use an optional OAuth 2.1 layer. The model is never
-the trust boundary.
+MCP tool calls are safe only if the server knows who asks and what they may do. Local stdio
+relies on the OS process boundary; remote HTTP adds optional OAuth 2.1 with PKCE and audience-bound
+tokens. The model is never the trust boundary.
 
 ## Why it exists
 - **An MCP server has side effects.** It is a remote-procedure interface that reads a customer's CRM,
@@ -120,8 +120,8 @@ downstream-scoped token.
 - **Session IDs must be cryptographically random** and never substitute for authentication, *because* a
   guessed or leaked ID would let an attacker inject messages into another user's session.
 - **Validate the bearer token on every request** regardless of session.
-- **Bind session state to the authenticated subject** (key it as `subject:session_id`), per the spec's
-  security guidance, so a stolen ID presented with someone else's token resolves to nothing.
+- **Bind session state to the authenticated subject** (key it as `subject:session_id`), as the spec's
+  security guidance suggests, so a stolen ID presented with someone else's token resolves to nothing.
 
 ### The confused deputy
 The shape: an MCP server fronts a third-party API (say, a SaaS CRM) and acts as an OAuth *proxy*. It
@@ -256,7 +256,7 @@ A user holds tokens for two servers: a low-risk `docs` server and a sensitive `b
 
 | Step | Without audience check | With audience check |
 |---|---|---|
-| Prompt injection on the `docs` server exfiltrates its token | Attacker has a valid token from the trusted issuer | Same |
+| The `docs` server is compromised (or malicious) and keeps the bearer tokens clients send it | Attacker has a valid token from the trusted issuer | Same |
 | Attacker presents it to `billing` | Signature and issuer pass, call succeeds | `aud` is the `docs` URI, server returns `401` |
 | Audit log | Shows the user issuing refunds they never saw | Shows a rejected token with the wrong audience |
 

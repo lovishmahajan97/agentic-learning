@@ -5,7 +5,7 @@ name: Continuous batching
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/batching-and-concurrency-limits
   - serving-inference/prefill-vs-decode
@@ -219,15 +219,19 @@ for cap in (16, 32, 48):
 
 ## Pitfalls
 - **Benchmarking with uniform output lengths.** Symptom: little gain over static batching in the load test,
-  then surprise when production's skewed lengths behave completely differently.
+  then surprise when production's skewed lengths behave completely differently. Fix: replay output lengths
+  sampled from production logs.
 - **Raising `max_num_seqs` until throughput peaks and shipping that.** Symptom: excellent tokens/sec with
-  complaints that text streams slowly, because TPOT was never on the dashboard.
+  complaints that text streams slowly, because TPOT was never on the dashboard. Fix: cap it where TPOT p95
+  meets the budget.
 - **Chunked prefill disabled on a mixed workload.** Symptom: periodic stalls across all streams that
-  correlate with long-prompt arrivals rather than request rate.
+  correlate with long-prompt arrivals rather than request rate. Fix: enable it with a token budget.
 - **An unbounded waiting queue.** Symptom: TTFT climbing linearly over minutes under steady overload,
-  because the loop retires fewer sequences per second than arrive.
+  because the loop retires fewer sequences per second than arrive. Fix: backpressure at the gateway and
+  scale on queue depth.
 - **Expecting better single-request latency.** Symptom: disappointment when a lightly loaded server's TPOT
-  equals the bandwidth floor regardless of settings.
+  equals the bandwidth floor regardless of settings. Fix: use per-request levers such as weight
+  quantization or speculative decoding.
 
 ## When to use
 Every production LLM engine does this; what you choose is the dials.

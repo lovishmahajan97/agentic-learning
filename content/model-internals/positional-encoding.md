@@ -5,7 +5,7 @@ name: Positional encoding (RoPE)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - model-internals/self-attention
   - model-internals/context-window
@@ -249,17 +249,20 @@ print(position_ids)
 
 ## Pitfalls
 - **Mixing the interleaved and rotate-half layouts** when loading ported weights. Symptom: correct shapes,
-  no errors, perplexity in the hundreds.
+  no errors, perplexity in the hundreds. Fix: permute the `W_Q` and `W_K` rows as the official conversion
+  script does, then re-check perplexity against the source.
 - **Feeding wrong position ids:** restarting at 0 on each decode step, or counting pad tokens in a
   left-padded batch. Symptom: output fine for the longest prompt but degraded for shorter ones, or quality
   that drops right after the first generated token. Positions must come from the attention mask and the
   cache length.
 - **Running past `max_position_embeddings` with no scaling.** Symptom: output that degenerates into
-  repetition or nonsense right after the trained length, with no exception raised.
+  repetition or nonsense right after the trained length, with no exception raised. Fix: cap the engine's
+  max length at the trained or officially extended length.
 - **Computing the cos/sin tables in bf16 or fp16 for large positions.** Symptom: slowly degrading quality
   at high positions caused by rounding of large angles. Keep the frequency computation in fp32.
 - **Setting `rope_scaling` in a serving config without the fine-tuning the method assumes.** Symptom:
-  degraded short-context quality and only partial recovery at long context.
+  degraded short-context quality and only partial recovery at long context. Fix: use only the scaling the
+  vendor documents for that checkpoint, or fine-tune for it, and evaluate at short and long lengths.
 
 ## When to use
 You choose a positional scheme indirectly by choosing a model, but you meet it directly in three places:

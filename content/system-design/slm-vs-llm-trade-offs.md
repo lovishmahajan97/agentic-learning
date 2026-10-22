@@ -41,8 +41,8 @@ knowledge they do not. Decide by task narrowness, tail-error cost and data locat
   less reliably, hallucinate more on knowledge (fewer facts fit in fewer parameters) and degrade more
   sharply in long contexts.
 - **The gap is task-dependent.** Pattern-following tasks (classify, extract, reformat, answer from
-  supplied text) saturate early, and fine-tuning closes the remaining gap; broad reasoning and knowledge
-  keep improving with scale. The question is "does this task saturate", and that must be measured.
+  supplied text) saturate early: beyond some size a bigger model does not do them measurably better,
+  and fine-tuning closes the remaining gap; broad reasoning and knowledge keep improving with scale. The question is "does this task saturate", and that must be measured.
 
 ## How it works
 ### What shrinks when a model shrinks
@@ -115,18 +115,19 @@ knowledge they do not. Decide by task narrowness, tail-error cost and data locat
 
 ## Diagram
 The usual answer is a cascade: the distilled SLM takes every request first, and only low-confidence or
-invalid outputs pay for the LLM. The threshold on the confidence check is the cost-quality dial.
+invalid outputs pay for the LLM. The gate before serving tests the exact quantized artefact on a
+human-labelled set; the calibrated threshold on the confidence check is the cost-quality dial.
 
 ```mermaid
-flowchart LR
+flowchart TD
     T["LLM as teacher on task inputs"] -->|"labels, sample human-verified"| FT["Fine-tune SLM, parameter-efficient"]
-    FT --> EV{"Exact deployed artefact meets bar on human-labelled set?"}
+    FT --> EV{"Deployed artefact meets bar?"}
     EV -->|"no"| L["Stay on LLM or larger open-weight model"]
     EV -->|"yes"| S["SLM serves every request"]
     R["Request"] --> S
-    S --> C{"Confidence above calibrated threshold and output valid?"}
+    S --> C{"Confident and output valid?"}
     C -->|"yes, most traffic"| OK["Accept SLM answer"]
-    C -->|"no, the tail"| ESC["Escalate to LLM or human review queue"]
+    C -->|"no, the tail"| ESC["Escalate to LLM or review queue"]
     OK -.->|"sampled reviews"| CAL["Recalibrate threshold on fresh labels"]
     ESC -.-> CAL
     CAL -.-> C
@@ -182,7 +183,7 @@ def daily(volume, in_tok=300, out_tok=10, p_in=1, p_out=3, gpu_fixed=100,
 for v in (100_000, 5_000_000):
     r = daily(v, escalate=0.15)
     print(v, {k: round(x) for k, x in r.items()})
-# 100000  {'api': 33, 'slm': 120, 'cascade': 105, 'break_even_req': 303030}   API wins
+# 100000 {'api': 33, 'slm': 120, 'cascade': 105, 'break_even_req': 303030}   API wins
 # 5000000 {'api': 1650, 'slm': 1100, 'cascade': 348, 'break_even_req': 303030} cascade wins
 ```
 

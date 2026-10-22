@@ -5,7 +5,7 @@ name: Small language models (SLMs)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - model-internals/scaling-laws
   - model-internals/hallucination
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-An SLM is a model of roughly 0.5–10B parameters (no fixed boundary) that runs on one consumer GPU, a CPU
-or a phone. Modern recipes make them strong on narrow tasks, trading knowledge and reasoning for speed,
-cost, privacy and cheap fine-tuning.
+An SLM is a roughly 0.5–10B-parameter model (no fixed boundary) that runs on one consumer GPU, a CPU or
+a phone. Over-training, distillation and curated data make it strong on narrow tasks, trading
+knowledge and reasoning for speed, cost and privacy.
 
 ## Why it exists
 - **Most production requests are narrow.** A ticket classifier, entity extractor, query rewriter or PII
@@ -189,8 +189,8 @@ def distill_loss(student_logits, teacher_logits, labels, T=2.0, alpha=0.5):
 ```
 
 ## Production patterns
-- **Cascade with confidence escalation.** Serve the SLM first and escalate on a small top-two logit margin
-  or a failed schema check, as in the `route` function above. Tune the threshold on held-out data and
+- **Cascade with confidence escalation.** Serve the SLM first and escalate on a small top-two class
+  probability margin or a failed schema check, as in the `route` function above. Tune the threshold on held-out data and
   monitor the escalation rate, accuracy on SLM-kept traffic, and blended cost per task.
 - **Per-task LoRA with an eval gate.** Fine-tune adapters with Hugging Face PEFT (`LoraConfig` with a rank
   such as 16) on thousands of labelled examples, version each adapter, and block release unless it beats
@@ -224,18 +224,20 @@ def distill_loss(student_logits, teacher_logits, labels, T=2.0, alpha=0.5):
 ## Pitfalls
 - **Judging an SLM with zero-shot prompts written for a frontier model.** Symptom: "it fails" on tasks it
   would handle after a few-shot prompt or a small fine-tune, and a premature conclusion that SLMs are
-  useless.
+  useless. Fix: evaluate after few-shot prompting or a small fine-tune.
 - **Asking an SLM for facts from its weights.** Symptom: confident fabrication of dates, citations and API
   names. Fix: give it the source text and let it extract.
 - **Comparing on a public benchmark that may be in the training data.** Symptom: a benchmark score far
-  above the in-house eval on your own data.
+  above the in-house eval on your own data. Fix: choose between candidates on your own golden set.
 - **Quantising to 4-bit and skipping re-evaluation.** Symptom: subtle regressions in JSON validity and
-  multilingual output, because small models lose more under quantisation than large ones.
+  multilingual output, because small models lose more under quantisation than large ones. Fix: re-run
+  those evals on every quantised build.
 - **Serving single-stream on a server GPU.** Symptom: a 3B model whose cost per token rivals a well-batched
   30B model, because the card is bandwidth-bound and mostly idle at batch 1 while the larger model amortises
-  each weight read over dozens of requests.
+  each weight read over dozens of requests. Fix: continuous batching at real concurrency.
 - **Front-loading a 6k-token system prompt plus retrieved context.** Symptom: slow prefill and answers that
-  ignore the middle of the context, since small models degrade faster with long inputs.
+  ignore the middle of the context, since small models degrade faster with long inputs. Fix: fine-tune the
+  instructions in and cap retrieved context.
 
 ## When to use
 - **Use when:** the task is narrow and high-volume, the inputs carry the facts the answer needs, latency or

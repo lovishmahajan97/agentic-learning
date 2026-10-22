@@ -5,7 +5,7 @@ name: LLM architecture (encoder–decoder vs decoder-only)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - model-internals/transformer
   - model-internals/attention-mechanism
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-Encoder–decoder models read input bidirectionally, then write via cross-attention; decoder-only models
-treat prompt and answer as one causal stream. Decoder-only won for chat: it scales on raw text and
-reuses its cache. Encoder–decoder still wins for fixed inputs, short outputs.
+Encoder–decoder models read input bidirectionally, then write via cross-attention; decoder-only treats
+prompt and answer as one causal stream. That won for chat: it scales on raw text and reuses its cache.
+Encoder–decoder still wins for fixed, long inputs with short outputs.
 
 ## Why it exists
 - **Seq2seq tasks have a shape.** Translation has a complete input you may read in any order, then an
@@ -34,13 +34,14 @@ reuses its cache. Encoder–decoder still wins for fixed inputs, short outputs.
   directions, *because* understanding a sentence benefits from seeing its end. The decoder is masked so
   each output token sees only earlier output, *because* at inference later tokens do not exist yet.
   Cross-attention connects the two.
-- **Question 1: which single objective is most general?** Next-token prediction over a causal stream turns
+- **Question 1: which single objective yields the most general model from unlabelled text?** Next-token
+  prediction over a causal stream turns
   every token into a training example, with no masking scheme or input/output split to design.
 - **Question 2: how do you handle a conversation?** This turn's output is next turn's input. A two-stack
   model re-encodes the growing transcript every turn; a one-stack model appends tokens and keeps the cache.
 - **Question 3: how does few-shot prompting work?** Examples and the request live in the same stream as
-  the answer, so in-context learning falls out of the objective. Decoder-only answered all three with less
-  machinery, and at scale that simplicity compounded.
+  the answer, so in-context learning falls out of the objective instead of needing a separate mechanism.
+- **Decoder-only answered all three with less machinery**, and at scale that simplicity compounded.
 
 ## How it works
 ### Three families
@@ -219,9 +220,11 @@ print(reencoded, "tokens encoded vs", 300 * 10, "prefilled once with a KV cache"
 
 ## Pitfalls
 - **Using a chat model for bulk classification or reranking.** Cost per item is far higher than an encoder
-  with a head, and latency budgets blow up at scale.
+  with a head, and latency budgets blow up at scale. Fix: route scoring to an encoder or cross-encoder,
+  validated against the chat model's labels on a sample.
 - **Assuming an encoder–decoder can "continue the conversation" cheaply.** The transcript is re-encoded
-  every turn, so latency grows with history even for short replies.
+  every turn, so latency grows with history even for short replies. Fix: keep dialogue on a decoder-only
+  model and use the encoder–decoder for one-shot transformations.
 - **Treating the prompt as if it were read bidirectionally.** Instructions placed after a long document
   cannot influence how earlier tokens were represented. Symptom: extraction misses fields the task asked
   for, because the document was "read" before the model knew what to look for.
@@ -229,7 +232,8 @@ print(reencoded, "tokens encoded vs", 300 * 10, "prefilled once with a KV cache"
   after long documents), so stating the task before the document and repeating it after is a common hedge;
   measure on your task.
 - **Confusing the architecture family with the training recipe.** A decoder-only base model never
-  instruction-tuned will happily continue your prompt instead of answering it.
+  instruction-tuned will happily continue your prompt instead of answering it. Fix: use the instruct or
+  chat variant for question answering, and keep base models for completion or fine-tuning.
 
 ## When to use
 - **Default to decoder-only** for anything conversational, agentic, tool-using or open-ended: it has the

@@ -5,7 +5,7 @@ name: Retry strategies
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/timeouts
   - serving-inference/idempotency
@@ -175,6 +175,9 @@ def call_with_retry(send):
             time.sleep(delay)
 ```
 
+- **`retry_after` is assumed to be seconds already.** If the header carries the HTTP-date form, convert
+  it first with `email.utils.parsedate_to_datetime` and subtract the current time, or `float()` raises.
+
 ### Token-bucket retry budget, simulated through an outage
 Pure Python, runs as is. Successes deposit 0.1, retries spend 1; during a full outage the bucket drains
 and the fleet falls back to one attempt per request.
@@ -208,9 +211,9 @@ One user click traced through a stack that retries at three layers, then after t
 | Layer | Attempts before | Attempts after |
 |---|---|---|
 | Browser | 4 (retries three times) | 1 (no retries) |
-| Service | 4 (retries three times) | 1 (breaker and fallback instead) |
+| Service | 4 (retries three times) | 1 per target (breaker and fallback instead) |
 | SDK | 3 (retries twice) | 3 (the only retrying layer) |
-| Worst case per click | 3 × 4 × 4 = 48 | 3 |
+| Worst case per click | 3 × 4 × 4 = 48 | 3 per target tried, so 6 if the fallback rung also runs |
 
 ## Production patterns
 - **SDK as the single retry layer.** Keep the official SDK's retries and set them explicitly, for example

@@ -5,7 +5,7 @@ name: TypedDict, Literal and Enum
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/type-hints
   - python-for-ai/pydantic
@@ -120,7 +120,7 @@ value's vocabulary, then how much runtime behaviour you need.
 flowchart TD
     Q["What are you typing?"] --> S{"A dict shape or a single value?"}
     S -->|"dict shape"| D{"Must it stay a plain dict at runtime?"}
-    D -->|"yes, SDK payload or graph state"| TD["TypedDict, validated once with TypeAdapter"]
+    D -->|"yes, SDK payload or graph state"| T1["TypedDict, validated once with TypeAdapter"]
     D -->|"no, needs validation in many places"| PM["Pydantic model"]
     S -->|"one of N values"| B{"Needs methods, iteration or many modules?"}
     B -->|"no, only compared and serialized"| L["Literal plus assert_never in match"]

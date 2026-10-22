@@ -5,7 +5,7 @@ name: REST / GraphQL API design
 kind: decision
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/api-versioning-and-backward-compatibility
   - backend-fundamentals/pagination-rate-limits-api-quotas
@@ -239,17 +239,17 @@ Agent A and agent B both improve the same template within seconds.
 
 ## Pitfalls
 - **Verbs in URLs and everything as `POST`.** Symptom: nothing can be cached or safely retried, and
-  observability shows one undifferentiated endpoint.
+  observability shows one undifferentiated endpoint. Fix: nouns for resources, methods for actions.
 - **Errors with status 200 and a flag in the body.** Symptom: retry and alerting policies never fire, and
-  SDKs treat failures as success.
+  SDKs treat failures as success. Fix: real status codes plus one Problem Details body.
 - **GraphQL resolvers without DataLoader.** Symptom: query count scales with list length in the database
-  logs (the N+1 pattern).
+  logs (the N+1 pattern). Fix: a per-request DataLoader for every list relation.
 - **Holding a request open for a multi-minute AI job.** Symptom: intermittent 504s from a proxy whose idle
-  timeout you never configured, and clients retrying work that already ran.
+  timeout you never configured, and clients retrying work that already ran. Fix: `202` plus a job resource.
 - **Read-modify-write without `ETag`/`If-Match` or a version field.** Symptom: "my change disappeared"
-  reports when two users or two agents edit the same resource within seconds.
+  reports when two users or two agents edit the same resource within seconds. Fix: require `If-Match`.
 - **Unlimited GraphQL query depth and cost.** Symptom: one client's nested query pins the database while
-  everything else times out.
+  everything else times out. Fix: depth and cost limits, persisted queries for first-party clients.
 
 ## When to use
 - **Default to REST with an OpenAPI schema** for AI service endpoints, internal service-to-service calls
@@ -312,12 +312,13 @@ mostly machines, and long-running work plus caching favour HTTP semantics.
   or paginate it.
 - **Fix and guard:** batch with DataLoader, persist the query, and alert on queries-per-operation.
 
-### How would you design an endpoint for a model call that takes 30 seconds to 5 minutes?
-- **Submit:** `POST` with an `Idempotency-Key` returns `202 Accepted`, a `Location` to the job, and
-  optionally a `Retry-After` polling hint.
-- **Observe:** clients `GET` the job until a terminal `status`, or subscribe to SSE progress events.
-- **Finish:** the result lives at its own URL and is cacheable once terminal; `DELETE` cancels and is
-  idempotent.
+### How would you implement `Idempotency-Key` on a `POST`, and how much storage does it need?
+- **Record before doing the work:** insert the key, scoped per client, with a hash of the body and an
+  in-progress state under a unique constraint; on success store the response, and replay it for repeats.
+- **Edge cases:** a duplicate arriving while the first is still in progress gets `409` and retries later;
+  the same key with a different body is rejected (`409` or `422`) rather than replayed.
+- **Sizing:** keys live for a fixed window; at 50 creates per second and a 24-hour window that is
+  50 × 86,400 = 4.32 million rows, so give them a TTL or a scheduled purge.
 
 ## Quiz
 ### Q: Why return `202 Accepted` with a `Location` header for a five-minute AI job instead of holding the request open until it finishes?

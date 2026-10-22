@@ -5,7 +5,7 @@ name: Multi-head attention
 kind: concept
 difficulty: core
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - model-internals/self-attention
   - model-internals/attention-mechanism
@@ -228,9 +228,10 @@ A team trained a small model with a custom head dimension above 256 to "give eac
   Symptom: a silent fall-back to the math path, attention memory that grows with n² and much lower
   throughput. Force the backend in a test to make it fail loudly.
 - **Leaving out `W_O`, or applying it per head.** The symptom is subtle, usually that adding heads stops
-  helping because they cannot combine.
+  helping because they cannot combine. Fix: one `[h·d_k, d]` projection applied after concatenation.
 - **Explaining a prediction with one head's attention map.** Symptom: contradictory stories from
-  different heads and layers for the same output.
+  different heads and layers for the same output. Fix: test a head's role by ablating it and measuring
+  the change.
 
 ## When to use
 Multi-head attention is a given inside any transformer; what you decide is the split.
@@ -287,11 +288,13 @@ only shrinks if you reduce KV heads through GQA, which the question did not do.
 - **Options:** run TP on 4 GPUs and use the rest for another replica or pipeline stage, pick a model
   whose head counts fit, or use data-parallel replicas instead.
 
-### Which quantities change when you go from 8 to 32 heads at fixed d_model, and which do not?
-- **Unchanged:** parameters (4d²), score FLOPs (2·n²·d) and the full-MHA KV cache per token (2d per
-  layer).
-- **Changed:** the `[B, h, n, n]` probability tensor grows four times, and per-head rank caps fall, for
-  example from 512 to 128 at d = 4,096.
+### How much KV cache does a 4,096-token sequence need on Llama-2-7B versus Llama-3-8B, and why do they differ?
+- **Formula:** 2 (K and V) × layers × KV heads × head_dim × bytes. Both have 32 layers, 32 query heads
+  and head_dim 128 in fp16.
+- **Llama-2-7B (full MHA, 32 KV heads):** 0.5 MiB per token, so about 2 GiB for 4,096 tokens.
+- **Llama-3-8B (GQA, 8 KV heads):** 0.125 MiB per token, about 0.5 GiB, four times less. The query-head
+  count is the same; only the KV heads changed, which is why you size caches from
+  `num_key_value_heads`.
 
 ## Quiz
 ### Q: Why does multi-head attention cost roughly the same as a single head of width d_model?

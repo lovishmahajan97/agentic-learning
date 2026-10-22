@@ -5,7 +5,7 @@ name: asyncio
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/async-await
   - python-for-ai/async-cancellation-and-exception-propagation
@@ -310,12 +310,13 @@ request is the fingerprint.
   executor has `min(32, cpu_count + 4)` threads and pure-Python work stays GIL-serialized.
 - **Mostly-sync codebases** may be simpler with a thread pool than with function colour everywhere.
 
-### p99 latency rose under load but CPU is low. Which numbers would you look at first?
-- **Event-loop lag:** a probe that sleeps 0.5 s and logs the overshoot. Lag that tracks your slowest
-  synchronous section means something blocks the loop.
-- **Debug mode in staging:** `PYTHONASYNCIODEBUG=1` logs any step slower than
-  `loop.slow_callback_duration` (100 ms by default) with the task name, pointing at the blocking call.
-- **Pending task count and pool waits**, to rule out a full `httpx` pool (100 connections by default).
+### You raise the fan-out semaphore from 32 to 200, but throughput barely moves and some calls fail with PoolTimeout. Why?
+- **The client pool is the real cap.** A default `httpx.AsyncClient` allows 100 connections, so above
+  100 in-flight calls the extra tasks wait for a free connection instead of sending.
+- **Pool waits count against the timeout.** httpx's default timeout (5 seconds) also covers acquiring a
+  connection from the pool, so tasks queued behind 3-second LLM calls can raise `httpx.PoolTimeout`.
+- **Match the numbers:** size `httpx.Limits(max_connections=...)` to the semaphore and keep both under the
+  provider's concurrency limit, because the provider's cap (seen as 429s) is the one you cannot change.
 
 ## Quiz
 ### Q: A coroutine on the event loop calls `time.sleep(2)`. What happens to the other tasks?

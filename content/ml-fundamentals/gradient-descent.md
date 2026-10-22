@@ -5,7 +5,7 @@ name: Gradient descent
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/loss-functions
   - ml-fundamentals/backpropagation
@@ -193,9 +193,10 @@ def train_epoch(model, loader, optimizer, scheduler, max_norm=1.0, log=print):
 - **Gradient-norm clipping as a default.** Call `torch.nn.utils.clip_grad_norm_` (max norm around 1.0 is
   a common starting value) before `optimizer.step()`. Monitor the returned pre-clip norm; frequent
   clipping means the learning rate is too high.
-- **Warmup plus decay.** Wrap the optimizer in a scheduler that ramps η up over the first steps and decays
-  it afterwards, because the landscape sharpens as training proceeds. Monitor the logged learning rate
-  next to the loss.
+- **Warmup plus decay.** Wrap the optimizer in a scheduler that ramps η up over the first steps, because
+  early updates from a random initialisation (and fresh optimizer statistics) are the least stable, then
+  decays it, because the landscape sharpens as training proceeds. Monitor the logged learning rate next
+  to the loss.
 - **Fail fast on non-finite loss.** Check `torch.isfinite(loss)` each step, stop and dump the batch ids,
   then resume from the last good checkpoint with a lower η. Monitor NaN events per run.
 - **Retune η when the batch size changes.** When moving to more GPUs or gradient accumulation, re-sweep

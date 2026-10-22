@@ -5,7 +5,7 @@ name: API clients with retries & circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/retry-strategies
   - reliability/circuit-breakers
@@ -126,7 +126,7 @@ sleep(n) = random(0, min(cap, base × 2^n))      // attempt n
   quotas, and backed by Redis it works across replicas.
 - **Why a budget:** per-request limits do not bound fleet-wide amplification; if every request may make
   3 attempts, an outage can triple traffic.
-- **Retry budget:** cap retries as a fraction of recent requests (for example, at most one retry per ten
+- **Retry budget:** cap retries as a fraction of recent successful or total requests (for example, at most one retry per ten
   requests over the last minute, an illustrative ratio to tune). During a blip almost every failure gets
   its retry; during an outage the budget empties and failures surface immediately.
 - **Prior art:** it is the per-client analogue of a breaker; some service meshes and gRPC clients

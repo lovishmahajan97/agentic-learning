@@ -5,7 +5,7 @@ name: Streams & backpressure
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - node-ts-for-ai/abortcontroller-and-cancellation
   - node-ts-for-ai/event-loop-and-microtask-queue
@@ -35,9 +35,11 @@ latency. Backpressure pauses a fast producer when the consumer lags, keeping mem
   acknowledge them; a file reader produces 64 KiB chunks far faster than an embedding call consumes them.
   Without a rule, the fast side's output piles up in your process.
 - **Size it honestly.** Text chat is small (800 tokens is a few KB, perhaps tens of KB as SSE JSON events), so
-  an unbounded buffer is a latent bug. Raw 24 kHz 16-bit mono speech is 48,000 bytes per second: a 60-second
-  answer is about 2.9 MB, and a thousand stalled mobile clients is about 2.9 GB of heap. The same arithmetic
-  applies to file downloads, exports and proxied uploads.
+  there an unbounded buffer is a latent bug more than an outage.
+- **Bulk payloads are different.** Raw 24 kHz 16-bit mono speech is 48,000 bytes per second: a 60-second
+  answer is about 2.9 MB, and a thousand stalled mobile clients is about 2.9 GB of heap. The process dies of
+  memory pressure while every request looks healthy. The same arithmetic applies to file downloads, exports
+  and proxied uploads.
 - **Backpressure is the actual fix.** "Make the consumer faster" does not exist for a network you do not
   control. The consumer's capacity propagates backwards so the producer stops reading its source until there
   is room; Node's stream abstractions make that, plus error and early-termination propagation, automatic.
@@ -112,8 +114,8 @@ latency. Backpressure pauses a fast producer when the consumer lags, keeping mem
   `push()` after it has returned `false`; that buffer has no bound.
 
 ## Diagram
-The happy path flows right; the backpressure signal flows back from the slow client to the provider's
-socket. `pipeline` carries errors and aborts along the same chain.
+Data flows down the solid arrows; the dotted arrows are the backpressure signal flowing back from the slow
+client to the provider's socket. `pipeline` carries errors and aborts along the same chain.
 
 ```mermaid
 flowchart TD
@@ -121,7 +123,7 @@ flowchart TD
     R --> T["Transform: SSE to NDJSON"]
     T --> W["ServerResponse"]
     W --> C["Slow mobile client"]
-    C -.->|"buffer over highWaterMark"| W
+    C -.->|"slow ACKs, buffer fills"| W
     W -.->|"write returns false"| T
     T -.->|"stop pulling"| R
     R -.->|"TCP window fills"| M
@@ -133,9 +135,9 @@ flowchart TD
 A Transform that reframes a provider's SSE stream into newline-delimited JSON for the browser, wired with
 `pipeline` so a client disconnect or upstream error tears down the whole chain.
 
-On client disconnect the
-`AbortSignal` cancels the upstream `fetch` and closes that connection; most providers stop generating when
-the connection drops, but whether partial output is still billed is vendor-specific.
+On client disconnect the `AbortSignal` cancels the upstream `fetch` and closes that connection; most
+providers stop generating when the connection drops, but whether partial output is still billed is
+vendor-specific.
 
 ```ts
 import { Transform, Readable, type TransformCallback } from "node:stream";
@@ -252,20 +254,24 @@ Raw 24 kHz 16-bit mono PCM is 48,000 bytes per second, streamed to mobile client
 
 ## Pitfalls
 - **Ignoring the `false` return of `write()`** in a manual `'data'` handler. Symptom: heap growth proportional
-  to the number of slow clients and eventual out-of-memory under load.
+  to the number of slow clients and eventual out-of-memory under load. Fix: `pipeline`, or `await
+  once(res, "drain")` when `write()` returns `false`.
 - **Using `pipe` instead of `pipeline`,** so an error on the response does not destroy the upstream body.
-  Symptom: leaked file descriptors and upstream connections held open after users disconnect.
+  Symptom: leaked file descriptors and upstream connections held open after users disconnect. Fix:
+  `pipeline` with the request's signal.
 - **A custom `Readable` that keeps calling `push()` after it returns `false`** (for example, one fed by an SDK's
   event callbacks). Symptom: backpressure that "works in tests" but buffers unboundedly with real slow
-  clients.
+  clients. Fix: pause the source until `_read` is called again, or wrap it in an async generator.
 - **Decoding each chunk with `chunk.toString()`** in a streaming parser. Symptom: occasional `\uFFFD`
-  replacement characters in non-English or emoji output where a character straddled two chunks.
+  replacement characters in non-English or emoji output where a character straddled two chunks. Fix: one
+  `StringDecoder` or `TextDecoderStream` per stream.
 - **Buffering the whole stream (`await res.text()`) before streaming it on.** Symptom: time-to-first-token
-  equal to total generation time.
+  equal to total generation time. Fix: parse incrementally in a Transform.
 - **Proxies or compression middleware buffering the response.** Symptom: tokens arrive in one burst at the end
   although the server wrote them incrementally. Fix: nginx's `X-Accel-Buffering: no` header or the equivalent
   proxy setting, and no compression on streamed routes.
-- **Not aborting upstream on client disconnect.** Symptom: token spend on responses nobody receives.
+- **Not aborting upstream on client disconnect.** Symptom: token spend on responses nobody receives. Fix:
+  `res.on("close", () => ac.abort())` with `ac.signal` passed to the upstream call.
 
 ## When to use
 - **Stream when output is incremental and a human is waiting** (chat completions, voice, progress of long agent

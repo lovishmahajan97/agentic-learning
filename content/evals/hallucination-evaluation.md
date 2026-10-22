@@ -5,7 +5,7 @@ name: Hallucination evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - evals/faithfulness-groundedness
   - model-internals/hallucination
@@ -213,8 +213,12 @@ for n in (50, 100, 400):
     print(n, f"±{100 * half_width(0.10, n):.1f} points")
 # 50 ±8.3 points   -> "12% -> 8%" is noise
 # 100 ±5.9 points
-# 400 ±2.9 points  -> a 4-point move starts to mean something
+# 400 ±2.9 points  -> per run; comparing two runs widens it by about 1.4x (±4.1)
 ```
+
+- **Comparing two versions is noisier than one run.** The difference of two independent rates has a
+  half-width about √2 times larger, so at 400 items a 4-point move is still borderline. Paired
+  comparison on the same items (which ones flipped) is tighter.
 
 ## Production patterns
 - **Unanswerable slice as a release gate.** Keep a few hundred unanswerable, false-premise and

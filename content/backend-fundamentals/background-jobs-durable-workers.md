@@ -5,7 +5,7 @@ name: Background jobs / durable workers
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/message-queues
   - backend-fundamentals/redis
@@ -131,7 +131,8 @@ within a Postgres table on modest hardware.
 
 ### What to measure
 - **Queue depth and age of the oldest queued job** detect a stalled worker fleet.
-- **Run duration per type, attempts histogram and dead count** detect a failing dependency.
+- **Run duration per type** shows what each job type costs in worker time.
+- **Attempts histogram and dead count** detect a failing dependency.
 
 ## Diagram
 The job's lifecycle as stored in the row: every arrow is one guarded `UPDATE`, and lease expiry is the
@@ -261,9 +262,9 @@ Uploads average 0.5 per second with 4-minute embedding jobs; then one tenant bul
 
 | Question | Arithmetic | Answer |
 |---|---|---|
-| Worker slots at steady state | 0.5/s × 240 s | 120 jobs in progress; provision more than 120 slots |
-| Bulk import on a shared run-order queue, 120 slots | 10,000 × 240 s ÷ 120 | ~20,000 s (about 5.6 hours) before other tenants' jobs start |
-| Same import with a per-tenant cap of 20 slots | the tenant uses 20, others share 100 | other tenants keep near-normal latency; the import takes longer |
+| Worker slots at steady state | 0.5/s × 240 s | 120 jobs in progress; provision more, say 150 slots |
+| Bulk import on a shared run-order queue, 150 slots | 10,000 × 240 s ÷ 150 | 16,000 s (about 4.4 hours) before other tenants' new jobs start |
+| Same import with a per-tenant cap of 20 slots | the tenant uses 20, others share 130 against the 120 they need | other tenants keep near-normal latency; the import takes 10,000 × 240 s ÷ 20 = 120,000 s (about 33 hours) |
 
 The cap trades the bulk tenant's completion time for everyone else's latency, which is usually the right
 product call; make it explicit in the tier's terms.

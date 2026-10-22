@@ -5,7 +5,7 @@ name: PostgreSQL transactions & migrations
 kind: practice
 difficulty: core
 est_minutes: 18
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/postgresql-transactions-and-isolation-levels
   - backend-fundamentals/sql
@@ -228,7 +228,9 @@ Two runs for the same tenant charge 1,000 tokens each, at the same moment, with 
 
 ### Production snippet: NOT NULL on a live table, in steps
 Each file is its own migration, so the brief strong lock of `ADD CONSTRAINT ... NOT VALID` is not held
-during the validation scan. The backfill runs as a batched job between the first two files.
+during the validation scan. The backfill runs as a batched job between the first two files, and code
+that writes `tenant_id` on every insert must be deployed before the backfill, because a `NOT VALID`
+check is still enforced on new and updated rows and `VALIDATE` fails on any null left behind.
 
 ```sql
 -- 0010_expand.sql: nullable column, metadata-only
@@ -259,9 +261,11 @@ ALTER TABLE messages DROP CONSTRAINT messages_tenant_nn;
 - **Pool saturation alerts.** node-postgres exposes `pool.totalCount`, `pool.idleCount` and
   `pool.waitingCount`; export them as gauges. A sustained non-zero waiting count with total at `max`
   means leaked clients or transactions held across slow calls.
-- **Outbox relay with `SKIP LOCKED`.** When writes must trigger jobs, a relay polls
-  `SELECT ... FROM outbox ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED`, publishes, then deletes or marks
-  the rows, so several relays never double-claim. Monitor the age of the oldest unpublished row.
+- **Outbox relay with `SKIP LOCKED`.** When writes must trigger jobs, a relay opens a transaction,
+  runs `SELECT ... FROM outbox ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED`, publishes, then deletes or
+  marks the rows and commits, so several relays never double-claim. A crash between publish and commit
+  republishes the batch, so consumers must still be idempotent. Monitor the age of the oldest
+  unpublished row.
 - **Fail-fast migrations, retried by the pipeline.** Every migration starts with `SET lock_timeout`, runs
   as a gated CI or init-container step before rollout, and the job retries off-peak on timeout. Monitor
   lock waits and migration duration per deploy.

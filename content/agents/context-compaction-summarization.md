@@ -5,7 +5,7 @@ name: Context compaction / summarization
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - agents/agent-loop
   - agents/agent-memory
@@ -31,10 +31,13 @@ external state; the hard part is choosing what must survive.
 - **Cost is quadratic, value is linear.** Illustratively, at 3,000 tokens per step, step 40 sends about
   120,000 tokens, and the run has sent 3,000 × (1 + 2 + … + 40) ≈ 2.5 million tokens for information
   that grew linearly.
-- **Three things break before the budget does.** The hard limit (a 200k-token window ends the run
-  mid-task, usually on the hard, long runs); quality ("lost in the middle": the task statement at
-  position 2 competes with 100k tokens of logs); and distraction (stale errors and abandoned plans keep
-  pulling the model back).
+- **Three things break before the budget does.**
+  - *Hard limit:* a 200k-token window ends the run mid-task, at the worst moment, because long runs are
+    the hard ones.
+  - *Quality:* models use information in the middle of a long prompt less reliably than near the start
+    or end ("lost in the middle"), so the task statement at position 2 competes with 100k tokens of logs.
+  - *Distraction:* stale observations (an already-fixed error, an abandoned plan) stay visible and keep
+    pulling the model back.
 - **Naive fixes fail.** Dropping the oldest messages removes the system prompt, task and constraints,
   the most important tokens. A bigger window moves the wall but keeps the quadratic cost and the
   attention dilution. "Be concise" does not control tool output sizes, which is where the tokens are.

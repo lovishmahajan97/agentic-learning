@@ -5,7 +5,7 @@ name: GIL (Global Interpreter Lock)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/asyncio-vs-threads-vs-multiprocessing
   - python-for-ai/race-conditions-and-synchronization-primitives
@@ -21,9 +21,9 @@ sources:
 ---
 
 ## TL;DR
-The GIL is a CPython mutex letting one thread run bytecode at a time, protecting reference counts and
-C extensions. Threads still help with I/O and GIL-releasing native code, not pure-Python CPU work. It
-does not make your code thread-safe.
+The GIL is a mutex in standard CPython letting one thread run bytecode at a time, protecting reference
+counts and C extensions. Threads still help with I/O and GIL-releasing native code, not pure-Python CPU work. It
+does not make code thread-safe.
 
 ## Why it exists
 - **Reference counts change constantly.** Every CPython object's count is updated on nearly every
@@ -221,16 +221,16 @@ Python-level work that holds the GIL, and in testing it pulled the hashing ratio
 
 ## Pitfalls
 - **Threads to speed up a pure-Python tokenising or parsing loop.** Symptom: CPU pinned near 100% of one
-  core and no wall-clock improvement.
+  core and no wall-clock improvement. Fix: a process pool, or move the hot loop into native code.
 - **Assuming the GIL makes shared counters or dicts thread-safe.** Symptom: occasional lost updates or
-  inconsistent state that disappears when you add logging.
+  inconsistent state that disappears when you add logging. Fix: a `threading.Lock` or `queue.Queue`.
 - **Blaming the GIL for a slow I/O-bound service.** If CPU is low and latency high, the problem is waiting
-  or blocking calls; the GIL is not the bottleneck.
+  or blocking calls; the GIL is not the bottleneck. Fix: find the blocking call or the slow dependency.
 - **Assuming a library releases the GIL because it is written in C.** Some hold it for the whole call, and
-  profiling shows threads queuing instead of running in parallel.
+  profiling shows threads queuing instead of running in parallel. Fix: measure CPU/wall per call first.
 - **A free-threaded build plus an extension not marked compatible.** CPython re-enables the GIL at runtime
   (with a warning), threads stop scaling, and `sys._is_gil_enabled()` (3.13+) returns `True` where you
-  expected `False`.
+  expected `False`. Fix: use free-threaded wheels for every compiled dependency, and check the flag at startup.
 
 ## When to use
 You do not use the GIL; you design around it.

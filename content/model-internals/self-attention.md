@@ -5,7 +5,7 @@ name: Self-attention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - model-internals/attention-mechanism
   - model-internals/multi-head-attention
@@ -195,6 +195,8 @@ answer correctly.
 
 ```python
 tok.padding_side = "left"                 # Hugging Face tokenizer, decoder-only generation
+if tok.pad_token is None:                 # many causal-LM tokenizers ship without one
+    tok.pad_token = tok.eos_token
 batch = tok(prompts, return_tensors="pt", padding=True)
 out = model.generate(**batch, max_new_tokens=64)   # passes attention_mask with the ids
 ```
@@ -230,14 +232,17 @@ out = model.generate(**batch, max_new_tokens=64)   # passes attention_mask with 
 
 ## Pitfalls
 - **Masking with zeros after softmax, or masking the wrong triangle.** Tokens see the future. Symptom: a
-  training loss that falls suspiciously close to zero, followed by nonsense at inference.
+  training loss that falls suspiciously close to zero, followed by nonsense at inference. Fix: mask logits
+  with −∞ where j > i before softmax, and assert the weights above the diagonal are zero.
 - **Right-padding a decoder-only batch during generation.** Pad tokens land after the prompt. Symptom:
   shorter prompts in a batch produce junk while the longest one is fine. Fix: left padding with an
   attention mask.
 - **A fully masked row.** Every key −∞, as with an all-padding query row, makes softmax return NaN.
-  Symptom: NaN losses that appear only on certain batches.
+  Symptom: NaN losses that appear only on certain batches. Fix: guarantee each query row at least one
+  visible key, or zero out fully masked rows explicitly.
 - **Costing attention with only one term.** Using only the quadratic or only the linear term gives a
-  capacity plan that is right at one context length and wrong by multiples at another.
+  capacity plan that is right at one context length and wrong by multiples at another. Fix: cost both
+  8·n·d² and 4·n²·d at every context length you serve.
 
 ## When to use
 Self-attention is not optional in a transformer, so the real decisions are around it.

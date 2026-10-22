@@ -5,7 +5,7 @@ name: Throughput vs latency
 kind: decision
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/continuous-batching
   - serving-inference/batching-and-concurrency-limits
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-A decode step costs about the same for one sequence or thirty-two, so batching multiplies throughput
-almost for free, but each added request lengthens every step and the queue. Pick an operating point per
-workload and enforce it with limits and SLOs.
+A decode step costs about the same for one sequence or thirty-two, because reading the weights
+dominates, so batching multiplies throughput until compute or KV memory saturates. Each added request
+also lengthens every step and the queue: pick an operating point per workload.
 
 ## Why it exists
 - **A GPU at concurrency 1 is mostly idle.** It streams 16 GB of weights through its memory system to
@@ -218,16 +218,17 @@ for rho in (0.5, 0.7, 0.9, 0.95):
 
 ## Pitfalls
 - **Autoscaling on GPU utilisation.** Symptom: a metric pinned near 100 % at both light and heavy load,
-  so replicas scale out late or never while users wait through a queue.
+  so replicas scale out late or never while users wait through a queue. Fix: scale on queue depth.
 - **Closed-loop throughput benchmarks with no SLO.** Symptom: a "capacity" figure production never
-  reaches without blowing p99.
+  reaches without blowing p99. Fix: report goodput from an open-loop run.
 - **Sizing from mean latency.** Symptom: on-call pages for p99 while the dashboard average looks fine,
-  since queueing lives entirely in the tail.
+  since queueing lives entirely in the tail. Fix: size against p95 and p99.
 - **One batch job on the interactive pool.** Symptom: TTFT spikes at the exact minute a cron job starts.
+  Fix: a separate pool or a provider batch API.
 - **Raising `max_num_seqs` without checking KV memory.** Symptom: preemptions and recompute stalls that
-  lower throughput and latency at once.
+  lower throughput and raise latency at once. Fix: check KV occupancy and the preemption counter first.
 - **Treating speculative decoding as free throughput.** Symptom: lower aggregate tokens/s at peak than
-  without it.
+  without it. Fix: keep it on the low-concurrency pool.
 
 ## When to use
 - **Every time** you configure a replica, choose a provider tier, or set a rate limit, you are making

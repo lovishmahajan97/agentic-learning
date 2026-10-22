@@ -5,7 +5,7 @@ name: Promises & async error propagation
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
   - node-ts-for-ai/abortcontroller-and-cancellation
@@ -226,13 +226,14 @@ An agent step needs a model call, a tool call and an embedding lookup that do no
 | Pattern | Latency | Failure behaviour |
 |---|---|---|
 | `await` each in turn (1.2 s + 0.8 s + 0.3 s) | 2.3 s, the sum | Safe, but slow |
-| Start all, await one by one | 1.2 s, the max | Crashes if the 0.3 s call rejects during the 1.2 s wait |
+| Start all, await one by one (model first) | 1.2 s, the max | Crashes (default mode) if the 0.8 s or 0.3 s call rejects during the 1.2 s wait |
 | Start all, `await Promise.allSettled([...])` | 1.2 s, the max | Every outcome known; retry only what failed |
 
 ## Production patterns
 - **Lint floating promises in CI.** Enable `@typescript-eslint/no-floating-promises` (it needs type
   information) as an error, and require an explicit `void` plus `.catch` for intentional fire-and-forget.
-  Track disables per file in review.
+  By default the rule accepts a bare `void p` (`ignoreVoid`), which still crashes if `p` rejects, so review
+  that every `void` carries a `.catch`. Track disables per file in review.
 - **Crash loudly, report first.** Keep Node's default `--unhandled-rejections=throw` (or use `strict`), and
   if you add a `process.on('unhandledRejection')` listener, make it log with the request context and then
   exit so the orchestrator restarts the process. Alert on restart count and on any such log line.
@@ -263,19 +264,22 @@ An agent step needs a model call, a tool call and an embedding lookup that do no
 ## Pitfalls
 - **Forgetting `await` on a call whose result you ignore** (logging, metrics, cache writes). Symptom: a crash
   whose stack points into a logging or cache helper rather than the request that started it (or
-  `ERR_UNHANDLED_REJECTION` with no stack when a non-Error was thrown), or data that never arrives.
+  `ERR_UNHANDLED_REJECTION` with no stack when a non-Error was thrown), or data that never arrives. Fix:
+  await it, or attach an explicit `.catch`.
 - **`return promise` inside `try` instead of `return await promise`.** Symptom: a `catch` block that "never
-  runs" while the error surfaces in the caller.
+  runs" while the error surfaces in the caller. Fix: `return await` inside `try`.
 - **Awaiting sequentially what could run concurrently** (`const a = await x(); const b = await y();`).
-  Symptom: latency equal to the sum of calls instead of the max.
+  Symptom: latency equal to the sum of calls instead of the max. Fix: run independent calls concurrently
+  through a combinator.
 - **"Fixing" that with staggered awaits.** Symptom: an intermittent unhandled-rejection crash that only
-  happens when the second call fails while the first is slow.
+  happens when the second call fails while the first is slow. Fix: start both, then await one combinator.
 - **Throwing inside a `setTimeout` or event-listener callback** and expecting the surrounding `try` to catch
-  it. Symptom: an `uncaughtException` crash whose stack has no request-handler frames.
+  it. Symptom: an `uncaughtException` crash whose stack has no request-handler frames. Fix: use the promise
+  API (`timers/promises`, `events.once`) so the error re-enters the chain.
 - **Rethrowing as a fresh `new Error(msg)` without `cause`.** Symptom: logs saying "model call failed" with
-  no status code, no request id and no stack from the real failure.
+  no status code, no request id and no stack from the real failure. Fix: pass `{ cause: err }`.
 - **Retrying the whole batch on `Promise.all` rejection.** Symptom: duplicated tool side effects, because
-  the calls that had succeeded are run again.
+  the calls that had succeeded are run again. Fix: `allSettled`, retry only failures, idempotency keys.
 
 ## When to use
 - **Default:** `async`/`await` with `try`/`catch` for all I/O.

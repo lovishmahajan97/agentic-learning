@@ -5,7 +5,7 @@ name: Reflection / self-critique
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - agents/agent-loop
   - agents/planning

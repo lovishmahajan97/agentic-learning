@@ -5,7 +5,7 @@ name: Parallel tool calls
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - agents/tool-calling
   - agents/agent-loop

@@ -5,7 +5,7 @@ name: Grouped-query attention (GQA)
 kind: concept
 difficulty: core
 est_minutes: 12
-status: crisp
+status: crisp-verified
 related:
   - model-internals/multi-head-attention
   - model-internals/kv-cache
@@ -172,7 +172,7 @@ from transformers import AutoConfig
 
 cfg = AutoConfig.from_pretrained("meta-llama/Meta-Llama-3-8B")   # any causal LM id you can access
 kv_heads = getattr(cfg, "num_key_value_heads", None) or cfg.num_attention_heads
-head_dim = cfg.hidden_size // cfg.num_attention_heads
+head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
 per_token = 2 * cfg.num_hidden_layers * kv_heads * head_dim * 2   # fp16 bytes
 print(cfg.num_attention_heads, kv_heads, per_token // 1024, "KB/token")
 # 32 8 128 KB/token
@@ -204,7 +204,7 @@ faster. Time-to-first-token barely changes, because prefill is compute-bound.
   8 GPUs for g = 8. Monitor per-GPU cache memory when you add GPUs; if it does not shrink, KV heads are
   being replicated.
 - **Use a GQA-aware attention path.** Let the engine's fused kernel index shared heads; in your own
-  PyTorch code, recent versions of `F.scaled_dot_product_attention` accept `enable_gqa=True` instead of a
+  PyTorch code, `F.scaled_dot_product_attention` accepts `enable_gqa=True` (PyTorch 2.5+) instead of a
   materialized `repeat_kv`. Monitor prefill activation memory.
 
 ## Trade-offs
@@ -222,16 +222,20 @@ faster. Time-to-first-token barely changes, because prefill is compute-bound.
 
 ## Pitfalls
 - **Using `num_attention_heads` instead of `num_key_value_heads` in a capacity estimate.** Symptom: a
-  cache budget four times too large, and a cluster sized or rejected on the wrong number.
+  cache budget four times too large, and a cluster sized or rejected on the wrong number. Fix: read
+  `num_key_value_heads`, falling back to the query-head count only when the field is absent.
 - **Expecting GQA to cut time-to-first-token.** Symptom: an unchanged TTFT after switching models while
-  only throughput and per-token latency improved.
+  only throughput and per-token latency improved. Fix: judge GQA on decode throughput and inter-token
+  latency; attack TTFT with prefix caching or chunked prefill instead.
 - **Materializing `repeat_kv` copies in a custom attention path at prefill.** Symptom: transient
-  activation memory as large as MHA even though the cache itself is small.
+  activation memory as large as MHA even though the cache itself is small. Fix: use a kernel that
+  indexes shared heads, or `enable_gqa=True`.
 - **Converting an MHA checkpoint by slicing or averaging heads without uptraining.** Symptom: a sharp
   perplexity jump on the first evaluation that only continued pre-training (the paper's ~5% uptraining)
-  recovers.
+  recovers. Fix: budget the uptraining run, or pick a model trained with GQA.
 - **Tensor-parallel degree larger than the KV-head count.** Symptom: per-GPU cache memory that does not
-  shrink as expected when you add GPUs.
+  shrink as expected when you add GPUs. Fix: keep the TP degree at or below the KV-head count, and use
+  extra GPUs for replicas or pipeline stages.
 
 ## When to use
 - **Choosing a model to serve:** at long context or high concurrency, read `num_key_value_heads` before
@@ -290,11 +294,12 @@ evenly.
 - **Above g, KV heads are replicated**, so adding GPUs stops shrinking per-GPU cache memory; plan the TP
   degree to divide g.
 
-### How many 4k-token chats fit on an 80 GB GPU for a 7B model with 32 versus 8 KV heads?
-- **Per token:** 512 KB for MHA and 128 KB for GQA (32 layers, head_dim 128, fp16), so 2 GB versus
-  0.5 GB per chat.
-- **Capacity:** about 66 GB free after weights gives roughly 30 versus 130 chats, before fragmentation and
-  activation headroom.
+### Estimate the decode step time floor for an 8B model at batch 64 and 4k context, MHA versus GQA.
+- **Bytes per step:** ~16 GB of fp16 weights plus the batch's cache: ~128 GB with 32 KV heads, ~32 GB with
+  8, so ~144 GB versus ~48 GB.
+- **Floor:** at roughly 2 TB/s that is ~72 ms versus ~24 ms per step, so GQA decodes about three times
+  faster, before compute or kernel overheads bite (illustrative orders of magnitude).
+- **Caveat:** the MHA batch does not fit on one 80 GB card at all, so in practice it runs a smaller batch.
 
 ## Quiz
 ### Q: What does grouped-query attention primarily reduce?

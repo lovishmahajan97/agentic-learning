@@ -5,7 +5,7 @@ name: TPOT (time per output token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/ttft
   - serving-inference/tokens-sec
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 Time per output token (TPOT) is the average gap between tokens once generation starts. Each decode step
-reads all weights plus the KV cache, so TPOT has a bandwidth floor and barely rises with batch size;
-extra FLOPs alone do not help.
+reads all weights plus the KV cache, so TPOT has a bandwidth floor and barely rises with batch size.
+Fewer bytes per step help; extra FLOPs do not.
 
 ## Why it exists
 - **It dominates total time for real answers.** After the first token, total latency is
@@ -79,8 +79,9 @@ step_time ≥ (weight_bytes + Σ kv_bytes_per_sequence) / memory_bandwidth
 4. **The compute crossover can be estimated.** Counting only weight matmuls, a step does `2 × N × B`
    FLOPs while reading `N × bytes_per_param` bytes, so arithmetic intensity is `2B / bytes_per_param`
    FLOPs per byte.
-5. **Compare with the GPU's ratio** of peak FLOP/s to bandwidth, roughly 1e15 / 3.35e12 ≈ 300 for an H100
-   in bf16. With fp16 weights the crossover is a batch near 300, independent of model size.
+5. **The GPU turns compute-bound when that intensity reaches its ratio** of peak FLOP/s to bandwidth,
+   roughly 1e15 / 3.35e12 ≈ 300 for an H100 in bf16. With fp16 weights (`2B / 2 = B`) the crossover is
+   a batch near 300, independent of model size.
 6. **Int8 weights halve it**, because each byte read now feeds twice the arithmetic. KV reads add bytes
    without much arithmetic, which pushes the real crossover later still.
 7. **Long contexts pull the memory limit in fast**, because KV bytes scale with `B × context_length`;
@@ -226,17 +227,18 @@ for b, ctx in [(1, 4_000), (32, 4_000), (32, 32_000)]:
 
 ## Pitfalls
 - **Expecting a faster-FLOPs GPU to speed single-stream decode proportionally.** Symptom: a costly
-  upgrade that moves TPOT only as much as the bandwidth ratio.
+  upgrade that moves TPOT only as much as the bandwidth ratio. Fix: compare GPUs on HBM bandwidth.
 - **Reporting TPOT only as a mean.** Symptom: users describe "freezes" while the dashboard shows a
-  healthy 25 ms, because prefill stalls and preemptions live in p99 ITL.
+  healthy 25 ms, because prefill stalls and preemptions live in p99 ITL. Fix: chart the ITL histogram.
 - **Including TTFT in the TPOT calculation.** Symptom: TPOT that mysteriously grows with prompt length
-  even though decode speed has not changed.
+  even though decode speed has not changed. Fix: start the clock at the first token.
 - **Benchmarking at batch 1 and sizing concurrency from it.** Symptom: per-user speed that halves the
-  moment real traffic arrives.
+  moment real traffic arrives. Fix: run a load curve at realistic concurrency.
 - **Ignoring context length in capacity math.** Symptom: TPOT and preemptions climbing as conversations
-  get longer during the day.
-- **Counting streamed chunks as tokens.** Servers can coalesce tokens, so TPOT looks better than the
-  provider's own usage numbers imply.
+  get longer during the day. Fix: size KV memory for the real context mix.
+- **Counting streamed chunks as tokens.** Servers can coalesce or split tokens per chunk, so a
+  chunk-based TPOT disagrees with the provider's usage numbers (coalescing inflates it, splitting
+  flatters it). Fix: divide by the usage-reported output token count.
 
 ## When to use
 - **Track TPOT and p99 ITL** for every surface where output length is non-trivial: chat, code

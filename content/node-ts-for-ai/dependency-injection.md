@@ -5,7 +5,7 @@ name: Dependency injection
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - node-ts-for-ai/vitest-jest-and-integration-testing
   - node-ts-for-ai/typescript-strict-mode-and-advanced-types
@@ -109,7 +109,7 @@ llm = withCache(redis,                       // outermost: a hit skips everythin
   `createScope()` in Awilix) and lazy construction.
 - **It costs** a runtime resolution step, errors that surface at boot instead of compile time, and a
   learning curve.
-- **Rule of thumb:** for a dozen dependencies a hand-written root is clearer; past a few dozen with
+- **Rule of thumb:** for a dozen dependencies a hand-written root is usually clearer; past a few dozen with
   request scopes, a container pays for itself.
 
 ### What it is not
@@ -185,7 +185,9 @@ const svc = createChatService({
 
 ### A fallback decorator and the test that proves it
 The decorator satisfies `LLM`, so the service cannot tell it apart from a single provider. Only
-rate limits and server errors fall back; a 400 is the caller's bug and must surface.
+rate limits and server errors fall back; a 400 is the caller's bug and must surface. SDK connection
+errors and timeouts carry no `.status`, so this predicate does not fall back on them; extend it if an
+unreachable provider should also trigger the secondary.
 
 ```ts
 // with-fallback.ts — composes two LLMs behind one interface

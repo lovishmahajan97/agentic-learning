@@ -5,7 +5,7 @@ name: Mixture of experts (MoE)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - model-internals/transformer
   - model-internals/llm-architecture
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-An MoE transformer swaps each dense FFN for many expert FFNs plus a router that picks one or two per
-token. Compute tracks active parameters and quality beats a dense model of that size, but every expert
-must sit in memory.
+An MoE transformer swaps each dense FFN for many expert FFNs plus a router that sends each token to a
+few. Compute tracks active parameters, quality lands between dense models of active and total size, and
+every expert must sit in memory.
 
 ## Why it exists
 - **Dense models pay for every parameter on every token.** Scaling laws say loss keeps falling as
@@ -88,7 +88,8 @@ Count Mixtral 8x7B: 8 experts per layer, top-2 routing.
 
 ### Load balancing
 Left alone, routers collapse: experts that are slightly better early receive more tokens, learn faster and
-attract still more, until most experts are dead weight. Three mechanisms counter this:
+attract still more, until most experts are dead weight. Two mechanisms push load back toward even, and
+two more keep routing stable and bounded:
 - **Auxiliary load-balancing loss (Switch style).** For each expert multiply the fraction of tokens routed
   to it, f_i, by the mean router probability it received, P_i; sum over experts and scale by N. The sum is
   minimised when both are uniform, and because P_i is differentiable it pushes the router toward
@@ -265,16 +266,19 @@ for b in (1, 4, 8, 16):
 - **Sizing serving hardware from active parameters.** Symptom: an out-of-memory error at model load,
   because all experts must be resident regardless of how few run per token. Fix: size from total.
 - **Reading "8x7B" as a 56B model.** Benchmarking it against dense 56B models is wrong too: shared attention
-  makes it about 47B total and 13B active, and the two numbers answer different questions.
+  makes it about 47B total and 13B active, and the two numbers answer different questions. Fix: quote both
+  and say which one each comparison uses.
 - **Expecting human-interpretable specialists.** "The code expert" and "the legal expert" do not exist: the
   Mixtral authors found routing correlates with token type and syntax far more than with topic, so you
-  cannot prune "the experts you don't need" by domain.
+  cannot prune "the experts you don't need" by domain. Fix: keep every expert loaded.
 - **Setting the capacity factor too low to save memory.** Symptom: quality degrades on inputs with an
   unusual token mix (code in a chat model, a rare language), because overflow tokens are silently dropped.
+  Fix: log the dropped-token rate and raise the factor or route overflow to the next choice.
 - **Router collapse during training or continued pre-training.** Symptom: an expert-utilisation histogram
   with a few hot experts and many near zero, plus a loss plateau the parameter count does not explain.
+  Fix: restore the balancing loss or bias and add a router z-loss.
 - **Extrapolating batch-1 throughput to production.** Weight traffic per step rises with batch until all
-  experts are read, so the dense-versus-MoE comparison can invert.
+  experts are read, so the dense-versus-MoE comparison can invert. Fix: benchmark at real concurrency.
 
 ## When to use
 You rarely decide to train an MoE; you decide whether to deploy one.

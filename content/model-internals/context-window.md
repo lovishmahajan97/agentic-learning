@@ -5,7 +5,7 @@ name: Context window
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: crisp
+status: crisp-verified
 related:
   - model-internals/kv-cache
   - model-internals/positional-encoding
@@ -215,17 +215,20 @@ for n in (8_192, 32_768, 131_072):
 ## Pitfalls
 - **Wrong tokenizer or missing overhead.** Counting with the wrong tokenizer or forgetting template and
   tool-definition overhead. Symptom: intermittent "context length exceeded" errors on requests that looked
-  within budget.
+  within budget. Fix: count the fully templated prompt with the deployed model's tokenizer.
 - **Assuming the model finds a fact anywhere.** In a 100k-token prompt, the symptom is answers that ignore
-  material in the middle while the same material at the end works.
+  material in the middle while the same material at the end works. Fix: put key material at the start or
+  end, retrieve less but better, and measure by position.
 - **Letting an agent loop append tool outputs forever.** Latency climbs turn by turn, cost per turn grows
-  linearly, and the run eventually fails at the boundary.
+  linearly, and the run eventually fails at the boundary. Fix: compact old turns and large tool outputs.
 - **Truncating from the front.** Cutting the system prompt or a tool's schema changes behaviour abruptly
-  mid-conversation with no error.
+  mid-conversation with no error. Fix: pin the fixed parts and trim or summarize history instead.
 - **Setting `max_tokens` far above real answer lengths.** Engines whose schedulers budget KV memory against
-  a request's worst-case length then admit fewer concurrent requests even though answers are short.
+  a request's worst-case length then admit fewer concurrent requests even though answers are short. Fix:
+  size the cap from observed output-length percentiles.
 - **Forgetting hidden thinking tokens.** Reasoning models spend them from the same budget. Symptom: empty
-  or cut-off answers with a "length" finish reason on hard prompts while easy ones work.
+  or cut-off answers with a "length" finish reason on hard prompts while easy ones work. Fix: reserve
+  output room for thinking as well as the answer, and track truncated finishes per route.
 
 ## When to use
 - **There is no opting out;** every request has a window. The decisions are how much of it to spend on

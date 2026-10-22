@@ -5,7 +5,7 @@ name: Timeouts
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/streaming
   - serving-inference/cancellation
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-LLM calls last from under a second to minutes, so one flat timeout kills good work or lets hung calls
-hold resources. Layer connect, first-token, idle and total timers, derive the total from
-`max_tokens × TPOT`, propagate the remaining budget, and cancel on every expiry.
+LLM call duration depends on unknown output length plus queueing, so one flat timeout kills good work
+or lets hung calls hold resources. Layer connect, first-token, idle and total timers, derive the total
+from `max_tokens × TPOT`, propagate the budget, and cancel on every expiry.
 
 ## Why it exists
 - **Legitimate durations vary by 100×.** Ordinary HTTP timeouts assume tens of milliseconds. An LLM
@@ -256,16 +256,17 @@ call, then raise the idle timeout on hops you own.
 ## Pitfalls
 - **Inheriting defaults.** A 60-second proxy or load balancer idle timeout in front of a non-streaming
   endpoint shows up as gateway errors at exactly 60 s on long generations while the engine keeps running.
+  Fix: audit every hop's timer, then stream or raise the ones you own.
 - **Treating the HTTP read timeout as a total timeout.** Symptom: a "timeout" that never fires on a
-  slow-but-alive stream, since it resets on every chunk.
+  slow-but-alive stream, since it resets on every chunk. Fix: add an explicit total deadline.
 - **Timing out without cancelling.** Symptom: provider usage and GPU load that stay high after clients
-  have given up, and tokens billed for answers nobody saw.
+  have given up, and tokens billed for answers nobody saw. Fix: close the connection on every expiry.
 - **One timeout constant regardless of `max_tokens`.** Symptom: short calls waiting minutes to fail and
-  long calls cut off while healthy.
+  long calls cut off while healthy. Fix: derive the budget per call.
 - **Agent steps that each get the full user budget.** Symptom: a 60-second SLO breached by a request
-  whose individual calls all "succeeded within timeout".
+  whose individual calls all "succeeded within timeout". Fix: propagate one absolute deadline.
 - **Retrying timeouts immediately, without a budget check.** Symptom: an overload that worsens as clients
-  time out, the signature of a retry storm.
+  time out, the signature of a retry storm. Fix: retry only within budget, with jitter, behind a breaker.
 
 ## When to use
 - **Every call** to a model, a retriever or a tool needs the layered timers above; the question is only

@@ -5,7 +5,7 @@ name: Batching & concurrency limits
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/continuous-batching
   - serving-inference/prefill-vs-decode
@@ -23,15 +23,15 @@ sources:
 ---
 
 ## TL;DR
-Decode streams all weights once per step regardless of batch size, so batching multiplies throughput
-almost free until compute or KV-cache reads bind. Concurrency limits stop past-the-knee latency growth
-and preemption thrash; enforce them at engine, gateway and client.
+Decode reads every weight once per step whatever the batch, so batching multiplies throughput almost
+free until compute or KV reads bind. Past that knee each request slows everyone and over-admission
+thrashes, so measure the knee and enforce it at engine, gateway and client.
 
 ## Why it exists
 - **Decode is bandwidth-bound.** A Llama-3-8B-class model in fp16 has about 16 GB of weights. At roughly
   3.35 TB/s (an H100 SXM's published figure), reading them once takes about 4.8 ms, capping one sequence
-  at roughly 200 tokens per second however fast the tensor cores are. Its FLOPs, about 2 × 8 billion = 16
-  GFLOP, take a small fraction of that time.
+  at roughly 200 tokens per second however fast the tensor cores are. The FLOPs for that one token, about
+  2 × 8 billion = 16 GFLOP, take a small fraction of that time: the GPU is mostly waiting on memory.
 - **Batching reuses each weight read.** With 64 sequences the weights are read once for all 64 tokens, so
   the step takes about the same 4.8 ms plus extra KV-cache reads, and throughput rises toward 64×.
 - **Over-admission ends badly.** KV memory is finite and each sequence holds it for its whole lifetime,
@@ -247,13 +247,16 @@ reads, not the weights, now set the step time.
 
 ## Pitfalls
 - **Limiting by request count only.** A handful of 100k-token requests exhausts the KV pool while the
-  count looks healthy. Symptom: preemption spikes and latency jitter at low request rates.
-- **Benchmarking with short synthetic prompts.** Deployed to traffic with long retrieved context,
-  throughput looks fine in the benchmark and TPOT doubles in production.
+  count looks healthy. Symptom: preemption spikes and latency jitter at low request rates. Fix: cap
+  tokens per step and per tenant, and cap `max_model_len` per route.
+- **Benchmarking with short synthetic prompts.** The knee measured that way is too high for traffic with
+  long retrieved context: throughput looks fine in the benchmark and TPOT doubles in production. Sweep
+  with production-shaped prompt and output lengths.
 - **Client timeouts shorter than queueing time.** Clients retry while the original request is still
-  running, so load doubles exactly when the system is saturated.
+  running, so load doubles exactly when the system is saturated. Fix: timeouts above expected queueing
+  time, and retry only on an explicit `Retry-After`.
 - **Disabling chunked prefill for peak prefill speed.** In-flight conversations then stall for hundreds of
-  milliseconds each time a long prompt arrives.
+  milliseconds each time a long prompt arrives. Fix: keep it on and tune the token budget instead.
 - **Setting the tokens-per-step budget very high.** Engines that profile the activation peak at startup
   (vLLM) respond by shrinking the KV pool, so capacity silently drops. Engines that do not profile OOM on
   a large prefill, a failure that only appears when a big prompt and a full decode batch coincide.

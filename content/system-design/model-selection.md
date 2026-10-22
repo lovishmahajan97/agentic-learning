@@ -76,7 +76,7 @@ data is. The usual gates:
 |---|---|
 | 1.96 × √(0.9 × 0.1 / 100) ≈ 0.059 | a 2-point gap on 100 examples is noise |
 | Repeated runs average only sampling randomness | they do not shrink the error from drawing *these* 100 examples; only more examples do |
-| Halving the interval needs four times as many examples | about 860 examples for ±2 points at 0.9 |
+| Halving the interval needs four times as many examples | 400 examples for ±3 points; about 860 for ±2 points at 0.9 |
 
 4. **Compare paired.** Every candidate runs on the same examples, so count the examples only model A
    gets right and only model B gets right (McNemar's test uses exactly these discordant counts).

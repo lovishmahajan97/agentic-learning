@@ -5,7 +5,7 @@ name: Hugging Face (transformers, datasets, tokenizers, accelerate, PEFT, TRL)
 kind: tool
 difficulty: core
 est_minutes: 22
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/pytorch
   - python-for-ai/safetensors

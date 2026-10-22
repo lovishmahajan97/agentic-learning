@@ -5,7 +5,7 @@ name: Webhook signature verification & replay protection
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - backend-fundamentals/api-and-sdk-integration
   - backend-fundamentals/message-queues
@@ -60,7 +60,7 @@ and keep the handler idempotent: providers retry.
 | Stripe | `"{timestamp}.{raw_body}"` | `Stripe-Signature: t=<unix>,v1=<hex>` |
 | Standard Webhooks (Svix and several vendors) | `"{msg_id}.{timestamp}.{raw_body}"` | `webhook-id`, `webhook-timestamp`, `webhook-signature` |
 | GitHub | the body alone, no timestamp | `X-Hub-Signature-256: sha256=<hex>`, plus a separate `X-GitHub-Delivery` id |
-| Slack | `"v0:{timestamp}:{raw_body}"` | `X-Slack-Signature` |
+| Slack | `"v0:{timestamp}:{raw_body}"` | `X-Slack-Signature: v0=<hex>`, timestamp in `X-Slack-Request-Timestamp` |
 
 - **The common core:** an HMAC with a per-endpoint secret over raw bytes.
 - **An HMAC, not a bare hash**, *because* a hash of public bytes can be computed by anyone.
@@ -236,7 +236,7 @@ Tolerance 300 seconds, dedupe retention 3 days, provider retries for up to a few
 | Real delivery replayed after a week | valid | fails | | 400 |
 | Real delivery replayed after 2 minutes | valid | passes | seen | 2xx, no side effect |
 | Provider retry after a timeout | valid (re-signed) | passes | seen | 2xx, no side effect |
-| Retry after 4 days, beyond retention | valid | passes | expired | processed again: only an idempotent handler saves you |
+| Retry after 4 days, beyond retention | valid (re-signed) | passes | expired | processed again: only an idempotent handler saves you |
 
 ## Production patterns
 - **Verify in a dedicated dependency on raw bytes.** Read `await request.body()` before any JSON parsing,
@@ -273,20 +273,22 @@ Tolerance 300 seconds, dedupe retention 3 days, provider retries for up to a few
 
 ## Pitfalls
 - **Verifying over re-serialised JSON.** Symptom: signatures fail only for some payloads (non-ASCII text,
-  floats, nested key order) while every local test passes.
+  floats, nested key order) while every local test passes. Fix: verify over the raw request bytes.
 - **Comparing signatures with `==`.** There is no functional symptom, which is exactly the danger; it
-  surfaces only in a pentest or security review.
+  surfaces only in a pentest or security review. Fix: `hmac.compare_digest`.
 - **Checking the signature but neither timestamp nor event id.** Symptom: double side effects (two credits,
-  two emails) whenever the provider retries, and silent replayability.
+  two emails) whenever the provider retries, and silent replayability. Fix: tolerance window plus dedupe.
 - **A gateway, body-parsing middleware or compression layer rewriting the body.** Symptom: every signature
-  fails after a deployment that changed nothing in your code.
+  fails after a deployment that changed nothing in your code. Fix: exempt the webhook route from rewriting.
 - **Doing the work inline and returning 200 at the end.** Symptom: provider-side timeouts, escalating
-  retries and duplicate processing under load, sometimes ending with the endpoint disabled.
+  retries and duplicate processing under load, sometimes ending with the endpoint disabled. Fix: ack, then
+  queue.
 - **Assuming ordered delivery.** Symptom: a record stuck in `started` because a late `started` event
-  overwrote `completed`.
+  overwrote `completed`. Fix: fetch the current object by id, or ignore state regressions.
 - **Rotating the secret without an overlap.** Symptom: a burst of 400s and missed events during the switch.
+  Fix: accept both secrets for an overlap window.
 - **Logging full headers and bodies.** Symptom: signatures, tokens and customer data sit in the log
-  platform for anyone with search access.
+  platform for anyone with search access. Fix: log event id, type and a body hash instead.
 
 ## When to use
 - **Every inbound webhook, without exception**, including your own services' events whenever they cross a

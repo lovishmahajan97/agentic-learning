@@ -85,6 +85,9 @@ The example count is a dial between thoroughness and suite time, so set it per e
 - **`derandomize=True` in CI** makes examples a fixed function of the test, so a red build is reproducible
   and never an unlucky draw. The price: CI explores the same inputs every run, which is why some teams
   keep a randomised nightly job alongside it.
+- **`derandomize=True` implies `database=None`**, so a derandomized lane neither saves nor replays
+  failures; the example database only helps randomised runs. Recent Hypothesis versions also detect CI
+  and default to derandomized settings there, so check your version before assuming randomness in CI.
 
 ### Stateful testing
 - **The bug is often in a *sequence* of calls** for objects with operations (a cache, a conversation
@@ -243,8 +246,9 @@ Rough orders of magnitude for a suite of 40 property tests at ~2 ms per example 
 - **Pin every shrunk counterexample.** Add it as `@example(...)` on the property and, for important bugs,
   as a plain named regression test like `test_empty_text_regression`. The bug then stays covered even if
   the `.hypothesis/` database is wiped.
-- **Persist the example database in CI.** Cache the `.hypothesis/` directory between CI runs with your
-  CI system's cache step, so failures found on one run are replayed first on the next.
+- **Persist the example database in randomised CI lanes.** Cache the `.hypothesis/` directory between
+  nightly runs with your CI system's cache step, so failures found on one run are replayed first on the
+  next. Skip it for the derandomized PR lane, which does not use the database.
 - **Reproduce from CI output.** Enable the `print_blob=True` setting in the CI profile; a failure then
   prints an `@reproduce_failure(...)` line you paste locally to replay the exact case.
 - **Tune deadlines, not tolerance for slowness.** For legitimately slow properties set
@@ -330,7 +334,8 @@ that is an eval over real prompts, and replies would be recorded examples, not g
   function of the test, not an unlucky draw.
 - **Get the exact case:** with `print_blob=True` the failure prints a `@reproduce_failure(...)` line you
   paste locally.
-- **Keep it covered:** pin the shrunk input with `@example(...)` and cache `.hypothesis/` between CI runs.
+- **Keep it covered:** pin the shrunk input with `@example(...)`, because a derandomized CI lane has no
+  example database to replay it from.
 
 ### When is property-based testing the wrong tool?
 - **When you cannot state the rule:** for code whose correctness is not expressible as an invariant, a few

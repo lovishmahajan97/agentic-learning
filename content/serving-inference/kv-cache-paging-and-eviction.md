@@ -5,7 +5,7 @@ name: KV-cache paging & eviction
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/pagedattention
   - serving-inference/kv-cache-memory-estimation
@@ -258,16 +258,17 @@ for name, kv, params in [("GQA 8B", GQA, 8), ("MHA 7B", MHA, 7)]:
 
 ## Pitfalls
 - **Reading "memory utilization 95%" as healthy while the preemption counter climbs.** Symptom: periodic
-  multi-second stalls on individual streams with no error logged.
+  multi-second stalls on individual streams with no error logged. Fix: alert on the preemption counter.
 - **Setting `max_model_len` far above real prompt lengths and assuming it is free.** Symptom: a preemption
   storm the first time a handful of requests actually grow into that headroom, because optimistic admission
-  let them in on their prompt size and the pool was sized for the typical case.
+  let them in on their prompt size and the pool was sized for the typical case. Fix: set it near the real
+  p99.
 - **Swap-based preemption on hosts with little pinned memory or slow PCIe.** Symptom: preempted requests
-  take longer to resume than recomputation would have.
+  take longer to resume than recomputation would have. Fix: benchmark resume latency both ways first.
 - **Changing block size on a tuned deployment without re-measuring.** Symptom: a surprise drop in prefix hit
-  rate or kernel throughput that nobody attributes to the flag.
+  rate or kernel throughput that nobody attributes to the flag. Fix: re-run the load test on any change.
 - **An approximate token-eviction method for long conversations.** Symptom: the model forgets instructions
-  from early in the chat while memory charts look great.
+  from early in the chat while memory charts look great. Fix: gate it on a long-range recall eval.
 
 ## When to use
 Paging is not optional in a modern engine; what you decide is the policy around it.

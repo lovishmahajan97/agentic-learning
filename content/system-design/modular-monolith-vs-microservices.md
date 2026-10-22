@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-The real decision is where *deployment and ownership* boundaries go. Start with a modular monolith
-(enforced module APIs, owned data) and turn a boundary into a network boundary only when it has a
-proven, independent reason: scaling, team or blast radius.
+The decision is where *deployment and ownership* boundaries go, not how code is organised. Start
+modular (enforced module APIs, owned data); make a boundary a network boundary, paying for partial
+failure and eventual consistency, only for a proven reason: scaling, team or blast radius.
 
 ## Why it exists
 - **Failure mode 1: the big ball of mud.** A monolith with no internal structure: any table joined from

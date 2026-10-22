@@ -25,7 +25,7 @@ sources:
 ## TL;DR
 Model calls are slow, billed and non-deterministic, so split tests into three layers: unit tests with an
 injected fake, integration tests with the real SDK over intercepted HTTP plus real databases, and scored
-evals against the real model.
+evals against the real model. Injecting the model client is what makes the first two layers possible.
 
 ## Why it exists
 - **The model call breaks every test assumption.** It takes seconds, costs money per token, needs a
@@ -53,7 +53,7 @@ differ in how code reaches the test.
 | TypeScript | Transform you configure: `ts-jest`, `babel-jest` or an swc plugin | Vite's transformer (esbuild, or Oxc in recent Vite) strips types without type-checking, so run `tsc --noEmit` separately |
 | ESM | Long behind an experimental flag, so projects accumulate `moduleNameMapper` and `transformIgnorePatterns` | Default; `vite.config.ts` aliases apply to tests too |
 | Workers | Child processes | `pool: "forks"` (child processes, default since v2) or `"threads"` (lighter, cannot use `process.chdir`, fragile with some native addons) |
-| Serialise files | `--runInBand` | `fileParallelism: false` |
+| Serialise files (when a shared resource forces it) | `--runInBand` | `fileParallelism: false` |
 | Watch | Re-runs related tests | Re-runs only files whose import graph changed |
 
 - **Default choice.** For a TypeScript-first AI service started today, Vitest. Jest stays right when the
@@ -292,13 +292,15 @@ Illustrative orders of magnitude for the Check yourself situation, not a benchma
 - **Testing backoff with real timers.** Symptom: a retry test takes a minute or hits the default test
   timeout, which then gets raised instead of fixed. Fix: fake timers with awaited async advances.
 - **Forgetting `maxRetries: 0` on the client under test.** Symptom: a test of a 500 response is slowed by
-  real backoff sleeps and sees three requests where it expected one.
+  real backoff sleeps and sees three requests where it expected one. Fix: construct the test client with
+  `maxRetries: 0`, and test retry behaviour explicitly where you mean to.
 - **Snapshotting model text.** Symptom: the snapshot file is updated with `-u` on every change, so the test
   no longer tests anything. Fix: snapshot the prompt, score the output.
 - **Rollback isolation while the code takes its own pooled connection.** Symptom: "row not found" for
   fixtures the test just inserted, and rows that survive between tests. Fix: inject the transaction client.
 - **Leaving `onUnhandledRequest` at its default (`"warn"`).** Symptom: a test hit the real network because
-  a URL did not match the handler, with only a warning buried in the output.
+  a URL did not match the handler, with only a warning buried in the output. Fix: set it to `"error"` in
+  the shared setup file.
 
 ## When to use
 - **Injected fake:** whenever logic surrounds the model: prompt assembly, parsing, repair loops, budgets,

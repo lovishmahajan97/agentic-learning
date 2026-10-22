@@ -5,7 +5,7 @@ name: Security scanning & dependency auditing (pip-audit, Bandit)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
   - python-for-ai/uv-poetry-pip
@@ -162,6 +162,10 @@ cfg_safe = yaml.safe_load(open("agent.yaml"))
 #   pip-audit -r req.txt --no-deps --disable-pip   # export is already fully resolved; skip pip install
 #   bandit -r src -ll                              # medium+ only: hides B105/B101, so run -l periodically
 ```
+
+- **Expect low-severity noise on the safe version too:** Bandit still reports `B603` (subprocess without a
+  shell) on `run_tool_safe`, plus `B403` for `import pickle`. Both are low severity; review them once rather
+  than suppressing them by default.
 
 ### Scanner configuration kept in the repo
 Bandit reads `[tool.bandit]` from `pyproject.toml` when you pass the file with `-c` (install `bandit[toml]`);

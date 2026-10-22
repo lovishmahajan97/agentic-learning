@@ -5,7 +5,7 @@ name: Backpressure
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - serving-inference/batching-and-concurrency-limits
   - serving-inference/timeouts

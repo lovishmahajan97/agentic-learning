@@ -5,7 +5,7 @@ name: Runtime schema validation (Zod)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - node-ts-for-ai/typescript-strict-mode-and-advanced-types
   - node-ts-for-ai/openai-anthropic-node-sdks
@@ -20,9 +20,9 @@ sources:
 ---
 
 ## TL;DR
-TypeScript types vanish at runtime, so nothing checks JSON from clients, webhooks, env vars or models. A Zod
-schema defines the shape once, derives the type, parses untrusted input into typed values or errors, and
-becomes the model's tool JSON Schema.
+TypeScript types are erased at compile time, so nothing checks JSON from clients, webhooks, env vars or
+models. One Zod schema derives the type, parses untrusted input, and becomes the model's tool JSON Schema,
+so the model follows the contract you enforce.
 
 ## Why it exists
 - **Every interesting input is untrusted.** A request body can be anything the client sent. A model's "JSON"
@@ -55,8 +55,7 @@ becomes the model's tool JSON Schema.
 | `z.input<typeof S>` | What the producer may send | Whoever constructs the payload, including the model |
 | `z.output<typeof S>` | What `parse` gives back | The code that consumes it |
 
-- **`z.infer` is the output side:** `z.output<typeof S>` (which is what `z.infer` returns) is what `parse`
-  gives back.
+- **`z.infer` is the output side:** it returns `z.output<typeof S>`, the type `parse` gives back.
 - **They differ** whenever a field has a `.default()` (optional on input, required on output) or a
   `.transform()` (a string in, a `Date` out).
 
@@ -271,16 +270,18 @@ A team tracks `safeParse` failures per tool after switching model versions (illu
 
 ## Pitfalls
 - **Casting untrusted JSON with `as` instead of parsing.** Symptom: a `TypeError` on an `undefined` field deep
-  in business logic, after the model call was billed.
+  in business logic, after the model call was billed. Fix: `safeParse` into a schema-derived type.
 - **A TypeScript interface and a hand-written JSON Schema kept separately.** Symptom: the model returns a field
-  the code rejects, or the code expects a field the model was never told about.
+  the code rejects, or the code expects a field the model was never told about. Fix: generate both from one
+  Zod schema.
 - **Default `strip` on tool arguments.** Symptom: a hallucinated extra parameter is silently dropped, so the
-  tool runs with half of what the model intended.
+  tool runs with half of what the model intended. Fix: `.strict()` (or `z.strictObject`) on tool arguments.
 - **Returning raw `ZodError` messages to end users or logging full payloads in issues.** Symptom: leaked
-  internal field names or PII in client responses and logs.
+  internal field names or PII in client responses and logs. Fix: map issues to `path` and `message` only.
 - **Skipping the parse because the provider "guarantees" the schema.** Symptom: `refine` rules never run, and a
-  provider-side change or bug reaches production unchecked.
+  provider-side change or bug reaches production unchecked. Fix: always `safeParse` the reply.
 - **Reading `process.env` without coercion.** Symptom: `"3000" + 1` style bugs and a port compared as a string.
+  Fix: parse env once at boot with `z.coerce.number()`.
 - **`z.coerce.boolean()` for env flags.** It applies JavaScript truthiness, so `FEATURE_X=false` turns the
   feature *on* because `"false"` is a non-empty string. Parse with an enum
   (`z.enum(["true", "false"]).transform((v) => v === "true")`) or Zod 4's `z.stringbool()` instead.

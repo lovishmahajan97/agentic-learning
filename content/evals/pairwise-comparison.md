@@ -5,7 +5,7 @@ name: Pairwise comparison
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - evals/llm-as-a-judge
   - evals/judge-calibration-and-bias
@@ -246,7 +246,8 @@ print(comparisons_needed(0.60, 0.035))                  # 753: halving the inter
 - **Elo on a static dataset.** Symptom: ratings that change when the comparison order is shuffled. Fix:
   batch Bradley–Terry fit.
 - **Reusing LLM-judged pairs as DPO data without debiasing.** Symptom: a model whose outputs get longer
-  every training round while human preference stays flat.
+  every training round while human preference stays flat. Fix: keep only position-consistent verdicts
+  and check the chosen-vs-rejected length gap before training.
 
 ## When to use
 - **Use when** comparing variants of one system (prompt A vs B, a model upgrade, a fine-tune), collecting

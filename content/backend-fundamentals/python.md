@@ -5,7 +5,7 @@ name: Python
 kind: tool
 difficulty: intro
 est_minutes: 10
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/async-await
   - python-for-ai/gil
@@ -316,7 +316,7 @@ when the model, eval and SDK ecosystem is Python-first.
 - **Resilience:** retry 429 and 5xx with exponential backoff and jitter, validate each answer with
   Pydantic, and record failures for a re-run.
 - **Shape:** one shared async client for connection reuse; batch APIs, if the provider offers them, cut
-  cost and remove the rate-limit pressure entirely.
+  cost and move the work off the per-minute request limit (they have their own quotas).
 
 ### Would you run the free-threaded CPython build in production today?
 - **Status:** experimental in 3.13 (PEP 703) and officially supported from 3.14, but a separate opt-in

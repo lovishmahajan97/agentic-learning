@@ -5,7 +5,7 @@ name: Package structure & import design
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/dependency-injection-and-interface-boundaries
   - python-for-ai/protocols-generics-structural-typing
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-In Python the import graph is your architecture: it decides what tests in isolation and what runs at
-startup. Use a `src/` layout, point imports one way (domain ← services ← adapters ← entrypoints), and keep
-heavy SDKs and import-time side effects at the edges.
+Your import graph is your architecture: it decides what tests alone, what runs at startup and what breaks
+when a dependency changes. Use a `src/` layout, one-way imports (domain ← services ← adapters ←
+entrypoints), and keep heavy SDKs and import-time side effects at the edges.
 
 ## Why it exists
 - **Notebooks grow into tangles.** One notebook becomes a `utils.py`, then forty modules where everything

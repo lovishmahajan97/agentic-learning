@@ -5,7 +5,7 @@ name: OpenTelemetry instrumentation
 kind: practice
 difficulty: core
 est_minutes: 17
-status: crisp
+status: crisp-verified
 related:
   - observability/opentelemetry
   - observability/tracing
@@ -263,7 +263,7 @@ export const worker = new Worker("runs", async (job) => {
         catch (e: any) { span.recordException(e); span.setStatus({ code: SpanStatusCode.ERROR }); throw e; }
         finally { span.end(); }
       }));
-}, { connection });
+}, { connection });                                         // connection: your ioredis instance or options
 ```
 
 ### Worked scenario: what head sampling keeps
@@ -273,10 +273,12 @@ Illustrative traffic: 200 requests per second, about 40 spans per request, 1% of
 |---|---|---|---|
 | No sampling | 8,000 | ~691 million | all 2 |
 | Head sampling at 10% | 800 | ~69 million | ~0.2: 90% of failures discarded |
-| 10% head plus collector tail sampling that keeps every error | ~800 plus error traces | ~69 million plus errors | all 2 |
+| SDK at 100%, collector tail sampling keeps every error plus 10% of the rest | ~872 stored (792 from 10% of 198 OK traces, 80 from 2 error traces) | ~75 million stored | all 2 |
 
-The tail-sampling row needs the SDK to export every span to the collector (sample at 100% in the SDK)
-so the collector can decide per trace; the cost moves from the backend bill to collector capacity.
+The tail-sampling row only works because the SDK exports every span: a 10% head sampler in front of it
+would already have discarded 90% of the failures before the collector saw them. The collector still
+receives all 8,000 spans per second and buffers whole traces, so the cost moves from the backend bill
+to collector capacity.
 
 ## Production patterns
 - **Collector gateway with tail sampling.** When errors and slow traces matter more than volume, run the

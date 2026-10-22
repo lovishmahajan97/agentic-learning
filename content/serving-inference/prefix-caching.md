@@ -5,7 +5,7 @@ name: Prefix caching
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - prompting/prompt-caching
   - serving-inference/kv-cache-paging-and-eviction
@@ -163,6 +163,9 @@ print(f"volatile-first: {run(bad)*1000:.0f} ms/request")
 # llm.llm_engine metrics (or the server's /metrics endpoint) expose the prefix hit rate.
 ```
 
+- **Confirm with the counters, not only the timer.** On a server, the prefix-cache query and hit counters
+  on `/metrics` give the hit rate directly; timings on a small offline run are noisy.
+
 ### Why one early token kills every later hit: a block-hash simulator
 Pure Python, no GPU. Each block's key chains the previous key, exactly as described above.
 
@@ -207,7 +210,7 @@ A 4k-token system prompt plus a growing trajectory, 10 tool steps per task, illu
 | Setup | What prefills each step | Fleet effect |
 |---|---|---|
 | Timestamp at the top, round-robin routing | the whole prompt, every step | TTFT grows with trajectory length; hit rate near zero |
-| Timestamp moved to the end, still round-robin | everything on ~3 of 4 steps (a step returns to a replica that has its prefix only about 1 time in 4) | single-replica hit rate looks fine, fleet rate poor |
+| Timestamp moved to the end, still round-robin | the shared system prompt hits once each replica is warm, but the trajectory since that replica last saw the task re-prefills on most steps (the previous step's replica comes back only about 1 time in 4) | fleet hit rate well below what one replica serving the whole task would reach |
 | Stable prefix and routing by conversation id | only the newest tool result | step latency stops growing, except the decode-side cache-read term |
 
 ## Production patterns
@@ -241,15 +244,19 @@ A 4k-token system prompt plus a growing trajectory, 10 tool steps per task, illu
 
 ## Pitfalls
 - **A timestamp, request id or user name at the top of the prompt.** Symptom: hit rate near zero despite a
-  long identical system prompt.
+  long identical system prompt. Fix: move volatile fields to the end of the prompt.
 - **Retrieval results before the question in a non-deterministic order.** Symptom: hits only on the system
-  prompt, never on the document block, with TTFT still scaling with retrieved length.
+  prompt, never on the document block, with TTFT still scaling with retrieved length. Fix: sort retrieved
+  chunks deterministically (for example by document id).
 - **Round-robin load balancing across replicas.** Symptom: single-replica hit rate far higher than the
-  fleet's, and TTFT that depends on which replica the request landed on.
+  fleet's, and TTFT that depends on which replica the request landed on. Fix: route by conversation or
+  tenant id.
 - **Measuring hit rate on a benchmark that replays one prompt.** Symptom: 95% hits on the dashboard and 20%
-  in production, because real conversations diverge after the system prompt.
+  in production, because real conversations diverge after the system prompt. Fix: replay sampled
+  production traffic.
 - **Assuming the cache stores responses.** Symptom: confusion when the same prompt yields different text at
-  non-zero temperature, which is expected because only K and V are reused.
+  non-zero temperature, which is expected because only K and V are reused. Fix: use a response cache for
+  repeated full prompts.
 - **One prefix cache across mutually untrusted tenants.** Invisible in metrics, but a hit is measurably
   faster than a miss, so a tenant can probe whether someone recently sent a given prefix (a timing side
   channel). Isolate tenants by replica or mix a per-tenant salt into the block hash, which some engines

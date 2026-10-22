@@ -5,7 +5,7 @@ name: KV cache
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - model-internals/self-attention
   - model-internals/grouped-query-attention
@@ -182,8 +182,8 @@ The fix was not more compute: cap context per tier, move to a GQA model, and ena
   set `max_model_len` and `max_num_seqs` (vLLM) so the expected mix fits with ~10% headroom. Monitor KV
   utilization and preemption counts.
 - **Enable prefix caching for shared prompts.** Keep system prompts and tool definitions byte-identical
-  and first in the request, so engines like vLLM and SGLang reuse their cache. Monitor prefix-cache hit
-  rate and time to first token.
+  and first in the request, so engines like vLLM (`enable_prefix_caching`) and SGLang (RadixAttention)
+  reuse their cache. Monitor prefix-cache hit rate and time to first token.
 - **Quantize the cache before buying GPUs.** Turn on an FP8 KV cache (for example `kv_cache_dtype="fp8"`
   in vLLM), run your eval set, and accept it if quality holds. It roughly doubles resident sequences.
 - **Cap context per product tier.** Long-document features get a separate deployment or a retrieval step,
@@ -212,7 +212,8 @@ The fix was not more compute: cap context per tier, move to a GQA model, and ena
   tracks memory bandwidth more than peak FLOPs. Compare GPUs on bandwidth.
 - **Reusing a cache after editing history.** Cached keys carry their position (RoPE is applied to them)
   and every entry depends on all earlier content. Any change before position *i* invalidates everything
-  from *i* onward.
+  from *i* onward. Symptom: garbled or off-topic output after a history edit. Fix: truncate the cache at
+  the first changed position and re-prefill from there, or rebuild it.
 - **Extrapolating single-request benchmarks.** With batching, every concurrent request's cache competes
   for the same memory bandwidth. Benchmark at the concurrency you will run.
 

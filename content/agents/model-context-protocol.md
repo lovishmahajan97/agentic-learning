@@ -5,7 +5,7 @@ name: Model Context Protocol (MCP)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - agents/mcp-authentication-authorization-transport-security
   - agents/a2a-protocol
@@ -268,7 +268,9 @@ definition.
   changes per server.
 - **Least-privilege stdio.** For local servers; pass an explicit minimal environment (the Python SDK's
   `StdioServerParameters` takes an `env` mapping) and a narrow root directory, never the developer's full
-  shell. Monitor files and hosts each server touches.
+  shell. A trimmed env still lets the process read any file your OS user can (such as credentials under
+  `HOME`), so run third-party servers in a container or as a separate user. Monitor files and hosts each
+  server touches.
 - **Map both failure channels and trace per server.** In every host; convert JSON-RPC errors and dead
   connections into `is_error` results, and log server, tool, latency and outcome per call. Monitor per-server
   call latency and error rate.

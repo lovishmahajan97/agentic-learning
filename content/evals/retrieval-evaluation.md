@@ -5,7 +5,7 @@ name: Retrieval evaluation (recall@k, MRR, NDCG)
 kind: metric
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - rag-retrieval/recall-vs-precision-trade-off
   - rag-retrieval/reranking
@@ -21,9 +21,9 @@ sources:
 ---
 
 ## TL;DR
-A RAG answer is only as good as its retrieved passages, so the retriever is scored alone against known
-relevant documents: recall@k (did evidence get in?), MRR (first hit how high?), NDCG (graded ranking
-right?). Choosing k and honest judgments matter most.
+A RAG answer is only as good as its retrieved passages, so the retriever is scored alone: recall@k (did
+evidence get in?), MRR (first hit how high?), NDCG (graded ranking right?). Matching k to the context
+budget and honest judgments matter more than formulas.
 
 ## Why it exists
 - **A wrong RAG answer has two suspects.** The retriever did not surface the evidence, or the generator

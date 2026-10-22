@@ -5,7 +5,7 @@ name: Offline vs online evaluation
 kind: decision
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - evals/a-b-testing
   - evals/golden-dataset
@@ -115,8 +115,8 @@ with its interval, decision. Two readings matter:
 | Signal | Arrives in | Drives |
 |---|---|---|
 | Offline | Minutes | Prompt iteration |
-| Shadow | Hours or days | Model swaps, large prompt changes |
-| A/B | Days or weeks | Expensive or strategic changes |
+| Shadow | Hours or days | Model swaps (which then also earn an A/B), large prompt changes |
+| A/B | Days or weeks | Model swaps, expensive or strategic changes |
 
 No team should wait two weeks to learn that a prompt broke JSON output.
 

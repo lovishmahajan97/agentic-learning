@@ -181,7 +181,8 @@ async def chat(request: Request, body: dict):
 ```
 
 ### Contract tests that pin the order
-Order bugs only show up in a browser, so encode the expectations as tests against the app above.
+CORS-order bugs show up only in a browser (curl ignores CORS headers), so encode the expectations as
+tests against the app above.
 
 ```python
 from fastapi.testclient import TestClient
@@ -200,19 +201,21 @@ def test_preflight_is_answered_by_cors():
     assert r.status_code == 200
 ```
 
-### Worked scenario: three `add_middleware` calls
-A file calls `add_middleware(CORS)`, then `add_middleware(ApiKey)`, then `add_middleware(Logger)`.
+### Worked scenario: three `add_middleware` calls, read top to bottom
+A file calls `add_middleware(RequestID)`, then `add_middleware(Auth)`, then `add_middleware(GZip)`,
+expecting the request ID to exist before auth runs.
 
 | After call | `user_middleware` (outermost first) |
 |---|---|
-| `add_middleware(CORS)` | CORS |
-| `add_middleware(ApiKey)` | ApiKey, CORS |
-| `add_middleware(Logger)` | Logger, ApiKey, CORS |
+| `add_middleware(RequestID)` | RequestID |
+| `add_middleware(Auth)` | Auth, RequestID |
+| `add_middleware(GZip)` | GZip, Auth, RequestID |
 
-- A bad key is rejected by ApiKey before CORS runs, so the 401 has no CORS headers and preflight fails.
-- Logger code after `call_next` never runs for unhandled exceptions, so 500s vanish from its log.
-- Fix: register in reverse (or use the list form) so CORS wraps ApiKey, and wrap `call_next` in
-  `try/finally`.
+- **Auth runs before the ID exists.** Its "rejected key" log lines have no request ID, and its 401
+  never passes back through RequestID, so the response carries no `x-request-id` either.
+- **GZip wraps everything, token streams included**, where compression buffering can delay chunks.
+- **Fix:** use the list form in the intended order (RequestID, then Auth, then GZip), and keep
+  compression off streaming routes.
 
 ## Production patterns
 - **Declare the stack in one list.** Use for every service: pass `FastAPI(middleware=[...])` in
@@ -340,7 +343,7 @@ in a layer inside CORS if the browser must read crash responses.
 - **Pin it with contract tests:** a bad key plus an `Origin` header must return 401 with
   `access-control-allow-origin` and `x-request-id`; an OPTIONS preflight must return 200.
 - **Rerun them on every Starlette or FastAPI upgrade**, because the stack is framework-built and order
-  bugs only show up in a browser, never in curl.
+  bugs such as a missing CORS header show up in a browser, not in curl.
 
 ## Quiz
 ### Q: With three `app.add_middleware()` calls A, B, C in that order, which runs first on an incoming request?

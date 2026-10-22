@@ -24,8 +24,8 @@ sources:
 
 ## TL;DR
 With a rare class, accuracy, an unweighted loss and a 0.5 threshold quietly optimise for "say the common
-class". It is a cost problem: fix evaluation, then the threshold, and only then weights, resampling or
-focal loss, which distort probabilities.
+class". It is less a data problem than a cost problem: fix evaluation, then the threshold, and only then
+weights, resampling or focal loss, which distort probabilities.
 
 ## Why it exists
 - **Rare positives are the valuable case.** Fraud, abuse, prompt injection, hallucinated answers, churn,
@@ -122,7 +122,8 @@ When positives are below roughly one in a thousand, or unlabelled, reframe:
 - **Multi-class:** merge rare classes into a parent class or handle them hierarchically.
 
 ### Translating between enriched evaluation and production
-Recall and FPR transfer from an enriched set; precision does not. Convert with the production prevalence π:
+Evaluation sets are often enriched with positives to make recall estimates stable. Recall and FPR transfer
+from an enriched set; precision does not. Convert with the production prevalence π:
 
 ```
 precision_at_prod = TPR * pi / (TPR * pi + FPR * (1 - pi))
@@ -200,7 +201,7 @@ The output is the one people miss. In one run:
 
 | Model | AP | At τ = 0.5 | At tuned τ | Mean predicted p |
 |---|---|---|---|---|
-| Unweighted | 0.82 | recall 0.67 | τ about 0.13: recall 0.80 at precision 0.61 | near the 2% base rate |
+| Unweighted | 0.82 | recall 0.67, precision 0.95 | τ about 0.13: recall 0.80 at precision 0.61 | 0.021, near the 2% base rate |
 | Balanced | 0.74 | recall 0.89, precision 0.16 | τ about 0.73: recall 0.83 at precision 0.31 | 0.17 on 2% data |
 
 - **The weights taught the model nothing new about the minority.** They moved its operating point and
@@ -276,15 +277,15 @@ production prevalence and compare.
 
 ## Pitfalls
 - **Resampling or SMOTE before the split.** Symptom: near-perfect cross-validation then a production collapse,
-  because neighbours of the same minority point sat in both folds.
+  because neighbours of the same minority point sat in both folds. Fix: resample inside each fold.
 - **Non-stratified splits with rare positives.** Symptom: folds with zero positives, undefined recall and
-  wildly varying scores between random seeds.
+  wildly varying scores between random seeds. Fix: stratify every split.
 - **Reporting accuracy or ROC-AUC alone.** Symptom: 0.99 accuracy with no positives caught, or 0.95 AUC with a
-  review queue that is 90% false alarms.
+  review queue that is 90% false alarms. Fix: raw counts plus the precision–recall curve.
 - **Shipping raw probabilities from a reweighted model.** Symptom: everything looks "likely positive" and
-  every downstream threshold breaks.
+  every downstream threshold breaks. Fix: recalibrate or prior-correct first.
 - **Measuring precision on the enriched evaluation set.** Symptom: 0.8 offline and 0.1 in production with no
-  change in the model.
+  change in the model. Fix: convert through TPR, FPR and the production prior.
 - **Few-shot prompts whose demonstrations are all one class.** Symptom: predictions skew to that class
   whatever the input says.
 - **Validating on LLM-generated minority examples.** Symptom: excellent numbers on synthetic positives and no

@@ -5,7 +5,7 @@ name: Tensor parallelism at inference
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - training-adaptation/distributed-training
   - model-internals/grouped-query-attention
@@ -32,8 +32,8 @@ decode sends hundreds of tiny all-reduces per token.
 - **Pipeline parallelism fits but does not speed up a token.** GPU 0 runs layers 1–40, GPU 1 runs 41–80.
   A request still passes through them one after another, so per-token latency does not improve, and
   keeping both busy needs several requests in flight at different stages.
-- **Offloading is too slow.** PCIe moves data roughly 50–100× slower than HBM, so decode slows to seconds
-  per token.
+- **Offloading is too slow.** Keeping part of the weights in CPU memory and streaming them in means PCIe,
+  roughly 50–100× slower than HBM, so decode slows to seconds per token.
 - **Quantization alone is not always enough.** It halves or quarters bytes but costs quality. A 4-bit 70B
   model still needs about 40 GB: it fits an 80 GB card, not a 24 GB one, and leaves little cache room on a
   48 GB one.
@@ -121,9 +121,10 @@ t_step(N) ≈ (weight_bytes + kv_bytes_read) / (N × HBM_bw)  +  2 × n_layers �
 |---|---|---|
 | Pipeline | layer ranges | cross-node friendly, adds latency |
 | Expert | whole experts of a mixture-of-experts model | tokens exchanged via all-to-all |
-| Context / sequence | a very long prompt, for prefill | combined with TP in large deployments |
+| Context / sequence | a very long prompt, for prefill | splits prefill work across GPUs |
 
-At inference on a single node, TP alone is the common case.
+All three are combined with TP in large deployments. At inference on a single node, TP alone is the
+common case.
 
 ## Diagram
 One transformer layer at TP = N: each GPU computes its heads and its MLP slice locally, and two
@@ -217,14 +218,14 @@ for n in (1, 2, 4, 8):
   of two that fits weights plus a healthy cache (`--tensor-parallel-size 4` in vLLM) and scale throughput
   with replicas. Monitor KV-cache usage and preemptions per replica.
 - **Verify the topology before benchmarking.** Run `nvidia-smi topo -m` and confirm the GPUs in a TP group
-  connect via NV links, not PCIe host bridges. Setting `NCCL_DEBUG=INFO` logs which transport NCCL chose
-  at startup.
+  show NV# (NVLink) entries, not PHB, NODE or SYS (PCIe and socket hops). `NCCL_DEBUG=INFO` logs
+  which transport NCCL chose at startup.
 - **TP inside the node, pipeline across nodes.** For models that need more than one node, combine tensor
   parallel within each NVLink node with pipeline parallel across nodes (vLLM's
   `--pipeline-parallel-size`). Monitor per-stage utilisation for pipeline bubbles.
 - **Keep CUDA graphs on for decode.** Avoid eager mode (`--enforce-eager` in vLLM) in production, because
-  CUDA graphs remove per-kernel launch overhead that TP multiplies across ranks. Monitor TPOT after any
-  engine flag change.
+  CUDA graphs remove per-kernel launch overhead, which grows as a share of the step as TP shortens each
+  rank's compute and adds collective kernels. Monitor TPOT after any engine flag change.
 - **Benchmark the TP curve per hardware SKU.** Measure tokens/s per request and aggregate tokens/s at TP =
   1, 2, 4 (where the model fits) on the exact node type, and record where speedup flattens.
 
@@ -246,11 +247,12 @@ for n in (1, 2, 4, 8):
 - **A TP degree that does not divide the KV head count.** It forces KV replication. Symptom: less cache
   capacity than the per-GPU arithmetic predicted.
 - **Assuming TP = 2 doubles throughput.** Throughput per GPU usually drops relative to two replicas,
-  because communication is pure overhead when the batch already saturates one GPU.
+  because communication is pure overhead when the batch already saturates one GPU. Fix: benchmark
+  against two replicas before choosing.
 - **Forgetting per-rank overhead.** Each TP rank keeps its own CUDA context, NCCL buffers and activation
   workspace, so per-GPU cache room is less than weights ÷ N suggests.
 - **Mixing GPU models or driver versions in a TP group.** Collectives run at the pace of the slowest
-  device, and some combinations fail to initialise at all.
+  device, and some combinations fail to initialise at all. Keep each TP group homogeneous.
 
 ## When to use
 - **Use when** the model does not fit one GPU at an acceptable precision, or it fits but single-stream

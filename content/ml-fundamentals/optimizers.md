@@ -5,7 +5,7 @@ name: Optimizers (Adam, AdamW)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: crisp
+status: crisp-verified
 related:
   - ml-fundamentals/gradient-descent
   - ml-fundamentals/backpropagation
@@ -87,10 +87,10 @@ Each piece has a reason:
 m̂ ≈ λθ while √v̂ ≈ σ (when λθ ≪ σ). The coupled update shrinks the weight by about ηλθ/σ per step: the
 effective decay coefficient is λ/σ, not λ.
 
-| λ = 0.01, gradient RMS σ | Coupled L2 in Adam: effective decay | AdamW: decay per step |
+| λ = 0.01, gradient RMS σ | Coupled L2 in Adam: effective coefficient λ/σ | AdamW: coefficient (shrink per step ηλ) |
 |---|---|---|
-| 1 | 0.01 | ηλ |
-| 0.1 | 0.1, ten times harder, for no reason anyone chose | ηλ |
+| 1 | 0.01 | 0.01 |
+| 0.1 | 0.1, ten times harder, for no reason anyone chose | 0.01 |
 
 **What AdamW does.** It removes λθ from the gradient and applies decay as its own step:
 θ ← θ − η(m̂/(√v̂ + ε) + λθ), implemented in PyTorch as θ ← θ·(1 − ηλ) followed by the ordinary Adam step.
@@ -121,7 +121,7 @@ That number drives the alternatives:
 ### Hyperparameters in practice
 | Setting | Typical value | Why |
 |---|---|---|
-| β1 | 0.9 almost everywhere | |
+| β1 | 0.9 almost everywhere | momentum averages over roughly the last 1/(1 − β1) = 10 steps |
 | β2 | 0.999 default; 0.95 in many LLM pre-training recipes | a long memory in v reacts slowly when the gradient distribution shifts, and that lag produces loss spikes in long runs |
 | Weight decay | 0.01 (the PyTorch default) to 0.1 (common in LLM recipes) | on matrices only |
 | Peak LR, full fine-tuning | 1e-5 to 5e-5 (illustrative, recipe-dependent) | always with warmup, decay schedule and clipping around 1.0 |
@@ -316,11 +316,14 @@ the shrink per step is ηλ, so a learning-rate schedule scales the decay along 
   estimated from a handful of samples, and clip gradients.
 - **Verify** with the loss and gradient-norm curves over the first few hundred steps.
 
-### Why is the weight_decay argument of torch.optim.Adam not the same as AdamW?
-- **Adam's argument is coupled L2:** λθ is added to the gradient and divided by √v̂, so large-gradient
-  weights are barely decayed and tiny-gradient ones decay at about the full rate.
-- **AdamW is decoupled:** θ ← θ(1 − ηλ) separately, so every weight shrinks by the same fraction.
-- **Practical effect:** λ becomes tunable independently of η, and generalisation improves.
+### A long AdamW pre-training run shows sudden loss spikes every few thousand steps. What do you look at?
+- **β2 lag:** with β2 = 0.999, v remembers about 1,000 steps, so when a parameter's gradient suddenly
+  grows, √v̂ is still small and the step jumps to several times η for dozens of steps. Lowering β2 to
+  0.95 lets v track faster.
+- **Rails:** confirm gradient-norm clipping around 1.0 is on, check ε under bf16, and lower the peak
+  learning rate if spikes persist.
+- **Evidence:** log gradient norm and per-layer update-to-weight ratio around each spike, inspect the
+  batch, and resume from the last good checkpoint with optimizer state.
 
 ### How much GPU memory does full AdamW fine-tuning of a 7B model need, and what are your options if you have one 80 GB GPU?
 - **16 bytes per parameter:** fp16 weights 2, gradients 2, fp32 master 4, m 4, v 4, so about 112 GB before

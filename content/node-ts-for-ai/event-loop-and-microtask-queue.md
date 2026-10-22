@@ -5,7 +5,7 @@ name: Event loop & microtask queue
 kind: concept
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - node-ts-for-ai/promises-and-async-error-propagation
   - node-ts-for-ai/worker-threads-for-cpu-bound-tasks
@@ -135,12 +135,13 @@ flowchart TD
     PC --> P["poll: I/O callbacks, maybe block"]
     P --> C["check: setImmediate"]
     C --> CL["close callbacks"]
-    CL -->|"next tick"| T
+    CL -->|"next iteration"| T
     CB["after every callback"] --> N["drain nextTick queue"]
     N --> PR["drain promise queue"]
     PR -->|"new microtasks queued"| N
-    P -.->|"each callback"| CB
     T -.->|"each callback"| CB
+    P -.->|"each callback"| CB
+    C -.->|"each callback"| CB
 ```
 
 ## Examples
@@ -250,15 +251,17 @@ A gateway holds 2,000 SSE streams. One route parses tool results of up to 20 MB 
 
 ## Pitfalls
 - **CPU-heavy work inline in a handler** (tokenizing, big `JSON.parse`, similarity search). Symptom: every
-  concurrent stream stalls at once and p99 spikes while one core sits at 100%.
+  concurrent stream stalls at once and p99 spikes while one core sits at 100%. Fix: offload to a worker
+  thread, or chunk with `setImmediate` if the job is occasional.
 - **Recursive `process.nextTick` or resolved promises to "spread work out".** Symptom: a process alive and
-  busy that accepts no new connections, because poll never runs.
+  busy that accepts no new connections, because poll never runs. Fix: re-schedule with `setImmediate`.
 - **Assuming `setTimeout(fn, 100)` fires at 100 ms.** Symptom: timers drift by seconds under load, because
-  they fire only when the timers phase is reached.
+  they fire only when the timers phase is reached. Fix: treat timers as minimums and keep the loop unblocked.
 - **Sync APIs in a hot path** (`fs.readFileSync`, `child_process.execSync`, sync `zlib`) because "it is just a
   small file". Symptom: appears only under concurrency, when the small stall multiplies across requests.
+  Fix: use the async or promise versions outside startup code.
 - **Not watching event-loop lag.** Symptom: latency incidents with no CPU, memory or upstream signal to
-  explain them, because the delay is inside the process.
+  explain them, because the delay is inside the process. Fix: export `monitorEventLoopDelay` p99 and alert.
 - **"Yielding" with `await Promise.resolve()` or `await null`** in a hot loop. Symptom: loop lag unchanged,
   because microtasks are drained before the loop reaches poll. Fix: yield with `setImmediate`.
 

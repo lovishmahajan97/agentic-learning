@@ -5,7 +5,7 @@ name: GPU memory optimization (VRAM math)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - model-internals/kv-cache
   - serving-inference/kv-cache-memory-estimation
@@ -137,7 +137,8 @@ flowchart TD
     C --> L{"Step time meets SLO?"}
     L -->|"no"| R["Lower concurrency or add GPUs"]
     L -->|"yes"| D["Set engine limits"]
-    Q["Quantize, fp8 KV, caps, TP"] -.->|"shrink a term"| W
+    Q["Quantize, fp8 KV, caps, TP"] -.->|"shrink weights"| W
+    Q -.->|"fewer bytes or tokens"| T
 ```
 
 ## Examples
@@ -239,14 +240,19 @@ serving engines avoid by computing logits only where they sample.
 
 ## Pitfalls
 - **Sizing from weights alone.** Symptom: a server that starts cleanly, reports healthy, and OOMs or
-  preempts heavily the first time concurrency and context length rise together.
+  preempts heavily the first time concurrency and context length rise together. Fix: write all four
+  lines and size KV from capped tokens in flight.
 - **Reading `nvidia-smi` as "memory the model needs".** It includes the allocator's reserve and the
-  pre-allocated KV pool, so a serving engine reports near-full even at idle.
+  pre-allocated KV pool, so a serving engine reports near-full even at idle. Fix: use the PyTorch
+  counters and the engine's logged KV size.
 - **Adding a second process without re-profiling** (an embedding model, a reranker). The engine's pool was
-  sized to the free memory at its own startup, so the newcomer OOMs or evicts it.
+  sized to the free memory at its own startup, so the newcomer OOMs or evicts it. Fix: lower the main
+  engine's memory fraction and restart it.
 - **Testing only short prompts and small batches.** The activation peak is never exercised; the first
-  32k-token prompt during a full decode batch triggers the OOM profiling would have predicted.
-- **Budgeting an MoE model by its active parameters.** The checkpoint then does not load.
+  32k-token prompt during a full decode batch triggers the OOM profiling would have predicted. Fix:
+  load-test the worst step.
+- **Budgeting an MoE model by its active parameters.** The checkpoint then does not load. Fix: budget
+  weights from total parameters.
 
 ## When to use
 - **Do the ledger** before every deployment, model swap, change to context or concurrency limits, and

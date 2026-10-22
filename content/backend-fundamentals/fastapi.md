@@ -5,7 +5,7 @@ name: FastAPI
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: crisp
+status: crisp-verified
 related:
   - fastapi-for-ai/asgi-lifecycle
   - fastapi-for-ai/async-endpoints
@@ -22,7 +22,7 @@ sources:
 ---
 
 ## TL;DR
-FastAPI is the default framework for Python AI services: async-native ASGI, Pydantic as one contract
+FastAPI is the default framework for Python AI services: async-native ASGI on Starlette, Pydantic as one contract
 for validation and docs, first-class streaming and DI. Sharp edge: one blocking call in `async def`
 stalls the worker. (Deep dive: `fastapi-for-ai`.)
 
@@ -246,13 +246,14 @@ only whether each one costs a thread or a coroutine.
 - **An `httpx.AsyncClient` per request.** Symptom: a new TLS handshake per call and socket exhaustion
   under load. Fix: one client in `lifespan`.
 - **Returning ORM objects or internal dicts without `response_model`.** Symptom: an internal field (a
-  cost figure, a secret flag) appears in client responses.
+  cost figure, a secret flag) appears in client responses. Fix: declare `response_model` on every route.
 - **CPU-heavy work in the handler** (tokenizing megabytes, re-ranking in pure Python). Symptom: loop
   stalls visible as every endpoint slowing together. Fix: a thread, process or worker.
 - **Long jobs through `BackgroundTasks`.** Symptom: work silently vanishes on every deploy or pod restart,
-  with no error logged because the request already returned 200.
+  with no error logged because the request already returned 200. Fix: a durable queue and a worker.
 - **State in module-level variables.** Symptom: behaviour depends on which worker served the request (a
-  rate limit that allows N times the configured rate with N workers).
+  rate limit that allows N times the configured rate with N workers). Fix: keep shared state in Redis
+  or the database.
 
 ## When to use
 - **Use when** building the HTTP layer of a Python AI service: model gateways, RAG endpoints, agent
@@ -260,8 +261,8 @@ only whether each one costs a thread or a coroutine.
 - **Prefer Django** when the application is mostly conventional CRUD with an ORM and admin, and Flask only
   for tiny sync tools.
 - **Measure:** event-loop lag (schedule a no-op every 100 ms and record how late it fires), health-check
-  latency under load (it should stay flat), threadpool saturation for `def` handlers, and upstream
-  connection reuse.
+  latency under load (it should stay flat; if it tracks the model endpoint's latency, something is
+  blocking the loop), threadpool saturation for `def` handlers, and upstream connection reuse.
 - **Day-to-day skill:** keep the request path fully async, design Pydantic models that double as
   structured-output schemas, and wire shared clients through dependencies.
 - **Interviews:** probe whether you know why `def` and `async def` handlers behave differently. The

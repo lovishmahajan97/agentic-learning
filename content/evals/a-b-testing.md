@@ -5,7 +5,7 @@ name: A/B testing
 kind: practice
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - evals/offline-vs-online-evaluation
   - evals/pairwise-comparison
@@ -36,7 +36,8 @@ metric, fixed sample size, no peeking.
 - **LLM products need it more than classic software.** Changes are cheap (edit a prompt) and effects
   subtle (a few points of resolution rate), so shipping on a hunch is tempting and small regressions go
   unnoticed. Outcomes are behavioural and delayed: did the user come back, did the ticket stay closed.
-  Costs move with quality: 1% more resolved tickets at 40% more tokens per conversation may be a loss.
+  Costs move with quality: 1% more resolved tickets at 40% more tokens per conversation may be a loss,
+  which only a test with cost as a guardrail reveals.
 - **Randomisation removes confounders.** With a coin-flip assignment the only systematic difference
   between arms is the change, so the outcome difference is effect plus quantifiable noise. It sits at
   the top of the evaluation ladder, not instead of it, because it is slow, needs traffic and exposes real

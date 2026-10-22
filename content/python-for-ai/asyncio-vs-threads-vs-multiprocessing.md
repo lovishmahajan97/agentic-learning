@@ -5,7 +5,7 @@ name: asyncio vs threads vs multiprocessing
 kind: decision
 difficulty: core
 est_minutes: 17
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/asyncio
   - python-for-ai/gil

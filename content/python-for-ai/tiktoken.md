@@ -5,7 +5,7 @@ name: tiktoken
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: crisp
+status: crisp-verified
 related:
   - model-internals/tokenization
   - model-internals/context-window

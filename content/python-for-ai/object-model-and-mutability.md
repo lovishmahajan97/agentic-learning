@@ -5,7 +5,7 @@ name: Object model and mutability
 kind: concept
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/dataclasses
   - python-for-ai/memory-and-performance-profiling
@@ -123,11 +123,12 @@ Which one runs is a property of the type, not the syntax; the next section is th
   output history references it, which is why `del x` sometimes frees nothing.
 
 ## Diagram
-Names point at objects; a shallow copy makes a new outer dict whose entries still point at the same
-inner objects. Follow both requests' edges to the one shared `headers` dict: that is the tenant leak.
+Names point at objects; a shallow copy of a plain-dict `DEFAULTS` makes a new outer dict whose entries
+still point at the same inner objects. Follow both requests' edges to the one shared `headers` dict:
+that is the tenant leak, and the bottom box is the fix used in the second example.
 
 ```mermaid
-flowchart LR
+flowchart TD
     D["name DEFAULTS"] --> OD["dict object: outer defaults"]
     A["name cfg in request A"] -->|"DEFAULTS.copy()"| CA["new outer dict A"]
     B["name cfg in request B"] -->|"DEFAULTS.copy()"| CB["new outer dict B"]
@@ -135,7 +136,8 @@ flowchart LR
     CA -->|"key headers"| H
     CB -->|"key headers"| H
     H -.->|"A writes X-Tenant acme, B writes X-Tenant beta"| L["Last write wins for both requests"]
-    F["Fix: build per request"] --> N["new dict from DEFAULTS headers plus X-Tenant"]
+    L --> F["Fix: build per request"]
+    F --> N["new dict from DEFAULTS headers plus X-Tenant"]
 ```
 
 ## Examples

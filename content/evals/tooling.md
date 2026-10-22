@@ -5,7 +5,7 @@ name: Tooling (Promptfoo, RAGAS, DeepEval, Braintrust, LangSmith, Langfuse)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: crisp
+status: crisp-verified
 related:
   - evals/eval-harness
   - evals/llm-as-a-judge
@@ -154,7 +154,7 @@ Two axes decide it:
 ### What is under every prebuilt metric
 - **A prompt, a model and a parsing step.** Read the prompt before trusting the number, pin the judge
   model, and calibrate against a few dozen human-labelled items from your domain before it gates anything.
-- **Faithfulness-style metrics are a ratio,** supported statements ÷ extracted statements, so the score
+- **Faithfulness-style metrics are typically a ratio,** supported statements ÷ extracted statements, so the score
   inherits two judge decisions per item: how the answer was split, and whether each statement was judged
   supported.
 - **It mildly rewards saying less.** A terse answer with one supported claim scores 1.0; a thorough answer
@@ -236,11 +236,14 @@ tests:
 | Tool | Calculation | Result |
 |---|---|---|
 | Promptfoo | 2 prompts × 2 providers × 2 tests = 8 cells, each graded by its two assertions | view shows prompt v7 and v8 side by side per provider, the comparison you wanted |
-| DeepEval | SCIM answer makes four claims; the retrieved article supports three | faithfulness 3/4 = 0.75, below the 0.9 threshold: the test fails and `reason` names the unsupported claim |
+| DeepEval | SCIM answer makes four claims; the retrieved article supports three and contradicts one | faithfulness 3/4 = 0.75, below the 0.9 threshold: the test fails and `reason` names the contradicted claim |
 
 - **The four claims:** SCIM lives under Settings → Security; it needs the Enterprise plan; you generate a
-  token; you paste the token into the identity provider. Nothing in the article mentions a plan
-  requirement.
+  token; you paste the token into the identity provider. The article says SCIM is available on every
+  plan, so the plan claim contradicts it.
+- **Metric definitions differ:** DeepEval's faithfulness counts a claim as truthful unless it
+  *contradicts* the context, so a claim the article is merely silent on would not lower the score. RAGAS
+  counts a claim the context cannot support as unfaithful. Same name, different number.
 - **The trap:** if retrieval had returned the SSO article and the bot faithfully described SSO setup,
   faithfulness would be 1.0 and the test would pass.
 - **What catches it:** the Promptfoo `contains: SCIM` and the rubric assertion. The general lesson: pair

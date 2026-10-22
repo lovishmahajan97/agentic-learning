@@ -17,9 +17,9 @@ related:
 ---
 
 ## TL;DR
-AI use-case discovery turns "we could use AI for…" ideas into a short ranked list that is valuable, suited
-to a model, feasible with reachable data, and safe to get wrong sometimes. A bad first pick sinks the
-programme's credibility.
+AI use-case discovery ranks "we could use AI for…" ideas into a shortlist that is valuable, model-suited,
+feasible now and safe to get wrong sometimes. Most ideas are plain automation, too risky or data-starved,
+and a bad first pick sinks the programme's credibility.
 
 ## Why it exists
 - **Ideas outrun evaluation.** Once an organisation decides to "do AI", every team has a list, vendors
@@ -53,7 +53,8 @@ programme's credibility.
 
 - **Test for verification asymmetry.** Tasks where checking an answer is much cheaper than producing it
   (drafting a reply a human approves, extracting fields a human confirms) are strong fits.
-- **Because** the human review turns a probabilistic component into a reliable system at low cost.
+- **Review is what makes them strong**, because the human check turns a probabilistic component into a
+  reliable system at low cost.
 
 ### 3. Estimate value
 - **Formula:** volume × time per item × loaded cost, plus error and delay costs, and any revenue effect.
@@ -112,8 +113,8 @@ what verification asymmetry means in numbers.
 - **Technique-first ("we want an agent")** is how deterministic problems end up with LLMs in them.
 
 ## Diagram
-Each candidate passes three gates before it is scored; failures are routed to a non-model fix or a
-parallel access request rather than dropped silently.
+Each candidate passes three gates (AI fit, data, a quick probe) before it is scored; failures are routed
+to a non-model fix, a parallel access request or a rethink rather than dropped silently.
 
 ```mermaid
 flowchart TD
@@ -121,8 +122,9 @@ flowchart TD
     F -->|"rule or lookup"| A["Automate without a model"]
     F -->|"unstructured, patterned"| D{"Data reachable now?"}
     D -->|"no"| X["Start access request"]
-    D -->|"yes"| P["Probe 20 to 50 real items"]
-    P --> R["Classify risk and review"]
+    D -->|"yes"| P{"Probe on 20 to 50 items usable?"}
+    P -->|"model cannot read them"| Y["Drop or rethink"]
+    P -->|"plausibly reachable"| R["Classify risk and review"]
     R --> V["Score value vs feasibility"]
     V --> S["Portfolio: first use case plus strategic bet"]
     S --> T["Choose technique last"]
@@ -231,17 +233,20 @@ print(automate_max_error_rate(value_saved_per_item=8, cost_per_error=200))  # 0.
 
 ## Pitfalls
 - **Choosing the technique before the problem ("find us agent use cases").** Symptom: a shortlist where
-  every item is an agent and several are just scheduled scripts with an LLM bolted on.
+  every item is an agent and several are just scheduled scripts with an LLM bolted on. Fix: write each
+  candidate as a role, task, input and output line and pick the technique last.
 - **Ranking by value alone.** Symptom: a first project stuck in legal, security or data-access review for
-  months while stakeholders lose patience.
+  months while stakeholders lose patience. Fix: score feasibility and risk alongside value.
 - **Ignoring where output lands.** Symptom: a model that works in a notebook but has no system, screen or
-  queue to deliver into, so nobody uses its results.
+  queue to deliver into, so nobody uses its results. Fix: name the integration point during screening.
 - **Not checking for a measurable baseline.** Symptom: a finished pilot where nobody can say whether it
-  improved anything, because the current time or error rate was never recorded.
+  improved anything, because the current time or error rate was never recorded. Fix: record the baseline
+  before building.
 - **Assuming human review makes any accuracy acceptable.** Symptom: reviewers approve drafts unread once
-  they are usually right, so errors reach customers at the model's raw error rate.
+  they are usually right, so errors reach customers at the model's raw error rate. Fix: measure the review
+  step's catch rate.
 - **Treating the candidate list as fixed.** Symptom: a stale backlog that ignores what the first deployment
-  taught about data quality and user adoption.
+  taught about data quality and user adoption. Fix: re-score the backlog after each deployment.
 
 ## When to use
 - **Use when** a customer or organisation has more AI ideas than capacity, at the start of an AI

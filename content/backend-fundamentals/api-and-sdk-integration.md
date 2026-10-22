@@ -5,7 +5,7 @@ name: API & SDK integration
 kind: practice
 difficulty: core
 est_minutes: 14
-status: crisp
+status: crisp-verified
 related:
   - python-for-ai/openai-sdk
   - python-for-ai/anthropic-sdk
@@ -232,17 +232,17 @@ In the service, check `allow()` before `complete(...)`, call `record(True)` on s
 A service at 100 user requests per second calls a provider through its SDK (default 2 retries, so 3
 attempts) wrapped in an adapter that also makes 3 attempts. The provider starts returning 503.
 
-| Quantity | Two layers retrying | Adapter only (`max_retries=0`) |
+| Quantity | Two layers retrying, SDK default timeout | Adapter only (`max_retries=0`), 20 s deadline |
 |---|---|---|
-| Upstream calls per user request | 3 × 3 = 9 | 3 |
-| Load sent to the struggling provider | ~900 calls/s | ~300 calls/s |
+| Upstream calls per user request | 3 × 3 = 9 | at most 3 |
+| Load sent to the struggling provider | ~900 calls/s | up to ~300 calls/s |
 | Worst case per request, ten-minute SDK timeout | up to 9 × 10 min of waiting, plus sleeps | capped by the 20 s total deadline |
 | What users see | requests hang, then fail | a clear error or fallback within 20 s |
 
 ## Production patterns
 - **Retry in one layer only.** Set `max_retries=0` and an explicit `timeout` on the SDK client, and own
   the policy in the adapter (or the reverse, but never both). Monitor a histogram of attempts per
-  request and alert when the mean climbs above 1.
+  request; the mean sits just above 1 when healthy, so alert when it climbs well past that baseline.
 - **A total deadline per user request.** Wrap every vendor call in `asyncio.timeout` sized from the
   user-facing budget, and pass the remaining budget down to nested calls. Monitor p99 latency including
   retries and the deadline-exceeded count.
@@ -270,19 +270,19 @@ attempts) wrapped in an adapter that also makes 3 attempts. The provider starts 
 
 ## Pitfalls
 - **No timeout, or an inherited multi-minute default.** Symptom: worker pools drain during a vendor
-  incident while error rates stay at zero.
+  incident while error rates stay at zero. Fix: explicit per-phase timeouts plus a total deadline.
 - **Retrying everything, including 400 and 401.** Symptom: the same invalid request hammers the vendor
-  four times, with a rate-limit ban on top of the original bug.
+  four times, with a rate-limit ban on top of the original bug. Fix: retry only the retryable class.
 - **Retrying a non-idempotent `POST` after a timeout without an idempotency key.** Symptom: duplicate
-  records, double charges or two emails sent.
+  records, double charges or two emails sent. Fix: send an idempotency key, or do not retry.
 - **Retrying in two layers** (your wrapper and the SDK, or a gateway and the app). Symptom: vendor-side
-  request counts several times your own during an incident.
+  request counts several times your own during an incident. Fix: `max_retries=0` in all but one layer.
 - **Treating a stream without its terminal event as complete.** Symptom: answers stop mid-sentence and
-  parsers fail on truncated JSON with no error in the logs.
+  parsers fail on truncated JSON with no error in the logs. Fix: require the terminal event.
 - **A new client per request.** Symptom: a TLS handshake on every call and "too many open files" under
-  load.
+  load. Fix: one shared client per process.
 - **Parsing vendor error bodies ad hoc in callers.** Symptom: a schema change in the error payload breaks
-  twelve call sites at once.
+  twelve call sites at once. Fix: map errors to your own exceptions inside the adapter.
 
 ## When to use
 - **Scale the adapter to blast radius.** A model provider on the request path gets timeouts, retries,

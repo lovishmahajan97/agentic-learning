@@ -230,8 +230,9 @@ pytestmark = pytest.mark.asyncio(loop_scope="session")   # every test in this mo
   `asyncio_default_fixture_loop_scope = "function"` in `[tool.pytest.ini_options]`, so behaviour does not
   shift on upgrade. Monitor deprecation warnings from the plugin in CI output after each bump.
 - **Leaked-task guard.** An autouse `@pytest_asyncio.fixture` that, after `yield`, collects
-  `asyncio.all_tasks()` except `asyncio.current_task()`, cancels any not done and fails the test. Leaks
-  then fail the test that caused them, not a later one. Watch for tests that need an opt-out.
+  `asyncio.all_tasks()` except `asyncio.current_task()`, cancels any not done and raises, so pytest
+  reports a teardown error. Leaks then land on the test that caused them, not a later one. Watch for
+  tests that need an opt-out.
 - **asyncio debug mode in CI.** Run the async lane with `PYTHONASYNCIODEBUG=1` (or `python -X dev`):
   asyncio then logs callbacks slower than `loop.slow_callback_duration` (0.1 s by default) and gives
   "never awaited" warnings a traceback. Grep CI logs for "Executing" warnings to catch blocking calls.
