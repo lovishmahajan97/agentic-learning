@@ -5,7 +5,7 @@ name: Tenant-specific configuration & feature flags
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/tenant-isolation
@@ -23,7 +23,7 @@ sources:
 
 ## TL;DR
 One agent serves many customers: tenant configuration holds each one's model, prompt version, tool list
-and guardrails as typed, versioned data, and feature flags decide who gets which agent behaviour, so you
+and guardrails as typed, versioned data resolved at runtime, and feature flags decide who gets which agent behaviour, so you
 never fork the agent per customer.
 
 ## For agent builders
@@ -121,6 +121,9 @@ entitlements implemented as ad hoc flags get lost when someone cleans up "old fl
   producing a run no single version explains and nobody can reproduce. Snapshot the resolved config and
   flag decisions at the start of the request, job or conversation, carry its version in the trace, and
   apply changes at the next unit.
+- **Kill switches are the exception to pinning.** A switch exists to stop harm now, so the tool adapter
+  checks it on every call and returns "tool unavailable" to the model, even inside a pinned run, because
+  waiting for long runs to finish defeats the switch.
 - **Key the cache by tenant,** *because* a cache keyed by flag name alone is a cross-tenant leak: the
   first tenant to resolve a key sets it for everyone.
 
@@ -130,7 +133,8 @@ prompt the tenant is not entitled to.
 1. **Pick the prompt** by `prompt_version`, never by editing prompt text in place, so every run names the
    exact prompt it used.
 2. **Filter the tool registry** to the tenant's enabled tools, then remove any tool whose kill switch is
-   on. A tool that is not registered cannot be called, which is stronger than telling the model not to.
+   on. A tool that is not registered cannot be called, which is stronger than telling the model not to;
+   a switch flipped mid-run is caught by the per-call check above.
 3. **Apply limits** from config: step budget, token budget per run, allowed models and providers.
 4. **Stamp the trace** with config version, prompt version, tool list and flag decisions, so an eval or
    incident can replay the run under the same settings.
@@ -152,8 +156,10 @@ flowchart TD
     R["Request or agent run starts"] --> C{"Tenant-keyed cache has value?"}
     C -->|"no and service down"| D["Conservative coded default"]
     C -->|"yes"| M["Merge: global, plan, region, tenant, env"]
+    C -->|"no and service up"| S["Fetch layers from service"]
+    S --> M
     M --> V{"Schema valid?"}
-    V -->|"no"| E["Reject change at write time"]
+    V -->|"no"| E["Reject and alert"]
     V -->|"yes"| P["Pin snapshot and config version"]
     D --> P
     P --> F["Evaluate flags: hash of flag and user"]
@@ -319,18 +325,20 @@ switch target.
 
 ## Pitfalls
 - **Customer names in code** (`if tenant == "acme"`). Symptom: nobody can list a tenant's differences
-  without grepping, and a refactor silently drops one customer's behaviour.
+  without grepping, and a refactor silently drops one customer's behaviour. Fix: move the difference into
+  a typed config key.
 - **Release flags that are never removed.** Symptom: dozens of stale flags, dead code paths that still
-  need testing, and an incident when someone flips one nobody remembers.
+  need testing, and an incident when someone flips one nobody remembers. Fix: owner and removal date.
 - **A fallback default that is the permissive path.** Symptom: during a flag-service outage, guardrails or
-  redaction quietly switch off for every tenant.
+  redaction quietly switch off for every tenant. Fix: make the coded default the conservative path.
 - **Not logging the config version per request.** Symptom: a quality regression report you cannot
-  attribute, because a prompt version changed by an admin left no trace in the trace.
+  attribute, because a prompt version changed by an admin left no trace in the trace. Fix: stamp it on
+  every span.
 - **Secrets or connector credentials directly in tenant configuration.** Symptom: API keys appearing in
-  admin UIs, config diffs and debug logs.
+  admin UIs, config diffs and debug logs. Fix: store a secret-manager reference only.
 - **Re-reading configuration at every step of a long agent run or conversation.** Symptom: a trace in which
   the prompt version or model changes mid-run, and a bug report nobody can reproduce because no single
-  config version produced it.
+  config version produced it. Fix: pin a snapshot at run start.
 - **Disabling a tool by prompt instead of by registry.** Symptom: on-call adds "do not use web search" to
   the prompt during an incident and the agent still calls it on some runs. Fix: remove the tool from the
   request through a kill switch.
@@ -377,9 +385,9 @@ eligible tenant is migrated.
 - **Entitlements blur the line,** so model them as configuration; ad hoc entitlement flags get lost in
   flag clean-ups.
 
-### A customer says answers got worse on Tuesday and there was no deploy. How do you investigate?
-- **Pull the config version from the traces** for that tenant before and after Tuesday; an admin change
-  to a prompt version or retrieval threshold is as likely as a deploy.
+### A customer says their support agent got worse on Tuesday and there was no deploy. How do you investigate?
+- **Pull the config and prompt versions from the agent's run traces** for that tenant before and after
+  Tuesday; an admin change to a prompt version, tool list or retrieval threshold is as likely as a deploy.
 - **Diff the resolved configs,** including inherited layers, since a global default edit also changes
   every non-overriding tenant.
 - **Re-run the tenant's regression suite** on both versions to confirm, then roll back by activating the
@@ -398,7 +406,8 @@ eligible tenant is migrated.
 
 ### An external tool your agent uses starts returning garbage. How do you contain it across all tenants?
 - **Flip the tool's kill switch,** which removes it from every tenant's tool registry at the next run
-  without a deploy; runs already in progress keep their pinned config until they end.
+  without a deploy; runs already in progress see it too, because the adapter checks the switch on every
+  call and returns "tool unavailable" to the model.
 - **Confirm from traces** that tool-call counts for it drop to zero, then check task success per tenant
   to see which agents depended on it and need a fallback.
 
@@ -439,8 +448,8 @@ eligible tenant is migrated.
   and tool list from one codebase.
 - **Rolling a new model or prompt to an agent fleet.** A release flag targeted by tenant, gated by each
   tenant's regression suite, moves agents over in waves.
-- **Incident response on agent tools.** A kill switch removes a failing external tool from every agent's
-  registry in seconds.
+- **Incident response on agent tools.** A kill switch, checked on every tool call, takes a failing
+  external tool away from every agent, in-flight runs included, without a deploy.
 - **Prompt A/B tests on agents.** Experiment flags bucketed by run id compare two prompts without mixing
   them inside one run.
 

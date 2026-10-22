@@ -1,71 +1,106 @@
 ---
 id: reliability
 title: Reliability
+status: agentic
 ---
 
 ## Overview
-This module is about keeping an AI product working, or failing in a controlled way, when the things
-it depends on do not. It begins with targets: SLIs, SLOs, SLAs and error budgets turn "reliable" into
-a number you can measure from the user's side, including quality and cost for model endpoints. High
-availability then shows how availabilities multiply along a request path and why the model provider
-usually caps yours. Fault tolerance supplies the baseline toolkit for every remote call: timeouts,
-bounded jittered retries and idempotency. Circuit breakers, bulkheads, backpressure and load shedding
-and tenant-level quotas are the containment layer, each stopping one slow dependency, workload or
-customer from consuming capacity everyone else needs. Durable workflow execution makes long agent runs
-and approval flows survive crashes and deploys without redoing paid model calls. Multi-region
-architecture, disaster recovery and business continuity widen the frame to region loss, deleted data,
-vendor exits and the people and decisions around a restore. FMEA and chaos engineering close the loop:
-one finds the failure modes nobody is watching, the other proves the mechanisms actually fire. After
-the module you can set SLOs for an LLM service, size pools and queues with Little's law, design
-fallbacks and failover with stated RPO and RTO, and show evidence that they work. It matters most for
-Architects, who own these trade-offs, and for Engineers who carry the pager.
+This module is about keeping an AI product and its agents working, or failing in a controlled way,
+when the things they depend on do not. An agent run chains many model and tool calls, so a fault that
+is rare per call becomes routine per run. Every lesson here is a mechanism you put around those calls.
+
+The lessons connect in five groups:
+
+- **Targets:** SLIs, SLOs, SLAs and error budgets turn "reliable" into a number measured from the user's side, including quality and cost for model endpoints. High availability shows how availabilities multiply along a request path and why the model provider usually caps yours.
+- **Per-call hygiene:** fault tolerance supplies the baseline toolkit for every remote call: timeouts, bounded jittered retries and idempotency.
+- **Containment:** circuit breakers, bulkheads, backpressure and load shedding, and tenant-level quotas each stop one slow dependency, workload or customer from consuming capacity everyone else needs.
+- **Survival of larger losses:** durable workflow execution makes long agent runs and approval flows survive crashes and deploys without redoing paid model calls. Multi-region architecture, disaster recovery and business continuity widen the frame to region loss, deleted data, vendor exits and the people and decisions around a restore.
+- **Verification:** FMEA finds the failure modes nobody is watching, and chaos engineering proves the mechanisms actually fire.
+
+Which lessons matter most for agents:
+
+- **Core (you use them directly in the agent loop):** fault-tolerance, circuit-breakers, bulkheads and durable-workflow-execution.
+- **Useful (you meet them when serving and operating agents):** slas-slos, high-availability, backpressure-and-load-shedding, tenant-level-quotas-and-noisy-neighbor-isolation, multi-region-architecture, disaster-recovery, fmea and chaos-engineering-and-resilience-testing.
+- **Background:** business-continuity, whose management-system details the business owns, though the continuity ladder's engineering rungs are yours.
+
+After the module you can:
+
+- Set SLOs for an LLM service and an agent's task completion.
+- Size pools and queues with Little's law.
+- Design fallbacks and failover with stated RPO and RTO.
+- Show evidence that each mechanism works.
+
+It matters most for Architects, who own these trade-offs, and for Engineers who carry the pager.
 
 ## Why it matters
-- **Engineer:** You write the client wrapper every service imports, so you must get timeouts, retry budgets, idempotency keys, breaker thresholds, per-dependency semaphores and `Retry-After` handling right, and export the metrics that show when traffic is quietly running on a fallback path.
-- **Architect:** You choose the availability target, the number of zones, regions and model providers, the RPO and RTO for each store, and the isolation boundaries between tenants and workload classes, and each choice sets cost, complexity and what the SLA can honestly promise.
-- **FDE:** Enterprise buyers ask about multi-region, continuity plans and what happens when your AI vendor is down; you need credible answers, a sensible SLA, and quotas that stop one customer's backfill from slowing everyone else on a shared deployment.
+- **Engineer:** You write the client wrapper every agent service imports, so you must get timeouts, retry budgets, idempotency keys, breaker thresholds, per-dependency semaphores and `Retry-After` handling right, and export the metrics that show when agent traffic is quietly running on a fallback path.
+- **Architect:** You choose the availability target, the number of zones, regions and model providers, the RPO and RTO for each store of agent state, and the isolation boundaries between tenants and workload classes, and each choice sets cost, complexity and what the SLA can honestly promise.
+- **FDE:** Enterprise buyers ask about multi-region, continuity plans and what happens when your AI vendor is down; you need credible answers, a sensible SLA, and quotas that stop one customer's backfill or looping agent from slowing everyone else on a shared deployment.
 
 ## Mental model
-Picture reliability as a budget defended in rings. At the centre is the error budget from your SLO:
-the amount of failure users will tolerate, measured as they experience it. The first ring is per-call
-hygiene (timeout, bounded retry, idempotency), which turns transient faults into successes without
-duplicating side effects. The second ring is containment: breakers, bulkheads, backpressure, load
-shedding and tenant quotas, each keeping a local fault local by capping how much shared capacity it
-can take, sized with Little's law (in-flight = rate × time). The third ring is survival of larger
-losses: redundancy and failover for components and regions, durable execution for long processes,
-backups separated in time, place and trust for data, and continuity plans for suppliers and people.
-Around all of it sits verification: FMEA decides which faults to worry about, and chaos experiments
-show whether each ring holds. A mechanism nobody has seen fire does not count as protection.
+Picture reliability as a budget defended in rings around every agent step.
+
+| Ring | What it does | Lessons |
+|---|---|---|
+| Centre: error budget | The amount of failure users will tolerate, measured as they experience it | slas-slos, high-availability |
+| Per-call hygiene | Timeout, bounded retry and idempotency turn transient faults into successes without duplicating side effects | fault-tolerance |
+| Containment | Breakers, bulkheads, backpressure, load shedding and tenant quotas keep a local fault local by capping its share of capacity | circuit-breakers, bulkheads, backpressure-and-load-shedding, tenant-level-quotas-and-noisy-neighbor-isolation |
+| Survival of larger losses | Redundancy and failover for components and regions, durable execution for long processes, backups separated in time, place and trust, continuity plans for suppliers and people | durable-workflow-execution, multi-region-architecture, disaster-recovery, business-continuity |
+| Verification | FMEA decides which faults to worry about; chaos experiments show whether each ring holds | fmea, chaos-engineering-and-resilience-testing |
+
+- **Size containment with Little's law:** in-flight = rate × time, which sets every pool, queue and cap.
+- **Evidence over intent:** a mechanism nobody has seen fire does not count as protection.
+
+```mermaid
+flowchart TD
+    U["User or tenant request"] --> Q["Admission and tenant quota"]
+    Q -->|"over budget"| R["Shed with 429 and Retry-After"]
+    Q -->|"admitted"| W["Durable agent workflow"]
+    W --> C["Client wrapper: timeout, retry, key"]
+    C --> B["Breaker and bulkhead per dependency"]
+    B --> M["Model provider"]
+    B --> T["Tool APIs"]
+    B -->|"open"| F["Fallback model or degraded mode"]
+    W --> S[("Replicated state and backups")]
+    S --> D["DR and continuity plan"]
+    O["SLOs, FMEA and chaos tests"] -.->|"set and verify"| W
+```
 
 ## Suggested order
-1. slas-slos — sets measurable targets and error budgets first, so every later mechanism has a goal to defend.
-2. high-availability — shows how availabilities compose along a dependency chain and why the provider caps your nines.
-3. fault-tolerance — the baseline per-call toolkit of timeouts, retry budgets, idempotency and fallbacks that the later patterns build on.
-4. circuit-breakers — stops sending to a failing dependency, the first containment pattern layered on top of timeouts and retries.
-5. bulkheads — caps aggregate resource use per dependency or workload, covering the window before a breaker trips.
-6. backpressure-and-load-shedding — applies Little's law to overload, bounding queues and rejecting early to protect goodput.
-7. tenant-level-quotas-and-noisy-neighbor-isolation — extends bounded capacity to fair division among tenants who share a provider key or GPU pool.
-8. durable-workflow-execution — makes multi-step agent and approval processes survive crashes and deploys without repeating side effects.
+1. fault-tolerance — agent core: the baseline per-call toolkit of timeouts, retry budgets, idempotency and fallbacks that every agent step and the later patterns build on.
+2. circuit-breakers — agent core: stops sending to a failing model or tool, the first containment pattern layered on top of timeouts and retries.
+3. bulkheads — agent core: caps aggregate resource use per tool, model or workload, covering the window before a breaker trips.
+4. durable-workflow-execution — agent core: makes multi-step agent and approval processes survive crashes and deploys without repeating side effects.
+5. slas-slos — sets measurable targets and error budgets, so every mechanism has a goal to defend and agent health means task done correctly.
+6. high-availability — shows how availabilities compose along a dependency chain and why the provider caps your nines.
+7. backpressure-and-load-shedding — applies Little's law to overload, bounding queues and rejecting early to protect goodput.
+8. tenant-level-quotas-and-noisy-neighbor-isolation — extends bounded capacity to fair division among tenants who share a provider key or GPU pool.
 9. multi-region-architecture — moves from component failure to region loss, latency and residency, where state placement decides what is lost.
 10. disaster-recovery — defines RPO and RTO and the restore of state that redundancy cannot protect, such as indexes, weights and deleted data.
-11. business-continuity — wraps DR in function-first planning for vendors, people, roles and communication during a disruption.
+11. business-continuity — background: wraps DR in function-first planning for vendors, people, roles and communication during a disruption.
 12. fmea — systematically lists and ranks failure modes, especially silent AI ones, to decide what to guard and test.
 13. chaos-engineering-and-resilience-testing — verifies the earlier mechanisms by injecting the top FMEA faults under a bounded blast radius.
 
 ## Capstone
 ### Brief
-Harden a multi-tenant document question-answering and drafting service for a B2B SaaS company that is
-about to sign its first enterprise customers. The service has a chat endpoint that retrieves from a
-vector store and calls a hosted LLM, a batch endpoint that re-embeds customer documents, and an agent
-flow that drafts a reply, waits for human approval and then sends it through a CRM API. Today it runs in
-one region on one provider key with one shared worker pool, and a single tenant's backfill has already
-slowed everyone. Over a week, define SLIs and SLOs for availability, latency, answer quality and cost
-per task; run an FMEA of the request path; then implement the fixes the top rows call for: a shared
-client wrapper with timeouts, retry budgets and idempotency keys, a breaker and secondary-provider
-fallback, per-dependency bulkheads, queue-wait-based load shedding, per-tenant token buckets with fair
-queuing, and the approval flow as a durable workflow. Write the DR and continuity plan, including how
-the vector index is restored or rebuilt and what happens if the provider is down for a day, and prove
-the design with fault-injection experiments.
+**Use case:** a B2B SaaS company is about to sign its first enterprise customers for a multi-tenant
+document question-answering and drafting agent. Your job is to harden it so one tenant, one tool or one
+provider outage cannot take everyone down.
+
+The service today has:
+
+- **A chat endpoint** that retrieves from a vector store and calls a hosted LLM.
+- **A batch endpoint** that re-embeds customer documents.
+- **An agent flow** that drafts a reply, waits for human approval and then sends it through a CRM API.
+
+It runs in one region on one provider key with one shared worker pool, and a single tenant's backfill
+has already slowed everyone. This is the module's major project, spread over a week.
+
+- **Define targets:** SLIs and SLOs for availability, latency, answer quality and cost per task.
+- **Find the risks:** run an FMEA of the request path.
+- **Implement the fixes the top rows call for:** a shared client wrapper with timeouts, retry budgets and idempotency keys, a breaker and secondary-provider fallback, per-dependency bulkheads, queue-wait-based load shedding, per-tenant token buckets with fair queuing, and the approval flow as a durable workflow.
+- **Plan for loss:** write the DR and continuity plan, including how the vector index is restored or rebuilt and what happens if the provider is down for a day.
+- **Prove it:** run fault-injection experiments against the design.
 
 ### Deliverables
 - An SLO document with SLI definitions (including a quality SLI backed by an eval), 30-day targets, error-budget arithmetic, a burn-rate alert rule and a draft external SLA that is looser than the SLOs.

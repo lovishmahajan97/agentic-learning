@@ -5,7 +5,7 @@ name: Reasoning models / test-time compute
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/chain-of-thought
@@ -90,8 +90,8 @@ every tool call.
 | 4. Trained reasoning | the model internalises the first three in one long trace through RL | you control a budget rather than orchestrating samples |
 
 - **Difficulty decides.** Snell et al. found sequential revision wins on easy questions and parallel
-  sampling and search on hard ones; a difficulty-aware policy that picks per question is reported to be
-  several times more compute-efficient than any fixed strategy.
+  sampling and search on hard ones; a difficulty-aware policy that picks per question was reported to be
+  several times (more than 4×) more compute-efficient than a best-of-N baseline.
 
 ### Verifiers
 - **Outcome vs process reward models.** Outcome reward models score only the final answer; process reward
@@ -439,4 +439,4 @@ Decide on pass@1, pass@5 and cost per solved task measured on their task set.
   run it with thinking off, on for the plan step only, and on for all steps, three runs each; log task
   success, thinking tokens and wall-clock per step.
 - **Done when:** a table shows task success (mean and pass^3), tokens and latency per policy, and you can
-  name the cheapest policy within one point of the best success rate.
+  name the cheapest policy whose success is within run-to-run noise of the best (about one task in 30).

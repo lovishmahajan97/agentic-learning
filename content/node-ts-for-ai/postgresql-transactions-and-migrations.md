@@ -5,7 +5,7 @@ name: PostgreSQL transactions & migrations
 kind: practice
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - backend-fundamentals/postgresql-transactions-and-isolation-levels

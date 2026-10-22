@@ -5,7 +5,7 @@ name: Representative test-case sampling
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - evals/golden-dataset
@@ -207,8 +207,8 @@ print({s: sum(t == s for t, _ in sample) for s in w})
 # {'read-short': 135, 'read-long': 59, 'write-short': 55, 'write-long': 51}
 ```
 
-- **Why it matters:** write-long sessions are 1% of traffic but hold most of the costly failures; a
-  proportional 300-item sample would contain about three.
+- **Why it matters:** write-long sessions are 1% of traffic but are where loops and unsafe writes tend to
+  concentrate; a proportional 300-item sample would contain about three, while the floor gives 51.
 
 ### Deduplicate by cluster before drawing
 A crude but runnable version: normalise digits and whitespace, keep one representative per cluster and

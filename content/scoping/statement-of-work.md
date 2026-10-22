@@ -5,7 +5,7 @@ name: Statement of work
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/success-metrics-kpis
@@ -18,9 +18,9 @@ related:
 ---
 
 ## TL;DR
-A statement of work (SOW) is the contract for your agent project: deliverables, acceptance, customer
-obligations, out of scope and change control. Agents need a stricter one: statistical acceptance on a
-frozen eval set, and named tools and actions.
+A statement of work (SOW) is the project contract: deliverables, acceptance, customer obligations, out of
+scope, change control. Agents need a stricter one, because outputs are probabilistic and agents act:
+statistical acceptance on a frozen eval set, named tools and actions, dated dependencies.
 
 ## For agent builders
 - **Why it matters for agents.** An agent acts: it calls APIs, writes records, sends messages. The SOW is
@@ -258,17 +258,22 @@ print(accept(rows)["rule_of_three_bound"])          # 0.005, about 0.5%
 
 ## Pitfalls
 - **Acceptance criteria in prose such as "accurate" or "production-ready".** Symptom: an acceptance meeting
-  where the customer shows three wrong answers and refuses sign-off.
+  where the customer shows three wrong answers and refuses sign-off. Fix: thresholds on a frozen set,
+  computed by a named harness.
 - **Customer dependencies without dates or consequences.** Symptom: the team waits weeks for data, tool API
-  credentials or access while the delivery date stays fixed.
+  credentials or access while the delivery date stays fixed. Fix: dated obligations with a day-for-day
+  clause.
 - **Committing to a quality target before measuring feasibility on real data.** Symptom: a project that is
-  technically sound but contractually failed because the data was worse than the sample.
+  technically sound but contractually failed because the data was worse than the sample. Fix: a discovery
+  or PoC SOW first, with targets set from its measurements.
 - **No action scope for the agent.** Symptom: mid-pilot the customer expects the agent to update records it
   was only meant to read, and nobody can point to a clause. Fix: an action table with approval rules.
 - **No support boundary after go-live.** Symptom: the delivery team is paged for production incidents
-  months after the engagement ended.
+  months after the engagement ended. Fix: name who operates, monitors and pays for inference after
+  go-live, and when the warranty ends.
 - **An eval set the customer can change during the project.** Symptom: acceptance thresholds are met and
-  then the set is "updated" with new hard cases before sign-off.
+  then the set is "updated" with new hard cases before sign-off. Fix: freeze the set with a recorded
+  content hash, and route new cases through change control.
 
 ## When to use
 - **Use when:** someone outside the team must accept the agent, and especially when money or a go-live

@@ -5,7 +5,7 @@ name: Demos
 kind: practice
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/rapid-prototyping-poc
@@ -176,7 +176,7 @@ proposes a refund and waits for approval: six steps. Rehearsal shows each step b
 |---|---|
 | Steps per task | 6 |
 | Per-step stability in rehearsal | 0.97 |
-| One whole task behaves as rehearsed | 0.97⁶ ≈ 0.83 |
+| One whole task behaves as rehearsed (steps treated as independent) | 0.97⁶ ≈ 0.83 |
 | Three live tasks all behave | 0.83³ ≈ 0.57 |
 | Eval task success to quote | 72% on 150 replayed tickets |
 

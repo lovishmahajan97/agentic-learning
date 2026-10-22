@@ -5,7 +5,7 @@ name: Exec communication
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - adoption/stakeholder-management
@@ -139,7 +139,8 @@ Send pre-reads early enough to be read, and open the meeting with the decision, 
 document.
 
 ## Diagram
-Read top-down as the order of an update; the branch on the right is the pre-wire path for bad news.
+Read top-down as the order of an update; the "yes" branch is the pre-wire path for bad news, and the last
+split picks the channel by the kind of decision.
 
 ```mermaid
 flowchart TD

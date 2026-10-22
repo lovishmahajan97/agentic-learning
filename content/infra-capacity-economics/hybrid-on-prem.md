@@ -5,7 +5,7 @@ name: Hybrid / on-prem
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/cloud-ai-architecture

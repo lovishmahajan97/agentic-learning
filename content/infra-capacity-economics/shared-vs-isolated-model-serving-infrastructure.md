@@ -5,7 +5,7 @@ name: Shared vs isolated model-serving infrastructure
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/inference-clusters
@@ -418,9 +418,9 @@ along with its cost. Dedicated capacity is reviewed against their utilization ev
 **Prove a noisy-neighbour fix for agents (2-3 hours).**
 - **Goal:** show that a per-tenant in-flight cap protects an interactive agent from another tenant's
   fan-out on a shared endpoint.
-- **Steps:** put a small gateway in front of one local model server with limited concurrency (a small
-  model on vLLM, or Ollama with a low `OLLAMA_NUM_PARALLEL`), because a hosted endpoint's pool is too big
-  to show contention; tag each call with a tenant id; run tenant A as an interactive agent issuing one call at a time and tenant B as a
+- **Setup:** one local model server with limited concurrency (a small model on vLLM, or Ollama with a
+  low `OLLAMA_NUM_PARALLEL`), because a hosted endpoint's pool is too big to show contention.
+- **Steps:** put a small gateway in front of it that tags each call with a tenant id; run tenant A as an interactive agent issuing one call at a time and tenant B as a
   batch job firing 30 parallel sub-agent calls; measure tenant A's TTFT with no cap, then with a cap on
   tenant B's in-flight calls counted across its whole fan-out.
 - **Done when:** you have a before/after table of tenant A's p50 and p95 TTFT, tenant B's total runtime

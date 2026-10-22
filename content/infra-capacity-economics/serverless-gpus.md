@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-Serverless GPUs bill per second and scale to zero, so bursty agent work (nightly agents, eval suites)
-pays only for busy seconds. The cost: cold starts of seconds to minutes and a rate above on-demand.
-Decide on utilisation break-even, gated by your latency SLO.
+Serverless GPUs bill per second and scale to zero, so bursty agent work (eval suites, nightly runs) pays
+only for busy seconds, at the cost of cold starts (tens of seconds to minutes) and a premium rate.
+Decide on break-even, gated by the SLO.
 
 ## For agent builders
 - **Why it matters for agents.** Much agent GPU work is bursty: an eval suite that runs on every prompt

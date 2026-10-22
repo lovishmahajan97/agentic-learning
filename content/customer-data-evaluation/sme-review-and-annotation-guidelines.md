@@ -5,7 +5,7 @@ name: SME review & annotation guidelines
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - evals/rubrics
@@ -357,7 +357,7 @@ and blind to system identity, since discussion or version knowledge inflates agr
 - **Goal:** produce a versioned review guideline for an agent and show one revision raising fail-specific
   agreement.
 - **Steps:** collect 30 traces from a small RAG or tool-calling agent; draft a card with an action criterion
-  and three answer criteria; have two people label blind and shuffled; compute κ and fail-specific
-  agreement with `cohen_kappa`; rewrite the most-cited section and relabel 20 fresh traces.
+  and three answer criteria; have two people label blind and shuffled; compute κ with `cohen_kappa` and
+  fail-specific agreement with the formula above; rewrite the most-cited section and relabel 20 fresh traces.
 - **Done when:** you have guideline v1 and v2, agreement numbers for both rounds, and a list of
   disagreements grouped by cited section.

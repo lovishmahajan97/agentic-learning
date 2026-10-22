@@ -5,7 +5,7 @@ name: Enterprise connectors (Salesforce, SAP, ServiceNow, SharePoint, Confluence
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - enterprise-integration/incremental-synchronization-and-cdc
@@ -282,7 +282,7 @@ illustrative; check the org's real daily allocation in its limits endpoint.
 | Steps per session (median) | 6 |
 | Salesforce calls per step (tool plus pagination) | 2 |
 | Calls per day | 24,000 |
-| Same agent with a retry loop bug at p99 (40 steps) | adds thousands of calls from a few sessions |
+| Same agent with a retry-loop bug in the worst 1% of sessions (40 steps) | about 1,400 extra calls a day from just 20 sessions (20 × 34 extra steps × 2) |
 
 The fix was a per-session tool budget (stop after N Salesforce calls and say so), caching account
 lookups for the session, and alerting when the agent's share of the org's API usage passed the agreed slice.

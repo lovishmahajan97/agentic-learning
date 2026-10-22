@@ -5,7 +5,7 @@ name: SLAs
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - reliability/slas-slos
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-An SLA for an agent is a contract: covered service, exact measurement, exclusions and remedies. A
-multi-step agent chains model, tools and retrieval, so commit only to what that chain and on-call can
-back.
+An SLA for an agent is a contract: covered service, exact measurement, exclusions and remedies.
+Service SLAs cover availability and latency per run, support SLAs cover response by severity; commit
+only to what the model-tool chain and on-call can back.
 
 ## For agent builders
 - **Why it matters for agents.** One agent run makes many model and tool calls in series, so its

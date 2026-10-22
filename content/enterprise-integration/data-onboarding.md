@@ -5,7 +5,7 @@ name: Data onboarding
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/data-access-and-permissions-discovery
@@ -21,7 +21,7 @@ related:
 ## TL;DR
 Before an agent can answer from a customer's data, onboarding takes it from "access granted" to "loaded,
 validated and syncing" in gated stages: inventory, sample, profile, map, SME-checked pilot, backfill and
-sync. The data, not the model, is usually the riskiest part.
+sync. The data, not the model, is usually slowest and riskiest.
 
 ## For agent builders
 - **Why it matters for agents.** A RAG agent or a tool-calling agent that reads records is only as right
@@ -184,7 +184,7 @@ SME questions were scored by how the agent answered and which tool results it us
 |---|---|---|---|
 | Correct answer, correct citations | 29 | none | none |
 | Cited an adjuster note from another claim | 6 | join on a non-unique key | 4, mapping |
-| "No information found" | 3 | answer sat in a scanned PDF before OCR | 3, routing |
+| "No information found" | 3 | answer sat in a scan loaded before its OCR pass finished | 5, re-run pilot load |
 | Showed a document a handler should not see | 2 | folder ACL not ingested | 1, permission model |
 
 Re-run after fixes: 38 of 40 pass and zero permission leaks; the 40 questions stay as the agent's
@@ -265,23 +265,24 @@ feed after the backfill would have left record 42 at version 1.
 
 ## Pitfalls
 - **Loading the full export before profiling a sample.** Symptom: a multi-week load followed by the
-  discovery that a key field is unusable, and a restart.
+  discovery that a key field is unusable, and a restart. Fix: profile a sample first.
 - **Sampling the first N rows or the most convenient folder.** Symptom: a pilot that looks clean and a
-  production load full of formats and states the sample never contained.
+  production load full of formats and states the sample never contained. Fix: stratify.
 - **Defaulting unmappable values to a catch-all bucket.** Symptom: answers and analytics that are quietly
-  wrong for a whole category of records.
+  wrong for a whole category of records. Fix: quarantine with an owner.
 - **No agreed acceptance criteria.** Symptom: a sign-off meeting that turns into a debate, with the
-  customer judging success by individual bad answers.
+  customer judging success by individual bad answers. Fix: agree the acceptance record up front.
 - **An unthrottled backfill against the customer's production database.** Symptom: a call from their
-  operations team about slow screens during business hours.
+  operations team about slow screens during business hours. Fix: throttled, off-peak batches.
 - **Starting the incremental feed only after the backfill completes.** Symptom: records whose indexed
-  version is older than the source's, all with source edit times inside the backfill window.
+  version is older than the source's, all with source edit times inside the backfill window. Fix: record
+  the feed position first.
 - **Ingesting content without its permissions.** Symptom: a pilot user sees a document or record in an
-  answer that the source system would not have shown them.
+  answer that the source system would not have shown them. Fix: ingest ACLs with the first load.
 - **Validating tables but not the agent's tool results.** Symptom: every count reconciles, yet the agent
   cites the wrong claim's notes. Fix: review answers and the tool calls behind them in the pilot.
 - **Treating onboarding as finished at backfill.** Symptom: a slowly diverging index because deletes and
-  late updates after the snapshot were never reconciled.
+  late updates after the snapshot were never reconciled. Fix: keep reconciliation running.
 
 ## When to use
 - **Run every stage** for an unfamiliar system or a regulated dataset.

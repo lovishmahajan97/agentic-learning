@@ -5,7 +5,7 @@ name: Dependency injection
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - node-ts-for-ai/vitest-jest-and-integration-testing

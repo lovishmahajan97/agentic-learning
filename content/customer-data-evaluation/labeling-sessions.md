@@ -5,7 +5,7 @@ name: Labeling sessions
 kind: practice
 difficulty: intro
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - customer-data-evaluation/golden-dataset-creation-with-client-smes
@@ -150,7 +150,8 @@ print(batch_size(reviewers=3, minutes=50, min_per_label=3, gold_checks=3, d=0.25
 ```
 
 - **The agent line is the planning point:** a session that labels 120 short answers labels only about 32
-  traces, so a 400-item agent golden set needs many more sessions than the sponsor expects.
+  traces, so a 400-item agent golden set needs about 13 sessions instead of 4, far more than the sponsor
+  expects.
 
 ### Worked session: contract-review pilot (timings and rates illustrative)
 A 90-minute weekly session with three in-house lawyers reviewing a clause-extraction agent.
@@ -275,12 +276,14 @@ sections plus examples for the new case types, and shorter sessions if quality d
 - **If signals agree,** review that reviewer's batch and recalibrate together on the items concerned,
   rather than discarding their labels wholesale.
 
-### How do you extract rules from disagreements without destroying label independence?
+### How do you turn session disagreements into agent prompt rules without destroying label independence?
 - **Order matters:** silent calibration and independent labelling come first, and labels are committed
   before any discussion.
 - **Discuss only the splits afterwards,** asking each reviewer to explain, and log the outcome against item IDs.
 - **Relabel from the log,** so the rule changes later labels without anyone editing their original
   judgement in the moment.
+- **Ship the rule as one versioned change:** the log entry updates the guideline, the judge prompt and the
+  agent's system prompt together, then the affected items are rescored before the change is called a win.
 
 ### When would you not run live sessions?
 - **Stable, well-calibrated tasks** with high agreement can go async, because there are few new rules to surface.

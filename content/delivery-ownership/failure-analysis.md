@@ -5,7 +5,7 @@ name: Failure analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - delivery-ownership/production-debugging
@@ -18,15 +18,15 @@ related:
 ---
 
 ## TL;DR
-Failure analysis finds the few failure modes causing most harm across many agent runs. Sample without
-bias, label each run by its first error and stage, count, weight by severity, and fix the top of the list
-instead of swapping models on instinct.
+Failure analysis finds the few failure modes causing most harm across many agent runs, which fail in
+diverse and often silent ways. Sample without bias, label each run by its first error and stage, count,
+weight by severity, and fix the top of the list.
 
 ## For agent builders
 - **Why it matters for agents.** Agents fail in more places than chatbots: wrong tool chosen, malformed
   arguments, a tool error ignored, a loop, a missed hand-off to a human. Reading a sample of trajectories
   tells you which of these actually dominates, so the next week of work goes there.
-- **Where it shows up in your stack.** Trace viewers or an annotation queue for coding runs, a shared
+- **Where it shows up in your stack.** Trace viewers or an annotation queue for labelling runs, a shared
   taxonomy of failure categories, and the eval suite where top categories become regression cases.
 - **What you control.** Which signals mark a run as failed, how you sample, the taxonomy and severity
   scale, and whether each trace records per-step outputs so the originating stage can be named.
@@ -83,7 +83,7 @@ instead of swapping models on instinct.
 
 This is the discipline the evals module calls error analysis, applied here to live production traffic.
 
-### Coding agent trajectories
+### Labelling agent trajectories
 For a multi-step agent, the "first error" is the first bad **step**. Stages worth tagging:
 
 | Stage | Typical first error |
@@ -397,11 +397,12 @@ estimate the ceiling each intervention could reach before committing.
   tracked on every change.
 
 ### Mini project
-**Run a failure analysis on 50 agent trajectories (2-3 hours).**
+**Run a failure analysis on 40 agent trajectories (2-3 hours).**
 - **Goal:** produce a ranked, stage-tagged list of what breaks a small tool-calling agent.
-- **Steps:** run a simple agent (2-3 tools) on 100+ varied tasks and log every step; pick 50 failed runs
-  at random plus 10 successes; for each, note the first bad step, its stage and a severity from 1 to 4;
-  cluster into categories; compute shares with 95% intervals and a severity-weighted score; implement the
-  cheapest fix for the top category and rerun.
+- **Steps:** run a simple agent (2-3 tools) on 100-200 varied tasks, including hard and ambiguous ones,
+  and log every step; pick 40 failed runs at random (all of them if fewer fail) plus 10 successes; for
+  each, note the first bad step, its stage and a severity from 1 to 4; cluster into categories; compute
+  shares with 95% intervals and a severity-weighted score; implement the cheapest fix for the top
+  category and rerun.
 - **Done when:** you have a table of categories with shares and intervals, one fix shipped at its
   originating stage, and a rerun showing whether that category's share fell.

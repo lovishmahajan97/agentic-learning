@@ -5,7 +5,7 @@ name: Incremental synchronization & CDC
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - enterprise-integration/webhooks
@@ -281,8 +281,8 @@ changes are status or assignee updates).
 | Strategy | Re-embeds per day | Staleness |
 |---|---|---|
 | Nightly full reload | 2,000,000 | up to 24 hours |
-| Watermark sync, no hash gate | about 30,000 (10,000 changes × about 3 overlapping runs) | about 5 to 15 minutes |
-| Watermark sync with hash gate | about 1,500 | about 5 to 15 minutes |
+| Watermark sync, no hash gate | about 30,000 (10,000 changes × about 3 overlapping runs) | up to about 5 minutes; up to 15 for late commits caught by the overlap |
+| Watermark sync with hash gate | about 1,500 | same as above |
 | Log-based CDC with hash gate | about 1,500 | seconds |
 
 ## Production patterns
@@ -445,5 +445,6 @@ tombstone table, or move to log-based CDC, which emits delete events, plus perio
   watermark sync with overlap and keyset paging; store a content hash and timestamps per chunk; build a
   `search_tickets` tool that returns index lag; run a script that edits statuses, edits bodies and deletes rows.
 - **Done when:** deleted tickets vanish from search within one run, status-only edits cause zero re-embeds,
-  a long open transaction's row still appears after commit, and the agent caveats or calls a live lookup when
+  a row from a transaction held open for a few minutes (shorter than the overlap) still appears after it
+  commits, and the agent caveats or calls a live lookup when
   lag exceeds the status tolerance.

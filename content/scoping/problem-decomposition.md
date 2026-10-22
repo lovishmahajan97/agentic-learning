@@ -5,7 +5,7 @@ name: Problem decomposition
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - scoping/workflow-analysis
@@ -221,7 +221,7 @@ All figures illustrative. The same invoice task built two ways, measured on 200 
 | Design | Model-decided steps per invoice | Rough end-to-end | What a failure looks like |
 |---|---|---|---|
 | One agent, generic tools (`read_file`, `sql`), told "handle the exception" | About 10, each about 95% | 0.95¹⁰ ≈ 60% | A plausible email with a wrong PO; no idea which step failed |
-| Agent whose tools are the nodes above: `parse_invoice`, `match_po`, `route_to_owner` | 2 (extract, classify) plus a draft | About 75%, with validators catching more | Validator or threshold escalation, logged on the failing span |
+| Agent whose tools are the nodes above: `parse_invoice`, `match_po`, `route_to_owner` | 2 (extract, classify) plus a draft | About 75%, with validators turning about half the silent errors into escalations | Validator or threshold escalation, logged on the failing span |
 
 - **Decomposition shrank the model's decisions**, because joins, routing and parsing moved into tools with
   typed outputs.
@@ -262,20 +262,24 @@ All figures illustrative. The same invoice task built two ways, measured on 200 
 
 ## Pitfalls
 - **Decomposing by org chart or by existing system instead of by data flow.** Symptom: nodes whose outputs
-  nobody consumes and handoffs that recreate today's delays.
+  nobody consumes and handoffs that recreate today's delays. Fix: split at data-flow seams, working
+  backwards from the output.
 - **Putting deterministic steps inside the prompt.** Symptom: arithmetic errors, invented IDs or wrong dates
   in otherwise fluent output. Fix: make them tools.
 - **Treating per-node accuracy as end-to-end accuracy.** Symptom: a team reporting 90%+ on every component
-  while users see a large share of cases go wrong.
+  while users see a large share of cases go wrong. Fix: multiply along the chain and keep an end-to-end
+  eval set.
 - **Leaving node outputs unstructured.** Symptom: downstream code parsing free text with regexes and failing
-  whenever the model rephrases.
+  whenever the model rephrases. Fix: give every node a typed output schema and validate it at the seam.
 - **Reporting a single success rate that mixes escalations and silent errors.** Symptom: operations say "too
   many items reach the queue" and risk says "too many errors reach customers", and neither can be traded
-  off because they were never measured separately.
+  off because they were never measured separately. Fix: report automated-correct and silent-error shares
+  separately.
 - **Building the easy nodes first.** Symptom: a mostly finished pipeline blocked for weeks on the one hard
-  extraction that should have been spiked on day one.
+  extraction that should have been spiked on day one. Fix: spike the riskiest node first.
 - **Giving an agent generic tools instead of node-shaped ones.** Symptom: long, varied traces where the
-  agent writes its own SQL and joins, with failures nobody can localise.
+  agent writes its own SQL and joins, with failures nobody can localise. Fix: expose each deterministic
+  node as a narrow typed tool such as `match_po`.
 
 ## When to use
 - **Use before** estimating, before writing a statement of work, before choosing a model and before writing
@@ -325,8 +329,8 @@ because everything else depends on them and scanned legal documents are where qu
 ### How does decomposition shape the tools you give an agent?
 - **Deterministic nodes become tools** with typed input and output schemas, such as `match_po` instead of a
   generic SQL tool, so the model cannot get an exact operation approximately right.
-- **Fewer model-decided steps means less compounding:** ten free steps at 95% give about 60%, while two
-  model steps plus tools stay near the pipeline's 75% and fail at a known span.
+- **Fewer model-decided steps means less compounding:** ten free steps at 95% give about 60%, while three
+  model steps (extract, classify, draft) plus tools stay near the pipeline's 75% and fail at a known span.
 - **Each tool gets its own test suite**, and the agent gets an end-to-end one.
 
 ### When would you merge nodes or let an agent plan instead of an explicit pipeline?

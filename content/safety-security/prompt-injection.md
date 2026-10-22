@@ -5,7 +5,7 @@ name: Prompt injection (direct, indirect)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/prompt-injection
@@ -265,9 +265,9 @@ above. The numbers show the shape of the trade-off, not a benchmark.
 
 | Design | Attack success | Utility under attack | Why |
 |---|---|---|---|
-| Prompt rule only | high, varies by model | high | the payload competes with one sentence |
-| Plus quarantine and classifier | lower, never zero | slightly lower | detection is probabilistic |
-| Plus executor allowlist and approval on sends | 0% for exfiltration via sends | most tasks still pass | the check never reads the payload |
+| Prompt rule only | high, varies by model | lower: hijacked tasks often fail | the payload competes with one sentence |
+| Plus quarantine and classifier | lower, never zero | some loss to false positives | detection is probabilistic |
+| Plus executor allowlist and approval on sends | 0% for exfiltration via sends to non-allowlisted recipients | most tasks still pass | the check never reads the payload |
 
 The decision: ship the third design, and keep the classifier as an early-warning signal in the logs.
 

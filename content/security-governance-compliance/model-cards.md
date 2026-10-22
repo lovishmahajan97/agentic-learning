@@ -5,7 +5,7 @@ name: Model cards
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - security-governance-compliance/model-governance
@@ -157,7 +157,8 @@ results = {
     ("channel", "broker_portal"): (0.78, 240), ("channel", "fax_scan"): (0.88, 40),
     ("attachment_present", True): (0.86, 1100), ("attachment_present", False): (0.90, 1930),
 }
-caveats = [f"Model drift: running {running['model']}" for _ in [0] if running["model"] != card["model"]]
+caveats = [f"Model drift: running {running['model']}"] if running["model"] != card["model"] else []
+if running["prompt_sha256"] != card["prompt_sha256"]: caveats.append("Prompt changed since card was signed")
 caveats += [f"Undeclared tool: {t}" for t in running["tools"] if t not in card["tools"]]
 for (f, v), (s, n) in results.items():
     if n < card["min_slice_n"]: caveats.append(f"Too few examples to judge {f}={v} (n={n})")

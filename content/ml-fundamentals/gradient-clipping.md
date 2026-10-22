@@ -5,7 +5,7 @@ name: Gradient clipping
 kind: practice
 difficulty: core
 est_minutes: 11
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/backpropagation
@@ -86,8 +86,9 @@ What that means depends on the optimizer:
 
 ### Where agent traces push the norm
 - **Long trajectories with a summed loss.** If the loss is summed over tokens instead of averaged, a
-  batch holding one 30k-token trace has a far larger norm than a batch of short tool calls, so the clip
-  fires on exactly the batches you most need to learn from in proportion.
+  batch holding one 30k-token trace has a far larger norm than a batch of short tool calls. The clip then
+  fires mostly on long-trace batches and shrinks them, so how much each trace counts depends on the clip,
+  not on your data mix. Average over tokens first.
 - **Degenerate targets.** Traces with mislabelled roles (tool output trained as assistant text) or
   truncated JSON put high loss on tokens the model cannot predict, and show up as norm spikes.
 - **Masking matters.** Training only on assistant and tool-call tokens, not on tool results, removes

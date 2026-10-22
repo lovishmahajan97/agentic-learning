@@ -5,7 +5,7 @@ name: PII protection / DLP
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - safety-security/pii-redaction
@@ -383,11 +383,14 @@ at-rest scans to catch whatever slipped through.
   catastrophic, such as card numbers to a provider, where blocking is right.
 - **Remember it is still personal data under GDPR,** because re-identification is possible.
 
-### A user exercises the right to erasure. What has to happen in an LLM system?
+### A user exercises the right to erasure against your support agent. What has to happen?
 - **Delete the source record and every derived copy:** chunks, embeddings, cached summaries, memory
   entries, eval rows, and logs within retention.
 - **That requires lineage,** source IDs carried on each derived artifact, plus at-rest scans to catch
   copies that slipped through, and a measured time-to-delete.
+- **Agent state is a derived copy too:** long-term memory, durable-execution checkpoints and saved traces
+  of past runs hold the person's data; memory that stores record IDs stops resolving once the source is
+  gone.
 
 ### How do you handle employees pasting customer data into public AI tools?
 - **There is no gateway of yours in the path,** so offer a sanctioned enterprise tenant with contractual
@@ -445,7 +448,8 @@ at-rest scans to catch whatever slipped through.
 - **Goal:** an agent that completes a refund-email task while neither the model, the traces nor a
   third-party tool ever sees a raw email address.
 - **Steps:** wire the `Pseudonymiser` and `call_tool` wrapper from this lesson into a small tool-calling
-  loop with one internal CRM tool and one fake external search tool; log every context the framework
+  loop with one internal CRM tool and one fake external search tool; mask the user's message on entry
+  with the same mapping; log every context the framework
   sends to the model; run a DLP scan (Presidio or the regexes here) over those logs; add a test where the
   model tries to put a raw address into the search tool.
 - **Done when:** the task completes, the log scan returns zero hits, and the external-tool test raises

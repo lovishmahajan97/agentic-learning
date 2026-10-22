@@ -5,7 +5,7 @@ name: Dropout / regularization
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/optimizers

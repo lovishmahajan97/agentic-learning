@@ -5,7 +5,7 @@ name: Timeboxing
 kind: practice
 difficulty: core
 est_minutes: 11
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/rapid-prototyping-poc
@@ -204,9 +204,12 @@ when they should not be).
 
 | Exit rule (day 0) | Decision |
 |---|---|
-| ≥ 70% success and 0 wrong refunds | pilot with approval gate on refunds |
-| 50–70% success, 0 wrong refunds | one more week on the top error category |
+| ≥ 70% success and 0 uncaught wrong refunds | pilot with approval gate on refunds |
+| 50–70% success, 0 uncaught wrong refunds | one more week on the top error category |
 | < 50% success, or any wrong refund that guardrails cannot catch | stop; recommend agent drafts, human sends |
+
+"Uncaught" means a wrong refund that the approval gate or argument validation would not have blocked;
+with these bands every result maps to exactly one decision.
 
 | Day | Work | Task success |
 |---|---|---|

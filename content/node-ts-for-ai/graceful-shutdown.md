@@ -5,7 +5,7 @@ name: Graceful shutdown
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/graceful-shutdown-and-worker-draining
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-On SIGTERM an agent API or worker must fail readiness, stop intake, bring in-flight agent steps to a
-checkpoint before a deadline, close queues and pools, flush telemetry and exit. Otherwise every deploy
-truncates streams, re-runs tool calls and loses traces.
+On SIGTERM an agent API or worker must fail readiness, stop intake, checkpoint in-flight steps before a
+deadline shorter than the grace period, close queues and pools, flush telemetry and exit. Otherwise
+deploys truncate streams, re-run tool calls and lose traces.
 
 ## For agent builders
 - **Why it matters for agents.** Agent runs outlive deploys: a run may be mid-way through step 7 of 15,
@@ -227,7 +227,8 @@ whole run.
 ```ts
 import { Queue, Worker } from "bullmq";
 // conn() is an ioredis factory with maxRetriesPerRequest: null; loadRun, runStep, saveStep are app code
-const stopping = new AbortController();               // aborted when shutdown begins
+const stopping = new AbortController();               // shutdown began: finish the current step, then yield
+const hardStop = new AbortController();               // deadline near: cut the in-flight model call
 const steps = new Queue("agent-steps", { connection: conn() });
 
 const agentWorker = new Worker("agent-steps", async (job) => {
@@ -238,21 +239,28 @@ const agentWorker = new Worker("agent-steps", async (job) => {
       await steps.add("step", { runId }, { jobId: `run-${runId}-from-${nextStep}` });
       return { yielded: nextStep };
     }
-    const r = await runStep(runId, nextStep, stopping.signal);   // model call gets the signal too
-    await saveStep(runId, nextStep, r);                // checkpoint before the next step starts
-    done = r.final; nextStep++;
+    try {
+      const r = await runStep(runId, nextStep, hardStop.signal);  // only the hard stop cuts a step short
+      await saveStep(runId, nextStep, r);              // checkpoint before the next step starts
+      done = r.final; nextStep++;
+    } catch (e) {
+      if (!hardStop.signal.aborted) throw e;           // a real failure: let BullMQ retry the job
+    }                                                  // cut off: loop round and yield; the step re-runs elsewhere
   }
   return { done: true };
 }, { connection: conn(), concurrency: 4 });
 
-export async function drainAgents() {
-  stopping.abort();                                    // running steps finish or abort, then yield
+export async function drainAgents(hardStopAfterMs = 15_000) {
+  stopping.abort();                                    // running steps finish, then yield
+  const t = setTimeout(() => hardStop.abort(), hardStopAfterMs);   // inside the 20 s deadline
   await agentWorker.close();                           // waits for active jobs, which now return fast
+  clearTimeout(t);
 }
 ```
 
-- **Passing the signal into `runStep` is a choice.** It aborts the in-flight model call immediately; pass
-  it only once the deadline is near if you would rather let the current step finish.
+- **Two signals, two meanings.** `stopping` lets the current step finish, so a deploy usually costs no
+  repeated work. `hardStop` fires 15 s into the drain and aborts the in-flight model call, so that step
+  re-runs on another worker, which is safe only if its tool side effects carry idempotency keys.
 
 Illustrative timeline, assuming each step takes under 10 seconds:
 
@@ -428,11 +436,11 @@ not a shell.
   the spans and errors of the close steps.
 - **Each step still needs a cap** so one slow close cannot consume the whole deadline.
 
-### When is a longer grace period the wrong fix for jobs that get cut off during deploys?
-- **When jobs are long by nature:** with `concurrency: 10` and ten-minute jobs, no sensible grace
-  period lets every active job finish.
-- **Better:** per-chunk checkpoints and idempotent writes, so a job re-run after a stall resumes where it
-  left off.
+### When is a longer grace period the wrong fix for agent runs and jobs that get cut off during deploys?
+- **When the work is long by nature:** with `concurrency: 10` and ten-minute agent runs or embedding
+  jobs, no sensible grace period lets every active job finish.
+- **Better:** step-level or per-chunk checkpoints and idempotent writes, so a run re-started after a yield
+  or a stall resumes where it left off.
 - **Keep the grace period** sized to a reasonable unit of work, and treat re-runs as normal.
 
 ### How do you size the in-app deadline for a 30-second grace period with a 5-second `preStop` sleep?

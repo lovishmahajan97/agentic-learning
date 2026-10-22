@@ -5,7 +5,7 @@ name: Feature stores (hybrid ML only)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - ml-fundamentals/train-test-leakage
@@ -333,18 +333,20 @@ with batch values for the same entities and timestamps (illustrative findings):
 - **Two implementations of the same feature for batch and serving.** Symptom: a production accuracy drop that
   disappears when the serving values are logged and compared against the batch ones. Fix: one definition.
 - **Setting no TTL on a feature view.** Symptom: a model happily consuming a value computed a year ago for a
-  dormant entity as if it were current.
+  dormant entity as if it were current. Fix: a `ttl` on every view, set to the staleness the model tolerates.
 - **Mixing event time and ingestion time.** Symptom: subtle leakage when late-arriving events get stamped with
-  when they were loaded rather than when they happened.
+  when they were loaded rather than when they happened. Fix: join on event time; keep ingestion time as a
+  separate column.
 - **Putting the risk gate in the prompt.** Symptom: the agent approves a flagged action after a persuasive
   user message. Fix: the threshold check lives in the tool's code.
 - **Adopting a feature store for an LLM-only application.** Symptom: an expensive platform holding document
-  metadata that the ingestion pipeline already handled.
+  metadata that the ingestion pipeline already handled. Fix: use ingestion contracts and embedding versioning.
 - **Not recording feature view versions in the model's provenance.** Symptom: being unable to tell why model
-  v12 and v13 disagree after a feature definition changed.
+  v12 and v13 disagree after a feature definition changed. Fix: write feature view versions and the offline
+  snapshot into the training manifest.
 - **An inclusive as-of join on a feature that counts the label event itself.** Symptom: a feature that is
   suspiciously predictive offline and whose logged serving values sit consistently one below the training
-  values.
+  values. Fix: a strict comparison at the boundary, matching what serving can know.
 
 ## When to use
 - **Use when** the system trains and serves more than a couple of classical models that share features, when
@@ -464,5 +466,6 @@ after the inputs are right.
   a leaky latest-value join and once with a point-in-time join; train a logistic regression on each and
   compare offline AUC; put the point-in-time model behind a `refund_tool` that reads the latest features,
   fails closed on stale ones, and logs the score on the trace; replay 200 later events through it.
-- **Done when:** a table shows the leaky model's offline AUC beating the honest one but losing on the
-  replayed events, and every replayed tool call has a score and feature version in its trace.
+- **Done when:** a table compares both models' offline AUC and their accuracy on the replayed events (the
+  leaky one should win offline and lose on replay; if it does not, make a feature depend on events after the
+  label), and every replayed tool call has a score and feature version in its trace.

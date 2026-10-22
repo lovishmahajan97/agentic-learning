@@ -5,7 +5,7 @@ name: Vendor exit strategy
 kind: decision
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/ai-gateway

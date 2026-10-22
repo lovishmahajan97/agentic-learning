@@ -5,7 +5,7 @@ name: Client document parsing (PDF, scans, OCR)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - rag-retrieval/document-parsing
@@ -22,7 +22,7 @@ sources:
 ---
 
 ## TL;DR
-A RAG agent can only cite what parsing extracted. Client documents mix digital PDFs, scans and faxes, so
+A RAG agent can only cite what parsing extracted. Client documents mix digital PDFs, scans, faxes and protected files, so
 triage each page to the cheapest working route (text layer, OCR, layout or vision model), score
 confidence, review doubtful pages, and keep page provenance.
 
@@ -310,23 +310,23 @@ the 2% review share tells the client how many reviewer hours to book.
 
 ## Pitfalls
 - **Treating empty extraction as an empty document.** Symptom: a coverage gap of scanned files that never
-  appear in retrieval, found only when a user asks about one.
+  appear in retrieval, found only when a user asks about one. Fix: an empty-extraction coverage alert.
 - **Trusting any non-empty text layer.** Symptom: garbled text from broken font encodings embedded and
-  retrieved, producing confident answers grounded in nonsense.
+  retrieved, producing confident answers grounded in nonsense. Fix: a text-quality check before indexing.
 - **Treating OCR confidence as an accuracy guarantee,** with a threshold never checked against labelled
   pages. Symptom: a page that passed at high confidence with a misread amount, found by a user comparing
-  the answer with the original scan.
+  the answer with the original scan. Fix: tune on labelled pages and add field-level checks.
 - **Deciding route per file instead of per page.** Symptom: hybrid PDFs where the digital cover page is
-  indexed and the scanned body is lost.
+  indexed and the scanned body is lost. Fix: per-page triage.
 - **OCR with the wrong language setting.** Symptom: high error rates on accented and non-Latin characters,
-  which also breaks keyword search on names and terms.
+  which also breaks keyword search on names and terms. Fix: set languages from the corpus profile.
 - **Discarding page numbers and positions.** Symptom: citations that point to a whole 200-page file, so
-  users cannot verify answers and stop trusting them.
+  users cannot verify answers and stop trusting them. Fix: store page and box provenance per span.
 - **Hiding parse failures from the agent.** Symptom: the agent answers "the contract does not mention a
   termination clause" because the scanned pages were empty. Fix: tool results report excluded or
   escalated pages so the agent says what it could not read.
 - **Evaluating the parser on public sample PDFs.** Symptom: a parser that looked accurate in testing and
-  fails on the client's faxed, stamped and skewed originals.
+  fails on the client's faxed, stamped and skewed originals. Fix: a labelled set from the client's corpus.
 
 ## When to use
 - **Apply this triage** whenever a client corpus is more than a handful of born-digital files, which in

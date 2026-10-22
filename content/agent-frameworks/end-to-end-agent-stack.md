@@ -5,7 +5,7 @@ name: end-to-end agent stack (framework, LLM gateway, vector store, tracing, eva
 kind: decision
 difficulty: advanced
 est_minutes: 22
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-frameworks/choosing-an-agent-framework
@@ -127,7 +127,7 @@ def retrieve(tenant_id: str, query_vec: list[float], k: int = 5) -> list[tuple]:
             "ORDER BY embedding <=> %s::vector LIMIT %s",
             (tenant_id, str(query_vec), k),
         ).fetchall()
-        span.set_attribute("retrieval.doc_ids", [r[0] for r in rows])
+        span.set_attribute("retrieval.doc_ids", [str(r[0]) for r in rows])  # OTel takes str/int lists only
         return rows
 
 def answer(session_id: str, tenant_id: str, question: str, query_vec: list[float]) -> str:
@@ -141,7 +141,8 @@ def answer(session_id: str, tenant_id: str, question: str, query_vec: list[float
                       {"role": "user", "content": question}],
             extra_body={"metadata": {"session_id": session_id, "tenant": tenant_id}},
         )
-        span.set_attribute("llm.total_tokens", resp.usage.total_tokens)
+        span.set_attribute("gen_ai.usage.input_tokens", resp.usage.prompt_tokens)   # GenAI semconv
+        span.set_attribute("gen_ai.usage.output_tokens", resp.usage.completion_tokens)
         return resp.choices[0].message.content
 # Configure an OTLP exporter to Langfuse or another backend at startup; check each tool's current docs
 # for the exact metadata fields the gateway records.
@@ -171,8 +172,9 @@ A B2B SaaS team of 4 engineers, Python backend, 30 tenants, about 20k agent conv
   score drop beyond a threshold; sample live traces for online scoring. Track scores per release.
 - **Keep tenant isolation in every data layer.** Tenant filters in vector queries, tenant-scoped sessions
   and memory, and tenant tags on traces. Test cross-tenant retrieval in CI.
-- **Set budgets at three levels.** Max steps per run in the framework, max tokens per call at the gateway,
-  and monthly spend limits per key. Alert on runs that hit the step cap.
+- **Set budgets at three levels.** Max steps per run in the framework, `max_tokens` on every model call
+  plus token and request rate limits per key at the gateway, and spend limits per key (LiteLLM virtual keys
+  take a max budget). Alert on runs that hit the step cap.
 - **Checkpoint state outside the process.** Store sessions and checkpoints in Postgres (or the framework's
   durable store) so deploys, crashes and human approvals resume safely. Monitor resumed-run success.
 

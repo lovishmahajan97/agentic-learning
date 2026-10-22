@@ -5,7 +5,7 @@ name: Streams & backpressure
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - node-ts-for-ai/abortcontroller-and-cancellation

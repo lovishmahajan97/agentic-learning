@@ -5,7 +5,7 @@ name: Private endpoints
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - deployment/customer-vpc-on-prem-air-gapped
@@ -171,7 +171,7 @@ REQUIRED_PRIVATE = [
 
 def resolved_ips(host):
     infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-    return sorted({ipaddress.ip_address(info[4][0]) for info in infos})
+    return sorted({ipaddress.ip_address(info[4][0]) for info in infos}, key=str)  # v4 and v6 mix
 
 failures = []
 for host in REQUIRED_PRIVATE:
@@ -210,7 +210,7 @@ def diagnose(host, port=443, timeout=3.0):
         return f"{host}: DNS lookup failed (no record or no resolver path)"
     if any(not ip.is_private for ip in ips):
         return f"{host}: resolves publicly; private DNS zone missing for this VPC"
-    ip = str(sorted(ips)[0])
+    ip = sorted(map(str, ips))[0]     # str sort: mixed IPv4/IPv6 objects cannot be compared
     try:
         socket.create_connection((ip, port), timeout=timeout).close()
     except OSError:
@@ -448,7 +448,7 @@ check to deployment so a regression is caught before traffic flows.
   unreachable dependency.
 - **Steps:** write a small agent config listing the model client hostname and three tool base URLs;
   generate the `REQUIRED_PRIVATE` list from it; run the resolution check and the `diagnose` adapter from a
-  container; then point a hosts-file entry at a public IP and, separately, at an unreachable private IP,
-  and record what each reports.
+  container; wrap one tool in `call_tool` inside a minimal agent loop; then point a hosts-file entry at a
+  public IP and, separately, at an unreachable private IP, and record what each reports.
 - **Done when:** the gate exits non-zero for both broken cases with the right named cause, passes for the
   clean config, and the agent loop logs a single non-retryable error instead of repeated timeouts.

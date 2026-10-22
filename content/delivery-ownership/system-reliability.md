@@ -5,7 +5,7 @@ name: System reliability
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - reliability/high-availability
@@ -153,8 +153,8 @@ expected for a failure mode ≈ frequency × mean_duration × mean_blast_radius
 Before launch, a production readiness review checks each lever explicitly.
 
 ## Diagram
-Follow one incident through its life; each box on the right is the lever that shortens or shrinks that
-stage, and the loop at the bottom decides what gets funded next.
+Follow one incident through its life; each dotted "Lever" box points at the stage it shortens or
+shrinks, and the weekly review at the bottom decides what gets funded next.
 
 ```mermaid
 flowchart TD
@@ -207,7 +207,7 @@ Three conclusions follow:
 A quarter's incident history, reduced to per-month averages with the impact formula
 `frequency × mean_duration × mean_blast_radius`. Figures are illustrative.
 
-| Failure mode | Per month | Mean minutes | Users hit | Impact (user-minutes) |
+| Failure mode | Per month | Mean minutes | Users hit | Impact (full-outage-equivalent minutes) |
 |---|---|---|---|---|
 | Bad prompt deploy | 1 | 180 | 100% | 180 |
 | Stale retrieval index | 1 | 600 | 10% | 60 |
@@ -257,6 +257,9 @@ def run_agent(task, plan_next_step, call_tool, save_checkpoint, state=None):
   (this sketch allows two), the 90.4 percent versus 99.90 percent shown above.
 - **What it does not buy:** a deterministic bug fails every attempt, and without the idempotency key a
   retried write (a refund, a ticket update) may run twice.
+- **Persist the planned action before calling a write tool.** On resume this sketch re-plans the step,
+  and the model may choose a different action under the same key, which the tool side would wrongly drop
+  as a duplicate. Checkpoint the action first and replay it, so the key always names one action.
 
 ## Production patterns
 - **Pinned model versions with a promotion step** — when calling a hosted model, reference a dated

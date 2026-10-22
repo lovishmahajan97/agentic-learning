@@ -5,7 +5,7 @@ name: Canary / shadow deployments
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - llmops-platform/rollback
@@ -385,12 +385,13 @@ B's refund behaviour in canary is the one thing shadow could not test, so it get
 - **Cohort coverage.** Check the hashed cohort includes the languages, tenants and document types of real
   traffic.
 
-### How would you shadow an agent that can send emails and issue refunds?
-- **Disable or stub side effects in the shadow arm**, recording the intended tool calls instead, because
-  a mirrored agent must not act twice.
-- **Compare the intended tool-call mix** and arguments against the incumbent's actual calls.
-- **Accept the blind spot:** real refund behaviour can only be observed in canary, so give refund rate
-  the tightest guard and the smallest first step.
+### Your shadow agent runs with dry-run tools that return recorded results. What can and can't you conclude from it?
+- **You can compare the first decision:** which tool the candidate picks and with what arguments, against
+  the incumbent's real call on the same input, plus argument-validation failures per tool.
+- **Later steps drift from reality:** once the candidate calls a tool the incumbent did not, there is no
+  recorded result for it, so a synthetic stand-in shapes every step after that.
+- **So treat shadow as a first-step and safety check;** loop length, completion and the effect of real
+  actions (refunds, emails) only become observable in canary, which gets the tightest guard on them.
 
 ### When is a canary the wrong tool and a pre-registered A/B test the right one?
 - **When the question is "which is better", not "is anything broken".** A canary is asymmetric and ends

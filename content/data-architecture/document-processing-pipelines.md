@@ -5,7 +5,7 @@ name: Document processing pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/document-parsing
@@ -262,17 +262,19 @@ agent gets typed blocks with page numbers, plus an explicit list of pages it mus
 
 ```python
 INLINE_TIERS = ["native", "ocr"]          # fast enough for one tool call
-def read_document(path, tiers, queue, max_pages=40):
+def read_document(path, tiers, queue, max_pages=100):
     inline = [(n, f) for n, f in tiers if n in INLINE_TIERS]
     result = process(path, inline)        # per-page routing, quality gate, errors recorded
     pending = [p["page"] for p in result["pages"] if p["tier"] == "needs_review"]
     if pending:
         queue.put({"path": path, "pages": pending, "tiers": ["layout", "vlm"]})   # background escalation
+    shown = result["pages"][:max_pages]   # cap the tool result size, but never silently
     blocks = [{"page": p["page"] + 1, "type": b["type"], "text": b["text"]}
-              for p in result["pages"][:max_pages] for b in p["blocks"]
+              for p in shown for b in p["blocks"]
               if b["type"] not in ("header", "footer")]
     return {"blocks": blocks,
             "pending_pages": [n + 1 for n in pending],     # tell the agent, and through it the user
+            "not_returned_from_page": len(shown) + 1 if len(result["pages"]) > max_pages else None,
             "note": "Pages in pending_pages are still being processed; do not answer from them."}
 ```
 

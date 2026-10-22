@@ -5,8 +5,8 @@ name: FMEA (Failure Mode and Effects Analysis)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
-agent_relevance: core
+status: agentic-verified
+agent_relevance: useful
 related:
   - reliability/chaos-engineering-and-resilience-testing
   - reliability/fault-tolerance
@@ -23,7 +23,7 @@ sources:
 ## TL;DR
 FMEA is a table of how each step of your agent can fail (modes), what happens (effects), why (causes) and
 how you would notice (detection), ranked by Severity × Occurrence × Detection: a postmortem written before
-launch, aimed at silent, wrong-tool-call failures.
+launch, aimed at silent failures such as a wrong tool call.
 
 ## For agent builders
 - **Why it matters for agents.** An agent's worst failures return 200 OK: a plausible wrong answer, a tool

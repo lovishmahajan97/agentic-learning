@@ -5,7 +5,7 @@ name: Threat modeling
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - security-governance-compliance/ai-security

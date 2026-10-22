@@ -5,7 +5,7 @@ name: Data lineage
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - data-architecture/model-and-dataset-provenance
@@ -329,7 +329,7 @@ traversal from a chunk that should have been retrieved, comparing the last good 
 - **Documenting lineage in a diagram or README rather than emitting it from jobs.** Symptom: a graph that is
   confidently wrong six weeks later. Fix: run-time events.
 - **Storing chunk metadata without the ingest run id or source version.** Symptom: being unable to explain
-  why two retrievals of the "same" page differ after a re-index.
+  why two retrievals of the "same" page differ after a re-index. Fix: stamp both on every chunk at ingest.
 - **Treating the agent trace and the ingestion lineage as separate systems.** Symptom: a citation that
   cannot be linked to a specific document version when a user disputes it. Fix: log chunk ids on the trace.
 - **Skipping lineage for manual one-off fixes** ("I just patched that table by hand"). Symptom: an

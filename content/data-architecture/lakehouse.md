@@ -5,7 +5,7 @@ name: Lakehouse
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - data-architecture/etl-elt-for-rag
@@ -301,7 +301,7 @@ steps = pa.table({
 write_deltalake(traces, steps, mode="append", partition_by=["date"])   # batch flush, not per step
 
 dt = DeltaTable(traces)
-eval_snapshot = dt.version()            # store this next to the agent prompt and model id in the eval record
+eval_snapshot = dt.version()            # an offline eval scoring these runs stores this with its results
 
 dt.delete("user_id = 'u-42'")           # commits a new version without the user's rows
 # The rows still exist in eval_snapshot until vacuum removes files older than the retention window,
@@ -310,7 +310,7 @@ dt.delete("user_id = 'u-42'")           # commits a new version without the user
 
 | Question | Where the answer comes from |
 |---|---|
-| Did the agent eval drop because of the prompt or the data? | re-run the old prompt against `eval_snapshot` of the chunk table |
+| Did the agent eval drop because of the prompt or the data? | re-run the old prompt against the chunk-table version the old eval recorded (`DeltaTable(path, version=n)`) |
 | Which tool fails most for tenant X this week? | scan of the trace table, partition-pruned by date |
 | Is user u-42 gone everywhere? | delete commit, then vacuum after retention, then purge the vector index and memory store |
 
@@ -489,6 +489,7 @@ resolve the same table and access policy.
 - **Goal:** show that an agent eval score change can be traced to a data commit.
 - **Steps:** with the `deltalake` package on a local directory, write a small chunk table; build an in-memory
   index from it and run 10 scripted questions through a tiny retrieval agent, recording `dt.version()`;
-  merge a change that breaks one answer; re-run; then re-run the old prompt against the old version.
+  merge a change that breaks one answer; re-run; then load the recorded version with
+  `DeltaTable(path, version=n)` and re-run against it.
 - **Done when:** a two-row table shows score and snapshot version per run, the table history names the commit
   that caused the drop, and time travel to the old version restores the original score.

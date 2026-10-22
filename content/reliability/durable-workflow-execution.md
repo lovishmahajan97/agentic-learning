@@ -5,7 +5,7 @@ name: Durable workflow execution
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-reliability/durable-execution-and-checkpointing
@@ -252,7 +252,10 @@ class AgentRun:
 
 - **A crash anywhere replays to the last recorded step:** earlier `call_model` results come from history,
   so no tokens are re-spent and the model's earlier choices cannot change.
-- **`run_tool` derives its idempotency key** from workflow ID and activity ID, as in `send_reply` above.
+- **`run_tool` derives its idempotency key** from workflow ID, run ID (`info.workflow_run_id`) and
+  activity ID. Unlike `send_reply` above, this loop uses continue-as-new, and activity IDs are numbered
+  per run, so workflow ID plus activity ID alone would collide across continued runs and dedupe a new
+  tool call against an old one.
 - **The transcript lives behind `ref`,** so the history holds references, not tens of thousands of tokens.
 
 ### Trace one run through a redeploy
@@ -495,5 +498,5 @@ continue-as-new and add heartbeats to long model calls.
   tools and a fake "create document" tool that counts calls; kill the process at a random step, restart
   it against the saved history (a JSON file), then repeat with the real SDK in a local Temporal dev server
   if you have one.
-- **Done when:** across 20 random crashes, the model call count equals the number of steps and the tool
-  created exactly one document per intended action.
+- **Done when:** across 20 random crashes, each run's model call count equals its step count and the
+  tool created exactly one document per intended action.

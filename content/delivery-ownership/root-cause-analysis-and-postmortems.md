@@ -5,7 +5,7 @@ name: Root-cause analysis & postmortems
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - delivery-ownership/production-debugging
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 Root-cause analysis asks why an agent incident was possible; a postmortem turns the answer into owned,
-tracked work. Map contributing factors across prevention, detection and mitigation, blamelessly. "The
-model hallucinated" is a symptom, never a cause.
+tracked work. Complex systems rarely have one root cause, so map contributing factors across prevention,
+detection and mitigation, blamelessly. "The model hallucinated" is a symptom, never a cause.
 
 ## For agent builders
 - **Why it matters for agents.** Agents will make wrong calls; the postmortem question is why the
@@ -34,8 +34,9 @@ model hallucinated" is a symptom, never a cause.
   for new regression cases, tool wrappers for validators and idempotency, and flags for kill switches.
 - **What you control.** Which defences sit between a model decision and a side effect, how fast a bad
   pattern is detected, and whether every postmortem action lands as a test, gate or alert with an owner.
-- **What you can skip.** Formal reliability engineering methods beyond five whys, a fishbone and a simple
-  fault tree; they are enough for agent incidents.
+- **What you can skip.** Formal reliability methods beyond five whys, a fishbone and a simple fault tree;
+  those three are usually enough for agent incidents, with heavier methods kept for safety-critical
+  domains.
 
 ## Why it exists
 - **Mitigation ends the incident, not the next one.** Roll back, close the ticket and move on, and the
@@ -189,12 +190,12 @@ Note what is absent: "the model hallucinated" and "the admin should have checked
 
 ### Worked agent postmortem: the cancelled orders
 **Incident (illustrative):** over 50 minutes an order-support agent cancelled 23 orders whose customers
-had only asked about delivery dates. **Proximate trigger:** a tool-description edit made `cancel_order`
-read as the general "order changes" tool.
+had only asked about delivery dates. **Proximate trigger:** a tool-description edit widened `cancel_order`
+to read as the general "order changes" tool.
 
 | Layer | What the trace showed | Contributing factor |
 |---|---|---|
-| Tool design | One tool both modified and cancelled orders | Over-broad tool |
+| Tool design | One tool's description covered both order edits and cancellation | Over-broad tool |
 | Approval gate | Cancellation needed no confirmation from the user | Missing gate for an irreversible action |
 | Evals | No trajectory case where the user asks a question and no action should be taken | Eval gap |
 | Change process | Tool descriptions were edited outside code review | Unreviewed prompt surface |
@@ -202,7 +203,7 @@ read as the general "order changes" tool.
 
 | Category | Action | Owner | Due |
 |---|---|---|---|
-| Prevent | Split `cancel_order` from order edits and require explicit user confirmation | agent team | 2 weeks |
+| Prevent | Narrow `cancel_order` to cancellation only and require explicit user confirmation | agent team | 2 weeks |
 | Prevent | Tool descriptions in version control with review and an eval run | platform | 3 weeks |
 | Detect | 40 "question only, no action" trajectories in the regression suite, plus an alert on cancellations per hour | AI engineer | 2 weeks |
 | Mitigate | Per-tool kill switch for `cancel_order` | platform | 1 week |

@@ -5,7 +5,7 @@ name: Cost allocation by tenant & feature
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/finops
@@ -154,12 +154,18 @@ async def run_agent(tenant_id, feature, run_id):
     await call_model("answer", 0.04)
     return {"job": "reembed", **TAGS.get()}                 # copy tags into job payloads
 
+def run_job(payload):                      # queue worker: restore tags from the payload
+    TAGS.set({k: payload[k] for k in ("tenant_id", "feature", "run_id")})
+    record("model:reembed", 0.08)
+
 job = asyncio.run(run_agent("acme", "research-agent", "r-17"))
 record("model:background_job_without_tags", 0.08)          # a hop that lost the context
+run_job(job)                                               # the same job, tags carried over
 for row in LEDGER:
     print(row["tenant_id"], row["kind"], row["cost_usd"])
 # acme model:plan 0.03 ... acme model:answer 0.04
 # UNATTRIBUTED model:background_job_without_tags 0.08
+# acme model:reembed 0.08
 ```
 
 ### Worked scenario: where an agent run's spend goes missing

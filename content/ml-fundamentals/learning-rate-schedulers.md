@@ -5,7 +5,7 @@ name: Learning-rate schedulers
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/warmup
@@ -30,9 +30,10 @@ A schedule sized in the wrong units is a common reason a tool-calling fine-tune 
 - **Why it matters for agents.** Fine-tuning a model to emit your tool-call format, follow a router policy
   or imitate good trajectories is a short run on a few thousand traces. Short runs are where a mis-set
   horizon or a missing decay silently wastes the whole job.
-- **Where it shows up in your stack.** `lr_scheduler_type`, `warmup_ratio` and `num_training_steps` in the
-  Hugging Face Trainer (and TRL trainers built on it); hosted fine-tuning services usually pick the shape
-  and expose only a learning-rate multiplier and epoch count.
+- **Where it shows up in your stack.** `lr_scheduler_type` and `warmup_ratio` in Hugging Face
+  `TrainingArguments` (TRL's configs inherit them), and `num_training_steps` when you build a scheduler
+  yourself; hosted fine-tuning services usually pick the shape and expose only a learning-rate
+  multiplier and epoch count.
 - **What you control.** The peak rate, warmup length, the horizon in optimizer steps (not traces, not
   micro-batches), the floor, and whether scheduler state is saved with each checkpoint.
 - **What you can skip.** Pre-training shapes (WSD, SGDR, inverse square root) beyond recognising the
@@ -79,8 +80,13 @@ total length `T`. Frameworks apply it as a multiplier on the optimizer's base ra
 ### What the scheduler steps on
 - **Per optimizer step**, not per micro-batch, not per epoch and not per trace.
 - **With gradient accumulation of 8**, one scheduler step happens every 8 forward/backward passes.
-- **If `T` is computed from the number of micro-batches**, the schedule finishes 8× too early and the
-  model trains most of the run at η ≈ 0.
+- **The unit of `T` and the unit of `step()` must match.** A mismatch of 8 goes wrong in one of two ways:
+
+| Mismatch | What the logged rate shows |
+|---|---|
+| `T` counted in micro-batches, stepped per optimizer step | the run ends 1/8 of the way into the decay, near the peak: no anneal |
+| `T` in optimizer steps, `scheduler.step()` called every micro-batch | the schedule finishes 8× too early and the model trains most of the run at η ≈ 0 |
+
 - **Packed or filtered traces change the count.** Sequence packing and dropping over-length trajectories
   change how many batches an epoch has, so compute `T` from the final dataloader, not the raw trace count.
 
@@ -158,7 +164,9 @@ def plan(n_traces, per_device_batch, n_gpus, grad_accum, epochs, warmup_ratio=0.
 
 print(plan(n_traces=12_000, per_device_batch=4, n_gpus=1, grad_accum=8, epochs=3))
 # micro_batches 9000, num_training_steps 1125, warmup_steps 34, check_at [0, 34, 579, 1125]
-# Sizing T as 9000 (micro-batches) would leave the last ~88% of the run at the floor.
+# Sizing T as 9000 (micro-batches) ends the run 12.5% into the decay, still near the peak.
+# Stepping the scheduler every micro-batch against T=1125 hits the floor after 12.5% of the
+# run and trains the last ~88% there.
 ```
 
 ### Warmup plus cosine to a 10% floor, checked by eye
@@ -251,8 +259,12 @@ is still at the peak at 0.75.
   (or vice versa). Symptom: a rate stuck at the warmup value, or collapsing to near zero within the first
   epoch. Fix: step once per optimizer step.
 - **Sizing the schedule in micro-batches or traces.** Computing `num_training_steps` from micro-batches
-  with gradient accumulation on, so the schedule finishes early and the second half trains near zero.
-  Fix: divide the micro-batch count by the accumulation steps before building the scheduler.
+  with gradient accumulation on, then stepping per optimizer step. Symptom: the rate never decays and the
+  final weights are noisy. Fix: divide the micro-batch count by the accumulation steps before building
+  the scheduler.
+- **Stepping the scheduler inside the accumulation loop.** Calling `scheduler.step()` every micro-batch
+  instead of only after `opt.step()`. Symptom: the schedule finishes early and the rest of the run
+  trains near zero. Fix: step it in the same branch as the optimizer.
 - **Resuming without scheduler state.** Warmup restarts or the decay resets; the loss curve shows a jump
   at the resume point that was not there before. Fix: restore the scheduler with the optimizer.
 - **Extending a cosine run without re-planning.** Clamped, the extra steps run at the floor and barely
@@ -310,8 +322,9 @@ changing the schedule.
 - **Adam too:** per-parameter normalization does not change the global scale η, so the argument holds.
 
 ### You LoRA-tuned a model on tool-call traces and the agent eval barely moved. What do you check first?
-- **The logged learning rate:** if it sat near zero for most of the run, the horizon was sized in
-  micro-batches or traces instead of optimizer steps.
+- **The logged learning rate:** if it sat near zero for most of the run, the scheduler was stepped per
+  micro-batch; if it never decayed, the horizon was sized in micro-batches or traces instead of
+  optimizer steps.
 - **The peak and warmup:** a peak too low for an adapter, or a warmup that covers most of a short run,
   leaves the format unlearned.
 - **Then the data:** only after the schedule checks out, inspect trace quality and the eval itself.

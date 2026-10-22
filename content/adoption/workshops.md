@@ -5,7 +5,7 @@ name: Workshops
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - adoption/user-training
@@ -136,8 +136,8 @@ Each has a different artifact, so do not merge them.
 | Enablement or prompting | Users able to work with the tool | Adoption, feedback quality |
 
 ## Diagram
-Follow the path from artifact to follow-up; the loop on the right is what happens when relabeling shows
-agreement did not rise.
+Follow the path from artifact to follow-up; the "no" branch is what happens when relabeling shows
+agreement did not rise, and the last two steps are what turn the session into agent eval data.
 
 ```mermaid
 flowchart TD
@@ -149,8 +149,9 @@ flowchart TD
     D --> C["Draft criteria, owner rules on hard constraints"]
     C --> L["Relabel fresh items"]
     L --> Q{"Agreement rose?"}
-    Q -->|"no"| E["Escalate to owner of good"]
+    Q -->|"no"| E["Escalate to owner of quality"]
     Q -->|"yes"| F["Rubric and labels into eval repo"]
+    F --> G["Summary with owners in 1-2 days"]
 ```
 
 ## Examples
@@ -348,12 +349,13 @@ regression set run on every prompt or model change.
 - **Real cases:** walk five recent tickets through the map silently, then discuss only where people placed
   the approval differently; the owner rules on hard constraints.
 
-### How do you budget time for a three-hour rubric session with 20 examples?
-- **Start from the artifact:** estimate how many items will split (for example about 10 to 12) and minutes
-  per split item (roughly 5), giving about 60 minutes of discussion.
-- **Add fixed blocks:** framing, silent labeling, reveal, drafting criteria, relabel, owners.
-- **Pick items to hit the estimate:** include obvious passes and fails alongside hard cases, so the split
-  count fits the slot.
+### When would you not run a workshop?
+- **When one expert can answer by message**, because pulling eight people into a room costs far more than
+  one reply.
+- **When the decision is already made** and only needs communicating; a "workshop" to ratify it is detected
+  quickly and costs trust.
+- **When the agent question is narrow**, such as one tool's argument format, a short review with the tool's
+  owner is cheaper than a session.
 
 ## Quiz
 ### Q: Why start a workshop segment with silent individual work before group discussion?

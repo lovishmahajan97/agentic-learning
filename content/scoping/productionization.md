@@ -5,7 +5,7 @@ name: Productionization
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - scoping/pilot-to-production-plan
@@ -232,7 +232,10 @@ def run_agent(task_id, messages, call_model, tools, approve, log):
                 continue
             key = hashlib.sha256(f"{task_id}:{reply.tool}:{sorted(args.items())}".encode()).hexdigest()
             args = {**args, "idempotency_key": key}       # same action on retry -> same key
-        result = tools[reply.tool](**args)                # runs with the end user's permissions
+        try:
+            result = tools[reply.tool](**args)            # runs with the end user's permissions
+        except Exception as e:                            # tool errors go back to the model, not up the stack
+            result = f"tool error: {type(e).__name__}: {e}"
         messages.append({"role": "tool", "content": str(result)})   # untrusted text from here on
         log("step", task_id, step, cost, tool=reply.tool)
     return log("step_limit", task_id, MAX_STEPS, cost) or None
@@ -240,6 +243,10 @@ def run_agent(task_id, messages, call_model, tools, approve, log):
 
 - **The limits are illustrative;** set them from the step and cost distribution in your eval traces.
 - **The tool must honour the key:** the idempotency key only helps if the receiving service rejects repeats.
+- **The budget check runs before each model call,** so a task can overshoot `MAX_COST_USD` by at most one
+  step's cost; keep the cap below the true ceiling by that margin.
+- **The key is derived from task, tool and arguments,** so a task that legitimately needs two identical writes
+  must add a sequence number to the key.
 
 ### Capacity, cost and retry-budget calculator
 Run this before launch with your own volumes and your provider's current prices and quota tier.
@@ -308,7 +315,8 @@ print("app x gateway x SDK retries:", retry_amplification([3, 3, 3]), "calls")  
   cost and can amplify an outage; this flips toward fewer retries when the call sits on a latency-critical
   user path.
 - **Pinned versions vs migration work.** Pinning gives reproducible behavior but forces planned migrations
-  before deprecation dates; floating aliases avoid that work at the price of unannounced behavior change.
+  before deprecation dates; floating aliases avoid that work at the price of unannounced behavior change,
+  so accept an alias only for low-stakes features with a fast eval running on a schedule.
 - **Full logging vs sensitive data.** Logging full prompts and outputs makes debugging and audits far easier,
   but creates a store of sensitive data; redact or sample when inputs contain regulated or personal data.
 - **Human fallback vs staffing.** A fallback to a human or a simpler path keeps service available, but needs

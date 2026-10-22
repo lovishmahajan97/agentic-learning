@@ -5,7 +5,7 @@ name: Retry / deduplication / reconciliation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - enterprise-integration/webhooks
@@ -23,9 +23,9 @@ sources:
 ---
 
 ## TL;DR
-An agent's tool calls fail, time out and get retried by the loop itself. Retry handles failed calls,
-deduplication makes repeats safe when a write succeeded silently, and reconciliation catches events that
-never arrived. Agents writing to customer systems need all three.
+Agent tool calls fail, time out and get retried: retry handles failed calls, deduplication makes repeats
+safe when a write silently succeeded, and reconciliation (a scheduled source-versus-target diff) catches
+events that never arrived. Each covers a failure the other two cannot see.
 
 ## For agent builders
 - **Why it matters for agents.** An agent loop retries by nature: the framework retries the HTTP call, the
@@ -79,7 +79,7 @@ For the retryable class:
 2. **Honour `Retry-After`** when the platform sends it.
 3. **Bound both attempts and total elapsed time.**
 
-Two enterprise-specific additions:
+Three additions specific to enterprise integrations:
 - **Retry budget per integration.** For example, retries may be at most a small percentage of calls over
   a rolling window. This stops an outage at the customer turning your workers into a load generator
   against the instance their employees share.
@@ -163,7 +163,7 @@ The diff has three classes:
   whether your copy matches their system of record.
 
 ### Inside the agent's tool loop
-An agent adds two retry layers that a plain integration does not have, and both repeat writes.
+A plain integration has one retry layer; an agent loop has three, and every one of them repeats writes.
 1. **Adapter retry.** The tool adapter retries transient errors (408, 429, 5xx) with backoff before the
    model ever sees them, because a model shown a raw 503 often re-plans instead of waiting.
 2. **Model retry.** When the adapter gives up, the error goes back to the model as a tool result, and the
@@ -309,7 +309,7 @@ A support agent calls `create_ticket` during an incident. Timeline of one run (i
 | Adapter retry after backoff | 2 tickets | upsert updates the same ticket |
 | Model re-plans and calls the tool again | 3 tickets | same operation id, ledger returns the saved result |
 | Worker crashes, run resumes from checkpoint | 4 tickets | ledger hit, no call made |
-| Hourly reconciliation | nothing to resolve | `unknown` resolved by external-id lookup |
+| Hourly reconciliation | 4 valid-looking tickets, nothing flagged | no `unknown` entries left (any that remain are resolved by external-id lookup) |
 
 Four tickets for one incident pages four on-call engineers at the customer; the ledger version makes one.
 
@@ -505,5 +505,6 @@ move the webhook acknowledgement to after the durable write.
   classified retries and backoff; add a ledger keyed on run id, tool and incident id plus upsert by
   external id; run a 10-step agent loop, kill the process mid-run and resume; finally write a
   reconciliation function that resolves every `unknown` entry.
-- **Done when:** 50 runs with injected timeouts and crashes leave exactly 50 tickets, the ledger has no
-  `unknown` entries after reconciliation, and you can show the per-run count of suppressed duplicates.
+- **Done when:** 50 runs (one ticket intent each) with injected timeouts and crashes leave exactly 50
+  tickets, the ledger has no `unknown` entries after reconciliation, and you can show the per-run count of
+  suppressed duplicates.

@@ -5,7 +5,7 @@ name: Disaster recovery (RPO / RTO)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - reliability/business-continuity
@@ -413,5 +413,7 @@ prompt registry and model artefacts.
 - **Steps:** build a small RAG agent with Postgres (sessions and checkpoints) and a local vector index;
   snapshot the index with its embedding model name; take a base backup and archive WAL; delete the
   database and index; restore to a chosen second, time each RTO step, and run five golden questions.
-- **Done when:** a table records RPA and RTA per store against targets, the golden answers match the
-  pre-disaster run, and the drill notes list every manual step to automate next.
+- **Done when:** a table records RPA and RTA per store against targets, the five golden questions
+  retrieve the same top-k chunk IDs as before the disaster and their answers pass the same checks (exact
+  wording may differ, because generation is not deterministic), and the drill notes list every manual
+  step to automate next.

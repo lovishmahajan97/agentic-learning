@@ -5,7 +5,7 @@ name: High availability
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - reliability/fault-tolerance
@@ -241,7 +241,8 @@ def run_step(call, *, retries=1, backoff_s=0.5, fallback=None):
         try:
             return call()
         except TimeoutError:
-            time.sleep(backoff_s * (2 ** attempt) * (0.5 + random.random()))  # jittered backoff
+            if attempt < retries:    # no pointless sleep after the last attempt
+                time.sleep(backoff_s * (2 ** attempt) * (0.5 + random.random()))  # jittered backoff
     if fallback is not None:
         return fallback()            # e.g. second provider or smaller model with a portable prompt
     raise StepFailed("step exhausted retries")  # caller resumes the run from its last checkpoint
@@ -370,11 +371,11 @@ the target should be renegotiated unless both changes are funded.
   with no change in failure rate.
 - **Budget detection inside that:** a 10 s probe needing 3 failures already spends ~30 s.
 
-### Every component of your agent is at 99.9%, yet 6% of runs fail. What is going on and what do you do?
+### Your model provider is at 99.9% and your tools at 99.5%, yet 6% of agent runs fail. What is going on and what do you do?
 - **Runs are series chains.** Fifteen model calls and ten tool calls multiply, so per-call health of
   99.9% and 99.5% gives only about 93.7% clean runs.
-- **Add step-level retries with backoff,** which lifts each step close to 99.999% when failures are
-  independent, and make tools idempotent so a retry cannot act twice.
+- **Add step-level retries with backoff,** which lift a model step to about 99.9999% and a tool step to
+  about 99.9975% when failures are independent, and make tools idempotent so a retry cannot act twice.
 - **Track run completion as the SLO,** not per-call success, so the gap is visible on a dashboard.
 
 ### How do you keep long agent runs alive through deploys and node failures?

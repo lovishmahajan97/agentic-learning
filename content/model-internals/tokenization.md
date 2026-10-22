@@ -5,7 +5,7 @@ name: Tokenization (BPE, SentencePiece)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - model-internals/embeddings
@@ -227,9 +227,12 @@ uuid_tokens = len(enc.encode("3f2b8c1e-9a4d-4e7b-8f21-6c0d5a9e7b13"))
 steps, n_tools = 12, 40                           # a 12-step run with 40 similar tools
 print(f"2 tools: {schema_tokens} tokens; one UUID: {uuid_tokens} tokens")
 print(f"~{schema_tokens / 2 * n_tools * steps:,.0f} schema tokens per run before any caching")
+# 2 tools: 119 tokens; one UUID: 34 tokens
+# ~28,560 schema tokens per run before any caching
 ```
 
-- **Reading the output:** a UUID costs far more tokens than its 36 characters suggest in prose terms, and
+- **Reading the output:** a UUID costs 34 tokens, nearly one per character instead of the ~9 that 36
+  characters of prose would cost, and
   40 schemas re-sent for 12 steps can dominate input cost.
 - **Levers:** retrieve only relevant tools per step, shorten descriptions, keep the tool block stable for
   prefix caching, and replace raw IDs in results with short aliases mapped back in code.

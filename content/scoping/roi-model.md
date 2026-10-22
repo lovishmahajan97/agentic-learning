@@ -5,7 +5,7 @@ name: ROI model
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/success-metrics-kpis
@@ -199,8 +199,13 @@ What the run tells you:
 | Joint mild pessimism (capture 0.45, adoption 0.5, 3 minutes saved, each milder than its single-input stress) | ROI of about −17% and no payback within 24 months |
 
 Three modest disappointments together sink a case that survives each one alone, so the one-at-a-time view
-flatters the case. To model a multi-step agent instead, set `ai_cost_per_ticket` from the measured cost
-per successful task above and re-run the break-even.
+flatters the case.
+
+- **To model the multi-step agent instead,** set `ai_cost_per_ticket` to total agent spend per ticket
+  attempted, because the model multiplies it by every ticket: $2,800 / 10,000 = $0.28 in the trace
+  example. Using the $0.35 per-success figure here would count the failure rate twice.
+- **What changes:** at $0.28 the base ROI falls to about +44%, payback moves to month 11, and break-even
+  rises to about 2.8 minutes saved, so the pilot's 4-minute margin shrinks sharply.
 
 ### Monte Carlo with correlated inputs
 Continues the script above (reuses `BASE` and `evaluate`). A shared "usefulness" factor drives both minutes
@@ -341,8 +346,9 @@ and full per-attempt cost, then show the break-even capture rate so they can jud
 - **Unit of cost:** whether inference was priced per successful task instead of per attempt, missing
   retries, failed runs and unused drafts.
 - **Run length:** steps per run drifting up after a prompt or tool change, or loops that never hit a cap.
-- **Volume and upkeep:** drafts generated for every ticket rather than only adopted cases, eval maintenance,
-  monitoring and re-validation after a provider retired a model version.
+- **Volume:** drafts generated for every ticket rather than only adopted cases, and growth in eligible
+  volume.
+- **Upkeep:** eval maintenance, monitoring and re-validation after a provider retired a model version.
 
 ### How do you handle a finance reviewer who asks why you did not just fix the templates?
 - **Cost the next-best alternative.** Estimate how much of the targeted handle time a template or process
@@ -394,7 +400,7 @@ and full per-attempt cost, then show the break-even capture rate so they can jud
 - **Goal:** compute cost per successful task for a small agent and feed it into the ROI model above.
 - **Steps:** run a two-tool agent on 100 tasks, logging tokens, steps and retries per run from the provider
   usage fields; label success by audit; add a review-minutes cost for failures; compute cost per
-  successful task; set `ai_cost_per_ticket` to it and re-run `evaluate` and the break-even search; then try
-  a step budget and a cheaper model for one step.
+  successful task; set `ai_cost_per_ticket` to total spend per attempted task and re-run `evaluate` and
+  the break-even search; then try a step budget and a cheaper model for one step.
 - **Done when:** you have a table of naive versus true unit cost, the new break-even minutes saved, and a
   one-paragraph recommendation on which lever (success rate, step cap, model tier) moves ROI most.

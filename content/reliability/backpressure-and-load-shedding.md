@@ -5,7 +5,7 @@ name: Backpressure & load shedding
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/backpressure
@@ -29,7 +29,7 @@ pushes "slow down" upstream via bounded queues and 429/503; **load shedding** re
 and cheaply so admitted runs finish within budget.
 
 ## For agent builders
-- **Why it matters for agents.** An agent multiplies load: one user request becomes 10 to 50 model calls,
+- **Why it matters for agents.** An agent multiplies load: one user request can become 10 to 50 model calls,
   parallel tool calls and retries. Shedding individual steps wastes the tokens already spent on a run, so
   agents need admission at the run level and honest handling of the provider's 429s.
 - **Where it shows up in your stack.** The provider's 429 and `Retry-After`, SDK `max_retries`, a
@@ -289,6 +289,10 @@ gate = RunAdmission(calls_per_min=600)
 print(sum(gate.try_admit(12) for _ in range(80)))   # 50 runs admitted, 30 rejected up front
 ```
 
+- **Simplification:** the gate charges a run's whole estimate to the minute it is admitted. Runs that span
+  several minutes need a sliding window or per-step reservations, plus a per-run step budget for runs
+  that outgrow their estimate.
+
 ## Production patterns
 - **Semaphore plus wait timeout in front of every model client.** Size in-flight slots from measured
   capacity (for vLLM, the engine's own `max_num_seqs` caps batched sequences) and the queue from
@@ -471,7 +475,7 @@ else notices.
 **Load-test an agent with and without run-level admission (2-3 hours).**
 - **Goal:** show that admitting whole runs raises completed agent runs per minute under overload.
 - **Steps:** write a fake provider that allows N calls per minute and returns 429 with `Retry-After`
-  beyond it; run a 12-step fake agent at 1.6× the sustainable run rate, first with no admission control,
+  beyond it (drive it with a simulated clock so a test minute takes a second); run a 12-step fake agent at 1.6× the sustainable run rate, first with no admission control,
   then with the `RunAdmission` gate and jittered backoff on 429.
 - **Done when:** a table shows calls made, runs completed and tokens wasted on unfinished runs for both
   policies, and the admitted policy completes close to the sustainable run rate.

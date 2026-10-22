@@ -5,7 +5,7 @@ name: Pagination, rate limits & API quotas
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/rest-graphql-api-design
@@ -238,13 +238,13 @@ async def list_documents_tool(client: httpx.AsyncClient, run_state: dict,
     used = run_state.setdefault("pages_used", 0)
     if used >= MAX_PAGES_PER_RUN:
         return {"error": f"page budget of {MAX_PAGES_PER_RUN} reached; narrow the search instead"}
+    run_state["pages_used"] = used + 1                     # count before awaiting: parallel calls can't overshoot
     params = {"limit": min(limit, 50)}                     # the tool's cap sits below the API's 100
     if cursor:
         params["cursor"] = cursor                          # opaque: the model passes it back verbatim
     r = await client.get("/documents", params=params)
     r.raise_for_status()
     body = r.json()
-    run_state["pages_used"] = used + 1
     return {
         "items": [{"id": d["id"], "title": d["title"][:120]} for d in body["data"]],  # compact rows
         "has_more": body["has_more"],

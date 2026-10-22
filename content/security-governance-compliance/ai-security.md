@@ -5,7 +5,7 @@ name: AI security
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - security-governance-compliance/threat-modeling
@@ -296,8 +296,10 @@ print(sanitize(reply))
   load time, usually discovered only in the incident review. Fix: safetensors and a registry.
 - **Letting the agent write to its own long-term memory without gating.** Symptom: a behaviour change (an
   odd instruction followed, a link inserted) that persists across sessions after one bad page was read.
+  Fix: gate memory writes on tainted turns and record each entry's source.
 - **Securing the chat UI and forgetting the logs, traces and eval datasets that duplicate every prompt.**
-  Symptom: customer PII found in an observability SaaS during an audit.
+  Symptom: customer PII found in an observability SaaS during an audit. Fix: redact before export and
+  give those stores the same retention and access rules as the data they copy.
 
 ## When to use
 This lesson is the map; use it on day one of any AI project to decide which deep lessons apply.
@@ -410,8 +412,9 @@ classifier and prompt as defence in depth, with logging to detect attempts.
   turning the agent into an exfiltration client.
 - **Internal copilots over company data.** On-behalf-of identity keeps the assistant from returning
   records the asking employee could not open themselves.
-- **Agent platforms hosting third-party tools.** Safe weight loading, pinned artifacts and per-session
-  budgets bound supply-chain and denial-of-wallet exposure across every tenant.
+- **Agent platforms serving many tenants.** Safe weight loading for self-hosted models, pinned tool and
+  model artifacts, and per-session budgets bound supply-chain and denial-of-wallet exposure for every
+  tenant.
 
 ### Mini project
 **Harden a three-tool agent against indirect injection (2-3 hours).**

@@ -5,7 +5,7 @@ name: ROC-AUC
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/confusion-matrix

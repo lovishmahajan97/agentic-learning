@@ -5,7 +5,7 @@ name: ReAct (reason + act)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/chain-of-thought

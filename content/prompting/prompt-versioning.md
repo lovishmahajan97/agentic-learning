@@ -5,7 +5,7 @@ name: Prompt versioning
 kind: practice
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/prompt-templates
@@ -192,7 +192,7 @@ def triage(client, ticket: str, tracer) -> str:
                                messages=[{"role": "user", "content": ticket}])
     tracer.log(prompt=p["name"], version=p["version"], hash=p["hash"],   # the line that makes replay possible
                model=p["meta"]["model"], input_tokens=r.usage.input_tokens)
-    return r.content[0].text
+    return "".join(b.text for b in r.content if b.type == "text")   # content[0] may be a tool_use block
 ```
 
 ### A per-category promotion gate (runnable)
@@ -234,7 +234,7 @@ A support agent has three tools: `lookup_order`, `issue_refund` and `escalate`. 
 | Correct tool on first call | 91% | 84% |
 | `issue_refund` called without a prior `lookup_order` | 2% | 9% |
 | Median steps per task | 4 | 5 |
-| Bundle hash | changes | changes, because tool schemas are in the bundle |
+| Bundle hash | baseline hash | a new hash, because tool schemas are in the bundle |
 
 - **Because the description is in the bundle**, v22 gets a new hash, runs the agent eval and is blocked
   on the tool-order regression before reaching users.

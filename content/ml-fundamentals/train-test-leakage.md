@@ -5,7 +5,7 @@ name: Train/test leakage
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - training-adaptation/train-val-test-split
@@ -30,7 +30,7 @@ flatters offline scores, so the agent collapses on real users.
 ## For agent builders
 - **Why it matters for agents.** Agent evals are small, hand-built and reused for months, and agents have
   many side doors to the answers: few-shot examples, long-term memory, the RAG index, cached tool results
-  and fine-tuning traces. One leak turns a 60% agent into a "92%" agent.
+  and fine-tuning traces. A few small leaks can turn a 66% agent into a "92%" one (see the scenario below).
 - **Where it shows up in your stack.** Your golden task set, eval harness fixtures, vector store, memory
   store, prompt templates and any fine-tuning file built from production traces.
 - **What you control.** Who writes eval tasks, a dev/test split for prompt iteration, splitting traces by
@@ -261,7 +261,8 @@ A support agent is scored on 150 golden tasks (illustrative numbers). The audit 
 | Rewrite tasks from real tickets, not model-generated from indexed docs | 68% | lexical overlap with the corpus |
 | Measured on live traffic the next week | 66% | close: the eval is honest now |
 
-- **Each leak was "small".** Together they inflated the number by 26 points.
+- **Each leak was "small".** Together they inflated the eval by 24 points, and the reported number sat 26
+  points above live traffic.
 - **The fix is structural:** a frozen test split, memory isolation per run and a CI dedupe step, not a
   one-off cleanup.
 
@@ -405,6 +406,8 @@ fine-tuning data; and report the test number alongside the number of times it ha
 - **Watch the threshold:** too aggressive and you remove legitimate recurring patterns the model must learn.
 
 ### Your stateful agent scores 10 points higher on the second eval run with no code change. What happened?
+- **Rule out noise first:** rerun the same configuration a few times; a 10-point jump on a fixed task set
+  is far outside normal run-to-run variation for most evals.
 - **Suspect memory leakage:** the first run wrote facts, answers or summaries into long-term memory or a
   cache, and the second run retrieved them, so it is reading its own earlier answers.
 - **Confirm:** rerun with a fresh memory namespace; if the score falls back, the rise was leakage.
@@ -456,5 +459,5 @@ fine-tuning data; and report the test number alongside the number of times it ha
   agent sees (system prompt few-shots, a sample of the vector store, memory entries, fine-tune traces);
   flag exact and near-duplicate matches using normalized text and embedding similarity; plant three
   deliberate leaks and confirm they are caught; wire the script as a CI step that fails on any hit.
-- **Done when:** the script reports every planted leak with its source artifact, shows no false alarms on
-  the clean set, and you can show the eval score with and without the leaked items.
+- **Done when:** the script reports every planted leak with its source artifact, raises no false alarms on
+  the clean items at the threshold you chose by reading flagged pairs, and you can show the eval score with and without the leaked items.

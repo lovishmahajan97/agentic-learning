@@ -5,7 +5,7 @@ name: OpenTelemetry instrumentation
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - observability/opentelemetry
@@ -439,10 +439,10 @@ trace spans API, database, Redis and worker.
 - **Make sure it was kept:** tail sampling that keeps slow and failed runs, and context carried through
   the queue so worker steps join the run's trace.
 
-### Some DB spans attach to the wrong request's trace, but only under load. What is happening?
+### Tool and DB spans from one agent run attach to another run's trace, but only under load. What is happening?
 - **Context follows scheduling, not registration:** `AsyncLocalStorage` restores the context active when
-  a continuation was scheduled, so a pool or batching client that runs queued callbacks later runs them
-  in someone else's context.
+  a continuation was scheduled, so a pool or batching client (a batched embedding or vector-search
+  client, say) that runs queued callbacks later runs them in another run's context.
 - **`EventEmitter` listeners** run in the context of the `emit()` caller.
 - **Fix:** bind callbacks with `context.bind(context.active(), fn)` or `AsyncResource.bind` where they are
   handed over, then verify with a concurrent load test.

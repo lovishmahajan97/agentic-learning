@@ -5,7 +5,7 @@ name: Observability stack
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - observability/tracing
@@ -263,6 +263,7 @@ def run_agent(task, keys, run_id):
                 if not resp.tool_calls:
                     root.set_attributes({"app.steps": step + 1, "app.status": "answered"})
                     return resp.text
+                messages.append(resp.as_message())             # the assistant turn, once per step
                 for tc in resp.tool_calls:
                     arg_hash = hashlib.sha256(json.dumps(tc.args, sort_keys=True).encode()).hexdigest()[:8]
                     with tracer.start_as_current_span(f"tool {tc.name}", attributes={
@@ -271,7 +272,7 @@ def run_agent(task, keys, run_id):
                             result = TOOLS[tc.name](**tc.args)
                         except Exception as e:
                             t.set_status(Status(StatusCode.ERROR, str(e))); result = f"error: {e}"
-                    messages += [resp.as_message(), {"role": "tool", "name": tc.name, "content": str(result)}]
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)})
         root.set_attributes({"app.steps": MAX_STEPS, "app.status": "step_budget_exhausted"})
         root.set_status(Status(StatusCode.ERROR, "step budget exhausted"))   # tail sampler keeps it
 ```

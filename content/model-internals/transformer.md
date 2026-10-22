@@ -5,7 +5,7 @@ name: Transformer
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - model-internals/attention-mechanism
@@ -268,7 +268,7 @@ print(m(ids).shape, f"{sum(p.numel() for p in m.parameters())/1e6:.1f}M params")
 A team priced a 7B summarization route at 2N FLOPs per token, validated at 2k context, then launched
 64k-token documents.
 
-| Context | Attention-score term vs 2N | What the 2N-only model predicted |
+| Context | Attention-score term vs 2N (token at that position) | What the 2N-only model predicted |
 |---|---|---|
 | 2k | about +8% | close enough |
 | 8k | about +31% | noticeably low |
@@ -455,6 +455,7 @@ encoder–decoder processes the input once and cross-attends to it cheaply from 
   it against measured usage.
 - **Steps:** pick an open model and read its layers and hidden size from `config.json`; log input and output
   tokens per step of a small agent with two fake tools; compute ≈2N FLOPs per token and the attention term
-  per step; compare the total with the provider or engine usage numbers.
+  per step; check your logged token counts against the provider's or engine's reported usage, then
+  price the run from those tokens.
 - **Done when:** you have a per-step table of tokens and estimated FLOPs, and a short note on which steps
   dominate and why transcript growth, not step count, drives the total.

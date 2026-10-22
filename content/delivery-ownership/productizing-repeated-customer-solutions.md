@@ -5,7 +5,7 @@ name: Productizing repeated customer solutions
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - customer-data-evaluation/feedback-loops-to-product
@@ -128,8 +128,9 @@ Diff the instances component by component and put each difference in one bucket:
   than custom code, and engineering hours per customer per month.
 
 ## Diagram
-The decision path for each difference found when diffing agent forks (prompt, tools, connectors, limits); only configuration and extensions
-enter the product, and one-offs stay as priced services work.
+The decision path for each difference found when diffing agent forks (prompt, tools, connectors,
+limits). Only configuration and extensions enter the product; one-offs stay as priced services work.
+A proprietary connector is an extension even for one customer, because it plugs into an existing seam.
 
 ```mermaid
 flowchart TD
@@ -137,8 +138,8 @@ flowchart TD
     Q1 -->|"no"| A["Accident: converge on one"]
     Q1 -->|"yes"| Q2{"Expressible as data?"}
     Q2 -->|"yes"| C["Configuration: versioned schema"]
-    Q2 -->|"no"| Q3{"Will other customers need it?"}
-    Q3 -->|"likely"| E["Extension behind interface"]
+    Q2 -->|"no"| Q3{"Fits a shared seam or recurs?"}
+    Q3 -->|"yes"| E["Extension behind interface"]
     Q3 -->|"no"| O["One-off: paid services work"]
     C --> G["Gate: tenant regression suite"]
     E --> G
@@ -247,10 +248,16 @@ class AgentTenantConfig(BaseModel):
         unknown = set(self.enabled_tools) - REGISTRY.keys()
         if unknown:
             raise ValueError(f"unknown tools: {sorted(unknown)}")
-        if not self.memory_namespace.startswith(self.tenant_id):
+        if set(self.approval_required) - set(self.enabled_tools):
+            raise ValueError("approval rules name tools that are not enabled")
+        # exact prefix plus separator, so tenant "acme" cannot claim "acme2:..."
+        if not self.memory_namespace.startswith(f"{self.tenant_id}:"):
             raise ValueError("memory namespace must be scoped to the tenant")
         return self
 ```
+
+- **Why the separator matters:** a bare `startswith(tenant_id)` check would let tenant `acme` load
+  `acme2:tickets`, which is exactly the cross-tenant read the core must refuse.
 
 | Change | With 4 agent forks | With one core and 4 configs |
 |---|---|---|
@@ -316,8 +323,9 @@ class AgentTenantConfig(BaseModel):
   shared tools. Fix: move the difference into config or a separate extension tool.
 
 ## When to use
-- **Use when:** the same agent shape (prompt, tools, loop) appears for the third customer, onboarding time per customer has
-  stopped falling, or a model upgrade or security fix has to be applied in several places.
+- **Use when:** the same agent shape (prompt, tools, loop) appears for the third customer, onboarding
+  time per customer has stopped falling, or a model upgrade or security fix has to be applied in
+  several places.
 - **Avoid when:** the domain is still being discovered and each customer teaches you something new about
   the shape.
 - **Before committing:** run the break-even arithmetic with your own hour estimates for recurring

@@ -5,7 +5,7 @@ name: Stakeholder alignment
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - adoption/stakeholder-management
@@ -18,9 +18,9 @@ related:
 ---
 
 ## TL;DR
-Stakeholder alignment gets everyone who can fund, approve or veto an agent to agree, before building, on
-its goal, success metric, acceptable error rate, which actions need approval, and who can pause it. An
-agent's "does it work?" needs an agreed operating point.
+Stakeholder alignment gets everyone who funds, approves, operates, uses or can veto an agent to agree,
+before building, on its goal, metric, acceptable error rate, failure handling, approval-gated actions and
+who can pause it, because "does it work?" needs an agreed operating point.
 
 ## For agent builders
 - **Why it matters for agents.** An agent takes actions, so the late veto is sharper: compliance, security
@@ -53,7 +53,7 @@ agent's "does it work?" needs an agreed operating point.
   stakeholder management.
 
 ## How it works
-### Background
+### The method at a glance
 Steps 1-7 are the general alignment method for any AI system: map the people, separate goals from red
 lines, measure the human baseline, choose an operating point on a measured curve, pre-wire, write one page
 and re-align at gates. Step 8 is what an agent adds.

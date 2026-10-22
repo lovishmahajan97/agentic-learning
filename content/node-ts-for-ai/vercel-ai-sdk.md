@@ -5,7 +5,7 @@ name: Vercel AI SDK
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - node-ts-for-ai/openai-anthropic-node-sdks
@@ -376,6 +376,8 @@ provider-specific economics.
   on the server and send the result back as the tool's output so the next request continues the loop.
 - **Keep read tools server-run** with `execute`, so only consequential actions pause, and log approvals
   and denials per tool.
+- **Check your major:** v6 adds a built-in approval flag on tools (`needsApproval`), which replaces the
+  hand-rolled pattern above; confirm it in the docs for the version you install.
 
 ## Quiz
 ### Q: What makes `anthropic("...")` and `openai("...")` interchangeable in a `streamText` call?

@@ -5,7 +5,7 @@ name: Policy enforcement across agents & tools
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-runtime-architecture/approval-and-authorization-boundaries
@@ -398,4 +398,4 @@ denial produced by a staged poisoned page in their environment.
   list" instruction; log every decision with its policy version.
 - **Done when:** the researcher's `email.send` is denied on scope, the orchestrator's send after the label
   merge returns `require_approval`, removing the merge line makes it `allow` (proving the merge matters),
-  and policy tests for each rule pass in CI.
+  and a test per rule passes (`opa test` for Rego, pytest for the Python version).

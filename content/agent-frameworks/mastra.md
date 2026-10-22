@@ -5,7 +5,7 @@ name: Mastra (TypeScript agents and workflows)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/frameworks
@@ -27,7 +27,7 @@ one project structure.
 
 ## For agent builders
 - **Why it matters for agents.** Many agent products are TypeScript web apps. Mastra gives them the agent
-  loop, typed tools, conversation memory, durable-ish workflows and a dev playground without a Python
+  loop, typed tools, conversation memory, workflows that persist snapshots to storage and a dev playground without a Python
   service on the side.
 - **Where it shows up in your stack.** The `@mastra/core` package (`Agent`, `createTool`, `Mastra`,
   workflows), `@mastra/memory` plus a storage adapter such as `@mastra/libsql` or Postgres, model providers
@@ -98,7 +98,8 @@ flowchart TD
 ## Examples
 ### A minimal agent with a typed tool
 Requires `npm i @mastra/core @ai-sdk/openai zod` and `OPENAI_API_KEY`; the model id is illustrative. The
-tool `execute` signature has changed across Mastra versions, so check the current docs.
+`execute: async ({ context })` form below is the 0.x signature; 1.x passes the validated input as the
+first argument instead, so match the docs for your installed version.
 
 ```typescript
 import { Agent } from "@mastra/core/agent";

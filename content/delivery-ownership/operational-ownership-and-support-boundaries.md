@@ -5,7 +5,7 @@ name: Operational ownership & support boundaries
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - delivery-ownership/incident-severity-and-escalation
@@ -121,7 +121,7 @@ Agents add layers that default to nobody:
 | Agent behaviour (tool choice, task success) | Agent team, via prompts and evals | Each tool team sees only its own calls |
 | Each tool's implementation and API | The team that owns the wrapped system | The agent team wrote the wrapper, so is assumed to own the system |
 | Tool permissions and scopes | Security or the system owner | Granted once at build time, never reviewed |
-| Actions taken on a user's behalf | Agent team for the decision, system owner for the effect | Both assume the other will reverse it |
+| Actions taken on a user's behalf | Agent team for the decision, system owner for the effect | Both assume the other will reverse it, so name one Accountable for reversal |
 
 - **Tool contracts:** for each tool, record its owner, its error format and its on-call, because a tool
   that changes its response shape breaks the agent with no error on either side.

@@ -5,7 +5,7 @@ name: Platform strategy
 kind: decision
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - llmops-platform/centralized-vs-federated-ai-platform
@@ -219,12 +219,13 @@ illustrative):
 
 ### Worked scenario: shared tool access for agent teams
 Two, then four, agent teams each wrap the CRM API as a tool with their own service account. Plug the
-break-even inequality in ($k per year, illustrative); the incident term is the expected cost of an
-over-scoped credential letting an agent write where it should only read.
+break-even inequality in with c_team 30, C_platform 60, c_adopt 5 and coordination 10 ($k per year,
+illustrative); the incident term (50) is the expected cost of an over-scoped credential letting an agent
+write where it should only read.
 
 | Case | Teams cost (n × c_team + incident) | Platform cost (C + n × c_adopt + coord) | Decision |
 |---|---|---|---|
-| n=2, c_team 30, incident 50 | 60 + 50 = 110 | 60 + 10 + 10 = 80 | centralise |
+| n=2, incident 50 | 60 + 50 = 110 | 60 + 10 + 10 = 80 | centralise |
 | n=2, no incident term | 60 | 80 | leave with teams |
 | n=4, incident 50 | 120 + 50 = 170 | 60 + 20 + 10 = 90 | centralise |
 
@@ -248,8 +249,9 @@ over-scoped credential letting an agent write where it should only read.
   how often teams request bypass routes.
 - **Exception register for off-road teams** — any team leaving the paved road records owner, reason and a
   review date. Monitor the count; a rising number means the paved road no longer fits.
-- **Per-run budgets for agents in the gateway** — tag each request with an agent run ID and cap steps or
-  spend per run, so one looping agent cannot exhaust a team's budget. Monitor runs that hit the cap and
+- **Per-run budgets for agents** — tag each gateway request with an agent run ID and cap steps or spend
+  per run, enforced in the shared agent runtime or as custom gateway logic (most gateways budget per key
+  or team, not per run), so one looping agent cannot exhaust a team's budget. Monitor runs that hit the cap and
   spend per completed task.
 - **Scoped tool credentials from the core** — agents get short-lived, least-privilege credentials for
   each internal system through a shared tool layer instead of team-held service accounts. Monitor tool
@@ -392,8 +394,8 @@ so convergence later is cheap.
   schema and scoped tool credentials on day one, so they build only their agent loop.
 - **Swapping a model under every agent.** A deprecated model is replaced by remapping an alias once each
   agent team's evals pass on the replacement.
-- **Containing a runaway agent.** Per-run budgets in the gateway stop one looping agent before it
-  exhausts its team's monthly spend.
+- **Containing a runaway agent.** Per-run step and spend caps stop one looping agent before it exhausts
+  its team's monthly gateway budget.
 - **Auditing what an agent did.** One trace store answers which agent run made a CRM change, with which
   credential, after which tool result.
 

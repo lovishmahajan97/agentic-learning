@@ -5,7 +5,7 @@ name: MCP server primitives (tools, resources, prompts)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - mcp/mcp-architecture
@@ -60,7 +60,9 @@ control and what your agent spends tokens on.
 | **Prompts** | The user | `prompts/list` | `prompts/get` | Slash commands, menu entries |
 
 All list methods are paginated with an opaque `cursor` in the request and `nextCursor` in the result, so a
-host must loop until `nextCursor` is absent.
+host must loop until `nextCursor` is absent. In 2026-07-28, list results and `resources/read` also carry
+`ttlMs` (a freshness hint) and `cacheScope` (`public` or `private`), so hosts and gateways can cache them
+instead of re-listing on every turn.
 
 ### Tools
 - **Definition:** `name`, optional `title` (display), `description`, `inputSchema` (JSON Schema, an
@@ -186,7 +188,8 @@ asyncio.run(main())
 ```
 
 FastMCP derives `inputSchema` from the signature (the `Literal` becomes an `enum`) and an `outputSchema`
-from the return type; a list return is wrapped as `{"result": [...]}` in `structuredContent`.
+from the return type; a list return is wrapped as `{"result": [...]}` in `structuredContent`, because up to
+2025-11-25 `structuredContent` must be a JSON object (2026-07-28 allows any JSON value).
 
 ### Worked scenario: choosing the primitive for each capability
 A support-agent team maps six capabilities. Token figures are illustrative orders of magnitude.

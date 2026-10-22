@@ -5,7 +5,7 @@ name: AI risk management
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - security-governance-compliance/ai-inventory-and-use-case-risk-classification
@@ -346,7 +346,8 @@ still above appetite either drop the capability or obtain formal acceptance from
   one KRI to a real metric.
 - **Steps:** write five cause-event-consequence risks for an agent with retrieval and one write tool; score
   inherent and residual on 1-5 scales; add a CI script that fails on residual above appetite without an
-  unexpired acceptance record and flags impact-floor entries; log approval rejections from the agent's gate
-  and compute the KRI daily.
+  unexpired acceptance record, flags impact-floor entries, and fails when a control the register names (such
+  as the approval gate) is missing from the agent's tool config; log approval rejections from the agent's
+  gate and compute the KRI daily.
 - **Done when:** removing the approval gate from the tool config makes CI fail, and an injected test document
   that triggers rejected refund proposals shows up as a KRI rise.

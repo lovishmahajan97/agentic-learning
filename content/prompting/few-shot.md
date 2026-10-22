@@ -5,7 +5,7 @@ name: Few-shot prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/zero-shot
@@ -257,7 +257,8 @@ EXAMPLES = [  # placeholders are deliberately fake so leaks are detectable
     {"user": "What did I order on 2000-01-15?",
      "calls": [("search_orders", {"date": "2000-01-15"})]},
 ]
-EXAMPLE_VALUES = {v for ex in EXAMPLES for _, args in ex["calls"] for v in args.values()}
+# Only placeholder values: an enum value such as "damaged" is legitimate in real calls too.
+EXAMPLE_VALUES = {"ORDER-EXAMPLE-1", "2000-01-15"}
 
 def render_examples():
     blocks = []
@@ -268,7 +269,7 @@ def render_examples():
 
 def leaked(tool_args: dict) -> bool:
     """True if a real call reuses a value that only exists in the examples."""
-    return any(v in EXAMPLE_VALUES for v in tool_args.values())
+    return any(isinstance(v, str) and v in EXAMPLE_VALUES for v in tool_args.values())
 
 SYSTEM = "You are a refund agent. Always call get_order before issue_refund. Dates are YYYY-MM-DD.\n"
 SYSTEM += render_examples()          # static: stays inside the cached prefix

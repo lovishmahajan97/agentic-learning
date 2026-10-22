@@ -5,7 +5,7 @@ name: Customer VPC / on-prem / air-gapped deployment
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - deployment/private-endpoints
@@ -52,7 +52,8 @@ agent becomes a signed, self-contained bundle.
   losing traces means losing the only record of why it chose a tool.
 - **So it is a different product shape.** A signed, self-contained bundle, a configuration surface that
   captures every environment decision, and an operating model where the customer's platform team holds
-  the keys. The further inward, the more of your product is packaging rather than infrastructure you run.
+  the keys. Each step inward trades your operability for their control, so more of your product
+  is packaging rather than infrastructure you run.
 
 ### The hidden internet dependencies
 | Dependency | Why it breaks |
@@ -144,7 +145,10 @@ proxy and identity provider.
 
 ### Signing for an air gap: key pair vs keyless
 - **Key pair (simplest).** A long-lived key pair whose public key ships out of band; verification needs
-  nothing but the key.
+  nothing but the key, as long as you skip the transparency-log upload when signing (or ship the
+  signature bundle), since cosign v2 otherwise looks the entry up in Rekor online.
+- **Most air-gapped sites choose key pairs,** accepting key-rotation work in exchange for simpler
+  verification.
 - **Keyless (cosign's default).** Ties signatures to a short-lived certificate (Fulcio) and a
   transparency log (Rekor).
 - **Keyless offline is possible but heavy.** It verifies offline only if you also ship the signature
@@ -230,8 +234,9 @@ if __name__ == "__main__":
 - **Where it runs.** `build` runs on your connected side after packaging; `verify` runs on the
   customer's side, before anything is loaded into their mirror registry.
 - **Why verify first.** A corrupted 140 GB copy is caught before the install starts rather than during it.
-- **Authorship too.** The manifest is then signed with `cosign sign-blob` (key-pair mode, so
-  `cosign verify-blob --key` works offline) so the customer checks authorship as well as integrity.
+- **Authorship too.** The manifest is then signed with `cosign sign-blob` in key-pair mode, with no
+  transparency-log entry or with the signature bundle shipped, so `cosign verify-blob --key` works
+  offline and the customer checks authorship as well as integrity.
 - **Three distinct rejections.** A file that is missing (truncated transfer); a file whose hash differs
   (corruption or tampering); a file present but not in the manifest (added after signing, which an
   installer that globs the directory would otherwise load).
@@ -345,7 +350,8 @@ spec:
   warning weeks before expiry and again during the grace period. Monitor days-to-expiry per site from
   support bundles.
 - **Bounded version support and expand-then-contract migrations.** Publish how many bundle versions you
-  support at once and require sites to upgrade into that window, so back-ports stay finite. Add columns
+  support at once and require sites to upgrade into that window, so back-ports stay finite; track the
+  version each site runs. Add columns
   and tables first, remove old ones a release later, so `helm rollback` to the previous chart still
   finds a schema it understands. Test rollback in CI.
 
@@ -513,10 +519,12 @@ observability; fixes arrive as bundles on a schedule, and they must operate the 
 **Make a tool-calling agent pass an offline install gate (2-3 hours).**
 - **Goal:** prove a small agent (one model endpoint, two tools, one retrieval step) runs with zero
   internet access.
-- **Steps:** containerise the agent with weights baked in and `HF_HUB_OFFLINE=1` set; add the host
-  preflight as an init container; deploy it to a local kind or k3s cluster in a namespace with the
-  deny-egress NetworkPolicy; run a scripted task that calls both tools; then add a public web-search tool
-  and watch the preflight fail.
+- **Steps:** containerise the agent with weights baked in and `HF_HUB_OFFLINE=1` set; serve a small
+  open-weight model (0.5-3B) in-cluster so the model call stays inside; add the host preflight as an
+  init container.
+- **Then gate it:** deploy to a local k3s cluster (it enforces NetworkPolicy out of the box) or kind with
+  a policy-enforcing CNI, in a namespace with the deny-egress NetworkPolicy; run a scripted task that
+  calls both tools; then add a public web-search tool and watch the preflight fail.
 - **Done when:** the clean install completes the task with no DNS errors for public hosts, the polluted
   install is refused before the agent starts, and you have a one-page list of every outbound dependency
   you removed.

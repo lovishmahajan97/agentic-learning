@@ -5,7 +5,7 @@ name: Backpropagation
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - ml-fundamentals/gradient-descent
@@ -196,14 +196,16 @@ print(tool, reward, logits.grad)                # gradient is zero when the run 
 A team fine-tunes with LoRA on agent traces and raises the maximum sequence length to keep whole runs.
 Activation memory is shown relative to the 4k setting; it is a scaling sketch, not a measurement.
 
-| Max sequence length | Activations (relative) | With gradient checkpointing | Compute per step |
-|---|---|---|---|
-| 4k | 1× | much lower | baseline |
-| 8k | about 2× | much lower | about a third more with checkpointing |
-| 16k | about 4× | much lower | about a third more with checkpointing |
+| Max sequence length | Activations, fused attention (relative) | Compute per step (relative) |
+|---|---|---|
+| 4k | 1× | 1× |
+| 8k | about 2× | about 2× or more (attention grows with T²) |
+| 16k | about 4× | about 4× or more |
 
 - **Weights and LoRA state do not change** with sequence length; activations do, which is why the job ran
   at 4k and failed at 16k.
+- **Gradient checkpointing** cuts the activation column sharply at every length, for about a third more
+  compute on top of the compute column.
 - **Order of levers:** checkpointing, a fused attention kernel, micro-batch 1 with gradient accumulation,
   then truncating or summarising long tool results in the training data.
 - **Measure** peak memory at two lengths before buying hardware, to confirm the linear scaling.
@@ -417,11 +419,13 @@ diagnosis before and after by logging per-layer gradient norms.
   most about a third.
 - **What does fall sharply** is gradient and optimizer-state memory for the frozen weights.
 
-### Gradients in your early layers are tiny. What is the mechanism and which fixes address it?
-- **Mechanism:** the early-layer adjoint is a product of every later layer's Jacobian; norms below 1
-  shrink it exponentially (sigmoid bound 0.25 per layer).
-- **Fixes:** ReLU or GELU, residual connections, normalisation, variance-preserving initialisation.
-- **Verify** with per-layer gradient norms before and after.
+### Your agent fine-tuning script's memory grows every step until it runs out. What do you check?
+- **A retained graph:** the usual cause is logging or accumulating the loss tensor itself (for example
+  appending `loss` to a list), which keeps every step's graph and saved activations alive.
+- **Fix:** log `loss.item()` or `loss.detach()`, and make sure no tensor that requires grad is stored
+  across steps.
+- **Confirm** with `torch.cuda.memory_allocated()` logged per step: it should be flat after the first few
+  steps, not climbing.
 
 ## Quiz
 ### Q: Why is reverse-mode automatic differentiation the right choice for training neural networks?

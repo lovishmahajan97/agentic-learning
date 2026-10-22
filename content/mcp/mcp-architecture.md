@@ -5,7 +5,7 @@ name: MCP architecture (hosts, clients, servers, JSON-RPC lifecycle, capability 
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/model-context-protocol
@@ -93,7 +93,13 @@ Most deployed servers and SDK 1.x releases still speak this model.
   `io.modelcontextprotocol/protocolVersion`, `io.modelcontextprotocol/clientCapabilities` and (should)
   `io.modelcontextprotocol/clientInfo` in `_meta`, and the server judges each request on its own.
 - **`server/discover`.** Servers must implement it to return `supportedVersions`, `capabilities`,
-  identity and `instructions`; clients may call it first, or just send requests and handle errors.
+  `instructions` and identity (`io.modelcontextprotocol/serverInfo` in `_meta`); clients may call it
+  first, or just send requests and handle errors.
+- **Every result carries `resultType`:** `complete` for ordinary results, `input_required` for an
+  interim result that asks the client for more input. Clients treat a missing field from an older
+  server as `complete`.
+- **Removed utilities.** `ping` and `logging/setLevel` are gone; a client sets the log level per request
+  with `io.modelcontextprotocol/logLevel` in `_meta`.
 - **Version mismatch** returns `UnsupportedProtocolVersionError` with a `supported` list, and the client
   retries with a common version.
 - **No sessions, no server-initiated requests.** Sampling, elicitation and roots ride inside results as
@@ -109,7 +115,7 @@ Most deployed servers and SDK 1.x releases still speak this model.
 | Side | Capability | Means |
 |---|---|---|
 | Server | `tools`, `resources`, `prompts` | Offers that primitive; `listChanged` means it will announce changes |
-| Server | `resources.subscribe` | Clients may subscribe to updates of one resource |
+| Server | `resources.subscribe` | Clients may subscribe to updates of one resource (handshake era; `subscriptions/listen` in 2026-07-28) |
 | Server | `logging`, `completions` | Emits log messages; offers argument autocompletion |
 | Client | `roots`, `sampling`, `elicitation` | Can list workspace roots, run an LLM call for the server, ask the user |
 | Both | `experimental`, `extensions` (2026-07-28) | Opt-in features outside the core |
@@ -174,7 +180,7 @@ async def main():
     async with stdio_client(params) as (read, write):          # host spawns the server
         async with ClientSession(read, write) as session:      # one client for this server
             init = await session.initialize()                  # handshake-era negotiation
-            print(init.protocolVersion)                        # e.g. 2025-11-25 on SDK 1.x
+            print(init.protocolVersion)                        # 2025-11-25 on recent 1.x releases
             print(init.serverInfo.name, "|", init.instructions)
             print(init.capabilities.model_dump(exclude_none=True))  # tools, prompts, resources...
             tools = (await session.list_tools()).tools         # becomes the model's tool list

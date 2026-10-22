@@ -5,7 +5,7 @@ name: LangGraph fundamentals (StateGraph, nodes, edges, conditional routing)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/frameworks
@@ -74,9 +74,10 @@ add branches, parallel work and limits deliberately.
 - **Supersteps.** All nodes triggered in one step run, then their updates merge through reducers, then the
   next set runs. Parallel branches fan in at a node with several incoming edges.
 - **`recursion_limit`** (in the run config) caps supersteps; exceeding it raises `GraphRecursionError`.
-  Set it per run as your step budget.
-- **Retries per node.** `add_node(..., retry_policy=RetryPolicy(max_attempts=3))` retries flaky tool or
-  model nodes with backoff.
+  Set it per run as your step budget: older releases defaulted to 25, but current 1.x releases default to
+  roughly 10,000, so the default no longer stops a runaway loop.
+- **Retries per node.** `add_node(..., retry_policy=RetryPolicy(max_attempts=3))` (import from
+  `langgraph.types`) retries flaky tool or model nodes with backoff.
 
 ### Prebuilt pieces
 | Piece | Does |
@@ -201,7 +202,8 @@ print(app.invoke({"ticket": "Double charge on my card", "findings": []})["reply"
 - **Keep routers deterministic.** Let a model node write a typed decision into state (via structured
   output), and let a plain function route on it. Edge choices then show up clearly in traces and are easy
   to unit-test.
-- **Set a recursion limit per run.** Pass `{"recursion_limit": 25}` (or your budget) in the config and
+- **Set a recursion limit per run.** Pass `{"recursion_limit": 25}` (or your budget) in every config, since
+  the current default is far too high to act as a budget, and
   catch `GraphRecursionError` to return a graceful "could not finish" with the partial state; alert on
   its rate.
 - **Retry at the node, not the graph.** Attach `RetryPolicy(max_attempts=3)` to nodes that call flaky

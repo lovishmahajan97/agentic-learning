@@ -5,7 +5,7 @@ name: Mixed precision
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/gradient-clipping

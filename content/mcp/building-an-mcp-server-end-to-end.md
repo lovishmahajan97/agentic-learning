@@ -5,7 +5,7 @@ name: Building an MCP server end to end (FastMCP in Python, TypeScript SDK)
 kind: tool
 difficulty: core
 est_minutes: 20
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/mcp-python-sdk
@@ -55,7 +55,7 @@ empty file to an agent using your server.
 | Option | Pick when | Watch out for |
 |---|---|---|
 | Official Python SDK 1.x, `mcp.server.fastmcp.FastMCP` | Python team, most examples and tutorials | Speaks up to 2025-11-25; pin `mcp>=1.10,<2` |
-| Official Python SDK 2.x, `mcp.server.mcpserver.MCPServer` | New Python servers that need 2026-07-28 | Renamed classes and snake_case fields; read the migration guide |
+| Official Python SDK 2.x, `mcp.server.mcpserver.MCPServer` | New Python servers that need 2026-07-28 (it serves handshake-era clients too) | Renamed classes and snake_case attributes (`is_error`, `input_schema`); read the migration guide |
 | Standalone `fastmcp` package | You want its extra features (composition, proxies, client utilities) | A separate project with its own API and releases; check its docs |
 | TypeScript SDK `@modelcontextprotocol/sdk` 1.x | Node or TypeScript team, edge or web deployments | Zod-based schemas; v2 splits into packages such as `@modelcontextprotocol/server`, so check current docs |
 
@@ -72,7 +72,8 @@ empty file to an agent using your server.
    message that tells the model what to do next. In Python SDK 1.x, argument validation failures also come
    back as `isError` results.
 5. **Report progress and logs** with `ctx.report_progress(...)` and `ctx.info(...)` for long calls; plain
-   logging goes to stderr.
+   logging goes to stderr. MCP logging is deprecated in 2026-07-28, so put operational logs on stderr or
+   OpenTelemetry and keep `ctx.info` for messages the host should show.
 6. **Annotate.** `readOnlyHint`, `destructiveHint` and `idempotentHint` let hosts decide what to
    auto-approve.
 7. **Test without a model.** A stdio client in a test (or the MCP Inspector, `npx

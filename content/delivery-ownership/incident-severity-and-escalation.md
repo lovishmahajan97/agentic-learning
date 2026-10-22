@@ -5,7 +5,7 @@ name: Incident severity & escalation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - delivery-ownership/production-debugging
@@ -30,8 +30,8 @@ outputs and leaks that throw no errors.
   200 while issuing a duplicate refund, emailing the wrong customer or leaking another tenant's document.
   Severity criteria that only mention uptime will not page anyone for that.
 - **Where it shows up in your stack.** Alerts on tool-action rates, guardrail blocks and quality scores;
-  per-tool and per-tenant kill switches; the paging tool's escalation timers; and the request IDs you
-  send to your model provider.
+  per-tool and per-tenant kill switches; the paging tool's escalation timers; and the provider request
+  IDs you attach when escalating to your model vendor.
 - **What you control.** Which agent behaviours count as SEV1 (irreversible or unauthorised actions, data
   exposure), which mitigations exist without a deploy (disable a tool, read-only mode, pin a snapshot),
   and who can flip them.
@@ -90,6 +90,8 @@ Agents act, so classify by what the action did and whether it can be undone:
 
 - **Count actions, not just requests.** One run can call a side-effecting tool many times, so the share of
   degraded requests understates impact.
+- **Treat the table as a starting point.** Harm and reach still decide: one irreversible but trivially
+  small action may be SEV2, while reversible wrong actions that hit a key customer's records can be SEV1.
 
 ### Declare early, adjust freely
 - **Declare at the higher plausible severity and downgrade as facts arrive**, *because* under-declaring
@@ -207,7 +209,7 @@ out but the payment actually went through (timeline illustrative).
 
 | Time | What happened | Severity |
 |---|---|---|
-| **14:05** | Cost alert: tool calls per run up from about 4 to about 7. No errors, no complaints. | SEV3 |
+| **14:05** | Alert: `issue_refund` calls per hour up about 25% while ticket volume is flat. No errors, no complaints. | SEV3 |
 | **14:20** | Trace sample: 9 of 40 runs called `issue_refund` twice for the same order. Money left the company and cannot be pulled back automatically. | SEV1 |
 | **14:23** | Mitigation: `issue_refund` disabled by flag, agent tells users a human will follow up. Finance and leadership informed. | SEV1 |
 | **15:10** | Duplicates listed from traces and handed to finance; idempotency key added to the tool before re-enabling. | SEV2 until reconciled |

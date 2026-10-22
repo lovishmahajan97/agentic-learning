@@ -5,7 +5,7 @@ name: Deployment readiness reviews
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - deployment/security-and-architecture-reviews
@@ -199,8 +199,9 @@ def tool_drift(approved, candidate):
     for name, scope in candidate.items():
         if name not in approved:
             findings.append((name, "new tool", "BLOCKING" if scope == "write" else "review"))
-        elif scope != approved[name]:
-            findings.append((name, f"scope {approved[name]} -> {scope}", "BLOCKING"))
+        elif scope != approved[name]:                    # widened to write blocks; narrowed needs a look
+            findings.append((name, f"scope {approved[name]} -> {scope}",
+                             "BLOCKING" if scope == "write" else "review"))
     return findings
 
 for f in tool_drift(approved, candidate):

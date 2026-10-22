@@ -5,7 +5,7 @@ name: Model & dataset provenance
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - data-architecture/data-lineage
@@ -364,13 +364,15 @@ than `router-v3` in production. Diff the two manifests (illustrative values):
 - **Hashing a dataset directory that was later edited in place.** Symptom: a manifest digest that matches
   nothing on disk when an audit asks for the bytes. Fix: immutable snapshots.
 - **Loading pickle-format checkpoints from an unverified source.** Symptom: arbitrary code execution at load
-  time, usually discovered by a security review rather than by the model misbehaving.
+  time, usually discovered by a security review rather than by the model misbehaving. Fix: safetensors only,
+  verified against a signed digest.
 - **Forgetting licence propagation through fine-tunes and merges.** Symptom: a commercial deployment of a
   model whose ancestor forbids it. Fix: compute obligations over the full closure.
 - **Recording eval results but not the eval set digest.** Symptom: scores that cannot be compared across
-  runs because the set quietly changed.
+  runs because the set quietly changed. Fix: store the eval set digest beside every score.
 - **Recording a synthetic dataset's digest but not the generator model and prompt version.** Symptom: a
-  quality shift after regenerating "the same" dataset that nobody can explain.
+  quality shift after regenerating "the same" dataset that nobody can explain. Fix: record generator model,
+  revision, prompt version, sampling parameters and filter.
 
 ## When to use
 - **Record provenance for every artifact that reaches a registry:** every fine-tune, merged model, dataset
@@ -491,5 +493,6 @@ believe not", which does not survive a dispute.
   digests, index version); fine-tune or stub a tiny router with the manifest writer above; run the
   contamination check between its training rows and a 30-task agent eval set; ship two releases with one
   deliberate tool-schema change and one dataset change; tag traces with the release id.
-- **Done when:** `diff(v1, v2)` prints exactly the two changes, the contamination report shows zero exact and
+- **Done when:** `diff(v1, v2)` prints exactly the two changes (the edited tool's digest and the
+  retrained router's checkpoint digest), the contamination report shows zero exact and
   near overlaps (or blocks the run), and any trace can be mapped to its release manifest.

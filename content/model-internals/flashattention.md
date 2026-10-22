@@ -5,7 +5,7 @@ name: FlashAttention
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/self-attention
@@ -91,7 +91,8 @@ O_new = exp(m - m_new) · O + exp(S_ij - m_new) · V_j
 - **Why the rescale works.** Everything accumulated so far was computed relative to the old max;
   multiplying by `exp(m − m_new)` re-expresses it relative to the new one.
 - **Exact, not approximate.** After the last block, `O / l` is the exact softmax-weighted sum, a
-  re-association of the same sum, so agent evals do not shift when you switch it on.
+  re-association of the same sum, so agent evals should move only within fp16/bf16 rounding noise when
+  you switch it on (greedy outputs can still differ on near-tied tokens).
 - **FlashAttention-2 defers the division** by *l* to the very end to cut non-matmul work.
 
 ### Backward pass by recomputation (fine-tuning)

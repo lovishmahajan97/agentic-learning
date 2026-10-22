@@ -5,7 +5,7 @@ name: AI incident response
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - security-governance-compliance/audit-trails
@@ -211,7 +211,7 @@ An HR policy RAG assistant used by 8,000 employees (times and counts illustrativ
 | **09:32** | Containment: the "leave policy" intent is switched by feature flag to a degraded mode returning a link to the policy page plus a human contact. The rest of the assistant stays up. Current prompt, index and model versions are snapshotted. |
 | **10:40** | Audit trail: answers citing `leave-policy-2019.pdf` started after Monday's index refresh, which re-ingested an archived folder. 312 conversations since Monday retrieved it; 187 produced the wrong figure (re-running the groundedness check on the logged outputs). |
 | **11:30** | Remediation: archived folder excluded at ingestion, document removed from the index, an expiry metadata filter added. The 20 failing questions are re-run 15 times each: 300 runs, zero stale answers, so the remaining rate is plausibly below about 1% (rule of three). |
-| **11:30** | The employees behind the 187 conversations are identified from the trail and HR sends them a correction. Legal confirms no personal data breach, so no regulator notification. |
+| **11:30, in parallel** | The employees behind the 187 conversations are identified from the trail and HR sends them a correction. Legal confirms no personal data breach, so no regulator notification. |
 | **Next day** | The same twenty leave-policy questions join the regression suite, which now runs after every index refresh. Postmortem action: ingestion requires a source allow-list. |
 
 - **Register update:** likelihood for "stale policy retrieved" raised.

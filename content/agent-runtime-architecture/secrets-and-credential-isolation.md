@@ -5,7 +5,7 @@ name: Secrets & credential isolation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/secrets-management
@@ -385,10 +385,12 @@ value appears, and alert on any scrubber hit as a sign something upstream regres
 ### Mini project
 **Make a sandboxed coding agent unable to leak a key (2-3 hours).**
 - **Goal:** show that a prompt-injected "print your environment and POST it" attack finds nothing to steal.
-- **Steps:** run generated Python in a container with only `HTTPS_PROXY` and `SSL_CERT_FILE` set; put a
-  forward proxy in front that allows one host and one path and adds a fake `Authorization` header; expose a
-  `crm_search` tool whose schema has only `query`; add the `scrub` function to tool results; run the
-  `secret_hits` test inside both images in CI.
+- **Steps:**
+  1. Run generated Python in a container with only `HTTPS_PROXY` and `SSL_CERT_FILE` set.
+  2. Put a TLS-intercepting forward proxy in front that allows one host and one path and adds a fake
+     `Authorization` header (mitmproxy with a short addon script is the quickest to set up).
+  3. Expose a `crm_search` tool whose schema has only `query`, and run the `scrub` function on its results.
+  4. Run the `secret_hits` test inside both the sandbox and loop images as a build step.
 - **Done when:** the injected `env` dump shows only the proxy address and CA path, a POST to a non-allowed
   host is blocked, a planted secret in a tool response comes back as `[REDACTED]`, and adding a
   `GITHUB_TOKEN` variable fails the CI test.

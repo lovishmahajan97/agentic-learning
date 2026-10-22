@@ -5,7 +5,7 @@ name: Approval & authorization boundaries
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/human-in-the-loop

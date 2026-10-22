@@ -5,7 +5,7 @@ name: agent memory libraries (Mem0, Letta)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-memory
@@ -52,7 +52,8 @@ user, while Letta (formerly MemGPT) runs stateful agents that edit their own mem
 ### Mem0: a memory layer you call around your agent
 1. **Add.** After a turn, call `m.add(messages, user_id=...)`. An LLM extracts candidate facts and compares
    them with existing memories, then adds, updates or deletes entries, because storing every message
-   would duplicate and contradict.
+   would duplicate and contradict. Passing `infer=False` skips extraction and stores the messages as
+   given, which is cheaper but loses consolidation.
 2. **Search.** Before the next model call, `m.search(query, user_id=...)` returns the most relevant
    memories, which you inject into the prompt.
 3. **Manage.** `get_all`, `update`, `delete` and `history` support inspection, corrections and

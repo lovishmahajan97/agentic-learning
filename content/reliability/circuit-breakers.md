@@ -5,7 +5,7 @@ name: Circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - reliability/bulkheads
@@ -185,22 +185,24 @@ class CircuitBreaker:
         self.results = collections.deque(maxlen=window)    # True = failed call
         self.state, self.opened_at, self.probe_ok, self.probe_inflight = "closed", 0.0, 0, 0
 
-    def _allow(self):
+    def _allow(self):                                       # None = reject, True = probe, False = normal
         if self.state == "open":
             if time.monotonic() - self.opened_at < self.reset_after:
-                return False                                # fail fast: no network call at all
+                return None                                 # fail fast: no network call at all
             self.state, self.probe_ok, self.probe_inflight = "half_open", 0, 0
         if self.state == "half_open":
             if self.probe_inflight >= self.probes:
-                return False                                # only a few trial calls at a time
+                return None                                 # only a few trial calls at a time
             self.probe_inflight += 1
-        return True
+            return True
+        return False
 
     def _trip(self):
         self.state, self.opened_at = "open", time.monotonic()
 
-    def _record(self, failed):                              # failed=None: ignored outcome (e.g. a 4xx)
-        if self.state == "half_open":
+    def _record(self, failed, probe):                       # failed=None: ignored outcome (e.g. a 4xx)
+        if probe:
+            if self.state != "half_open": return            # another probe already reopened it
             self.probe_inflight -= 1                        # always release the probe slot
             if failed is None: return
             if failed: self._trip(); return                # still broken: reopen, timer restarts
@@ -208,22 +210,23 @@ class CircuitBreaker:
             if self.probe_ok >= self.probes:                # enough evidence of recovery
                 self.state, self.results = "closed", collections.deque(maxlen=self.window)
             return
-        if failed is None: return
+        if self.state != "closed" or failed is None: return # late result from before the trip: ignore
         self.results.append(failed)
         n = len(self.results)
         if n >= self.min_calls and sum(self.results) / n >= self.fail_ratio:
             self._trip()
 
     async def call(self, fn, *args, timeout=10.0, **kw):
-        if not self._allow():
+        probe = self._allow()
+        if probe is None:
             raise CircuitOpen("dependency marked unhealthy")
         try:
             result = await asyncio.wait_for(fn(*args, **kw), timeout)
         except (asyncio.TimeoutError, ConnectionError, UpstreamError):
-            self._record(True); raise
+            self._record(True, probe); raise
         except BaseException:                               # 4xx, cancellation: neither success nor failure
-            self._record(None); raise
-        self._record(False)
+            self._record(None, probe); raise
+        self._record(False, probe)
         return result
 
 breaker = CircuitBreaker()
@@ -239,6 +242,9 @@ async def answer(prompt):
 - **The catch-all branch matters more than it looks.** Without it, a 4xx or a cancelled request during
   half-open would never release its probe slot, and after three such calls the breaker would reject
   everything forever while the dependency was healthy.
+- **Late results are ignored.** Calls admitted before the trip keep finishing (timing out) for one timeout
+  after it; counting them would restart the open timer, and counting them during half-open would release
+  probe slots they never held. Only probe calls decide the half-open outcome.
 - **Emit a metric on every state transition;** a breaker that opens silently is an outage nobody is
   looking at.
 
@@ -432,7 +438,7 @@ utilization should stay flat.
 - **A ratio over a sliding window** catches the partial failures typical of overloaded providers, at the
   cost of a minimum-calls guard and more state.
 
-### How would you design breakers for an LLM gateway that uses two providers, three models and two regions?
+### How would you design breakers for the LLM gateway behind your agents, with two providers, three models and two regions?
 - **One breaker per failure domain:** provider × model × region, so a failing deployment does not take
   healthy ones down and healthy traffic does not dilute the sick one's ratio.
 - **Check traffic per partition:** each breaker must reach its minimum calls; merge partitions or use

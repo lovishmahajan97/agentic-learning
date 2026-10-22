@@ -5,7 +5,7 @@ name: Speculative decoding
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -34,8 +34,9 @@ with outputs provably unchanged. For self-hosted agents it cuts per-step latency
   retrieved text are predictable, which is exactly where drafts are accepted most often.
 - **Where it shows up in your stack.** The speculative decoding settings of a self-hosted engine (vLLM's
   draft-model and n-gram modes, a configurable number of speculative tokens), `assistant_model` and
-  `prompt_lookup_num_tokens` in Hugging Face `generate`. Hosted APIs may use it internally; you do not
-  configure it there.
+  `prompt_lookup_num_tokens` in Hugging Face `generate`. Hosted APIs may use it internally without
+  exposing a setting; OpenAI's Predicted Outputs (the `prediction` request parameter) is a related hosted
+  option for edits where most of the output is known in advance.
 - **What you control.** Whether to enable it per serving pool, which drafter (n-gram lookup, a small
   same-family model, trained heads), and how many tokens to speculate, all measured at real concurrency.
 - **What you can skip.** The full rejection-sampling proof; remember that the lossless rule keeps outputs
@@ -121,7 +122,7 @@ speedup ≈ (1 − α^(γ+1)) / ((1 − α) · (γ·c + 1))
 |---|---|---|
 | **Separate small model** | same tokenizer (so draft ids mean the same to the target), usually same family, an order of magnitude or more smaller | flexible, reusable across a family; extra weights and cache |
 | **N-gram or prompt lookup** | propose the continuation that followed the same recent tokens earlier in the context | no second model, near-zero cost; strong on RAG answers that quote sources and code edits that reproduce input, weak elsewhere |
-| **Extra heads (Medusa)** | heads on the last hidden state predict offsets +2, +3, ...; candidates verified as a tree in one pass | drafting costs one target pass's worth of extra heads, not a second model; heads trained per target |
+| **Extra heads (Medusa)** | heads on the last hidden state predict offsets +2, +3, ...; candidates verified as a tree in one pass | drafting rides on the target's own pass through small extra heads, no second model; heads trained per target |
 | **Feature-level head (EAGLE)** | a light autoregressive module predicts the next hidden state, not the next token | reuses the target's representations for higher acceptance |
 
 - **Check the acceptance mode.** Medusa also offers a relaxed "typical acceptance" rule that trades
@@ -201,7 +202,9 @@ tokens (a tool call carrying a code edit). Same illustrative costs as above.
 | Prompt lookup or drafter, α = 0.8 (edits copying the file) | ~10 | ~3.0 s | ~45 s |
 
 - **Same output, faster run.** The lossless rule means the agent's trajectory and eval scores are
-  unchanged at temperature 0; only wall-clock time moves.
+  unchanged at temperature 0; only wall-clock time moves. In practice the verify pass uses a different
+  kernel shape, so in fp16 or bf16 a near-tied token can occasionally flip, exactly as with any batching
+  change.
 - **Measure acceptance per step type.** Tool-call JSON and edits tend to sit near the top row; free-text
   reasoning sits lower.
 
@@ -406,4 +409,5 @@ low concurrency while leaving the high-throughput pool without it.
   free-text reasoning); with a small open model in Hugging Face, time `generate` greedily with and without
   `prompt_lookup_num_tokens`; confirm outputs are identical; compute ms per output token per step type.
 - **Done when:** you have a table of speedup per step type, a check that every output matched the
-  baseline, and a recommendation for which agent steps or pools should enable it.
+  baseline (any mismatch traced to a near-tied token, not a bug), and a recommendation for which agent
+  steps or pools should enable it.

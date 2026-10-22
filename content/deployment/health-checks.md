@@ -5,7 +5,7 @@ name: Health checks
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - fastapi-for-ai/health-readiness-endpoints
@@ -143,9 +143,9 @@ stateDiagram-v2
 A FastAPI agent service that loads a model at startup, separates liveness from readiness and reports
 overload. The model loader is a stand-in for real initialisation.
 
-It runs as a background task because
-an `await` inside the lifespan would delay the server from accepting connections until loading ends:
-probes would see connection refused rather than a 503 with a reason.
+It runs as a background task because an `await` inside the lifespan would delay the server from
+accepting connections until loading ends: probes would see connection refused rather than a 503 with a
+reason.
 
 ```python
 import asyncio
@@ -266,8 +266,9 @@ def synthetic_check(base_url, token):
 | Provider in **metrics and synthetic check only** | Pods stay ready; requests use the fallback model or return a clear error; an alert links to the runbook |
 
 ## Production patterns
-- **Separate endpoints per probe.** Expose `/livez`, `/readyz` and `/startupz` (the naming Kubernetes
-  itself uses for its API server) with distinct logic, and wire each to the matching probe. Monitor
+- **Separate endpoints per probe.** Expose `/livez`, `/readyz` and `/startupz` with distinct logic
+  (the first two follow the naming the Kubernetes API server uses for its own health endpoints), and wire
+  each to the matching probe. Monitor
   container restart counts and ready replica count per deployment.
 - **Startup window from measured cold loads.** Measure model load time on a cold node (image pull plus
   weight download), then set startup `periodSeconds × failureThreshold` above the worst case with margin.
@@ -311,6 +312,7 @@ def synthetic_check(base_url, token):
   the model never loaded or a GPU is in an error state. Fix: readiness checks model and GPU state.
 - **Treating green probes as proof the agent works.** Symptom: all-green dashboards while users get wrong
   answers from a stale index or a broken tool, which only a synthetic end-to-end check would have caught.
+  Fix: a scheduled golden task that asserts on the answer and the tool path.
 
 ## When to use
 - **Every deployed agent service:** liveness and readiness.
@@ -360,7 +362,7 @@ slow loads are not killed.
 
 ### Agent runs take several minutes and are cut off during every deploy. What do you change?
 - **Drain properly:** a short pre-stop delay so endpoint removal propagates, then a grace period longer than
-  the typical run so in-flight requests finish.
+  the longest streamed answer so in-flight requests finish.
 - **Checkpoint long runs:** persist state after each tool step so a run on a terminating pod resumes on
   another replica; verify by counting runs resumed versus lost and truncated streams per rollout.
 

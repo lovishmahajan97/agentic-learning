@@ -5,7 +5,7 @@ name: Scaling laws
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - model-internals/small-language-models

@@ -5,7 +5,7 @@ name: Content moderation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - safety-security/llama-guard
@@ -356,8 +356,9 @@ classifier is a separate component.
 - **Then retune per category,** keep mid-range scores as allow-and-flag, and reserve hard blocks for very
   high scores or zero-tolerance categories.
 
-### How would you design moderation for a RAG assistant over user-generated forum posts?
-- **Moderate the retrieved chunks too,** because quoted forum text becomes output verbatim.
+### How would you design moderation for a RAG agent that answers from user-generated forum posts?
+- **Moderate the retrieval tool's results too,** scoring chunks before they enter the context, because
+  quoted forum text becomes output verbatim.
 - **Moderate output as well,** since jailbreaks and poisoned documents surface there.
 - **Log direction and category per decision** so you can tell whether harm came from users, sources or
   the model.

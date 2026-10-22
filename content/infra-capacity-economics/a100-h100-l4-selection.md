@@ -22,7 +22,7 @@ sources:
 
 ## TL;DR
 Pick each agent-stack card by its first binding constraint: fit (long contexts), per-step decode
-(bandwidth), then cost per token at load. L4: cheap 24 GB. A100: 40/80 GB, no FP8. H100:
+(bandwidth), then cost per token. L4: cheap 24 GB. A100: 40/80 GB, no FP8. H100:
 80 GB, ~3.35 TB/s, FP8, cheapest per token when busy.
 
 ## For agent builders

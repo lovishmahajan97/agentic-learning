@@ -5,7 +5,7 @@ name: Experiment tracking (MLflow, W&B)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - llmops-platform/model-registry
@@ -86,8 +86,9 @@ Both clients are thin writers to a store; their transport explains several sharp
   reference lands in the run.
 
 ### Three sharp edges that follow
-1. **MLflow params are strings,** so a filter such as `params.lr > 0.001` is not a numeric comparison. Put
-   numbers you will range-query into metrics or tags you control.
+1. **MLflow params are strings,** so a filter such as `params.lr > 0.001` is not a numeric comparison:
+   params accept only string comparators (`=`, `!=`, `LIKE`, `ILIKE`), so the search is rejected. Put
+   numbers you will range-query into metrics, which compare numerically.
 2. **MLflow sorts on a metric's *last* logged value, not its best.** Log a separate `best_eval_acc` if that
    is what you will rank by.
 3. **W&B requires the `step` passed to `log` to increase monotonically.** A call with an earlier step is
@@ -369,10 +370,11 @@ artifacts, with the adapter registered from the run so the registry version carr
 - **Artifacts:** per-task trajectories, because the reason a configuration lost lives in the tool calls, not
   in the aggregate.
 
-### A search for `params.lr > 0.001` returns runs with lr = 0.0002. What is going on?
-- **MLflow stores params as strings,** so the comparison is lexicographic, not numeric.
-- **Fix:** log values you will range-query as metrics or as tags you control with a sortable format, and
-  keep params for exact-match filters.
+### A search for `params.lr > 0.001` fails, and `params.lr = '2e-4'` misses a run logged with lr 2e-4. Why?
+- **MLflow stores params as strings** and only allows string comparators on them, so `>` is rejected and
+  equality compares text: Python logged 2e-4 as the string `0.0002`, which is not `2e-4`.
+- **Fix:** log values you will range-query as metrics (numeric comparison works there), and keep params
+  for exact-match filters written in the exact string form that was logged.
 - **Related trap:** run-table sorting uses each metric's last value, so log a best-value metric too.
 
 ### How do you choose between MLflow and W&B for a regulated customer?
@@ -438,4 +440,5 @@ artifacts, with the adapter registered from the run so the registry version carr
   prompt versions times two `max_steps` values); log params, success rate, mean steps, cost per task and
   trajectories per run; query the runs sorted by success, then by cost.
 - **Done when:** you can name the chosen run, show its params, open one failed task's trajectory from the
-  run page, and re-run it from the logged params to the same result.
+  run page, and re-run it from the logged params to the same success rate within noise (exactly, if model
+  calls go through a response cache).

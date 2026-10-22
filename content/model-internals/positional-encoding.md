@@ -5,7 +5,7 @@ name: Positional encoding (RoPE)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/self-attention
@@ -218,7 +218,7 @@ EVALUATED_LIMIT = 32_768     # longest length your agent evals passed at, not th
 RESERVE = 2_048              # room for the next tool call and answer
 
 def needs_compaction(messages):
-    n = len(tok.apply_chat_template(messages, tokenize=True))
+    n = len(tok.apply_chat_template(messages, tokenize=True, return_dict=False))   # list of ids
     return n > EVALUATED_LIMIT - RESERVE, n
 
 # in the loop: if needs_compaction(history)[0]: replace old tool results with summaries

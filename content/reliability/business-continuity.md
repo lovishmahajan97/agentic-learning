@@ -5,7 +5,7 @@ name: Business continuity
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - reliability/disaster-recovery
@@ -57,10 +57,11 @@ Disaster recovery is its technical subset; a business impact analysis comes firs
 
 ## How it works
 ### Background: the BC lifecycle in brief
-- **Business impact analysis (BIA) first.** A ranked inventory of business **functions, not systems**:
-  what each does and who depends on it, its **maximum tolerable downtime** (some frameworks say maximum
-  acceptable outage), the systems and suppliers it needs, and what an hour of disruption costs in money,
-  compliance exposure and trust.
+- **Business impact analysis (BIA) first,** because mid-disruption nobody has time to decide what
+  matters. It is a ranked inventory of business **functions, not systems**: what each does and who
+  depends on it, its **maximum tolerable downtime** (how long before harm becomes unacceptable; some
+  frameworks say maximum acceptable outage), the resources, systems and suppliers it needs, and what an
+  hour of disruption costs in money, compliance exposure and trust.
 - **RPO and RTO for each supporting system are derived from the BIA,** so an honest one often shrinks the
   expensive list: most functions can wait a day, a few cannot wait ten minutes.
 - **Restoring the system is not restoring the function.** People still clear the backlog, re-enter manual
@@ -177,7 +178,7 @@ of both prompt maintainers, a prompt-injection incident that forces a halt.
 | T+10 minutes | degraded service | if that also fails: keyword rules route to a general queue, with a banner telling agents triage is degraded |
 | T+15 minutes | communication | status page updates |
 | T+30 minutes | manual workaround | if backlog exceeds 150 tickets, the support lead activates it: two agents triage from a shared view |
-| T+60 | communication | enterprise customers with contractual notification clauses are emailed |
+| T+60 minutes | communication | enterprise customers with contractual notification clauses are emailed |
 
 - **Manual capacity:** the BIA shows two agents sustain roughly half of peak volume, so the backlog grows
   at about 150 tickets per hour, and enterprise tickets are pulled first to protect the four-hour SLA.

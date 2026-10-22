@@ -5,7 +5,7 @@ name: Langfuse
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - observability/tracing
@@ -141,7 +141,7 @@ datasets and the next prompt version, which closes the loop.
 
 ```mermaid
 flowchart TD
-    APP["App with @observe"] -->|"background batches"| API["Langfuse API"]
+    APP["Agent with @observe"] -->|"background batches"| API["Langfuse API"]
     API --> OS[("Object storage")]
     OS --> RQ["Redis queue and workers"]
     RQ --> CH[("ClickHouse: traces")]
@@ -155,8 +155,10 @@ flowchart TD
 ## Examples
 ### Tracing a support bot with the Python SDK
 The decorator builds the trace, the OpenAI drop-in records the generation, the prompt comes from prompt
-management and is linked to the generation, and the trace is tagged with user and session. Method names
-follow the current (v3) Python SDK; the earlier SDK exposed the same ideas through `langfuse_context`.
+management and is linked to the generation, and the trace is tagged with user and session.
+
+Method names follow the OTel-based v3 Python SDK; the earlier SDK exposed the same ideas through
+`langfuse_context`, so check the names against the major version you pin.
 
 ```python
 # pip install langfuse openai ; env: LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and the host URL if self-hosted
@@ -446,7 +448,8 @@ separate projects.
 **From a failing agent run to a promoted fix (2-3 hours).**
 - **Goal:** close the trace, dataset, experiment, promote loop for a small agent.
 - **Steps:** run Langfuse locally with Docker Compose; build a two-tool agent with `@observe` and the
-  OpenAI drop-in; move its system prompt into prompt management; run 30 tasks and score each for success;
-  add the failures to a dataset; edit a new prompt version and run a dataset experiment.
+  OpenAI drop-in; move its system prompt into prompt management; run 30 tasks and score each with a code
+  check (right tool called, expected final state) plus `steps_used`; add the failures, with expected
+  outputs, to a dataset; run the dataset against the current prompt version, then against an edited one.
 - **Done when:** the UI shows both dataset runs side by side with success, cost and steps per task, and the
   `production` label points at the better version with generations recording it.

@@ -5,7 +5,7 @@ name: Technical documentation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/adrs
@@ -192,9 +192,9 @@ sys.exit(1 if stale else 0)
   which forces a reviewer to ask whether its steps and expected outputs still hold.
 - **It is a nudge, not proof:** a trivial edit silences it, so pair it with the pull-request question
   about invalidated docs.
-- **It needs real history.** Many CI systems check out a shallow clone of depth one by default, where
-  every path reports the same last commit and the check silently passes, so fetch full history (or at
-  least the merge base) in the job that runs it.
+- **It needs real history.** CI often checks out a shallow clone (GitHub Actions fetches one commit by
+  default), where paths older than the clone report the same boundary commit and the check silently
+  passes, so fetch full history (or at least the merge base) in the job that runs it.
 
 ### Production snippet: a runbook in the fixed order
 One alert, one page, written for the 2 a.m. reader. Names and thresholds are illustrative.
@@ -251,8 +251,8 @@ print(render_card(TOOLS, MANIFEST))
 
 - **Why generate it:** a reviewer asking "can this agent write to the ERP without a human?" gets an answer
   that matches production, *because* the card and the agent read the same list.
-- **Run it in CI:** publish the card per release tag, and fail the build if a write tool lacks an
-  approval decision recorded in an ADR.
+- **Run it in CI:** publish the card per release tag, and turn the warning into a non-zero exit so a
+  write tool without human approval cannot merge unless an ADR records why.
 
 ## Production patterns
 - **Full-history checkout for doc checks** — when a CI job compares commit times, fetch full history;
@@ -369,8 +369,8 @@ invalidates, and CI checks links and freshness. I would run one tabletop inciden
 - **Measure** time to find the first safe action in each drill and in real incident timelines.
 
 ### Your doc freshness check has never failed in CI. What do you suspect?
-- **A shallow clone:** many CI systems check out depth one by default, so every path reports the same
-  last commit and the comparison always passes.
+- **A shallow clone:** CI often checks out few commits (one by default on GitHub Actions), so paths
+  report the same boundary commit and the comparison always passes.
 - **Fix it** by fetching full history or the merge base in that job, then confirm the check fails on a
   test change to a covered path.
 - **Also check coverage:** docs without a `covers:` line are skipped silently.

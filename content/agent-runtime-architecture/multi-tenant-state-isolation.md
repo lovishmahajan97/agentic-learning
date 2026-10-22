@@ -5,7 +5,7 @@ name: Multi-tenant state isolation
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/multi-tenancy
@@ -391,10 +391,15 @@ is caught before a customer reports it, and run the offboarding deletion drill a
 ### Mini project
 **Build and break a two-tenant memory agent (2-3 hours).**
 - **Goal:** show that tenant scoping is enforced by the stores, not by the model or by care.
-- **Steps:** build an agent with a `remember` and a `recall` tool backed by Postgres with RLS (or pgvector)
-  and a semantic cache; take tenant only from a context object; first ship a deliberately broken version
-  that post-filters top-k and keys the cache on the prompt only; write the canary test from the examples
-  and watch it fail; then fix filter placement and the cache key.
-- **Done when:** the canary test fails on the broken build and passes on the fixed one, a small tenant
-  owning 0.2% of vectors gets 8 recall hits, and a tool call that tries to pass `tenant_id` is rejected by
-  the schema.
+- **Steps:**
+  1. Build an agent with `remember` and `recall` tools over a pgvector table and a semantic cache; take
+     tenant only from a context object.
+  2. Ship a deliberately broken version: recall with no tenant filter, the table owner role (so RLS does
+     not apply), and cache keys on the prompt alone.
+  3. Write the canary test from the examples plus a same-question cache test, and watch both fail.
+  4. Fix it: forced RLS with a non-owner role, the filter inside the search, tenant in the cache key.
+  5. Seed 100,000 vectors with a small tenant owning 0.2%, and compare post-filtering with in-search
+     filtering.
+- **Done when:** both leak tests fail on the broken build and pass on the fixed one, the small tenant gets
+  about 0 of the top 100 hits post-filtered but 8 hits with in-search filtering, and a tool call that tries
+  to pass `tenant_id` is rejected by the schema.

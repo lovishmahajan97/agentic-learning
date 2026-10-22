@@ -5,7 +5,7 @@ name: Per-customer guardrails
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - safety-security/input-output-guardrails
@@ -191,7 +191,7 @@ def merge(tenant: str, *layers: Policy) -> Policy:
 
 PLATFORM = Policy(blocked_topics=frozenset({"weapons", "dosage"}), redact_pii=frozenset({"ssn"}))
 ACME     = Policy(redact_pii=frozenset({"iban"}), max_refund=50.0,
-                  allowed_tools=frozenset({"lookup_order", "issue_refund"}),
+                  allowed_tools=frozenset({"lookup_order", "issue_refund", "escalate_to_human"}),
                   requested_exceptions=frozenset({"dosage"}))   # asks, but is not approved
 ACME_FAQ = Policy(allowed_tools=frozenset({"lookup_order"}), max_refund=100.0)
 
@@ -264,10 +264,13 @@ def guarded_call(policy, tool, args, execute, audit):
 |---|---|---|
 | 1 | `lookup_order` | runs |
 | 2 | `issue_refund` amount 400 | denied, `refund_over_limit`, logged with rule id |
-| 3 | `escalate_to_human` (model reads the hint) | denied as `tool_not_allowed` until Acme's allowlist includes it |
+| 3 | `escalate_to_human` (model reads the hint) | runs, because Acme's allowlist includes it |
 
 - **Without the structured hint**, agents often retry the same call with small changes until they hit the
   step budget; the denial result is part of the guardrail design.
+- **The hint must name a tool the tenant allows.** If `escalate_to_human` were missing from Acme's
+  allowlist, step 3 would be denied as `tool_not_allowed` and the agent would be stuck; test denial paths
+  per tenant, not only the happy path.
 
 ## Production patterns
 - **Policy schema validated in CI** — when customers or FDEs edit policy. Define the customer-settable

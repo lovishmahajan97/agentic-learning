@@ -5,7 +5,7 @@ name: Sampling strategies (temperature, top-k / top-p, greedy vs beam)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - model-internals/logits
@@ -62,7 +62,9 @@ temperature 0 as reproducible.
 ## How it works
 ### Reshaping: temperature
 - **Mechanism.** Logits `z` are divided by *T* before softmax. `T < 1` sharpens toward the top token,
-  `T > 1` flattens, and `T = 0` is treated as greedy by every engine rather than as a division.
+  `T > 1` flattens, and `T = 0` is treated as greedy by hosted APIs and engines such as vLLM rather than
+  as a division. Hugging Face Transformers instead expresses greedy as `do_sample=False` and rejects a
+  zero temperature when sampling is on.
 - **Ranking is unchanged.** Because temperature rescales all logits, it changes only how much mass the
   leaders hold.
 - **The most used knob.** Near 0 for extraction, classification, code and tool arguments, where
@@ -204,7 +206,7 @@ where it is missing, issue several requests.
 ### Worked scenario: compounding error over a 20-step agent run
 Assume each step independently has some chance of a malformed or wrong tool call (illustrative rates).
 
-| Per-step failure rate | Clean 20-step runs | What usually gets you there |
+| Per-step failure rate | Clean 20-step runs | A setting that might land there (illustrative, measure yours) |
 |---|---|---|
 | 2% | 0.98²⁰ ≈ 67% | free sampling at temperature 1 |
 | 1% | 0.99²⁰ ≈ 82% | low temperature, no schema |
@@ -400,8 +402,9 @@ repetition metric and a human spot-check across a small parameter grid rather th
 ### Mini project
 **Measure sampling settings on a tool-calling agent (2-3 hours).**
 - **Goal:** find the sampling profile that maximizes clean whole-run completion for a small agent.
-- **Steps:** build an agent with three tools and 20 tasks that each need 3-6 tool calls; run every task 5
-  times at temperature 0, 0.5 and 1.0, with and without schema-constrained tool calls; log per-step
+- **Steps:** build an agent with three tools (stubbed, so runs are fast and free of side effects) and 20
+  tasks that each need 3-6 tool calls; run every task 3 times at temperature 0, 0.5 and 1.0, with and
+  without schema-constrained tool calls, using a small, cheap model; log per-step
   parse failures, wrong-tool choices and whole-run success.
 - **Done when:** you have a table of per-step failure rate and run success for each setting, the observed
   run success roughly matches per-step reliability compounded over the run, and you can name the profile

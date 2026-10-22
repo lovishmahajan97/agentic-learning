@@ -5,7 +5,7 @@ name: Input / output guardrails
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - safety-security/prompt-injection
@@ -149,7 +149,8 @@ Output rails conflict with token streaming. Options:
 
 ## Diagram
 Cheap deterministic rails run first and short-circuit; model-based rails run only on what survives, and
-output failures can retry with the rail's reason as feedback.
+output failures can retry with the rail's reason as feedback. In an agent the loop closes: an approved
+tool call runs, and its result re-enters through the input rails before the model sees it.
 
 ```mermaid
 flowchart TD
@@ -157,11 +158,13 @@ flowchart TD
     D -->|"fail"| B["Block with specific message"]
     D -->|"pass"| C["Small classifier rail"]
     C -->|"fail"| B
-    C -->|"pass"| M["Model plus tools"]
+    C -->|"pass"| M["Model"]
     M --> O["Output rails: schema, canary, policy"]
     O -->|"retryable"| M
     O -->|"hard fail"| B
-    O -->|"pass"| R["User or action"]
+    O -->|"pass: answer"| R["User"]
+    O -->|"pass: tool call"| T["Tool executor"]
+    T -->|"tool result"| D
     D -.->|"verdict, score, trace id"| L[("Decision log")]
     O -.->|"verdict, score, trace id"| L
 ```
@@ -264,15 +267,15 @@ keep hard blocks for the canary and schema checks.
 A support agent makes about 10 tool calls per task. Each step passes an input rail on the tool result and
 an output rail on the next tool call. Illustrative per-check false-positive rates from a labelled set:
 
-| Quantity | Per check | Per task (20 checks) |
+| Rail setup (0.5% FP per check) | Hard-blocking checks per task | Tasks wrongly interrupted |
 |---|---|---|
-| Input rail on tool results, 0.5% FP | 10 checks | 1 − 0.995¹⁰ ≈ 4.9% tasks interrupted |
-| Output rail on tool calls, 0.5% FP | 10 checks | ≈ 4.9% tasks interrupted |
-| Both together | 20 checks | 1 − 0.995²⁰ ≈ 9.5% tasks interrupted |
-| Same rails with flag-and-continue for low-risk tools | hard block only on writes | interruptions fall to the write steps only |
+| Input rail on every tool result | 10 | 1 − 0.995¹⁰ ≈ 4.9% |
+| Output rail on every tool call | 10 | ≈ 4.9% |
+| Both together | 20 | 1 − 0.995²⁰ ≈ 9.5% |
+| Flag-and-continue everywhere except the 2 write calls | 2 | 1 − 0.995² ≈ 1.0% |
 
 The lesson: per-check rates that look harmless in chat compound across agent steps, so agents hard-block
-only consequential tool calls and flag the rest.
+only consequential tool calls and flag the rest (the flags still feed review and the dashboard).
 
 ## Production patterns
 - **Shadow mode before enforce.** Ship every new rail as log-only, compare its verdicts against a
@@ -343,7 +346,6 @@ only consequential tool calls and flag the rest.
   re-run the red-team suite after every prompt or model change.
 - **Interviews:** answer "how would you stop the bot doing X" with layered rails plus the measurement
   loop, not with a sentence in the system prompt.
-
 - **In agents:** decide rails per tool and per hop; measure interruptions per task, since a 20-step run
   multiplies every per-check false-positive rate.
 
@@ -450,8 +452,9 @@ on a dashboard so the trade-off is explicit and the next tuning decision is made
 **Wrap a tool-calling agent in rails (2-3 hours).**
 - **Goal:** add input and output rails to a small agent and measure what they cost per task.
 - **Steps:** build an agent with one read tool (fetch a page from a local fixture folder) and one write
-  tool (a fake `send_email`); add a size limit, an injection regex and a canary check on tool results, and
-  an allowlist plus argument validation on tool calls; run 30 benign and 10 poisoned tasks with every rail
-  in log-only mode, then in enforce mode.
+  tool (a fake `send_email`); add a size limit and an injection regex on every tool result; plant a canary
+  in the system prompt and check answers and `send_email` arguments for it; add a recipient allowlist plus
+  argument validation on tool calls; run 30 benign and 10 poisoned tasks with every rail in log-only mode,
+  then in enforce mode.
 - **Done when:** you have a table of blocks, false positives and interruptions per task for both modes,
   every verdict is in a decision log with a trace id, and no poisoned task triggers `send_email`.

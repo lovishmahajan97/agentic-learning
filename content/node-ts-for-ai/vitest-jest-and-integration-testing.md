@@ -5,7 +5,7 @@ name: Vitest / Jest & integration testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - node-ts-for-ai/dependency-injection

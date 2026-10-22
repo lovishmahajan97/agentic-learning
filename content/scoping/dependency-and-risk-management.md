@@ -5,7 +5,7 @@ name: Dependency & risk management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/statement-of-work
@@ -253,17 +253,20 @@ report(with_impact(after_spike, "R1", 4))        # adapter contingency: R1 20 ->
 
 ## Pitfalls
 - **Writing the risk list once at kickoff.** Symptom: a deck slide that still lists "data quality" as medium
-  in week 8, after it has already caused a slip.
+  in week 8, after it has already caused a slip. Fix: a living RAID log reviewed at every steering
+  meeting.
 - **Naming teams instead of people as owners.** Symptom: a dependency marked "with IT" for three weeks with
-  nobody able to say who is working on it.
+  nobody able to say who is working on it. Fix: one named person and a need-by date per row.
 - **Starting security and legal reviews only when the system is ready.** Symptom: a finished agent pilot
-  that waits a month for approval to touch production data or write to a customer system.
+  that waits a month for approval to touch production data or write to a customer system. Fix: submit
+  them on day 0, in parallel with building.
 - **Building tools against API docs instead of the real API.** Symptom: in pilot week the agent hits rate
   limits, auth scopes or response fields the docs never mentioned. Fix: a week-one spike per tool.
 - **Accepting risks without triggers or contingencies.** Symptom: a crisis meeting debating options that
-  could have been decided calmly in week one.
+  could have been decided calmly in week one. Fix: a dated trigger and a pre-agreed contingency per risk.
 - **Ignoring model and provider risks.** Symptom: a deployment design that fails on quota, regional
-  availability or a deprecated model version in the final week.
+  availability or a deprecated model version in the final week. Fix: track quota headroom and deprecation
+  dates as risks, behind a provider adapter.
 
 ## When to use
 - **Use when:** scoping, before the SOW is signed, because dated customer dependencies and known risks
@@ -306,6 +309,7 @@ against remaining slack and tell the sponsor now whether the end date still hold
   the eval set may not represent production inputs.
 - **Tools:** each tool is a customer API with credentials, rate limits and undocumented behaviour, and
   write access needs its own security approval.
+- **Approval:** security review of external model APIs and data residency, often the longest lead time.
 - **Provider:** behaviour changes when a model version is updated or retired, and quotas or regional
   availability can block a design that worked in a demo.
 

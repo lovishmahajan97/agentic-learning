@@ -5,7 +5,7 @@ name: Gradient descent
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/loss-functions
@@ -331,7 +331,7 @@ the per-step dynamics that caused the blow-up.
   agent never writes.
 - **Fix:** pick the checkpoint by agent eval, lower η or the number of epochs, and re-sweep.
 
-### Loss is flat for the first 1,000 steps of a fine-tune. How do you debug it?
+### Loss is flat for the first 1,000 steps of a fine-tune on agent trajectories. How do you debug it?
 - **Check gradient flow:** log the gradient norm; zero or tiny means frozen parameters, dead units, or a
   detached graph.
 - **Check the learning rate:** the scheduler may still be in warmup or η may be far too small.
@@ -392,7 +392,8 @@ the per-step dynamics that caused the blow-up.
 **Learning-rate sweep for a tiny tool router (1-2 hours).**
 - **Goal:** see divergence, stagnation and a good run side by side on a model that picks one of four tools.
 - **Steps:** embed 400 labelled requests with any sentence encoder; train a linear softmax router with
-  SGD plus momentum at four learning rates spaced by about 3×; log loss and gradient norm every step; add
-  clipping to the fastest run and repeat.
+  SGD plus momentum at four learning rates spaced by about 3×, widening the range upward until the top
+  run visibly spikes or oscillates; log loss and gradient norm every step; add clipping to the fastest run
+  and repeat.
 - **Done when:** you have one chart with four loss curves, each labelled with its symptom from the table,
   and held-out routing accuracy for the run you would ship.

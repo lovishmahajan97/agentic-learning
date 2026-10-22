@@ -5,7 +5,7 @@ name: Audit trails
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - security-governance-compliance/compliance-architecture
@@ -75,7 +75,7 @@ An event answers who, what, when, on what basis and with what result.
   trail's.
 
 ### Tamper evidence
-Two mechanisms, usually combined:
+Three mechanisms, usually combined (the first two detect tampering, the third prevents it):
 1. **Hash chaining.** Each record stores `h_i = SHA256(h_{i-1} || canonical(record_i))`. Changing or
    deleting any past record breaks every later hash, so re-walking the chain detects tampering.
 2. **Anchoring the head.** Two attacks survive a bare chain: a writer can recompute every hash after an

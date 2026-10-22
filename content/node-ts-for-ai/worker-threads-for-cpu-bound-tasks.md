@@ -5,7 +5,7 @@ name: Worker threads for CPU-bound tasks
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue

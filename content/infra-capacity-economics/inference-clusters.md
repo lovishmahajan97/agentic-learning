@@ -5,7 +5,7 @@ name: Inference clusters
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/gpu-infrastructure

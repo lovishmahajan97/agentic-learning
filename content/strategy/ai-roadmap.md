@@ -5,7 +5,7 @@ name: AI roadmap
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/ai-use-case-discovery
@@ -18,9 +18,9 @@ related:
 ---
 
 ## TL;DR
-An AI roadmap for agents is a sequenced portfolio of agent use cases, each a hypothesis with an eval
-gate, plus the shared capabilities early agents build for later ones. It commits to outcomes and earned
-autonomy, not named models or dates.
+An AI roadmap for agents sequences agent use cases, each a hypothesis with an eval gate, plus the shared
+capabilities early agents build for later ones. It commits to outcomes, milestones and earned autonomy,
+not to named models or dates for everything.
 
 ## For agent builders
 - **Why it matters for agents.** The roadmap decides which agent you build first, how much autonomy it

@@ -5,7 +5,7 @@ name: Reproducible evaluations
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - llmops-platform/experiment-tracking

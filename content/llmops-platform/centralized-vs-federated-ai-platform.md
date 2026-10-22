@@ -5,7 +5,7 @@ name: Centralized vs federated AI platform
 kind: decision
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - strategy/platform-strategy
@@ -359,7 +359,7 @@ taking their work over.
   thresholds, because only the domain can judge task success.
 - **Bridge with a paved road:** an agent template with tracing, approval gates and eval harness pre-wired.
 
-### Your agent's tool calls start failing with 429s every night, though its traffic is flat. What is going on in the platform?
+### Your agent's model calls start failing with 429s every night, though its traffic is flat. What is going on in the platform?
 - **Pooled quota:** provider rate limits are typically per account or project, so another team's batch
   job consumes the shared key, and a multi-step agent hits the limit on every step.
 - **Fix in the core:** per-team virtual keys with tokens-per-minute limits, a priority class that serves

@@ -5,7 +5,7 @@ name: Data mapping & canonical schemas (schema mapping)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - data-architecture/data-contracts
@@ -27,7 +27,7 @@ tool schema serves every customer.
 
 ## For agent builders
 - **Why it matters for agents.** Without a canonical model every tool schema, retrieval filter and prompt
-  has to know each customer's field names and codes. With one, the agent's `update_case(status=...)` tool
+  has to know each customer's field names and codes. With one, the agent's `update_ticket_status(status=...)` tool
   takes the same closed enum for every tenant, and the adapter maps it to that tenant's source code.
 - **Where it shows up in your stack.** Tool argument and result schemas, metadata filters in the vector
   store, the mapping layer inside each tool adapter, and the eval harness that compares agent outputs
@@ -298,23 +298,27 @@ With one source and one consumer both columns are 1 versus 2, which is why mappi
 
 ## Pitfalls
 - **Designing the canonical schema as the union of every source's fields.** Symptom: hundreds of mostly
-  null columns and no consumer able to tell which fields are reliably populated.
+  null columns and no consumer able to tell which fields are reliably populated. Fix: model your domain
+  and keep the rest in extensions.
 - **Mapping by field name alone without checking values.** Symptom: two sources with a `priority` field
   whose scales run in opposite directions, so high-priority tickets from one source sort to the bottom.
+  Fix: profile values and crosswalk them.
 - **Dropping naive timestamps into UTC without the source zone.** Symptom: events shifted by hours and
-  off-by-one-day errors around midnight and daylight-saving changes.
+  off-by-one-day errors around midnight and daylight-saving changes. Fix: record the source zone in the
+  mapping.
 - **Defaulting unknown codes.** Symptom: a canonical category that grows quietly and contains records that
-  belong elsewhere.
+  belong elsewhere. Fix: quarantine them.
 - **No mapping version on records.** Symptom: after a crosswalk fix you cannot tell which records were
-  mapped under the old rule and need remapping from raw.
+  mapped under the old rule and need remapping from raw. Fix: stamp the version on every record.
 - **Writing back through an inverted many-to-one crosswalk.** Symptom: source records whose status changes
   from `K` to `W` when the assistant updates an unrelated field, and the client's reports shifting for no
-  visible reason.
+  visible reason. Fix: write back the kept source value, plus a round-trip fixture.
 - **Exposing source codes in tool schemas.** Symptom: the agent writes `W` for one tenant and `pending`
   for another, and a prompt tuned on one customer fails on the next. Fix: canonical enums in the tool,
   mapping inside the adapter.
 - **Letting the LLM interpret raw source records at query time instead of mapping.** Symptom: filters and
-  permissions that do not work and answers that vary across model versions.
+  permissions that do not work and answers that vary across model versions. Fix: map the fields used for
+  filtering, routing and permissions.
 
 ## When to use
 - **Introduce a canonical schema** once you have more than one source system or more than one consumer of

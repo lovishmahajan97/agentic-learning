@@ -5,7 +5,7 @@ name: OpenAI Agents SDK (agents, tools, handoffs, guardrails, tracing)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/frameworks
@@ -220,7 +220,7 @@ async def handle(user_id: str, message: str) -> str:
   cost per conversation is a dashboard, not a guess.
 
 ## Trade-offs
-- **Small API vs no orchestration model.** Five primitives are quick to learn, but there is no graph,
+- **Small API vs no orchestration model.** A handful of primitives is quick to learn, but there is no graph,
   checkpointing or interrupt primitive. Flips to LangGraph or a durable engine when runs pause for days.
 - **OpenAI-first defaults vs portability.** Responses API features and hosted tools work best on OpenAI
   models; other providers work through adapters with uneven feature support. Test your exact model.

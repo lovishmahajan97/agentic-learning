@@ -5,7 +5,7 @@ name: Agent runtime & orchestration layer
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/agent-loop
@@ -407,7 +407,7 @@ steps before the process exits.
 ## Use cases & projects
 ### Use cases
 - **Support agents that issue refunds or credits.** The run parks in `waiting_for_approval`, survives a
-  day-long wait and dispatches exactly once with an idempotency key.
+  day-long wait, and the idempotency key makes the refund take effect once even if dispatch is retried.
 - **Long-running coding and research agents.** Dozens of steps over minutes to hours outlive any request
   timeout, so the step log and resume path carry the task across restarts and deploys.
 - **Supervisor agents that fan out to sub-agents.** Child runs carry a `parent_run_id`, attenuated scopes

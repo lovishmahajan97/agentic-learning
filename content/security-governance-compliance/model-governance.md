@@ -5,7 +5,7 @@ name: Model governance
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - security-governance-compliance/ai-inventory-and-use-case-risk-classification
@@ -344,9 +344,9 @@ is refused until the new approval exists.
 - **Why it is separate:** models change behaviour without code changes (a provider repoints an alias) and
   fail statistically rather than crashing, so a code-review-and-deploy process never sees the change.
 
-### Output quality on a production feature shifted overnight with no deploy. How do you investigate?
-- **Check the model reference first:** a floating alias may have been repointed to a new snapshot by the
-  provider.
+### Your production agent's task success shifted overnight with no deploy. How do you investigate?
+- **Check the model references first:** a floating alias for the planner or any worker model may have been
+  repointed to a new snapshot by the provider.
 - **Then check other material inputs:** prompt registry edits, retrieval source or chunking changes, tool
   changes, provider data-terms updates.
 - **Fix the class:** pin snapshots, make the gateway refuse aliases, and rerun the tier's evals before any

@@ -5,7 +5,7 @@ name: User training
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - adoption/change-management
@@ -186,9 +186,11 @@ actually gets wrong.
 import random
 
 # one record per eval case: agent output, whether the grader passed it, and the failure type
+# (stand-in data: 120 cases, every sixth one failed; load your real eval results instead)
+FAILS = ["invented_policy", "wrong_plan", "missing_caveat"]
 eval_results = [
     {"id": i, "output": f"draft {i}", "passed": i % 6 != 0,
-     "failure": None if i % 6 else random.choice(["invented_policy", "wrong_plan", "missing_caveat"])}
+     "failure": None if i % 6 else FAILS[(i // 6) % 3]}
     for i in range(1, 121)
 ]
 
@@ -204,6 +206,7 @@ def build_drill(results, n=20, error_share=0.25, seed=7):
 drill = build_drill(eval_results)
 print(sum(not r["passed"] for r in drill), "errors of", len(drill))   # 5 errors of 20
 print(sorted({r["failure"] for r in drill if r["failure"]}))
+# ['invented_policy', 'missing_caveat', 'wrong_plan']
 # Version the drill next to the eval set; rebuild it when the agent's failure mix shifts.
 ```
 

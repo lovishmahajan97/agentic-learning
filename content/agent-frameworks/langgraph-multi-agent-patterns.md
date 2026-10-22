@@ -5,7 +5,7 @@ name: LangGraph multi-agent patterns (supervisor, handoffs, subgraphs)
 kind: tool
 difficulty: advanced
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/multi-agent-patterns
@@ -55,8 +55,10 @@ when one agent with good tools measurably fails.
 - **Strengths:** central control, easy budgets and logging. **Cost:** an extra model call per hop, and the
   supervisor's context grows with every report.
 - **Prebuilt:** `create_supervisor([agents], model=..., prompt=...)` from `langgraph-supervisor` builds
-  it from `create_agent` workers. The LangChain docs also show "subagents as tools", where the main agent
-  calls each worker through a tool; check current docs for the recommended form.
+  it from named agent graphs.
+- **Now recommended: subagents as tools.** The `langgraph-supervisor` README itself recommends a main
+  `create_agent` that calls each worker through a tool for most new work, because you choose exactly what
+  context each worker receives and returns.
 
 ### Pattern 2: handoffs (swarm-style)
 - **Agents pass control directly.** A tool returns `Command(goto="billing", graph=Command.PARENT,
@@ -217,8 +219,9 @@ briefs needing many searches.
 - **Scope context per worker.** Pass a worker its task and the minimum history (subgraph with its own
   schema, or `output_mode="last_message"` in `create_supervisor`), so tokens do not grow with every hop.
   Monitor tokens per agent per run.
-- **One budget for the whole system.** Set `recursion_limit` on the parent run and count handoffs in state,
-  so agents cannot ping-pong forever. Alert on runs near the limit.
+- **One budget for the whole system.** Set `recursion_limit` explicitly on the parent run (the current
+  default is roughly 10,000 supersteps) and count handoffs in state, so agents cannot ping-pong forever.
+  Alert on runs near the limit.
 - **Name every agent in traces.** Give each agent a `name` and stream with `subgraphs=True`, so LangSmith
   traces and UI events show which agent spent which tokens.
 - **Persist at the parent.** Compile only the parent with a checkpointer; subgraphs inherit it, and
@@ -232,7 +235,7 @@ briefs needing many searches.
 - **Shared history vs private state.** Shared `messages` lets agents build on each other, but floods each
   context. Private subgraph state saves tokens at the risk of losing needed facts.
 - **Prebuilt helpers vs hand-written graphs.** `create_supervisor` and `create_swarm` get you running
-  quickly; hand-written graphs are easier to customize and debug.
+  quickly; hand-written graphs or subagents-as-tools are easier to customize, debug and scope context in.
 
 ## Pitfalls
 - **Multi-agent by default.** Symptom: triple the tokens with no quality gain. Fix: compare against one

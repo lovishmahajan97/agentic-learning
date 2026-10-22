@@ -5,7 +5,7 @@ name: REST / GraphQL API design
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/api-versioning-and-backward-compatibility
@@ -230,7 +230,9 @@ def tools_from_openapi(spec: dict) -> list[dict]:
             })
     return tools
 
-# tools = tools_from_openapi(app.openapi())  ->  create_summary, get_summary, cancel_summary
+# tools = tools_from_openapi(app.openapi())  ->  create_summary_v1_summaries_post,
+#   get_summary_v1_summaries__job_id__get, ... (FastAPI's default operationIds); pass
+#   operation_id="create_summary" on each route to give the model short, stable tool names
 ```
 
 ### GraphQL: the same domain

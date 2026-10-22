@@ -5,7 +5,7 @@ name: Residual connections
 kind: concept
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - ml-fundamentals/normalization
@@ -58,8 +58,9 @@ debugging and layer dropping behave predictably.
 
 ## How it works
 ### What the agent builder does with it
-- **Place adapters on stream projections.** LoRA adds a low-rank term to a projection that writes into the
-  stream, so its downstream effect is an added increment, predictable and removable.
+- **Know what an adapter changes.** LoRA adds a low-rank term to a projection inside a branch (attention
+  or MLP), so whatever it learns reaches the stream only as a change to that branch's added increment,
+  which is why it can be switched off or swapped per agent.
 - **Hook the right tensor.** The stream at layer k is the sum of all earlier writes; a layer's own
   contribution is its branch output.
 - **Debug fine-tunes layer by layer.** The logit lens decodes intermediate streams, showing where a tuned
@@ -240,10 +241,10 @@ for alpha in (0.9, 0.95, 1.0, 1.05):                      # learned skip scale y
 A drift of just 5% in `α` either way shrinks the direct gradient path about 12× or grows it about 10×.
 
 ## Production patterns
-- **Attach adapters and steering to the stream deliberately.** Put LoRA on the projections that write into
-  the stream (set them in the PEFT config's target modules), or add steering vectors at a single chosen
-  layer, and hook the branch output when you need a layer's own contribution rather than the cumulative
-  sum. Monitor the agent eval with the adapter on and off.
+- **Attach adapters and steering deliberately.** Choose LoRA's target modules in the PEFT config (all
+  linear projections is a common default; narrow to specific layers when localizing a behaviour), add
+  steering vectors at a single chosen layer, and hook the branch output when you need a layer's own
+  contribution rather than the cumulative sum. Monitor the agent eval with the adapter on and off.
 - **Debug agent fine-tunes with the logit lens.** Apply the final norm and unembedding to intermediate
   streams on a fixed prompt set (for example the first tool-choice token of your eval traces) and track
   how early the right token appears. Use it to locate where a fine-tune changed behaviour.

@@ -5,7 +5,7 @@ name: Llama Guard
 kind: tool
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - safety-security/content-moderation
@@ -90,7 +90,7 @@ p_unsafe = exp(z_unsafe) / (exp(z_unsafe) + exp(z_safe))
 | Llama Guard (December 2023) | Llama 2 7B fine-tune | six categories of its own |
 | Llama Guard 2 | Llama 3 8B | MLCommons hazard taxonomy, S1 to S11 |
 | Llama Guard 3 | 8B on Llama 3.1, plus a 1B text model and an 11B vision model on Llama 3.2 | S1 to S14 |
-| Llama Guard 4 | larger, multimodal (2025) | |
+| Llama Guard 4 | 12B, natively multimodal (April 2025) | S1 to S14 |
 
 - **Llama Guard 3's S1 to S14:** violent crimes, non-violent crimes, sex-related crimes, child sexual
   exploitation, defamation, specialised advice, privacy, intellectual property, indiscriminate weapons,
@@ -186,13 +186,15 @@ reply = {"role": "assistant", "content": "I can't help with that. If it's your o
 print(moderate([user, reply]))                   # output rail: the reply is judged given the question
 ```
 
-- **Expected:** the input call comes back `unsafe` with a non-violent-crimes code (S2); the output call
-  comes back `safe`, because the refusal is judged in context.
+- **Expected (typical, verify on your setup):** the input call comes back `unsafe` with a non-violent-crimes
+  code (S2); the output call comes back `safe`, because the refusal is judged in context.
 
 ### Guard rails around one agent turn
 Wraps the agent's turn with the `moderate` function above: an input rail, an optional check on code the
 agent proposes to execute, and an output rail, each with its own threshold from config. `agent_step`,
 `run_in_sandbox` and the thresholds are the application's own.
+
+- **One tool round is shown;** a real loop repeats the action check for every code-execution call.
 
 ```python
 THRESHOLDS = {"input": 0.5, "action": 0.3, "output": 0.4}   # chosen from labelled sweeps per rail

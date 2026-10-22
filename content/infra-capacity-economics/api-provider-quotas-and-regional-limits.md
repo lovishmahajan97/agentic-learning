@@ -5,7 +5,7 @@ name: API provider quotas & regional limits
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - infra-capacity-economics/cloud-ai-architecture
@@ -25,8 +25,8 @@ sources:
 
 ## TL;DR
 Every agent step is a hosted-API call counted against requests and tokens per minute, per model, per
-region, by tier. Agents multiply calls and re-send growing transcripts, so they hit 429s first;
-plan quota per run, self-limit, pause runs cleanly, spread regions.
+region, by tier; a full pool fails you even under quota. Agents hit 429s first: budget per run,
+self-limit, checkpoint, spread regions, reserve the base.
 
 ## For agent builders
 - **Why it matters for agents.** One agent run is 5-50 calls, each charged prompt plus `max_tokens`, with

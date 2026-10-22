@@ -5,7 +5,7 @@ name: Structured outputs / JSON mode
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/function-tool-calling
@@ -122,8 +122,11 @@ not wrong answers, so validation and evals stay yours.
   orchestrator can merge without another LLM call to interpret it.
 - **Eval judges.** An LLM judge returns a score and a rationale in a fixed shape, so agent evals aggregate
   cleanly.
-- **Escape actions are mandatory here.** Without `ask_user` or `give_up` in the action enum, an agent with
+- **Escape actions are mandatory here.** Without `ask_user` or `finish` in the action enum, an agent with
   no good move is forced to pick a tool anyway.
+- **Native tool calls are the other half.** Most agent loops take actions through tool calling with
+  strict tool schemas; a typed decision schema fits routers, planners and judges. With tools, the escape
+  hatch is an `ask_user` tool or permission to answer in text.
 
 ### What you still own
 - **Truncation:** a `max_tokens` stop cuts the JSON mid-object, so check the stop reason before parsing.
@@ -275,8 +278,9 @@ Illustrative daily volume of 100,000 extraction calls.
 The remaining risk moves from format to content, which is what the golden-set eval measures.
 
 ## Production patterns
-- **Typed step decisions in the loop.** Have each agent step return a schema with an action enum that
-  includes `ask_user` and `finish`, and dispatch on the enum. Monitor the action distribution per version;
+- **Typed step decisions in the loop.** For router or planner steps, return a schema with an action enum
+  that includes `ask_user` and `finish`, and dispatch on the enum; for tool-calling steps, use strict tool
+  schemas plus an `ask_user` tool. Monitor the action distribution per version;
   a spike in one tool or zero `ask_user` on ambiguous eval tasks signals a forced choice.
 - **Typed sub-agent results.** Give each sub-agent an output schema the orchestrator validates before
   merging, with nullable fields for what it could not find. Monitor null rates and validation failures per

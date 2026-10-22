@@ -5,7 +5,7 @@ name: SCIM provisioning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - enterprise-integration/sso-iam-integration
@@ -181,8 +181,12 @@ async def patch_user(user_id: str, body: dict, authorization: str = Header(...))
     return to_scim_user(user)                          # full resource, 200
 ```
 
-- **Still to handle in a real implementation:** filtered paths such as `emails[type eq "work"].value` and
-  group membership patches. The point here is that deactivation is a security event with side effects.
+- **Still to handle in a real implementation:** filtered paths such as `emails[type eq "work"].value`,
+  `remove` operations (ignored above) and group membership patches. The point here is that deactivation is
+  a security event with side effects.
+- **Add the agent's stored tool tokens to the transition block.** The handler revokes sessions and API
+  tokens and pauses jobs; the deactivation list above also requires revoking the OAuth refresh tokens the
+  agent holds for downstream tools, or a paused job's credentials stay live.
 
 ### The agent loop's side of deactivation
 Runnable standard library: the agent runtime re-checks the principal before every tool step, so a run that

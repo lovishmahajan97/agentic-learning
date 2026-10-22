@@ -5,7 +5,7 @@ name: Choosing an agent framework (build on SDKs vs frameworks)
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/frameworks
@@ -69,7 +69,8 @@ a hosted harness, not by feature lists.
 - **LangGraph.** Agents as a typed state graph with checkpointers, interrupts and streaming; most control
   over flow, more code for simple cases.
 - **LlamaIndex.** Data-first: loaders, indexes and query engines, plus agents and event-driven workflows.
-- **OpenAI Agents SDK.** `Agent`, `Runner`, function tools, handoffs, guardrails and built-in tracing.
+- **OpenAI Agents SDK.** `Agent`, `Runner`, function tools, handoffs, guardrails, tool approvals and
+  built-in tracing.
 - **Claude Agent SDK.** The harness behind Claude Code: built-in tools, MCP servers, subagents, hooks and
   permission modes.
 - **CrewAI.** Agents with a role, goal and backstory, assigned tasks in a crew; Flows for explicit control.
@@ -92,7 +93,7 @@ flowchart TD
     Q1 -->|"no"| Q2["Mostly retrieval over documents?"]
     Q2 -->|"yes"| LI["LlamaIndex or LangChain retrievers"]
     Q2 -->|"no"| Q3["Committed to one provider?"]
-    Q3 -->|"yes"| VS["OpenAI Agents SDK or Claude Agent SDK"]
+    Q3 -->|"yes"| VS["Vendor SDK: OpenAI or Claude"]
     Q3 -->|"no"| Q4["Need typed outputs and DI?"]
     Q4 -->|"yes"| PA["Pydantic AI"]
     Q4 -->|"no"| RAW["Raw SDK loop plus LiteLLM"]
@@ -160,11 +161,11 @@ stay in their VPC; one provider today, maybe two next year.
 |---|---|---|---|---|
 | Raw SDK loop | build it (state table, resume logic) | via LiteLLM | any OTel backend | viable, most code |
 | LangGraph | `interrupt()` plus a Postgres checkpointer | yes | LangSmith self-hosted, Langfuse | best fit |
-| OpenAI Agents SDK | not a built-in durable pause; check current docs | partial | custom trace processors | weaker fit |
+| OpenAI Agents SDK | `needs_approval` tools; you store and reload the serialized `RunState` | partial | custom trace processors | workable, more glue |
 | CrewAI | human input exists; durable resume weaker | yes | yes | prototype only |
 
-The team picked LangGraph for the approval path and kept tools as plain functions, so the exit cost stays
-low.
+The team picked LangGraph because the durable pause is built in, not bolted on, and kept tools as plain
+functions, so the exit cost stays low.
 
 ## Production patterns
 - **Keep tools framework-free.** Write tools as plain typed functions in your own package and adapt them
@@ -186,8 +187,8 @@ low.
   outage cover.
 - **Batteries vs debuggability.** Prebuilt agents and crews hide prompts; when output is wrong you debug
   someone else's prompt. Explicit graphs cost more code but keep every step visible.
-- **Hosted platform vs self-run.** Managed deployment (LangGraph Platform, vendor runtimes) removes ops
-  work but adds a bill and a data-residency question.
+- **Hosted platform vs self-run.** Managed deployment (LangSmith Deployment, formerly LangGraph Platform,
+  or vendor runtimes) removes ops work but adds a bill and a data-residency question.
 
 ## Pitfalls
 - **Choosing by tutorial.** Symptom: month-three rewrite when you need resume-after-crash. Fix: list hard

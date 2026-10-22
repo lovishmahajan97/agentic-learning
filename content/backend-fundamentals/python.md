@@ -5,7 +5,7 @@ name: Python
 kind: tool
 difficulty: intro
 est_minutes: 10
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/async-await

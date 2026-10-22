@@ -5,7 +5,7 @@ name: Optimizers (Adam, AdamW)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/gradient-descent
@@ -358,10 +358,10 @@ the shrink per step is ηλ, so a learning-rate schedule scales the decay along 
 - **Judge by the agent eval:** tool-call accuracy on held-out tasks plus a general-skills check for
   forgetting.
 
-### Your fine-tune diverges in the first 200 steps with Adam at lr = 0.1. What happened and what do you change?
+### Your LoRA fine-tune of a tool-calling model diverges in the first 200 steps with Adam at lr = 0.1. What happened and what do you change?
 - **Wrong scale:** Adam moves each parameter by about η per step, so 0.1 is enormous; SGD-style rates do
   not transfer.
-- **Fix:** sweep in the 1e-5 to 5e-5 range for full fine-tuning (higher for LoRA), add warmup so v is not
+- **Fix:** sweep around 1e-4 to 3e-4 for LoRA (1e-5 to 5e-5 for full fine-tuning), add warmup so v is not
   estimated from a handful of samples, and clip gradients.
 - **Verify** with the loss and gradient-norm curves over the first few hundred steps.
 

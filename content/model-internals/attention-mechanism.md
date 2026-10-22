@@ -5,7 +5,7 @@ name: Attention mechanism
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - model-internals/self-attention
@@ -201,6 +201,11 @@ top_k = np.argsort(-scores)[:2]                     # hard top-k: only these sch
 for t, s, w in zip(tools, scores, soft):
     print(f"{t:14s} score {s:.2f}  soft weight {w:.2f}")
 print("schemas sent to the model:", [tools[i] for i in top_k])
+# search_orders  score 0.93  soft weight 0.32
+# refund_order   score 1.00  soft weight 0.64
+# get_weather    score 0.00  soft weight 0.00
+# create_ticket  score 0.72  soft weight 0.04
+# schemas sent to the model: ['refund_order', 'search_orders']
 # The soft weights blend two close tools; the hard top-k gives an auditable list you can log and eval.
 ```
 

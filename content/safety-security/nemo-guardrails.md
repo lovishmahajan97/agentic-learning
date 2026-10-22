@@ -5,7 +5,7 @@ name: NeMo Guardrails
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - safety-security/input-output-guardrails
@@ -122,7 +122,7 @@ call.
 | NeMo Guardrails | decides what to check, in what order, and what to do with the answer | framework and DSL in the request path |
 | Output-validation libraries (Guardrails AI, Pydantic validators) | structure of a single completion | not conversation policy |
 | Hand-rolled middleware | same power, no framework dependency | you rebuild configuration, testing and the intent matcher |
-| NVIDIA NemoGuard microservices | hosted content safety, topic control, jailbreak detection | plug in as rails |
+| NVIDIA NemoGuard microservices | NIM models for content safety, topic control, jailbreak detection, self-hostable | plug in as rails |
 
 ## Diagram
 A request passes five rail stages; the dialog stage is where a matched intent plus a predefined message

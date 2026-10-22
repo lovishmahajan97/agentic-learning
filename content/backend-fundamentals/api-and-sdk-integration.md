@@ -5,7 +5,7 @@ name: API & SDK integration
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/openai-sdk
@@ -145,7 +145,7 @@ flowchart TD
     B -->|"no"| A["Attempt with per-phase timeouts"]
     A --> K{"Classify result"}
     K -->|"2xx with terminal event"| OK["Return your own type"]
-    K -->|"400, 401, 403, 422"| T["Terminal error, no retry"]
+    K -->|"400, 401, 403, 404, 422"| T["Terminal error, no retry"]
     K -->|"429, 5xx, timeout, truncated"| R{"Budget left and idempotent?"}
     R -->|"yes"| S["Sleep: Retry-After or full jitter"]
     S --> A
@@ -212,6 +212,7 @@ idempotency key from run id plus step, then decides what the model sees.
 
 ```python
 import asyncio
+import httpx
 
 class StopRun(Exception): ...                         # credentials or policy: a human must act
 
@@ -231,8 +232,9 @@ async def run_tool(tool, args: dict, run_id: str, step: int, run_deadline: float
         if msg.startswith(("HTTP 401", "HTTP 403")):
             raise StopRun(msg)                         # never let the model loop on auth errors
         return {"error": msg[:300]}                    # 400/404/422: the model can fix its arguments
-    except RetryableError as e:                        # retries were exhausted inside the adapter
-        return {"error": f"{tool.name} unavailable ({e}); try another approach"}
+    except (RetryableError, httpx.TransportError) as e:  # adapter exhausted retries (it re-raises
+        # the last error, which may be an httpx timeout or connection error, not RetryableError)
+        return {"error": f"{tool.name} unavailable ({type(e).__name__}: {e}); try another approach"}
 ```
 
 ### A circuit breaker in front of the adapter

@@ -5,7 +5,7 @@ name: Data access & permissions discovery
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/acl-aware-retrieval
@@ -272,19 +272,23 @@ inventory.
 
 ## Pitfalls
 - **Building the prototype on an exported folder.** Symptom: a demo that delights an admin user but answers
-  questions from documents ordinary users were never allowed to see.
+  questions from documents ordinary users were never allowed to see. Fix: prototype on the production
+  access path with non-admin test identities.
 - **Connecting with a broad service account and promising to "add permissions later".** Symptom: an
   architecture with no place to carry user identity into tool calls, discovered during security review.
+  Fix: design identity propagation into the tool layer from the first prototype.
 - **Ignoring permission-change latency.** Symptom: a revoked or walled-off user still retrieving content for
-  hours or days after the change, until the next full re-index.
+  hours or days after the change, until the next full re-index. Fix: agree a propagation requirement and
+  run an incremental ACL sync with lag alerts.
 - **Naming a team instead of a person as data owner.** Symptom: access requests that sit unanswered for
-  weeks because nobody feels entitled to approve them.
+  weeks because nobody feels entitled to approve them. Fix: record a named person per source.
 - **Securing retrieval but not the traces or memory.** Symptom: a developer or vendor support engineer able
-  to read restricted document text in the prompt logs of the observability tool.
+  to read restricted document text in the prompt logs of the observability tool. Fix: apply the source
+  visibility rule to logs and memory, or redact.
 - **Letting the model supply identity.** Symptom: a tool that accepts a user ID argument, so an injected
   instruction retrieves another user's data. Fix: take identity from the session in the tool layer.
 - **Treating "the data exists" as "the data is usable".** Symptom: a pipeline that connects successfully and
-  returns scanned images, empty fields or a schema nobody can explain.
+  returns scanned images, empty fields or a schema nobody can explain. Fix: get a real sample in week one.
 
 ## When to use
 - **Use from the first week** of any agent engagement that touches customer data, which in enterprise AI is

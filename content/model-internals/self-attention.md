@@ -5,7 +5,7 @@ name: Self-attention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - model-internals/attention-mechanism
@@ -382,7 +382,8 @@ materializing them) and possibly sparse or windowed attention are what determine
 ## Use cases & projects
 ### Use cases
 - **Long-running research and coding agents.** Transcript growth, not step count, sets per-step latency,
-  so compaction policy is designed from the n/(2d) crossover.
+  so compaction thresholds are set from measured per-step latency, with the n/(2d) crossover showing
+  where attention starts to dominate.
 - **Self-hosted batch serving of agent sessions.** Correct left padding and masks keep outputs identical
   whether a session runs alone or in a batch.
 - **Choosing encoder or decoder per step.** Bidirectional encoders handle embedding and reranking; causal

@@ -5,7 +5,7 @@ name: Softmax
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - model-internals/logits

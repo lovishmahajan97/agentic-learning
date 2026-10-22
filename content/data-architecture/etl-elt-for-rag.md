@@ -5,7 +5,7 @@ name: ETL / ELT for RAG
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - data-architecture/ingestion-pipelines
@@ -269,7 +269,8 @@ the keys to start from.
 def trace_tool_result(result, tables):
     """result: one item from the agent's search_docs output (payload fields from the index)."""
     chunk = tables["chunks"].get(result["chunk_id"])
-    parsed = tables["parsed"].get((chunk["doc_id"], chunk["doc_version"], chunk["parser_version"]))
+    parser_version = chunk["metadata"]["parser_version"]          # recorded in chunk metadata at build time
+    parsed = tables["parsed"].get((chunk["doc_id"], chunk["doc_version"], parser_version))
     raw = tables["documents"].get((chunk["doc_id"], chunk["doc_version"]))
     return {
         "chunker_version": chunk["chunker_version"],

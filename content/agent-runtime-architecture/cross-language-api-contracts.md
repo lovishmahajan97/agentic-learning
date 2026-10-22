@@ -5,7 +5,7 @@ name: Cross-language API contracts
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/typed-tool-contracts
@@ -400,10 +400,13 @@ drift is caught in minutes.
 **One contract for a polyglot tool call (2-3 hours).**
 - **Goal:** drive a Python agent loop and a TypeScript tool server from a single schema and prove drift is
   caught in CI.
-- **Steps:** define `CreateTicketArgs` and the event union in Pydantic; emit
-  `contracts/agent.schema.json`; generate TypeScript types and an ajv validator from it; send the
-  tool definition to a model and validate its arguments in Python and again in the tool server; add golden
-  fixtures for an id above 2^53, a naive `due_at`, an extra `assignee` field and an unknown event type;
-  add a `git diff --exit-code` regeneration check.
-- **Done when:** both pipelines accept and reject the same fixtures, renaming a field without regenerating
-  fails CI, and the agent's tool-call argument rejection rate is logged per tool and schema version.
+- **Steps:**
+  1. Define `CreateTicketArgs` and the event union in Pydantic and emit `contracts/agent.schema.json`.
+  2. Generate TypeScript types from it, and compile the same file with ajv plus ajv-formats so `date-time`
+     rejects a missing offset.
+  3. Send the tool definition to a model and validate its arguments in Python and again in the tool server.
+  4. Add golden fixtures for an id above 2^53, a naive `due_at`, an extra `assignee` field and an unknown
+     event type.
+  5. Add a `git diff --exit-code` regeneration check as a script or CI step.
+- **Done when:** both sides accept and reject the same fixtures, renaming a field without regenerating
+  fails the check, and the agent's tool-call argument rejection rate is logged per tool and schema version.

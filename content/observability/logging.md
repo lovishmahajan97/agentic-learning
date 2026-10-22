@@ -5,7 +5,7 @@ name: Logging
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - observability/tracing
@@ -22,7 +22,7 @@ sources:
 
 ## TL;DR
 Logging records each agent event (model call, tool call, guardrail, stop) as a structured record bound to
-trace and run ids. Logs hold what traces and metrics should not: raw completions, tool arguments and
+trace and run ids. Logs hold what traces and metrics should not: rendered prompts, raw completions, tool arguments and
 errors, redacted and retained by policy.
 
 ## For agent builders
@@ -155,7 +155,7 @@ flowchart TD
     SH --> HOT[("Hot searchable logs")]
     HOT -->|"expire"| ARC[("Cold archive, then delete")]
     SH -.->|"payload key only"| OBJ[("Payload object store")]
-    AUD[("Audit log, never sampled")] -.->|"separate path"| SH
+    CS -.->|"side-effect tools, separate path"| AUD[("Audit log, never sampled")]
 ```
 
 ## Examples
@@ -257,7 +257,8 @@ One `run.summary` record per run (values illustrative) turns operating questions
 | What does a typical run cost? | p50 and p95 of `cost_usd`, grouped by `model` |
 
 A run with `steps=7`, `tools=["search_orders","get_order","refund"]`, `tool_failures=1`,
-`stop_reason=final_answer`, `input_tokens=18400` and `output_tokens=950` is one row, not 30 lines.
+`stop_reason=final_answer`, `input_tokens=18400` and `output_tokens=950` is one row instead of about 20
+per-step lines (a step, model-call and tool event for each iteration).
 
 ### Worked numbers: what each payload policy costs
 One million calls a day at 20 KB per payload, before indexing.

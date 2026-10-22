@@ -5,7 +5,7 @@ name: Prompt engineering
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/system-prompt
@@ -165,8 +165,8 @@ The first step of a support agent routes each ticket to a sub-agent, so this is 
 scored on a labeled set. V1 is what people write first; V2 enumerates labels, defines them and fixes the
 output format.
 
-The harness turns "I think it is
-better" into a number you can defend, and it is reused for every later change.
+The harness turns "I think it is better" into a number you can defend, and it is reused for every later
+change.
 
 ```python
 import anthropic, json, collections

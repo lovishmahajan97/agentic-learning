@@ -5,7 +5,7 @@ name: Google Agent Development Kit (ADK)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/frameworks
@@ -191,7 +191,8 @@ root_agent = SequentialAgent(name="brief_pipeline", sub_agents=[researcher, writ
 - **Young, fast-moving API vs stability.** New features land often, which also means breaking changes
   between minor versions; pin and read release notes.
 - **Gemini-first vs model-agnostic.** Other models work through LiteLLM, but built-in tools such as
-  `google_search` are Gemini-only.
+  `google_search` are Gemini-only, and they have had limits on mixing with other tools in one agent
+  (wrapping them in an `AgentTool` is the usual workaround); check the docs for your version.
 
 ## Pitfalls
 - **Keeping the in-memory session service in production.** Symptom: users lose context after a deploy or
@@ -202,6 +203,9 @@ root_agent = SequentialAgent(name="brief_pipeline", sub_agents=[researcher, writ
   vague ones cause wrong or missing calls. Fix: type every argument and describe when to use the tool.
 - **Mutating state outside events.** Writing to a fetched session object directly is not persisted. Fix:
   use `output_key`, `tool_context.state` or callback context, which record state deltas in events.
+- **Parallel branches writing the same key.** `ParallelAgent` children share one session state, so two
+  branches with the same `output_key` overwrite each other. Fix: give each branch its own key and merge
+  them in a later step.
 
 ## When to use
 - **Use when:** you build on Google Cloud or Gemini, want sequential, parallel and loop orchestration

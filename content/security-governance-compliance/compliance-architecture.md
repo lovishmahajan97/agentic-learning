@@ -5,7 +5,7 @@ name: Compliance architecture (GDPR, SOC 2, HIPAA, ISO 42001, EU AI Act, DPDP Ac
 kind: concept
 difficulty: advanced
 est_minutes: 25
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - security-governance-compliance/data-residency

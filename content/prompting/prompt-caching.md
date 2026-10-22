@@ -5,7 +5,7 @@ name: Prompt caching
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/system-prompt
@@ -241,13 +241,13 @@ full-price-equivalent input tokens, using the 1.25× write and 0.1× read rates.
   step while writes stay near 1.5k.
 
 ## Production patterns
-- **Append-only agent transcripts, volatile data last.** Never edit or delete earlier tool results
-  mid-run. Put per-step reminders, current date, user name, plan and retrieved snippets in the newest turn
-  or after the shared breakpoint, never at the top of the system prompt. Monitor cached share of input per
-  step, and diff two rendered prompts (as above) whenever reads stay at zero.
-- **Compact at a boundary, not every step.** When the transcript nears the window, summarize old steps
-  once into a new stable block and accept one write, instead of trimming a little each step and missing
-  the cache every time.
+- **Append-only agent transcripts, volatile data last.** Avoid editing or deleting earlier tool results
+  mid-run. Put per-step reminders, current date, user name, plan and retrieved snippets in the newest
+  turn or after the shared breakpoint, never at the top of the system prompt. Monitor cached share of
+  input per step, and diff two rendered prompts (as above) whenever reads stay at zero.
+- **Compact or clear at a boundary, not every step.** When the transcript nears the window, summarize old
+  steps (or clear stale tool results) once, in one batch, and accept one write, instead of trimming a
+  little each step and missing the cache every time.
 - **Layered request builder.** Build every request as stable (tools, policies), session and turn layers,
   serialized deterministically (`json.dumps(..., sort_keys=True)`, tools sorted by name), with breakpoints
   at the layer boundaries. Monitor hit ratio per route.
@@ -399,8 +399,8 @@ deterministic, and the model and thinking settings do not change mid-task.
 
 ## Use cases & projects
 ### Use cases
-- **Long-running coding and research agents.** Append-only transcripts keep step 30 close to step 1 in
-  input cost and time to first token.
+- **Long-running coding and research agents.** Append-only transcripts bill the ever-growing history at
+  the read rate, so step 30 costs a fraction of its uncached price and its time to first token stays low.
 - **Agents with large tool sets.** Dozens of tool schemas form a stable prefix that every step reads at the
   read rate instead of re-paying.
 - **Document-grounded agents.** A contract or codebase summary loaded once is questioned across many steps

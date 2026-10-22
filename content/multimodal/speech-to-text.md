@@ -5,7 +5,7 @@ name: Speech-to-text (Whisper)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - multimodal/tts

@@ -5,7 +5,7 @@ name: OCR
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - multimodal/document-understanding
@@ -423,11 +423,12 @@ arithmetic validation (line items sum to total) so residual errors are caught.
   than guesses small digits.
 
 ### Mini project
-**An OCR tool with honest uncertainty (1-2 hours).**
+**An OCR tool with honest uncertainty (2-3 hours).**
 - **Goal:** give an agent an OCR tool whose output marks uncertain tokens and a re-read tool for flagged
   regions.
-- **Steps:** collect 20 scanned receipts or invoices with hand-labelled totals; run Tesseract with and
-  without preprocessing; return results in the shaped format above; let an agent answer "what is the
-  total?" and call the re-read tool on flagged regions; compute CER and total accuracy.
+- **Steps:** collect 20 scanned receipts or invoices with hand-labelled totals, and type out the full
+  text of 5 of them as CER references; run Tesseract with and without preprocessing; return results in
+  the shaped format above; let an agent answer "what is the total?" and call the re-read tool on flagged
+  regions; compute CER on the 5 references and total accuracy on all 20.
 - **Done when:** you report CER before and after preprocessing, total accuracy with and without the
   uncertainty marks, and how many re-read calls the agent made.

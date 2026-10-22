@@ -5,7 +5,7 @@ name: CrewAI (crews, roles, tasks, flows)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - agents/frameworks
@@ -59,12 +59,13 @@ Flows when you need deterministic control around them.
 | `CrewOutput` | `.raw`, `.pydantic`, `.json_dict`, `.tasks_output`, `.token_usage` | log `token_usage` per run |
 
 ### Processes
-- **`Process.sequential`:** tasks run in order, each seeing the outputs named in `context` (and by
-  default the previous one). Predictable and cheapest.
+- **`Process.sequential`:** tasks run in order. A task without `context` receives earlier output
+  automatically; set `context` to choose exactly which task outputs it sees. Predictable and cheapest.
 - **`Process.hierarchical`:** a manager (set `manager_llm` or `manager_agent`) plans, delegates and
   validates. More flexible, more calls, harder to predict.
 - **Delegation:** with `allow_delegation=True` an agent can hand subtasks or questions to coworkers via
-  built-in tools. Turn it off unless you measured a benefit, because it multiplies calls.
+  built-in tools. Recent versions default it to off, but older examples enable it; keep it off unless
+  you measured a benefit, because it multiplies calls.
 
 ### Tools and models
 - **Tools:** decorate a function with `@tool("Name")` from `crewai.tools` (docstring is the description)

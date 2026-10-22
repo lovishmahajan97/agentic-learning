@@ -5,7 +5,7 @@ name: Knowledge management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - data-architecture/document-processing-pipelines
@@ -220,7 +220,8 @@ TOOLS = [
 ]
 
 def search_policy(query: str, user_groups: set[str]) -> list[dict]:
-    rows = candidates(ordered, user_groups)            # the gated ranking above, filtered by the USER's ACL
+    # toy: `chunks` stand in for the vector hits for `query`; gate and rank them by the USER's ACL
+    rows = candidates(ordered, user_groups)
     return [{"text": t, "source": s, "score": sc} for sc, s, t in rows[:3]]
 
 print(search_policy("refund window", {"all"})[0])

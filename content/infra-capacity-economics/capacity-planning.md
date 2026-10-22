@@ -5,7 +5,7 @@ name: Capacity planning (tokens/sec, requests/sec, concurrent sessions)
 kind: practice
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/queueing-theory
@@ -216,7 +216,7 @@ print(plan_agent(2, 10, 4000, 1000, 200, 0.8, 0.03, 2.0, 2 * 32 * 8 * 128 * 2, 5
 | Reading | Meaning |
 |---|---|
 | 20 calls/sec from 2 runs/sec | ten times the arrivals a per-user count would suggest |
-| 170,000 input tokens/sec, but 20,000 new | prefix caching on an append-only transcript removes most prefill |
+| 170,000 input tokens/sec, but 20,000 new | prefix caching on an append-only transcript removes most prefill, but only while each run's prefix stays cached between steps (the 7-replica case) |
 | 136 in flight, 176 live runs | 40 runs are in a tool at any instant |
 | 5 vs 7 replicas | keeping every waiting run's cache resident costs 2 more replicas; letting it be evicted costs re-prefill instead |
 
@@ -243,13 +243,11 @@ Same workload, but traffic grows 10% a month and reserved GPUs take a quarter to
 - **Plan from agent traces, not user counts.** Pull steps per run, tokens per step and tool time per step
   from production traces into the capacity script, per agent type. Monitor steps-per-run p95 after every
   prompt or tool change, since one extra step raises calls/sec by a tenth on a 10-step agent.
-- **Replay recorded runs as the load test.** Drive the load test with real agent transcripts so prompts
-  grow step by step and tool gaps are realistic. Monitor where the knee falls compared with chat-shaped
-  tests.
-- **Load test with production-shaped prompts.** Replay token-length distributions sampled from production
-  (not fixed-length synthetic prompts) and sweep concurrency, recording p95 TTFT and TPOT at each step.
-  Monitor where the latency knee and the KV-memory bound fall, and re-run after every model or engine
-  change.
+- **Load test by replaying recorded agent runs.** Drive the test with real transcripts, so token lengths
+  follow production distributions (not fixed-length synthetic prompts), prompts grow step by step and
+  tool gaps are realistic; sweep concurrency, recording p95 TTFT and TPOT at each level. Monitor where the
+  latency knee and the KV-memory bound fall versus chat-shaped tests, and re-run after every model or
+  engine change.
 - **Reconcile predicted and observed concurrency.** Export the engine's running and waiting request counts
   (vLLM publishes both) and compare them with L = λW from your telemetry. Monitor the gap; a large one means
   W, the token mix or fan-out is mis-measured.
@@ -421,5 +419,6 @@ output, enabling prefix caching for shared prompts, or adding replicas sized fro
 - **Steps:** run a small tool-calling agent on 30 tasks and log per step: prompt tokens, output tokens,
   model time and tool time; fit steps per run and prompt growth; feed them into `plan_agent` above at
   three peak run rates; compare predicted in-flight calls with a short load test or a concurrency count.
-- **Done when:** you have a one-page plan with replicas at each run rate, which term binds (KV memory or
-  prefill), and how the answer changes with prefix caching and a 20% shorter transcript.
+- **Done when:** you have a one-page plan with replicas at each run rate, which term binds (sequence
+  slots from `plan_agent`, or prefill: its `in_tps` against a per-replica prefill rate you measure or
+  state as an assumption), and how the answer changes with prefix caching and a 20% shorter transcript.

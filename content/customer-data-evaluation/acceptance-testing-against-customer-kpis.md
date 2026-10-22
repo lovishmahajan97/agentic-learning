@@ -5,7 +5,7 @@ name: Acceptance testing against customer KPIs
 kind: practice
 difficulty: advanced
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/success-metrics-kpis
@@ -361,7 +361,8 @@ and size the sample so it is provable. Then everything goes into a signed annex 
 **Write and score an acceptance annex for a toy agent (2-3 hours).**
 - **Goal:** draft signed-style criteria for an agent, check feasibility, then score a simulated pilot.
 - **Steps:** pick an invoice or refund agent; write a KPI tree; define one primary, two guardrails (one
-  zero-tolerance action guardrail) and one segment floor in a config file; run `n_for_upper_bound` and the
-  rule of three on each; simulate pilot outcomes; score them with `wilson`.
+  zero-tolerance action guardrail) and one segment floor in a config file; size each with
+  `n_for_upper_bound` (mirrored for lower-bound rules) or the rule of three; simulate pilot outcomes; score
+  them with `wilson`.
 - **Done when:** you have the config, a feasibility table flagging any unpassable criterion with its fix,
   and a pass or fail report with intervals for every criterion.

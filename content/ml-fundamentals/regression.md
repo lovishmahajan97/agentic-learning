@@ -5,7 +5,7 @@ name: Regression
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/classification
@@ -282,6 +282,10 @@ print("pinball q=0.95 picks", best(lambda c: pinball(c, 0.95)))  # 2000.0, the t
   are far too narrow for large requests.
 - **Budgeting agent runs on the mean.** Symptom: a max-steps limit set at the average run length cuts off
   a large share of legitimate long tasks. Budget from a tail quantile per task type instead.
+- **High-leverage points.** A few requests with extreme feature values, such as one 100k-token prompt in a
+  set of short ones, can swing a linear fit on their own. Symptom: coefficients that move sharply when a
+  handful of rows are dropped. Fix: inspect influence (for example Cook's distance), cap or log-transform
+  the feature, or fit that segment separately.
 - **Collinear features.** Symptom: coefficients that flip sign between retrains while predictions barely
   change, which destroys any story told about feature importance.
 
@@ -352,12 +356,12 @@ pays off.
 - **Monitor coverage:** about 95% of completed runs should fall below the budget, per segment, and the
   runs that hit it should mostly be loops.
 
-### You route agent requests to a cheap or expensive model using a predicted cost. How do you build and judge it?
-- **Target:** log(cost) with request-time features only, since output length and step count are unknown
-  before the run.
-- **Correct the back-transform:** summed predictions on the dollar scale run low without a bias factor.
-- **Judge the decision, not the R²:** the share of truly expensive runs sent to the right tier and the
-  cheap traffic misrouted, broken out for the tail.
+### Your LLM judge's mean 1–5 score rose from 3.2 to 3.4 after a prompt change. Did the agent get better?
+- **Not provably:** judge scores are ordinal, so a 0.2 change in the mean has no fixed meaning, and on a
+  small eval set it may be noise.
+- **Better readouts:** the pass rate at a rubric threshold (for example score of 4 or more), or a pairwise
+  win rate of new versus old outputs, with a confidence interval from the number of cases.
+- **Check the judge too:** measure its agreement with human labels on a sample before trusting any shift.
 
 ## Quiz
 ### Q: Which statement about MSE versus MAE is correct?

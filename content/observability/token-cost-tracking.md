@@ -5,7 +5,7 @@ name: Token / cost tracking
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - observability/monitoring
@@ -28,8 +28,8 @@ inside the loop.
 
 ## For agent builders
 - **Why it matters for agents.** Each step resends the growing transcript, so a 20-step run sends far
-  more input than 20 single calls, and one looping run can cost more than a thousand normal ones. Cost
-  is a property of the loop, not of a request.
+  more input than 20 single calls, and one looping run can cost as much as dozens of normal ones (about
+  19× in the worked scenario below). Cost is a property of the loop, not of a request.
 - **Where it shows up in your stack.** The `usage` object on every provider response (including cached and
   reasoning token fields), `tiktoken` or a provider's token-counting endpoint for pre-call estimates,
   span attributes in your tracing tool, and the gateway or agent state that holds budgets.

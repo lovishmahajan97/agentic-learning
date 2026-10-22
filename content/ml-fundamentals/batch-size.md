@@ -5,7 +5,7 @@ name: Batch size
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/gradient-descent
@@ -30,7 +30,7 @@ are one decision.
 
 ## For agent builders
 - **Why it matters for agents.** Agent fine-tunes (tool-call format, routing, trajectory imitation) run on
-  small datasets of a few thousand traces. A vendor-default batch of 128 can leave only a few dozen
+  small datasets of a few thousand traces. A batch of 128 copied from a larger recipe can leave only a few dozen
   optimizer steps, and the adapter barely learns your tool schema.
 - **Where it shows up in your stack.** `per_device_train_batch_size` and `gradient_accumulation_steps` in
   the Hugging Face Trainer and TRL trainers, the world size of your launcher, and the batch-size setting a
@@ -191,7 +191,7 @@ A team LoRA-tunes a model on 3,000 tool-call traces for 3 epochs. Traces average
 
 | Effective batch | Optimizer steps per epoch | Total steps | Tokens per step (approx.) | Outcome |
 |---|---|---|---|---|
-| 128 (vendor default) | 23 | 69 | ~320k | too few steps: warmup and decay barely fit, tool format half-learned |
+| 128 (copied from a larger recipe) | 23 | 69 | ~320k | too few steps: warmup and decay barely fit, tool format half-learned |
 | 32 | 93 | 279 | ~80k | a few hundred steps: room for warmup and decay |
 | 16 | 187 | 561 | ~40k | more steps and more gradient noise; re-tune the peak rate down |
 

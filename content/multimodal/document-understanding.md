@@ -5,7 +5,7 @@ name: Document understanding
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - multimodal/ocr
@@ -480,5 +480,6 @@ accuracy alone would still leave silent errors.
 - **Steps:** collect 20 invoice PDFs (some scanned, some born-digital, two with an injected instruction
   in the text); implement the extraction tool with a nullable schema and the checks above; add a stub
   payment tool that enforces the status; run the agent over the set and label the correct totals.
-- **Done when:** you report per-field accuracy on totals, straight-through rate, escaped errors (should be
-  zero), and confirm the injected documents never triggered a payment.
+- **Done when:** you report accuracy on totals, straight-through rate, escaped errors (wrong totals that
+  went straight through, found by checking every clean document by hand), and confirm the injected
+  documents never triggered a payment.

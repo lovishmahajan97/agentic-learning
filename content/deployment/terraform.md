@@ -5,7 +5,7 @@ name: Terraform (infrastructure as code)
 kind: tool
 difficulty: core
 est_minutes: 19
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - deployment/customer-vpc-on-prem-air-gapped
@@ -34,8 +34,8 @@ so every environment and customer account is reproducible and reviewable.
 - **Where it shows up in your stack.** Modules for `aws_vpc_endpoint` and buckets, the IAM policy behind
   your agent's tool role, the remote state backend, and the CI pipeline that runs `terraform plan`.
 - **What you control.** Least-privilege roles per tool, `prevent_destroy` on the vector store and memory
-  tables, and whether any agent (say an infra or coding agent) may run plan, and never apply, without a
-  human approval gate.
+  tables, and the rule that an infra or coding agent may run plan but never apply without a human
+  approval gate.
 - **What you can skip.** Writing providers and the internals of the dependency graph. Know state, plan,
   the replace hazard, `moved` blocks and how to ship into an isolated account.
 
@@ -306,11 +306,12 @@ only Terraform tool runs plan; apply waits for a human.
 |---|---|---|
 | 1. Agent edits modules | adds a staging root calling `module.rag` | code review |
 | 2. Agent calls plan tool | plan: 3 to add, 0 to change, 0 to destroy | plan guard passes |
-| 3. Agent "tidies" a module name | re-plan: 3 destroys, 3 creates | guard returns BLOCK to the agent |
-| 4. Agent adds `moved` blocks | re-plan: 3 to add, 0 to destroy | guard passes |
+| 3. Agent "tidies" resource names inside the shared `rag` module | prod re-plan: 3 destroys, 3 creates | guard returns BLOCK to the agent |
+| 4. Agent adds `moved` blocks in the module | prod: no changes; staging: 3 to add | guard passes |
 | 5. Human approves saved plan | `terraform apply tfplan` in CI | change ticket |
 
-Step 3 is the one that matters: the model saw a harmless rename, the guard saw a replaced bucket.
+Step 3 is the one that matters: the model saw a harmless rename, the guard saw a replaced bucket in an
+environment that already exists. A rename in the not-yet-applied staging root alone would destroy nothing.
 
 ## Production patterns
 - **Saved plan, exact apply.** In CI run `terraform plan -out=tfplan` on every pull request, attach the
@@ -329,7 +330,8 @@ Step 3 is the one that matters: the model saw a harmless rename, the guard saw a
   the release bundle, and point the customer's CLI configuration at it with a `filesystem_mirror` block,
   so `terraform init` never reaches the public registry.
 - **Split state by layer and guard data twice.** Separate network, cluster and application states so a
-  routine app change cannot plan against the VPC; pass values with outputs and data sources. Protect the
+  routine app change cannot plan against the VPC; pass values with outputs and data sources, and track
+  plan duration per state. Protect the
   vector store and memory tables with `prevent_destroy`, cloud-side deletion protection, and the
   plan-guard script in CI.
 
@@ -485,10 +487,10 @@ include a provider mirror.
 ### Mini project
 **Build a plan-only Terraform tool for an agent (2-3 hours).**
 - **Goal:** let an agent propose infrastructure changes while a guard and a human keep apply safe.
-- **Steps:** write a tool that runs `terraform plan -out=tfplan -input=false` and
-  `terraform show -json tfplan` in a scratch workspace using a local or LocalStack-style backend; run
-  the plan guard on the JSON and return a summary (adds, changes, destroys, blocked addresses) to the
-  model; give a small tool-calling agent the task "rename the documents bucket block" and observe it
-  respond to a BLOCK.
+- **Steps:** apply a small baseline yourself first (against LocalStack, or with `terraform_data`
+  resources and the guard's `PROTECTED` set adjusted), so state exists; write a tool that runs
+  `terraform plan -out=tfplan -input=false` and `terraform show -json tfplan`; run the plan guard on the
+  JSON and return a summary (adds, changes, destroys, blocked addresses) to the model; give a small
+  tool-calling agent the task "rename the documents bucket block" and observe it respond to a BLOCK.
 - **Done when:** the agent's first attempt is blocked, it recovers by adding a `moved` block until the plan
   shows zero destroys, and there is no apply tool anywhere in its tool list.

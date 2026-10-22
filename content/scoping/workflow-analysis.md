@@ -5,7 +5,7 @@ name: Workflow analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/customer-discovery
@@ -21,7 +21,8 @@ sources:
 
 ## TL;DR
 Workflow analysis maps how work actually flows: steps, people, systems, handoffs, exceptions and waits. It
-places your agent, because an agent only improves the outcome at the step that limits it; speeding a ten-minute task inside a three-day process changes almost nothing.
+shows where to put an agent, which only improves the outcome at the step that limits it; speeding a
+ten-minute task inside a three-day process changes almost nothing.
 
 ## For agent builders
 - **Why it matters for agents.** Agents are pitched at tasks ("research the ticket"), but customers judge
@@ -235,6 +236,8 @@ print(EVENTS[-1]["activity"], EVENTS[-1]["actor"])   # request info agent
 ```
 
 - **The `actor` field** lets the same mining script split waits by human versus agent steps after launch.
+- **The completeness check here is a plain rule** to keep the sketch short; a real intake agent might use a
+  model to read a free-text ticket, but it would emit the same rows.
 
 ## Production patterns
 - **Emit the same events before and after** — when the agent goes live, have it write case ID, activity
@@ -268,17 +271,23 @@ print(EVENTS[-1]["activity"], EVENTS[-1]["actor"])   # request info agent
 
 ## Pitfalls
 - **Analysing the documented process instead of the real one.** Symptom: an agent that handles the happy
-  path but fails on the exception paths that make up much of real volume.
+  path but fails on the exception paths that make up much of real volume. Fix: observe real items and mine
+  the event log for variants.
 - **Measuring only touch time.** Symptom: a pilot that cuts handling time per item yet leaves
-  customer-visible cycle time unchanged, and the sponsor sees no improvement.
+  customer-visible cycle time unchanged, and the sponsor sees no improvement. Fix: split touch from wait
+  per step before choosing the insertion point.
 - **Ignoring side-channel tools.** Symptom: users keep their old spreadsheet open next to the new agent,
-  because a check or lookup it supported was never modelled as a tool.
+  because a check or lookup it supported was never modelled as a tool. Fix: list every side channel seen
+  in observation and give each a tool or an explicit manual step.
 - **Inserting an agent without redesigning the human step around it.** Symptom: reviewers either approve
-  everything unread or redo the work from scratch, erasing the saving.
+  everything unread or redo the work from scratch, erasing the saving. Fix: design the review step (what
+  to check, how long, sampled or full) as part of the to-be flow.
 - **Speeding up one step without checking downstream capacity.** Symptom: a queue that shrinks in front of
-  the improved step and grows in front of the next one, with cycle time unchanged.
+  the improved step and grows in front of the next one, with cycle time unchanged. Fix: check the next
+  step's capacity against the new arrival rate before launch.
 - **Not recording a baseline before changing the flow.** Symptom: an argument after launch about whether
-  things improved, settled by anecdote.
+  things improved, settled by anecdote. Fix: record cycle time, touch time and rework rate from the log
+  before the agent ships.
 
 ## When to use
 - **Use whenever** an agent will sit inside an existing business process, which is almost always in

@@ -5,7 +5,7 @@ name: Model integration
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/ai-gateway
@@ -170,7 +170,7 @@ def from_anthropic_messages(r: dict) -> Completion:
     calls = [(b["name"], dict(b["input"]))                                     # args: object
              for b in r["content"] if b["type"] == "tool_use"]
     finish = {"end_turn": "stop", "stop_sequence": "stop", "max_tokens": "length",
-              "tool_use": "tool_use"}[r["stop_reason"]]
+              "tool_use": "tool_use", "refusal": "filtered"}[r["stop_reason"]]
     return Completion(text, calls, finish,
                       r["usage"]["input_tokens"], r["usage"]["output_tokens"])
 ```

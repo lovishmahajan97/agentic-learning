@@ -5,7 +5,7 @@ name: FastAPI
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - fastapi-for-ai/asgi-lifecycle
@@ -42,8 +42,8 @@ contracts, SSE streaming of steps, and DI for shared clients. Sharp edge: one bl
 
 ## Why it exists
 - **An agent endpoint is unusual HTTP.** A request may hold its connection open for ten seconds or far
-  longer, stream hundreds of chunks and step events, carry large structured bodies both ways, and share expensive clients (a provider
-  connection pool, a vector store) across every request.
+  longer, stream hundreds of chunks and step events, carry large structured bodies both ways, and
+  share expensive clients (a provider connection pool, a vector store) across every request.
 - **WSGI was built for the opposite.** Flask and traditional Django dedicate one thread or process per
   request. With 200 in-flight model calls of five seconds each, a WSGI server needs 200 workers that sit
   idle on sockets; one ASGI event loop holds all 200 pending awaits, bounded by memory and the upstream.

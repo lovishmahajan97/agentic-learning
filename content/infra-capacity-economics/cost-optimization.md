@@ -5,7 +5,7 @@ name: Cost optimization
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - infra-capacity-economics/cost-modeling
@@ -248,10 +248,10 @@ def cache_key(question, tenant_id, permission_scope, source_versions, prompt_ver
   with Anthropic mark the stable prefix with `cache_control: {"type": "ephemeral"}`, while OpenAI caches
   long prefixes automatically. Monitor the cached-token share from usage fields (for example
   `cache_read_input_tokens` or `cached_tokens`) after every prompt change.
-- **Tool-result budgets.** Agent teams cap how many tokens each tool may return to the model and summarize
-  or select fields before appending. Monitor tokens added per step by tool.
-- **Step limits and cost circuit breakers.** Set a maximum step count per run and stop or escalate a run
-  whose accumulated cost passes a threshold. Monitor the share of runs hitting either limit.
+- **Tool-result budgets, step limits and cost circuit breakers.** Cap how many tokens each tool may return
+  to the model (select fields or summarize before appending), set a maximum step count per run, and stop
+  or escalate a run whose accumulated cost passes a threshold. Monitor tokens added per step by tool and
+  the share of runs hitting either limit.
 - **Batch lanes for deferrable work.** Send evals, backfills and nightly summaries through the provider's
   batch endpoint (OpenAI's Batch API, Anthropic's Message Batches API) instead of the interactive path.
   Monitor batch completion time against the job's deadline.

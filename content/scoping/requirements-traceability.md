@@ -5,7 +5,7 @@ name: Requirements traceability
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/statement-of-work
@@ -223,11 +223,15 @@ The team trials a cheaper model. The global pass rate barely moves; the per-requ
 
 | Requirement | Cases | Current model | Candidate | Threshold | Verdict |
 |---|---|---|---|---|---|
-| R1 policy-only answers | 420 | 96% | 96% | 95% | pass |
+| R1 policy-only answers | 450 | 96% | 96% | 95% | pass |
 | R2 escalate medical claims | 8 | 100% | 0% | 100% | **block** |
-| R3 cite policy section | 340 | 91% | 92% | 90% | pass |
+| R3 cite policy section | 340 | 91% | 91% | 90% | pass |
 | R4 data isolation | 32 | 100% | 100% | 100% | pass, bounded below about 10% |
 | Global average | 800 | 91% | 90% | n/a | looks fine |
+
+- **Slices overlap and are not exhaustive:** many cases carry both R1 and R3 tags, and slices for other
+  requirements are not shown, so the rows do not sum to 800. The 1-point global drop is R2's eight cases,
+  8/800 of the suite.
 
 - **The trace shows why:** the candidate model rarely calls `escalate_to_human`, so R2's eight scenarios
   all fail. The fix lives in the tool description or the escalation prompt, both linked to R2.
@@ -265,18 +269,23 @@ The team trials a cheaper model. The global pass rate barely moves; the per-requ
 
 ## Pitfalls
 - **Reporting a single aggregate eval score as proof of acceptance.** Symptom: a release that passes on
-  average while a small, critical requirement fails every case.
+  average while a small, critical requirement fails every case. Fix: a per-requirement report with its own
+  threshold per slice.
 - **Non-functional requirements left out of the matrix.** Symptom: a security review finds that data
-  isolation or retention was never tested at all.
+  isolation or retention was never tested at all. Fix: give them IDs and link them to deterministic,
+  load or security tests.
 - **Tool descriptions treated as untracked text.** Symptom: someone "tidies" a tool description and the
   agent stops calling it in the cases a requirement depends on. Fix: link tools to requirements like
   prompts.
 - **A hand-maintained traceability spreadsheet.** Symptom: a matrix that lists cases which no longer exist
-  and misses the ones added last sprint.
+  and misses the ones added last sprint. Fix: generate the matrix in CI from tags and the requirements
+  file.
 - **Not recording model and prompt versions with the evidence.** Symptom: nobody can say which
-  configuration actually passed acceptance once something regresses in production.
+  configuration actually passed acceptance once something regresses in production. Fix: store model,
+  prompt and tool-schema versions with every run.
 - **Treating orphan cases as harmless.** Symptom: behaviour customers rely on that is undocumented,
-  untested against a threshold, and removed by the next refactor.
+  untested against a threshold, and removed by the next refactor. Fix: decide each orphan, write and
+  approve the missing requirement or remove the element.
 
 ## When to use
 - **Use when:** there is an SOW with numbered requirements and more than a few dozen eval cases. In practice

@@ -5,7 +5,7 @@ name: Loss functions (cross-entropy, contrastive)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/classification
@@ -438,4 +438,5 @@ absent from the training data. Only after these would I suspect the data itself.
   supervised-token share per trace; run one forward pass of a small model and compare the loss with and
   without the mask.
 - **Done when:** you have a table of supervised-token share per trace, a unit test that fails if any tool
-  result token is supervised, and a note explaining why the unmasked loss is lower but meaningless.
+  result token is supervised, and a note on how the two losses differ and why only the masked one measures
+  the agent's own behaviour.

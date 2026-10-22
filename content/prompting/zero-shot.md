@@ -5,7 +5,7 @@ name: Zero-shot prompting
 kind: pattern
 difficulty: intro
 est_minutes: 10
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/few-shot
@@ -195,8 +195,9 @@ for ticket, expected in EVAL:
 ```
 
 ### Closing the label set with a forced tool call
-A production variant, and the usual shape of an agent's router step: instead of a format clause in words, force a tool call whose input schema has an
-enum, so the label is always one of the set, `other` included as the exit.
+A production variant, and the usual shape of an agent's router step: instead of a format clause in
+words, force a tool call whose input schema has an enum, so the label is one of the set, with `other`
+included as the exit.
 
 ```python
 import anthropic

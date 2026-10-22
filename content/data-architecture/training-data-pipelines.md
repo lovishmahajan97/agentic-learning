@@ -5,7 +5,7 @@ name: Training data pipelines
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/data-curation

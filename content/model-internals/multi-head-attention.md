@@ -5,7 +5,7 @@ name: Multi-head attention
 kind: concept
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/self-attention

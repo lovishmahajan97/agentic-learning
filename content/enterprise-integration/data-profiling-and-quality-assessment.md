@@ -5,7 +5,7 @@ name: Data profiling & quality assessment
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - enterprise-integration/data-onboarding
@@ -294,17 +294,18 @@ No prompt change would have fixed APAC; the profile shows the agent had nothing 
 
 ## Pitfalls
 - **Reporting only aggregate metrics.** Symptom: a dataset judged healthy that fails badly for the one
-  department or region the pilot serves.
+  department or region the pilot serves. Fix: slice every metric.
 - **Profiling once at onboarding and never again.** Symptom: a sudden quality drop months later traced to
-  a source-side upgrade that renamed a picklist value.
+  a source-side upgrade that renamed a picklist value. Fix: load-time expectations and baseline diffs.
 - **Counting only true nulls.** Symptom: a field reported 98% complete whose most frequent value is `N/A`
-  or `1900-01-01`, and prompts or filters that treat the placeholder as real data.
+  or `1900-01-01`, and prompts or filters that treat the placeholder as real data. Fix: a disguised-null
+  registry.
 - **Treating format validity as accuracy.** Symptom: clean-looking data that SMEs reject because values
-  are stale, defaulted or entered into the wrong field.
+  are stale, defaulted or entered into the wrong field. Fix: SME review of a sample.
 - **Ignoring duplicates and near duplicates in document corpora.** Symptom: retrieval returning five
-  versions of the same policy and answers citing an outdated draft.
+  versions of the same policy and answers citing an outdated draft. Fix: hash and MinHash before indexing.
 - **A profile report with no decisions or owners.** Symptom: the same findings rediscovered in the pilot,
-  after users have already seen the consequences.
+  after users have already seen the consequences. Fix: classify each finding and name an owner.
 - **Tuning the agent's prompt for what is a data gap.** Symptom: weeks of prompt iterations that lift one
   slice and hurt another, while the failing slice simply has no content to retrieve. Fix: split eval
   failures by profile slice before touching the prompt.
@@ -350,11 +351,13 @@ reaching users.
   and blocking for a retrieval filter, so each finding becomes acceptable, pipeline fix, source fix or
   blocking, with an owner.
 
-### A field shows 2% nulls but the summarizer keeps inventing answers from it. What do you check?
+### A field shows 2% nulls but your agent keeps inventing answers from what its tool returns. What do you check?
 - **Disguised missing values:** look at the top values for placeholders like `N/A`, `-` or "see email"
   with suspiciously high frequency.
 - **Recompute effective completeness** as nulls plus placeholder share, and add the placeholders to a
   per-source registry so filters and prompts treat them as missing.
+- **Change the tool result:** return placeholders as explicit nulls, so the agent says "no resolution
+  recorded" instead of building an answer around "see email".
 
 ### How big a sample do you profile, and what can a clean sample tell you?
 - **Detection:** a sample of *n* catches a defect of rate *p* with probability `1 − (1 − p)^n`; a 0.1%

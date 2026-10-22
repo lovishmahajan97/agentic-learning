@@ -5,7 +5,7 @@ name: scikit-learn basics
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/train-test-leakage

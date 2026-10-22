@@ -5,7 +5,7 @@ name: AutoGen / AG2 (conversational multi-agent)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - agents/frameworks
@@ -87,7 +87,8 @@ the community fork AG2, which keeps the original API.
 
 ## Diagram
 Follow a critic loop: the team alternates speakers, tools run on the investigator's turn, and the
-termination condition, not the model, decides when the conversation ends.
+termination condition (checked after every message, simplified here to the reviewer's turn), not the
+model, decides when the conversation ends.
 
 ```mermaid
 flowchart TD

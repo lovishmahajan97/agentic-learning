@@ -5,7 +5,7 @@ name: Pilot → production plan
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/rapid-prototyping-poc

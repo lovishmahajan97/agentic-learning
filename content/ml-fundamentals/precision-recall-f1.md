@@ -5,7 +5,7 @@ name: Precision / recall / F1
 kind: metric
 difficulty: intro
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - ml-fundamentals/confusion-matrix
@@ -232,16 +232,18 @@ for k in (1, 3, 5, 8):
   top-5 generator, whatever the prompt says.
 
 ### Agent scenario: scoring when a research agent calls its search tool
-An eval set of 200 tasks, 80 of which need a web search. Two system-prompt versions are compared on the
-per-step label "called search when needed".
+An eval set of 200 tasks, 80 of which need a web search (illustrative numbers). Two system-prompt versions
+are compared on the per-task label "called search when needed".
+- **TP:** a needed search that was made. **FP:** a search on one of the 120 tasks that did not need it.
+  **FN:** a needed search that was skipped.
 
 | Version | Search calls | TP | FP | FN | Precision | Recall | F1 | F2 |
 |---|---|---|---|---|---|---|---|---|
 | v1, "search when unsure" | 100 | 70 | 30 | 10 | 0.70 | 0.875 | 0.778 | 0.833 |
 | v2, "search only if needed" | 60 | 58 | 2 | 22 | 0.967 | 0.725 | 0.829 | 0.763 |
 
-- **F1 prefers v2,** but its 22 misses are tasks answered from memory, the main source of hallucinated
-  facts in a research agent.
+- **F1 prefers v2,** but its 22 misses are tasks answered from the model's memory, a common source of
+  hallucinated or stale facts in a research agent.
 - **The 30 extra calls in v1 cost latency and API spend,** which is usually cheaper than a wrong answer.
   If a miss is the expensive error, F2 (or "recall ≥ 0.85, then fewest calls") picks v1.
 - **Score per tool.** The same table for a rarely needed `refund` tool would use a precision floor

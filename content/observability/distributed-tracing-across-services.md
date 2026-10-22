@@ -5,7 +5,7 @@ name: Distributed tracing across services
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - observability/tracing
@@ -232,7 +232,7 @@ numbers).
 | `agent.run` | 8.2 s | 8.2 s |
 | `generation` ×2 | 1.9 s total | 1.9 s total |
 | `tool.search_tickets` (CLIENT) | 6.1 s, no children | 6.1 s |
-| `tool.search_tickets` (SERVER, tool server) | separate one-span trace, 0.2 s | 0.2 s, child of the client span |
+| `tool.search_tickets` (SERVER, tool server) | root of a separate trace, 0.2 s | 0.2 s, child of the client span |
 | `db.query` (tool server) | in that separate trace | 0.15 s |
 | Client-to-server gap | invisible | 5.9 s: connection pool wait in the transport |
 

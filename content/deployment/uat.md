@@ -5,7 +5,7 @@ name: UAT (user acceptance testing)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - customer-data-evaluation/acceptance-testing-against-customer-kpis
@@ -352,13 +352,13 @@ blocks.
 - **Why it matters:** each cause has a different owner and fix, and prompt-tuning around an integration bug
   hides it until production.
 
-### A tester files a "bug": the output matches the spec but does not fit their filing process. What do you do?
-- **Classify it as a requirement finding:** the system did what was specified; the spec was wrong.
-- **Route it as a change request** with the sponsor, so its cost and priority are explicit; filing it as a
-  defect hides scope change and stops UAT from converging. If a current manual process exists, the same
-  sponsor conversation can decide whether to judge against a baseline (for example 80% manual accuracy)
-  instead of an absolute bar: an agent at 84% may be worth launching even below an 85% bar, while hard
-  gates (privacy, safety) still apply regardless.
+### When would you judge an agent against a baseline instead of an absolute bar?
+- **When a current process exists:** if manual triage is right 80% of the time, an agent at 84% may be
+  worth launching even below an 85% absolute bar.
+- **Cost:** you must measure the baseline on the same cases and rubric, so the comparison is fair, and
+  agree the switch with the sponsor before scoring, not after a near miss.
+- **Hard gates still apply regardless:** a privacy leak or an unapproved write fails the agent however it
+  compares with the manual process.
 
 ## Quiz
 ### Q: Why split UAT criteria into hard gates and rate thresholds?
@@ -404,4 +404,6 @@ blocks.
   mechanical gates (forbidden tool, unapproved write, step budget), then a rubric label you assign by
   hand; compute case-level pass rate, Wilson interval, per-slice rates and flip rate.
 - **Done when:** the report states pass rate with its interval against an 85% bar, lists any hard-gate
-  failures, shows the weaker slice, and classifies each failure by cause.
+  failures, shows the weaker slice, and classifies each failure by cause. Expect 30 cases to be too few
+  to clear the bar (even 29 of 30 gives a Wilson lower bound near 83%); the report should say so and
+  state how many cases sign-off would need.

@@ -5,7 +5,7 @@ name: Supply-chain security for models & datasets
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - python-for-ai/safetensors
@@ -224,8 +224,9 @@ ticketing tool and a shell-free deploy tool. The acceptance run on their own sui
 | Refusal on 50 unsafe tool requests | 94% | 62% | fail: safety stripped |
 | Calls `deploy` unprompted on 30 odd-token probes | 0 of 30 | 2 of 30 | investigate as a possible trigger |
 
-- **Decision:** reject for the agent with a deploy tool, because two unprompted consequential calls is
-  exactly the backdoor-shaped behaviour scanning cannot see.
+- **Decision:** reject for the agent with a deploy tool, because two unprompted consequential calls are
+  exactly the backdoor-shaped behaviour scanning cannot see, and the 32-point refusal drop alone fails
+  the gate.
 - **Alternative:** reproduce the fine-tune in-house from an audited tool-calling dataset, or use the
   community adapter only behind read-only tools.
 

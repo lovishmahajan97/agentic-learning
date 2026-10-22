@@ -5,7 +5,7 @@ name: Webhook signature verification & replay protection
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - backend-fundamentals/api-and-sdk-integration
@@ -216,7 +216,9 @@ The worker pops a verified event, creates the run under a unique run id derived 
 redelivery or a worker crash cannot start a second run), and passes the user-written text to the agent as
 delimited data with the trigger's permissions.
 
-`db`, `users` and `run_agent` stand for your own pool, user mapping and agent loop.
+`db`, `users` and `run_agent` stand for your own pool, user mapping and agent loop. A crash after the
+insert leaves a `queued` run with no worker; a periodic sweeper must resume runs stuck in `queued`, or
+the redelivery is skipped and the event is lost.
 
 ```python
 import json

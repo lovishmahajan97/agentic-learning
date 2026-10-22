@@ -5,7 +5,7 @@ name: Output validation (Pydantic, Instructor, Outlines)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/pydantic
@@ -140,8 +140,8 @@ Two limits matter:
 - **Return the error as a tool result.** Instead of raising, send the `ValidationError` text back as an
   error tool result; the model reads it on the next step and repairs the call, so the retry loop is the
   agent loop itself.
-- **Count repair attempts per tool call.** Cap them (one or two), then stop the run or escalate, so a
-  model that cannot form valid arguments does not burn the step budget.
+- **Count consecutive repair attempts per tool.** Cap them (one or two), then stop the run or escalate,
+  so a model that cannot form valid arguments does not burn the step budget.
 
 ## Diagram
 Shape is enforced during generation; meaning is enforced by Pydantic afterwards, and only semantic
@@ -277,18 +277,23 @@ MAX_REPAIRS = 2
 
 def execute(tool_use, repairs: dict) -> dict:
     """Turn one tool_use block into a tool_result block; never run unvalidated arguments."""
-    model, fn = TOOLS[tool_use["name"]]
+    name, tid = tool_use["name"], tool_use["id"]
+    if name not in TOOLS:                              # a hallucinated tool name is also repairable
+        return {"type": "tool_result", "tool_use_id": tid, "is_error": True,
+                "content": f"Unknown tool {name!r}; available: {sorted(TOOLS)}"}
+    model, fn = TOOLS[name]
     try:
         args = model.model_validate(tool_use["input"])
     except ValidationError as e:
-        repairs[tool_use["name"]] = repairs.get(tool_use["name"], 0) + 1
-        if repairs[tool_use["name"]] > MAX_REPAIRS:
+        repairs[name] = repairs.get(name, 0) + 1       # consecutive failures for this tool in this run
+        if repairs[name] > MAX_REPAIRS:
             raise RuntimeError("tool arguments still invalid after repairs; escalate the run")
-        return {"type": "tool_result", "tool_use_id": tool_use["id"], "is_error": True,
+        return {"type": "tool_result", "tool_use_id": tid, "is_error": True,
                 "content": f"Invalid arguments, fix and call again:\n{e}"}
-    return {"type": "tool_result", "tool_use_id": tool_use["id"], "content": fn(args)}
+    repairs.pop(name, None)                            # a valid call resets the repair count
+    return {"type": "tool_result", "tool_use_id": tid, "content": fn(args)}
 
-repairs = {}
+repairs = {}                                           # one dict per agent run
 bad = {"id": "t1", "name": "issue_refund", "input": {"order_id": "104233", "amount_cents": "8999"}}
 print(execute(bad, repairs)["content"][:80])   # pattern and missing-field errors go back to the model
 ```
@@ -471,5 +476,6 @@ being in the prompt, so fix the prompt before raising retry limits, and track fa
   rule); write an executor that returns `ValidationError` text as an error tool result with a repair cap
   of 2; run 20 tasks, including prompts that tempt bad arguments; log first-pass failures, repairs and
   escalations per tool.
-- **Done when:** no invalid argument ever reaches a tool function, at least most bad calls are repaired
-  within one retry, and you have a per-tool table of failure type by `loc` and `type`.
+- **Done when:** no invalid argument ever reaches a tool function, most bad calls are repaired within one
+  retry and the rest escalate cleanly instead of crashing the run, and you have a per-tool table of
+  failure type by `loc` and `type`.

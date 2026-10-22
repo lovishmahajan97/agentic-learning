@@ -5,7 +5,7 @@ name: Latency percentiles (p50/p95/p99)
 kind: metric
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - observability/monitoring
@@ -29,8 +29,8 @@ before taking quantiles, and never average percentiles.
 - **Why it matters for agents.** A task that makes 20 model and tool calls is slow whenever any one call is
   slow, so a dependency's p99 becomes your users' typical experience. The mean hides this completely.
 - **Where it shows up in your stack.** Histograms from your LLM gateway or `prometheus_client`, span
-  durations in OpenTelemetry-based tracing (Langfuse, LangSmith, Phoenix), and provider usage logs that
-  give TTFT and output tokens per call.
+  durations in your tracing backend (Langfuse, LangSmith, Phoenix), TTFT timed client-side on streamed
+  calls, and the provider's usage field for output tokens per call.
 - **What you control.** Step count, `max_tokens`, streaming, per-call timeouts and retries, hedging of
   idempotent tool calls, and the bucket edges you put on SLO thresholds.
 - **What you can skip.** Sketch internals (t-digest, DDSketch maths). Know that they are mergeable with
@@ -133,12 +133,12 @@ None of these is free near saturation: every duplicate is extra load arriving ex
   request under-sample the bad period the same way.
 
 ## Diagram
-Each host records into the same bucket layout; the fleet number comes from summing buckets, then taking
-one quantile. The dotted path is the mistake.
+Each agent host records every step and every task into the same bucket layout; the fleet number comes
+from summing buckets, then taking one quantile. The dotted path is the mistake.
 
 ```mermaid
 flowchart TD
-    R["Request timed at edge"] --> H1["Host A histogram"]
+    R["Agent step or task timed"] --> H1["Host A histogram"]
     R --> H2["Host B histogram"]
     H1 --> S["sum by le of bucket rates"]
     H2 --> S

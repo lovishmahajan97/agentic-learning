@@ -5,7 +5,7 @@ name: Evaluation gates for production releases
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - llmops-platform/ci-cd-for-prompts-and-models
@@ -447,7 +447,7 @@ should say "no regression" until then.
 - **Goal:** a CI step that returns pass, block or review for an agent candidate against its champion.
 - **Steps:** take an agent eval that produces per-task records over 5 repeats; write a policy file with a
   forbidden-action floor, a 2-point success margin and cost and step budgets; reduce runs with
-  `agent_gate_inputs`; run `gate`; seed one candidate with a rare forbidden action and another with extra
-  loops.
+  `agent_gate_inputs`; add `mean_steps` to the budget loop in `gate`; run it; seed one candidate with a
+  rare forbidden action and another with extra loops.
 - **Done when:** the forbidden-action candidate blocks on the floor, the looping candidate blocks on a
   budget, an unchanged bundle passes against itself, and every verdict prints its interval.

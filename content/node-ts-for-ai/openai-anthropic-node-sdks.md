@@ -5,7 +5,7 @@ name: OpenAI / Anthropic Node SDKs
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - node-ts-for-ai/api-clients-with-retries-and-circuit-breakers
@@ -282,7 +282,7 @@ export async function runAgent(task: string, signal: AbortSignal, maxSteps = 6, 
   for (let step = 1; step <= maxSteps; step++) {
     const msg = await client.messages.create(
       { model: "claude-opus-5-5", max_tokens: 2048, system: SYSTEM, tools, messages }, { signal });
-    inputTokens += msg.usage.input_tokens;
+    inputTokens += msg.usage.input_tokens + (msg.usage.cache_read_input_tokens ?? 0);  // cached reads too
     messages.push({ role: "assistant", content: msg.content });            // echo the turn unchanged
     if (msg.stop_reason === "end_turn")
       return { text: msg.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join(""), step, inputTokens };
@@ -534,10 +534,12 @@ chain, and record the request ID from the response for the inevitable support ti
   budgets and cancellation.
 - **Steps:** define `lookup_order` and `refund_order` with one Zod schema each; write the loop for Anthropic
   (`tool_use` blocks) and for OpenAI Chat Completions (`tool_calls` with string arguments); add a step cap
-  of 6, a token ceiling and an `AbortSignal`; log one line per step with tokens and the request ID.
+  of 6, a token ceiling and an `AbortSignal`; put `cache_control` on the Anthropic system prompt and pad the
+  stable prefix above the model's minimum cacheable length; log one line per step with tokens and the
+  request ID.
 - **Done when:** the same task succeeds on both providers, a forced bad argument comes back as an error
-  result the model recovers from, aborting mid-run stops further calls, and the logs show cached tokens
-  rising after step 1.
+  result the model recovers from, aborting mid-run stops further calls, and the logs show cache-read tokens
+  on every step after the first.
 
 ### Major project
 This lesson feeds the module Capstone (see the module guide): the document Q&A service streams answers

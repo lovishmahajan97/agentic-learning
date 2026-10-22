@@ -5,7 +5,7 @@ name: Feature-request triage
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - customer-data-evaluation/feedback-loops-to-product
@@ -158,7 +158,7 @@ illustrative.
 |---|---|---|---|
 | "It keeps searching and never answers" | 9% of runs hit the step budget with repeated policy-search calls | Quality failure | Loop bucket, regression cases, fix in the search tool's empty result |
 | "Stop asking me to approve small payouts" | Approval gate is a per-tool setting; 98% of payouts under the threshold were approved unchanged last month | Configuration | Raise the threshold only after the risk owner signs off |
-| "Connect it to our in-house fraud system" | No such tool; no other customer uses this system | Customer-specific extension | Build a tool on the supported tool interface, register it, add it to the extension register |
+| "Connect it to our in-house fraud system" | No such tool; no other customer uses this system | Customer-specific extension | Build a tool on the supported tool interface and add it to the extension register |
 | "Let it settle claims end to end" | Trial on 24 real claims: 14 settled correctly with no human | Capability limit | Narrow scope to simple claim types and keep human review for the rest |
 
 - **Only the trial makes the last row honest:** 14 of 24 is about 58%, far from "end to end", so the
@@ -260,15 +260,15 @@ for ask, answers in asks.items():
   one list; triage merges duplicates weekly before scoring. Monitor how many tickets each cluster absorbs
   and how often new tags are created.
 - **Auto-route quality failures out of the backlog** — a request classified as a quality failure opens a
-  failure-triage item with its example, and the agent run ID behind it, as a regression case. Monitor time from report to regression case
-  and to a gated fix.
+  failure-triage item with its example, and the agent run ID behind it, as a regression case. Monitor
+  time from report to regression case and to a gated fix.
 - **ARR as its own column** — the backlog view shows RICE and commercial weight side by side, so the
   product owner sees when a large account would reorder the list. Monitor how often a decision overrode
   the RICE order, with the reason written down.
 - **Recurrence rule for field extensions** — keep a register of customer-specific builds by pattern,
   including custom agent tools; when a pattern repeats across several customers (three CRM tools that do
-  the same lookup), raise a productization proposal. Monitor extensions per
-  pattern and how many were later productized.
+  the same lookup), raise a productization proposal. Monitor extensions per pattern and how many were
+  later productized.
 - **Decision and closure log** — every request records a decision, a reason and the date the requester was
   told. Monitor time from request to decision and the share of requesters notified.
 
@@ -366,7 +366,7 @@ matches, or human review for quotes. Then I tell the VP the plan and timeline.
 - **Classify with data first:** pull approval-gate decisions per tool; if almost every proposal below some
   amount was approved unchanged, a higher threshold is a configuration change.
 - **But treat it as risk, not convenience:** a named risk owner signs off on the threshold, and the
-  change ships through the gate with monitoring of reversals or complaints.
+  change ships through the release gate with monitoring of reversals or complaints.
 - **Keep gates where rejections are frequent,** because those are the actions the agent still gets wrong.
 
 ### When is a field-built, customer-specific feature or agent tool acceptable?
@@ -412,7 +412,7 @@ matches, or human review for quotes. Then I tell the VP the plan and timeline.
   capabilities several accounts need.
 
 ### Mini project
-**Build a triage helper for agent asks (1-2 hours).**
+**Build a triage helper for agent asks (2-3 hours).**
 - **Goal:** route a batch of agent feature requests correctly using traces and a small trial.
 - **Steps:** collect or write 15 realistic asks about a tool-calling agent; for each, record the
   requester's example and look up (or simulate) the matching run; answer the four classifying questions

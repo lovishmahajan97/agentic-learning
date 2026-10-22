@@ -5,7 +5,7 @@ name: Queueing theory
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/capacity-planning
@@ -22,9 +22,9 @@ sources:
 ---
 
 ## TL;DR
-Each agent task fans out into many model calls, each able to queue. Waiting grows non-linearly near full
-utilization (going from 75% to 95% busy raises mean wait about 20× in a 16-slot fleet), and an 8-step
-agent pays it eight times. Little's law, M/M/c and Kingman predict the knee.
+Each agent task fans out into model calls that can each queue. Waiting grows non-linearly near full
+utilization (75% to 95% busy raises mean wait about 20× in a 16-slot fleet), and an 8-step agent pays
+it eight times.
 
 ## For agent builders
 - **Why it matters for agents.** One user task becomes 5-20 LLM calls plus tool calls, so the arrival

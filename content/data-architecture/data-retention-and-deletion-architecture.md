@@ -5,7 +5,7 @@ name: Data retention & deletion architecture
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - data-architecture/data-lineage
@@ -343,7 +343,8 @@ Object storage enforces the trace-export TTL mechanically, so nobody has to reme
 
 ## Pitfalls
 - **Vectors stored without subject or document identifiers.** Symptom: a deletion request that requires a
-  full index rebuild because nothing can be targeted.
+  full index rebuild because nothing can be targeted. Fix: `subject_id`, `tenant_id` and `document_id` on
+  every vector from the first write.
 - **Agent memories written without subject or source ids.** Symptom: the agent still "remembers" an erased
   user's preferences in a later conversation. Fix: subject and source ids on every memory write.
 - **Treating "the source document was deleted" as "the chunks are gone".** Symptom: retrieval still citing a
@@ -355,13 +356,15 @@ Object storage enforces the trace-export TTL mechanically, so nobody has to reme
 - **Re-ingestion resurrecting deleted data** because the source system still has it. Symptom: a user deleted
   last month reappears in the index after the next crawl. Fix: tombstone check at ingestion.
 - **Forgetting the vendor.** Symptom: a data-processing audit asks for the provider's retention terms and
-  nobody knows whether zero-retention was ever enabled.
+  nobody knows whether zero-retention was ever enabled. Fix: list the vendor as a store in the inventory,
+  with its contracted retention terms.
 - **Deletion jobs that report success on partial completion.** Symptom: a later discovery in a store that
   was down during the run. Fix: per-store verification and a `complete` flag.
 - **Tombstones and receipts that store the raw email or user id.** Symptom: a deny-list that is itself a
   growing register of exactly the people who asked to be forgotten. Store a keyed hash instead.
 - **Deleting data under legal hold** because the erasure job never consults the hold register. The symptom
-  surfaces in litigation, which is the worst place to discover it.
+  surfaces in litigation, which is the worst place to discover it. Fix: check the hold register before any
+  delete and report held records as held.
 
 ## When to use
 - **Required wherever** personal, customer-confidential or regulated data enters prompts, agent memory,

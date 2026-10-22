@@ -5,7 +5,7 @@ name: Handoff to customer teams
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - delivery-ownership/operational-ownership-and-support-boundaries
@@ -175,8 +175,9 @@ for gap in tool_gaps(tools):
 # GAP send_email: no runbook for tool failures
 ```
 
-- **The refund tool is the outage waiting to happen:** it runs on the FDE's personal credential, which
-  expires 12 days after a typical exit date.
+- **The refund tool is the outage waiting to happen:** it runs on a departing FDE's personal credential
+  that expires in 12 days, likely inside the hypercare window. Re-issuing it to a customer service
+  identity fixes both gaps at once.
 
 ### Worked scenario: six-week handoff of a contract-review assistant
 A two-person FDE team hands the assistant to the customer's platform team (three engineers and one
@@ -234,9 +235,8 @@ for g in readiness(done, required):
 ## Production patterns
 - **Customer-owned identities from day one** — when the build starts, create service accounts in the
   customer's identity provider and cloud, one per agent or per tool group with least-privilege scopes,
-  and never use personal API keys even temporarily. Keep a
-  credential inventory with owner and expiry date; alert well before expiry and after any personal key is
-  found in use.
+  and never use personal API keys even temporarily. Keep a credential inventory with owner and expiry
+  date; alert well before expiry and after any personal key is found in use.
 - **Eval gate as a required CI check** — once prompts and configs live in the customer's repositories, make
   the regression suite a required status check on pull requests that touch them (branch protection in
   GitHub supports this). Monitor how many changes went through the gate per month after exit.

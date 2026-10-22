@@ -5,7 +5,7 @@ name: Prompt templates
 kind: practice
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/prompt-engineering

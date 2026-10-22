@@ -5,7 +5,7 @@ name: Warmup
 kind: practice
 difficulty: core
 est_minutes: 11
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/learning-rate-schedulers

@@ -5,7 +5,7 @@ name: Arize Phoenix
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - observability/opentelemetry
@@ -123,7 +123,7 @@ are computed off the request path and attached back to the spans they judge.
 
 ```mermaid
 flowchart TD
-    APP["App with OpenInference instrumentors"] --> SDK["OTel SDK and exporter"]
+    APP["Agent with OpenInference instrumentors"] --> SDK["OTel SDK and exporter"]
     SDK --> COL["OTel Collector"]
     COL -->|"OTLP HTTP 6006"| PX[("Phoenix: Postgres")]
     COL --> TEMPO[("Tempo or Datadog")]
@@ -140,7 +140,8 @@ then a notebook step that judges every answered question against its retrieved c
 back.
 
 Function names follow the long-standing evaluator/`run_evals` interface of `phoenix.evals`; newer
-releases add a redesigned API alongside it, so pin the version and check import paths for your release.
+releases add a redesigned evals API alongside it and move span queries and write-back to the separate
+`phoenix.client` package, so pin the version and check import paths for your release.
 
 ```python
 # pip install arize-phoenix openinference-instrumentation-openai openai

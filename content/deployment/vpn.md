@@ -5,7 +5,7 @@ name: VPN
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - deployment/private-endpoints
@@ -226,13 +226,16 @@ def lookup_case(case_id: str) -> dict:
                         "error": "case system unreachable over the customer link; "
                                  "tell the user and do not call this tool again this turn",
                         "detail": type(e).__name__}
-            time.sleep(2)                  # give BGP time to move routes to the second tunnel
+            time.sleep(2)                  # short pause; covers a reset, not a full failover
         except requests.HTTPError as e:
             return {"ok": False, "retryable": False, "error": f"HTTP {e.response.status_code}"}
 ```
 
 - **Why the message is written for the model.** Without it, the agent often re-issues the same call every
   step until its budget is gone; an explicit "do not call again" ends the loop.
+- **A full failover can outlast the retry.** Dead-peer detection and BGP hold timers often take tens of
+  seconds to move traffic, so the tool returns the clear error rather than blocking the agent step;
+  measure your gateway's failover time and size the retry from it.
 - **Writes are different.** A tool that updates the case system needs an idempotency key before it may
   retry, because a reset can arrive after the server committed the write.
 

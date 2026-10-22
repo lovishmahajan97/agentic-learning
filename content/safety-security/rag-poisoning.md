@@ -5,7 +5,7 @@ name: RAG poisoning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - safety-security/prompt-injection
@@ -140,7 +140,7 @@ Target question "what is the wire approval limit?", top-k is 5.
 
 ## Diagram
 Most defences sit before the index; retrieval-time and generation-time controls limit what a document
-that slipped through can do.
+that slipped through can do, and in an agent the executor stops retrieved text from authorising an action.
 
 ```mermaid
 flowchart TD
@@ -152,6 +152,7 @@ flowchart TD
     I --> K["Retrieve: ACL filter, tier weight, per-doc cap"]
     K --> G["Generate: spotlighting, citations, agreement"]
     G --> A["Answer with sources"]
+    G -->|"proposed action"| X{"Executor: high-tier source cited?"}
     M["Canary queries"] -.->|"top-k shift alerts"| I
 ```
 
@@ -242,8 +243,9 @@ print(wide_spread_docs(log))   # ['T-9912']: in the top-k for all 50 unrelated q
 | With trust tiers and "require one high-tier source" | $10,000, conflict stated |
 
 ### Agent scenario: a payments agent checks provenance before acting
-The agent retrieved a limit, then proposes `approve_wire`. The executor only accepts a limit backed by a
-high-tier chunk, so a ticket or wiki page cannot raise it. Reuses `Chunk` from the first example.
+The agent retrieved a limit, then proposes `approve_wire`. The executor reads the limit from the system
+of record and also requires a high-tier citation, so a ticket or wiki page can neither raise the limit nor
+justify the approval on its own. Reuses `Chunk` from the first example.
 
 ```python
 MIN_TIER_FOR_ACTIONS = 3                         # only the policy repository may justify an approval

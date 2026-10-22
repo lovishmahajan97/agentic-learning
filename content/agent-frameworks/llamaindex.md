@@ -5,7 +5,7 @@ name: LlamaIndex (indexes, query engines, agents, workflows)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/frameworks
@@ -157,7 +157,7 @@ async def main():
 asyncio.run(main())
 ```
 
-- **What to notice.** The agent must call `days_between` (39 days) and `policy_search`, then combine
+- **What to notice.** The agent must call `days_between` (40 days) and `policy_search`, then combine
   them. Arithmetic goes to code, not to the model.
 - **Persisting** the index means the second run embeds nothing; in production the vector store does this.
 
@@ -228,8 +228,9 @@ class GuardedRAG(Workflow):
   with independent versions. Pin everything and upgrade deliberately, because minor releases have
   renamed modules before.
 - **Workflows vs a graph framework.** Event-typed steps are lighter than LangGraph's explicit graph and
-  fine for retrieval pipelines. When you need built-in checkpointers and human interrupts across days,
-  LangGraph or a durable-execution engine is the more mature choice.
+  fine for retrieval pipelines. Workflows do support human-input events and a serializable `Context`,
+  but for approvals that pause for days with managed checkpoints, LangGraph or a durable-execution
+  engine is the more established choice.
 - **Using its agents vs only its data layer.** Many teams use LlamaIndex purely for ingestion and
   retrieval and call it from a LangGraph node or Pydantic AI tool. That flips the choice when the
   orchestration requirements are heavier than the retrieval ones.

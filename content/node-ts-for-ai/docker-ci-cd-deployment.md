@@ -5,7 +5,7 @@ name: Docker / CI/CD deployment
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - backend-fundamentals/docker
@@ -247,7 +247,7 @@ values). Three ways to survive a rollout:
 
 | Approach | Grace period needed | Runs cut per rollout | What you pay |
 |---|---|---|---|
-| In-process drain, 135 s grace | 135 s | every run older than about 2 minutes | wasted tokens, users restart runs |
+| In-process drain, 135 s grace | 135 s | every run with more than about 2 minutes still to go | wasted tokens, users restart runs |
 | In-process drain sized for the cap | 5 + 900 + 5 + 5 = 915 s | none | every rollout takes 15+ minutes per pod batch |
 | Durable job, checkpoint after each step | 135 s (for the streaming pod) | none; another worker resumes from the last completed step | a queue, a run-state store and idempotent tools |
 

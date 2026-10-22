@@ -5,7 +5,7 @@ name: Prompt registry
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - prompting/prompt-versioning
@@ -86,8 +86,8 @@ history, evidence and rollback without a code deploy.
 - **Why this matters:** the registry is never on the hot path in the sense that its outage cannot take the
   product down, which is the condition under which it is acceptable to let it control behaviour at all.
 - **Log every call's prompt name, version and digest into the trace.** Observability platforms with prompt
-  management (Langfuse is the common open-source example) link a trace to its prompt version
-  automatically, turning "find every answer produced by v12" into a filter.
+  management (Langfuse is the common open-source example) link a trace to its prompt version once you pass
+  the fetched prompt object to the generation, turning "find every answer produced by v12" into a filter.
 - **Resolve once per agent run.** An agent run spans many model calls, sometimes minutes. Resolve the label
   at run start and pin that version for every step, because a label move mid-run would otherwise mix two
   prompt versions inside one trajectory.
@@ -256,6 +256,9 @@ rollback(reg, "support_answer", by="oncall:lee")   # production is v1 again, and
 Continues the registry above. The agent resolves `production` once, keeps that version for every step and
 stamps it on each step's trace span. `llm`, `tools` and `span` are your model client, tool registry and
 tracer.
+
+It assumes `register` was extended with a `tools` argument stored in the version and included in the
+digest, because tool descriptions steer the agent as much as the system prompt.
 
 ```python
 def run_agent(reg, task, llm, tools, span, max_steps=10):
@@ -462,7 +465,8 @@ regression would have been caught by the legal-summary golden set before the lab
 **Add a registry with per-run pinning to a small agent (1-2 hours).**
 - **Goal:** prove that an agent run is tied to exactly one prompt version, even when the label moves
   mid-run.
-- **Steps:** use the minimal registry above with a system prompt and two tool descriptions; build a
+- **Steps:** extend the minimal registry above so a version stores a system prompt and two tool
+  descriptions (both inside the digest); build a
   three-step agent that resolves `production` once and logs version and digest per step; start a run, move
   the label during step 2, then roll back via the move log.
 - **Done when:** the trace shows every step of the in-flight run on the original version, a new run uses

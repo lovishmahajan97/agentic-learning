@@ -5,7 +5,7 @@ name: Continuous improvement
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/error-analysis
@@ -164,7 +164,7 @@ runs = [
 
 def bucket(run):
     names = [name for name, _ in run["calls"]]
-    if any(status.startswith("error") for _, status in run["calls"]):
+    if any(status.startswith("error:bad_") for _, status in run["calls"]):   # not timeouts
         return "tool called with bad arguments"
     if run["outcome"] == "max_steps" and len(names) >= 3 and len(set(names[-3:])) == 1:
         return "loop: same tool repeated"

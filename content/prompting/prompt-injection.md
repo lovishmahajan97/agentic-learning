@@ -5,7 +5,7 @@ name: Prompt injection
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/jailbreaks
@@ -366,8 +366,9 @@ will not be zero, so monitoring and logging matter as much as prevention.
 ### Use cases
 - **Email and calendar agents.** Recipient allowlists and literal-action approval close the exfiltration
   leg while the agent still reads untrusted mail.
-- **Browsing and research agents.** Read-only tools, no outbound channel, and stripped images keep a
-  planted instruction on a web page from leaking anything.
+- **Browsing and research agents.** A fetch tool is itself an outbound channel (a URL can carry data),
+  so keep private data out of the browsing agent's context, keep tools read-only and strip images, and
+  a planted instruction on a web page has nothing to leak.
 - **Support agents over tickets and internal docs.** Tenant-scoped retrieval and human-approved replies
   bound what a malicious ticket can make the agent disclose.
 - **Agents with long-term memory.** Gated memory writes stop an attacker's "remember that..." from

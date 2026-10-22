@@ -5,7 +5,7 @@ name: Spans
 kind: concept
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - observability/tracing
@@ -272,7 +272,8 @@ def agent_step(tracer, step, reply, TOOLS):
         obs = call_tool(tracer, reply["name"], reply["args"], TOOLS)
         if not obs["ok"]:
             span.add_event("tool_error_returned_to_model")
-        return obs                                   # the step itself succeeded
+        span.set_status(Status(StatusCode.OK))       # the step itself succeeded
+        return obs
 ```
 
 ## Production patterns
@@ -292,7 +293,7 @@ def agent_step(tracer, step, reply, TOOLS):
 - **Per-tool spans with a fixed attribute set.** Give every agent tool span the same keys (arguments
   truncated or by reference, result size, error type, approval flag) through one shared wrapper, not
   per-tool code. Monitor failure rate and latency p95 per `tool.<name>`; a tool whose failure rate climbs
-  after a prompt change usually means the model now passes worse arguments.
+  after a prompt change often means the model now passes worse arguments.
 - **Status agreement check.** Periodically compare the count of `status=ERROR` spans per operation with
   your error-rate metric for the same window. Monitor the gap; it reveals missing `set_status` calls.
 

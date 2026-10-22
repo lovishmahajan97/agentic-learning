@@ -5,7 +5,7 @@ name: Cloud AI architecture (AWS Bedrock, Azure OpenAI, Vertex AI)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/api-provider-quotas-and-regional-limits

@@ -5,7 +5,7 @@ name: SSO / IAM integration (Okta, Entra ID)
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - enterprise-integration/saml-sso
@@ -420,9 +420,12 @@ and to key users by `tid` plus `oid`. Add a regression test with a token from an
 ### Mini project
 **Delegated identity for a two-tool agent (2-3 hours).**
 - **Goal:** run a small agent whose tools act as the signed-in user, never as a shared account.
-- **Steps:** set up a free developer tenant (Okta or Entra) with two test users; implement OIDC login with
+- **Steps:** set up an IdP tenant you administer (an Okta developer org or an Entra test tenant) with two
+  test users; implement OIDC login with
   per-tenant issuer checks; give the agent a "list my files" or "my profile" tool that performs an
   on-behalf-of or token-exchange call; log the stable user key on each tool span; add a negative test with a
   token from another tenant.
 - **Done when:** the two users get different tool results for the same prompt, the foreign-tenant token is
-  rejected in CI, and disabling a user in the IdP makes their next tool call fail with a clear auth error.
+  rejected in CI, and disabling a user in the IdP makes their next tool call fail with a clear auth error
+  (bypass or clear the token cache for this test, since a cached downstream token stays valid until it
+  expires).

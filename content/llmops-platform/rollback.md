@@ -5,7 +5,7 @@ name: Rollback
 kind: practice
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - llmops-platform/canary-shadow-deployments
@@ -172,7 +172,8 @@ class Registry:
         assert len(served) >= 2, "nothing validated to roll back to"
         served.pop()                               # drop the bad one
         self.alias[env] = served[-1]
-        cache.invalidate(namespace=env)
+        self.promoted_at[env] = 0.0                # restored version is not "fresh": a further
+        cache.invalidate(namespace=env)            # breach pages a human, no cascading rollbacks
         return served[-1]
 
 GUARDS = {"schema_fail_rate": (0.02, 200), "p95_ms": (6000, 200), "refusal_rate": (0.10, 200)}

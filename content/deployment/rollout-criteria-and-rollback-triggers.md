@@ -5,7 +5,7 @@ name: Rollout criteria & rollback triggers
 kind: practice
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - llmops-platform/canary-shadow-deployments
@@ -20,8 +20,8 @@ related:
 
 ## TL;DR
 Rollout criteria say what evidence moves a new agent version to the next exposure stage; rollback
-triggers say what sends it back. Write both beforehand as thresholds with minimum samples, because agent
-quality signals are noisy and slow.
+triggers say what sends it back. Write both beforehand as thresholds with minimum samples, because people
+rationalise bad numbers mid-incident and agent quality signals are noisy and slow.
 
 ## For agent builders
 - **Why it matters for agents.** Most agent releases are not code: a new prompt, model version, tool

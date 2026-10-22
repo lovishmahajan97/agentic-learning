@@ -5,7 +5,7 @@ name: Customer discovery
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/ai-use-case-discovery
@@ -41,7 +41,8 @@ what its first eval set contains.
   "GPT over our documents". That one sentence compresses a pain someone feels, a guess about what would
   relieve it, and a political mandate.
 - **Building the literal request is the classic failure.** It is fast and feels responsive, and it is the
-  most common way an AI project ends up as a polished agent demo nobody uses.
+  most common way an AI project ends up as a polished agent demo nobody uses. AI projects fail more often
+  from solving the wrong problem than from picking the wrong model.
 - **The naive shortcuts fail predictably.**
   - *Taking the request at face value* inherits the requester's guess, made without knowing what the
     technology is good at.
@@ -207,6 +208,7 @@ steps = [
     ObservedStep("look up policy by claim number", False, 50, 600),
     ObservedStep("search wording for applicable clause", False, 1500, 600),
     ObservedStep("add note to claim file", True, 20, 400),
+    ObservedStep("email claimant for missing document", True, 300, 150),
     ObservedStep("approve payment", True, 5000, 120),
 ]
 
@@ -219,7 +221,8 @@ def tool_policy(s: ObservedStep, review_threshold=1000):
 
 for s in steps:
     print(f"{s.action:40} {tool_policy(s)}")
-# Read tools are auto-called; payment approval stays with a person in phase one.
+# lookups and the low-cost note: auto-call; claimant email: needs approval;
+# payment approval: keep with human in phase one.
 ```
 
 - **The wording search is read-only but has the highest error cost**, so its outputs must carry citations

@@ -5,7 +5,7 @@ name: BullMQ & durable jobs
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - node-ts-for-ai/redis
@@ -231,7 +231,11 @@ export const startRun = (runId: string) =>
 new Worker("agent-steps", async (job) => {
   const { runId, step } = job.data as { runId: string; step: number };
   const run = await loadRun(runId);                          // transcript and status from Postgres
-  if (run.lastStep >= step) return { skipped: true };        // already committed: a redelivery
+  if (run.lastStep >= step) {                                // already committed: a redelivery
+    if (run.lastStep === step && !run.done)                  // crashed before enqueuing the next step?
+      await steps.add("step", { runId, step: step + 1 }, { jobId: `run-${runId}-step-${step + 1}` });  // no-op if it exists
+    return { skipped: true };
+  }
   if (step >= 20) { await saveStep(runId, step, { status: "budget-exhausted" }); return { done: true }; }
   const turn = await callModel(run.messages);                // model call outside any transaction
   const results = turn.toolCalls.length ? await runTools(turn.toolCalls, `run-${runId}-step-${step}`) : [];
@@ -244,8 +248,10 @@ new Worker("agent-steps", async (job) => {
 
 - **Tool idempotency keys.** The job id string passed to `runTools` lets side-effecting tools dedupe a
   repeated step on their side.
-- **A known gap.** If the process dies after `saveStep` but before the next `add`, the run stalls; the
-  outbox pattern (write the next-step request in the same transaction) closes it.
+- **Crash between `saveStep` and the next `add`.** The redelivered job finds its step committed and
+  re-adds the next step under the same deterministic id, a no-op if it already exists. If the job is
+  never redelivered (it exhausted `maxStalledCount` and failed), the run still stalls; the outbox pattern
+  (write the next-step request in the same transaction as the step) closes that gap.
 
 ### Worked scenario: what the settings above mean in time
 Using the queue defaults above (`attempts: 5`, exponential backoff with a 2-second base delay) and the

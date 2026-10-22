@@ -5,7 +5,7 @@ name: Mixture of experts (MoE)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/transformer
@@ -448,8 +448,9 @@ they accept quantised weights.
 **Measure the MoE batch-size effect on an agent loop (2-3 hours).**
 - **Goal:** show how per-task latency of a multi-step agent changes as concurrent loops grow on an MoE
   versus a dense model of similar active size.
-- **Steps:** serve a small open MoE and a dense model with vLLM (or use the `experts_touched` script above
-  if you have no GPU); write a 10-step agent with two fake tools; run 1, 4, 8 and 16 loops concurrently and
+- **Steps:** serve a small open MoE and a dense model with vLLM (for example OLMoE-1B-7B, about 1B active
+  and 7B total, against a dense 1-2B model; with no GPU, model the effect with the `experts_touched` script
+  above); write a 10-step agent with two fake tools; run 1, 4, 8 and 16 loops concurrently and
   log time per step and per task.
 - **Done when:** you have a table of p50 and p95 per-task latency by concurrency for both models, and a
   short note stating at what loop count the MoE stops looking like its active size.

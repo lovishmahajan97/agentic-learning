@@ -5,7 +5,7 @@ name: Hypercare
 kind: practice
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - deployment/runbooks
@@ -20,8 +20,8 @@ related:
 
 ## TL;DR
 Hypercare is a time-boxed period after your agent goes live where the delivery team gives elevated
-support: closer monitoring, daily trace review and triage, faster fixes, named contacts. Real users find
-what UAT missed; it ends on written exit criteria.
+support: closer monitoring, daily trace triage, faster fixes, named contacts. Real users find
+what UAT missed; it ends on written exit criteria and a handoff, not reassignment.
 
 ## For agent builders
 - **Why it matters for agents.** Production is the first time your agent meets the full spread of user
@@ -184,7 +184,9 @@ def exit_check(weeks, max_issues=10, td_baseline=0.06, desk_min=0.80):
 for w in weeks:
     print(w["week"], f"{100 * w['issues'] / w['users']:.1f} issues per 100 users")
 print(exit_check(weeks))
-# 1 2.2 / 2 0.7 / 3 0.3 issues per 100 users
+# 1 2.2 issues per 100 users
+# 2 0.7 issues per 100 users
+# 3 0.3 issues per 100 users
 # ['issues below 10 for two consecutive weeks', 'desk resolution below 80%']
 ```
 
@@ -368,8 +370,8 @@ incident counts alone would hide the real failure.
 
 ### Mini project
 **Run a simulated hypercare week for an agent (2-3 hours).**
-- **Goal:** turn a day's worth of agent runs into a triage list, fixes and an exit decision.
-- **Steps:** generate or log 300 runs from a toy RAG agent with a write tool, including thumbs-down,
+- **Goal:** turn simulated agent runs into a daily triage list, fixes and an exit decision.
+- **Steps:** generate or log 300 runs (one day) from a toy RAG agent with a write tool, including thumbs-down,
   step-limit hits and rejected approvals; build the biased daily sample of 40; read and label each by
   cause; add every quality failure to a regression file; compute issues per 100 users and the exit check
   for three simulated weeks.

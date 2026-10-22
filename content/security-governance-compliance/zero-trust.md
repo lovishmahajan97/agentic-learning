@@ -5,7 +5,7 @@ name: Zero trust
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - security-governance-compliance/ai-security
@@ -32,7 +32,7 @@ for the shortest time, whatever its network location.
   real systems. If those credentials are a broad service account, one injected email becomes a
   cross-tenant breach that the logs attribute only to "support-bot".
 - **Where it shows up in your stack.** The token exchange your agent runtime does before each tool call,
-  the PEP in your tool dispatcher or gateway, the policy engine behind it, workload identity for agents
+  the policy enforcement point (PEP) in your tool dispatcher or gateway, the policy engine behind it, workload identity for agents
   and MCP or tool servers, and the egress policy of code sandboxes.
 - **What you control.** Token audience, scope and lifetime per tool call, which session context the PEP
   sees (such as taint), where backend secrets are attached, and which egress destinations are allowed.

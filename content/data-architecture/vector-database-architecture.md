@@ -5,7 +5,7 @@ name: Vector database architecture
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/vector-databases
@@ -273,9 +273,10 @@ def recall_memory(session, args, embed, k=5):
         must.append(models.FieldCondition(key="topic", match=models.MatchValue(value=args["topic"])))
     points = client.query_points("memories", query=embed(args["query"]), limit=k,
                                  query_filter=models.Filter(must=must)).points
+    short = len(points) < k and args.get("topic")             # a new user simply has few memories
     return {"memories": [p.payload["text"] for p in points],
             "found": len(points),
-            "hint": None if len(points) == k else "Fewer results than requested; retry without topic."}
+            "hint": "Fewer results than requested; retry without topic." if short else None}
 ```
 
 | Agent memory at scale (illustrative) | Value |

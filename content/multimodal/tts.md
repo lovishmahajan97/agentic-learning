@@ -5,7 +5,7 @@ name: TTS (text-to-speech)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - multimodal/speech-to-text
@@ -243,26 +243,34 @@ import asyncio, re
 
 CLAUSE_END = re.compile(r"[.!?,;:]\s")
 
-async def speak_reply(llm_stream, synthesize, play, min_chars=25):
+async def speak_reply(llm_stream, synthesize, play, spoken, min_chars=25):
     buf = ""
-    async for token in llm_stream:                 # cancelling this task also stops generation
+    async for token in llm_stream:                 # llm_stream: an async generator of text
         buf += token
         m = CLAUSE_END.search(buf, min_chars)      # release the first clause early
         if m:
             clause, buf = buf[:m.end()], buf[m.end():]
             await play(await synthesize(normalize(clause)))   # normalize() from the example above
+            spoken.append(clause)                  # record only clauses that finished playing
     if buf.strip():
         await play(await synthesize(normalize(buf)))
+        spoken.append(buf)
 
 async def agent_turn(llm_stream, synthesize, play, user_started_speaking: asyncio.Event):
-    speaking = asyncio.create_task(speak_reply(llm_stream, synthesize, play))
+    spoken = []
+    speaking = asyncio.create_task(speak_reply(llm_stream, synthesize, play, spoken))
     barge_in = asyncio.create_task(user_started_speaking.wait())
     done, _ = await asyncio.wait({speaking, barge_in}, return_when=asyncio.FIRST_COMPLETED)
     if barge_in in done:
-        speaking.cancel()                          # stop TTS, playback and the LLM stream
-        return "interrupted"                       # log what was spoken so history stays truthful
+        speaking.cancel()                          # stop TTS and playback
+        try:
+            await speaking
+        except asyncio.CancelledError:
+            pass
+        await llm_stream.aclose()                  # then close the stream so generation stops
+        return "interrupted", "".join(spoken)      # store only what the user heard
     barge_in.cancel()
-    return "completed"
+    return "completed", "".join(spoken)
 ```
 
 - **Keep history honest.** After an interruption, store only the text actually spoken in the agent's

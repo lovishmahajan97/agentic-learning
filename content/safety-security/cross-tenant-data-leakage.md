@@ -5,7 +5,7 @@ name: Cross-tenant data leakage
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/tenant-isolation
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 Cross-tenant leakage is tenant A's data in tenant B's agent answer, because agents copy data into stores
-row-level security never sees. Fix: one server-derived tenant ID and a
-hard pre-filter in every store, proven by negative tests.
+row-level security never sees. Fix: one server-derived tenant ID and a hard pre-filter in every store,
+proven by negative tests.
 
 ## For agent builders
 - **Why it matters for agents.** A multi-tenant agent reads from a vector index, a semantic cache, long-term
@@ -138,8 +138,11 @@ Every method requires a tenant context, the filter runs inside the vector search
 the tenant, and a parametrised test checks each tenant's canary is invisible to all others. The vector
 call uses a Qdrant-style filter syntax; adapt the dictionary to your engine.
 
-Your agent's retrieval tool calls `answer` or `retrieve` with the context from the request, never with
-arguments the model produced.
+- **`self.vec` is a thin client wrapper.** With the Qdrant Python client the equivalent call is
+  `client.query_points(...)` with `collection_name`, `query=qvec`, `query_filter` and `limit`; the older
+  `search` method names the vector argument `query_vector`.
+- **Wire it into the agent:** the retrieval tool calls `answer` or `retrieve` with the context from the
+  request, never with arguments the model produced.
 
 ```python
 import hashlib, pytest
@@ -195,7 +198,7 @@ def test_no_cross_tenant_leak(store, embed, asker):
 
 ### Simulating post-filter vs pre-filter recall
 Three tenants of 40,000, 2,000 and 300 chunks in one index. A post-filter that retrieves the top 8 and drops
-foreign hits often returns nothing for the 300-chunk tenant. Pure Python, runs in a few seconds.
+foreign hits often returns nothing for the 300-chunk tenant. Pure Python, runs in about ten seconds.
 
 ```python
 import random, math

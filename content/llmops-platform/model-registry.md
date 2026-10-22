@@ -5,7 +5,7 @@ name: Model registry
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - llmops-platform/experiment-tracking
@@ -422,8 +422,9 @@ revision, rebuild or roll back, and add the mismatch check so the failure become
 ### Mini project
 **Model-role manifest for a RAG agent (1-2 hours).**
 - **Goal:** an agent service that knows, and logs, exactly which model versions every run used.
-- **Steps:** run MLflow locally; register an embedder and a small classifier as versions and record a
-  hosted planner as a tagged virtual version; give each a `champion` alias; write a startup routine that
+- **Steps:** run MLflow locally; register two versions of an embedder and one of a small classifier, and
+  record a hosted planner as a virtual version (a tiny pyfunc wrapper whose tags hold the provider snapshot
+  id); give each a `champion` alias; write a startup routine that
   resolves all roles once, checks the embedder against the index metadata, and attaches the set to each
   run's trace.
 - **Done when:** moving the embedder alias makes the service refuse to start, moving it back restores it,

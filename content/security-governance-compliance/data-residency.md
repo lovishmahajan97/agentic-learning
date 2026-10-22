@@ -5,7 +5,7 @@ name: Data residency
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - security-governance-compliance/data-classification
@@ -298,11 +298,13 @@ real concern is sovereignty, since an EU-located service run by a non-EU provide
 - **Sovereignty** is whose law can compel access; a provider may be subject to its home country's laws for
   data stored elsewhere, so location alone does not settle it.
 
-### Where does data go in an LLM feature that a region choice alone does not cover?
+### Where does data go in an agent that a region choice alone does not cover?
 - **Provider side:** the endpoint's processing location and cross-region routing, plus abuse-monitoring logs
   and stored files.
 - **Your side:** caches, agent memory, vector indexes, traces, prompt logs, eval sets, backups and DR
   replicas.
+- **Agent hops:** every hosted tool, third-party API and MCP server the agent calls, and the checkpoint
+  store of a durable-execution framework, which holds full copies of the context.
 - **Derived and human paths:** embeddings and fine-tuned weights carry the source's obligations, and remote
   staff access can itself be a transfer.
 

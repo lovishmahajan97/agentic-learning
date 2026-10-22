@@ -5,7 +5,7 @@ name: OWASP Top 10 for LLMs
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - safety-security/prompt-injection

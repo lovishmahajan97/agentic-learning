@@ -5,7 +5,7 @@ name: Usage analytics
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - adoption/adoption-and-value-realization-measurement
@@ -175,6 +175,7 @@ illustrative.
 from math import sqrt
 
 # Weekly aggregates per agent version from run_finished events (no prompt or tool content).
+# completed = finished unaided, edited = finished after user edits, taken_over = user did it by hand.
 weeks = {
     "v3": {"runs": 600, "completed": 390, "edited": 120, "taken_over": 90, "tool_calls": 4_200},
     "v4": {"runs": 600, "completed": 330, "edited": 132, "taken_over": 138, "tool_calls": 5_700},
@@ -200,7 +201,7 @@ print(f"diff={p4 - p3:.2f} se={se:.3f} z={(p4 - p3) / se:.1f}")
 | Reading | Conclusion |
 |---|---|
 | Takeover 0.15 → 0.23 on 600 runs each | about 3.6 standard errors: not noise |
-| Tool calls per completed task 8.2 → 12.3 | the agent is looping or retrying tools before users give up |
+| Tool calls per completed task 8.2 → 12.3 | a hint, not proof, that the agent loops or retries tools before users give up |
 | Next step | slice by team to rule out mix, then pull taken-over runs by run ID and read their trajectories |
 
 ### Cohort retention and draft disposition in SQL

@@ -5,7 +5,7 @@ name: Claude Agent SDK (agent loop, tools, MCP, subagents)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/frameworks
@@ -69,7 +69,8 @@ automatic context management, driven from Python or TypeScript.
 - **Tools:** `allowed_tools` lists tools pre-approved to run; `disallowed_tools` removes tools.
   Built-ins include `Read`, `Write`, `Edit`, `Bash`, `Glob`, `Grep`, `WebSearch` and `WebFetch`.
 - **Permissions:** `permission_mode` (`default`, `acceptEdits`, `plan`, `bypassPermissions`) plus a
-  `can_use_tool` callback for decisions in code.
+  `can_use_tool` callback for decisions in code. In Python the callback needs streaming input (use
+  `ClaudeSDKClient` or an async-iterable prompt), not a plain string prompt.
 - **Scope and limits:** `cwd` for the working directory, `max_turns` for the loop budget.
 - **Sessions:** `resume=<session_id>` continues a conversation; `fork_session` branches from it.
 
@@ -182,7 +183,7 @@ async def block_dangerous_bash(input_data, tool_use_id, context):
 options = ClaudeAgentOptions(
     cwd="./repo",
     permission_mode="acceptEdits",                         # file edits auto-approved inside cwd
-    allowed_tools=["Read", "Grep", "Glob", "Edit", "Bash", "Task"],  # Task = subagent tool; check name
+    allowed_tools=["Read", "Grep", "Glob", "Edit", "Bash", "Task"],  # subagent tool; its name varies by version
     agents={"test-runner": AgentDefinition(
         description="Runs the test suite and reports failures. Use after every code edit.",
         prompt="Run pytest -q, then summarise failing tests and their errors. Never edit files.",

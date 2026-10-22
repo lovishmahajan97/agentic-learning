@@ -5,7 +5,7 @@ name: AI use-case discovery
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/customer-discovery
@@ -48,7 +48,8 @@ a prompt or workflow, and which no model.
 - **Ranking by value or enthusiasm fails because value is one of four independent axes.** A good *first*
   candidate is valuable, genuinely needs pattern-matching over unstructured input, has data and an
   integration point reachable now, and has occasional errors bounded by review or reversibility.
-- **Discovery checks all four before committing engineers.**
+- **Discovery checks all four before committing engineers**, because most ideas turn out to be plain
+  automation, too risky or data-starved, and a bad first pick sinks the programme's credibility.
 
 ## How it works
 ### 1. Build the candidate inventory from work, not wishes
@@ -143,11 +144,11 @@ flowchart TD
     F -->|"rule or lookup"| A["Automate without a model"]
     F -->|"unstructured, patterned"| D{"Data reachable now?"}
     D -->|"no"| X["Start access request"]
-    D -->|"yes"| P{"Probe on 20 to 50 items usable?"}
+    D -->|"yes"| P{"Probe on 20-50 items usable?"}
     P -->|"model cannot read them"| Y["Drop or rethink"]
     P -->|"plausibly reachable"| R["Classify risk and review"]
     R --> V["Score value vs feasibility"]
-    V --> S["Portfolio: first use case plus strategic bet"]
+    V --> S["First use case plus strategic bet"]
     S --> T{"Paths open-ended at run time?"}
     T -->|"no"| W["Workflow with model calls"]
     T -->|"yes"| G["Agent with tools"]

@@ -5,7 +5,7 @@ name: Promises & async error propagation
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue

@@ -5,7 +5,7 @@ name: MCP TypeScript SDK
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/model-context-protocol
@@ -267,6 +267,9 @@ policy the servers cannot see.
 - **Approval gate:** a write tool is forwarded only after `approve` resolves true; a denial goes back to the
   model as an error result it can explain to the user.
 - **Step budget:** the loop throws after `maxSteps` model calls instead of running until the bill stops it.
+- **Protocol errors still throw.** `callTool` rejects on a JSON-RPC error (an unknown tool name, a request
+  timeout), so wrap it in `try` / `catch` and return an `is_error` result if one bad call should not end
+  the run.
 
 ```ts
 // agent.ts — several MCP servers behind one tool table, a step budget and a human approval gate.

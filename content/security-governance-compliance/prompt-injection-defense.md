@@ -5,7 +5,7 @@ name: Prompt injection defense
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - safety-security/prompt-injection

@@ -5,7 +5,7 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - backend-fundamentals/redis
@@ -22,8 +22,8 @@ sources:
 ---
 
 ## TL;DR
-Redis is an in-memory data-structure server whose commands run one at a time, so each is atomic and
-sub-millisecond. Replicated agent services keep shared, expiring state there: caches, provider rate
+Redis is an in-memory data-structure server: commands run one at a time, so each is atomic, and most
+take microseconds. Replicated agent services keep shared, expiring state there: caches, provider rate
 limits, run locks, short-term memory, token streams and BullMQ's store.
 
 ## For agent builders
@@ -241,11 +241,13 @@ redis.on("error", (e) => console.error("redis", e.message));
 
 export async function remember(tenant: string, convo: string, turn: object) {
   const key = `t:{${tenant}}:mem:${convo}`;
-  await redis.multi()
-    .lpush(key, JSON.stringify(turn))   // newest first
-    .ltrim(key, 0, 19)                  // keep the last 20 turns
-    .expire(key, 86_400)                // forget after a day idle
-    .exec();
+  try {
+    await redis.multi()
+      .lpush(key, JSON.stringify(turn)) // newest first
+      .ltrim(key, 0, 19)                // keep the last 20 turns
+      .expire(key, 86_400)              // forget after a day idle
+      .exec();
+  } catch { /* Redis down: best effort, the run continues without memory */ }
 }
 export async function recall(tenant: string, convo: string): Promise<object[]> {
   try { return (await redis.lrange(`t:{${tenant}}:mem:${convo}`, 0, -1)).reverse().map((s) => JSON.parse(s)); }

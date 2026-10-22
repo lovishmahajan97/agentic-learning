@@ -5,7 +5,7 @@ name: System prompt
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/prompt-engineering
@@ -124,8 +124,8 @@ Tool results come back as lower-privileged messages, so the system prompt is whe
   so you pay the write premium for nothing.
 
 ## Diagram
-Follow one request (in an agent, one step of the loop): the system block is the shared, cached prefix; the user text varies; the output check
-in code is what turns a probable rule into a guaranteed one.
+Follow one request (in an agent, one step of the loop): the system block is the shared, cached prefix,
+the user text varies, and the output check in code is what turns a probable rule into a guaranteed one.
 
 ```mermaid
 sequenceDiagram
@@ -450,4 +450,5 @@ turn thirty, not just turn one.
   with a minimal system prompt, then with an untrusted-content rule and email policy; finally add a code
   gate that blocks `send_email` without user approval.
 - **Done when:** you have a table of injected-call rate per prompt version, the gate shows 0 executed
-  injected emails, and the cached-token count confirms the prefix stayed stable.
+  injected emails, and a diff of two rendered requests shows the system prompt and tool list stayed
+  byte-identical (a prompt this short is below the minimum cacheable length, so expect zero cached tokens).

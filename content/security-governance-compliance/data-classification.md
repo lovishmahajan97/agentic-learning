@@ -5,7 +5,7 @@ name: Data classification
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - security-governance-compliance/pii-protection-dlp
@@ -232,7 +232,7 @@ class Label(IntEnum):
 
 SINK_MAX = {  # highest label each sink may receive; illustrative policy
     "llm:external-api-zdr-eu": Label.CONFIDENTIAL,
-    "tool:web_search": Label.PUBLIC,              # the query leaves for a third party
+    "tool:web_search": Label.INTERNAL,            # the query leaves for a third party
     "tool:post_slack_public": Label.INTERNAL,
     "memory:write": Label.CONFIDENTIAL,
 }
@@ -251,6 +251,7 @@ class Session:
 s = Session()
 s.ingest(Label.PUBLIC)                            # read the public FAQ
 s.check("tool:post_slack_public")                 # fine: context is INTERNAL
+s.check("tool:web_search")                        # fine: search before the confidential read
 s.ingest(Label.CONFIDENTIAL)                      # read a customer contract
 s.check("llm:external-api-zdr-eu")                # fine: endpoint approved for CONFIDENTIAL
 for sink in ("tool:post_slack_public", "tool:web_search"):
@@ -259,12 +260,12 @@ for sink in ("tool:post_slack_public", "tool:web_search"):
     except PermissionError as e:
         print(e)
 # tool:post_slack_public approved up to INTERNAL, context is CONFIDENTIAL
-# tool:web_search approved up to PUBLIC, context is CONFIDENTIAL
+# tool:web_search approved up to INTERNAL, context is CONFIDENTIAL
 ```
 
-- **Session labels are coarse, like session taint.** Here web search is blocked even for a harmless query,
-  because the user's own turn is Internal. Labelling each argument by where its value came from is more
-  permissive and much harder to get right.
+- **Session labels are coarse, like session taint.** After the contract, web search is blocked even for a
+  harmless query such as a public company name, because the whole context is now Confidential. Labelling
+  each argument by where its value came from is more permissive and much harder to get right.
 - **Order the work to keep the session low:** run public lookups before the agent reads confidential
   data, or split them into a separate session.
 
@@ -382,7 +383,8 @@ Otherwise the model may only run where Confidential data is allowed.
 
 ### Your agent reads a Confidential contract, then wants to call a public web-search tool. How should the system decide?
 - **By the session label, not the model's judgement.** After the contract, the context is Confidential,
-  and a search query is egress to a third party approved only for Public, so the orchestrator refuses.
+  and a search query is egress to a third party approved only up to Internal, so the orchestrator
+  refuses.
 - **Then design around it:** run public lookups before reading confidential data, split research into a
   separate session, or build the query from trusted fields so a per-argument label can allow it.
 - **Log the refusal with both labels,** so the product team sees where the policy bites.

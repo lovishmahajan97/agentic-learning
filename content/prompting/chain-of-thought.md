@@ -5,7 +5,7 @@ name: Chain-of-thought prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/zero-shot
@@ -180,10 +180,10 @@ for style in (DIRECT, COT):
     votes = collections.Counter(ask(style)[0] for _ in range(5))             # self-consistency: 5 chains
     answer, n = votes.most_common(1)[0]
     print(f"{'direct' if style is DIRECT else 'cot':<7} majority={answer} ({n}/5) votes={dict(votes)}")
-# Expected: 4*3 + 8*3 - 5 = 31. The model named here always reasons internally, so expect
-# little gap: the hidden chain already supplies the computation. To see the classic CoT effect,
-# run both styles on a model without built-in reasoning. The ordering and parsing discipline
-# shown here applies to any model.
+# Expected: 4*3 + 8*3 - 5 = 31. If your model reasons internally (thinking or effort settings),
+# expect little gap: the hidden chain already supplies the computation. To see the classic CoT
+# effect, run both styles on a model without built-in reasoning. The ordering and parsing
+# discipline shown here applies to any model.
 ```
 
 ### When voting helps and when it backfires

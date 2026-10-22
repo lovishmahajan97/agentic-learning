@@ -5,7 +5,7 @@ name: Customer-specific regression suites
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - evals/regression-tests
@@ -215,10 +215,12 @@ numbers):
 | Final-answer pass | 54 / 60 | 53 / 60 |
 | Escalation trajectory cases (blocking) | 12 / 12 | 9 / 12 |
 | Median steps per case | 4 | 6 |
-| Paired flips (pass-to-fail, fail-to-pass) | | 5, 1 |
+| Paired flips on whole-case pass (pass-to-fail, fail-to-pass) | | 5, 1 |
 
 - **Outcome-only scoring would ship it.** The answers barely moved; three escalations were skipped
   because the new description no longer mentioned the tenant's approval limit.
+- **The statistics alone would too.** Five flips against one gives an exact McNemar p of about 0.22,
+  well short of significance on a 60-case suite.
 - **The trajectory tier blocks it.** Three blocking escalation cases failed, so B is pinned to the old
   tool definition while the others roll forward and the description is fixed.
 

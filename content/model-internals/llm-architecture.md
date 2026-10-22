@@ -5,7 +5,7 @@ name: LLM architecture (encoder–decoder vs decoder-only)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/transformer

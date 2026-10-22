@@ -5,7 +5,7 @@ name: Classification
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - ml-fundamentals/regression
@@ -253,7 +253,8 @@ print(round(correct_prior(0.8), 2))   # 0.11
   accuracy of auto-handled cases.
 - **Embed-then-logistic-regression router before an LLM router.** Fit logistic regression on frozen
   embeddings; it is cheap, fast and often good enough. Compare per-class recall against the prompted LLM
-  on the same held-out set, and log the predicted class distribution daily to catch drift.
+  on the same held-out set. Log the predicted class distribution daily, alert when it moves sharply from
+  the training mix, then re-label a fresh sample.
 
 ## Trade-offs
 - **Tunable probabilities vs calibration upkeep.** Exposing probabilities with a tunable threshold is more

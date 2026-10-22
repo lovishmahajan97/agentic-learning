@@ -5,7 +5,7 @@ name: Domain modeling
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - system-design/domain-driven-design-and-bounded-contexts
@@ -194,7 +194,10 @@ def transition(claim: Claim, new: ClaimStatus) -> Claim:
 c = Claim(claim_id="CLM-00412345", policy_number="HX-778", loss_date="2026-03-02",
           reported_date="2026-03-05", status="under_review", reserve_amount=4200)
 print(transition(c, ClaimStatus.APPROVED).status.value)   # approved
-transition(c, ClaimStatus.PAID)   # raises: under_review -> paid is not a permitted transition
+try:
+    transition(c, ClaimStatus.PAID)
+except ValueError as e:
+    print(e)                     # under_review -> paid is not a permitted transition
 ```
 
 - **Field descriptions carry the glossary** into the JSON schema the model sees.
@@ -222,11 +225,13 @@ TOOL = {"name": "set_claim_status",
 CLAIMS = {c.claim_id: c}                                         # stand-in for the claims system
 
 def set_claim_status(raw_args: dict) -> dict:
-    args = SetClaimStatusArgs.model_validate(raw_args)           # rejects bad IDs and unknown states
     try:
+        args = SetClaimStatusArgs.model_validate(raw_args)       # rejects bad IDs and unknown states
+        if args.claim_id not in CLAIMS:
+            return {"ok": False, "error": f"no claim {args.claim_id}"}
         CLAIMS[args.claim_id] = transition(CLAIMS[args.claim_id], args.new_status)
         return {"ok": True, "status": CLAIMS[args.claim_id].status.value}
-    except ValueError as e:
+    except ValueError as e:                                      # pydantic's ValidationError is a ValueError
         return {"ok": False, "error": str(e)}                    # goes back to the model as the tool result
 
 print(set_claim_status({"claim_id": "CLM-00412345", "new_status": "paid"}))
@@ -335,18 +340,23 @@ Five inbound emails to a claims agent, resolved with the cascade from step 2 bef
 
 ## Pitfalls
 - **Defining terms from documents alone, without SMEs.** Symptom: a glossary that reads well but gets
-  corrected on almost every example walked through with the people who do the work.
+  corrected on almost every example walked through with the people who do the work. Fix: validate every
+  term against real records with SMEs.
 - **Letting prompts, schemas and evaluation labels drift apart.** Symptom: an agent that passes its own
-  tests while users report it uses terms differently from the reporting dashboards.
+  tests while users report it uses terms differently from the reporting dashboards. Fix: generate all of
+  them from one versioned domain module.
 - **Forcing one meaning across bounded contexts.** Symptom: endless debates over a field definition and
-  outputs that are right for one department and wrong for another.
+  outputs that are right for one department and wrong for another. Fix: model separate bounded contexts
+  with an explicit translation.
 - **Enforcing invariants only through prompt instructions.** Symptom: a rare but recurring output or tool
-  call that violates a rule the business considers impossible, discovered by an auditor.
+  call that violates a rule the business considers impossible, discovered by an auditor. Fix: enforce it
+  in a validator or inside the write tool.
 - **Giving an agent write tools on individual records inside an aggregate.** Symptom: each update passes its
   own validation while the combination violates a cross-record rule, such as payments exceeding the
-  approved total.
+  approved total. Fix: expose tools on the aggregate root only.
 - **Modelling entities without identity resolution.** Symptom: extracted records that name a customer or
-  policy but cannot be linked to the system of record, so downstream steps or tool calls fail.
+  policy but cannot be linked to the system of record, so downstream steps or tool calls fail. Fix: run
+  the resolution cascade and store which rule matched.
 
 ## When to use
 - **Use when** the agent extracts, classifies or acts on business entities, when several teams or systems

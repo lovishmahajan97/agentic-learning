@@ -5,7 +5,7 @@ name: Edge AI deployment
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/hybrid-on-prem
@@ -283,13 +283,17 @@ def edge_agent(task: str, escalate, max_steps: int = 4) -> str:
         text = out["choices"][0]["message"]["content"]
         try:
             step = json.loads(text)
-        except json.JSONDecodeError:
+            if not isinstance(step, dict): raise ValueError("not an object")
+        except ValueError:                # JSONDecodeError is a ValueError too
             return escalate(task, messages, reason="invalid tool call")
         if "answer" in step:
             return step["answer"]
         if step.get("tool") not in LOCAL_TOOLS:
             return escalate(task, messages, reason="unknown tool")
-        result = LOCAL_TOOLS[step["tool"]](**step.get("args", {}))
+        try:
+            result = LOCAL_TOOLS[step["tool"]](**step.get("args", {}))
+        except TypeError:                 # wrong or missing argument names from a small model
+            return escalate(task, messages, reason="bad arguments")
         messages += [{"role": "assistant", "content": text}, {"role": "user", "content": f"Result: {result}"}]
     return escalate(task, messages, reason="step budget")   # escalation uploads the transcript
 ```

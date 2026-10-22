@@ -5,7 +5,7 @@ name: RBAC / ABAC mapping to customer identity
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - enterprise-integration/sso-iam-integration

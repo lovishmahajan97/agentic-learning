@@ -5,7 +5,7 @@ name: Golden dataset strategy
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/golden-dataset
@@ -263,10 +263,10 @@ An agent with four tools; per-tool slices at p = 0.8 using the half-width table 
 
 | Slice (by main tool) | Share of traffic | Items | 95% half-width | Can it catch a 10-point drop? |
 |---|---|---|---|---|
-| `search_orders` | 55% | 200 | ±5.5 | yes |
-| `issue_refund` | 20% | 50 | about ±11 | barely; raise to 200 before gating on it |
-| `update_address` | 15% | 50 | about ±11 | barely |
-| `escalate_to_human` | 10% | 50 | about ±11 | barely, but it carries a safety floor anyway |
+| `search_orders` | 55% | 200 | ±5.5 | usually, and reliably with a paired comparison |
+| `issue_refund` | 20% | 50 | about ±11 | no: the interval is wider than the drop; raise to 200 before gating on it |
+| `update_address` | 15% | 50 | about ±11 | no |
+| `escalate_to_human` | 10% | 50 | about ±11 | no, but it carries a safety floor anyway |
 
 The refund slice is the one with money at stake, so it gets the larger quota first even though it is not
 the largest share of traffic.
@@ -475,7 +475,7 @@ for the champion on that version, and put slice floors into the gate.
 ### Mini project
 **Build a versioned task set for a small agent (2-3 hours).**
 - **Goal:** a tiered, content-hashed golden set for a tool-calling agent, sized from the half-width table.
-- **Steps:** define 3 slices by tool; write or mine 20 tasks per slice with starting state, expected final
+- **Steps:** define 3 slices by tool; write or mine 10 tasks per slice with starting state, expected final
   state and one forbidden action each; convert one failed run into a regression item with fixtures; run
   the contamination check against your few-shot bank; cut smoke, full and regression versions with
   `cut_version`.

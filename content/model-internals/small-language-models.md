@@ -5,7 +5,7 @@ name: Small language models (SLMs)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - model-internals/scaling-laws

@@ -5,7 +5,7 @@ name: Calibration
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - ml-fundamentals/roc-auc
@@ -312,8 +312,8 @@ Use `method="sigmoid"` instead when the calibration data is small, because isoto
   correctness on labelled agent runs. Monitor cost per request, which grows n times; spend it only on
   steps that gate an irreversible action.
 - **Calibrate the LLM judge before trusting pass rates.** Label a few hundred eval transcripts by hand,
-  plot the judge's score against human verdicts, and fit a map so "judge 0.8" means humans agree about
-  80% of the time. Re-check whenever the judge model or its prompt changes.
+  plot the judge's score against human verdicts, and fit a map so that of transcripts the judge scores
+  0.8, humans pass about 80%. Re-check whenever the judge model or its prompt changes.
 
 ## Trade-offs
 - **One-parameter temperature scaling vs flexibility.** It preserves accuracy and ranking and needs little
@@ -454,7 +454,7 @@ verifier. Then monitor ECE on fresh labels, because drift will undo the fix.
 - **Model cascades and routers.** A calibrated "probability the small model is right" decides when to pay
   for the large model, so the cost-versus-quality trade is a number, not a guess.
 - **Guardrails on tool calls.** Blocking or confirming a risky action (refund, delete, send) at a
-  confidence that means the same thing after every model upgrade.
+  confidence threshold that is refitted after every model upgrade, so it keeps meaning the same risk.
 - **LLM-as-judge in eval harnesses.** Mapping judge scores to agreement with human labels, so a
   dashboard's pass rate tracks what reviewers would say.
 

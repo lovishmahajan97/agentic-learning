@@ -5,7 +5,7 @@ name: Context engineering
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/system-prompt
@@ -374,8 +374,8 @@ against step count to confirm the curve flattens.
 
 ## Use cases & projects
 ### Use cases
-- **Long-running coding agents.** Stubbing consumed file reads and test output, plus a state note, keeps
-  step 60 as sharp as step 6.
+- **Long-running coding agents.** Stubbing consumed file reads and test output, plus a state note, stop
+  quality from collapsing after a few dozen steps; confirm it by charting success against step count.
 - **RAG agents.** Retrieval budgets and best-at-the-edges ordering decide whether the retrieved clause is
   actually used.
 - **Research agents with sub-agents.** Each sub-agent surveys sources in its own context and returns a

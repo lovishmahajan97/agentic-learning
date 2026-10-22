@@ -5,7 +5,7 @@ name: Gradient accumulation
 kind: practice
 difficulty: core
 est_minutes: 11
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/batch-size
@@ -279,7 +279,7 @@ for mb in mbs:
   hour fall with it; on a small fine-tuning set, fewer and larger steps can be worse than more and smaller
   ones, a batch-size question accumulation cannot answer.
 - **Accumulation vs gradient checkpointing.** Accumulation costs no extra compute but cannot make a single
-  long sequence fit; checkpointing costs roughly one extra forward pass per layer but shrinks per-sequence
+  long sequence fit; checkpointing costs roughly one extra forward pass (each checkpointed layer is recomputed once) but shrinks per-sequence
   activation memory. Most memory-constrained runs use both.
 
 ## Pitfalls

@@ -5,7 +5,7 @@ name: Data contracts
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - data-architecture/ingestion-pipelines
@@ -344,7 +344,7 @@ print(gate_partition(good, [{}] * 400, baseline))      # every billing row broke
 - **Enforcing the contract only in the consumer.** Symptom: the AI team discovers every upstream change and
   argues for a fix after the damage is done. Fix: producer-side gate.
 - **Omitting the contract version from the records themselves.** Symptom: a reprocessing job that cannot
-  tell which rules applied to which historical rows.
+  tell which rules applied to which historical rows. Fix: stamp `contract_version` on every record.
 - **Treating filter metadata as free text.** Symptom: `tenant_id` values with different casing or whitespace
   making ACL filters leak or return nothing. Fix: closed or normalised value sets.
 - **Passing raw tool responses straight into the context.** Symptom: the agent improvises around a missing
@@ -352,9 +352,10 @@ print(gate_partition(good, [{}] * 400, baseline))      # every billing row broke
 - **Silently dropping violating records to keep the pipeline green.** Symptom: row counts drift down and a
   training set over-represents whatever happened to validate. Fix: dead-letter and alert.
 - **Making every field required to be safe.** Symptom: the producer defaults fields to placeholder values
-  just to pass, which is worse than null.
+  just to pass, which is worse than null. Fix: require only what consumers need; make the rest nullable.
 - **Dead-lettering per record with no batch-level threshold.** Symptom: a partition that publishes on
-  schedule with a fraction of its usual rows and a quietly shifted category distribution.
+  schedule with a fraction of its usual rows and a quietly shifted category distribution. Fix: a
+  contract-stated violation-rate threshold that fails the partition.
 
 ## When to use
 - **Use for any dataset crossing a team boundary** into an embedding, fine-tuning, feature, evaluation or

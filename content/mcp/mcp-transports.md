@@ -5,7 +5,7 @@ name: MCP transports (stdio, Streamable HTTP, legacy SSE)
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - mcp/mcp-architecture
@@ -77,8 +77,10 @@ failure modes.
 - **Request-scoped SSE:** an SSE response carries progress and log notifications for that request, then the
   final response. Closing the stream is the cancellation signal.
 - **Headers mirror the body** so gateways can route without parsing JSON: `MCP-Protocol-Version`,
-  `Mcp-Method`, and `Mcp-Name` (tool name or resource URI). Mismatches get `400` with `HeaderMismatch`
-  (`-32020`). Tool parameters marked `x-mcp-header` are mirrored as `Mcp-Param-{name}`.
+  `Mcp-Method`, and `Mcp-Name` (tool or prompt name, or resource URI). Mismatches get `400` with
+  `HeaderMismatch` (`-32020`). Tool parameters marked `x-mcp-header` are mirrored as `Mcp-Param-{name}`.
+- **Errors carry a JSON-RPC body:** an unsupported version is `400` with `UnsupportedProtocolVersionError`,
+  an unknown method is `404` with `-32601`. The body is what tells a modern server apart from a legacy one.
 - **Broken streams lose the request;** the client re-issues it with a new id, so tools must be safe to retry.
 - **Change notifications** use a long-lived `subscriptions/listen` POST instead of the GET stream.
 
@@ -101,7 +103,7 @@ The decision path most teams follow when choosing a transport for a new server.
 
 ```mermaid
 flowchart TD
-    A["New MCP server"] --> B{"Runs on the user's machine for one user?"}
+    A["New MCP server"] --> B{"Local, single-user server?"}
     B -->|"yes"| C["stdio subprocess"]
     B -->|"no, shared or remote"| D["Streamable HTTP"]
     D --> E{"Clients speak 2026-07-28?"}
@@ -154,7 +156,7 @@ With `stateless_http=True` no `Mcp-Session-Id` is issued and a bare POST works w
 
 ```
 curl -s -X POST http://127.0.0.1:8000/mcp -H 'Content-Type: application/json' \
-  -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2025-11-25' \
+  -H 'Accept: application/json, text/event-stream' -H 'MCP-Protocol-Version: 2025-06-18' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
 ```
 

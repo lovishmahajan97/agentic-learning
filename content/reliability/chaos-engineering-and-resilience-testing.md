@@ -5,7 +5,7 @@ name: Chaos engineering & resilience testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - reliability/fmea
@@ -206,11 +206,11 @@ import asyncio, os, random
 
 class ChaosTool:
     """Wraps one agent tool. Inert unless CHAOS_TOOL names this tool."""
-    def __init__(self, name, fn):
+    def __init__(self, name, fn):                              # own env vars, so ChaosLLM stays inert
         self.name, self.fn = name, fn
         self.on = os.getenv("CHAOS_TOOL") == name
-        self.rate = float(os.getenv("CHAOS_RATE", "0"))
-        self.mode = os.getenv("CHAOS_MODE", "latency")
+        self.rate = float(os.getenv("CHAOS_TOOL_RATE", "0"))
+        self.mode = os.getenv("CHAOS_TOOL_MODE", "latency")
 
     async def __call__(self, **args):
         if self.on and random.random() < self.rate:
@@ -223,7 +223,7 @@ class ChaosTool:
         return await self.fn(**args)
 
 # Wrap every tool at startup: tools = {n: ChaosTool(n, f) for n, f in tools.items()}
-# Experiment: CHAOS_TOOL=search CHAOS_MODE=error CHAOS_RATE=0.5, then run the agent eval set.
+# Experiment: CHAOS_TOOL=search CHAOS_TOOL_MODE=error CHAOS_TOOL_RATE=0.5, then run the agent eval set.
 ```
 
 ### Worked scenario: 429s against an agent loop

@@ -5,7 +5,7 @@ name: Event loop & microtask queue
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - node-ts-for-ai/promises-and-async-error-propagation
@@ -355,11 +355,12 @@ yields if it is occasional, and keep a loop-lag alert so regressions are caught 
 - **Pair it with utilization:** high lag at moderate utilization means long callbacks to offload; high lag
   at utilization near 1 means saturation and a scale-out.
 
-### Your agent server hosts 200 sessions and users say tokens stutter whenever one agent reranks results. What do you do?
-- **Confirm it is the loop:** stutters synchronized across sessions plus a p99 `monitorEventLoopDelay` spike
-  that matches the rerank duration point to one long callback, not the provider.
-- **Fix by step type:** move the rerank to a worker pool (it runs every turn), cap tool-result size, and add
-  load shedding on lag so in-flight agent streams are protected.
+### An agent step counts tokens over the whole transcript before every model call. Inline, chunked or worker?
+- **Measure first:** time the step on production CPU and multiply by how often it runs across concurrent
+  sessions; if p99 `monitorEventLoopDelay` tracks transcript length, it is hurting other sessions.
+- **Decide by size and frequency:** a few milliseconds stays inline; an occasional tens-of-ms job can be
+  chunked with `setImmediate`; work that repeats every turn for every session goes to a worker pool.
+- **Or shrink the work:** count only the newly appended messages and cache the running total per session.
 
 ### Does raising `UV_THREADPOOL_SIZE` help a handler that blocks on a large `JSON.parse`?
 - **No:** the pool runs native operations such as filesystem calls and `getaddrinfo`, never your JavaScript.

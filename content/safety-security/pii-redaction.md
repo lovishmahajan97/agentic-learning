@@ -5,7 +5,7 @@ name: PII redaction
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - security-governance-compliance/pii-protection-dlp
@@ -140,8 +140,9 @@ Five boundaries, each with its own policy:
 - **Precision is a utility metric:** over-redaction quietly breaks the task.
 
 ## Diagram
-Each boundary gets its own transformation; only the model path is reversible, and re-hydration is gated
-by the same authorisation as retrieval.
+Each boundary gets its own transformation; only the model path is reversible. Re-hydration happens in
+two places only: the tool executor, just before a side effect, and the output path, gated by the same
+authorisation as retrieval.
 
 ```mermaid
 flowchart TD
@@ -149,10 +150,10 @@ flowchart TD
     DET --> PS["Typed placeholders"]
     PS --> V[("Vault, TTL in minutes")]
     PS --> M["Model call"]
-    DET --> RL["Irreversible redact"]
-    RL --> LOG[("Logs and traces")]
-    DET --> IX["Redact chunk text"]
-    IX --> VI[("Vector index, ids in metadata")]
+    DET -->|"irreversible redact"| LOG[("Logs and traces")]
+    DET -->|"redact chunk text"| VI[("Vector index, ids in metadata")]
+    M -->|"tool call with placeholders"| EX["Executor re-hydrates args"]
+    V -.-> EX
     M --> OS["Output scan"]
     OS --> AZ{"Viewer authorised?"}
     AZ -->|"yes, re-hydrate"| U["User sees originals"]

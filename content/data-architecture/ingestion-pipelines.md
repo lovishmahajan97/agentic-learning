@@ -5,7 +5,7 @@ name: Ingestion pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - data-architecture/etl-elt-for-rag
@@ -150,7 +150,9 @@ in rising order of fidelity and cost:
 - **Tombstones must reach the tool, not only the landing store.** A delete that lands but never propagates
   to the index still lets the agent quote a revoked contract.
 - **Freshness lag is an agent SLA.** If an operations agent acts on an orders table, its decisions are only
-  as current as `now − last_committed_watermark`; CDC keeps that in seconds, a nightly job in hours.
+  as current as the last successful sync; CDC keeps that in seconds, a nightly job in hours. For the tool's
+  stale flag, use the time since the last successful sync rather than the watermark, because a quiet source
+  has an old watermark yet is fully current.
 
 ## Diagram
 Changes flow from the source into an immutable landing store; the watermark advances only after writes are
@@ -263,6 +265,8 @@ The agent's search tool drops tombstoned documents, filters by the caller's ACL 
 the model can cite a version and the loop can refuse to act on a source past its freshness SLA. The
 `landing` and `index` objects are the same stand-ins as in the connector loop.
 
+`state` holds one record per source, with `last_sync_ok` set when a sync run finishes after its flush.
+
 ```python
 import datetime as dt
 
@@ -279,7 +283,8 @@ def search_docs(query, user_groups, index, landing, state, k=5):
             continue
         if not set(hit["acl"]) & set(user_groups):           # caller may not read it at the source
             continue
-        lag = now - state[hit["source"]]["watermark"]
+        lag = now - state[hit["source"]]["last_sync_ok"]       # last successful sync, not the watermark:
+                                                              # a quiet source has an old watermark but is fresh
         out.append({"text": hit["text"], "source_id": hit["source_id"],
                     "source_version": hit["source_version"], "fetched_at": hit["fetched_at"].isoformat(),
                     "stale": lag > FRESHNESS_SLA.get(hit["source"], dt.timedelta(hours=24))})

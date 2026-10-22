@@ -5,7 +5,7 @@ name: API clients with retries & circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - serving-inference/retry-strategies
@@ -29,9 +29,9 @@ per-attempt timeout, classified retries with jittered backoff and a deadline. A 
 while a provider or tool is down.
 
 ## For agent builders
-- **Why it matters for agents.** An agent makes dozens of model and tool calls per run, so a 1% transient
-  failure rate per call breaks a large share of runs unless calls retry. Badly layered retries do the
-  opposite: they multiply load and cost across every step during an outage.
+- **Why it matters for agents.** An agent makes dozens of model and tool calls per run: at a 1% transient
+  failure rate per call, a 50-call run fails about 40% of the time (1 − 0.99^50) unless calls retry.
+  Badly layered retries do the opposite: they multiply load and cost across every step during an outage.
 - **Where it shows up in your stack.** The Anthropic and OpenAI SDK options `maxRetries` and `timeout`,
   your tool wrappers around SaaS and internal APIs, `opossum` or `cockatiel` policies, and the queue's
   `attempts` setting above the whole step.
@@ -108,7 +108,8 @@ sleep(n) = random(0, min(cap, base × 2^n))      // attempt n
   `timeout × (maxRetries + 1)` plus backoff.
 - **Typed errors.** `Anthropic.RateLimitError` for 429, `Anthropic.InternalServerError` for 5xx
   including 529, `Anthropic.APIConnectionError`, all subclasses of `Anthropic.APIError` with `.status`,
-  `.headers`, the parsed body on `.error` and `.type` such as `overloaded_error`. Classification is an
+  `.headers` and the parsed error body on `.error` (whose inner error's `.type` is, for example,
+  `overloaded_error`). Classification is an
   `instanceof` chain plus a status check, not string matching.
 - **Configure, do not wrap.** Set those options rather than adding a second retry loop, *because* nested
   retries multiply: 3 × 3 = 9 attempts against a provider that is already overloaded.
@@ -324,7 +325,9 @@ The search tool is called on 6 of the 12 steps and is failing slowly (every atte
 | Same, plus a per-tool breaker with threshold 3 | 9, then fast fallbacks | ~135 s | error results, then "unavailable" on the last 3 search calls |
 
 - **The breaker counts logical calls.** It wraps the whole retry sequence, so 3 exhausted sequences (9
-  attempts) trip it; each half-open probe after the 30 s reset adds one more attempt while the outage lasts.
+  attempts) trip it. The table assumes the last 3 search calls land inside the 30 s reset window.
+- **Probes are full sequences.** A search call after the reset is the half-open probe, and because the
+  breaker wraps the retry loop it runs all 3 attempts (~45 s) before re-opening the breaker.
 
 ### Worked scenario: how nested retries amplify an outage
 One user action during a provider incident, where every attempt fails slowly.

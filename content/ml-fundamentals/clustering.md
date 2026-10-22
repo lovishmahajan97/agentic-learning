@@ -5,7 +5,7 @@ name: Clustering
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/supervised-vs-unsupervised-vs-self-supervised-learning
@@ -212,7 +212,7 @@ clusters them with k = 20 and reads ten central runs per cluster. Figures are il
 | Loops calling the search tool with the same query | 700 | 19% | add a repeated-call guard and a step budget |
 | Asks about a product the knowledge base lacks | 540 | 15% | add documents to the RAG index |
 | Greeting-template boilerplate (not a real failure) | 430 | 12% | strip the template, re-cluster |
-| Remaining 16 clusters | 880 | 25% | sample 5 each into the eval set |
+| Remaining 16 clusters | 880 | 24% | sample 5 each into the eval set |
 
 - **Two fixes cover about half the failures,** found in an afternoon instead of reading 3,600 traces.
 - **The boilerplate cluster is a warning,** not a finding: cleaning should have removed it before embedding.

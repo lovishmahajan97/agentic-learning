@@ -5,7 +5,7 @@ name: Embedding versioning / re-indexing strategy
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - rag-retrieval/embedding-models
@@ -102,8 +102,9 @@ Re-indexing is needed even when the model never changes:
 - **The alias resolves to a pair:** the collection and the recipe that built it.
 - **The retrieval tool embeds with exactly that recipe** (model, prefix, dimension), *because* swapping the
   collection while the query embedder stays on the old model recreates the cross-space mismatch in reverse.
-- **Key query-embedding caches on `(query_text, embedding_version)`,** never on text alone. Agents repeat
-  similar search queries often, so these caches get high hit rates and serve stale vectors widely.
+- **Key query-embedding caches on `(query_text, embedding_version)`,** never on text alone. Agents often
+  re-issue the exact same search strings, so these caches get high hit rates and, after a swap, serve
+  old-space vectors widely.
 - **Adapters are a temporary bridge only.** A learned mapping from the new model's space into the old one
   (a linear or small adapter trained on pairs of embeddings of the same texts) lets a new query model run
   against the old index before the rebuild finishes. It recovers only part of the quality, so it must pass

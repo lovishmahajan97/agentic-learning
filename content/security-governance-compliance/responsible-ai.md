@@ -5,7 +5,7 @@ name: Responsible AI
 kind: concept
 difficulty: intro
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - security-governance-compliance/ai-risk-management

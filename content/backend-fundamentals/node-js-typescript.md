@@ -5,7 +5,7 @@ name: Node.js / TypeScript
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
@@ -200,7 +200,7 @@ const tools = {
 type ToolName = keyof typeof tools;
 
 export async function dispatch(name: string, rawArgs: string, signal: AbortSignal) {
-  if (!(name in tools)) return { error: `unknown tool ${name}` };       // model invented a tool
+  if (!Object.hasOwn(tools, name)) return { error: `unknown tool ${name}` }; // invented tool; `in` would accept "toString"
   const tool = tools[name as ToolName];
   let json: unknown;
   try { json = JSON.parse(rawArgs); } catch { return { error: "arguments were not valid JSON" }; }
@@ -254,11 +254,13 @@ reads ~10. Figures are illustrative.
 
 ## Production patterns
 - **Validate every tool call before it runs.** Parse each model tool call with Zod `safeParse`, return
-  `error.issues` to the model as the tool result, and log them with the prompt version. Track
-  validation-failure rate per model, prompt and tool; a spike after a prompt change is a regression.
+  `error.issues` to the model as the tool result, and log them with the prompt version; parse webhooks
+  and third-party responses the same way. Track validation-failure rate per model, prompt and tool; a
+  spike after a prompt change is a regression.
 - **Abort the agent run on disconnect.** Pass an `AbortController` signal to every upstream `fetch` and
   SDK call, abort on the response `close` event before it finished, and check the signal before
-  side-effecting tools. Monitor token spend against tokens delivered.
+  side-effecting tools. Monitor the ratio of upstream to client connections, and token spend against
+  tokens delivered.
 - **Alert on event-loop delay.** Export `monitorEventLoopDelay` percentiles (p99, max) as a metric every
   few seconds and reset the histogram; alert when p99 climbs. Rising lag across all routes points to sync
   CPU work on the main thread.

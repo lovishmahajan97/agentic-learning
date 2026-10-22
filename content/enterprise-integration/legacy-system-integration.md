@@ -5,7 +5,7 @@ name: Legacy system integration
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - enterprise-integration/enterprise-connectors

@@ -5,7 +5,7 @@ name: LangGraph persistence, streaming and human-in-the-loop (checkpointers, int
 kind: tool
 difficulty: advanced
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agent-frameworks/langgraph-fundamentals
@@ -66,8 +66,8 @@ updates, LLM tokens and custom progress events while the run is in flight.
 
 - **Pending writes.** If one node in a superstep fails, writes from the nodes that succeeded are kept, so
   a resume does not re-run them.
-- **Durability modes.** `durability="exit"`, `"async"` (the default in current releases) or `"sync"`
-  trades write latency against how much can be lost on a crash; check the current docs for your version.
+- **Durability modes.** The `durability` argument to `invoke` or `stream` takes `"exit"`, `"async"` (the
+  default in current releases) or `"sync"`, trading write latency against how much can be lost on a crash.
 
 ### Reading and editing history
 - **`get_state(cfg)`** returns a `StateSnapshot`: `values`, `next`, `tasks` (with any interrupts) and
@@ -310,7 +310,8 @@ shared durable checkpointer such as `PostgresSaver`, not `InMemorySaver`, and re
 - **Use `stream` with several modes:** `updates` for steps, `messages` for tokens, `custom` for tool
   progress from `get_stream_writer()`.
 - **Forward over SSE,** filtering tokens by `langgraph_node` so only the answer node types into the chat,
-  and send a final event with the state id for reconnection.
+  and send the `thread_id` and latest checkpoint id so a reconnecting client can call `get_state` and
+  catch up.
 
 ### When would you fork a thread with `update_state`?
 - **Debugging and what-if.** Rewind to the checkpoint before a bad tool call, correct the state, and

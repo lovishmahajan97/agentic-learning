@@ -5,7 +5,7 @@ name: Technical due diligence
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - strategy/vendor-evaluation
@@ -52,7 +52,7 @@ true will cost, before the price is fixed.
   Diligence turns claims into evidence first.
 
 ## How it works
-### Background
+### The six diligence questions
 For AI, diligence centres on six questions; steps 1-8 below work through them, and the agent-specific
 checks follow:
 
@@ -250,19 +250,19 @@ print(f"3x, +25% rates {gross_margin(4000, 900 * 3 * 1.25, 400):.1%}")   # illus
   digits unless pricing passes costs through.
 
 ### Worked scenario: testing a support agent's "80% resolved" claim
-A partner sells a ticket-resolution agent. The acquirer replays 150 of its own tickets in a sandbox with
+The target sells a ticket-resolution agent. The acquirer replays 150 of its own tickets in a sandbox with
 mock CRM and email tools. All figures are illustrative.
 
 | Step | Finding |
 |---|---|
 | Target's definition of resolved | The agent sent a final reply; no check that the ticket's end state was correct |
 | End state checked on 150 tickets | 62% completed; the interval at 150 is about ±8 points, so the gap to 80% is real |
-| Steps per ticket | about 9 on the acquirer's tickets versus about 5 in the target's traces, so cost per ticket is roughly 1.8× |
+| Steps per ticket | about 9 on the acquirer's tickets versus about 5 in the target's traces, so at similar tokens per step cost per ticket is roughly 1.8× |
 | Human involvement | traces show a review queue where staff edit a share of replies before sending |
 | Tool scopes | the CRM credential can write to every customer account, not only the ticket's |
 
-- **Classification:** not a deal-breaker; a price adjustment for the completion and cost gap, and a
-  remediation item to scope tool credentials per ticket.
+- **Classification:** not a deal-breaker if the thesis still holds at 62%; a price adjustment for the
+  completion and cost gap, and a remediation item to scope tool credentials per ticket.
 - **The definition was the finding.** Agree "completed" as a checked end state before comparing numbers.
 
 ## Production patterns
@@ -435,7 +435,7 @@ The answer changes the valuation, not necessarily the decision.
 - **Steps:** take any small agent (your own or an open-source example) and write its claim as a number;
   build 30 held-out tasks with checkable end states and mock tools; replay them and log completion, steps,
   tokens and human-needed runs; list every tool credential and its scope; compute cost per completed task
-  and a margin at 3× tokens.
+  and the margin at an assumed price per task, today and at 3× tokens.
 - **Done when:** you have the claim versus your measured number with its interval, a scope table with any
   over-scoped tool flagged, and a findings list where each item is a deal-breaker, adjustment or
   remediation.

@@ -5,7 +5,7 @@ name: Fine-tuning pipelines on client data
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - training-adaptation/fine-tune-vs-rag-vs-prompt-decision
@@ -24,7 +24,7 @@ permission, redaction, leakage-safe splits, baseline evals and lineage. It must 
 deprecations, deletion requests and new labels force reruns.
 
 ## For agent builders
-- **Why it matters for agents.** The usual reason to fine-tune for an agent is distillation: a large
+- **Why it matters for agents.** The most common reason to fine-tune for an agent is distillation: a large
   prompted agent works but is slow and costly at the customer's volume, so its successful tool-calling
   traces train a smaller model for one step (routing, classification, a fixed-format tool call).
 - **Where it shows up in your stack.** Your trace store feeds the dataset; the eval harness and
@@ -33,7 +33,7 @@ deprecations, deletion requests and new labels force reruns.
   results are rendered in the model's chat template, the split unit (conversation or case), and the
   gate against the prompted agent.
 - **What you can skip.** Training-loop internals and full fine-tuning; a per-customer LoRA adapter on a
-  standard trainer covers almost every agent use.
+  standard trainer covers most agent uses.
 
 ## Why it exists
 - **Sometimes fine-tuning is right.** Hundreds of house-specific labels, a rigid output format, a house
@@ -419,7 +419,7 @@ a small per-customer adapter rather than a shared multi-customer model.
 - **Goal:** turn logged agent traces into a leakage-safe, manifest-backed dataset for one routing step.
 - **Steps:** generate or collect about 2,000 synthetic first-step traces with a conversation id, a tenant
   and a chosen tool; filter to completed runs; redact phone numbers in tool results; split with
-  `split_and_manifest` using the conversation id as the group key; plant canaries with `make_canaries`;
+  `split_and_manifest` with the conversation id stored as `case_id`, so it is the group key; plant canaries with `make_canaries`;
   render examples in a chat template; train a small adapter if you have a GPU, or stop at the dataset.
 - **Done when:** the manifest lists every train and test id with a hash, no conversation appears on
   both sides, a near-duplicate check reports its removals, and (if trained) the probe finds no canaries.

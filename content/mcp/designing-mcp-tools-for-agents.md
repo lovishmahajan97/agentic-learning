@@ -5,7 +5,7 @@ name: Designing MCP tools for agents (naming, schemas, errors, pagination, token
 kind: practice
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - mcp/mcp-server-primitives
@@ -184,8 +184,8 @@ What a client sees (abridged output of calling it):
 crm_search_orders(customer="acme", limit=2)
   -> {'orders': [{'id': 'o_1', 'total': 10, 'status': 'paid'}, {'id': 'o_2', 'total': 20, 'status': 'paid'}],
       'total_matches': 80, 'next_cursor': 'eyJvIjogMn0='}
-crm_search_orders(customer="acmee")   -> isError: No orders for customer 'acmee'. Check the slug with crm_find_customer.
-crm_search_orders(customer="acme", limit=500) -> isError: validation error, limit must be <= 50
+crm_search_orders(customer="acmee")   -> isError: ... No orders for customer 'acmee'. Check the slug with crm_find_customer.
+crm_search_orders(customer="acme", limit=500) -> isError: ... limit: Input should be less than or equal to 50
 ```
 
 ### Worked scenario: redesigning a tool set an agent kept failing with
@@ -196,7 +196,7 @@ orders of magnitude for one 10-step task.
 |---|---|---|
 | Tool schema tokens per turn | ~4,500 | ~1,300 |
 | Average result size | ~6,000 tokens (full records) | ~400 tokens (concise page) |
-| Context after 10 steps (schemas plus accumulated results) | ~65k tokens | ~6k tokens |
+| Context after 10 steps (schemas plus accumulated results) | ~65k tokens (4,500 + 10 × 6,000) | ~5k tokens (1,300 + 10 × 400) |
 | Common failure | Invented UUIDs, wrong endpoint chosen | Rare; errors name the right tool |
 | Changes made | none | prefixed names, enums, bounded `limit`, `response_format`, `next_cursor`, actionable `isError` |
 

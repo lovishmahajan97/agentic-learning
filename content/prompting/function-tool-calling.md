@@ -5,7 +5,7 @@ name: Function / tool calling
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/structured-outputs-json-mode
@@ -93,7 +93,7 @@ runs nothing, so execution, permissions and errors are yours.
 |---|---|
 | `tool_choice` `auto` (default) | the model decides |
 | `none` | forbids calls |
-| forced mode (`any`, or a named tool) | some providers; several of Anthropic's newest models (as of late 2026) reject forced modes with an error |
+| forced mode (`any`, or a named tool) | supported by most providers, but not on every model or setting: Anthropic's API rejects forced modes when extended thinking is on, and (as of late 2026) some newer models reject them outright |
 | `disable_parallel_tool_use` (a field of `tool_choice`) | at most one call per turn; matters for side effects; applies to the whole request, not one tool |
 | `strict: true` on a tool | constrained decoding on the arguments, the same mechanism as structured outputs, so input validates exactly |
 
@@ -175,8 +175,10 @@ def chat(user_text, max_steps=6):
         r = client.messages.create(model="claude-opus-5-5", max_tokens=4096,  # thinking counts too
                                    system="You are a support agent for Acme.", tools=TOOLS, messages=messages)
         messages.append({"role": "assistant", "content": r.content})   # keep tool_use blocks verbatim
-        if r.stop_reason != "tool_use":
-            return next((b.text for b in r.content if b.type == "text"), "")  # also end_turn / max_tokens
+        if r.stop_reason == "end_turn":
+            return next((b.text for b in r.content if b.type == "text"), "")
+        if r.stop_reason != "tool_use":                                    # max_tokens, refusal, ...
+            raise RuntimeError(f"unusable stop: {r.stop_reason}")          # never treat as success
         results = []
         for b in r.content:
             if b.type == "tool_use":

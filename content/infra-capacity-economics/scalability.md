@@ -5,7 +5,7 @@ name: Scalability
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - infra-capacity-economics/capacity-planning
@@ -135,8 +135,9 @@ flowchart TD
 
 ## Examples
 ### Which wall does an agent fleet hit first?
-A support agent makes 6 model calls per task at ~8,000 input tokens each, 2 vector searches and one
-checkpoint write per step. All limits below are illustrative; plug in your own.
+A support agent's task makes 6 model calls at ~8,000 input tokens each, 2 vector searches and 1 call to a
+search tool API, and writes one checkpoint per model step (6 per task). All limits below are
+illustrative; plug in your own.
 
 ```python
 calls_per_task, tokens_per_call = 6, 8_000

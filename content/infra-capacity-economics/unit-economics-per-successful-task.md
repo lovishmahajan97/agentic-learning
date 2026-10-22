@@ -5,7 +5,7 @@ name: Unit economics per successful task
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - infra-capacity-economics/cost-modeling

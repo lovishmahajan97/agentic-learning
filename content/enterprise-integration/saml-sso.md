@@ -5,7 +5,7 @@ name: SAML SSO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - enterprise-integration/sso-iam-integration
@@ -118,7 +118,8 @@ Each check exists *because* skipping it enables a known attack:
   - use a library version that has fixed this, and read the full canonicalized text.
 - **Encrypted assertions.** The IdP can encrypt to the SP's public key so the browser cannot read the
   attributes. Decrypt, then verify the signature on the decrypted assertion; encryption hides data but does
-  not authenticate it, so it never replaces the signature checks.
+  not authenticate it, *because* anyone with the SP's public key can encrypt, so it never replaces the
+  signature checks.
 - **RelayState.** The opaque value the SP sends with the request and gets back, usually the page to return
   to. Treat it as untrusted and accept only relative paths or an allow-list, *because* redirecting to
   whatever it contains turns your login into an open redirect.

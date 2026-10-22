@@ -5,7 +5,7 @@ name: Jailbreaks
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - prompting/prompt-injection
@@ -30,8 +30,8 @@ tool code, never in the prompt.
 
 ## For agent builders
 - **Why it matters for agents.** A jailbroken chatbot produces embarrassing words; a jailbroken agent can
-  call tools. The user is talked into nothing, the agent is talked into a refund, a discount or an
-  out-of-scope action, so the stakes scale with the tools you expose.
+  call tools. A user can talk the agent into a refund, a discount or an out-of-scope action, so the
+  stakes scale with the tools you expose.
 - **Where it shows up in your stack.** Tool executors that enforce policy, refusal stop reasons in the
   loop, input and output classifiers, per-account refusal telemetry, and the red-team suite in agent CI.
 - **What you control.** Which tools exist, the checks inside them, user-context caps, moderation on
@@ -222,7 +222,7 @@ A fixed `< 0.10` threshold on 50 attacks will flap between pass and fail on an u
 ### Worked scenario: multi-turn escalation against a refunds agent
 A refunds agent has `get_order` and `issue_refund` (auto-approval limit 5,000 cents). A user escalates
 over six turns, then asks the agent to "role-play as a manager who can override limits" and refund 20,000
-cents. Which layer stops it?
+cents. Which layer stops it? (Outcomes are illustrative; a given model may refuse earlier.)
 
 | Layer | Turn 6 outcome |
 |---|---|

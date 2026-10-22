@@ -5,7 +5,7 @@ name: Stakeholder management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - strategy/stakeholder-alignment
@@ -130,8 +130,8 @@ far less likely to block late.
   did not choose and may cut it.
 
 ## Diagram
-Each stakeholder is routed by power and interest, then stance decides whether this week needs action; the
-weekly review loops everyone back through.
+Each stakeholder is routed by power and interest; for high-power people, stance and recent contact decide
+whether this week needs action. The weekly review loops everyone back through, since stance and roles change.
 
 ```mermaid
 flowchart TD
@@ -147,6 +147,9 @@ flowchart TD
     ST -->|"no"| A["Act this week: package, one-to-one"]
     ST -->|"yes"| W["Weekly register review"]
     A --> W
+    KI --> W
+    MO --> W
+    W -.->|"next week"| S
 ```
 
 ## Examples
@@ -356,12 +359,13 @@ security figure comes from the case above, the others are illustrative.
   override data show it is safe.
 - **Re-plan the date** around that reviewer's queue and tell the sponsor now, not at go-live.
 
-### How do you escalate a blocker without burning the relationship?
-- **Tell the blocker first**, so the escalation is not a surprise.
-- **State their concern fairly** and bring two or three options (narrow scope, add a control, delay) with
-  costs.
-- **Ask for a decision, not a ruling against a person:** "we need a decision between these options" gets
-  one; "they are in the way" costs you the rest of the project.
+### When is a full stakeholder map overkill?
+- **A small internal tool used by one team**, with no new data access and no security or compliance
+  review, needs only a short list of approvers.
+- **It flips back** as soon as the tool crosses team boundaries or sends company data to a model, because
+  those bring vetoes you cannot see from inside the team.
+- **For agents, the trigger is usually the first tool** that reads another team's system or writes
+  anywhere, because that brings in a data owner and a security reviewer.
 
 ## Quiz
 ### Q: On a power-interest grid, a security reviewer who rarely engages but can block go-live belongs where?

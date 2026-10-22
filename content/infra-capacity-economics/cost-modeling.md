@@ -5,7 +5,7 @@ name: Cost modeling (cost per request, token economics)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - infra-capacity-economics/unit-economics-per-successful-task
@@ -22,8 +22,8 @@ sources:
 
 ## TL;DR
 A cost model turns an agent run's shape into dollars: fresh, cached and output tokens (including hidden
-reasoning) times prices, plus tool calls. Output costs more, cost grows roughly quadratically with turns,
-and runaway runs in the tail set the bill.
+reasoning) times prices, plus tool calls. Output costs more because decode is sequential, cost grows
+roughly quadratically with turns, and runaway runs can dominate.
 
 ## For agent builders
 - **Why it matters for agents.** An agent run is a loop of model calls that re-send a growing transcript,

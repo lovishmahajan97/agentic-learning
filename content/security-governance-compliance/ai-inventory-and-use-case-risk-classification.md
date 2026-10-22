@@ -5,7 +5,7 @@ name: AI inventory & use-case risk classification
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - security-governance-compliance/model-governance
@@ -93,8 +93,8 @@ judgement call each time. The deciding factors:
   - *Prohibited practices,* for example social scoring (the final text bans it for public and private
     actors alike) or manipulative techniques causing significant harm.
   - *High-risk areas in Annex III:* employment, education, access to essential services including credit
-    scoring, biometric identification, law enforcement, migration and justice, plus AI that is a safety
-    component of regulated products.
+    scoring, biometric identification, critical infrastructure, law enforcement, migration and justice.
+    AI that is a safety component of a product under EU product-safety law (Annex I) is high-risk too.
   - *Transparency obligations* for systems like chatbots and generated media; *minimal risk* for the rest.
     General-purpose AI models carry their own separate provider obligations.
 - **Impact.** Who is affected, how severely and how reversibly if the output or action is wrong.
@@ -160,7 +160,7 @@ autonomy is computed from the declared tool list instead of asked, so it cannot 
 ```python
 TIERS = ["low", "medium", "high"]
 ANNEX_III = {"employment", "education", "essential_services", "credit_scoring", "biometric_id",
-             "law_enforcement", "migration", "justice"}
+             "critical_infrastructure", "law_enforcement", "migration", "justice"}
 
 def agent_autonomy(tools: dict) -> str:
     # tools: name -> "read" | "write_approved" | "write"

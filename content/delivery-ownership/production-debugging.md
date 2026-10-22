@@ -5,7 +5,7 @@ name: Production debugging
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - delivery-ownership/failure-analysis
@@ -259,7 +259,7 @@ def messages_before(run, k):
                      "content": step["raw_tool_result"]})  # recorded result, never re-executed
     return msgs
 
-def replay_step(run, k, n=20, **overrides):
+def replay_step(run, k, n=20, **overrides):   # k is 0-based: steps[:k] are served from the trace
     t = {**run, **overrides}                              # one factor at a time
     msgs = messages_before(t, k)
     picks = [complete(msgs, t["model"], t["tools"], **t["params"]) for _ in range(n)]
@@ -283,7 +283,7 @@ A support agent normally finishes in about 6 steps. After a release, cost per co
 | Trace diff | Long runs call `search_orders` again and again | Loop at the tool step |
 | First divergent step | Step 4: the tool returns an error string, the model retries with the same arguments | Error handling |
 | Change log | The deploy renamed a field the tool expects | Candidate cause |
-| Replay step 4, n=20, tools stubbed | Same retry chosen 20 of 20 | Reproduced, deterministic |
+| Replay step 4, n=20, tools stubbed | Same retry chosen 20 of 20 | Reproduced on every sample |
 | Fix | Restore the field, return a structured error, cap identical calls per run, add the run as a regression case | Closed |
 
 ### Worked incident: wrong refund window

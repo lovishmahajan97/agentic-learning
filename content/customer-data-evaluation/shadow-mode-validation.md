@@ -5,7 +5,7 @@ name: Shadow-mode validation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - llmops-platform/canary-shadow-deployments
@@ -155,6 +155,7 @@ the candidate with write tools stubbed and records a comparable row.
 import asyncio, time, json
 
 WRITE_TOOLS = {"update_claim", "send_email", "issue_payment"}
+READ_TOOLS = {"get_claim", "get_policy"}
 
 class DryRunTools:
     def __init__(self, real_tools, recorded_reads):
@@ -163,6 +164,8 @@ class DryRunTools:
         if name in WRITE_TOOLS:                       # never execute writes in shadow
             self.intended_writes.append({"tool": name, "args": args})
             return {"status": "ok", "dry_run": True}
+        if name not in READ_TOOLS:                    # undeclared tool: fail closed
+            raise PermissionError(f"undeclared tool in shadow: {name}")
         key = json.dumps([name, args], sort_keys=True)
         if key in self.recorded:                      # reuse prod's read result: same facts
             return self.recorded[key]

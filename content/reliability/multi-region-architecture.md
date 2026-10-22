@@ -5,7 +5,7 @@ name: Multi-region architecture
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - reliability/high-availability
@@ -165,7 +165,7 @@ All numbers illustrative.
 | T+~60 s | global load balancer marks `us-east` unhealthy after failed checks and routes all users to `eu-west` |
 | T+few min | on-call confirms the region, not the checks, is the problem and runs the promotion step |
 | T+6 min | `eu-west`'s replica of US tenants becomes primary |
-| after | agent runs mid-step in `us-east` resume in `eu-west` from their last checkpoint, re-executing only the interrupted step |
+| after | agent runs mid-step in `us-east` resume in `eu-west` from their last replicated checkpoint, re-executing the interrupted step plus any step whose checkpoint fell in the ~2 s lag window (idempotency keys make those repeats safe) |
 
 - **Data loss:** writes `us-east` accepted in its last ~2 s never replicated, so the RPO for US tenants
   is about 2 s. They stay stranded in `us-east` until it returns; clients holding their idempotency keys
@@ -261,8 +261,8 @@ print(pick_endpoint({"home_region": "eu-west", "residency_bound": True}, healthy
   manual data-tier promotion is slower and safer, and becomes the better choice as the data's value rises.
 - **More quota vs more validation.** A second region doubles provider quota and model-availability
   options, yet model and prompt behaviour must be validated in two places, doubling eval and rollout work.
-- **Checkpoint often vs write cost.** Checkpointing every agent step keeps failover loss to one step but
-  adds a replicated write per step; checkpoint less often only when steps are cheap and side-effect free.
+- **Checkpoint often vs write cost.** Checkpointing every agent step limits failover loss to the
+  interrupted step plus the replication lag window, but adds a replicated write per step; checkpoint less often only when steps are cheap and side-effect free.
 
 ## Pitfalls
 - **A standby region never failed over to.** Expired credentials, missing secrets, a model not enabled in
@@ -389,7 +389,7 @@ rather than promised.
 - **Agents hitting provider quota ceilings.** A second region's model quota doubles headroom, with batch
   agent work shed first when one region must carry both.
 - **Long-running agent platforms with a region-loss SLA.** Replicated checkpoints let interrupted runs
-  resume in the surviving region, re-executing only the interrupted step.
+  resume in the surviving region, re-executing only the steps inside the replication lag window.
 - **Global RAG assistants.** Each region serves retrieval from an index built with the same embedding
   model version, cutting latency for distant users.
 

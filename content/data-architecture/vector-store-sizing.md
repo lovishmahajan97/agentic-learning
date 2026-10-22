@@ -5,7 +5,7 @@ name: Vector store sizing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - data-architecture/vector-database-architecture

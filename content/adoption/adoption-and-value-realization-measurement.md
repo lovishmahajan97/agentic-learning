@@ -5,7 +5,7 @@ name: Adoption & value-realization measurement
 kind: metric
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - adoption/usage-analytics
@@ -71,10 +71,11 @@ realized value ≈ eligible volume × adoption share × effect per assisted unit
   short to know what to fix.
 
 ### Reading the equation for an agent
-- **Adoption share** is the share of eligible tasks the agent attempts *and* completes without a human
-  takeover; a run that ends in takeover is not assisted work, it is often extra work.
-- **Effect per assisted unit** is net: time saved on agent-completed tasks minus the time humans spend
-  reviewing, approving and redoing taken-over runs.
+- **Adoption share** is the share of eligible tasks routed to the agent (its attempt share), not the share
+  of users who opened the agent UI.
+- **Effect per assisted unit** is net per attempted run: completion rate × time saved on completed tasks,
+  minus takeover rate × the time humans spend reviewing and redoing taken-over runs. A takeover is not
+  assisted work; it is often extra work.
 - **Run cost** scales with steps and tool calls per task, so a looping agent erodes value even when its
   completion rate holds.
 
@@ -151,7 +152,7 @@ flowchart TD
 ### Agent scenario: net value of a ticket-resolution agent
 A support agent attempts half of 10,000 eligible tickets a week. The per-ticket effects (10 minutes saved
 when it completes, 3 minutes lost when a human takes over) must come from a comparison design like the
-one below, not from trace self-reports. All numbers are illustrative.
+one below, not from the agent's own traces. All numbers are illustrative.
 
 ```python
 tickets = 10_000                       # eligible tickets a week
@@ -396,8 +397,8 @@ method, give a range and confirm the guardrails held. Then I propose the specifi
 **Build a value report for a simulated agent rollout (2-3 hours).**
 - **Goal:** produce a defensible, ranged estimate of an agent's weekly net value.
 - **Steps:** simulate weekly handling times for two teams over 10 weeks, with the agent going live in
-  team A at week 5 and a shared drift in both; add agent run logs (completed, taken over, tool calls,
-  cost); compute DiD, a placebo spread from pre-launch weeks, adoption share and net value with the
-  run-cost and takeover terms.
+  team A at week 5 and a shared drift in both; write a projected value up front; add agent run logs
+  (completed, taken over, tool calls, cost) and a weekly reopen rate as the guardrail; compute DiD, a
+  placebo spread from pre-launch weeks, adoption share and net value with the run-cost and takeover terms.
 - **Done when:** a one-page table shows projected versus realized value by factor with a range, the
   guardrail status, and the single factor you would invest in next.

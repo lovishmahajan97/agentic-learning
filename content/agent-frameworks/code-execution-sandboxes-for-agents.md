@@ -5,7 +5,7 @@ name: code-execution sandboxes for agents (E2B, Modal, Docker)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/sandboxing
@@ -117,10 +117,9 @@ def run_python(code: str, timeout_s: int = 10) -> dict:
         out = c.logs(stdout=True, stderr=True).decode(errors="replace")
         return {"exit_code": status["StatusCode"], "output": out[-4000:]}  # keep the tail only
     except Exception as e:
-        c.kill()
         return {"exit_code": None, "output": f"timeout or error: {type(e).__name__}"}
     finally:
-        c.remove(force=True)
+        c.remove(force=True)                        # force kills a still-running container first
 
 print(run_python("print(sum(range(10)))"))
 print(run_python("import urllib.request; urllib.request.urlopen('http://example.com')"))  # fails: no network

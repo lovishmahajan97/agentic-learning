@@ -5,7 +5,7 @@ name: Pydantic AI (typed agents, dependencies, structured results)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/frameworks

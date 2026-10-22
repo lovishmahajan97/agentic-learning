@@ -5,7 +5,7 @@ name: Data ingestion from client systems
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - data-architecture/ingestion-pipelines
@@ -198,7 +198,8 @@ def sync_tickets(api, raw_store, state, tenant):
   clock at the end of the run, because the two clocks disagree and a watermark from your clock can jump
   past records the source stamped slightly earlier.
 - **Sizing the overlap.** It should exceed the worst clock skew plus the longest transaction you expect at
-  the source; ten minutes is a starting value, not a derived one.
+  the source; ten minutes is a starting value, not a derived one. Content-hash dedupe makes a generous
+  overlap cheap, so err on the large side.
 - **Crashes resume.** A crash mid-run leaves the watermark where it was, so the next run resumes.
 - **What it cannot see.** A ticket hard-deleted in the source never appears in `updated_since`, which is
   why a separate reconciliation job compares ID sets.
@@ -232,9 +233,9 @@ Trace of the investigation (illustrative numbers).
 | Question | Finding |
 |---|---|
 | What did the agent retrieve? | the chunk for INC-2207 indexed at 06:00, status "awaiting customer" |
-| When did the source change? | closed at 09:12 by an automation rule |
-| Did the 10:00 sync see it? | no: the rule bumped `SystemModstamp`, the sync polls `LastModifiedDate` |
-| Fix for freshness | poll the system field, and add a live `get_ticket_status` tool the agent calls before stating a status |
+| When did the source change? | closed and stamped 09:12, inside a long transaction that committed at 09:20 |
+| Did the hourly syncs see it? | no: the 09:15 run had already set the watermark to 09:14 from other records, and the 10:15 run queried strictly `updated_at > 09:14` |
+| Fix for freshness | query from the watermark minus an overlap, and add a live `get_ticket_status` tool the agent calls before stating a status |
 | Fix for trust | show the chunk's indexed-at time in the tool result so the model can say how current it is |
 
 ### Worked scenario: choosing channels for one client
@@ -285,23 +286,25 @@ A client with three sources and different constraints (illustrative).
 
 ## Pitfalls
 - **Advancing the watermark before writes are durable.** Symptom: a small, permanent gap of records that
-  were fetched during a crash and never re-fetched.
+  were fetched during a crash and never re-fetched. Fix: advance after the write.
 - **A strict `>` comparison on a timestamp watermark with no overlap.** Symptom: occasional missing
-  records that share a timestamp with the previous run's last record.
+  records that share a timestamp with the previous run's last record, or committed late with an earlier
+  stamp. Fix: query from the watermark minus an overlap.
 - **Offset pagination over a set that changes during the run.** Symptom: records skipped or seen twice
   when inserts shift page boundaries. Fix: cursor or keyset pagination ordered on a stable key.
 - **Ignoring `Retry-After` and retrying immediately.** Symptom: the client's API gateway throttles or
-  blocks your service account, sometimes for the whole tenant's integrations.
+  blocks your service account, sometimes for the whole tenant's integrations. Fix: honour it and cap
+  concurrency.
 - **Hashing the whole API response, volatile fields included, for the dedupe key.** Symptom: a raw zone
   that grows by roughly the full overlap window on every run and "changed" counts that never fall,
-  although nobody edited those records.
+  although nobody edited those records. Fix: hash only content-bearing fields.
 - **Writing straight to the index with no raw copy.** Symptom: a parser or mapping fix requires a full
-  re-pull, which can take days against a rate-limited API.
+  re-pull, which can take days against a rate-limited API. Fix: land raw first.
 - **Giving agent tool calls and sync jobs separate, uncoordinated rate budgets.** Symptom: during a
   backfill the agent's live lookups start failing with 429s and users see "tool unavailable". Fix: one
   quota budget per client instance with priority for interactive calls.
 - **Assuming polling sees deletes.** Symptom: answers citing documents or records the customer deleted
-  weeks ago, often found by the customer.
+  weeks ago, often found by the customer. Fix: deleted-items endpoint, CDC or ID reconciliation.
 
 ## When to use
 - **Use for** any recurring pull from a system you do not own.
@@ -364,11 +367,13 @@ and tombstones the difference through to the index.
 - **Call live for what must be current,** such as status before the agent updates a ticket, because the
   index lags by up to one sync interval. Budget live calls inside the same API quota as the sync.
 
-### How large should the watermark overlap be?
-- **Larger than the worst clock skew plus the longest source transaction,** because late-committing
-  transactions are stamped with earlier times.
-- **Ten minutes is a starting value, not a derived one;** content-hash dedupe makes a generous overlap
-  cheap, so err on the large side.
+### Your agent states a ticket status that changed two hours ago. How do you find the cause?
+- **Start from the trace:** which chunk the retrieval tool returned and its indexed-at time, against the
+  source's change time, so you know whether the sync or the agent is at fault.
+- **Then check the sync runs after the change:** did the query window cover the change's timestamp
+  (watermark overlap, late commits), and does the polled field move on this kind of change?
+- **Fix both layers:** an overlap sized above skew plus the longest transaction (ten minutes is a starting
+  value, not a derived one), plus a live status tool and indexed-at time in the tool result.
 
 ## Quiz
 ### Q: Why should the watermark be advanced only after the batch has been durably written?

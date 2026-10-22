@@ -5,7 +5,7 @@ name: Rapid prototyping / PoC
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - scoping/timeboxing
@@ -223,7 +223,7 @@ print(f"p=0.88, n=200: ±{half_width(0.88, 200):.1%}")      # ±4.5%
 | Likely result vs threshold | Gap | Examples worth labeling |
 |---|---|---|
 | 95% vs 85% | 10 points | ~100 resolves it |
-| 88% vs 85% | 3 points | ~550, or accept a pilot with the risk stated |
+| 88% vs 85% | 3 points | ~450 at p = 0.88 (~550 if sized conservatively at 0.85), or accept a pilot with the risk stated |
 
 ### Worked scenario: a helpdesk-agent PoC
 Illustrative numbers. Threshold: 70% task success on held-out tickets, zero unauthorised writes, at most
@@ -297,7 +297,8 @@ Illustrative numbers. Threshold: 70% task success on held-out tickets, zero unau
 - **PoC when:** the main unknown is whether the model can meet a quantified bar on real data.
 - **Do both** before committing to an integration-heavy build, and inside a timebox.
 - **Skip when:** the task is well understood and the same pattern already runs in production elsewhere with
-  similar data; a pilot may then be the cheaper first step.
+  similar data; a pilot may then be the cheaper first step. Also skip the PoC when desirability, not
+  feasibility, is the risk: a Wizard-of-Oz prototype answers that faster without any model work.
 - **Measure:** a PoC by the decision it enabled and the risks it retired, not by how polished it looks.
 
 ## Role lens
@@ -340,8 +341,7 @@ untested. Otherwise the PoC passes and the pilot fails on the very data the cura
 - **Depends on the gap to the threshold.** At 85% accuracy, 100 examples give about ±7 points, 400 give about
   ±3.5, and ±3 points needs roughly 550.
 - **So** if the expected result is far from the threshold, 100 is plenty; if close, label more or report the
-  result as inconclusive. Skip the PoC entirely when the same pattern already runs in production on similar
-  data, or when desirability, not feasibility, is the risk.
+  result as inconclusive.
 
 ### How would you scope a two-week PoC for a customer-support agent with nine tools?
 - **Retire the riskiest assumption first:** real, scoped access to the systems the agent must call, then
@@ -352,7 +352,8 @@ untested. Otherwise the PoC passes and the pilot fails on the very data the cura
 
 ### Your agent PoC passes on task success but averages 14 tool calls per task. Is that a pass?
 - **Not if the threshold included a step or cost budget,** because cost and latency per task scale with
-  tool calls and a 40-second task may not fit the workflow.
+  tool calls; 14 model calls at a few seconds each can approach the 40-second answers that already count as
+  a fail.
 - **Diagnose from traces:** repeated lookups, retries on invalid arguments or loops usually explain it, and
   merging tools or validating arguments often cuts steps without hurting success.
 
@@ -400,4 +401,5 @@ untested. Otherwise the PoC passes and the pilot fails on the very data the cura
   20 held-out by id hash; build a loop with three tools (one stubbed with the real schema); run the
   harness on dev, bucket failures, fix the largest bucket twice; read held-out once.
 - **Done when:** you have a run log per iteration with error buckets, a held-out score with its interval,
-  and a one-page findings note listing what was stubbed and the decision.
+  and a one-page findings note listing what was stubbed and the decision. Expect "inconclusive" unless the
+  result is far from the threshold: 20 held-out tasks at 80% give about ±17.5 points.

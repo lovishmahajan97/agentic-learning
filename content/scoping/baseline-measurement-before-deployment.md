@@ -5,7 +5,7 @@ name: Baseline measurement before deployment
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/success-metrics-kpis
@@ -195,8 +195,9 @@ draft is logged next to what the human actually sent. The same rubric grades bot
 | Plan change | 60 | 8% | 10% | 5% |
 | Disputed charge | 30 | 13% | 27% | 40% |
 
-- **Overall the agent looks close to humans,** but the segment view shows it should not draft disputed
-  charges without review.
+- **The blended rate hides where the risk is.** Weighted by volume, agent drafts err on about 9.3% of
+  tickets against 6.8% for humans; the segment view shows the gap is almost all disputed charges, and the
+  agent beats humans on refund status.
 - **This becomes the launch scope:** autonomous drafts for refund status, assisted drafts for plan change,
   human-only for disputes until the eval improves.
 
@@ -220,7 +221,8 @@ Two comparable queues are baselined over the same 8 weeks; one gets the agent.
   telemetry uses. Monitor that the job still reproduces the frozen baseline value on the frozen snapshot.
 - **One rubric for humans and agents.** Draw the SME audit sample with a fixed random seed per segment,
   strip any indication of who produced the output, and grade human outputs with the same rubric (or the
-  same LLM judge, calibrated on SME labels) used for agent outputs. Monitor interval width per segment.
+  same LLM judge, calibrated on SME labels) used for agent outputs. Monitor interval width per segment
+  and enlarge the sample where it is too wide to set a bar.
 - **Holdout routing flag.** Route a fixed set of queues or teams to the old flow and tag every case with
   its arm at creation time, so the difference-in-differences can be computed by a query. Monitor arm
   balance and any leakage of the agent into the holdout.

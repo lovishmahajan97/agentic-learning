@@ -5,7 +5,7 @@ name: Tenant-level quotas & noisy-neighbor isolation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - reliability/bulkheads
@@ -257,14 +257,17 @@ print("DRR:        ", drr(backlog(), quantum=8_000, rounds=30))  # A: 240000, B:
 
 ### Worked scenario: a looping agent on a shared key
 Illustrative numbers. Tenant C's research agent hits a tool that keeps returning an error the model
-cannot fix, so it retries the same step. Each step re-sends a ~15k-token transcript plus `max_tokens` of
-1,000.
+cannot fix, so it retries the same step. A scheduled job has 20 such runs going at once, each taking a
+step about every 20 seconds.
+
+Each step re-sends a ~15k-token transcript plus `max_tokens` of 1,000, so it
+reserves ~16k tokens.
 
 | Control in place | What happens in the first 10 minutes |
 |---|---|
-| Global limit only | C's loop sends ~60 steps a minute, ~960k TPM, nearly the whole one-million-TPM key; every other tenant's agent queues |
-| Per-tenant bucket of 50k TPM | C is admitted ~3 steps a minute, then gets 429 with `Retry-After`; other tenants are untouched |
-| Plus a per-run step budget of 25 | C's run stops at step 25 with a clear "budget exhausted" result after ~8 minutes |
+| Global limit only | C's 20 runs send ~60 steps a minute, ~960k TPM, nearly the whole one-million-TPM key; every other tenant's agent queues |
+| Per-tenant bucket of 50k TPM | C is admitted ~3 steps a minute across all its runs, then gets 429 with `Retry-After`; other tenants are untouched |
+| Plus a per-run step budget of 25 | each run stops at step 25 with a clear "budget exhausted" result instead of looping until someone notices |
 | Plus a daily spend cap | a bug that starts many such runs is bounded by the tenant's spend, not the platform's |
 
 The per-tenant bucket protects neighbors; the per-run budget protects the tenant from its own agent.

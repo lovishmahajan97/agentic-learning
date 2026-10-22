@@ -5,7 +5,7 @@ name: OpenTelemetry
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - observability/tracing
@@ -24,8 +24,8 @@ sources:
 
 ## TL;DR
 OpenTelemetry (OTel) is the CNCF vendor-neutral standard for traces, metrics and logs. Instrument your
-agent once, every run, model call and tool call becomes a span in one trace, and Langfuse, Phoenix or
-your APM is just an OTLP endpoint.
+agent once and every run, model call and tool call becomes a span in one trace; Langfuse, Phoenix or
+your APM is then just an OTLP endpoint.
 
 ## For agent builders
 - **Why it matters for agents.** An agent run is a tree: a root task, model calls that decide, tool calls
@@ -136,18 +136,19 @@ your APM is just an OTLP endpoint.
   "agent step 3", tool name, remain manual.
 
 ## Diagram
-Spans flow from the SDK through a batch processor and OTLP to an agent Collector, then a gateway that tail
-samples and fans out. The `traceparent` header is what joins the downstream service.
+Spans from the agent's run, model and tool calls flow from the SDK through a batch processor and OTLP to
+an agent Collector, then a gateway that tail samples and fans out. The `traceparent` header is what joins
+a remote tool or MCP server to the same trace.
 
 ```mermaid
 flowchart TD
-    A["App code: API calls"] --> S["SDK: TracerProvider and sampler"]
+    A["Agent: run, model, tool spans"] --> S["SDK: TracerProvider and sampler"]
     S --> B["BatchSpanProcessor"]
     B -->|"OTLP gRPC 4317 or HTTP 4318"| CA["Collector agent per pod"]
     CA -->|"keyed on trace id"| CG["Collector gateway: tail sampling"]
     CG --> T[("Tracing backend")]
     CG --> L[("LLM tool: Langfuse or Phoenix")]
-    A -->|"traceparent header"| D["Downstream service"]
+    A -->|"traceparent header"| D["Tool or MCP server"]
     D -->|"same trace_id"| CA
 ```
 
@@ -332,8 +333,9 @@ memory to hold `decision_wait` seconds of full traffic (here 40,000 spans for 10
   "p95 duration of tool spans by name" or "runs that hit the step budget" works. Monitor spans per trace,
   because a runaway loop shows up as a trace with hundreds of turn spans.
 - **Opt in to content per environment.** Enable prompt and completion capture in staging and for sampled
-  production traffic only, using the instrumentation library's content-capture setting. Monitor span size and
-  storage growth.
+  production traffic only, using the instrumentation library's content-capture setting (for the OpenAI
+  instrumentation that follows the GenAI conventions, `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true`).
+  Monitor span size and storage growth.
 
 ## Trade-offs
 - **Vendor neutrality vs uneven maturity.** One instrumentation for every backend, but maturity varies across
@@ -412,6 +414,8 @@ confirm each service sets a distinct `service.name` so the merged trace is reada
 ### After moving tool execution to asyncio tasks, every tool call shows up as its own root trace. How do you debug it?
 - **Symptom means lost context.** The parent lives in `contextvars`; work started in a thread pool or a task
   created without the current context has no parent, so the SDK starts a new root.
+- **Usual culprits.** `asyncio.create_task` copies the context at creation, so look for `run_in_executor`
+  and thread pools (which do not copy it), or a long-lived worker task created before the span opened.
 - **Fix:** propagate context explicitly (copy the context into the task or executor, or use instrumentation
   that does), then verify by checking that tool spans share the root `trace_id`.
 - **Also check queues,** where `traceparent` must be injected into message headers.
@@ -484,7 +488,8 @@ confirm each service sets a distinct `service.name` so the merged trace is reada
 - **Goal:** see an agent run as one trace with turns, model calls and parallel tool calls.
 - **Steps:** run Jaeger or Phoenix locally as an OTLP backend; build a small agent with two tools (one that
   sometimes raises); instrument it with a root `agent.run` span, turn spans, model spans with `gen_ai.*`
-  attributes and tool spans; run the tools as asyncio tasks; then add a Collector with an error tail
-  sampling policy.
+  attributes and tool spans; run the tools as asyncio tasks; then put the contrib Collector
+  (`otelcol-contrib`, which ships `tail_sampling`) in front of the backend with an error policy and a 10%
+  baseline.
 - **Done when:** one run shows a single trace with sibling tool spans, a failing tool appears as an ERROR
   span under its turn, and only error runs plus a baseline survive the Collector.

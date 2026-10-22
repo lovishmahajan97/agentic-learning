@@ -5,7 +5,7 @@ name: Grouped-query attention (GQA)
 kind: concept
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/multi-head-attention
@@ -383,7 +383,7 @@ evenly.
 **Compare resident agent sessions across head layouts (2-3 hours).**
 - **Goal:** show, with numbers from configs and one real engine run, how KV heads change agent capacity.
 - **Steps:** read `num_key_value_heads` for an MHA and a GQA model of similar size; compute cache per 32k
-  session; serve the GQA model in vLLM with a fixed memory budget and replay 20 synthetic agent sessions
+  session; serve the GQA model in vLLM on one GPU with a fixed `gpu_memory_utilization` and replay 20 synthetic agent sessions
   of growing length; record KV-cache utilization and preemptions; repeat with an FP8 cache.
 - **Done when:** you have a table of predicted versus observed resident sessions per configuration and a
   short note on where the prediction was off and why.

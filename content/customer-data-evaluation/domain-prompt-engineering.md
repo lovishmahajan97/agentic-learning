@@ -5,7 +5,7 @@ name: Domain prompt engineering
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - prompting/prompt-engineering
@@ -25,8 +25,8 @@ path, each rule traced to an SME decision and eval case.
 
 ## For agent builders
 - **Why it matters for agents.** An agent does not just label; it acts on its reading of a term. If
-  "late" means the public meaning, it calls `file_claim` on shipments the customer would never credit,
-  and the mistake is an action in their system, not a wrong string in a report.
+  "late" means the public meaning, it calls `issue_sla_credit` on shipments the customer would never
+  credit, and the mistake is an action in their system, not a wrong string in a report.
 - **Where it shows up in your stack.** The agent's system prompt (glossary, ordered rules, boundary
   examples), tool descriptions that say when each tool applies, a structured final-answer or
   escalation tool with a closed enum, and the prompt version id logged on every trace.
@@ -175,12 +175,14 @@ FINAL_ANSWER_TOOL = {   # the agent ends every run by calling this; enums make t
         "reason": {"type": "string"}}},
 }
 
-def build_system_prompt(version="acme-freight-v7"):
+def build_system_prompt(version="acme-freight-v7", examples=()):
     terms = "\n".join(f"- {k}: {v}" for k, v in GLOSSARY.items())
     rules = "\n".join(f"{rid}. {text}" for rid, text in RULES)
+    shots = "\n".join(f"Input: {json.dumps(x)}\nOutput: {json.dumps(y)}" for x, y in examples)
     return (f"[prompt {version}]\nYou triage shipment exceptions. Use these definitions, not general "
             f"meanings:\n{terms}\nRules, in priority order:\n{rules}\n"
-            "Never infer a delivery time. Finish by calling submit_triage.")
+            "Never infer a delivery time. Finish by calling submit_triage.\n"
+            f"Examples:\n{shots}")
 
 def diagnose(results):
     """results: dicts with the SME's gold_label and gold_rule, and the agent's label and rule."""
@@ -213,6 +215,7 @@ EXAMPLES = [
     ({"promised_end": "10:00", "delivery_ts": "10:20", "reschedule_by": "carrier",
       "new_end": "12:00"}, {"label": "late", "rule": "R4"}),
 ]
+system_prompt = build_system_prompt(examples=EXAMPLES)   # stable prefix: cache it, log its version
 ```
 
 ### Worked iteration: v6 to v7 of the triage agent (numbers illustrative)

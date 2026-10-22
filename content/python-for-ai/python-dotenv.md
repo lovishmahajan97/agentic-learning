@@ -5,7 +5,7 @@ name: python-dotenv
 kind: tool
 difficulty: intro
 est_minutes: 9
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - python-for-ai/pydantic-settings

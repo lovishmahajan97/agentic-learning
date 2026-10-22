@@ -5,7 +5,7 @@ name: Monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - observability/latency-percentiles
@@ -293,7 +293,7 @@ A support agent's dashboard the day after `prompt_version` v14 replaced v13 (ill
 | HTTP error rate | 0.3% | 0.3% | flat: nothing "broke" |
 | Steps per task, p50 | 3 | 6 | the agent now re-searches before answering |
 | Step-budget stops | 1% | 7% | 7× more runs give up |
-| Cost per task, p50 | $0.012 | $0.027 | doubles with steps |
+| Cost per task, p50 | $0.012 | $0.027 | 2.25×: more than doubles with steps |
 | Failed-task ratio (budget 5% for a 95% SLO) | 5% | 11% | burn rate 1 vs 2.2: a ticket, not a page |
 
 - **Action:** roll back to v13 and add the failing runs to the eval set; only run-level metrics with a

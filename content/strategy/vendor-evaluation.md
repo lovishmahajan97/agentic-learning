@@ -5,7 +5,7 @@ name: Vendor evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/model-selection
@@ -238,13 +238,14 @@ Each candidate runs the same agent loop (same tools, tool descriptions tuned per
 | Task-completion rate | 0.86 | 0.74 |
 | Cost per ticket incl. human fix of failures | 0.084 + 0.14 × 0.50 = $0.154 | 0.044 + 0.26 × 0.50 = $0.174 |
 | p95 per step at load | 1.4 s | 0.9 s |
-| Rough run time at average steps | ~9.8 s | ~9.9 s |
+| Rough run time (p95 per step × average steps) | ~9.8 s | ~9.9 s |
 
 - **B is three times cheaper per step and still loses.** It needs more steps (weaker tool selection) and
   fails more runs, so the human fixes dominate.
 - **Faster steps did not buy a faster agent**, because B takes more of them.
-- **Check the gap against noise:** on 200 runs the interval on 0.86 is about ±5 points, so the 12-point
-  completion gap is real; read the failed trajectories to see where B goes wrong.
+- **Check the gap against noise:** on 200 runs the interval on 0.86 alone is about ±5 points, and on the
+  difference of two independent rates about ±8, so the 12-point completion gap is real (a paired count on
+  the same tickets is tighter still); read the failed trajectories to see where B goes wrong.
 
 ## Production patterns
 - **Re-runnable bake-off harness** — keep the held-out set, each vendor's prompts (tuned on the dev split)

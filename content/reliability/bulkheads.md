@@ -5,7 +5,7 @@ name: Bulkheads
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - reliability/circuit-breakers
@@ -28,8 +28,8 @@ detects failure; the price is capacity that cannot be borrowed.
 
 ## For agent builders
 - **Why it matters for agents.** An agent service calls many dependencies per turn: the model, a vector
-  store, and several tools, often in parallel. One hung tool can hold every worker, and then even runs that
-  never touch it, and your health checks, fail.
+  store, and several tools, often in parallel. One hung tool can hold every worker; then runs that never
+  touch it fail too, and so do your health checks.
 - **Where it shows up in your stack.** An `asyncio.Semaphore` per tool in the tool executor, one HTTP client
   per upstream, separate queues for background agents and interactive chat, Kubernetes namespaces with a
   `ResourceQuota`, and Resilience4j bulkheads on the JVM.
@@ -226,7 +226,10 @@ async def run_tool_calls(calls, tools):
     return await asyncio.gather(*(run_one(c, tools) for c in calls))
 ```
 
-- **A hung sandbox holds at most 8 workers,** however many runs ask for code execution at once.
+- **A hung sandbox holds at most 8 workers,** however many runs ask for code execution at once; every
+  other run gets `tool_busy` within 100 ms.
+- **The bulkhead does not end a hang.** Each tool still needs its own timeout (as the HTTP clients above
+  have), or the 8 runs holding permits wait forever and the compartment never frees.
 - **The model sees `tool_busy`** in the tool results and can finish the answer with the other tools.
 
 ### Sizing calculator with the oversubscription check
@@ -378,7 +381,7 @@ breaker on top releases the 20 permits once failures are confirmed.
   caller traffic; retries raise the rate until any fixed pool fills.
 - **The bulkhead turns that unbounded number into one you chose.**
 
-### How would you size a bulkhead for an LLM dependency doing 20 requests per second at a 3-second p99?
+### Your agents make 20 model calls per second at a 3-second p99. How would you size the LLM bulkhead?
 - **Little's law:** 20 × 3 = 60 concurrent calls in normal operation, so a cap around 100 leaves burst
   headroom.
 - **Check what it tolerates:** 100 ÷ 20 = 5 seconds of average latency before shedding starts.

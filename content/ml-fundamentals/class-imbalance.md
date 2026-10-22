@@ -5,7 +5,7 @@ name: Class imbalance
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/confusion-matrix
@@ -299,9 +299,10 @@ for tpr, fpr in ((0.95, 0.01), (0.95, 0.001)):
   observed positive rate per day.
 - **Cascade for very rare positives.** A cheap high-recall classifier routes a small enriched slice to an LLM
   judge or human review. Monitor stage-one recall on a labelled audit sample and stage-two queue volume.
-- **Budget guardrail false blocks per task, not per call.** Agent teams multiply the per-check FPR by
-  tool calls per task when setting thresholds, and log every block with the trace id so reviewers can
-  label it. Monitor blocked-task rate and the reviewed false-block share per guardrail.
+- **Budget guardrail false blocks per task, not per call.** With k independent checks per task, the
+  chance a clean task is blocked is 1 − (1 − FPR)^k, roughly k·FPR when that is small; set thresholds
+  from that number. Log every block with the trace id so reviewers can label it. Monitor blocked-task
+  rate and the reviewed false-block share per guardrail.
 
 ## Trade-offs
 - **Free threshold moving vs a ceiling.** It costs nothing and keeps probabilities honest, but cannot help a

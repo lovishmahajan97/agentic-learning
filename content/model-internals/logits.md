@@ -5,7 +5,7 @@ name: Logits
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - model-internals/softmax

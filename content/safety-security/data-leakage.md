@@ -5,7 +5,7 @@ name: Data leakage
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - safety-security/pii-redaction

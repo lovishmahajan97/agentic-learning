@@ -5,7 +5,7 @@ name: Eval review loops
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/error-analysis
@@ -373,6 +373,7 @@ improvement to the customer.
   system change separately.
 - **Steps:** build a docs-search agent over 20 short documents with one deliberately stale doc; run 40 eval
   questions with an LLM judge; review all failures and 10 random passes; code first bad step and
-  attribution; fix one label, the judge prompt and the stale doc; rescore the old agent, then the fixed one.
+  attribution; fix one label and the judge prompt, rescore the unchanged agent, then fix the stale doc and
+  score again.
 - **Done when:** you have an attribution tally, a corrected pass rate, a flip report, and a two-line report
   separating the measurement change from the agent change.

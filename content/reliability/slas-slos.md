@@ -5,7 +5,7 @@ name: SLAs / SLOs (and SLIs, error budgets)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - reliability/high-availability
@@ -209,8 +209,9 @@ ended with a final answer, within its 25-step budget, under 2 minutes and with n
 | Day 11: a tool schema change makes the model fill one argument wrong | bad rises to 3 percent, burn rate 1.5, ~50 bad per day |
 | Remaining budget | ~833 ÷ 50 ≈ 17 days, so a breach around day 27 |
 
-- **No call failed.** Every model and tool call returned 200; the failures were runs ending on the step
-  budget after repeated validation errors, which a call-level SLI would never count.
+- **No call-level SLI moved.** Model calls returned 200 and the argument errors came back as tool results;
+  the failures were runs ending on the step budget after repeated validation errors, which a call-level SLI
+  would never count.
 - **The slow-burn ticket catches it** once the 3-day window is dominated by the 1.5× burn; the trace outcome
   "budget exhausted" points straight at the tool.
 - **The policy applies:** the schema change is rolled back and prompt and tool changes need an eval gate
@@ -382,16 +383,19 @@ the measurement.
   successful task, so neither can be traded away silently.
 - **Policy:** burn-rate alerts on each, and prompt, tool-schema and model changes gated on remaining budget.
 
+### Each agent task makes 15 calls to a provider with 99.9 percent availability. What task availability should you expect, and what do you do about it?
+- **Serial calls multiply:** if every call must succeed, 0.999 to the 15th power is about 0.985, so roughly
+  1.5 percent of tasks fail before your own code, and a 99.5 percent task SLO is out of reach.
+- **Retries inside the run recover independent blips:** with one retry per call, failure per call drops
+  toward 0.001², so the task term rises to about 99.998 percent, assuming the failures are independent.
+- **Outages are not independent,** so retries do not help during a provider incident; that needs a fallback
+  provider, and the task SLO should be set from measured run outcomes, not from the vendor's number.
+
 ### Where does the 14.4 burn-rate threshold come from, and why use burn rate at all?
 - **14.4 means 2 percent of a 30-day budget in one hour:** 30 days is 720 hours, and 0.02 × 720 = 14.4.
 - **Burn rate scales alerts to budget impact,** so a two-minute blip does not page while a persistent 3×
   burn that breaches in ten days does.
 - **The 3-day 1× ticket tier** catches slow burns, like a prompt edit at 1.5×, that no page threshold sees.
-
-### A team runs a 99.9 percent SLO on a service with 2,000 requests a month, and alerts flap constantly. What would you change?
-- **The budget is two bad requests,** so one flaky client exhausts it and burn rates swing wildly.
-- **Options:** a longer window, a looser target, or synthetic probes to supply enough events for a stable
-  ratio.
 
 ### What does 99.99 percent availability imply operationally, and when would you refuse to promise it?
 - **4.32 minutes of budget per 30 days:** no human can be paged, diagnose and act in that time, so failover

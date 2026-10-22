@@ -137,8 +137,9 @@ flowchart TD
 ### Structurizr DSL: an agent with tools, a sandbox and a Dynamic view of one run
 The Context view shows three arrows leaving the system: model provider, CRM (read and write) and email.
 The Dynamic view numbers one run; Structurizr checks each step against the model, so deleting a
-relationship breaks the build instead of leaving a stale story. The DSL is line-based: an opening `{`
-ends its line and every closing `}` sits on a line of its own.
+relationship breaks the build instead of leaving a stale story.
+
+The DSL is line-based: an opening `{` ends its line and every closing `}` sits on a line of its own.
 
 ```
 workspace "Refund Agent" "Investigates and resolves refund tickets" {

@@ -5,7 +5,7 @@ name: MCP client primitives (sampling, roots, elicitation)
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - mcp/mcp-architecture
@@ -93,6 +93,9 @@ A server may only use a primitive the client declared in its capabilities (`samp
 - **Response:** `action` is `accept` (with `content` for forms), `decline` (explicit no) or `cancel`
   (dismissed). Servers must handle all three.
 - **Capability:** `elicitation: {"form": {}, "url": {}}`; an empty object means form only.
+- **2026-07-28 removed `notifications/elicitation/complete` and `elicitationId`.** Under MRTR the client
+  learns a URL-mode outcome by retrying the original request, so a server that must correlate across
+  retries encodes its own id in `requestState`.
 
 ### Delivery: server-initiated requests vs MRTR
 1. **Handshake era (2025-11-25 and earlier).** During `tools/call`, the server sends its own JSON-RPC
@@ -100,7 +103,8 @@ A server may only use a primitive the client declared in its capabilities (`samp
    call. On HTTP this needs the same server process for the whole exchange.
 2. **Stateless era (2026-07-28).** The server ends the call with `resultType: "input_required"`, an
    `inputRequests` map (keys chosen by the server, values are elicitation, sampling or roots requests) and
-   an opaque `requestState`.
+   an opaque `requestState`; it must include at least one of the two, and only requests the client
+   declared.
 3. **Retry.** The client gathers the answers and re-sends the original request with a new JSON-RPC `id`,
    `inputResponses` keyed the same way, and the exact `requestState`.
 4. **Finish or ask again.** Any replica decodes `requestState` and either completes or returns another
@@ -129,8 +133,9 @@ sequenceDiagram
 ## Examples
 ### A tool that uses all three, and a host that answers them
 Tested with the Python SDK 1.x (`mcp>=1.10,<2`), which uses handshake-era server-initiated requests. The
-2.x SDK also speaks 2026-07-28 and can deliver such questions as MRTR rounds through a different,
-resolver-based API, so check the migration guide.
+2.x SDK also speaks 2026-07-28, where `ctx.elicit()` and `ctx.session.create_message()` fail with
+`NoBackChannelError`; there you use its resolver-based API (`Resolve(...)` returning `Elicit(...)`) or
+return an `InputRequiredResult` yourself, so check the migration guide.
 
 ```python
 # deploy_server.py

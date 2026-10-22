@@ -5,7 +5,7 @@ name: Drift
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - llmops-platform/model-monitoring
@@ -441,5 +441,5 @@ being obvious in embedding space.
   bundle hash and an intent PSI over logged tasks; then inject three changes in turn (change the prompt
   out of band, change a tool's response enum, shift the task mix) and run recorded and live probes after
   each.
-- **Done when:** a short report correctly labels each injected change from the evidence (hash alert,
-  recorded-versus-live gap, PSI with stable outcomes) without you looking at what you changed.
+- **Done when:** a triage script, given only the logs and probe results, labels each injected change
+  correctly from the evidence (hash alert, recorded-versus-live gap, PSI with stable outcomes).

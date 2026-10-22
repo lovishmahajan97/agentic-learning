@@ -5,7 +5,7 @@ name: Model monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - llmops-platform/drift
@@ -399,8 +399,8 @@ treat any model change, alias update included, as a release that goes through sh
   detectable.
 
 ### How would you turn "schema validity" of agent tool calls and outputs into an alert that neither stays silent nor floods?
-- **Define an SLO:** for example 99% of extraction responses pass schema validation over 28 days, giving
-  a 1% error budget.
+- **Define an SLO per surface:** for example 99% of tool calls pass argument validation, and 99% of
+  extraction responses pass schema validation, over 28 days, each giving a 1% error budget.
 - **Alert on burn rate:** page on a fast burn in a short and long window, ticket on a slow burn.
 - **Attach examples:** every alert links to the failing traces, and fixed failures become eval cases.
 

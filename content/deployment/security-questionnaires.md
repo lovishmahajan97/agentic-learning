@@ -5,7 +5,7 @@ name: Security questionnaires
 kind: practice
 difficulty: intro
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - deployment/security-and-architecture-reviews
@@ -176,10 +176,13 @@ from datetime import date
 
 LIBRARY = [
     {"id": "AI-01", "q": "is customer data used to train ai models",
+     "answer": "No. Not used to train or fine-tune; LLM subprocessor terms exclude training.",
      "owner": "ml", "evidence": "DPA s4, subprocessor list", "reviewed": date(2026, 6, 1)},
     {"id": "ENC-03", "q": "is data encrypted at rest with customer managed keys",
+     "answer": "Partially. Provider-managed keys; customer-managed keys on the dedicated tier.",
      "owner": "infra", "evidence": "SOC 2 report, tier matrix", "reviewed": date(2025, 9, 15)},
     {"id": "RET-02", "q": "do you retain prompts and responses",
+     "answer": "Yes, 30 days for debugging, access-restricted, deletable on request.",
      "owner": "security", "evidence": "retention policy, trace config", "reviewed": date(2026, 8, 20)},
 ]
 
@@ -217,7 +220,7 @@ def draft(question, llm):
         return {"status": "needs_owner", "owner": entry["owner"],
                 "reason": f"{entry['id']} past review date", "draft": None}
     text = llm(f"Rewrite this approved answer to fit the question. Do not add claims.\n"
-               f"Question: {question}\nApproved answer id: {entry['id']}\n"
+               f"Question: {question}\nApproved answer ({entry['id']}): {entry['answer']}\n"
                f"Evidence: {entry['evidence']}")
     return {"status": "awaiting_approval", "owner": entry["owner"],
             "source": entry["id"], "draft": text}   # never sent until the owner approves

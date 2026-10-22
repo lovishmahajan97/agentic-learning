@@ -5,7 +5,7 @@ name: LangSmith for agents (tracing, datasets, evaluators, prompt hub)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - observability/langsmith
@@ -196,6 +196,8 @@ if __name__ == "__main__":
 - **`num_repetitions=3`** shows how stable each score is; agents with temperature above zero vary.
 
 ### Worked scenario: a model swap that looked fine
+Illustrative numbers from a refund agent's regression dataset.
+
 | Metric on 120 examples | Old model | New model |
 |---|---|---|
 | Final answer correct (judge) | 91% | 92% |

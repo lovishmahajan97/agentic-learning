@@ -5,7 +5,7 @@ name: Fault tolerance
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - reliability/high-availability
@@ -411,8 +411,8 @@ cases that still slip through, and the duplicate rate becomes a tracked metric.
   keys and read-after-timeout so a retried step cannot act twice.
 - **High-traffic assistants on a hosted provider.** Transient-only retries with a shared deadline and a
   retry budget ride out 429 bursts without tripling load during incidents.
-- **Structured-output pipelines.** Feeding schema validation errors back to the model repairs most
-  malformed tool calls within one extra step.
+- **Structured-output pipelines.** Feeding schema validation errors back to the model often repairs a
+  malformed tool call within one or two extra steps; measure the repair rate per tool.
 - **Multi-provider agents.** A labelled degradation ladder (primary model, smaller model, cached answer,
   typed unavailable) keeps runs finishing during a provider outage.
 
@@ -424,5 +424,5 @@ cases that still slip through, and the duplicate rate becomes a tracked metric.
   randomly delays replies past the caller's timeout; write the agent step handler with transient-only
   retries, a key minted before the first attempt, and read-after-timeout; run 1,000 simulated steps with
   injected 429s, timeouts and a worker crash between attempts.
-- **Done when:** the service holds exactly one ticket per intended action, the log shows retries,
-  repairs and unknown outcomes per class, and provider calls per step stay at or below the retry cap.
+- **Done when:** the service holds exactly one ticket per intended action, the log shows retries and
+  unknown outcomes per failure class, and calls per step stay at or below the retry cap.

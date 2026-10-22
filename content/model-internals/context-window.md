@@ -5,7 +5,7 @@ name: Context window
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - model-internals/kv-cache
@@ -207,9 +207,10 @@ def maybe_compact(system, messages, count, budget, summarize):
 ```
 
 The characters-per-token factor of 3 in the clip is a rough heuristic; clip by tokens if your tokenizer
-is cheap to call. Keep the system prompt and tool definitions out of the compacted region, and never
-split an assistant tool call from its tool result: most chat APIs reject a `tool` message whose call is
-missing, which is why the cut point moves back past any tool messages.
+is cheap to call. Keep the system prompt and tool definitions out of the compacted region.
+
+Never split an assistant tool call from its tool result: most chat APIs reject a `tool` message whose
+call is missing, which is why the cut point moves back past any tool messages.
 
 ### Worked scenario: a 30-step research agent on a 128k window
 The agent starts with a 7k-token prefix (system prompt plus 15 tool schemas) and each step appends about

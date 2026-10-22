@@ -5,7 +5,7 @@ name: Security & architecture reviews
 kind: practice
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - deployment/security-questionnaires

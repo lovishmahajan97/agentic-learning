@@ -5,7 +5,7 @@ name: AI control plane vs data plane
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - system-design/ai-gateway

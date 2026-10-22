@@ -5,7 +5,7 @@ name: Sandbox vs production environments
 kind: practice
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - enterprise-integration/enterprise-connectors
@@ -23,8 +23,8 @@ sources:
 
 ## TL;DR
 An agent's tools hit customer systems that come in pairs: production with real side effects, and
-sandboxes with different data and limits. Develop and evaluate agents against the sandbox, prove quality
-in shadow mode, and hard-guard tools so the two never mix.
+sandboxes with different data, configuration and limits. Develop against the sandbox, promote
+deliberately, prove quality in shadow mode, and hard-guard tools so the two never mix.
 
 ## For agent builders
 - **Why it matters for agents.** Every tool call an agent makes in a test run is a real call somewhere. An
@@ -141,7 +141,7 @@ production-safe tools:
 The sandbox proves the integration is *correct*; these prove it is *right for this customer*.
 
 ### Environments for an agent
-An agent adds three things the binding must cover, because the model decides at runtime which tools to
+An agent adds several things the binding must cover, because the model decides at runtime which tools to
 call and with what.
 - **The tool registry is per binding.** Each tool's adapter resolves its host and secret from the binding,
   so no prompt or tool argument can redirect a call to another environment. Never let the model supply a
@@ -149,6 +149,9 @@ call and with what.
 - **Shadow mode means write tools return a dry-run result.** The agent runs on live production inputs, read
   tools work normally, and write tools record the proposed call (tool, arguments, target record) and
   return "recorded, not executed". You compare proposed actions with what humans did.
+- **Watch how the model reacts to a dry run.** If it retries or changes plan because the write "did not
+  happen", the shadow trajectory stops matching a live one; return a success-shaped result and mark the
+  dry run only in the trace.
 - **Evals run against the sandbox, quality evals against real data.** Functional agent evals (does the
   agent call `update_case` with valid fields, does it respect permissions) run in the sandbox; task-quality
   evals need real text, gathered under the data agreement or from shadow logs.
@@ -376,11 +379,13 @@ ensuring the development binding can never reach the production host.
 - **Limits and identity differ too,** so throughput and permission-sensitive retrieval need production-safe
   checks such as shadow mode and a canary.
 
-### Design the guard that stops a staging deployment from writing to a customer's production CRM.
+### Design the guard that stops a staging agent's tools from writing to a customer's production CRM.
 - **Bind each environment explicitly** with a base URL, a secret reference and a writes flag, resolved
   from a variable with no default.
 - **Check the destination host in the client** against the binding and refuse on mismatch, so a typo
   fails loudly before any call.
+- **Keep hosts out of tool schemas,** so neither the model nor a prompt-injected document can pass a URL
+  or instance name that redirects a call.
 - **Keep production credentials out of non-production secret stores,** so even a bypassed check has
   nothing to authenticate with.
 
@@ -453,8 +458,8 @@ ensuring the development binding can never reach the production host.
 - **Goal:** one agent codebase that runs against a fake sandbox, a fake production API and in shadow mode,
   with cross-wiring impossible.
 - **Steps:** create two fake HTTP APIs on different local ports standing in for sandbox and production;
-  define bindings resolved from `APP_ENV` with no default; build a read tool and a write tool through the
-  guarded client; add an `AGENT_MODE=shadow` path where writes are recorded; run a 5-task agent loop in
+  define bindings resolved from `APP_ENV` with no default, and make the guard compare host *and* port,
+  since both fakes run on localhost; build a read tool and a write tool through the guarded client; add an `AGENT_MODE=shadow` path where writes are recorded; run a 5-task agent loop in
   each mode.
 - **Done when:** a deliberately mis-set binding fails at startup, shadow runs leave the production API
   untouched while producing a proposals log, and every trace line shows its binding pair.

@@ -5,7 +5,7 @@ name: DSPy (signatures, modules, optimizers)
 kind: tool
 difficulty: advanced
 est_minutes: 20
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - agents/frameworks
@@ -57,7 +57,7 @@ something you measure and improve.
 | Modules (`Predict`, `ChainOfThought`, `ReAct`, your own `dspy.Module`) | strategies that turn a signature into prompts and parse outputs | layers in a neural network |
 | `dspy.Example` | one training or dev example; `.with_inputs(...)` marks input fields | a labelled row |
 | Metric | `def metric(example, pred, trace=None) -> float or bool` | a loss function |
-| Optimizers (formerly teleprompters) | `BootstrapFewShot`, `MIPROv2` and others that compile a program | an optimizer and training loop |
+| Optimizers (formerly teleprompters) | `BootstrapFewShot`, `MIPROv2` and others (recent releases add `GEPA` and `SIMBA`) that compile a program | an optimizer and training loop |
 | `dspy.Evaluate` | runs a program over a dev set and scores it | a test harness |
 
 ### The workflow
@@ -68,7 +68,8 @@ something you measure and improve.
 4. **Compile.** Pass the program, metric and a train set to an optimizer. `BootstrapFewShot` collects demos
    that pass the metric; `MIPROv2` also proposes and searches instructions.
 5. **Save and load.** `compiled.save("program.json")` stores the learned instructions and demos;
-   `program.load(...)` restores them in production, so serving does not re-run optimization.
+   `program.load(...)` restores them in production, so serving does not re-run optimization. The JSON
+   holds state, not code: build the same program class first, then call `load` on it.
 
 ### When to pick DSPy
 | Pick DSPy when | Pick something else when |
@@ -126,7 +127,7 @@ def metric(example, pred, trace=None):
     return example.answer in pred.answer          # did the answer state the right window?
 
 evaluate = dspy.Evaluate(devset=trainset, metric=metric, num_threads=4, display_progress=True)
-print(evaluate(agent))                              # baseline score
+print(evaluate(agent))                              # baseline (DSPy 3.x returns a result with .score)
 
 compiled = dspy.BootstrapFewShot(metric=metric, max_bootstrapped_demos=4).compile(agent, trainset=trainset)
 print(evaluate(compiled))                           # use a separate devset in real work

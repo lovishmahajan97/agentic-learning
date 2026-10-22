@@ -5,7 +5,7 @@ name: Model lifecycle & deprecation policy
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - llmops-platform/model-registry

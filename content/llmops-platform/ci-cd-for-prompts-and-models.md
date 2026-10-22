@@ -5,7 +5,7 @@ name: CI/CD for prompts and models
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - backend-fundamentals/ci-cd
@@ -109,7 +109,8 @@ and an agent task makes several calls per run.
   A code-only PR that leaves every request byte-identical re-runs nothing and just re-scores. This is what
   makes a per-PR eval affordable.
 - **Agents cache step by step.** Each step's request embeds earlier tool results, so a changed step 3
-  misses the cache for steps 3 onward while steps 1 and 2 still hit.
+  misses the cache for steps 3 onward while steps 1 and 2 still hit. A system-prompt or tool-description
+  edit is different: those are part of every request, so every step of every task misses.
 - **The key must include every pin.** A key that omits the model id will happily serve stale outputs after
   a model upgrade and hide the change.
 - **Accept knowingly:** with temperature above zero, a cache hit replays one frozen sample, so the cached
@@ -234,7 +235,8 @@ sys.exit(0 if mean >= base["mean"] - 0.02 else 1)   # smoke tolerance; the relea
 ### Agent smoke eval with recorded tools
 The same job for a tool-calling agent: the real loop runs with the cached model client and a fixture
 lookup in place of every tool, and records trajectory metrics next to task success. `run_agent` and
-`task_succeeded` are your loop and your outcome check.
+`task_succeeded` are your loop and your outcome check; `cached_llm` is the cached client from the previous
+example.
 
 ```python
 # scripts/agent_smoke.py: run the production agent loop, never live tools
@@ -281,12 +283,12 @@ they are not a benchmark.
   is a changed judge request.
 
 ### Worked scenario: a tool-description edit on a 40-task agent smoke set
-An engineer rewrites the description of a `search_orders` tool. Illustrative numbers for an agent averaging
-6 model calls per task.
+An engineer rewrites the description of a `search_orders` tool. Illustrative numbers for an agent making
+about one model call per step.
 
 | Metric | Champion | Candidate | Reading |
 |---|---|---|---|
-| Model calls re-run (warm cache) | | ~90 of 240 | only steps after the first `search_orders` choice change |
+| Model calls (warm cache) | ~244 cached | ~296, all re-run | tool definitions are in every request, so every step misses |
 | Task success | 34 of 40 | 35 of 40 | within smoke noise, not proof of a win |
 | Mean steps per task | 6.1 | 7.4 | the agent now calls `search_orders` twice before answering |
 | Unrecorded tool calls | 0 | 9 | new paths; reviewers read these trajectories |

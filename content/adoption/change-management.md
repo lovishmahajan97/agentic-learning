@@ -5,7 +5,7 @@ name: Change management
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - adoption/user-training
@@ -49,9 +49,9 @@ broken model or tool loop.
 - **Agents arrive with an implied question about jobs.** An agent that completes tasks end to end raises it
   more sharply than an autocomplete. If nobody answers it, people answer it themselves, and quiet resistance
   is a rational response.
-- **The value needs the work redesigned around the agent.** If human agents (the support staff) are still
-  measured on the old metric, still follow the old checklist and still route through the old approval step,
-  the AI step is pure overhead.
+- **The value needs the work redesigned around the agent.** If staff are still measured on the old metric,
+  still follow the old checklist and still route through the old approval step, the agent's step is pure
+  overhead.
 - **The naive alternatives fail predictably.** "Announce it, record a training video, it's intuitive"
   creates awareness but not desire and leaves incentives untouched. "Mandate it" produces compliance
   theatre: people open the tool so the login count looks good, then ignore the output. Change management

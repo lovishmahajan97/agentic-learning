@@ -5,7 +5,7 @@ name: LangChain (LCEL, chat models, tools, retrievers)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - agents/frameworks
@@ -34,8 +34,8 @@ LangGraph underneath when you need custom control flow.
   stores and retrievers for RAG, `create_agent` for the loop (built on LangGraph in LangChain 1.x).
 - **What you control.** Which integration packages you install, the prompts you pass in, middleware on the
   agent loop, and retries and fallbacks on each Runnable.
-- **What you can skip.** Legacy chains and the old `AgentExecutor`. New agent code uses `create_agent` or
-  LangGraph directly; check the current docs for the migration notes.
+- **What you can skip.** Legacy chains and the old `AgentExecutor`, which LangChain 1.0 moved to the
+  `langchain-classic` package. New agent code uses `create_agent` or LangGraph directly.
 
 ## Why it exists
 - **Every provider speaks a slightly different dialect.** Message roles, tool-call formats and streaming
@@ -228,7 +228,8 @@ print(order_status.args_schema.model_json_schema()["properties"])
 
 ## Pitfalls
 - **Mixing legacy and current APIs.** Symptom: tutorials using `AgentExecutor` or `initialize_agent` fail
-  or behave oddly. Fix: use `create_agent` or LangGraph and current docs only.
+  to import on 1.x or behave oddly. Fix: use `create_agent` or LangGraph; pin `langchain-classic` only
+  while migrating old code.
 - **Vague tool docstrings.** Symptom: the model calls the wrong tool or invents arguments. Fix: the
   docstring is the tool description; state when to use it and give an example argument.
 - **Hidden prompt drift.** Symptom: answers change after an upgrade with no code change. Fix: keep your

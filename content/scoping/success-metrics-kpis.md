@@ -5,7 +5,7 @@ name: Success metrics / KPIs
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - scoping/baseline-measurement-before-deployment

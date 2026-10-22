@@ -5,7 +5,7 @@ name: LangSmith
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - observability/tracing
@@ -129,7 +129,7 @@ Production runs land in a project; online evaluators and rules turn some into fe
 
 ```mermaid
 flowchart TD
-    APP["App: traceable or LangGraph"] -->|"start and end posts"| PJ[("Project: run trees")]
+    APP["Agent: traceable or LangGraph"] -->|"start and end posts"| PJ[("Project: run trees")]
     PJ --> TH["Threads and dashboards"]
     PJ --> OE["Online evaluators on a sample"]
     OE --> FB["Feedback on runs"]
@@ -224,9 +224,12 @@ async def run(request: Request):
 If a proxy strips unknown headers, the callee's runs appear as separate root traces.
 
 ### Evaluating an agent's trajectory, not just its answer
-A plain-Python agent whose tools are `tool` runs, evaluated on whether it answered correctly and whether it
-repeated a tool call. The target returns the tool sequence so code evaluators can read it. `decide` stands
-for one model call (through a wrapped client) that returns either a tool request or a final answer.
+A plain-Python agent whose tools are `tool` runs, evaluated on whether it finished, whether its refund
+decision matches the reference and whether it repeated a tool call. The target returns the tool sequence so
+code evaluators can read it.
+
+`decide` stands for one model call (through a wrapped client) that returns either a tool request or a final
+answer; each `refund-tasks` example has a `should_refund` reference.
 
 ```python
 from langsmith import traceable, evaluate
@@ -258,8 +261,13 @@ def no_repeated_calls(outputs: dict) -> bool:             # trajectory evaluator
 def answered(outputs: dict) -> bool:
     return outputs["answer"] is not None
 
+def refund_decision_correct(outputs: dict, reference_outputs: dict) -> bool:   # outcome evaluator
+    refunded = any(c.startswith("issue_refund:") for c in outputs["tool_calls"])
+    return refunded == reference_outputs["should_refund"]
+
 evaluate(lambda inputs: refund_agent(inputs["task"]), data="refund-tasks",
-         evaluators=[no_repeated_calls, answered], experiment_prefix="refund-agent-v3")
+         evaluators=[no_repeated_calls, answered, refund_decision_correct],
+         experiment_prefix="refund-agent-v3")
 ```
 
 - **Each example is one traced agent run,** so a failing `no_repeated_calls` score links straight to the
@@ -446,8 +454,9 @@ canary project, and keep an online evaluator or feedback key tracking the loop r
 ### Mini project
 **Catch a looping agent with a trajectory eval (2-3 hours).**
 - **Goal:** detect and fix an agent that repeats tool calls, with evidence from experiments.
-- **Steps:** build a small agent with two `@traceable(run_type="tool")` tools and a vague tool description
-  that invites repeats; create a 20-task dataset; write `no_repeated_calls` and `answered` evaluators; run a
-  baseline experiment; tighten the tool descriptions or add a step budget; run a second experiment.
+- **Steps:** build a small refund agent with two `@traceable(run_type="tool")` tools and a vague tool description
+  that invites repeats; create a 20-task dataset with a `should_refund` reference per task; write
+  `no_repeated_calls`, `answered` and `refund_decision_correct` evaluators; run a baseline experiment;
+  tighten the tool descriptions or add a step budget; run a second experiment.
 - **Done when:** the comparison view shows the repeated-call failures falling between experiments, with at
   least one run tree opened to explain the original loop, and no example that passed before now failing.

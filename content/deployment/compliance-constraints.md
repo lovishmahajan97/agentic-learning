@@ -5,7 +5,7 @@ name: Compliance constraints
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - security-governance-compliance/compliance-architecture

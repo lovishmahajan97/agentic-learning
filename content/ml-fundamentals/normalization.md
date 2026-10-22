@@ -5,7 +5,7 @@ name: Normalization (LayerNorm, RMSNorm)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic
+status: agentic-verified
 agent_relevance: background
 related:
   - ml-fundamentals/residual-connections
@@ -33,7 +33,7 @@ type, `ε` and precision, or outputs drift.
   logits that match to two digits and tool calls that drift after a few hundred tokens.
 - **Where it shows up in your stack.** `rms_norm_eps` in Llama-style Hugging Face configs, `layer_norm_eps`
   in BERT-style ones (embedding and reranker models in RAG), fused RMSNorm kernels in serving engines, and
-  norm parameters left trainable in PEFT fine-tunes.
+  norm parameters when a fine-tune recipe unfreezes them.
 - **What you control.** Loading the checkpoint with its own norm settings, keeping norm statistics in fp32
   in any custom code, excluding norm gains from weight decay, and parity-testing a port before it serves
   agent traffic.
@@ -55,8 +55,8 @@ type, `ε` and precision, or outputs drift.
   per-layer synchronization.
 - **LayerNorm (2016) normalizes per token, across features.** Each token uses only its own `d_model`
   numbers, so the result is identical at batch size 1 and 1,024, in training and inference, and
-  independent of padding. That is why one agent request's output does not depend on who else is batched
-  with it on the server.
+  independent of padding. So the norm itself never makes one agent request's output depend on who else
+  is batched with it on the server (kernel numerics still can).
 - **The function is not optional, even if the layer is.** Careful init plus a low learning rate trains
   shallow transformers but does not scale; norm-free attempts use substitutes (zero-initialized scalar
   gates per branch, bounded element-wise functions) to recover the same stability.
@@ -66,8 +66,9 @@ type, `ε` and precision, or outputs drift.
 1. **Read the norm settings from the checkpoint config,** never from memory: type, `ε`, gain convention
    and cast order are part of the model.
 2. **Keep statistics in fp32** in any custom kernel or port, because the variance is a long sum.
-3. **Exclude norm gains and biases from weight decay** when fine-tuning an agent model; PEFT recipes often
-   leave them trainable since they are tiny.
+3. **Exclude norm gains and biases from weight decay** when fine-tuning an agent model. PEFT's LoRA
+   freezes them by default, but full fine-tunes and some adapter recipes (LongLoRA, for example) train
+   them because they are tiny.
 4. **Parity-test before serving:** compare logits and long greedy generations (including tool-call JSON)
    against the reference implementation.
 
@@ -153,8 +154,8 @@ squares.
 ### Training details
 - **No weight decay on `γ` and `β`** (nor on biases), conventionally: decaying the gain toward zero fights
   the normalization's purpose.
-- **Often left trainable in PEFT:** norm parameters are a tiny fraction of the model, so agent LoRA
-  recipes sometimes train them alongside the adapter.
+- **Sometimes unfrozen in PEFT:** LoRA freezes norms by default, but they are a tiny fraction of the
+  model, so some adapter recipes train them alongside the adapter.
 
 ## Diagram
 A Pre-LN decoder layer: the norms sit on the branch inputs, the residual stream (the straight path) is

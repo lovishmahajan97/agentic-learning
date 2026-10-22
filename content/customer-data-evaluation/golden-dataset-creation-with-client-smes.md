@@ -5,7 +5,7 @@ name: Golden dataset creation with client SMEs
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic
+status: agentic-verified
 agent_relevance: core
 related:
   - evals/golden-dataset
@@ -157,12 +157,15 @@ item = {
     "labeller": "adj-2", "guideline_version": "g3", "ambiguous": False,
 }
 
+WRITE_TOOLS = {"route_claim", "close_claim"}   # tools that change the customer's system
+
 def score(item, trace):
     """trace: {'tool_calls': [names in order], 'final': {...}} from one agent run."""
     calls = trace["tool_calls"]
+    first_write = next((i for i, c in enumerate(calls) if c in WRITE_TOOLS), len(calls))
     return {
         "outcome": trace["final"].get("route") == item["reference"]["route"],
-        "required": all(a in calls for a in item["required_actions"]),
+        "required": all(a in calls[:first_write] for a in item["required_actions"]),  # before any write
         "no_forbidden": not any(a in calls for a in item["forbidden_actions"]),
     }
 
@@ -338,6 +341,7 @@ reduced confidence explicitly, because the risk is theirs to accept.
 - **Run the harness there too:** fixtures recorded from customer systems are customer data, so the eval job
   runs in the same boundary.
 - **Store only what you may:** keep record ids so items can be traced and deleted if the customer revokes a record.
+- **Do it first:** settle access before labelling starts, because labels made in the wrong place are wasted expert time.
 
 ## Quiz
 ### Q: Two adjusters disagree on a category in a quarter of calibration cases. What should happen?

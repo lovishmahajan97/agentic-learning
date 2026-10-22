@@ -5,7 +5,7 @@ name: Perplexity
 kind: metric
 difficulty: core
 est_minutes: 12
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - ml-fundamentals/loss-functions
@@ -169,6 +169,7 @@ flowchart TD
 ### Agent scenario: gate a tool call on its own perplexity
 Self-hosted engines and some hosted APIs can return per-token log-probabilities. Perplexity over just the
 generated tool call, plus its least confident token, is a cheap signal for "execute" versus "escalate".
+
 Check that your provider returns logprobs for tool-call output, not only for text content; if it does not,
 generate the call as JSON text on a self-hosted engine.
 

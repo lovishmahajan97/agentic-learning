@@ -5,7 +5,7 @@ name: Runbooks
 kind: practice
 difficulty: core
 est_minutes: 13
-status: agentic
+status: agentic-verified
 agent_relevance: useful
 related:
   - deployment/health-checks
@@ -296,13 +296,15 @@ print(lint(alerts, runbooks, date(2026, 10, 20)))
   consistent mitigation time. Fix: lint for the link in CI.
 - **Leaving out AI-specific situations** such as cost spikes, agent loops, guardrail-block surges or
   prompt-injection reports. Symptom: a generic "service degraded" response to a problem that needed a kill
-  switch.
+  switch. Fix: write the four agent runbooks in the table above before go-live.
 - **A runbook step with no lever behind it.** Symptom: "disable the CRM tool" is written down, but the
   agent has no per-tool flag, so the only option is a full redeploy. Fix: build the lever with the tool.
 - **Keeping runbooks only behind the system's own login** or on infrastructure that fails with it.
   Symptom: in an identity or network outage the on-call cannot open the page that tells them what to do.
+  Fix: a mirrored or offline copy outside the blast radius.
 - **Writing them only for the vendor team.** Symptom: a customer operations team that escalates every page
-  during hypercare because the runbooks assume access and context they do not have.
+  during hypercare because the runbooks assume access and context they do not have. Fix: rewrite them in
+  the customer's tools and access model, then rehearse them in a game day with their on-call.
 
 ## When to use
 - **Use for:** every alert that pages a human, and every known failure mode a different team will
