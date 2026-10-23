@@ -5,7 +5,8 @@ name: Capacity planning (tokens/sec, requests/sec, concurrent sessions)
 kind: practice
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/queueing-theory
@@ -38,6 +39,60 @@ them; a load test sets replica capacity.
   prefix caching, and whether long agent runs share a pool with interactive chat.
 - **What you can skip.** Queueing-theory derivations. Little's Law, the latency knee and the headroom rule
   are enough to size an agent fleet.
+
+## Decision case
+### Scenario
+A team self-hosts the research agent from the multi-step example below and must decide what to order.
+All figures are illustrative and reuse that example.
+- **Peak traffic:** 2 runs/sec, 10 steps per run, a 4,000-token prefix growing by 1,000 per step, 200
+  output tokens and 2 s of tool time per step: 20 calls/sec, 136 sequences in flight, 176 live runs.
+- **Replica capacity from a load test of recorded runs:** 49 sequences (KV-bound) and ~25,000 prefill
+  tokens/sec within the TTFT budget; plans use 70% target utilization and one spare.
+- **Today:** 5 replicas, sized from in-flight calls; p95 TTFT breaches at peak.
+- **Constraints:** p95 TTFT under 2 s; traffic grows 10% a month and reserved GPUs take a quarter to
+  arrive (growth ≈ 1.33×); the budget allows at most 10 replicas.
+
+### Options
+| Option | How it works | Binding unit | Replicas today | Replicas at lead time | Budget |
+|---|---|---|---|---|---|
+| A. Keep 5, sized on calls | 136 ÷ (49 × 0.7) rounded up, plus 1; waiting runs' prefixes are evicted, so steps re-prefill their transcript | Prefill: 170,000 ÷ 5 = 34,000 tok/s per replica, above the 25,000 tested | 5, already breaching | n/a | Within, but fails the SLO |
+| B. Evict prefixes, size for prefill | 170,000 ÷ (25,000 × 0.7) = 9.7, rounded up, plus 1 | Prefill | 11 | 226,000 ÷ 17,500 → 13 + 1 = 14 | Over 10 |
+| C. Keep prefixes resident, size on live runs | 176 ÷ 34.3 = 5.1, rounded up, plus 1; only ~20,000 new tokens/sec to prefill | KV memory for live runs | 7 | 234 ÷ 34.3 = 6.8 → 7 + 1 = 8 | Within |
+
+### Decision
+Choose **C** and order **3 more replicas now** (8 − 5), because:
+- **It is the only option that meets the TTFT SLO inside the budget at lead time:** B needs 14 by the
+  time GPUs arrive; A is the current breach.
+- **The breach is a prefill problem in disguise.** Sizing on in-flight calls ignored that evicted
+  prefixes force re-prefill; the replica formula takes the larger of the sequence and prefill terms.
+- **Resident caches turn prefill into a small term:** 20,000 new tokens/sec needs about 2 replicas of
+  prefill work today (3 with the spare), so KV memory for live runs binds instead.
+- **Ordering on lead time** avoids a second breach: 8 covers the peak expected a quarter from now.
+
+**What would change it:**
+- **Longer tool waits:** at 6 s of tool time per step a run lasts 128 s, live runs reach 256, and C needs
+  9 replicas today and 11 at lead time, over budget. Then evict on long waits and compact transcripts.
+- **Growth faster than 10% a month:** re-run the plan and order earlier.
+- **A load test showing a different knee** after an engine or model change: every number above moves.
+
+### Trade-offs accepted
+- **Resident caches cost 2 replicas** over calls-only sizing (7 versus 5 today). Watch KV-cache
+  utilization and prefix-cache hit rate per agent type.
+- **The plan depends on traced step counts.** Watch steps per run at p95 after every prompt or tool
+  change; one extra step adds a tenth to calls/sec.
+- **Ordering ahead pays for idle GPUs** until growth arrives. Watch peak in-flight and live runs against
+  provisioned capacity each week.
+- **Predicted and observed concurrency can drift.** Watch the engine's running and waiting counts against
+  L = λW.
+
+### Review rubric
+- **Demand is expressed in linked units** (calls/sec, input and output tokens/sec, in-flight and live
+  runs), each recomputing from the stated traces.
+- **Replica capacity comes from a load test at the SLO,** naming whether KV memory or prefill binds.
+- **Both terms of the sizing formula are computed,** and the larger one is used.
+- **Cache residency for waiting runs is an explicit choice** with its replica cost.
+- **The order covers peak at the procurement lead time,** with growth stated.
+- **Reversal triggers are numbers** such as tool time per step or the growth rate.
 
 ## Why it exists
 - **The web habit breaks.** A classic web service has fairly uniform requests: if one pod handles 500 RPS

@@ -5,7 +5,8 @@ name: API provider quotas & regional limits
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - infra-capacity-economics/cloud-ai-architecture
@@ -39,6 +40,61 @@ self-limit, checkpoint, spread regions, reserve the base.
   and sub-agents you admit at once, retry and checkpoint behaviour, and which agents go to batch.
 - **What you can skip.** Each provider's exact limiter algorithm. Know the units, the `max_tokens` trap,
   the binding-ceiling formula and quota versus capacity.
+
+## Decision case
+### Scenario
+A legal-tech company launches a research agent that files tickets and drafts emails through tools.
+All figures are illustrative, from staging traces.
+- **Agent shape:** 12 steps per run; prompts average 8k tokens across a run as built; the provider
+  reserves `max_tokens` at admission, and the code ships with `max_tokens=4000`.
+- **Demand:** a launch-day peak of 5 interactive runs per minute; a nightly eval sweep of 2,000 runs.
+- **Constraints:** data may be processed only in one region, where the quota is 400k TPM; a quota
+  increase takes about 4 weeks but launch is in 2; tools have side effects, so a run must never be
+  restarted from step 1; evals must finish before 07:00.
+
+### Options
+| Option | How it works | Runs per minute at peak | Residency | Side effects and evals |
+|---|---|---|---|---|
+| A. Ship as built, rely on SDK retries | 8k + 4,000 = 12,000 charged per step, 144,000 per run | 400k ÷ 144k ≈ 2.8, short of 5; retries then add load | Met | A throttled run restarts and repeats tools; evals compete with live runs |
+| B. Right-size and self-limit in one region | `max_tokens=800`, compaction to a 4k average prompt: 4,800 per step, 57,600 per run; gateway bucket at 85% (340k TPM); checkpoint and resume; evals to the batch API | 340k ÷ 57.6k ≈ 5.9 | Met | Paused runs resume from their checkpoint; evals use separate batch limits |
+| C. B plus a second region | Weighted routing across two regional deployments | About double B | Broken | As B |
+| D. Wait for the increase or reserved capacity | Hold launch until more quota or provisioned throughput arrives | Whatever is granted | Met | Misses the 2-week launch |
+
+### Decision
+Choose **B**, and file the quota increase today, because:
+- **It is the only option that reaches 5 runs per minute in the allowed region by launch:** 5.9 runs
+  per minute at the self-limit, so peak uses about 85% of what the gateway admits.
+- **The bigger lever is the transcript:** compaction cuts the charge from 105,600 to 57,600 per run
+  after `max_tokens` is fixed, as the worked scenario shows.
+- **Evals cannot share the live quota:** 2,000 × 57,600 = 115.2M tokens is about 5.6 hours of the whole
+  self-limited budget, so they go to the batch API.
+- **Checkpoint and resume** turns a throttle into a pause, so no ticket or email is sent twice.
+
+**What would change it:**
+- **Demand above ~5.9 runs per minute:** only the quota increase or in-region reserved capacity helps.
+- **The residency rule widening to a geography:** C becomes legal and doubles headroom.
+- **Compaction lowering task success** on the agent eval set: keep longer prompts and buy capacity
+  sooner.
+
+### Trade-offs accepted
+- **15% of quota sits unused** as a margin for estimation drift. Watch provider 429s; if they stay at
+  zero, raise the share.
+- **Paused runs make users wait.** Watch paused-run age and cap concurrent runs per agent type so
+  admitted runs can finish.
+- **Compaction may drop context the agent needed.** Watch task success and tool-argument errors on the
+  eval set.
+- **A tight `max_tokens` can truncate answers.** Watch the truncation rate per step type.
+
+### Review rubric
+- **Demand is converted into the provider's units** per run (steps × prompt plus `max_tokens`), and the
+  binding ceiling recomputes.
+- **Retries happen in one layer** with `Retry-After`, jitter and a cap, and overload errors open a
+  circuit instead of retrying.
+- **Throttled runs resume from a checkpoint,** and the write-up shows how a tool never runs twice.
+- **Offline work is moved off the live quota,** with arithmetic for how much it would consume.
+- **Residency bounds every spreading option,** stated per region and deployment type.
+- **The quota increase is filed with lead time,** and the growth trigger is a measured runs-per-minute
+  number.
 
 ## Why it exists
 - **The provider's fleet is finite and shared.** Without limits one customer's spike would degrade every

@@ -163,35 +163,6 @@ flowchart TD
 ```
 
 ## Examples
-### Tracing norm spikes back to agent trajectories
-Log the pre-clip norm with the trace ids in each batch, and flag batches far above the rolling median so
-someone can open the offending transcripts.
-
-```python
-import statistics
-from collections import deque
-from torch.nn.utils import clip_grad_norm_
-
-recent = deque(maxlen=200)          # rolling window of healthy norms
-suspects = []                       # (step, norm, trace_ids) for data review
-
-def clip_and_log(model, step, trace_ids, max_norm=1.0, spike_factor=5.0):
-    norm = clip_grad_norm_(model.parameters(), max_norm).item()   # pre-clip norm
-    if len(recent) >= 50 and norm > spike_factor * statistics.median(recent):
-        suspects.append((step, norm, trace_ids))   # e.g. a 25k-token tool dump or a retry loop
-    else:
-        recent.append(norm)
-    return norm
-```
-
-| Step | Pre-clip norm | Rolling median | Trace in the batch | Finding |
-|---|---|---|---|---|
-| 410 | 0.9 | 0.8 | 16 short tool calls | healthy |
-| 411 | 6.3 | 0.8 | one trace with a 25k-token HTML tool result | trained on tool output by mistake |
-| 412 | 0.8 | 0.8 | 16 short tool calls | healthy |
-
-The fix at step 411 was data, not the threshold: mask tool results out of the loss and re-run.
-
 ### A training step in the correct order
 Accumulation, fp16 loss scaling and clipping in order. The function returns the pre-clip norm so it can
 be logged; the comment works one concrete step.
@@ -221,6 +192,35 @@ def train_step(model, opt, scaler, micro_batches, accum, max_norm=1.0):
 
 With bf16 there is no scaler: drop the `scaler` calls and call `clip_grad_norm_` directly after the last
 `backward()`. The ordering rule (accumulate, unscale, clip, step) is the same.
+
+### Tracing norm spikes back to agent trajectories
+Log the pre-clip norm with the trace ids in each batch, and flag batches far above the rolling median so
+someone can open the offending transcripts.
+
+```python
+import statistics
+from collections import deque
+from torch.nn.utils import clip_grad_norm_
+
+recent = deque(maxlen=200)          # rolling window of healthy norms
+suspects = []                       # (step, norm, trace_ids) for data review
+
+def clip_and_log(model, step, trace_ids, max_norm=1.0, spike_factor=5.0):
+    norm = clip_grad_norm_(model.parameters(), max_norm).item()   # pre-clip norm
+    if len(recent) >= 50 and norm > spike_factor * statistics.median(recent):
+        suspects.append((step, norm, trace_ids))   # e.g. a 25k-token tool dump or a retry loop
+    else:
+        recent.append(norm)
+    return norm
+```
+
+| Step | Pre-clip norm | Rolling median | Trace in the batch | Finding |
+|---|---|---|---|---|
+| 410 | 0.9 | 0.8 | 16 short tool calls | healthy |
+| 411 | 6.3 | 0.8 | one trace with a 25k-token HTML tool result | trained on tool output by mistake |
+| 412 | 0.8 | 0.8 | 16 short tool calls | healthy |
+
+The fix at step 411 was data, not the threshold: mask tool results out of the loss and re-run.
 
 ### Worked scenario: one unclipped spike under Adam
 One parameter's squared gradient normally averages 1, so `v ≈ 1`. A single batch arrives with gradient 50

@@ -5,7 +5,8 @@ name: ADRs (architecture decision records)
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/trade-off-analysis
@@ -38,6 +39,60 @@ the day and the trigger for revisiting.
   numeric triggers that force a re-run.
 - **What you can skip.** ADR tooling debates and heavyweight templates for two-way doors. A numbered
   Markdown file with context, options, decision, consequences, evidence and triggers is enough.
+
+## Decision case
+### Scenario
+A company runs three agent teams (support, sales research, back-office automation) on a shared
+platform. Last quarter a write tool shipped without approval and refunded the wrong orders, and an
+enterprise customer's auditor now asks why each agent may act on its own. The head of engineering must
+choose how decisions get recorded. All figures are illustrative.
+- **Volume:** about 10 decisions a quarter pass the significance test across the three teams; about 3 of
+  them are one-way doors (autonomous writes, embedding model, training on customer data).
+- **Effort:** a full MADR record takes about 3 hours with evidence; a short Nygard record about 1 hour.
+- **Constraints:** one architect; engineers push back on process; a new model generation arrives every
+  few months; the auditor wants the reasoning and evidence for every autonomy decision; the agent stack
+  lives in one monorepo.
+
+### Options
+| Option | How it works | Writing effort per quarter | Auditor and incident needs | Adoption risk |
+|---|---|---|---|---|
+| A. Design docs in the wiki | Long proposals, edited in place after the decision | Already spent; no extra | Reasoning is overwritten; nothing stops a new write tool | Low effort, low value |
+| B. Full MADR for every significant decision | Drivers, options, evidence, confirmation, triggers in `docs/adr/` | 10 × 3 = 30 hours | Fully met | High: friction on medium decisions, records stop being written |
+| C. Tiered: MADR for one-way doors, Nygard otherwise, CI confirmation for both | Same folder and PR flow; evidence and triggers required on every model, autonomy or vendor record | 3 × 3 + 7 × 1 = 16 hours | Met: every autonomy decision has evidence and a confirmation test | Medium: needs a code owner and a PR template question |
+
+### Decision
+Choose **C, tiered records with automated confirmation**, because:
+- **The incident was a confirmation failure,** not a missing document: a CI test over the tool registry
+  that fails on a write tool without approval would have blocked it, and C makes that test part of the
+  record.
+- **The auditor's question needs evidence**, so every autonomy and model record carries the golden-set
+  version, scores and dated assumptions, which A cannot keep because the wiki is edited in place.
+- **Effort fits one architect:** 16 hours a quarter against 30 for B, spent where reversal is
+  expensive.
+- **Revisit triggers handle model churn:** each model record names numeric triggers wired to dashboard
+  alerts, so a new model generation starts a re-run, not a debate.
+
+**What would change it:** a regulator requiring the full template for every decision would push toward
+B; a single small team with no external auditor could run Nygard records alone, still with confirmation
+tests for autonomy.
+
+### Trade-offs accepted
+- **Medium decisions get a thinner record.** Watch: superseding records for Nygard-form decisions that
+  cite missing evidence as the reason for reversal.
+- **The architect is a bottleneck as code owner.** Watch: records stuck in *Proposed* for more than two
+  weeks.
+- **Some significant changes will skip the record.** Watch: PRs adding a datastore, provider, deployable
+  or write tool merged without a linked ADR.
+- **Triggers can fire without follow-up.** Watch: fired trigger alerts with no review note or new record.
+
+### Review rubric
+- **The significance test is applied:** the write-up counts which decisions need a record and which
+  form, instead of recording everything or nothing.
+- **Effort is estimated and recomputed** per option against the people who will write the records.
+- **Each autonomy or model decision has an automated confirmation** and an evidence snapshot.
+- **Immutability is preserved:** changes create superseding records, linked both ways and checked in CI.
+- **Revisit triggers are numeric** and wired to something that alerts.
+- **Each accepted trade-off names a metric**, and at least one condition would change the practice.
 
 ## Why it exists
 - **Decisions are rarely written down.** Six months on, a new engineer finds the agent's vector store is

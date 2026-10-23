@@ -5,7 +5,8 @@ name: Jupyter
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/pandas
@@ -35,6 +36,151 @@ unreliable as agent code or evidence until restart and run all.
 - **What you can skip.** The messaging protocol and server internals. Know that state is execution
   history, that top-level `await` works because the kernel already runs an event loop, and that saved
   outputs can leak keys and customer data.
+
+## Lab
+### Task
+Build the CI gate that decides whether an agent error-analysis notebook can be trusted and committed: a
+static audit (execution order, never-run cells, API keys in saved outputs) and a re-execution check that
+runs a copy in a fresh kernel and reports cells whose saved output no longer matches. Time box: 60
+minutes.
+- **Prerequisites:** the pandas lesson is helpful; the reproducible evaluations lesson explains why this
+  gate exists.
+- **Setup:** Python 3.10+, `pip install nbformat nbclient ipykernel pytest` (checked against nbformat
+  5.11.1, nbclient 0.11.0, ipykernel 7.4.0). The `python3` kernel must be registered, which installing
+  `ipykernel` into the environment does. Save the starter as `nbgate.py` and the tests as
+  `test_nbgate.py`.
+
+### Starter code
+```python
+"""Lab: a CI gate for agent-analysis notebooks: hidden state, never-run cells, leaked keys."""
+import copy
+import re
+
+import nbformat
+from nbclient import NotebookClient
+from nbformat.v4 import new_code_cell, new_notebook, new_output
+
+SECRET = re.compile(r"sk-[A-Za-z0-9_-]{20,}")          # provider-style API keys
+
+
+def output_text(cell) -> str:
+    """All text a code cell displayed: stream output plus text/plain results, joined."""
+    parts = []
+    for out in cell.get("outputs", []):
+        if out["output_type"] == "stream":
+            parts.append(out["text"])
+        elif "data" in out:
+            parts.append(out["data"].get("text/plain", ""))
+    return "".join(parts).strip()
+
+
+def audit(nb) -> list[str]:
+    """Static checks on a saved notebook, one message per problem:
+    - "execution counts [...] are not 1..n in order"   (ignore empty code cells)
+    - "<k> code cell(s) never ran"
+    - "cell <i> output contains a secret"               (i = index in nb.cells)"""
+    raise NotImplementedError("YOUR CODE")
+
+
+def stale_cells(nb, timeout: int = 60) -> list[int]:
+    """Re-run a COPY of nb top to bottom in a fresh kernel (nbclient) and return the indices of code
+    cells whose saved output_text differs from the fresh one. Never modify `nb` itself."""
+    raise NotImplementedError("YOUR CODE")
+
+
+def demo_notebook():
+    """An error-analysis notebook saved after the filter in cell 1 was edited but cell 2 was not re-run."""
+    nb = new_notebook(cells=[
+        new_code_cell("runs = [{'id': i, 'score': s} for i, s in enumerate([1, 2, 2, 3, 5, 4])]",
+                      execution_count=1),
+        new_code_cell("fails = [r for r in runs if r['score'] < 3]", execution_count=4),
+        new_code_cell("len(fails)", execution_count=2, outputs=[
+            new_output("execute_result", data={"text/plain": "1"}, execution_count=2)]),
+        new_code_cell("print('using key', 'sk-' + 'a' * 24)", execution_count=3, outputs=[
+            new_output("stream", name="stdout", text="using key sk-" + "a" * 24 + "\n")]),
+    ])
+    nb.metadata["kernelspec"] = {"name": "python3", "display_name": "Python 3", "language": "python"}
+    return nb
+
+
+if __name__ == "__main__":
+    nb = demo_notebook()
+    for problem in audit(nb):
+        print("audit:", problem)
+    print("stale cells:", stale_cells(nb))
+```
+
+### Expected output
+```
+audit: execution counts [1, 4, 2, 3] are not 1..4 in order
+audit: cell 3 output contains a secret
+stale cells: [2]
+```
+Cell 2 saved `1` from the old filter; a clean run gives `3`. The kernel may also print a warning on
+stderr. `pytest -q test_nbgate.py` reports `4 passed`.
+
+### Tests
+```python
+import copy
+from nbformat.v4 import new_code_cell, new_markdown_cell, new_notebook, new_output
+from nbgate import audit, demo_notebook, stale_cells
+
+
+def clean_notebook():
+    nb = new_notebook(cells=[
+        new_markdown_cell("# Failures by tool"),
+        new_code_cell("x = 2", execution_count=1),
+        new_code_cell(""),                                       # empty cells never get a count
+        new_code_cell("x * 21", execution_count=2, outputs=[
+            new_output("execute_result", data={"text/plain": "42"}, execution_count=2)]),
+    ])
+    nb.metadata["kernelspec"] = {"name": "python3", "display_name": "Python 3", "language": "python"}
+    return nb
+
+
+def test_clean_notebook_passes_both_checks():
+    nb = clean_notebook()
+    assert audit(nb) == [] and stale_cells(nb) == []
+
+
+def test_audit_flags_order_and_secrets():
+    problems = audit(demo_notebook())
+    assert "execution counts [1, 4, 2, 3] are not 1..4 in order" in problems
+    assert "cell 3 output contains a secret" in problems
+
+
+def test_audit_flags_cells_that_never_ran():
+    nb = clean_notebook()
+    nb.cells[3].execution_count, nb.cells[3].outputs = None, []
+    assert "1 code cell(s) never ran" in audit(nb)
+
+
+def test_stale_output_is_found_without_touching_the_original():
+    nb = demo_notebook()
+    before = copy.deepcopy(nb)
+    assert stale_cells(nb) == [2]                                # saved '1', a fresh run gives '3'
+    assert nb == before
+```
+
+### Failure scenarios
+- **Execute `nb` itself instead of a deep copy.** The last test fails on `nb == before`, and in CI you
+  would overwrite the evidence you were checking. Debug by diffing the notebook before and after.
+- **Count empty code cells in the order check.** The clean notebook fails with a "never ran" message,
+  because empty cells never get a count. Debug by printing the counts list you built.
+- **Compare raw output dicts instead of `output_text`.** A fresh `execute_result` carries a new
+  execution count, so cells with results look stale even when the value matches. Debug by printing one
+  saved and one fresh output side by side.
+- **Point the kernel at another environment.** `NoSuchKernel` or a `ModuleNotFoundError` inside the
+  run, the same interpreter mismatch as `!pip`. Debug with `jupyter kernelspec list`.
+
+### Submission
+- **`nbgate.py`** passing the four tests unmodified.
+- **The `pytest -q` output** and the `python nbgate.py` output matching Expected output.
+- **A real notebook of yours** (an eval or trace analysis) run through both checks, with the problems found
+  and how you fixed them.
+- **A CI snippet** (for example a workflow step) that runs the gate on changed `.ipynb` files and fails the
+  build on any problem.
+- **Evaluated on:** exact messages, no mutation of the input notebook, and empty cells handled correctly.
 
 ## Why it exists
 - **Much AI work is exploratory.** Look at 50 failing eval cases, try three prompt variants, plot score

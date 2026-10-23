@@ -5,7 +5,8 @@ name: ruff
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/mypy
@@ -35,6 +36,179 @@ lost tasks and unsafe tool code; it checks likely bugs, not types.
   which need a design change.
 - **What you can skip.** Style debates and the full rule catalogue; `ruff rule <code>` explains any rule
   when it appears.
+
+## Lab
+### Task
+Four agent tools carry five planted defects: an `eval` calculator, an injectable SQL tool, a blocking
+sleep in an async tool, a mutable default, and a fire-and-forget memory write.
+
+You will let Ruff find
+them, read each rule with `ruff rule <code>`, and fix every one by design, with behaviour tests proving
+the fix is real and not just quiet.
+- **Time box:** 40-60 minutes.
+- **Prerequisites:** asyncio, and this lesson's Rules are namespaced by origin and Rules that map to
+  agent incidents sections.
+- **Setup:** Python 3.10+, `pip install ruff pytest` in one environment (checked against Ruff 0.17.2 and
+  pytest 9.1.1; the test runs `python -m ruff`). Save the starter as `agent_tools.py` and the tests as
+  `test_agent_tools.py`.
+- **Goal:** `ruff check --isolated --select ASYNC,S,B,RUF agent_tools.py` reports nothing, with no
+  `noqa`, and every behaviour test passes.
+
+### Starter code
+```python
+"""agent_tools.py: tools an agent can call. Each runs on model-chosen input."""
+import asyncio
+import sqlite3
+import time
+
+DB = sqlite3.connect(":memory:", check_same_thread=False)
+DB.execute("CREATE TABLE docs (tenant TEXT, title TEXT)")
+DB.executemany("INSERT INTO docs VALUES (?, ?)", [("acme", "Refund policy"), ("globex", "Payroll 2026")])
+MEMORY: list[str] = []
+BACKGROUND: set[asyncio.Task[list[str]]] = set()                  # keep background tasks here
+
+
+def calculator(expression: str) -> float:
+    return eval(expression)                                       # EXERCISE: model-written code runs
+
+
+def find_docs(tenant: str) -> list[str]:
+    rows = DB.execute(f"SELECT title FROM docs WHERE tenant = '{tenant}'").fetchall()   # EXERCISE
+    return [r[0] for r in rows]
+
+
+async def lookup(key: str) -> str:
+    time.sleep(0.2)                                               # EXERCISE: a slow backend call
+    return f"value for {key}"
+
+
+async def save_note(note: str, store: list[str] = []) -> list[str]:   # EXERCISE: shared default
+    store.append(note)
+    MEMORY.append(note)
+    return store
+
+
+async def agent_turn(note: str) -> str:
+    asyncio.create_task(save_note(note))                          # EXERCISE: fire-and-forget write
+    return "ok"
+
+
+async def main() -> None:
+    print("calc:", calculator("2 * (3 + 4)"))
+    print("acme docs:", find_docs("acme"))
+    print("injected:", find_docs("x' OR '1'='1"))
+    start = time.monotonic()
+    await asyncio.gather(lookup("a"), lookup("b"), lookup("c"))
+    print("3 lookups took about", round(time.monotonic() - start, 1), "s")
+    await agent_turn("user prefers metric units")
+    await asyncio.sleep(0)
+    print("memory:", MEMORY)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Expected output
+`python agent_tools.py` after the fix. The starter prints both tenants' titles on the injected line and
+`3 lookups took about 0.6 s`, and Ruff reports `S307`, `S608`, `ASYNC251`, `B006` and `RUF006`.
+
+```text
+calc: 14
+acme docs: ['Refund policy']
+injected: []
+3 lookups took about 0.2 s
+memory: ['user prefers metric units']
+```
+
+`ruff check --isolated --select ASYNC,S,B,RUF agent_tools.py` then prints `All checks passed!` and
+`pytest -v` reports `7 passed`.
+
+### Tests
+On the starter, 6 of 7 fail. They report the five rule codes, `DID NOT RAISE ValueError`, both tenants'
+rows, `0.61 < 0.4`, an empty `BACKGROUND`, and `['n1', 'a'] == ['a']` from the shared default.
+
+```python
+import asyncio
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+import agent_tools
+
+SRC = Path(agent_tools.__file__)
+
+
+def test_ruff_finds_nothing_in_the_agent_families():
+    r = subprocess.run([sys.executable, "-m", "ruff", "check", "--isolated", "--select", "ASYNC,S,B,RUF",
+                        "--output-format", "json", str(SRC)], capture_output=True, text=True)
+    findings = [f["code"] for f in json.loads(r.stdout)]
+    assert findings == []
+
+
+def test_fixed_by_design_not_by_suppression():
+    assert "noqa" not in SRC.read_text()
+
+
+def test_calculator_does_arithmetic_and_nothing_else():
+    assert agent_tools.calculator("2 * (3 + 4)") == 14
+    assert agent_tools.calculator("7 / 2 - 1") == 2.5
+    with pytest.raises(ValueError):
+        agent_tools.calculator("__import__('os').getcwd()")
+
+
+def test_tenant_filter_cannot_be_injected():
+    assert agent_tools.find_docs("acme") == ["Refund policy"]
+    assert agent_tools.find_docs("x' OR '1'='1") == []
+
+
+def test_lookups_do_not_block_the_loop():
+    async def three():
+        start = time.monotonic()
+        await asyncio.gather(*(agent_tools.lookup(k) for k in "abc"))
+        return time.monotonic() - start
+    assert asyncio.run(three()) < 0.4            # 0.2 s each, concurrently; about 0.6 s if blocking
+
+
+def test_background_write_is_tracked_and_completes():
+    async def turn():
+        await agent_tools.agent_turn("n1")
+        assert len(agent_tools.BACKGROUND) == 1
+        await asyncio.gather(*agent_tools.BACKGROUND)
+    asyncio.run(turn())
+    assert "n1" in agent_tools.MEMORY
+
+
+def test_default_store_is_not_shared_between_calls():
+    assert asyncio.run(agent_tools.save_note("a")) == ["a"]
+    assert asyncio.run(agent_tools.save_note("b")) == ["b"]
+```
+
+### Failure scenarios
+- **Inject: fix `S307` with `ast.literal_eval`, Ruff's own hint.** Ruff goes quiet, but `2 * (3 + 4)`
+  raises `ValueError: malformed node`, because `literal_eval` refuses arithmetic. Debug: the behaviour
+  test catches it; walk the `ast` and allow only numbers and the four operators.
+- **Inject: move `time.sleep(0.2)` into a helper in another module.** Ruff reports nothing, because it
+  sees one file at a time, yet the lookup test fails at about 0.6 s. Debug: time the gather, or run with
+  `python -X dev` and read the slow-callback warnings.
+- **Inject: drop `--select` from the Ruff command.** On Ruff 0.17.2 the default set reports only
+  `ASYNC251` and `B006` on the starter, missing `S307`, `S608` and `RUF006`. Debug: compare outputs with
+  and without the selection; tool code needs the families named explicitly.
+- **Inject: `# noqa: S608` on the query.** The lint test passes and the suppression test fails, while
+  the injection still returns both tenants' rows. Debug: a parameterised query, not a comment.
+
+### Submission
+- **The fixed `agent_tools.py`**, with the given tests unchanged and all 7 passing.
+- **Ruff output before and after**, with the `ruff rule` text for each of the five codes.
+- **A one-line design decision per finding**, for example "parameterised query" or "task kept in
+  `BACKGROUND` and discarded on completion".
+- **A `[tool.ruff.lint]` block** you would commit for this tools package, using `extend-select`.
+- **Evaluated by:** zero findings in the four families, zero suppressions, and behaviour tests proving
+  each fix changed what the tool does.
 
 ## Why it exists
 - **The old toolchain was five or six tools.** flake8 for errors and style, several flake8 plugins

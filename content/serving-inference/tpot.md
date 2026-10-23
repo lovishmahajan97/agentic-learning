@@ -5,7 +5,8 @@ name: TPOT (time per output token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - serving-inference/ttft
@@ -162,28 +163,24 @@ flowchart TD
     S -.->|"spikes show in"| I["ITL p99"]
 ```
 
+## Misconceptions
+- **"A GPU with more FLOPs decodes faster."** At low batch each decode step streams every weight from
+  HBM for one token per sequence, so TPOT tracks memory bandwidth; double the FLOPs at similar bandwidth
+  gives nearly the same TPOT.
+- **"Batching slows every user down proportionally."** The weight read is shared by the whole batch, so
+  batch 1 to 32 raised step time about 2× while server throughput rose about 16× in the worked example,
+  until compute or KV memory binds.
+- **"Mean TPOT tells me if streaming feels smooth."** A 25 ms stream with a 300 ms stall every 40 tokens
+  averages 31.9 ms; only the ITL distribution (p99) shows the freezes users notice.
+- **"Model size is what makes decode slow at scale."** At long contexts and high concurrency the KV-cache
+  reads (`B × context_length`) dominate the bytes per step, not the weights.
+- **"Speculative decoding always lowers TPOT."** It helps at low batch, but at high batch the wasted
+  verification compute can cut throughput, and ITL becomes bursty even when the mean improves.
+- **"Hidden reasoning is free because the user never sees it."** Reasoning tokens decode at the same
+  TPOT and sit on the critical path of every agent step; cutting output tokens is usually the biggest
+  lever.
+
 ## Examples
-### Mean TPOT hides the stall; ITL p99 shows it
-Runnable with synthetic timestamps: a steady 25 ms gap with one 300 ms prefill stall every 40 tokens.
-
-```python
-import statistics
-
-gaps_ms = [300 if i % 40 == 39 else 25 for i in range(200)]   # 200 gaps -> 201 tokens
-t = [0.0]
-for g in gaps_ms:
-    t.append(t[-1] + g)
-
-n_out = len(t)
-tpot = (t[-1] - t[0]) / (n_out - 1)                            # per-request mean
-itl = sorted(gaps_ms)
-p50, p99 = itl[len(itl) // 2], itl[int(len(itl) * 0.99)]
-print(f"TPOT {tpot:.1f} ms  ITL p50 {p50} ms  p99 {p99} ms")
-print(f"stdev {statistics.pstdev(gaps_ms):.0f} ms")
-# TPOT 31.9 ms  ITL p50 25 ms  p99 300 ms  -> mean looks healthy, users see freezes
-# stdev 43 ms
-```
-
 ### Worked scenario: predicting TPOT before buying hardware
 Take a Llama-3-8B-style model: 8B parameters in fp16 (16 GB of weights), 32 layers, 8 KV heads, head
 dimension 128.
@@ -216,6 +213,27 @@ for b, ctx in [(1, 4_000), (32, 4_000), (32, 32_000)]:
   pushes TPOT up at scale.
 - **Measured numbers will be worse** than every figure here; the point is the ratios and which term
   dominates.
+
+### Mean TPOT hides the stall; ITL p99 shows it
+Runnable with synthetic timestamps: a steady 25 ms gap with one 300 ms prefill stall every 40 tokens.
+
+```python
+import statistics
+
+gaps_ms = [300 if i % 40 == 39 else 25 for i in range(200)]   # 200 gaps -> 201 tokens
+t = [0.0]
+for g in gaps_ms:
+    t.append(t[-1] + g)
+
+n_out = len(t)
+tpot = (t[-1] - t[0]) / (n_out - 1)                            # per-request mean
+itl = sorted(gaps_ms)
+p50, p99 = itl[len(itl) // 2], itl[int(len(itl) * 0.99)]
+print(f"TPOT {tpot:.1f} ms  ITL p50 {p50} ms  p99 {p99} ms")
+print(f"stdev {statistics.pstdev(gaps_ms):.0f} ms")
+# TPOT 31.9 ms  ITL p50 25 ms  p99 300 ms  -> mean looks healthy, users see freezes
+# stdev 43 ms
+```
 
 ### Agent scenario: where a planner's minute goes
 A planner agent makes eight sequential calls; illustrative TTFT 300 ms per call, no tool time counted.

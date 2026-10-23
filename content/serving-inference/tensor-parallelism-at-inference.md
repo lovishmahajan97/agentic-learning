@@ -5,7 +5,8 @@ name: Tensor parallelism at inference
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/distributed-training
@@ -165,7 +166,45 @@ flowchart TD
     AR1 -.->|"latency-bound at decode"| L["Needs fast NVLink"]
 ```
 
+## Misconceptions
+- **"Pipeline parallelism also makes each token faster."** It only fits the model: a token still passes
+  through the layer ranges one GPU after another. TP is the split where all N GPUs work on the same token
+  at once, so only TP lowers TPOT.
+- **"Doubling the TP degree halves the step time."** Only the memory term shrinks as 1/N; the 160
+  all-reduces per step do not. At an assumed 20 µs each, TP = 4 to TP = 8 goes from about 13.7 ms to
+  8.5 ms, 1.6× for 2× the GPUs.
+- **"Decode all-reduces need more link bandwidth."** At decode each message is small (512 KB for 32
+  sequences at hidden 8,192), so the cost is per-collective latency. That is why TP stays inside an NVLink
+  node; even InfiniBand across nodes multiplies latency by 160 per token.
+- **"TP shards the weights but every GPU keeps the full KV cache."** Each GPU stores K and V only for its
+  own heads, so per-GPU cache per token is the full figure ÷ N. With 8 KV heads that holds up to TP = 8;
+  beyond it heads are replicated.
+- **"If the model fits on one GPU, TP = 2 is how to double throughput."** Two replicas give 2× throughput
+  with no communication; TP = 2 gives faster single-stream decode but less throughput per GPU. Choose TP
+  for a user watching one agent run, replicas for a queue of background runs.
+
 ## Examples
+### Step-time model across TP degrees
+Pure Python, using the formula and the assumed 20 µs per all-reduce. TP = 1 is hypothetical (the model
+does not fit), shown only as the baseline.
+
+```python
+HBM_BW = 3.35e12                     # bytes/s per H100-class GPU (published figure)
+
+def t_step_ms(n, weight_gb=141, kv_gb=0.0, layers=80, t_allreduce_us=20):
+    mem = (weight_gb + kv_gb) * 1e9 / (n * HBM_BW)          # shrinks as 1/N
+    comm = 0 if n == 1 else 2 * layers * t_allreduce_us * 1e-6  # does not shrink
+    return (mem + comm) * 1e3
+
+base = None
+for n in (1, 2, 4, 8):
+    ms = t_step_ms(n)
+    base = base or ms
+    print(f"TP={n}: step {ms:5.1f} ms, {1e3/ms:4.0f} tok/s per stream, "
+          f"speedup {base/ms:3.1f}x on {n} GPUs")
+# TP=2: 24.2 ms, TP=4: 13.7 ms, TP=8: 8.5 ms -> 5.0x on 8 GPUs, and the gap widens with slower links
+```
+
 ### Row- and column-parallel MLP with one all-reduce
 Run with `torchrun --nproc_per_node=2`. Each rank keeps only its weight slice and computes a partial
 output; the single all-reduce recovers the full result. Rank 0 checks it against the unsharded
@@ -212,27 +251,6 @@ illustrative 2 GB activation reserve.
 | Left for cache (72 GB budget) | about 35 GB, roughly 450k tokens | essentially nothing |
 | Weight-read floor per step | 35 GB ÷ 3.35 TB/s ≈ 10 ms | n/a |
 | Verdict | single-stream decode capped near 95 tokens/s before all-reduce overhead | not a usable deployment in bf16 |
-
-### Step-time model across TP degrees
-Pure Python, using the formula and the assumed 20 µs per all-reduce. TP = 1 is hypothetical (the model
-does not fit), shown only as the baseline.
-
-```python
-HBM_BW = 3.35e12                     # bytes/s per H100-class GPU (published figure)
-
-def t_step_ms(n, weight_gb=141, kv_gb=0.0, layers=80, t_allreduce_us=20):
-    mem = (weight_gb + kv_gb) * 1e9 / (n * HBM_BW)          # shrinks as 1/N
-    comm = 0 if n == 1 else 2 * layers * t_allreduce_us * 1e-6  # does not shrink
-    return (mem + comm) * 1e3
-
-base = None
-for n in (1, 2, 4, 8):
-    ms = t_step_ms(n)
-    base = base or ms
-    print(f"TP={n}: step {ms:5.1f} ms, {1e3/ms:4.0f} tok/s per stream, "
-          f"speedup {base/ms:3.1f}x on {n} GPUs")
-# TP=2: 24.2 ms, TP=4: 13.7 ms, TP=8: 8.5 ms -> 5.0x on 8 GPUs, and the gap widens with slower links
-```
 
 ### Worked scenario: a 15-step agent on a 70B model
 Each step decodes ~300 tokens (reasoning plus a tool call). Decode only, using the step times above;

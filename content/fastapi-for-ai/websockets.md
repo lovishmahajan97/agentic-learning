@@ -5,7 +5,8 @@ name: WebSockets
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/server-sent-events
@@ -38,6 +39,143 @@ auth and resume. One-way agent streams: use SSE.
   loop plus agent task shape, auth on the handshake, and session ids for reconnect and resume.
 - **What you can skip.** Frame-level details beyond close codes and ping/pong. Most text agents that only
   need a stop button are better served by SSE plus a cancel endpoint.
+
+## Lab
+### Task
+Fix an agent socket whose stop button does nothing: the handler awaits the whole answer before it reads
+the next message. Time box: 45-60 minutes. Prerequisites: Async endpoints and the asyncio lesson (tasks
+and events).
+- **Interruption:** a reader loop plus a generation task, so `stop` ends the answer mid-stream with a
+  `stopped` frame.
+- **Handshake auth:** a bad token is refused before `accept()` with close code 1008.
+- **Cleanup:** a disconnect cancels the generation task, so no tokens stream to nobody.
+
+### Starter code
+Save as `lab_ws.py`. Needs `pip install fastapi httpx` (checked with FastAPI 0.161.1, Starlette 1.9.0,
+httpx 0.28.1, Python 3.12). It runs as given and shows both bugs.
+
+```python
+import asyncio
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, WebSocketException, status
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+WORDS = [f"w{i}" for i in range(20)]                  # a 20-token answer
+TOKEN_DELAY = 0.05                                    # seconds per token (fake model speed)
+
+async def model_stream(prompt: str):                  # stand-in for your SDK's async stream
+    for w in WORDS:
+        await asyncio.sleep(TOKEN_DELAY)
+        yield w
+
+async def run_agent(ws: WebSocket, prompt: str, stop: asyncio.Event) -> None:
+    """The generation task: the only sender of token, stopped and done frames."""
+    async for piece in model_stream(prompt):
+        # YOUR CODE 1: if stop is set, send {"type": "stopped"} and return.
+        await ws.send_json({"type": "token", "delta": piece})
+    await ws.send_json({"type": "done"})
+
+@app.websocket("/ws/agent")
+async def agent(ws: WebSocket, token: str = ""):
+    # YOUR CODE 2: reject anything but token == "demo" BEFORE accept, with close code 1008.
+    await ws.accept()
+    stop = asyncio.Event()
+    try:
+        while True:
+            msg = await ws.receive_json()
+            if msg["type"] == "prompt":
+                # BUG: awaiting the run here means stop messages are not read until it ends.
+                # YOUR CODE 3: start run_agent as a task and keep this loop reading,
+                #              so {"type": "stop"} sets the event mid-answer.
+                await run_agent(ws, msg["text"], stop)
+            elif msg["type"] == "stop":
+                stop.set()
+    except WebSocketDisconnect:
+        pass
+    # YOUR CODE 4: in a finally block, cancel the generation task (client gone: stop paying).
+
+if __name__ == "__main__":
+    client = TestClient(app)
+    with client.websocket_connect("/ws/agent?token=demo") as ws:
+        ws.send_json({"type": "prompt", "text": "hi"})
+        tokens = [ws.receive_json()["delta"] for _ in range(3)]
+        ws.send_json({"type": "stop"})
+        while (msg := ws.receive_json())["type"] == "token":
+            tokens.append(msg["delta"])
+        print(msg["type"], "after", len(tokens), "of", len(WORDS), "tokens")
+    try:
+        with client.websocket_connect("/ws/agent?token=bad") as ws:
+            print("bad token accepted: it should have been refused")
+    except WebSocketDisconnect as exc:
+        print("bad token closed with", exc.code)
+```
+
+The starter prints `done after 20 of 20 tokens` and `bad token accepted: it should have been refused`.
+
+### Expected output
+With a correct solution, `python lab_ws.py` prints (the count can be 4 on a very slow machine):
+
+```
+stopped after 3 of 20 tokens
+bad token closed with 1008
+```
+
+### Tests
+Save as `test_lab_ws.py` and run `pytest -q`. On the starter the stop test fails (`done` instead of
+`stopped`) and the handshake test fails (accepted); the full-answer test passes and guards your fix.
+
+```python
+import pytest
+from fastapi import WebSocketDisconnect
+from fastapi.testclient import TestClient
+from lab_ws import WORDS, app
+
+client = TestClient(app)
+
+def collect_after_stop(ws, stop_after: int):
+    ws.send_json({"type": "prompt", "text": "hi"})
+    tokens = [ws.receive_json()["delta"] for _ in range(stop_after)]
+    ws.send_json({"type": "stop"})
+    while (msg := ws.receive_json())["type"] == "token":
+        tokens.append(msg["delta"])
+    return msg["type"], tokens
+
+def test_stop_interrupts_mid_answer():
+    with client.websocket_connect("/ws/agent?token=demo") as ws:
+        final, tokens = collect_after_stop(ws, 3)
+    assert final == "stopped"
+    assert len(tokens) < len(WORDS) // 2          # stop landed while tokens were still streaming
+
+def test_full_answer_without_stop_ends_with_done():
+    with client.websocket_connect("/ws/agent?token=demo") as ws:
+        ws.send_json({"type": "prompt", "text": "hi"})
+        msgs = [ws.receive_json() for _ in range(len(WORDS) + 1)]
+    assert [m.get("delta") for m in msgs[:-1]] == WORDS and msgs[-1] == {"type": "done"}
+
+def test_bad_token_is_refused_with_policy_violation():
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect("/ws/agent?token=bad"):
+            pytest.fail("the handshake was accepted")
+    assert exc.value.code == 1008
+```
+
+### Failure scenarios
+- **Reuse one `asyncio.Event` across prompts.** After the first stop, every later prompt answers
+  `stopped` at once. Debug: log `stop.is_set()` when each run starts; create a fresh event per prompt.
+- **Send frames from the reader loop as well as the task.** Frames interleave or a send races a close.
+  Debug: grep for every `send_` call; only the generation task (or one sender queue) may send.
+- **Accept, then check the token.** The client gets a working socket for a moment and the test sees a
+  successful handshake. Debug: move the check above `accept()` and raise `WebSocketException`.
+- **Forget the `finally` cancel.** Closing the client mid-answer leaves the task streaming into a dead
+  socket. Debug: log in `model_stream` after the client disconnects; lines should stop at once.
+
+### Submission
+- **Code:** `lab_ws.py` with the four YOUR CODE steps done and the protocol unchanged.
+- **Test run:** `pytest -q` showing 3 passed.
+- **Trace:** the output of `python lab_ws.py`, matching the expected output.
+- **Note (3-5 sentences):** why one coroutine cannot both stream and listen, and how an `approve` or
+  `deny` message would plug into the same reader loop.
+- **Evaluated on:** passing tests, a single sender, a fresh stop event per run, and cleanup on disconnect.
 
 ## Why it exists
 - **HTTP is request then response.** Once the client has sent its body it cannot say anything else on

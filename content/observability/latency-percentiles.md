@@ -5,7 +5,8 @@ name: Latency percentiles (p50/p95/p99)
 kind: metric
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - observability/monitoring
@@ -35,6 +36,163 @@ before taking quantiles, and never average percentiles.
   idempotent tool calls, and the bucket edges you put on SLO thresholds.
 - **What you can skip.** Sketch internals (t-digest, DDSketch maths). Know that they are mergeable with
   bounded relative error, and that per-process summaries are not.
+
+## Lab
+### Task
+Fix the latency numbers an agent team reports. The dashboard averages per-host p99s, nobody can read the
+SLO ratio, and agent steps are timed only when they succeed, so a CRM timeout makes the tail look better.
+Time box: 45-60 minutes. Prerequisites: Monitoring and Tracing, plus the bucket example in this lesson.
+- **Fleet p99:** sum the cumulative buckets across series, then take one quantile.
+- **SLO ratio:** the fraction under a threshold, refused when the threshold is not a bucket edge.
+- **Every outcome timed:** each step is recorded under `(step, status)` with `ok`, `timeout` or `error`.
+
+### Starter code
+Save as `lab_latency.py`. Plain Python 3.12 plus `pip install pytest` (checked with pytest 9.1.1). A fake
+clock stands in for real time, so the 30 s timeout costs nothing.
+
+```python
+import time
+
+EDGES = [0.5, 1, 2, 5, 10, float("inf")]                   # task buckets (le), on SLO thresholds
+STEP_EDGES = [0.25, 0.5, 1, 2, 5, 10, 30, float("inf")]    # agent-step buckets
+HOST_A = [7000, 9000, 9600, 9900, 9980, 10000]             # cumulative counts, busy host
+HOST_B = [10, 30, 60, 85, 98, 100]                         # small canary, slow
+
+def quantile(q, edges, cum):
+    """What histogram_quantile does: find the crossing bucket, interpolate linearly inside it."""
+    target = q * cum[-1]
+    lo_edge, lo_count = 0.0, 0
+    for edge, count in zip(edges, cum):
+        if count >= target:
+            if edge == float("inf"):
+                return lo_edge                              # cannot interpolate into +Inf
+            return lo_edge + (edge - lo_edge) * (target - lo_count) / (count - lo_count)
+        lo_edge, lo_count = edge, count
+    return lo_edge
+
+def observe(hist, key, seconds, edges=STEP_EDGES):
+    """hist maps (step, status) -> cumulative counts; a sample increments every bucket with le >= it."""
+    counts = hist.setdefault(key, [0] * len(edges))
+    for i, edge in enumerate(edges):
+        if seconds <= edge:
+            counts[i] += 1
+
+def fleet_quantile(q, edges, series):
+    # BUG: averages the per-series quantiles, so a tiny canary dominates the fleet number.
+    # YOUR CODE 1: merge first (sum counts per bucket across every series), take the quantile once.
+    return sum(quantile(q, edges, cum) for cum in series) / len(series)
+
+def slo_ratio(edges, cum, threshold):
+    # YOUR CODE 2: the fraction of requests that finished at or under `threshold`. It is exact only at
+    #              a bucket edge, so raise ValueError for a threshold that is not one of `edges`.
+    raise NotImplementedError
+
+def timed_step(hist, step, fn, *args, clock=time.perf_counter):
+    # BUG: only successes are timed, so a timeout vanishes from the sample and the p99 "improves".
+    # YOUR CODE 3: record every outcome under (step, status) with status "ok", "timeout"
+    #              (TimeoutError) or "error" (any other exception), with its elapsed time, then re-raise.
+    t0 = clock()
+    result = fn(*args)
+    observe(hist, (step, "ok"), clock() - t0)
+    return result
+
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+    def __call__(self):
+        return self.now
+
+def crm_lookup(clock, seconds):
+    clock.now += seconds                                   # the call takes `seconds` of fake time
+    if seconds >= 30:
+        raise TimeoutError("crm_lookup timed out after 30 s")
+    return {"customer": "c-1"}
+
+if __name__ == "__main__":
+    print(f"fleet p99  {fleet_quantile(0.99, EDGES, [HOST_A, HOST_B]):.2f} s")
+    merged = [a + b for a, b in zip(HOST_A, HOST_B)]
+    try:
+        print(f"under 2 s  {slo_ratio(EDGES, merged, 2):.1%}")
+    except NotImplementedError:
+        print("under 2 s  (not implemented)")
+    clock, hist = FakeClock(), {}
+    for seconds in [0.4] * 9 + [30]:                       # one call in ten hits the 30 s timeout
+        try:
+            timed_step(hist, "crm_lookup", crm_lookup, clock, seconds, clock=clock)
+        except TimeoutError:
+            pass
+    crm = [cum for (step, _), cum in hist.items() if step == "crm_lookup"]
+    calls = sum(cum[-1] for cum in crm)
+    print(f"crm_lookup p99 {fleet_quantile(0.99, STEP_EDGES, crm):.2f} s over {calls} timed calls")
+```
+
+The starter prints `fleet p99  7.50 s`, `under 2 s  (not implemented)` and `crm_lookup p99 0.50 s over 9
+timed calls`: the canary dominates, and the timeout has vanished from the sample.
+
+### Expected output
+With a correct solution, `python lab_latency.py` prints:
+
+```
+fleet p99  5.75 s
+under 2 s  95.6%
+crm_lookup p99 28.00 s over 10 timed calls
+```
+
+### Tests
+Save as `test_lab_latency.py` and run `pytest -q`. On the starter all four fail: the fleet p99 is 7.5,
+`slo_ratio` raises `NotImplementedError`, and the `timeout` and `error` series do not exist (`KeyError`).
+
+```python
+import pytest
+from lab_latency import (EDGES, HOST_A, HOST_B, STEP_EDGES, FakeClock, crm_lookup,
+                         fleet_quantile, slo_ratio, timed_step)
+
+def test_fleet_p99_merges_buckets_before_the_quantile():
+    assert fleet_quantile(0.99, EDGES, [HOST_A, HOST_B]) == pytest.approx(5.75, abs=0.005)   # not 7.50
+
+def test_slo_ratio_is_exact_at_an_edge_only():
+    merged = [a + b for a, b in zip(HOST_A, HOST_B)]
+    assert slo_ratio(EDGES, merged, 2) == pytest.approx(9660 / 10100)
+    with pytest.raises(ValueError):
+        slo_ratio(EDGES, merged, 3)                       # 3 s is not a bucket edge
+
+def test_timeouts_are_timed_and_labelled():
+    clock, hist = FakeClock(), {}
+    for seconds in [0.4] * 9 + [30]:
+        try:
+            timed_step(hist, "crm_lookup", crm_lookup, clock, seconds, clock=clock)
+        except TimeoutError:
+            pass
+    assert hist[("crm_lookup", "timeout")][-1] == 1
+    crm = [cum for (step, _), cum in hist.items() if step == "crm_lookup"]
+    assert fleet_quantile(0.99, STEP_EDGES, crm) == pytest.approx(28.0)
+
+def test_other_failures_are_errors_and_still_raise():
+    hist = {}
+    def broken():
+        raise ValueError("bad arguments")
+    with pytest.raises(ValueError):
+        timed_step(hist, "billing", broken)
+    assert hist[("billing", "error")][-1] == 1
+```
+
+### Failure scenarios
+- **Weight each host's p99 by its traffic instead of merging.** You get about 5.05 s, close enough to look
+  right and still wrong. Debug: compare with the quantile of the summed buckets; only that matches a pooled
+  sample.
+- **Swallow the exception in `timed_step` after recording it.** The tests pass for the histogram but the
+  agent loop now treats a timed-out CRM call as a result. Debug: `pytest.raises` in the last test catches it.
+- **Record the timeout as `ok`.** The p99 is right, but the timeout count next to it reads zero. Debug: plot
+  the `status` series separately; incidents should show up there first.
+- **Ask for "under 3 s".** Interpolating inside the 2-5 s bucket invents a number. Debug: put the SLO
+  threshold on a bucket edge, which is why `slo_ratio` refuses it.
+
+### Submission
+- `lab_latency.py` and a `pytest -q` run showing 4 passed.
+- The three printed lines, matching the expected output exactly.
+- One sentence explaining why the fleet p99 (5.75 s) is lower than the average of p99s (7.50 s).
+- The PromQL you would write for the same fleet p99 and SLO ratio on `agent_step_seconds`.
+- A reviewer checks that the starter's bugs are gone, not hidden: no averaging, no untimed exceptions.
 
 ## Why it exists
 - **The mean describes nobody.** Latency has a hard floor (network round trip plus minimum compute) and no

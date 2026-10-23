@@ -5,7 +5,8 @@ name: Hallucination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - model-internals/sampling-strategies
@@ -147,6 +148,24 @@ flowchart TD
     CV -->|"all supported"| OUT["Answer with sources"]
     FIX --> OUT
 ```
+
+## Misconceptions
+- **"Temperature 0 stops hallucination."** It cuts variance, not bias: greedy decoding still takes the
+  argmax of a wrong distribution, so a confidently wrong answer becomes reproducibly wrong.
+- **"RAG solves hallucination."** It moves the problem: a large share of reported RAG hallucinations
+  are retrieval failures, where the model bridges missing or stale passages with its priors. Fix retrieval
+  and add an abstention path before tuning the generator.
+- **"A bigger or newer model will make it go away."** The training objective has no "not stored" signal
+  and post-training rewards confident guesses, so every model has a long tail. In a 20-step agent even a
+  1% per-step error rate fails about 18% of tasks.
+- **"Fine-tuning on our documents makes the model stop inventing facts about them."** Training on
+  knowledge the base model lacks has been reported to increase hallucination elsewhere; facts belong in
+  retrieval and tool results, fine-tuning in format and behaviour.
+- **"Hallucination is a text-quality problem, not an agent-safety one."** In an agent it is an action:
+  an invented order ID gets refunded and a fabricated "tests passed" gets merged. Structural cases are
+  almost fully preventable with registry, schema and seen-ID checks before side effects.
+- **"Our LLM judge's hallucination rate is the true rate."** The judge is a model that can err in the
+  same direction as the generator; calibrate it against human labels before trusting the number.
 
 ## Examples
 ### Agent scenario: block invented tools, arguments and IDs before they execute

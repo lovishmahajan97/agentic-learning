@@ -5,7 +5,8 @@ name: RAG architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - rag-retrieval/chunking-strategies
@@ -40,6 +41,64 @@ every agent answer built on it.
   golden query set that measures retrieval apart from the agent.
 - **What you can skip.** ANN index internals and embedding training. Know recall@k, why ACL filters go
   inside the search, why fusion uses ranks, and how many tokens each call adds to the agent's context.
+
+## Decision case
+### Scenario
+A 2,100-person software company (1,800 employees, 300 contractors) wants an internal assistant agent
+over its wiki, tickets and HR policies. All figures are illustrative.
+- **Scale:** 50,000 documents, about 1,000,000 chunks, roughly 4 GB of raw 1024-dimension vectors.
+- **Question mix from a two-week log sample:** 85% single lookups, 15% multi-hop.
+- **Access control:** documents carry group ACLs; contractors must never see employee-only HR pages.
+- **Constraints:** data must stay in the existing EU Postgres region; a team of 3 engineers with
+  Postgres skills; 10 weeks to launch; finance wants predictable cost per question.
+- **Token model (from the worked scenario below):** a 3,000-token prefix, 2,400 tokens of evidence for
+  one retrieval, about 1,000 tokens per compact search-tool call.
+
+### Options
+| Option | How it works | Multi-hop (15%) | Avg input tokens per question | Fit with team, residency, deadline |
+|---|---|---|---|---|
+| A. Single-shot hybrid RAG | Retrieve once in pgvector (dense + BM25, ACL in the query, RRF, rerank), then one model call | Fails: second hop never retrieved | 5,400 | Best: one path, existing Postgres |
+| B. Agent-first search tool | Every question goes to an agent loop with `search_docs`, capped at 4 calls | Handled | 0.85 × 7,000 + 0.15 × 25,000 = 9,700 | Good, but cost varies per question |
+| C. Routed: single-shot default, tool for multi-hop | A classifier or first-pass signal escalates to the capped search loop | Handled when routed correctly | 0.85 × 5,400 + 0.15 × 25,000 = 8,340 | Good: same index and service, two paths to evaluate |
+
+Single lookups in option B take two model calls (3,000 then 4,000 input tokens), hence 7,000.
+
+### Decision
+Choose **C on pgvector**, because:
+- **It meets the quality bar where A cannot:** 15% of real questions are multi-hop, and a single
+  embedding of the original question cannot find the second hop.
+- **It keeps cost predictable:** 85% of questions cost exactly one retrieval and one model call, and
+  the average (8,340 tokens) is about 14% below agent-first (9,700).
+- **pgvector fits every hard constraint:** 4 GB of vectors is comfortable for it, it already runs in the
+  EU region, the team knows it, and the ACL predicate sits in the same `WHERE` clause as the similarity
+  order.
+
+**What would change it:** a multi-hop share above roughly 40% makes the router overhead not worth it
+(go agent-first, B); a corpus 10-100 times larger makes a dedicated vector database worth its operations
+cost; a corpus that shrinks to a few hundred stable pages makes long context with prompt caching simpler.
+
+### Trade-offs accepted
+- **Misrouted questions.** A multi-hop question sent down the single-shot path gets a partial answer.
+  Watch: grounding-check failures and "no information" answers on the single-shot path, sampled weekly.
+- **Two paths to evaluate.** The golden query set must include multi-hop cases and run against both
+  paths in CI. Watch: recall@5 per path, not one blended number.
+- **Filtered HNSW can starve top-k for small groups.** Contractors see a small slice of the corpus.
+  Watch: zero-result rate per user group; enable iterative index scans if it rises.
+- **Eventual freshness.** The index lags the sources. Watch: index lag per source and deleted documents
+  still appearing in citations.
+
+### Review rubric
+- **Constraints are explicit and numeric:** scale, question mix, ACL rules, residency, team and deadline
+  are stated before any option is discussed.
+- **Token arithmetic is shown and recomputes:** per-question costs are derived from stated per-call
+  numbers, and the weighted average matches the question mix.
+- **ACL placement is decided, not assumed:** the write-up says the filter runs inside the search and
+  identity comes from the session, not a tool argument.
+- **The choice is tied to constraints:** each reason maps to a named constraint, and rejected options
+  are rejected for a stated constraint.
+- **Reversal conditions are measurable:** at least two thresholds (question mix, corpus size) that would
+  flip the decision.
+- **Each accepted trade-off has a signal:** a metric or log query someone can actually watch.
 
 ## Why it exists
 - **Weights are a frozen public snapshot.** A model answers from its weights and its context window.

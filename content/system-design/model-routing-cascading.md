@@ -5,7 +5,8 @@ name: Model routing / cascading
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/model-selection
@@ -37,6 +38,62 @@ paying with router error or tail latency.
   task*, not per call.
 - **What you can skip.** Training a learned router on day one. Static per-step rules plus a deterministic
   gate capture most of the win; learn a router once you have labelled traces.
+
+## Decision case
+### Scenario
+An online retailer's support agent resolves order problems in chat: 30,000 tasks a day, 8 model steps
+each (1 plan, 5 tool-argument steps, 1 tool-result summary, 1 final answer). Everything runs on a
+frontier model today. Units and latencies are illustrative.
+- **Units per step:** small 1, large 15, LLM judge 0.5. Latency per step: small 0.8 s, judge 0.4 s,
+  large 3.0 s; schema validation is effectively free.
+- **Constraints:** finance wants model cost per task halved (at most 60 units against 120 today); the
+  chat UI streams per-step progress, so each step's p95 must stay at or under 4 s; task success must not
+  drop; two engineers, four weeks.
+- **Data available:** 2,000 traced tasks but no router labels. Replaying them shows small-model tool
+  steps succeed 0.97 each ungated and fail the schema gate 15% of the time. With the gate, escalated
+  steps behave like the large model's 0.99.
+- **Cost of a failed task:** a human hand-off, priced at 300 units.
+
+### Options
+| Option | How it works | Units per task | Step p95 | Task success |
+|---|---|---|---|---|
+| A. All large | Status quo | 8 × 15 = 120 | 3.0 s | About 0.95 |
+| B. Static routing, no gate | Plan and answer large, other steps small | 30 + 6 = 36 | 3.0 s | 0.97 to the 5th power ≈ 0.86 |
+| C. Static routing plus schema-gated cascade on tool steps | Escalate only a tool step whose call fails its schema | 30 + 5 × (1 + 0.15 × 15) + 1 = 47.25 | 0.8 + 3.0 = 3.8 s | 0.99 to the 5th power ≈ 0.95 |
+| D. Judge cascade on every step | Small first everywhere, judge, escalate about 30% | 8 × (1.5 + 0.3 × 15) = 48 | 0.8 + 0.4 + 3.0 = 4.2 s | Planner quality bounded by the judge |
+
+### Decision
+Choose **C**.
+- **Budget:** 47.25 units is a 61% cut, inside the 60-unit target.
+- **Latency:** an escalated step costs 3.8 s in series, under the 4 s per-step p95.
+- **Quality:** the gate keeps tool steps near 0.99, so task success stays where it is.
+- **Why not B:** it is cheaper per call but loses a task in seven. With a 300-unit hand-off it costs
+  36 + 0.14 × 300 ≈ 78 units per task against about 62 for C; the gate wins once a failure costs more
+  than about 122 units.
+- **Why not D:** it breaks the latency constraint (4.2 s) and puts planning behind an uncalibrated judge.
+- **Why no learned router:** C needs no labels, which the team does not have and cannot build in four
+  weeks.
+
+**What would change it:** if the gate's escalation rate climbs above 32%, C costs more than 60 units
+and needs a better small model or prompt. A step p95 tightened to 3 s rules out any cascade, so route
+only. Once a few thousand labelled traces exist, a router can send obviously hard tool steps straight
+to large.
+
+### Trade-offs accepted
+- **Tail latency on escalated steps.** Accept 3.8 s on 15% of tool steps and watch step p95 per route.
+- **Two models to keep compatible.** Keep a 3% baseline slice on the large model by stable hash and
+  compare task success per route.
+- **Escalation storms.** If the small model degrades, every tool step escalates. Cap escalations at 3
+  per task and alert when the rate leaves its normal band.
+- **No difficulty prediction yet.** Easy plans still pay large prices; revisit after labelling traces.
+
+### Review rubric
+- Measures the success rate, escalation rate and difficulty split from real traces before choosing.
+- Compares options on cost per successful task, pricing failed tasks, not only cost per call.
+- Checks the latency constraint against escalated paths in series, not the mean.
+- Names the escalation signal, explains why it is external, and caps escalations per task.
+- States the thresholds (escalation rate, p95) at which the choice flips.
+- Plans monitoring per route, including a baseline slice on the strong model.
 
 ## Why it exists
 - **Requests vary enormously in difficulty.** Everything on the strongest model overpays; everything on the

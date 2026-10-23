@@ -5,7 +5,8 @@ name: Query decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -150,6 +151,21 @@ flowchart TD
     S --> SY
     MH --> SY
 ```
+
+## Misconceptions
+- **"A bigger top-k catches both halves of a comparison."** The compound query embeds between the two
+  intents, and BM25 favours passages that mention the most terms. The second facet's passage can still
+  rank below dozens about the first, so wider k buys noise, not that passage.
+- **"Decompose every question to be safe."** The planner call and each extra retrieval are paid by atomic
+  questions too, and a split atomic question adds noise. Gate it: atomic questions get one search.
+- **"Decomposition can split any question with several answers."** The planner can only split parts the
+  question names. "List all plans with EU data residency" needs a filter, a structured query or an
+  enumerate-then-fan-out step, or the planner invents the members.
+- **"Parallel fan-out costs no latency."** Wall-clock is planner plus the slowest branch plus synthesis,
+  and the context budget is shared: 8 chunks over 3 facets leaves 2 each.
+- **"If every facet is retrieved, the composed answer will be right."** Models also fail at composing
+  answers they get right separately (Press et al.'s compositionality gap). An empty facet left unmarked
+  becomes a confident guess, so tag evidence per facet and allow "insufficient evidence".
 
 ## Examples
 ### Fan-out with parallel retrieval and merged evidence

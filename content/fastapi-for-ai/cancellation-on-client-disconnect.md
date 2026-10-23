@@ -5,7 +5,8 @@ name: Cancellation on client disconnect
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/asgi-lifecycle
@@ -39,6 +40,181 @@ children, clean up in `finally`, and shield the accounting.
   durable jobs instead.
 - **What you can skip.** The ASGI receive-channel internals beyond "disconnect is a message". Know how
   `CancelledError` propagates and why bare `create_task` orphans children.
+
+## Lab
+### Task
+Make an agent run stop when its client leaves: race the run against a disconnect watcher, make its
+parallel tool calls die with it, add a cancel point before a side-effecting tool, and record usage on
+every path under a bounded shield. Time box: 45-75 minutes.
+- **Prerequisites:** the async endpoints and StreamingResponse lessons, plus asyncio tasks and
+  cancellation.
+- **Setup:** Python 3.11+ (for `asyncio.TaskGroup`) and pytest; checked with Python 3.12 and pytest 9.1.
+  `FakeRequest` has the same `is_disconnected()` coroutine as Starlette's `Request`, so the finished code
+  drops into a FastAPI endpoint unchanged.
+- **Save** the starter as `lab.py` and the tests as `test_lab.py`, then run `pytest -q`.
+
+### Starter code
+```python
+"""Lab: make an agent run stoppable when the client disconnects. Python 3.11+, no packages.
+FakeRequest mimics Starlette's Request.is_disconnected(), so the same code runs in FastAPI."""
+import asyncio
+
+class Stopped(Exception):
+    """The run stopped at a cancel point because nobody is listening any more."""
+
+class FakeRequest:
+    def __init__(self, leave_after: float | None):
+        loop = asyncio.get_running_loop()
+        self.leave_at = None if leave_after is None else loop.time() + leave_after
+    async def is_disconnected(self) -> bool:
+        return self.leave_at is not None and asyncio.get_running_loop().time() >= self.leave_at
+
+class Agent:
+    """Fake model, tools and side effects that log what really happened."""
+    def __init__(self, llm_s: float = 0.1, tool_s: float = 0.3):
+        self.llm_s, self.tool_s, self.events, self.usage = llm_s, tool_s, [], []
+    async def _timed(self, name: str, seconds: float):
+        try:
+            await asyncio.sleep(seconds)
+            self.events.append(f"{name} done")
+        except asyncio.CancelledError:
+            self.events.append(f"{name} cancelled")
+            raise
+    async def llm(self, step: int): await self._timed(f"llm{step}", self.llm_s)
+    async def tool(self, name: str): await self._timed(name, self.tool_s)
+    async def send_email(self, idempotency_key: str):
+        self.events.append(f"email sent {idempotency_key}")      # the side effect
+    async def record_usage(self, run_id: str, status: str):
+        await asyncio.sleep(0.05)                                 # a write to the billing store
+        self.usage.append((run_id, status))
+
+PLAN = ["search", "email", "final"]   # step 0: two parallel tools, step 1: email, step 2: answer
+
+async def run_unless_disconnected(request, coro, poll_s: float = 0.05):
+    # LAB 1: run coro as a task; every poll_s check request.is_disconnected(). If the client
+    # left, cancel the task, wait for it to finish its finally blocks, and return None.
+    # Otherwise return the task's result. Cancel the task if this function is itself cancelled.
+    coro.close()                     # starter only: avoids a "never awaited" warning; remove it
+    raise NotImplementedError("lab step 1: run_unless_disconnected")
+
+async def run_agent(agent: Agent, request, run_id: str, plan=PLAN):
+    for step, action in enumerate(plan):
+        await agent.llm(step)
+        if action == "search":
+            # BUG to fix in LAB 2: bare tasks are orphans; cancelling the run does not stop them.
+            tasks = [asyncio.create_task(agent.tool(n)) for n in ("search-A", "search-B")]
+            await asyncio.wait(tasks)
+        elif action == "email":
+            # LAB 3: cancel point. If the client is gone, raise Stopped instead of sending.
+            await agent.send_email(idempotency_key=f"{run_id}:{step}")
+    # LAB 4: usage is only recorded on success. Record it on every path in a finally, with status
+    # "ok", "stopped" or "cancelled", under asyncio.shield(asyncio.wait_for(..., 2.0)), and never
+    # swallow CancelledError.
+    await agent.record_usage(run_id, "ok")
+    return "done"
+
+async def demo():
+    for label, leave in (("client stays", None), ("client leaves at 0.2s", 0.2)):
+        agent, req = Agent(), FakeRequest(leave)
+        out = await run_unless_disconnected(req, run_agent(agent, req, "r1"))
+        await asyncio.sleep(0.5)                                  # give orphans time to act
+        print(f"{label}: result={out}, events={sorted(agent.events)}, usage={agent.usage}")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(demo())
+    except NotImplementedError as e:
+        print(f"not done yet: {e}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints:
+
+```
+client stays: result=done, events=['email sent r1:1', 'llm0 done', 'llm1 done', 'llm2 done', 'search-A done', 'search-B done'], usage=[('r1', 'ok')]
+client leaves at 0.2s: result=None, events=['llm0 done', 'search-A cancelled', 'search-B cancelled'], usage=[('r1', 'cancelled')]
+```
+
+With only LAB 1 done, the second line shows `'search-A done', 'search-B done'` and `usage=[]`: the
+orphaned tools finished for nobody and the spend was never recorded.
+
+### Tests
+```python
+import asyncio
+import pytest
+import lab
+
+def test_completes_when_client_stays():
+    async def main():
+        agent, req = lab.Agent(), lab.FakeRequest(None)
+        return agent, await lab.run_unless_disconnected(req, lab.run_agent(agent, req, "r1"))
+    agent, out = asyncio.run(main())
+    assert out == "done"
+    assert agent.events.count("email sent r1:1") == 1 and agent.usage == [("r1", "ok")]
+
+def test_disconnect_cancels_run_and_its_parallel_tools():
+    async def main():
+        agent, req = lab.Agent(), lab.FakeRequest(0.2)            # leaves during the tools
+        t0 = asyncio.get_running_loop().time()
+        out = await lab.run_unless_disconnected(req, lab.run_agent(agent, req, "r1"))
+        took = asyncio.get_running_loop().time() - t0
+        await asyncio.sleep(0.5)                                  # orphans would finish now
+        return agent, out, took
+    agent, out, took = asyncio.run(main())
+    assert out is None and took < 0.35                            # noticed within a poll or so
+    assert {"search-A cancelled", "search-B cancelled"} <= set(agent.events)
+    assert not any(e.endswith("done") and e.startswith("search") for e in agent.events)
+    assert not any(e.startswith("email") for e in agent.events)
+    assert agent.usage == [("r1", "cancelled")]
+
+def test_cancel_point_blocks_side_effect():
+    async def main():
+        agent, req = lab.Agent(), lab.FakeRequest(0.42)           # leaves during llm1
+        with pytest.raises(lab.Stopped):
+            await lab.run_agent(agent, req, "r1")                 # no watcher: only the check
+        return agent
+    agent = asyncio.run(main())
+    assert "llm1 done" in agent.events
+    assert not any(e.startswith("email") for e in agent.events)
+    assert agent.usage == [("r1", "stopped")]
+
+def test_cancellation_propagates_and_usage_survives_a_second_cancel():
+    async def main():
+        agent = lab.Agent()
+        t = asyncio.create_task(lab.run_agent(agent, lab.FakeRequest(None), "r1"))
+        await asyncio.sleep(0.05); t.cancel()                     # client gone
+        await asyncio.sleep(0.01); t.cancel()                     # shutdown cancels again
+        await asyncio.gather(t, return_exceptions=True)
+        await asyncio.sleep(0.1)
+        return agent, t
+    agent, t = asyncio.run(main())
+    assert t.cancelled()                                          # CancelledError not swallowed
+    assert agent.usage == [("r1", "cancelled")]                   # shielded write completed
+```
+
+All four fail on the starter (`NotImplementedError`, the email sent after disconnect, no usage
+record); a correct solution passes all four.
+
+### Failure scenarios
+- **Keep the bare `create_task` + `asyncio.wait`.** The disconnect test fails on `search-A done`:
+  cancelling the run cancelled only the `wait`, not the children. Debug by logging task names still
+  pending with `asyncio.all_tasks()` after the run returns.
+- **Record usage without `asyncio.shield`.** Only the second-cancel test fails, with `usage == []`: a
+  shutdown cancel arriving during the billing write kills it. In production, compare provider token
+  totals against your usage table.
+- **Catch `BaseException` around the model call and continue.** `t.cancelled()` is false and the run goes
+  on to send the email, which is a ghost action. Debug by searching for bare `except:` and
+  `except BaseException` that do not re-raise.
+- **Check for disconnect only at the top of each step.** The cancel-point test fails: the client left
+  during `llm1` and the email still went out. Place the check immediately before every side effect.
+
+### Submission
+- `lab.py` with the four lab steps done, and `test_lab.py` unchanged.
+- A `pytest -q` run showing 4 passed, plus `python lab.py` matching the expected output.
+- The finished `run_unless_disconnected` wired into a real FastAPI endpoint, with a log line showing a
+  499 after you close `curl` mid-run.
+- Evaluation: no child task outlives a cancelled run, no side effect starts after a disconnect, and every
+  run writes exactly one usage record with the right status.
 
 ## Why it exists
 - **LLM requests are long and expensive.** A chat answer can stream for thirty seconds; an agent run can

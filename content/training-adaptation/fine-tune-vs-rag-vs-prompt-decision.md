@@ -5,8 +5,9 @@ name: Fine-tune vs RAG vs prompt decision
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
 agent_relevance: core
+lesson_type: decision
 related:
   - training-adaptation/supervised-fine-tuning
   - training-adaptation/peft
@@ -39,6 +40,78 @@ not facts. Climb only when evals prove the cheaper rung insufficient.
   climb, and the break-even arithmetic, which multiplies per call by steps per task.
 - **What you can skip.** Fine-tuning mechanics until the prompt rung has plateaued on a measured eval;
   many agent teams never need to leave the first two rungs.
+
+## Decision case
+### Scenario
+A mid-size insurer runs a claims-intake agent across three brands (all numbers illustrative). It reads
+a claim email, answers coverage questions, then calls `create_claim` with extracted fields.
+
+Volume is 40,000 claims a month at six model calls each, so 240,000 requests. Each call carries a
+6,000-token prompt: instructions, 14 tool schemas and ten extraction examples. Two of the six calls
+per claim are extraction steps, 80,000 a month.
+
+A review of 150 failed traces gives three piles:
+- **60 knowledge failures:** wrong coverage limits or excess amounts. Policy wordings differ per brand
+  and product and are revised every quarter.
+- **70 behaviour failures:** dates in the wrong format, a missing `policy_number`, or `create_claim`
+  called before the customer confirmed. Field-level accuracy is 94% against a 99% target.
+- **20 economics complaints:** finance flags the 1.44 billion input tokens a month (240,000 × 6,000).
+
+Constraints:
+- **Compliance:** every coverage answer must cite the policy clause and version, and retired wordings
+  must stop being used the day they are withdrawn.
+- **Data residency:** claim data stays in the EU, so only an EU-region hosted model or self-hosting.
+- **Team and deadline:** three application engineers, no ML engineer, a pilot in 10 weeks.
+- **Budget:** cost must not grow; the cycle cost of one fine-tune is estimated at $15,000 (review,
+  training, evals), repeated at each base-model upgrade, about every 6 months.
+
+### Options
+| Option | How it works | Citations and freshness | Field accuracy | Cost and team fit |
+|---|---|---|---|---|
+| A. Prompt only | Paste the relevant product's wording (~40k tokens) into every call | Cites, but every quarterly revision is a prompt redeploy per product | Unchanged by the extra text | 46k tokens × 240,000 ≈ 11B tokens a month, 7.7× today; lost-in-the-middle risk |
+| B. Retrieval tool plus prompt and schema fixes | `search_policy` filtered by brand, product and version; strict tool schemas and a confirm-before-create rule | Clause-level citations; re-index quarterly, delete retired versions | Fixed by schema and prompt, then measured | Prompt stays 6,000 tokens; fits the team and the deadline |
+| C. B plus a LoRA for the extraction step | Fine-tune an open-weights model for the 2 extraction calls per claim, prompt cut to 1,500 tokens | Same as B | Highest ceiling, if the prompt plateaus | Saves 360M tokens a month; needs GPUs in the EU and ML skills |
+| D. Fine-tune on policy documents and traces | Train wordings and behaviour into the weights | No citations, no deletion, stale after each revision | May improve format | Fails the compliance constraint outright |
+
+### Decision
+**Ship B now; hold C behind an eval gate.**
+- **Knowledge is a retrieval job here.** Clause citations, quarterly revisions and same-day withdrawal
+  are exactly what an index gives and weights cannot, which rules out D. A pays 7.7× the tokens to
+  get less control over versions.
+- **Behaviour goes to the prompt first.** The 70 behaviour failures are format and ordering errors,
+  the kind strict schemas and an explicit confirmation rule fix. A team with no ML engineer can ship
+  that inside 10 weeks.
+- **C fails the cost test today.** Removing 4,500 tokens from 80,000 extraction calls saves 360M
+  tokens a month: $1,080 at a placeholder $3 per million. Over 6 months that is $6,480, under the
+  $15,000 cycle cost, before any GPU bill.
+
+What would change it:
+- **A plateau:** if field accuracy stalls below 99% after two prompt and schema iterations, with the
+  tool set frozen, run C through an EU-region managed fine-tuning API.
+- **Volume:** at 10× claims, the same cut saves 3.6B tokens, $10,800 a month and $64,800 per
+  6-month cycle, which pays.
+- **Staffing:** an ML engineer joining makes self-hosted C viable.
+
+### Trade-offs accepted
+- **Retrieval becomes the main failure mode.** Watch recall on the golden set's coverage questions,
+  citation rate, and the share of "not in the policy" answers per brand.
+- **The 6,000-token prompt stays on every call.** Put the stable prefix first so prompt caching
+  applies; watch cached-token share and the monthly bill.
+- **A prompt ceiling on extraction.** Watch weekly field-level accuracy per field; a flat line for two
+  iterations triggers the C review.
+- **Dependence on one hosted vendor's EU region.** Keep the golden set provider-neutral so a switch
+  costs an eval run, not a rebuild.
+
+### Review rubric
+- **Gaps are counted, not asserted:** the write-up sorts real failures into knowledge, behaviour and
+  economics piles with numbers.
+- **Each constraint is applied to each option,** and at least one option is rejected by a named
+  constraint (here compliance rules out D).
+- **The arithmetic is shown and checks out:** requests × tokens, the saving, and the comparison with
+  the cycle cost, with prices labelled as placeholders.
+- **The decision names its trigger:** a measurable condition (accuracy plateau, volume, staffing) that
+  would move it to the next rung.
+- **Every accepted trade-off has a metric** someone will actually watch, with an owner or a cadence.
 
 ## Why it exists
 - **The same requests arrive every week.** "Make the agent know our stuff", "make it sound like us",

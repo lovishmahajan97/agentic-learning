@@ -5,7 +5,8 @@ name: Shared httpx AsyncClient
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/httpx
@@ -37,6 +38,190 @@ client per upstream per worker in the lifespan.
   responses on every path.
 - **What you can skip.** httpcore internals and HTTP/2 tuning. Know pooling, the four timeouts and the
   stream-close rule; that covers almost every agent outage this causes.
+
+## Lab
+### Task
+Fix an agent backend's model client: replace the per-request `AsyncClient` with one lifespan client
+injected through a dependency, map pool exhaustion to a fast 503, and write a streaming relay that
+returns its connection to the pool on success, on an upstream error status and when the upstream
+drops mid-stream. Time box: 45-60 minutes.
+- **Prerequisites:** the lifespan, dependency injection and StreamingResponse lessons.
+- **Setup:** `pip install fastapi httpx pytest`; checked with FastAPI 0.161, Starlette 1.9, httpx 0.28
+  and Python 3.12. `httpx.MockTransport` stands in for the provider, and `TrackedStream` counts
+  `aclose()` calls, which is the moment a real pooled connection is released.
+- **Save** the starter as `lab.py` and the tests as `test_lab.py`, then run `pytest -q`.
+
+### Starter code
+```python
+"""Lab: one shared httpx.AsyncClient per worker for an agent's model upstream.
+Needs fastapi and httpx. httpx.MockTransport stands in for the provider, so no network is used."""
+from contextlib import asynccontextmanager
+import httpx
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+
+CREATED: list[httpx.AsyncClient] = []          # every client ever built, so tests can count them
+
+def make_client(transport: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
+    c = httpx.AsyncClient(base_url="http://llm.test", transport=transport,
+                          limits=httpx.Limits(max_connections=16),
+                          timeout=httpx.Timeout(connect=3.0, read=60.0, write=10.0, pool=2.0))
+    CREATED.append(c)
+    return c
+
+def build_app(transport: httpx.AsyncBaseTransport) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # LAB 1: build ONE client with make_client(transport), store it on app.state.http,
+        # and close it with aclose() after the yield.
+        yield
+
+    app = FastAPI(lifespan=lifespan)
+
+    def get_http(request: Request) -> httpx.AsyncClient:
+        # LAB 1 (cont.): return the lifespan client.
+        raise NotImplementedError("lab step 1: get_http")
+
+    @app.post("/complete")
+    async def complete(body: dict):
+        # BUG to fix in LAB 2: a fresh client (and pool) per request. Use Depends(get_http),
+        # and map httpx.PoolTimeout to 503 with a Retry-After: 2 header.
+        async with make_client(transport) as http:
+            r = await http.post("/v1/complete", json=body)
+            r.raise_for_status()
+            return r.json()
+
+    @app.post("/stream")
+    async def stream(body: dict, http: httpx.AsyncClient = Depends(get_http)):
+        # LAB 3: send POST /v1/stream with stream=True. If status >= 400, aclose() the response
+        # and raise HTTPException(502). Otherwise relay r.aiter_raw() in a generator that
+        # aclose()s the upstream response in a finally block.
+        raise NotImplementedError("lab step 3: stream relay")
+
+    return app
+
+class TrackedStream(httpx.AsyncByteStream):
+    """Upstream body that counts how often it was closed (a connection returned to the pool)."""
+    closed = 0
+    def __init__(self, chunks: list[bytes]): self.chunks = chunks
+    async def __aiter__(self):
+        for c in self.chunks:
+            if c == b"DROP":
+                raise httpx.ReadError("upstream dropped mid-stream")
+            yield c
+    async def aclose(self):
+        TrackedStream.closed += 1
+
+def fake_provider(request: httpx.Request) -> httpx.Response:
+    body = request.read()
+    if b"busy" in body:
+        raise httpx.PoolTimeout("no free connection", request=request)
+    if request.url.path == "/v1/stream":
+        chunks = [b"data: Hel", b"DROP"] if b"drop" in body else [b"data: Hel", b"lo\n\n"]
+        status = 500 if b"fail" in body else 200
+        return httpx.Response(status, stream=TrackedStream(chunks))
+    return httpx.Response(200, json={"text": "ok"})
+
+if __name__ == "__main__":
+    from fastapi.testclient import TestClient
+    app = build_app(httpx.MockTransport(fake_provider))
+    try:
+        with TestClient(app) as client:
+            for _ in range(3):
+                client.post("/complete", json={"q": "hi"})
+            print(f"clients built for 3 calls: {len(CREATED)}")
+            r = client.post("/complete", json={"q": "busy"})
+            print(f"pool exhausted: {r.status_code} Retry-After={r.headers.get('retry-after')}")
+            r = client.post("/stream", json={"q": "hi"})
+            print(f"stream: {r.text!r}, upstream closes={TrackedStream.closed}")
+            r = client.post("/stream", json={"q": "fail"})
+            print(f"upstream 500: {r.status_code}, upstream closes={TrackedStream.closed}")
+        print(f"closed on shutdown: {CREATED[0].is_closed}")
+    except (NotImplementedError, httpx.HTTPError) as e:
+        print(f"not done yet: {type(e).__name__}: {e}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints (stdout; a Starlette deprecation warning about the test
+client may also appear on stderr, depending on versions):
+
+```
+clients built for 3 calls: 1
+pool exhausted: 503 Retry-After=2
+stream: 'data: Hello\n\n', upstream closes=1
+upstream 500: 502, upstream closes=2
+closed on shutdown: True
+```
+
+### Tests
+```python
+import httpx, pytest
+from fastapi.testclient import TestClient
+import lab
+
+@pytest.fixture
+def app():
+    lab.CREATED.clear()
+    lab.TrackedStream.closed = 0
+    return lab.build_app(httpx.MockTransport(lab.fake_provider))
+
+def test_one_client_per_worker_reused_and_closed(app):
+    with TestClient(app) as client:
+        for _ in range(5):
+            assert client.post("/complete", json={"q": "hi"}).json() == {"text": "ok"}
+        assert len(lab.CREATED) == 1 and app.state.http is lab.CREATED[0]
+        assert not lab.CREATED[0].is_closed
+    assert lab.CREATED[0].is_closed                      # aclose() ran after yield
+
+def test_pool_timeout_becomes_fast_503(app):
+    with TestClient(app) as client:
+        r = client.post("/complete", json={"q": "busy"})
+    assert r.status_code == 503 and r.headers["retry-after"] == "2"
+
+def test_stream_relays_and_releases_connection(app):
+    with TestClient(app) as client:
+        r = client.post("/stream", json={"q": "hi"})
+    assert r.status_code == 200 and r.text == "data: Hello\n\n"
+    assert lab.TrackedStream.closed == 1
+
+def test_mid_stream_failure_still_releases_connection(app):
+    with TestClient(app, raise_server_exceptions=False) as client:
+        try:
+            client.post("/stream", json={"q": "drop"})
+        except httpx.HTTPError:
+            pass                                         # the client sees a broken stream
+    assert lab.TrackedStream.closed == 1                 # only the relay's finally closes it
+
+def test_upstream_error_releases_connection_before_502(app):
+    with TestClient(app) as client:
+        r = client.post("/stream", json={"q": "fail"})
+    assert r.status_code == 502
+    assert lab.TrackedStream.closed == 1
+```
+
+On the starter all five fail: five clients built instead of one, a raw `PoolTimeout`, and
+`NotImplementedError` from the relay. A correct solution passes all five.
+
+### Failure scenarios
+- **Delete the relay's `finally`.** Only `test_mid_stream_failure_still_releases_connection` fails
+  (0 closes). On success httpx closes the response itself once `aiter_raw()` is exhausted, so happy-path
+  tests hide the leak; in production it shows as `PoolTimeout` after a burst of dropped streams. Debug by
+  counting closes per path.
+- **Skip `aclose()` before raising the 502.** The error-path test fails with 0 closes. In a real service
+  every upstream 5xx pins a connection until restart; watch connections checked out against
+  `max_connections`.
+- **Use `TestClient(app)` without `with`.** `get_http` fails with `AttributeError` on `app.state.http`,
+  because lifespan never ran. Debug by asserting `app.state.http` exists at the top of the test.
+- **Keep the per-request client.** `len(CREATED)` grows by one per call; in a trace each agent step shows
+  a fresh connect and TLS span instead of only during warm-up.
+
+### Submission
+- `lab.py` with the three lab steps done; `make_client`, `TrackedStream` and `fake_provider` unchanged.
+- A `pytest -q` run showing 5 passed and the `python lab.py` output matching the expected block.
+- A one-paragraph note naming every upstream your own agent calls and the `Limits` and `Timeout` you
+  would give each, with the fleet total `workers × max_connections`.
+- Evaluation: one client per app, closed on shutdown, no path through `/stream` that leaves a response
+  open, and `PoolTimeout` never surfaces as a 500.
 
 ## Why it exists
 - **Connection setup is a tax on every cold call.** A request to a hosted LLM over HTTPS starts with a DNS

@@ -5,7 +5,8 @@ name: Context window
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - model-internals/kv-cache
@@ -139,6 +140,22 @@ flowchart TD
     H --> J["Send full prompt, model re-reads all"]
     I --> J
 ```
+
+## Misconceptions
+- **"The model remembers the earlier steps of my agent run."** It is stateless between calls; the client
+  re-sends the whole transcript every step and the model re-reads it. Memory is what your application puts
+  back into the prompt, paid in tokens each time.
+- **"If it fits in 128k, the model will use all of it."** The effective window is task-dependent and
+  usually shorter: accuracy is highest at the start and end and drops in the middle. A step-1 instruction
+  can be present at step 30 and still be ignored.
+- **"Only the input has to fit."** The rule is `input_tokens + max_output_tokens ≤ window`, and reasoning
+  models spend hidden thinking tokens from the output side. A huge `max_tokens` also shrinks input room and
+  can cut concurrency.
+- **"Prompt caching gives me a bigger window."** It reuses the KV cache of a byte-identical prefix to cut
+  cost and time to first token. The prefix still occupies the window on every step.
+- **"Doubling the prompt doubles the cost."** Roughly true for short prompts, but attention overtakes the
+  rest near 25k tokens at d = 4,096, and KV memory on Llama-3-8B reaches about 16 GiB at 128k, as much as
+  the weights.
 
 ## Examples
 ### Token budgeter for a support assistant

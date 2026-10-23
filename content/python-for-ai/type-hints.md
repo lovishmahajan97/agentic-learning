@@ -5,7 +5,8 @@ name: Type hints
 kind: concept
 difficulty: intro
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/mypy
@@ -37,6 +38,148 @@ and the validator its arguments must pass.
   choose `X | None` honestly where the API can omit a field, and run a checker in CI.
 - **What you can skip.** Variance theory and the full PEP history. Know `Any` versus `object`,
   narrowing, `Annotated` and when annotations are evaluated; that covers agent code.
+
+## Lab
+### Task
+Build the piece of a tool decorator that turns a handler's hints into the JSON Schema the model sees
+and a checker for the arguments it sends back. This is what LangChain's `@tool` or a function-tool
+decorator does for you.
+
+Writing it once shows why resolved hints, `Literal` and `X | None` matter. Time box: 60-90 minutes.
+Do "How it works" in this lesson first.
+- **Build** `json_type`, `tool_schema` and `validate_args` in `lab.py` (the starter below).
+- **Constraint:** the module uses `from __future__ import annotations`, so annotations are strings
+  until you resolve them.
+- **Run** with Python 3.10+ (checked on 3.12.14 with pytest 9.1.1), standard library only.
+
+### Starter code
+Save as `lab.py`. It runs as given and reports which parts are not implemented yet.
+
+```python
+"""lab.py: build a tool's JSON Schema and argument checker from its type hints."""
+from __future__ import annotations      # every annotation below is stored as a STRING
+
+import inspect
+import json
+from collections.abc import Callable
+from typing import Annotated, Any, Literal, get_args, get_origin, get_type_hints
+
+def search(query: Annotated[str, "What to search for"], limit: int = 5,
+           source: Literal["docs", "tickets"] = "docs") -> list[str]:
+    """Search internal docs or tickets."""
+    return [f"{source}:{query}:{i}" for i in range(limit)]
+
+def convert(amount: float, unit: Literal["c", "f"], note: str | None = None) -> str:
+    """Convert a temperature."""
+    return f"{amount}{unit}"
+
+PRIMITIVES: dict[type, str] = {str: "string", int: "integer", float: "number", bool: "boolean"}
+
+def json_type(tp: Any) -> dict[str, Any]:
+    """One resolved annotation -> a JSON Schema fragment.
+    str/int/float/bool -> {"type": ...}; Literal[...] -> {"enum": [...]};
+    X | None -> the fragment for X (optionality is expressed by `required`);
+    Annotated[T, "text"] -> the fragment for T plus {"description": "text"}."""
+    raise NotImplementedError("LAB: json_type")        # LAB: use get_origin / get_args
+
+def tool_schema(fn: Callable[..., Any]) -> dict[str, Any]:
+    """{"name", "description" (first docstring line), "input_schema": {"type": "object",
+    "properties", "required" (params without a default, in order), "additionalProperties": False}}."""
+    raise NotImplementedError("LAB: tool_schema")      # LAB: resolve hints, do not read raw strings
+
+def validate_args(fn: Callable[..., Any], raw: dict[str, object]) -> dict[str, object] | str:
+    """Checked kwargs with defaults filled in, or ONE error string for the model, checked in this order:
+    'unknown argument: <k>', 'missing argument: <k>', then per parameter in signature order
+    '<k>: expected <json type>, got <python type name>' or '<k>: expected one of [...], got <repr>'.
+    No coercion: "3" is not an integer, True is not an integer, 3 is a valid number, None only if X | None."""
+    raise NotImplementedError("LAB: validate_args")
+
+if __name__ == "__main__":
+    steps: list[Callable[[], object]] = [
+        lambda: json.dumps(tool_schema(search)),
+        lambda: validate_args(search, {"query": "kv cache", "limit": 3}),
+        lambda: validate_args(search, {"query": "kv cache", "limit": "3"}),
+        lambda: validate_args(convert, {"amount": 21, "unit": "k"}),
+        lambda: validate_args(convert, {"amount": 21.5, "unit": "c", "notes": "x"}),
+    ]
+    for step in steps:
+        try:
+            print(step())
+        except NotImplementedError as e:
+            print("not implemented:", e)
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+{"name": "search", "description": "Search internal docs or tickets.", "input_schema": {"type": "object", "properties": {"query": {"type": "string", "description": "What to search for"}, "limit": {"type": "integer"}, "source": {"enum": ["docs", "tickets"]}}, "required": ["query"], "additionalProperties": false}}
+{'query': 'kv cache', 'limit': 3, 'source': 'docs'}
+limit: expected integer, got str
+unit: expected one of ['c', 'f'], got 'k'
+unknown argument: notes
+```
+
+### Tests
+Save as `test_lab.py` next to `lab.py` and run `python -m pytest -q`. On the starter all six fail
+with `NotImplementedError`.
+
+```python
+from lab import convert, search, tool_schema, validate_args
+
+def test_search_schema():
+    assert tool_schema(search) == {
+        "name": "search", "description": "Search internal docs or tickets.",
+        "input_schema": {"type": "object",
+                         "properties": {"query": {"type": "string", "description": "What to search for"},
+                                        "limit": {"type": "integer"},
+                                        "source": {"enum": ["docs", "tickets"]}},
+                         "required": ["query"], "additionalProperties": False}}
+
+def test_optional_is_not_required_and_unwrapped():
+    s = tool_schema(convert)["input_schema"]
+    assert s["required"] == ["amount", "unit"]
+    assert s["properties"]["note"] == {"type": "string"}
+    assert s["properties"]["amount"] == {"type": "number"}
+
+def test_valid_call_fills_defaults():
+    assert validate_args(search, {"query": "kv"}) == {"query": "kv", "limit": 5, "source": "docs"}
+
+def test_no_coercion_and_bool_is_not_int():
+    assert validate_args(search, {"query": "kv", "limit": "3"}) == "limit: expected integer, got str"
+    assert validate_args(search, {"query": "kv", "limit": True}) == "limit: expected integer, got bool"
+
+def test_int_is_a_valid_number_and_none_allowed_for_optional():
+    assert validate_args(convert, {"amount": 21, "unit": "c", "note": None}) == \
+        {"amount": 21, "unit": "c", "note": None}
+
+def test_literal_unknown_and_missing():
+    assert validate_args(convert, {"amount": 1.0, "unit": "k"}) == "unit: expected one of ['c', 'f'], got 'k'"
+    assert validate_args(convert, {"amount": 1.0, "unit": "c", "notes": "x"}) == "unknown argument: notes"
+    assert validate_args(convert, {"amount": 1.0}) == "missing argument: unit"
+```
+
+### Failure scenarios
+- **Read `fn.__annotations__` instead of `get_type_hints(fn, include_extras=True)`.** You see
+  `KeyError: 'int'` from `PRIMITIVES`, because the future import stored `"int"` as a string. Debug by
+  printing `fn.__annotations__` and noting every value is a `str`.
+- **Drop `include_extras=True`.** The `query` description disappears from the schema, because
+  `get_type_hints` strips `Annotated` by default. `test_search_schema` shows the missing key; print the
+  resolved hint to confirm it is plain `str`.
+- **Check `isinstance(v, int)` for integers.** `{"limit": True}` passes, because `bool` subclasses `int`.
+  The bool assertion fails; the fix is an explicit `bool` exclusion.
+- **Compare `get_origin(tp) is Union` only.** `str | None` is not unwrapped and `PRIMITIVES` raises
+  `KeyError`, because `X | None` has origin `types.UnionType`, not `typing.Union`, on 3.10 to 3.13.
+
+### Submission
+- **`lab.py` and `test_lab.py`** in a repo or gist, with the output of `python -m pytest -q` showing
+  6 passed.
+- **The output of `python lab.py`,** matching the expected block line for line.
+- **A third tool of your own** (for example `get_order(order_id: str, include_items: bool = False)`)
+  with its printed schema, generated by your code, not written by hand.
+- **A note of 3-5 sentences:** which failure scenario you hit, and one thing a real validator such as
+  Pydantic does that yours does not (coercion, nested models, structured error lists).
+- **Evaluation:** tests pass unmodified, the schema output is exact, and the note names a concrete gap.
 
 ## Why it exists
 - **Python is dynamically typed.** A name can hold anything, and a function discovers what it got only

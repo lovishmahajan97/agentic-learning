@@ -5,7 +5,8 @@ name: Embedding dimension & normalization
 kind: concept
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -145,6 +146,23 @@ flowchart TD
     RS --> R["Final top-k to agent tool"]
     IP --> R
 ```
+
+## Misconceptions
+- **"Choosing cosine vs dot product vs Euclidean is a big modelling decision."** On unit vectors
+  `‖a−b‖² = 2 − 2a·b` and cosine equals the dot product, so all three rank identically. The choice only
+  matters for unnormalized vectors, where it is the model card's call.
+- **"More dimensions means proportionally better retrieval."** Returns diminish quickly while storage,
+  compare time and graph memory grow linearly with `d`. Measure recall@10 at smaller sizes before
+  paying for 3072.
+- **"You can truncate any embedding to its first k dimensions."** Only Matryoshka-trained models put the
+  important information first; truncating a standard model discards a random slice of meaning. Either
+  way, the prefix must be renormalized.
+- **"A similarity score of 0.8 means the same thing for every model."** Anisotropy puts unrelated texts
+  well above zero by a model-specific amount. Recalibrate your agent's "nothing relevant" cut-off on
+  labelled pairs whenever the model changes.
+- **"Binary quantization throws away too much to be usable."** On high-dimensional normalized vectors,
+  a 32× smaller sign-bit index that fetches 100 candidates and rescores them at full precision often keeps
+  most of the recall. Measure it against float32.
 
 ## Examples
 ### Norm bias, the metric identity and truncation in numpy

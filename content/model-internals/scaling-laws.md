@@ -5,7 +5,8 @@ name: Scaling laws
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 related:
   - model-internals/small-language-models
@@ -150,6 +151,23 @@ flowchart TD
     E -->|"loss gap matters"| CO
     E -->|"gap acceptable"| D["Train and deploy"]
 ```
+
+## Misconceptions
+- **"Scaling laws say bigger is always better."** At a fixed budget they say the opposite: Gopher (280B
+  on about 300B tokens) lost to Chinchilla (70B on 1.4T) at similar compute, because parameters that
+  never see enough data are wasted.
+- **"Compute-optimal is the size you should deploy."** Compute-optimal minimises training cost for a
+  loss and ignores serving. With lifetime compute of `6ND + 2NT`, a widely used model is cheaper overall
+  when smaller and over-trained, which is why Llama 3 8B saw close to 2,000 tokens per parameter.
+- **"A smooth loss curve means agent success will improve smoothly too."** The laws predict
+  pre-training loss. Task success is thresholded, so it can sit flat and then jump; only your own agent
+  eval says whether a larger model finishes more tasks.
+- **"The Chinchilla constants are a law of nature."** E, A, B, α and β are specific to that data and
+  tokenizer, and minimising the published fit gives about 96 tokens per parameter rather than 20. Trust
+  the shape, not the constants.
+- **"Model size is the main lever on agent cost."** At about 2N FLOPs per processed token it is one
+  lever; in the 12-step example, prefix caching cut tokens per task about 7×, roughly as much as moving
+  from 70B to 8B.
 
 ## Examples
 ### Agent scenario: 2N FLOPs per token, applied to a 12-step agent

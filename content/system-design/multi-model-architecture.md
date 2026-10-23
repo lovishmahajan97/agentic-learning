@@ -5,7 +5,8 @@ name: Multi-model architecture
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/model-portfolio
@@ -34,6 +35,66 @@ next, so version and evaluate them together.
   per-stage timeouts and degraded modes, and evaluating each stage plus end-to-end task success.
 - **What you can skip.** Ensembles and exotic compositions until a high-stakes decision justifies them.
   Planner plus executors, a retrieval stack and a sampled judge cover most agents.
+
+## Decision case
+### Scenario
+A retail bank is building a policy-and-procedures agent for 3,000 branch staff, about 20,000 tasks a
+day. A task has 1 plan, 4 tool steps (one retrieval over policy documents, three account or product
+lookups) and 1 final answer that must cite the policy it relies on.
+
+Units and latencies are illustrative and match the worked scenario below.
+- **Units:** frontier call 15, small call 1, guard on a tool result 0.2, cross-encoder rerank 0.5;
+  query embedding and vector search are negligible. Latency: frontier 3 s, small 0.8 s, guard 0.08 s,
+  rerank 0.15 s.
+- **Constraints:** at most 45 units per task; a serial-path latency budget of 12 s (stage latencies summed); every answer must cite a
+  policy passage that was actually retrieved; regulators audit wrong advice.
+- **Vendors and timeline:** each new model vendor needs a data-processing agreement and about 8 weeks of
+  security review. Already approved: one API vendor (frontier and small chat models, embeddings) and
+  self-hosted open models on internal GPUs. Launch is in 10 weeks with three engineers.
+
+### Options
+| Option | How it works | Units per task | Serial latency | Fit |
+|---|---|---|---|---|
+| A. One frontier model for everything | Plans, fills tool arguments, ranks passages by prompt, answers | 6 × 15 = 90 | 6 × 3 = 18 s | Fails budget and latency |
+| B. Planner plus executors with a retrieval stack | Frontier plan and answer; small executors; self-hosted guard on each tool result, embed and cross-encoder rerank; deterministic citation check; 5% sampled small judge | 30 + 4 + 0.8 + 0.5 + 0.05 ≈ 35.4 | 6 + 3.2 + 0.32 + 0.15 ≈ 9.7 s | Meets both, only approved vendors |
+| C. B plus an inline frontier verifier | A second frontier call checks grounding on every answer | ≈ 50.4 | ≈ 12.7 s | Fails budget and latency |
+| D. B with a best-of-breed hosted reranker | Same stages, reranker from a new vendor | About the same as B | About the same as B | Security review alone takes 8 of the 10 weeks |
+
+### Decision
+Choose **B**.
+- **Budget and latency:** it is the only option that meets both with margin, at 35.4 units and 9.7 s.
+- **Vendors:** it uses only approved suppliers.
+- **Audit requirement:** met by a deterministic check that every cited passage id is in the reranked
+  top 5. It runs inline at no model cost, while the sampled judge watches answer quality per model
+  version.
+- **Why not C:** an inline frontier verifier would buy little that the citation check does not, at 15
+  units and 3 s per task.
+- **Why not D:** the new reranker could be adopted later through the canary process once its review is
+  complete.
+
+**What would change it:** if the regulator asks for model verification of every answer, add a small
+inline verifier (1 unit, 0.8 s), giving about 36.4 units and 10.5 s, still inside both limits.
+
+If the end-to-end eval shows small executors filling arguments badly, move one executor class to the frontier
+model and re-cost; each executor step moved adds 14 units.
+
+### Trade-offs accepted
+- **More moving parts.** Five model classes (frontier, small, guard, embedder, reranker) need a
+  registry entry, an owner and a deprecation date each; fail CI on unregistered model ids.
+- **Hidden coupling.** Executors are tuned to the planner's plans, so any stage upgrade ships as a
+  canary watched on both its component metric and task success.
+- **Quality problems found after users see them.** The 5% judge is asynchronous; watch judge score per
+  stage version and the citation-check failure rate daily.
+- **Re-index on embedder change.** Accept a full re-embed behind an alias whenever the embedding model
+  changes.
+
+### Review rubric
+- Decomposes the agent by job (output type, volume, latency, sensitivity) before naming models.
+- Recomputes cost and serial latency per option and compares each against the stated limits.
+- Defines typed contracts between stages and records model id and version per step in the trace.
+- Places checks deliberately: deterministic inline, model-based sampled, with a reason for each.
+- Accounts for vendor approval and compliance time, not only technical fit.
+- Says how a regression would be localised to one stage after an upgrade.
 
 ## Why it exists
 - **Production requests pass through many jobs.** Safety classifier, PII redaction, query rewriting,

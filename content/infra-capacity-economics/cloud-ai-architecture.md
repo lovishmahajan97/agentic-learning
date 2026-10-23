@@ -5,7 +5,8 @@ name: Cloud AI architecture (AWS Bedrock, Azure OpenAI, Vertex AI)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/api-provider-quotas-and-regional-limits
@@ -39,6 +40,62 @@ compliance; you pay with model lag, per-region quotas and lock-in.
   adopt versus keep in your own code.
 - **What you can skip.** Console click-paths and the full product catalog. Know the seven layers, the
   deployment-name trap, version pinning and the reserved-versus-shared arithmetic.
+
+## Decision case
+### Scenario
+An insurer that runs on AWS is launching a claims agent that reads policy documents and claim photos
+through tools. All prices and volumes are illustrative, not list prices.
+- **Volume:** about 22,000 runs a month at ~55k tokens per run, so ~1.2B tokens a month, with
+  business-hour peaks about 3× the average.
+- **Capacity figures from a load test:** a reservation costs $30,000 a month and serves ~1.5B tokens a
+  month of this mix at full use; pay-as-you-go costs $40 per million tokens.
+- **Constraints:** claim data must be processed in one named EU region; model spend at most $40,000 a
+  month; launch in 8 weeks; a new vendor's security review takes longer than that; the same agent must
+  ship next year to a partner that runs on Azure; the agent needs tool use with a pinned model version.
+
+### Options
+| Option | How it works | Residency | Monthly model cost | Peak behaviour | Lock-in and deadline |
+|---|---|---|---|---|---|
+| A. Vendor's direct API | Agent calls the model vendor's public endpoint | Depends on the vendor contract under review | 1.2B × $40/M = $48,000 | Vendor's shared limits | Newest models, but the review misses the launch |
+| B. Bedrock pay-as-you-go, regional | Converse API through a VPC endpoint, cross-region profiles off | Met | $48,000 | Shared regional quota: 429s at peak | Low; meets the deadline if quota is requested now |
+| C. Bedrock reserved base, pay-as-you-go spill, own loop behind a gateway | Reservation carries ~1.05B (70% use), ~0.15B of peak spills to on-demand in the same region | Met | $30,000 + 0.15B × $40/M = $36,000 | Base guaranteed, burst on shared quota | Gateway keeps the Azure port a config change |
+| D. As C, but on the cloud's managed agent service | The platform runs the loop, memory and tool wiring | Met | As C plus the service's own charges | As C | Fastest first agent; loop does not move to Azure |
+
+### Decision
+Choose **C**, because:
+- **It is the only option under the $40,000 budget that also meets residency and the deadline.** A and B
+  both cost $48,000, and A's review outlasts the 8 weeks.
+- **The reservation clears break-even:** u\* = 30,000 ÷ 60,000 = 50%, and the base load fills about 70%.
+- **The spill keeps peaks served without leaving the region,** because the fallback is same-region
+  pay-as-you-go, never a cross-region profile.
+- **Owning the loop behind a gateway** is what makes next year's Azure deployment a mapping change; D
+  would bind the loop, memory and tool wiring to one cloud.
+
+**What would change it:**
+- **Volume falling** so the reservation's use drops below 50% (under ~0.75B tokens a month): move to B.
+- **The residency rule widening** to an EU geography: add a cross-region inference profile as fallback.
+- **The product needing a model only the vendor offers:** restart A's review now, since it is the long
+  pole.
+
+### Trade-offs accepted
+- **Model and feature lag** behind the vendor's API. Watch release notes for the pinned model and keep
+  the agent eval set ready to replay on a new version.
+- **A forecast error is paid for the commitment term.** Watch reservation utilization against u\* every
+  week.
+- **Peak spill can still hit 429s** on the shared regional quota. Watch spill rate and 429s per agent,
+  and file quota increases weeks ahead.
+- **Running a gateway** is our code to operate. Watch that every gateway request has a matching
+  invocation-log entry.
+
+### Review rubric
+- **Residency is checked per layer:** region, deployment type, cross-region options and the fallback
+  path.
+- **Capacity mode is chosen with break-even arithmetic** that recomputes from the stated prices and
+  load-tested capacity.
+- **Volume is sized from agent steps** (tokens per run × runs), not from users.
+- **Version pinning and an eval gate** are part of the design, with the retirement date tracked.
+- **Lock-in is addressed explicitly,** naming which pieces (loop, memory, tools) stay portable.
+- **Reversal triggers are measurable,** such as utilization below u\* or a changed residency rule.
 
 ## Why it exists
 - **A vendor's public API triggers reviews unrelated to the model.** Who approved this vendor, where does

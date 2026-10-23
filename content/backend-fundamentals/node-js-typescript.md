@@ -5,7 +5,8 @@ name: Node.js / TypeScript
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
@@ -39,6 +40,224 @@ so Python owns the core. (Deep dive: `node-ts-for-ai`.)
   TypeScript edge in sync with a Python agent core.
 - **What you can skip.** libuv internals and V8 tuning. Know what blocks the loop, how `drain` works and
   why types vanish at runtime; that covers most agent-edge bugs.
+
+## Lab
+### Task
+Fix the three jobs a TypeScript agent edge must do: validate every model tool call, stop the run when
+the user leaves, and stop buffering when the client reads slowly. The starter casts model JSON, keeps
+calling the model and tools after an abort, and writes every chunk without waiting for `drain`.
+Time box: 60-90 minutes.
+- **Prerequisites:** this lesson's How it works (event loop, streams and backpressure, cancellation,
+  TypeScript at runtime); runtime-schema-validation and streams-and-backpressure in `node-ts-for-ai`
+  go deeper.
+- **Setup:** Node 24 in a fresh folder: `npm init -y`, `npm pkg set type=module`,
+  `npm i -D zod vitest tsx typescript @types/node` (checked on Node 24.21, Zod 4.6, vitest 5.0,
+  tsx 4.23, TypeScript 7.0). Save the starter as `lab.ts` and the tests as `lab.test.ts`.
+- **Done:** `npx tsx lab.ts` prints the expected output and `npx vitest run` passes.
+
+### Starter code
+```ts
+// Lab: validate, cancel and backpressure an agent's tool loop
+// (checked on Node 24, Zod 4.6, vitest 5.0, tsx 4.23)
+import { z } from "zod";
+import { Writable } from "node:stream";
+import { pathToFileURL } from "node:url";
+
+export const tools = {
+  lookup_order: {
+    args: z.object({ orderId: z.string().regex(/^ord_[a-z0-9]+$/) }),
+    run: async (a: { orderId: string }) => `order ${a.orderId}: shipped`,
+  },
+  refund: {
+    args: z.object({ orderId: z.string(), amountCents: z.number().int().positive().max(50_000) }),
+    run: async (a: { orderId: string; amountCents: number }) => `refund queued: ${a.amountCents} cents`,
+  },
+} as const;
+
+export const sideEffects: string[] = [];          // every tool that actually ran
+export type Result = { content: string } | { error: string };
+
+// LAB 1: never trust model output. Return { error } (never throw) for an unknown tool
+// ("unknown tool <name>", including inherited names like "toString"), arguments that are not JSON
+// ("arguments were not valid JSON"), and schema failures
+// ("invalid arguments: <path of first issue>: <its message>").
+// LAB 2a: if `signal` is already aborted, return { error: "run cancelled" } before any tool runs.
+export async function dispatch(name: string, rawArgs: string, signal: AbortSignal): Promise<Result> {
+  const tool = (tools as any)[name];              // BUG: inherited keys such as "toString" pass
+  const args = JSON.parse(rawArgs) as never;      // BUG: a cast is not validation
+  sideEffects.push(name);
+  return { content: await tool.run(args) };
+}
+
+export type Step = { tool: string; args: string } | { final: string };
+export type Model = (step: number, signal: AbortSignal) => Promise<Step>;
+export type RunResult = { reason: "final" | "budget_exhausted" | "cancelled"; modelCalls: number; text?: string };
+
+// LAB 2b: once `signal` is aborted, make no further model or tool calls and
+// return { reason: "cancelled", modelCalls }.
+export async function runAgent(model: Model, signal: AbortSignal, maxSteps = 5): Promise<RunResult> {
+  let modelCalls = 0;
+  for (let i = 0; i < maxSteps; i++) {
+    const s = await model(i, signal);
+    modelCalls++;
+    if ("final" in s) return { reason: "final", modelCalls, text: s.final };
+    await dispatch(s.tool, s.args, signal);
+  }
+  return { reason: "budget_exhausted", modelCalls };
+}
+
+// LAB 3: when sink.write() returns false, wait for "drain" (or "close") before the next chunk,
+// so a slow client cannot make the gateway buffer the whole stream.
+export async function relay(chunks: AsyncIterable<string>, sink: Writable): Promise<void> {
+  for await (const c of chunks) sink.write(c);    // BUG: ignores backpressure
+  await new Promise<void>((resolve) => sink.end(resolve));
+}
+
+// ---- demo ---------------------------------------------------------------------------------
+export function slowSink(highWaterMark: number, stats: { maxBuffered: number }): Writable {
+  const sink = new Writable({
+    highWaterMark,
+    write(_chunk, _enc, done) { setTimeout(done, 1); },   // a slow mobile client
+  });
+  const write = sink.write.bind(sink);
+  sink.write = ((c: any, ...rest: any[]) => {
+    const ok = write(c, ...rest);
+    stats.maxBuffered = Math.max(stats.maxBuffered, sink.writableLength);
+    return ok;
+  }) as typeof sink.write;
+  return sink;
+}
+
+export async function* tokens(n: number): AsyncGenerator<string> {
+  for (let i = 0; i < n; i++) yield "data: {\"token\":\"abcdefg\"}\n\n";  // 32 bytes per event
+}
+
+async function show(label: string, p: Promise<unknown>) {
+  try { console.log(label, "->", JSON.stringify(await p)); }
+  catch (e) { console.log(label, "-> threw", (e as Error).name); }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const live = new AbortController().signal;
+  await show("lookup_order", dispatch("lookup_order", '{"orderId":"ord_42x"}', live));
+  await show("toString", dispatch("toString", "{}", live));
+  await show("refund bad JSON", dispatch("refund", "{orderId: ord_1}", live));
+  await show("refund too big", dispatch("refund", '{"orderId":"ord_1","amountCents":90000}', live));
+
+  sideEffects.length = 0;
+  const ac = new AbortController();
+  const model: Model = async (step) => {
+    if (step === 1) ac.abort();                    // the user closes the tab during step 1
+    return { tool: "lookup_order", args: '{"orderId":"ord_42x"}' };
+  };
+  const run = await runAgent(model, ac.signal);
+  console.log(`cancelled run: reason=${run.reason}, model calls=${run.modelCalls}, tools run=${sideEffects.length}`);
+
+  const stats = { maxBuffered: 0 };
+  await relay(tokens(200), slowSink(64, stats));
+  console.log(`relay: 200 events, max buffered ${stats.maxBuffered} bytes`);
+}
+```
+
+As given, it prints `toString -> threw TypeError`, `refund too big -> {"content":"refund queued: 90000 cents"}`,
+`reason=budget_exhausted, model calls=5, tools run=5` and `max buffered 5400 bytes`.
+
+### Expected output
+```
+lookup_order -> {"content":"order ord_42x: shipped"}
+toString -> {"error":"unknown tool toString"}
+refund bad JSON -> {"error":"arguments were not valid JSON"}
+refund too big -> {"error":"invalid arguments: amountCents: Too big: expected number to be <=50000"}
+cancelled run: reason=cancelled, model calls=2, tools run=1
+relay: 200 events, max buffered 81 bytes
+```
+
+The Zod message text is from Zod 4.6; the exact buffered figure can differ slightly by Node version,
+but it must stay near the 64-byte high-water mark, not in the thousands.
+
+### Tests
+```ts
+import { beforeEach, describe, expect, it } from "vitest";
+import { dispatch, relay, runAgent, sideEffects, slowSink, tokens, type Model } from "./lab";
+
+const live = () => new AbortController().signal;
+beforeEach(() => { sideEffects.length = 0; });
+
+describe("dispatch", () => {
+  it("runs a valid call", async () => {
+    expect(await dispatch("lookup_order", '{"orderId":"ord_42x"}', live()))
+      .toEqual({ content: "order ord_42x: shipped" });
+  });
+  it("rejects unknown and inherited tool names without throwing", async () => {
+    expect(await dispatch("delete_user", "{}", live())).toEqual({ error: "unknown tool delete_user" });
+    expect(await dispatch("toString", "{}", live())).toEqual({ error: "unknown tool toString" });
+  });
+  it("returns JSON and schema errors to the model, and runs nothing", async () => {
+    expect(await dispatch("refund", "{orderId: ord_1}", live())).toEqual({ error: "arguments were not valid JSON" });
+    const r = await dispatch("refund", '{"orderId":"ord_1","amountCents":90000}', live());
+    expect("error" in r && r.error.startsWith("invalid arguments: amountCents: ")).toBe(true);
+    expect(sideEffects).toEqual([]);
+  });
+  it("does not run a tool once the run is cancelled", async () => {
+    const ac = new AbortController(); ac.abort();
+    expect(await dispatch("refund", '{"orderId":"ord_1","amountCents":500}', ac.signal))
+      .toEqual({ error: "run cancelled" });
+    expect(sideEffects).toEqual([]);
+  });
+});
+
+describe("runAgent", () => {
+  it("stops calling the model and tools after abort", async () => {
+    const ac = new AbortController();
+    const model: Model = async (step) => {
+      if (step === 1) ac.abort();
+      return { tool: "lookup_order", args: '{"orderId":"ord_42x"}' };
+    };
+    const run = await runAgent(model, ac.signal);
+    expect(run).toEqual({ reason: "cancelled", modelCalls: 2 });
+    expect(sideEffects).toEqual(["lookup_order"]);
+  });
+  it("still ends on a final answer or the budget", async () => {
+    expect((await runAgent(async () => ({ final: "done" }), live())).reason).toBe("final");
+    const loop: Model = async () => ({ tool: "lookup_order", args: '{"orderId":"ord_1"}' });
+    expect(await runAgent(loop, live(), 3)).toEqual({ reason: "budget_exhausted", modelCalls: 3 });
+  });
+});
+
+describe("relay", () => {
+  it("honours backpressure from a slow client", async () => {
+    const stats = { maxBuffered: 0 };
+    await relay(tokens(200), slowSink(64, stats));
+    expect(stats.maxBuffered).toBeLessThanOrEqual(96);   // high-water mark plus one 32-byte event
+  });
+});
+```
+
+On the starter, 5 of 7 fail for the intended reasons: a `TypeError` on `toString`, a `SyntaxError` on
+bad JSON, a refund that runs after abort, a run that reports `budget_exhausted` with 5 model calls, and
+5400 bytes buffered. The valid-call and final-or-budget tests pass and guard the happy path.
+
+### Failure scenarios
+- **Inject: check the tool name with `name in tools`.** Observe: `toString` passes the check and
+  crashes on `.run`. Debug: `in` walks the prototype chain; use `Object.hasOwn`.
+- **Inject: abort only inside `dispatch`, not in `runAgent`.** Observe: no tool runs after the abort
+  but the model is still called 5 times, which is the token bill. Debug: count model calls per run in
+  your trace and compare them with the moment the client's `close` event fired.
+- **Inject: wait with `sink.once("drain", r); sink.once("close", r)`.** Observe: the buffer stays small,
+  but Node prints `MaxListenersExceededWarning: ... 11 close listeners added`. Debug: the listener that
+  did not fire is never removed; remove both in one `done` callback (the gateway example in Examples
+  has the same shape on a per-request response).
+- **Inject: cast with `as ToolCall` instead of `safeParse`.** Observe: `refund queued: 90000 cents`, a
+  refund over the limit. Debug: log validation results per tool; a zero failure rate is suspicious.
+
+### Submission
+- **Code:** your `lab.ts` with LAB 1-3 done, no `as any` left in `dispatch`, and strict type-checking
+  clean (`npx tsc --noEmit --strict --module esnext --moduleResolution bundler --types node lab.ts`).
+- **Test run:** `npx vitest run` showing 7 passed, plus the script output matching Expected output.
+- **Evidence of cancellation:** a log of the aborted run showing 2 model calls and 1 tool run.
+- **A short note (3-5 sentences):** what the gateway must also do so the Python core stops generating,
+  and why validation errors go back to the model rather than being thrown.
+- **Evaluation:** tests pass, no listener warnings, and buffered bytes stay near the high-water mark.
 
 ## Why it exists
 - **The web is built in TypeScript.** React, Next.js and the SSR frameworks that render them, the

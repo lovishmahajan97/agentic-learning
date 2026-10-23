@@ -5,7 +5,8 @@ name: Hybrid search (BM25 + dense)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -170,7 +171,50 @@ sequenceDiagram
     R-->>A: final top k for the agent context
 ```
 
+## Misconceptions
+- **"Merge the two lists and sort by score."** BM25 is an unbounded sum, often single or double digits,
+  while cosine sits in a narrow model-specific band. Sorting the union just returns the BM25 list
+  followed by the dense list.
+- **"Min–max normalizing each arm makes the scores comparable."** It stretches whatever spread the arm
+  had to [0, 1]. A weak BM25 near-tie of 2.1, 2.0 and 1.9 becomes 1.0, 0.5 and 0.0, as decisive as a
+  clear dense winner.
+- **"RRF rewards each arm's best hit."** It rewards agreement: with k = 60, rank 10 in both arms scores
+  about 0.0286 and beats rank 1 in a single arm at about 0.0164.
+- **"Hybrid always beats the best single arm."** It is a hypothesis. Adding BM25 noise to a strong dense
+  arm can lower precision at small k, so measure recall@k per arm, fused and per query slice, then check
+  agent task success.
+- **"The tenant filter is a relevance setting."** If only one arm applies it, the other returns foreign
+  documents into the fused list, and the agent may quote them. In a multi-tenant agent that is a data
+  leak; build one filter object and pass it to both arms.
+
 ## Examples
+### Reciprocal rank fusion in a dozen lines
+Document 3 is the BM25 arm's top hit but absent from the dense top 10; it falls to fifth behind four
+documents both arms agreed on, including document 8, which was only rank 4 and rank 6.
+
+```python
+from collections import defaultdict
+
+def rrf(ranked_lists, k=60):
+    """ranked_lists: iterable of lists of doc ids, best first. Returns [(doc_id, score)]."""
+    scores = defaultdict(float)
+    for ranking in ranked_lists:
+        for rank, doc_id in enumerate(ranking, start=1):
+            scores[doc_id] += 1.0 / (k + rank)
+    return sorted(scores.items(), key=lambda kv: -kv[1])
+
+bm25_top  = [3, 17, 42, 8, 21, 5, 11, 9, 30, 2]      # best first, from the inverted index
+dense_top = [42, 17, 7, 21, 13, 8, 19, 25, 6, 1]     # best first, from the ANN index
+
+for doc_id, score in rrf([bm25_top, dense_top])[:5]:
+    print(doc_id, f"{score:.5f}")
+# 42 0.03227   rank 3 + rank 1
+# 17 0.03226   rank 2 + rank 2
+# 21 0.03101   rank 5 + rank 4
+# 8  0.03078   rank 4 + rank 6
+# 3  0.01639   rank 1, BM25 only
+```
+
 ### Hybrid search tool for an agent: parallel arms, one filter, provenance
 The tool builds the filter once, runs both arms concurrently, fuses with RRF and records which arm found
 each chunk, so traces explain every result. `bm25_arm` and `dense_arm` are your async search functions.
@@ -209,33 +253,6 @@ A research agent searches 4 times per task. Per-search timings are illustrative 
 
 - **The reranker, not the second arm, dominates.** Parallel arms make BM25 nearly free; depth of the
   reranked pool is the lever that moves agent latency.
-
-### Reciprocal rank fusion in a dozen lines
-Document 3 is the BM25 arm's top hit but absent from the dense top 10; it falls to fifth behind four
-documents both arms agreed on, including document 8, which was only rank 4 and rank 6.
-
-```python
-from collections import defaultdict
-
-def rrf(ranked_lists, k=60):
-    """ranked_lists: iterable of lists of doc ids, best first. Returns [(doc_id, score)]."""
-    scores = defaultdict(float)
-    for ranking in ranked_lists:
-        for rank, doc_id in enumerate(ranking, start=1):
-            scores[doc_id] += 1.0 / (k + rank)
-    return sorted(scores.items(), key=lambda kv: -kv[1])
-
-bm25_top  = [3, 17, 42, 8, 21, 5, 11, 9, 30, 2]      # best first, from the inverted index
-dense_top = [42, 17, 7, 21, 13, 8, 19, 25, 6, 1]     # best first, from the ANN index
-
-for doc_id, score in rrf([bm25_top, dense_top])[:5]:
-    print(doc_id, f"{score:.5f}")
-# 42 0.03227   rank 3 + rank 1
-# 17 0.03226   rank 2 + rank 2
-# 21 0.03101   rank 5 + rank 4
-# 8  0.03078   rank 4 + rank 6
-# 3  0.01639   rank 1, BM25 only
-```
 
 ### Production snippet: RRF in one Postgres query
 Two subqueries (one ordered by the `tsvector` rank, one by cosine distance), each with a `ROW_NUMBER()`

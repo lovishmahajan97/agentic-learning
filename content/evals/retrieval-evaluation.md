@@ -5,7 +5,8 @@ name: Retrieval evaluation (recall@k, MRR, NDCG)
 kind: metric
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -166,6 +167,21 @@ flowchart TD
     B -.->|"new system finds unjudged chunks"| P["Pool and re-judge"]
     P --> QR
 ```
+
+## Misconceptions
+- **"High similarity scores mean retrieval is working."** A similarity score is not a relevance
+  judgment and is not comparable across models or even across queries. Only qrels tell you whether the
+  evidence came back.
+- **"A good MRR means the agent gets all the evidence it needs."** MRR stops at the first hit. A
+  multi-hop question needing three passages can score 1.0 with two of them missing; use recall@k or NDCG.
+- **"A new retriever that scores lower is worse."** With incomplete qrels, valid passages nobody judged
+  count as irrelevant, so a system that finds different evidence is penalised. Pool its top results and
+  re-judge before concluding.
+- **"Scoring the retriever on user questions covers the agent."** The agent writes its own, shorter
+  queries and may search several times. Score its logged search-tool arguments, and run-level recall over
+  the union of all calls.
+- **"A 2.5-point gain in mean recall@5 is a win."** On 40 queries the paired-bootstrap interval runs from
+  −0.025 to 0.075 and includes zero. Report paired intervals and per-category results before switching.
 
 ## Examples
 ### All three metrics for one query, worked by hand

@@ -5,7 +5,8 @@ name: Recall vs precision trade-off
 kind: concept
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -150,6 +151,22 @@ flowchart TD
     T -->|"no chunk passes"| N["Tool result: no evidence"]
     P --> G["Agent reads tool result, next step"]
 ```
+
+## Misconceptions
+- **"Extra chunks are harmless; the model just ignores the irrelevant ones."** Noise costs tokens on every
+  later agent step, pushes the evidence mid-prompt, and is the most confusable material in the corpus
+  (stale versions, near-duplicates), so low precision changes answers, not just bills.
+- **"Hit rate@k is recall@k."** Hit rate asks whether any relevant chunk arrived; recall asks what share
+  arrived. For an all-of question (table plus exclusions) hit rate reads 1.0 while the clause that flips
+  the answer is missing.
+- **"A reranker fixes recall."** It only reorders stage 1's candidates. It can lift recall@5 toward
+  recall@50, never above it; if the evidence is not in the candidate list, fix chunking, hybrid search or
+  the embedder.
+- **"Precision@5 of 0.2 means the ranking is bad."** Precision@k is capped at |R| / k, so a question with
+  one relevant chunk scores at most 0.2 at k = 5 even when it ranks first. Judge ranking with nDCG or MRR.
+- **"One cosine cut-off can separate relevant from irrelevant."** Similarity scores are not calibrated
+  across queries, so a global threshold returns nothing for some queries. Tune the cut-off on reranker
+  scores against a golden set.
 
 ## Examples
 ### Golden-set evaluation of stage 1 vs stage 2

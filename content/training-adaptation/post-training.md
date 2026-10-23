@@ -5,7 +5,8 @@ name: Post-training
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/pre-training
@@ -159,6 +160,23 @@ flowchart TD
     G -->|"fail or next round"| N["Sample new model, rank again"]
     N -->|"on-policy pairs"| PO
 ```
+
+## Misconceptions
+- **"Post-training teaches the model new knowledge."** It mostly installs behaviour on top of what the
+  base already knows: format, persona, refusals, when to call a tool. A model that does not know this
+  week's prices needs retrieval or a tool, not another training round.
+- **"More SFT data fixes any agent failure."** Imitation raises the average; it cannot say one fluent
+  answer is worse than another, and rare failures stay drowned out. Schema validity stuck at 91% needed a
+  verifiable reward, not more traces.
+- **"Preference data can be collected once and reused."** Pairs describe the mistakes of the model that
+  produced them. After a round the policy has moved, so stale pairs lift training win rate while user
+  complaints stay flat; sample each round from the current checkpoint.
+- **"A stage that wins its own metric is a win."** Win rate can rise while reasoning, coding or benign
+  request handling falls (the alignment tax, over-refusal). Gate every round on a capability suite and
+  refusal rates on benign sets too.
+- **"GPU compute is the expensive part."** For an 8B agent the recipe is a few hundred GPU-hours; the
+  demonstrations, rankings and eval sets written or reviewed by people dominate the budget and the
+  schedule.
 
 ## Examples
 ### Worked scenario: post-training a support agent

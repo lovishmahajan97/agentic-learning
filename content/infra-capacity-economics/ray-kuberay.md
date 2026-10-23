@@ -5,7 +5,8 @@ name: Ray / KubeRay
 kind: tool
 difficulty: advanced
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/keda-autoscaling
@@ -38,6 +39,60 @@ out agent evals, and serve models and rerankers behind tools.
   long-lived (RayService).
 - **What you can skip.** RL libraries, GCS internals and lineage-reconstruction details. Know tasks versus
   actors, logical-resource scheduling and the failure table; that is enough to run agent workloads safely.
+
+## Decision case
+### Scenario
+A customer-support platform runs a RAG agent on Kubernetes and needs a home for three GPU jobs around it.
+Throughput figures are the illustrative ones from the examples.
+- **Nightly re-embed:** 10 million documents in a 02:00-03:00 window, at about 1,000 documents per second
+  per GPU actor, plus about 5 minutes of start-up.
+- **Agent eval suite:** 500 episodes of about 2 minutes, twice a day, with mocked write tools. The model
+  endpoint sustains 50 in-flight episodes.
+- **Online reranker:** called on every retrieval step, so it must never cold-start inside a user's run.
+- **Constraints:** GPU quota 8; the reranker keeps at least 1 GPU at night. Three Python ML engineers
+  plus one SRE who already runs KEDA. The cluster sits in a regulated VPC, so no external platform.
+
+### Options
+| Option | How it works | Nightly re-embed | Eval fan-out | Reranker | Operating cost |
+|---|---|---|---|---|---|
+| A. KubeRay | RayJob with Ray Data GPU actors; Ray tasks capped by `ray.wait`; RayService for the reranker | 4 actors ≈ 47 min with start-up, about 3.1 GPU-hours | 50 in flight ≈ 20 min | Serve autoscaling, `min_replicas: 1` | A second scheduler, version pinning, GCS fault tolerance with external Redis |
+| B. Kubernetes Jobs + KEDA | Indexed Job of 4 GPU pods on static shards; eval runner with a 50-thread pool; reranker Deployment on KEDA | ≈ 47 min only if shards are even; the slowest shard sets wall-clock | ≈ 20 min, but retries and result collection are hand-written | KEDA on in-flight requests, min 1 | Tools the SRE knows; the team writes sharding, back-pressure and retries |
+| C. Serverless GPU platform | Functions per job, per-second billing | Fast fan-out | Fast fan-out | Warm minimum needed | Ruled out: data may not leave the VPC |
+
+### Decision
+Choose **A**.
+- **Window:** 4 actors finish in about 47 minutes. Eight would take about 26, but 8 + 1 reranker GPU
+  exceeds the quota of 8, so 4 (or at most 7) actors is the plan.
+- **Streaming beats static shards:** Ray Data overlaps reads, filtering and GPU encoding with
+  back-pressure, so one slow shard does not set wall-clock as in B.
+- **One model for three shapes:** batch actors, retryable eval tasks and an online endpoint share one
+  Python codebase the ML engineers can own.
+- **Cost:** `shutdownAfterJobFinishes` and `minReplicas: 0` mean night jobs pay about 3 GPU-hours, not an
+  always-on pool.
+- **Why not C:** the residency constraint removes it before price is considered.
+
+**What would change it:**
+- **Only the reranker remains** (embedding moves to a vendor): a Deployment with KEDA is less to operate;
+  take B.
+- **Corpus triples to 30 million:** even 7 actors need about 76 minutes, past the window, so raise quota
+  or widen the window.
+- **No one can own the head node:** without GCS fault tolerance, keep the reranker on a plain Deployment
+  and use Ray only for RayJobs.
+
+### Trade-offs accepted
+- **A second scheduler inside Kubernetes.** Pin one Ray and Python version across images; alert on
+  job-submission failures after image changes.
+- **Head-node risk for the reranker.** Run GCS fault tolerance with external Redis; give the retrieval
+  tool a fallback to vector order.
+- **Retries replay episodes.** Keep write tools mocked in evals; alert on retry spikes per run.
+- **An exposed dashboard is remote code execution.** Keep the dashboard and job API cluster-internal.
+
+### Review rubric
+- Sizes actor count from measured per-actor throughput and the time window, and checks it against quota.
+- Caps eval concurrency by the model endpoint, not by cluster CPUs.
+- Compares the extra scheduler's operating cost with the code the team would write without it.
+- Addresses head-node fault tolerance before putting an online agent tool on Ray Serve.
+- Applies hard constraints (residency, quota) before cost, and names what would flip the choice.
 
 ## Why it exists
 - **AI workloads rarely fit one box or one shape.** Batch inference over ten million documents needs CPU

@@ -5,7 +5,8 @@ name: GraphRAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
 code_tested: partial
@@ -139,7 +140,56 @@ flowchart TD
     LS -.->|"reads"| G
 ```
 
+## Misconceptions
+- **"GraphRAG is a better retriever, so it improves every question."** It helps global and relational
+  questions. Lookups answerable from one chunk do no better than hybrid search with reranking, so the
+  indexing bill buys nothing there; route by question type.
+- **"The graph database and Leiden clustering are the expensive parts."** Both are cheap. The bill is LLM
+  extraction over every chunk plus element and community summaries, about 21 million LLM tokens for a
+  4-million-token corpus in the estimator below.
+- **"A global search is one cheap call."** It maps over every community report at the chosen level
+  whatever the question, about 41 LLM calls for 40 reports, so cap it per run and fix its level.
+- **"Community reports are evidence you can cite."** They are paraphrases the indexing model wrote, and
+  reviewers cannot find their sentences in any source. Keep source-chunk links and cite chunks.
+- **"Merging entities by name and type resolves them."** That is crude entity resolution: "IBM" and
+  "International Business Machines" stay separate nodes, which splits neighbourhoods and communities.
+  Add an alias-merging pass.
+- **"Once indexed, the graph stays true."** Reports are frozen interpretations of a snapshot. A changing
+  corpus needs a refresh cadence or a deferred-summarisation variant such as LazyGraphRAG.
+
 ## Examples
+### Worked cost walkthrough: 2,000 incident reports
+Illustrative orders of magnitude, not benchmarks, for a corpus of 2,000 internal incident reports
+totalling about 4 million tokens.
+
+| Stage | GraphRAG | Plain vector RAG |
+|---|---|---|
+| Chunks (1,200 tokens each) | roughly 3,300 | same |
+| Index calls | one extraction call per chunk plus one gleaning pass ≈ 6,600 calls, each reading a chunk plus a long extraction prompt and writing structured output | one embedding pass |
+| Tokens processed | on the order of 15 to 25 million, plus thousands more calls for entity merging and community summarisation | 4 million |
+| Model doing the work | a generative LLM, typically one to three orders of magnitude more expensive per token than an embedding model (output tokens more still) | embedding model |
+| Index bill | commonly two or more orders of magnitude larger in dollars, set by the extraction model you choose; parts rerun as documents change | baseline |
+
+**Global query:** "What are the most common root causes across all incidents?"
+- Vector RAG retrieves 10 chunks, about 0.3% of the corpus, and reports whatever those happen to say.
+- GraphRAG uses, say, the 40 level-1 community reports: 40 map calls produce scored partial answers
+  ("deployment config drift, seen in communities about service X and Y"), and one reduce call synthesises
+  the top-scoring ones. Fewer than 50 calls give an answer grounded in a summary of the whole corpus.
+- The index-free way to get the same coverage, map-reduce over every chunk at query time, is about 3,300
+  calls per question. Community reports are that reading done once and reused, which is the whole economic
+  argument.
+
+**Local query:** "Which teams were involved in incidents touching the payments database?" Local search
+matches the entity PAYMENTS-DB, follows its edges to incidents and from incidents to TEAM entities, and
+pulls the source chunks for those edges, joining facts that never co-occur in one chunk.
+
+**Agent run, same corpus (illustrative):** with only `search_docs`, an analyst agent issues many searches
+of 10 chunks each and still covers a few percent of the corpus. With `global_search` it makes one heavy
+call (about 41 LLM calls inside), then a few `search_docs` calls to quote source chunks.
+
+**Decision:** lookup-heavy traffic ("what is the on-call rotation for X?") buys little; daily thematic and
+relational questions repay the bill.
+
 ### Agent tools: three retrieval modes with routing in the descriptions
 The agent picks the tool; descriptions say what each is for and what it costs. The handlers call into
 whatever GraphRAG and search backends you run; their signatures here are placeholders.
@@ -172,38 +222,6 @@ def handle(tool, args, run_state, backends):
         res = backends.hybrid_search(args["query"], k=8)
     return {"answer_or_chunks": res.text, "source_chunk_ids": res.source_chunk_ids}   # cite chunks
 ```
-
-### Worked cost walkthrough: 2,000 incident reports
-Illustrative orders of magnitude, not benchmarks, for a corpus of 2,000 internal incident reports
-totalling about 4 million tokens.
-
-| Stage | GraphRAG | Plain vector RAG |
-|---|---|---|
-| Chunks (1,200 tokens each) | roughly 3,300 | same |
-| Index calls | one extraction call per chunk plus one gleaning pass ≈ 6,600 calls, each reading a chunk plus a long extraction prompt and writing structured output | one embedding pass |
-| Tokens processed | on the order of 15 to 25 million, plus thousands more calls for entity merging and community summarisation | 4 million |
-| Model doing the work | a generative LLM, typically one to three orders of magnitude more expensive per token than an embedding model (output tokens more still) | embedding model |
-| Index bill | commonly two or more orders of magnitude larger in dollars, set by the extraction model you choose; parts rerun as documents change | baseline |
-
-**Global query:** "What are the most common root causes across all incidents?"
-- Vector RAG retrieves 10 chunks, about 0.3% of the corpus, and reports whatever those happen to say.
-- GraphRAG uses, say, the 40 level-1 community reports: 40 map calls produce scored partial answers
-  ("deployment config drift, seen in communities about service X and Y"), and one reduce call synthesises
-  the top-scoring ones. Fewer than 50 calls give an answer grounded in a summary of the whole corpus.
-- The index-free way to get the same coverage, map-reduce over every chunk at query time, is about 3,300
-  calls per question. Community reports are that reading done once and reused, which is the whole economic
-  argument.
-
-**Local query:** "Which teams were involved in incidents touching the payments database?" Local search
-matches the entity PAYMENTS-DB, follows its edges to incidents and from incidents to TEAM entities, and
-pulls the source chunks for those edges, joining facts that never co-occur in one chunk.
-
-**Agent run, same corpus (illustrative):** with only `search_docs`, an analyst agent issues many searches
-of 10 chunks each and still covers a few percent of the corpus. With `global_search` it makes one heavy
-call (about 41 LLM calls inside), then a few `search_docs` calls to quote source chunks.
-
-**Decision:** lookup-heavy traffic ("what is the on-call rotation for X?") buys little; daily thematic and
-relational questions repay the bill.
 
 ### Runnable estimator for your own corpus
 Prompt and output sizes and the price ratio are placeholders: replace them with your extraction prompt's

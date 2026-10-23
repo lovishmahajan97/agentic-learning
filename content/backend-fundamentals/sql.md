@@ -5,7 +5,8 @@ name: SQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/database-design
@@ -39,6 +40,181 @@ sets, and read the plan.
   transcripts, and indexes matching the agent's hot lookups.
 - **What you can skip.** Relational algebra proofs and exotic join hints. Know evaluation order, NULL
   logic, sargability, `EXPLAIN ANALYZE` and N+1; that covers agent backends.
+
+## Lab
+### Task
+Every agent step assembles context from the thread's history, and traces show three defects: step
+latency grows with thread length, the history pager silently drops a message, and the token report
+undercounts.
+
+You will find each in `history.py`, fix the SQL (not the test data), and keep the query
+count constant as threads grow. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's NULL, Pagination and Where the ORM fits sections, and the N+1
+  worked scenario under Examples. Database design (composite indexes) helps.
+- **Setup:** Python 3.11+ (standard-library `sqlite3`, checked against SQLite 3.53.1; row values such
+  as `(a, b) < (?, ?)` need 3.15+), `pip install pytest` (checked against pytest 9.1.1). Save the
+  starter as `history.py` and the tests as `test_history.py` in one directory.
+- **Goal:** history loads in at most 2 queries, keyset paging returns every message exactly once, and
+  a NULL token count only removes its own side of the sum.
+
+### Starter code
+```python
+"""history.py: context assembly for an agent step. Steps got slower as threads grew and the token
+report undercounts. Three defects, marked EXERCISE."""
+import sqlite3
+
+
+def connect():
+    db = sqlite3.connect(":memory:")
+    db.executescript("""
+    CREATE TABLE messages (
+      id INTEGER PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL,
+      input_tokens INTEGER, output_tokens INTEGER, created_at TEXT NOT NULL);
+    CREATE TABLE tool_calls (
+      id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL REFERENCES messages (id),
+      tool TEXT NOT NULL, status TEXT NOT NULL);
+    CREATE INDEX messages_by_conversation ON messages (conversation_id, created_at, id);
+    CREATE INDEX tool_calls_by_message ON tool_calls (message_id);
+    """)
+    return db
+
+
+def seed(db):
+    """Six messages in thread c1. Messages 4, 5 and 6 share a timestamp (one batch insert);
+    message 5's stream was cut off, so its output_tokens is NULL."""
+    for i in range(1, 7):
+        role = "user" if i % 2 else "assistant"
+        out = None if i == 5 else 20
+        db.execute("INSERT INTO messages VALUES (?, 'c1', ?, ?, 100, ?, ?)",
+                   (i, role, f"m{i}", out, f"2026-01-01T10:00:0{min(i, 4)}"))
+    db.executemany("INSERT INTO tool_calls (message_id, tool, status) VALUES (?, ?, ?)",
+                   [(2, "search", "ok"), (4, "fetch", "error"), (4, "fetch", "ok"), (6, "search", "ok")])
+
+
+def load_history(db, conversation_id):
+    """Messages oldest first, each with its tool calls as (tool, status) tuples in id order."""
+    rows = db.execute("SELECT id, role, content FROM messages WHERE conversation_id = ? "
+                      "ORDER BY created_at, id", (conversation_id,)).fetchall()
+    history = []
+    for mid, role, content in rows:            # EXERCISE 1: one query per message is N+1
+        calls = db.execute("SELECT tool, status FROM tool_calls WHERE message_id = ? ORDER BY id",
+                           (mid,)).fetchall()
+        history.append({"id": mid, "role": role, "content": content, "tool_calls": calls})
+    return history
+
+
+def page(db, conversation_id, cursor=None, limit=2):
+    """Message ids newest first. Returns (ids, next_cursor); pass next_cursor back for the next page."""
+    if cursor is None:
+        rows = db.execute("SELECT id, created_at FROM messages WHERE conversation_id = ? "
+                          "ORDER BY created_at DESC LIMIT ?", (conversation_id, limit)).fetchall()
+    else:                                      # EXERCISE 2: rows tied on created_at are skipped
+        rows = db.execute("SELECT id, created_at FROM messages WHERE conversation_id = ? "
+                          "AND created_at < ? ORDER BY created_at DESC LIMIT ?",
+                          (conversation_id, cursor, limit)).fetchall()
+    next_cursor = rows[-1][1] if len(rows) == limit else None
+    return [r[0] for r in rows], next_cursor
+
+
+def thread_tokens(db, conversation_id):
+    """Tokens billed for the thread; a NULL count must not erase the other side of that message."""
+    return db.execute("SELECT SUM(input_tokens + output_tokens) FROM messages "   # EXERCISE 3
+                      "WHERE conversation_id = ?", (conversation_id,)).fetchone()[0]
+
+
+if __name__ == "__main__":
+    db = connect()
+    seed(db)
+    statements = []
+    db.set_trace_callback(statements.append)
+    history = load_history(db, "c1")
+    db.set_trace_callback(None)
+    print("history:", len(history), "messages,", len(statements), "queries")
+    ids, cursor = page(db, "c1")
+    seen = list(ids)
+    while cursor is not None:
+        ids, cursor = page(db, "c1", cursor)
+        seen += ids
+    print("paged ids:", seen)
+    print("thread tokens:", thread_tokens(db, "c1"))
+```
+
+### Expected output
+The starter prints `7 queries`, `paged ids: [6, 5, 3, 2, 1]` and `thread tokens: 600`. After the fix,
+`python history.py` prints:
+
+```text
+history: 6 messages, 2 queries
+paged ids: [6, 5, 4, 3, 2, 1]
+thread tokens: 700
+```
+
+### Tests
+On the starter 3 of 4 fail: `assert 7 <= 2` (with the per-message statements listed),
+`assert [6, 5, 3, 2, 1] == [6, 5, 4, 3, 2, 1]`, and `assert 600 == ((6 * 100) + (5 * 20))`. The shape
+test passes before and after, so it guards against a fix that changes what the agent sees.
+
+```python
+import pytest
+
+from history import connect, load_history, page, seed, thread_tokens
+
+
+@pytest.fixture
+def db():
+    db = connect()
+    seed(db)
+    return db
+
+
+def test_history_shape(db):
+    history = load_history(db, "c1")
+    assert [m["id"] for m in history] == [1, 2, 3, 4, 5, 6]
+    assert history[3]["tool_calls"] == [("fetch", "error"), ("fetch", "ok")]
+    assert history[0]["tool_calls"] == []
+
+
+def test_history_query_count_is_constant(db):
+    statements = []
+    db.set_trace_callback(statements.append)
+    load_history(db, "c1")
+    assert len(statements) <= 2, statements
+
+
+def test_keyset_pages_return_every_message_once(db):
+    ids, cursor = page(db, "c1")
+    seen = list(ids)
+    while cursor is not None:
+        ids, cursor = page(db, "c1", cursor)
+        seen += ids
+    assert seen == [6, 5, 4, 3, 2, 1]
+
+
+def test_thread_tokens_counts_known_side_of_null_rows(db):
+    assert thread_tokens(db, "c1") == 6 * 100 + 5 * 20
+```
+
+### Failure scenarios
+- **Inject: fix the cursor to `(created_at, id)` but leave `ORDER BY created_at DESC`.** The test may
+  pass today and fail after an index change, because tied rows have no defined order. Debug: run
+  `EXPLAIN QUERY PLAN` with and without the index; order by exactly the cursor's columns.
+- **Inject: build the tool-call query with an f-string over the message ids.** It passes here, then a
+  model-extracted value with an apostrophe breaks it, or injects SQL. Debug: grep for `f"SELECT`; use a
+  subquery or placeholders.
+- **Inject: `COUNT(output_tokens)` in a "messages billed" report.** It says 5, `COUNT(*)` says 6.
+  Debug: run both side by side; the gap is the NULL rows, which is the same bug class as Exercise 3.
+- **Inject: one `JOIN` of messages to tool_calls without grouping.** Message 4 appears twice and
+  message 1 disappears with an inner join. Debug: the shape test fails; group in Python, or use a left
+  join and collapse rows by message id.
+
+### Submission
+- **Your fixed `history.py`**, with the given tests unchanged.
+- **A `pytest -v` log** with all 4 passing, plus the starter's failing run for comparison.
+- **The statement list** captured by `set_trace_callback` before and after Exercise 1.
+- **One extra test** of your own that seeds a 50-message thread and still asserts at most 2 queries.
+- **A three-line note** naming which index serves each fixed query and why the page cursor needs `id`.
+- **Evaluated by:** the given tests pass unmodified, your test fails on the starter, and no query is
+  built by string formatting.
 
 ## Why it exists
 - **Navigational databases coupled code to layout.** Programs walked pointers from record to record, so

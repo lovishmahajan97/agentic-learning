@@ -5,7 +5,8 @@ name: ANN indexes (HNSW, IVF)
 kind: concept
 difficulty: core
 est_minutes: 19
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -189,26 +190,22 @@ flowchart TD
     K -.->|"compare with brute force"| R["ANN recall at k"]
 ```
 
+## Misconceptions
+- **"ANN returns the exact top k, maybe slightly reordered."** It can drop true neighbors outright.
+  Recall depends on your data and knobs: the random-data sweep below gets HNSW recall@10 of 0.28 at
+  `efSearch` 16. Measure overlap with brute force on real agent queries.
+- **"A metadata filter just narrows the ANN result."** HNSW collects about `ef_search` global neighbors and
+  the filter runs over those. A user filter keeping 0.005% of rows leaves zero to two memories, and the
+  agent concludes it never knew the fact.
+- **"`LIMIT 100` returns 100 rows."** In pgvector, `hnsw.ef_search` (default 40) caps the candidate list,
+  so the query can quietly yield 40 unless you raise it or enable iterative scans (0.8).
+- **"Deleting a vector frees its slot and keeps recall."** HNSW deletes are tombstones because removing a
+  node can disconnect the graph. Under agent-memory churn, latency rises and recall drifts until you
+  rebuild.
+- **"The graph is what makes HNSW memory-hungry."** At 768 dimensions in fp32, the links add about 128
+  bytes to a 3,072-byte vector, roughly 4%. Shrinking the vector (PQ or int8) is what makes a corpus fit.
+
 ## Examples
-### Worked scenario: per-user agent memory that forgets
-An assistant agent stores memories in one pgvector table shared by 20,000 users and recalls with
-`WHERE user_id = $1 ORDER BY embedding <=> $2 LIMIT 10` (illustrative numbers).
-
-| Quantity | Value |
-|---|---|
-| Rows in the table | 10 million memories |
-| Rows for a typical user | ~500, so the filter keeps 0.005% |
-| HNSW candidate list | `hnsw.ef_search` default 40 |
-| Allowed rows among the 40 nearest overall | often none, at best a few |
-| Agent sees | 0-2 memories, then "I don't have that information" |
-
-- **Diagnosis.** The walk collects the 40 globally nearest memories, the filter discards nearly all of
-  them, and the agent concludes it never knew the fact.
-- **Fixes.** For a user with ~500 rows, an exact scan on a B-tree `user_id` index is cheap and loses no
-  recall; confirm with `EXPLAIN` that the planner picks it over the HNSW index. Otherwise use iterative index scans (pgvector 0.8), a partial index per large tenant, or an
-  engine with filtered traversal.
-- **Measure.** Count tool calls where returned rows are fewer than `LIMIT`, per user bucket.
-
 ### Recall–latency sweep in FAISS
 Build an exact index as the recall reference, then HNSW and IVF over the same vectors, and sweep each
 search knob. Random Gaussian data is the worst case for ANN (no cluster structure), so recall will be
@@ -254,6 +251,25 @@ print("flat", report(flat))
 - **Flat looks competitive here** because batched flat search is one BLAS matrix multiply and 200k vectors
   is small. That is the point of "start with exact search"; the gap opens as N grows, because flat cost is
   linear in N.
+
+### Worked scenario: per-user agent memory that forgets
+An assistant agent stores memories in one pgvector table shared by 20,000 users and recalls with
+`WHERE user_id = $1 ORDER BY embedding <=> $2 LIMIT 10` (illustrative numbers).
+
+| Quantity | Value |
+|---|---|
+| Rows in the table | 10 million memories |
+| Rows for a typical user | ~500, so the filter keeps 0.005% |
+| HNSW candidate list | `hnsw.ef_search` default 40 |
+| Allowed rows among the 40 nearest overall | often none, at best a few |
+| Agent sees | 0-2 memories, then "I don't have that information" |
+
+- **Diagnosis.** The walk collects the 40 globally nearest memories, the filter discards nearly all of
+  them, and the agent concludes it never knew the fact.
+- **Fixes.** For a user with ~500 rows, an exact scan on a B-tree `user_id` index is cheap and loses no
+  recall; confirm with `EXPLAIN` that the planner picks it over the HNSW index. Otherwise use iterative index scans (pgvector 0.8), a partial index per large tenant, or an
+  engine with filtered traversal.
+- **Measure.** Count tool calls where returned rows are fewer than `LIMIT`, per user bucket.
 
 ### Production snippet: pgvector HNSW with explicit knobs
 ```sql

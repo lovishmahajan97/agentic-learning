@@ -5,7 +5,8 @@ name: Secrets management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agent-runtime-architecture/secrets-and-credential-isolation
@@ -40,6 +41,196 @@ platform identity, short-lived, scoped and rotatable: leaks stay small.
   sandbox with no secrets in its environment.
 - **What you can skip.** KMS internals and HSM details. Know envelope encryption exists, the secret-zero
   problem, two-key rotation, and the rule that the model never sees a credential.
+
+## Lab
+### Task
+Your LLM gateway reads its provider key once at boot, like an environment variable. Last week a
+rotation revoked the old key early and every call failed with 401 until a restart, and a debug tool
+echoed the key into a trace.
+
+You fix the resolver and add redaction against an in-process fake secrets manager and fake provider,
+so the lab runs offline.
+- **Agent goal:** the gateway survives rotation without a restart, and no key reaches a tool result
+  the model sees or a log line that a trace exporter ships.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** this lesson's delivery, rotation and "Rules specific to AI systems" sections;
+  Python `logging` handlers and filters.
+- **Needs:** Python 3.10+ and `pytest`; checked with Python 3.12 and pytest 9.1.1. No other packages.
+
+### Starter code
+```python
+# secrets_lab.py: a provider-key resolver that survives rotation and never leaks the key
+import io, logging, re
+
+SECRET_PATTERNS = [re.compile(r"sk-live-[A-Za-z0-9]{20,}"),             # provider-key shape
+                   re.compile(r"(?i)bearer\s+[a-z0-9._\-]{20,}")]        # echoed auth headers
+
+class Clock:
+    def __init__(self): self.t = 0.0
+    def now(self): return self.t
+    def advance(self, s): self.t += s
+
+class FakeManager:
+    """Secrets Manager stand-in: staging labels, and a read counter (every read is an audited API call)."""
+    def __init__(self, value):
+        self.versions, self.reads = {"AWSCURRENT": value}, 0
+    def get_secret_value(self, name):
+        self.reads += 1
+        return self.versions["AWSCURRENT"]
+    def promote(self, new):
+        self.versions = {"AWSCURRENT": new, "AWSPREVIOUS": self.versions["AWSCURRENT"]}
+
+class FakeProvider:
+    """LLM provider stand-in: accepts only keys in `valid`; the 'debug' prompt echoes request headers."""
+    def __init__(self, *keys): self.valid = set(keys)
+    def chat(self, key, prompt):
+        if key not in self.valid:
+            return 401, "invalid api key"
+        if prompt == "debug":
+            return 200, f"headers: Authorization: Bearer {key}"
+        return 200, "ok"
+
+# YOUR CODE: fix Resolver.get, call_llm, scrub and RedactFilter (see the tests).
+class Resolver:
+    def __init__(self, manager, name, ttl_s=300, clock=None):
+        self.manager, self.name, self.ttl_s = manager, name, ttl_s
+        self.clock = clock or Clock().now
+        self.value = manager.get_secret_value(name)        # read once at boot, like an env var
+
+    def get(self, force=False) -> str:
+        return self.value
+
+def call_llm(resolver, provider, prompt):
+    """Return (status, text). On 401, refetch the key once and retry once."""
+    return provider.chat(resolver.get(), prompt)
+
+def scrub(text: str, known: list) -> str:
+    """Replace every known secret value and every SECRET_PATTERNS match with [REDACTED]."""
+    return text
+
+class RedactFilter(logging.Filter):
+    """Handler filter: rewrite each record so no secret from `resolver` or SECRET_PATTERNS is emitted."""
+    def __init__(self, resolver):
+        super().__init__(); self.resolver = resolver
+    def filter(self, record):
+        return True
+
+OLD, NEW = "sk-live-" + "A" * 32, "sk-live-" + "B" * 32
+
+def make_logger(resolver):
+    buf, log = io.StringIO(), logging.getLogger("agent")
+    log.handlers.clear(); log.propagate = False; log.setLevel(logging.INFO)
+    h = logging.StreamHandler(buf); h.addFilter(RedactFilter(resolver)); log.addHandler(h)
+    return log, buf
+
+if __name__ == "__main__":
+    clock, mgr, prov = Clock(), FakeManager(OLD), FakeProvider(OLD)
+    res = Resolver(mgr, "prod/llm-gateway/api-key", ttl_s=300, clock=clock.now)
+    for _ in range(10):
+        call_llm(res, prov, "hi")
+    print("10 calls, manager reads:", mgr.reads)
+    mgr.promote(NEW); prov.valid = {NEW}                  # rotated, and the old key revoked at once
+    clock.advance(60)
+    status, _ = call_llm(res, prov, "hi")
+    print("after rotation:", status, "| manager reads:", mgr.reads)
+    clock.advance(301); call_llm(res, prov, "hi")
+    print("after TTL expiry, manager reads:", mgr.reads)
+    _, echoed = call_llm(res, prov, "debug")
+    tool_result = scrub(echoed + " | other tenant: sk-live-" + "C" * 24, known=[res.get()])
+    print("tool result leaks a key:", "sk-live-" in tool_result)
+    log, buf = make_logger(res)
+    log.info("calling provider with key %s", res.get())
+    print("log leaks a key:", "sk-live-" in buf.getvalue())
+```
+
+As given, the script prints `after rotation: 401`, a read count stuck at 1, and `True` for both
+leak lines. The keys are fake but realistically shaped, so a scanner would flag them in a real repo.
+
+### Expected output
+```
+10 calls, manager reads: 1
+after rotation: 200 | manager reads: 2
+after TTL expiry, manager reads: 3
+tool result leaks a key: False
+log leaks a key: False
+```
+
+### Tests
+```python
+# test_secrets_lab.py: run with `pytest -q`
+from secrets_lab import (NEW, OLD, Clock, FakeManager, FakeProvider, Resolver, call_llm,
+                         make_logger, scrub)
+
+def setup(ttl=300):
+    clock, mgr = Clock(), FakeManager(OLD)
+    return clock, mgr, Resolver(mgr, "prod/llm-gateway/api-key", ttl_s=ttl, clock=clock.now)
+
+def test_cache_serves_reads_within_the_ttl():
+    clock, mgr, res = setup()
+    for _ in range(50):
+        res.get(); clock.advance(5)                    # 245 s in total, inside the TTL
+    assert mgr.reads == 1
+
+def test_ttl_expiry_picks_up_a_rotation_without_restart():
+    clock, mgr, res = setup()
+    assert res.get() == OLD
+    mgr.promote(NEW); clock.advance(301)
+    assert res.get() == NEW and mgr.reads == 2
+
+def test_401_refetches_once_and_retries():
+    clock, mgr, res = setup()
+    prov = FakeProvider(OLD)
+    assert call_llm(res, prov, "hi") == (200, "ok")
+    mgr.promote(NEW); prov.valid = {NEW}
+    assert call_llm(res, prov, "hi") == (200, "ok")
+    assert mgr.reads == 2
+
+def test_401_does_not_loop_when_the_new_key_also_fails():
+    clock, mgr, res = setup()
+    prov = FakeProvider()                              # accepts nothing
+    status, _ = call_llm(res, prov, "hi")
+    assert status == 401 and mgr.reads <= 2
+
+def test_scrub_removes_known_values_and_patterns():
+    other = "sk-live-" + "C" * 24
+    out = scrub(f"Authorization: Bearer {OLD} | leaked: {other} | token=abc", known=[OLD])
+    assert OLD not in out and other not in out and "[REDACTED]" in out
+    assert "token=abc" in out                          # ordinary text survives
+
+def test_log_lines_are_redacted_even_after_rotation():
+    clock, mgr, res = setup()
+    log, buf = make_logger(res)
+    log.info("key %s", res.get())
+    mgr.promote(NEW); clock.advance(301)
+    log.info("key %s", res.get())
+    assert "sk-live-" not in buf.getvalue() and buf.getvalue().count("[REDACTED]") == 2
+```
+
+Four fail on the starter with `AssertionError`. Two pass already and are guards: the cache test fails
+if you "fix" rotation by reading the manager on every call, and the no-loop test fails if a 401 retry
+never stops.
+
+### Failure scenarios
+- **Inject `force=True` on every `get`.** Rotation works, but the cache test reports 50 manager reads.
+  In production that is one audited, billed API call per LLM request and a hard dependency on the
+  manager's availability; watch the read counter or the CloudTrail read rate per identity.
+- **Inject a retry loop `while status == 401`.** With a provider that rejects every key the call
+  never returns, or hammers the manager. Bound it to one refetch and surface the 401.
+- **Inject redaction of the boot-time value only** (capture the key in `RedactFilter.__init__`).
+  After a rotation only `SECRET_PATTERNS` still catches the new key, because both share a shape; a key
+  of any other shape logs in clear. Make the filter ask the resolver for every value it has served.
+- **Inject the filter on the logger instead of the handler.** Records from child loggers such as
+  `agent.tools` propagate to the handler without passing the parent logger's filters, so they emit
+  unredacted. Log from a child logger in a test to see it.
+
+### Submission
+- **Your `secrets_lab.py`** with the four pieces fixed and the fakes unchanged.
+- **A `pytest -q` run** showing 6 passed.
+- **The script's printed output**, matching the expected lines.
+- **A note of 3-5 sentences:** why the 401 path is needed even with a TTL, and what the rotation runbook
+  should change so the early revoke never happens.
+- **Evaluated on:** green tests, one manager read per TTL window, exactly one refetch on 401, and
+  redaction applied to tool output and log handlers alike.
 
 ## Why it exists
 - **Secrets leak through boring paths.** A `.env` committed "just once", an `ENV API_KEY=` line in a

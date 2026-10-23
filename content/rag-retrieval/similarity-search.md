@@ -5,7 +5,8 @@ name: Similarity search (cosine, dot product)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -171,39 +172,24 @@ flowchart TD
     IX --> REC["Recall at k vs exact brute force on labeled set"]
 ```
 
+## Misconceptions
+- **"Cosine is always the right metric for embeddings."** The right metric is the one the model was
+  trained with. Dot-product-trained retrievers such as DPR store a usefulness prior in document norms,
+  and normalizing throws it away; cosine is the safe default only when the model card is silent.
+- **"Cosine, dot product and L2 rank differently, so the choice always matters."** On unit-length vectors
+  all three give the identical ranking, because ‖q − d‖² = 2 − 2·cos. The choice only matters when norms
+  vary, which is why normalizing at write time settles the debate.
+- **"A cosine of 0.8 means the passage is relevant."** Embedding spaces are anisotropic, so scores sit in
+  a narrow band whose location depends on the model. A cutoff is valid only for the model and pair type
+  it was calibrated on, and breaks on the next embedding upgrade.
+- **"The database will use my vector index for any similarity query."** An index serves exactly one
+  operator class. Query a `vector_cosine_ops` index with `<->` and pgvector silently runs a sequential
+  scan; only `EXPLAIN` or latency growing with N reveals it.
+- **"Exact search is too slow, so start with an ANN index."** A per-user memory of 5,000 vectors at
+  d = 1024 in fp32 is about 20 MB, roughly 2 ms per scan at an illustrative 10 GB/s, with perfect recall.
+  Approximate indexes pay off only in the low millions of vectors on CPU.
+
 ## Examples
-### Agent search tool with a calibrated threshold
-The tool the agent calls: normalized vectors, inner product, and a cutoff measured on labeled pairs for
-this model version. Below the cutoff it tells the agent explicitly, so the agent can rephrase instead of
-reasoning from weak chunks.
-
-```python
-import numpy as np
-
-MODEL_VERSION = "embed-v3"            # stored with the collection and the threshold
-THRESHOLD = {"embed-v3": 0.41}        # calibrated on labeled pairs, never copied from a blog
-
-def normalize(x):
-    return x / np.linalg.norm(x, axis=-1, keepdims=True)
-
-class SearchDocsTool:
-    def __init__(self, embed, chunks, vectors):
-        self.embed, self.chunks = embed, chunks
-        self.D = normalize(vectors.astype(np.float32))   # normalize once at write time
-
-    def __call__(self, query: str, k: int = 5) -> dict:
-        q = normalize(self.embed(query))
-        scores = self.D @ q                              # dot on unit vectors == cosine
-        k = min(k, len(scores))                          # a small memory may hold fewer than k
-        top = np.argpartition(-scores, k - 1)[:k]        # kth must be < N, so k - 1
-        top = top[np.argsort(-scores[top])]
-        hits = [{"text": self.chunks[i], "score": float(scores[i])}
-                for i in top if scores[i] >= THRESHOLD[MODEL_VERSION]]
-        if not hits:                                    # explicit signal for the agent loop
-            return {"results": [], "note": "No relevant passages. Try different terms."}
-        return {"results": hits}
-```
-
 ### Magnitude bias, and how normalization removes it
 Random vectors stand in for embeddings; 5% of the corpus gets a three-times-larger norm, the way a
 dot-product-trained model might inflate "important" passages. The dot-product top-k fills with those
@@ -235,6 +221,38 @@ qn = q / np.linalg.norm(q)
 print("dot on unit vectors == cosine ranking:", np.array_equal(topk(Dn @ qn), topk(cos)))
 print("l2 on unit vectors  == cosine ranking:",
       np.array_equal(topk(-np.linalg.norm(Dn - qn, axis=1)), topk(cos)))
+```
+
+### Agent search tool with a calibrated threshold
+The tool the agent calls: normalized vectors, inner product, and a cutoff measured on labeled pairs for
+this model version. Below the cutoff it tells the agent explicitly, so the agent can rephrase instead of
+reasoning from weak chunks.
+
+```python
+import numpy as np
+
+MODEL_VERSION = "embed-v3"            # stored with the collection and the threshold
+THRESHOLD = {"embed-v3": 0.41}        # calibrated on labeled pairs, never copied from a blog
+
+def normalize(x):
+    return x / np.linalg.norm(x, axis=-1, keepdims=True)
+
+class SearchDocsTool:
+    def __init__(self, embed, chunks, vectors):
+        self.embed, self.chunks = embed, chunks
+        self.D = normalize(vectors.astype(np.float32))   # normalize once at write time
+
+    def __call__(self, query: str, k: int = 5) -> dict:
+        q = normalize(self.embed(query))
+        scores = self.D @ q                              # dot on unit vectors == cosine
+        k = min(k, len(scores))                          # a small memory may hold fewer than k
+        top = np.argpartition(-scores, k - 1)[:k]        # kth must be < N, so k - 1
+        top = top[np.argsort(-scores[top])]
+        hits = [{"text": self.chunks[i], "score": float(scores[i])}
+                for i in top if scores[i] >= THRESHOLD[MODEL_VERSION]]
+        if not hits:                                    # explicit signal for the agent loop
+            return {"results": [], "note": "No relevant passages. Try different terms."}
+        return {"results": hits}
 ```
 
 ### Production snippet: pgvector with a matching operator class

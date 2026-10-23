@@ -5,7 +5,8 @@ name: Exceptions and custom exception hierarchies
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/tenacity
@@ -37,6 +38,201 @@ your bugs never retry at provider prices.
   `ToolError`), where vendor errors are translated, and the step and retry budgets that end a run.
 - **What you can skip.** Exception internals such as traceback objects and frame details; `except*`
   beyond fan-out of tools.
+
+## Lab
+### Task
+Build the provider adapter and retry policy of an agent's model call. A fake transport replays
+recorded provider responses (a 429, a context-length error, a 401, an outage, a changed body), so the
+lab runs offline. Translate each failure once into the hierarchy, then let `answer` handle it by class.
+
+Time box: 60-90 minutes. Do "How it works" here first; `tenacity` is the library version of this loop.
+- **Implement** `call_provider` (translation with `raise ... from e`) and `answer` (the policy).
+- **Fix** the planted bug in `ContextTooLong` so the error survives pickling, as it must when eval
+  workers run in other processes.
+- **Run** on Python 3.10+, standard library plus pytest (checked on Python 3.12.14, pytest 9.1.1).
+
+### Starter code
+Save as `lab.py`. It runs and reports every recorded case as not implemented.
+
+```python
+"""lab.py: translate recorded provider failures once, then handle each by policy."""
+from __future__ import annotations
+
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
+@dataclass
+class Response:                                  # one recorded HTTP response from the provider
+    status: int
+    headers: dict[str, str] = field(default_factory=dict)
+    body: dict[str, object] = field(default_factory=dict)
+
+class ProviderHTTPError(Exception):              # what the vendor SDK raises: must not pass the adapter
+    def __init__(self, response: Response) -> None:
+        super().__init__(response)
+        self.response = response
+
+class FakeTransport:
+    """Replays recorded responses in order and records the length of every prompt it was sent."""
+    def __init__(self, responses: list[Response]) -> None:
+        self.responses = list(responses)
+        self.sent: list[int] = []
+    def post(self, prompt: str) -> dict[str, object]:
+        self.sent.append(len(prompt))
+        r = self.responses.pop(0)
+        if r.status >= 400:
+            raise ProviderHTTPError(r)
+        return r.body
+
+class LLMError(Exception): ...
+class Transient(LLMError): ...                   # safe to retry
+class Permanent(LLMError): ...                   # do not retry
+class Recoverable(LLMError): ...                 # retry only after changing the request
+
+class RateLimited(Transient):
+    def __init__(self, retry_after: float) -> None:
+        super().__init__(retry_after)
+        self.retry_after = retry_after
+
+class ContextTooLong(Recoverable):
+    def __init__(self, tokens: int, limit: int) -> None:
+        super().__init__(f"{tokens} tokens > limit {limit}")   # LAB bug: args differ from the ctor's
+        self.tokens, self.limit = tokens, limit
+
+def call_provider(transport: FakeTransport, prompt: str) -> str:
+    """Return body["text"]. Translate ProviderHTTPError once, always `raise ... from e`:
+    429 -> RateLimited(float(retry-after) if it is all digits, else 2.0); 5xx -> Transient(f"provider
+    returned {status}"); body error code "context_length_exceeded" -> ContextTooLong(tokens, limit);
+    anything else -> Permanent(f"provider returned {status}")."""
+    raise NotImplementedError("LAB: call_provider")
+
+def answer(transport: FakeTransport, prompt: str, attempts: int = 3,
+           sleep: Callable[[float], None] = time.sleep) -> str:
+    """Up to `attempts` calls. Sleep only when another attempt follows: RateLimited -> min(retry_after, 30);
+    other Transient -> 2 ** n for 0-based attempt n. ContextTooLong -> cut the prompt to
+    len(prompt) * limit * 9 // (10 * tokens) characters, no sleep. Permanent and bugs propagate at once.
+    When attempts run out: raise Permanent(f"gave up after {attempts} attempts") from the last error."""
+    raise NotImplementedError("LAB: answer")
+
+RECORDED = {
+    "rate limit then ok": [Response(429, {"retry-after": "7"}), Response(200, body={"text": "ok after wait"})],
+    "context too long": [Response(400, body={"error": {"code": "context_length_exceeded",
+                                                       "tokens": 12000, "limit": 8000}}),
+                         Response(200, body={"text": "ok after shrink"})],
+    "auth": [Response(401, body={"error": {"code": "invalid_api_key"}})],
+    "outage": [Response(503), Response(503), Response(503)],
+    "changed body": [Response(200, body={"output": "field renamed by the provider"})],
+}
+
+if __name__ == "__main__":
+    for name, responses in RECORDED.items():
+        t, slept = FakeTransport(responses), []
+        try:
+            text = answer(t, "x" * 1000, sleep=slept.append)
+            print(f"{name}: {text} | sleeps={slept} sent={t.sent}")
+        except Exception as e:                   # report only; real code lets these propagate
+            print(f"{name}: {type(e).__name__}: {e} | cause={type(e.__cause__).__name__} "
+                  f"sleeps={slept} sent={t.sent}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly. The shrink is 1,000 × 8,000 × 9 // (10 ×
+12,000) = 600 characters, and the outage sleeps 1 and 2 seconds but not after the third attempt.
+
+```
+rate limit then ok: ok after wait | sleeps=[7.0] sent=[1000, 1000]
+context too long: ok after shrink | sleeps=[] sent=[1000, 600]
+auth: Permanent: provider returned 401 | cause=ProviderHTTPError sleeps=[] sent=[1000]
+outage: Permanent: gave up after 3 attempts | cause=Transient sleeps=[1, 2] sent=[1000, 1000, 1000]
+changed body: KeyError: 'text' | cause=NoneType sleeps=[] sent=[1000]
+```
+
+### Tests
+Save as `test_lab.py` and run `python -m pytest -q`. On the starter five fail with
+`NotImplementedError` and the pickle test fails with `TypeError` from the planted bug.
+
+```python
+import pickle
+import pytest
+from lab import (RECORDED, ContextTooLong, FakeTransport, LLMError, Permanent, ProviderHTTPError,
+                 RateLimited, Response, Transient, answer, call_provider)
+
+def raised(responses):
+    with pytest.raises(LLMError) as info:
+        call_provider(FakeTransport(responses), "x")
+    assert isinstance(info.value.__cause__, ProviderHTTPError), "translate with raise ... from e"
+    return info.value
+
+def test_adapter_classifies_once():
+    e = raised([Response(429, {"retry-after": "7"})])
+    assert type(e) is RateLimited and e.retry_after == 7.0
+    assert raised([Response(429, {"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"})]).retry_after == 2.0
+    assert type(raised([Response(503)])) is Transient
+    assert type(raised(RECORDED["auth"])) is Permanent
+    c = raised(RECORDED["context too long"][:1])
+    assert type(c) is ContextTooLong and (c.tokens, c.limit) == (12000, 8000)
+
+def run(responses):
+    t, slept = FakeTransport(responses), []
+    return t, slept, (lambda: answer(t, "x" * 1000, sleep=slept.append))
+
+def test_rate_limit_waits_with_a_cap():
+    t, slept, go = run(RECORDED["rate limit then ok"])
+    assert go() == "ok after wait" and slept == [7.0]
+    t, slept, go = run([Response(429, {"retry-after": "120"}), Response(200, body={"text": "ok"})])
+    assert go() == "ok" and slept == [30]
+
+def test_context_too_long_shrinks_instead_of_retrying_blindly():
+    t, slept, go = run(RECORDED["context too long"])
+    assert go() == "ok after shrink" and t.sent == [1000, 600] and slept == []
+
+def test_outage_gives_up_with_the_cause_kept():
+    t, slept, go = run(RECORDED["outage"])
+    with pytest.raises(Permanent, match="gave up after 3 attempts") as info:
+        go()
+    assert type(info.value.__cause__) is Transient and slept == [1, 2] and len(t.sent) == 3
+
+def test_permanent_and_bugs_are_never_retried():
+    t, _, go = run(RECORDED["auth"])
+    with pytest.raises(Permanent):
+        go()
+    assert t.sent == [1000]
+    t, _, go = run(RECORDED["changed body"])
+    with pytest.raises(KeyError):
+        go()
+    assert t.sent == [1000]
+
+def test_errors_survive_a_process_boundary():
+    c = pickle.loads(pickle.dumps(ContextTooLong(12000, 8000)))
+    r = pickle.loads(pickle.dumps(RateLimited(7.0)))
+    assert (c.tokens, c.limit, r.retry_after) == (12000, 8000, 7.0)
+```
+
+### Failure scenarios
+- **List `except Transient` before `except RateLimited`.** Python accepts the unreachable handler, so
+  the 429 sleeps 1 second instead of 7 and `slept == [7.0]` fails. Print `type(e).__mro__` for the
+  caught error and reorder the handlers subclass first.
+- **Raise the domain error without `from e`.** The behaviour tests pass but `raised()` fails: there is
+  no `__cause__`, only `__context__`, and logs read "During handling of the above exception". Check
+  `e.__cause__` in a debugger.
+- **Catch `Exception` in `answer`.** The changed body is retried three times and ends as `Permanent:
+  gave up after 3 attempts` caused by `IndexError` (the fake ran out of responses): a bug retried at
+  provider prices and mislabelled. Count `t.sent`; more than one call for a `KeyError` is the tell.
+- **Keep the planted `ContextTooLong` bug.** Unpickling calls `ContextTooLong("12000 tokens > limit
+  8000")` and fails with a missing `limit` argument. Pass the constructor arguments to
+  `super().__init__` and give the class a `__str__` for logs instead.
+
+### Submission
+- **`lab.py` and `test_lab.py`,** with the `python -m pytest -q` output showing 6 passed.
+- **The output of `python lab.py`,** matching the expected block, with the 600-character shrink
+  checked by hand.
+- **One new recorded case:** a 400 with code `content_filter`, mapped to a new `Refused(Permanent)`
+  leaf, with a test showing it is never retried.
+- **A note of 3-5 sentences:** which of these errors an agent loop would show the model as an error
+  tool result, and which it must keep out of the transcript.
+- **Evaluation:** tests pass unmodified, no handler inspects a status code or message string outside
+  `call_provider`, and every translated error keeps its `__cause__`.
 
 ## Why it exists
 - **One LLM call, a dozen failure modes, different fixes.**

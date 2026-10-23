@@ -5,7 +5,8 @@ name: Train / validation / test split
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/train-test-leakage
@@ -151,6 +152,21 @@ flowchart TD
     S -->|"every prompt and config decision"| VA["Validation"]
     S -->|"read once, paired comparison"| TE["Test"]
 ```
+
+## Misconceptions
+- **"Validation data is held out, so its score is honest."** It is held out from gradients, not from
+  decisions. Keep the best of twenty prompts or learning rates and the winner's score includes the
+  luckiest noise; only a test set no decision touched, read once, is unbiased.
+- **"A shuffled 80/10/10 split is the safe default."** Rows from one session, customer, document or task
+  template are not independent, so a row split rewards recognising the source. Cut on the unit the agent
+  must generalise across, or by time.
+- **"The split ratio sets how trustworthy the score is."** Absolute size does: the standard error is
+  about `sqrt(p·(1−p)/n)`, so 200 tasks at 90% is about ±2 points whatever fraction of the data they are.
+- **"Two configs with overlapping error bars cannot be told apart."** Scored on the same tasks, only the
+  discordant tasks carry evidence; 15 vs 30 discordant tasks gives McNemar p ≈ 0.04 despite ±2.6-point
+  bars on each config.
+- **"A prompt-only agent has no training set, so it cannot overfit."** Every prompt tweak kept because the
+  dev score rose is fitting; few-shot examples are training data and must not appear in the eval set.
 
 ## Examples
 ### Deterministic grouped split for agent traces

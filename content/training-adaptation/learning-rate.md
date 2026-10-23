@@ -5,7 +5,8 @@ name: Learning rate
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/learning-rate-schedulers
@@ -158,7 +159,54 @@ flowchart TD
     D -->|"stable, evals improving"| OK["Record peak, warmup, schedule, batch size"]
 ```
 
+## Misconceptions
+- **"A smaller learning rate is always the safe choice."** Distance travelled is roughly steps × step
+  size, so a rate ten times too small ends with the loss of a much shorter run. On LoRA, whose B matrix
+  starts at zero, it can mean the adapter barely changes the agent at all.
+- **"A rate that worked last time transfers."** It is tied to the optimiser, batch size, parameterisation
+  (full fine-tune versus LoRA, and LoRA's α/r) and base model. Change any of them and re-run a short ×3
+  grid.
+- **"Pick the rate with the lowest training loss."** Higher rates keep lowering loss while tool-call
+  validity and general skills fall. Select on held-out tool calls and a general suite.
+- **"Gradient clipping makes a high rate safe."** A clip that fires on most steps means the rate is too
+  high and the run is leaning on the clip; lower the peak until clipping is occasional.
+- **"The learning rate is one number."** It is a trajectory: warmup, peak and decay, sized in steps. A
+  500-step warmup copied onto a 300-step fine-tune never reaches the peak.
+- **"With Adam, gradient size sets the step."** Adam divides by a running estimate of gradient magnitude,
+  so each parameter moves about η per step whatever the raw gradient scale.
+
 ## Examples
+### The stability bound and Adam's normalisation
+The bound is easiest to see on the quadratic, and Adam's normalisation by feeding it two gradients that
+differ by 1000× and watching the parameter move by the same amount.
+
+```python
+import torch
+
+def gd(lr, curvature=4.0, theta=1.0, steps=10):
+    # Loss L = 0.5 * curvature * theta**2, gradient = curvature * theta
+    for _ in range(steps):
+        theta = theta - lr * curvature * theta          # = theta * (1 - lr * curvature)
+    return theta
+
+for lr in (0.05, 0.1, 0.45, 0.5, 0.6):
+    print(f"lr={lr:<5} factor={1 - lr * 4:+.2f}  theta after 10 steps={gd(lr):+.4f}")
+# lr=0.05  factor=+0.80  0.1074   slow, monotone
+# lr=0.1   factor=+0.60  0.0060   fast, monotone
+# lr=0.45  factor=-0.80  0.1074   oscillates, still converges
+# lr=0.5   factor=-1.00  1.0000   bounces forever: exactly the 2/curvature limit
+# lr=0.6   factor=-1.40  28.925   diverges
+
+# Adam normalises the gradient scale away, so the first step is ~lr whatever the gradient size.
+w = torch.nn.Parameter(torch.tensor([1.0]))
+opt = torch.optim.Adam([w], lr=1e-3)
+for scale in (1.0, 1000.0):
+    w.data.fill_(1.0); opt.state.clear()
+    w.grad = torch.tensor([scale])
+    opt.step()
+    print(f"gradient={scale:>6}: moved by {1.0 - w.item():.6f}")   # both ~0.001
+```
+
 ### A ×3 grid for a LoRA agent fine-tune, scored on tool calls
 The grid is judged on what the agent needs: held-out tool calls that parse, name a real tool and carry
 every required argument. `finetune_lora` and `generate_calls` stand in for the team's training and
@@ -209,37 +257,6 @@ Illustrative numbers (shape only, not a benchmark) for LoRA on 3,000 support-age
 
 - **Reading it.** Training loss keeps falling as the rate rises, but tool-call validity peaks at 1e-4
   and the general suite drops sharply above it. Pick 1e-4; 3e-4 buys loss, not agent behaviour.
-
-### The stability bound and Adam's normalisation
-The bound is easiest to see on the quadratic, and Adam's normalisation by feeding it two gradients that
-differ by 1000× and watching the parameter move by the same amount.
-
-```python
-import torch
-
-def gd(lr, curvature=4.0, theta=1.0, steps=10):
-    # Loss L = 0.5 * curvature * theta**2, gradient = curvature * theta
-    for _ in range(steps):
-        theta = theta - lr * curvature * theta          # = theta * (1 - lr * curvature)
-    return theta
-
-for lr in (0.05, 0.1, 0.45, 0.5, 0.6):
-    print(f"lr={lr:<5} factor={1 - lr * 4:+.2f}  theta after 10 steps={gd(lr):+.4f}")
-# lr=0.05  factor=+0.80  0.1074   slow, monotone
-# lr=0.1   factor=+0.60  0.0060   fast, monotone
-# lr=0.45  factor=-0.80  0.1074   oscillates, still converges
-# lr=0.5   factor=-1.00  1.0000   bounces forever: exactly the 2/curvature limit
-# lr=0.6   factor=-1.40  28.925   diverges
-
-# Adam normalises the gradient scale away, so the first step is ~lr whatever the gradient size.
-w = torch.nn.Parameter(torch.tensor([1.0]))
-opt = torch.optim.Adam([w], lr=1e-3)
-for scale in (1.0, 1000.0):
-    w.data.fill_(1.0); opt.state.clear()
-    w.grad = torch.tensor([scale])
-    opt.step()
-    print(f"gradient={scale:>6}: moved by {1.0 - w.item():.6f}")   # both ~0.001
-```
 
 ### A learning-rate range test in plain Python
 Minibatch SGD on a one-weight regression, with η ramped exponentially from 1e-4 to 10 and the run stopped

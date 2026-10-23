@@ -5,7 +5,8 @@ name: Job queues & durable workers (Celery / ARQ + job-status endpoint)
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/background-jobs-durable-workers
@@ -38,6 +39,191 @@ asyncio-native; both need idempotent jobs.
   not send the email twice), retry classification for 429s, per-step progress, and concurrency per queue.
 - **What you can skip.** Broker internals (AMQP details, Redis data structures). Know at-least-once
   delivery, visibility timeouts and late acks; that covers most agent-job incidents.
+
+## Lab
+### Task
+Make a corpus-summarisation job safe under at-least-once delivery, the same shape as a long agent run.
+A fake in-memory broker and fake model stand in for Redis, ARQ or Celery and the provider, so it runs
+offline. Time box: 60-90 minutes. Prerequisites: BackgroundTasks and Idempotency keys.
+- **The 202 contract:** commit the job row before enqueueing, answer 202 with a job id and `Location`.
+- **Status endpoint:** 404 for missing jobs and for jobs owned by someone else.
+- **Idempotent worker:** a redelivered job is a no-op, a retry skips documents already summarised, and
+  the email goes out once.
+- **Honest failure:** out of tries, the row says `failed` with the error class, never stuck in `running`.
+
+### Starter code
+Save as `lab_jobs.py`. Needs `pip install fastapi httpx pytest` (checked with FastAPI 0.161.1,
+Starlette 1.9.0, httpx 0.28.1, pytest 9.1.1, Python 3.12). `drain()` plays the worker process.
+
+```python
+import asyncio, uuid
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+app = FastAPI()
+JOBS: dict[str, dict] = {}             # your job table: the source of truth, not the broker
+SUMMARIES: dict[str, str] = {}         # doc id -> summary (an idempotent upsert target)
+QUEUE: list[tuple[str, str]] = []      # fake broker, at-least-once: (job_id, corpus_id)
+ENQUEUED_WITH: list[str | None] = []   # job row status seen at enqueue time (tests read it)
+CORPORA = {"c1": ["d1", "d2", "d3", "d4"]}
+CALLS = {"llm": 0, "emails": 0}
+
+class TransientLLMError(Exception):     # a 429, 5xx or timeout from the provider
+    pass
+
+class FakeLLM:
+    def __init__(self, fail_once_on=(), always_fail=False):
+        self.fail_once_on, self.always_fail = set(fail_once_on), always_fail
+    async def summarize(self, doc: str) -> str:
+        CALLS["llm"] += 1
+        if self.always_fail or doc in self.fail_once_on:
+            self.fail_once_on.discard(doc)
+            raise TransientLLMError("429 rate limited")
+        return f"summary of {doc}"
+
+async def send_email(owner: str, job_id: str) -> None:   # a side effect the user must get once
+    CALLS["emails"] += 1
+
+def enqueue(job_id: str, corpus_id: str) -> None:
+    ENQUEUED_WITH.append(JOBS.get(job_id, {}).get("status"))
+    QUEUE.append((job_id, corpus_id))
+
+class Req(BaseModel):
+    user_id: str
+    corpus_id: str
+
+@app.post("/jobs/summaries")
+async def create(body: Req, response: Response):
+    # YOUR CODE 1: write the job row (owner, status "queued", progress "0/0", error None)
+    #              BEFORE calling enqueue(), answer 202 with {"job_id": ...} and a
+    #              Location header of /jobs/{job_id}.
+    raise NotImplementedError
+
+@app.get("/jobs/{job_id}")
+async def status(job_id: str, user_id: str):        # user_id: from your auth dependency in real code
+    job = JOBS.get(job_id)
+    # YOUR CODE 2: 404 (not 403) when the job is missing or belongs to another user.
+    return {"status": job["status"], "progress": job["progress"], "error": job["error"]}
+
+async def summarize_corpus(llm: FakeLLM, job_id: str, corpus_id: str, job_try: int, max_tries: int):
+    """Worker body. The broker may deliver a job twice; raising TransientLLMError asks for a retry."""
+    # BUG: not safe under at-least-once delivery or retries.
+    # YOUR CODE 3: return at once if the job already succeeded; skip docs already summarised;
+    #              send the email exactly once; on the last try (or any other exception) set
+    #              status "failed" with error = the exception class name, then re-raise.
+    job = JOBS[job_id]
+    job["status"] = "running"
+    docs = CORPORA[corpus_id]
+    for i, doc in enumerate(docs, 1):
+        SUMMARIES[doc] = await llm.summarize(doc)
+        job["progress"] = f"{i}/{len(docs)}"
+    await send_email(job["owner"], job_id)
+    job["status"] = "succeeded"
+
+async def drain(llm: FakeLLM, max_tries: int = 3) -> None:
+    """Fake worker loop: a TransientLLMError puts the job back on the queue until max_tries."""
+    tries: dict[str, int] = {}
+    while QUEUE:
+        job_id, corpus_id = QUEUE.pop(0)
+        tries[job_id] = tries.get(job_id, 0) + 1
+        try:
+            await summarize_corpus(llm, job_id, corpus_id, tries[job_id], max_tries)
+        except TransientLLMError:
+            if tries[job_id] < max_tries:
+                QUEUE.append((job_id, corpus_id))
+
+if __name__ == "__main__":
+    client = TestClient(app)
+    r = client.post("/jobs/summaries", json={"user_id": "u1", "corpus_id": "c1"})
+    job_id = r.json()["job_id"]
+    print(r.status_code, r.headers["location"] == f"/jobs/{job_id}")
+    asyncio.run(drain(FakeLLM(fail_once_on={"d3"})))          # one 429 on d3, then a retry
+    print(client.get(f"/jobs/{job_id}", params={"user_id": "u1"}).json())
+    QUEUE.append((job_id, "c1")); asyncio.run(drain(FakeLLM()))  # the broker redelivers
+    print(CALLS, "| other user:", client.get(f"/jobs/{job_id}", params={"user_id": "u2"}).status_code)
+```
+
+### Expected output
+With a correct solution, `python lab_jobs.py` prints:
+
+```
+202 True
+{'status': 'succeeded', 'progress': '4/4', 'error': None}
+{'llm': 5, 'emails': 1} | other user: 404
+```
+
+### Tests
+Save as `test_lab_jobs.py` and run `pytest -q`. On the starter all five fail: a 500 instead of 202, a 200
+for another user, 8 model calls and 2 emails on redelivery, 7 calls on retry, and a row left `running`.
+
+```python
+import asyncio
+import pytest
+from fastapi.testclient import TestClient
+from lab_jobs import CALLS, ENQUEUED_WITH, JOBS, QUEUE, SUMMARIES, FakeLLM, app, drain
+
+client = TestClient(app, raise_server_exceptions=False)
+
+@pytest.fixture(autouse=True)
+def reset():
+    for store in (JOBS, SUMMARIES, CALLS):
+        store.clear()
+    QUEUE.clear(); ENQUEUED_WITH.clear(); CALLS.update(llm=0, emails=0)
+
+def seed(job_id="j1"):                                   # a job row plus its queue message
+    JOBS[job_id] = {"owner": "u1", "status": "queued", "progress": "0/0", "error": None}
+    QUEUE.append((job_id, "c1"))
+
+def test_create_commits_row_before_enqueue_and_answers_202():
+    r = client.post("/jobs/summaries", json={"user_id": "u1", "corpus_id": "c1"})
+    assert r.status_code == 202
+    job_id = r.json()["job_id"]
+    assert r.headers["location"] == f"/jobs/{job_id}"
+    assert ENQUEUED_WITH == ["queued"]                 # the worker can always find the row
+
+def test_status_hides_other_users_jobs():
+    seed()
+    assert client.get("/jobs/j1", params={"user_id": "u1"}).json()["status"] == "queued"
+    assert client.get("/jobs/j1", params={"user_id": "u2"}).status_code == 404
+    assert client.get("/jobs/nope", params={"user_id": "u1"}).status_code == 404
+
+def test_redelivery_after_success_is_a_no_op():
+    seed(); asyncio.run(drain(FakeLLM()))
+    QUEUE.append(("j1", "c1")); asyncio.run(drain(FakeLLM()))
+    assert CALLS == {"llm": 4, "emails": 1}
+
+def test_retry_resumes_without_paying_twice():
+    seed(); asyncio.run(drain(FakeLLM(fail_once_on={"d3"})))
+    assert JOBS["j1"]["status"] == "succeeded"
+    assert CALLS == {"llm": 5, "emails": 1}            # d1, d2, failed d3, then d3, d4
+
+def test_out_of_tries_marks_the_row_failed():
+    seed(); asyncio.run(drain(FakeLLM(always_fail=True), max_tries=3))
+    assert JOBS["j1"]["status"] == "failed"
+    assert JOBS["j1"]["error"] == "TransientLLMError"
+    assert CALLS["emails"] == 0
+```
+
+### Failure scenarios
+- **Enqueue before writing the row.** `ENQUEUED_WITH` records `None`; with a real broker a fast worker
+  logs "job not found". Debug: log the row's status inside `enqueue()` and fix the order.
+- **Mark `succeeded` before sending the email.** Tests pass, but a crash between the two loses the
+  email for good. Debug: kill the worker between the two lines and replay; record the email as its own
+  idempotent step (a flag or key per job).
+- **Catch every exception and return.** `drain()` never retries, so the retry test fails: the job ends
+  after one 429 with d3 and d4 unsummarised. Debug: only `TransientLLMError` may propagate for a retry;
+  classify errors.
+- **Re-raise on the last try without setting `failed`.** The row stays `running` and the status endpoint
+  lies forever. Debug: alert on rows `running` longer than `job_timeout`.
+
+### Submission
+- **Code:** `lab_jobs.py` with the three YOUR CODE steps done and the fakes unchanged.
+- **Test run:** `pytest -q` showing 5 passed.
+- **Trace:** the output of `python lab_jobs.py`, matching the expected output.
+- **Note (3-5 sentences):** how the same checks map onto an ARQ job (`ctx["job_try"]`, `arq.Retry`)
+  or a Celery task with `task_acks_late=True`, and how you would size `max_jobs` for a rate limit.
+- **Evaluated on:** passing tests, one email per job, no repeated model calls, and no row stuck `running`.
 
 ## Why it exists
 - **Intermediaries cut long requests.** Connections that run or idle too long are dropped, commonly after

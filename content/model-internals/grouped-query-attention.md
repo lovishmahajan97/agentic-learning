@@ -5,7 +5,8 @@ name: Grouped-query attention (GQA)
 kind: concept
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - model-internals/multi-head-attention
@@ -142,6 +143,20 @@ flowchart TD
     G2 --> A
     A --> O["W_O and residual stream"]
 ```
+
+## Misconceptions
+- **"GQA cuts attention compute by sharing work across heads."** Only keys and values are shared; every
+  query head still attends, so attention FLOPs are unchanged. The saving is cache memory and bytes read
+  per decode step, both down by h/g.
+- **"A GQA model makes every agent step faster."** Prefill is compute-bound, so ingesting a large tool
+  result and time-to-first-token barely change; the gain shows in decode throughput and resident
+  sessions.
+- **"You can turn an MHA checkpoint into GQA by averaging heads."** Mean-pooling is only the start; without
+  continued pre-training of about 5% of the original compute, perplexity jumps.
+- **"GQA and KV-cache quantization are alternatives."** They are orthogonal and multiply: 8 KV heads give
+  128 KB per token, and an FP8 cache halves that to 64 KB.
+- **"More tensor-parallel GPUs always shrink the per-GPU cache."** Above g, KV heads must be replicated,
+  so per-GPU cache stops shrinking; keep the TP degree at or below g and dividing it.
 
 ## Examples
 ### Mapping query heads onto shared KV heads, and the cache table

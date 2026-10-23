@@ -5,7 +5,8 @@ name: tenacity
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - serving-inference/retry-strategies
@@ -39,6 +40,148 @@ repeat.
   idempotency keys on write tools.
 - **What you can skip.** Writing custom backoff math. `wait_random_exponential` plus a stop budget covers
   almost every agent call.
+
+## Lab
+### Task
+Wrap an agent's `create_ticket` write tool in a tenacity policy that retries only transient errors,
+honors a capped `Retry-After`, reuses one idempotency key across retries and hands permanent errors back
+to the model. The agent goal is a write tool that can be retried without creating duplicate tickets.
+Time box: 45-60 min.
+- **Prerequisites:** Exceptions & custom exception hierarchies; Dependency injection & interface boundaries.
+- **Setup:** Python 3.10+, `pip install tenacity pytest` (checked with tenacity 9.2.1). Save the starter as
+  `lab.py`, the tests as `test_lab.py`.
+- **No real sleeping and no network:** `sleep` is injected (tenacity's `Retrying(sleep=...)`) and the
+  ticketing API is a scripted fake.
+
+### Starter code
+```python
+"""Lab: a retrying, idempotent create_ticket tool for an agent. Run: python lab.py"""
+from __future__ import annotations
+import itertools
+from typing import Callable
+from tenacity import (RetryCallState, Retrying, retry_if_exception_type, stop_after_attempt,
+                      wait_exponential)
+
+class Transient(Exception):                  # adapters map 429, 5xx and timeouts to this
+    def __init__(self, msg: str, retry_after: float | None = None) -> None:
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+class Permanent(Exception):                  # adapters map 4xx to this: the model should see it
+    pass
+
+class FakeTicketAPI:                         # stands in for the ticketing service
+    def __init__(self, script: list) -> None:
+        self.script, self.keys = list(script), []
+    def create(self, title: str, idempotency_key: str) -> str:
+        self.keys.append(idempotency_key)
+        outcome = self.script.pop(0) if self.script else "ok"
+        if isinstance(outcome, Exception):
+            raise outcome
+        return f"ticket for {title!r} (key {idempotency_key})"
+
+FALLBACK = wait_exponential(multiplier=1, max=8)   # deterministic for the lab; add jitter in production
+MAX_HINT = 30.0
+
+def wait_retry_after(state: RetryCallState) -> float:
+    # YOUR CODE HERE: if the failed attempt raised Transient with retry_after set, wait
+    # min(retry_after, MAX_HINT); otherwise return FALLBACK(state)
+    raise NotImplementedError
+
+def make_tool(api: FakeTicketAPI, sleep: Callable[[float], None],
+              new_key: Callable[[], str]) -> Callable[[str], dict]:
+    # YOUR CODE HERE: return create_ticket(title) -> dict
+    # - one idempotency key per create_ticket call, reused by every retry of that call
+    # - retry only Transient, at most 4 attempts, wait with wait_retry_after, sleep via `sleep`
+    # - an exhausted Transient re-raises the original exception, not tenacity.RetryError
+    # - Permanent: no retry, return {"content": "error: <message>", "is_error": True}
+    # - success: return {"content": <api result>, "is_error": False}
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    slept: list[float] = []
+    keys = (f"k{i}" for i in itertools.count(1))
+    api = FakeTicketAPI([Transient("503"), Transient("429", retry_after=5), "ok",
+                         Permanent("400 title too long")])
+    tool = make_tool(api, sleep=slept.append, new_key=lambda: next(keys))
+    print(tool("Refund A17"))
+    print(tool("x" * 300)["content"])
+    print("attempt keys:", api.keys)
+    print("slept:", slept)
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly (tenacity 9.2.1 hands `sleep` floats):
+
+```
+{'content': "ticket for 'Refund A17' (key k1)", 'is_error': False}
+error: 400 title too long
+attempt keys: ['k1', 'k1', 'k1', 'k2']
+slept: [1.0, 5.0]
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution
+passes all 5 (Python 3.12, tenacity 9.2.1, pytest 9.1).
+
+```python
+import itertools
+import pytest
+from lab import FakeTicketAPI, Permanent, Transient, make_tool
+
+def build(script):
+    api, slept = FakeTicketAPI(script), []
+    keys = (f"k{i}" for i in itertools.count(1))
+    return api, slept, make_tool(api, sleep=slept.append, new_key=lambda: next(keys))
+
+def test_transient_errors_retry_with_one_key():
+    api, slept, tool = build([Transient("503"), Transient("503")])
+    out = tool("Refund A17")
+    assert out["is_error"] is False and "k1" in out["content"]
+    assert api.keys == ["k1", "k1", "k1"] and slept == [1, 2]
+
+def test_retry_after_is_honored_and_capped():
+    api, slept, tool = build([Transient("429", retry_after=5), Transient("429", retry_after=120)])
+    tool("Refund A17")
+    assert slept == [5, 30]
+
+def test_permanent_error_goes_to_the_model_without_retry():
+    api, slept, tool = build([Permanent("404 order Z99 not found")])
+    assert tool("Refund Z99") == {"content": "error: 404 order Z99 not found", "is_error": True}
+    assert api.keys == ["k1"] and slept == []
+
+def test_exhausted_retries_reraise_the_original_error():
+    api, slept, tool = build([Transient("503")] * 5)
+    with pytest.raises(Transient, match="503"):
+        tool("Refund A17")
+    assert len(api.keys) == 4 and slept == [1, 2, 4]
+
+def test_each_logical_call_gets_a_fresh_key():
+    api, slept, tool = build([])
+    tool("a"); tool("b")
+    assert api.keys == ["k1", "k2"]
+```
+
+### Failure scenarios
+- **Generate the idempotency key inside the retried block.** `test_transient_errors_retry_with_one_key`
+  shows `['k1', 'k2', 'k3']`: against a real API each retry after a timeout could create a new ticket.
+  Log the key per attempt (or read `api.keys`); it must be constant within one tool call.
+- **Leave out `reraise=True`.** The exhausted case raises `tenacity.RetryError` and `pytest.raises(Transient)`
+  fails; in an agent, error handlers keyed on your exception types stop matching. Read
+  `RetryError.last_attempt.exception()` to see the original.
+- **Retry on every exception (the default `retry`).** The permanent-error test sees four attempts and
+  three sleeps for a 404 the model could have fixed. Print `api.keys` and `slept` after one permanent error.
+- **Forget the `MAX_HINT` cap.** A buggy or hostile `Retry-After: 120` parks the agent step for two minutes;
+  the capped test shows `[5, 120]`. Add a log line in `wait_retry_after` with the raw hint and the chosen wait.
+
+### Submission
+- **`lab.py`** with `wait_retry_after` and `make_tool` implemented, one tenacity policy, no hand-written loop.
+- **A green test run** (5 passed) and the output of `python lab.py`.
+- **A `before_sleep` hook** that logs attempt number, wait and exception class, with one sample log line.
+- **A short note:** where you would switch `FALLBACK` to `wait_random_exponential` and why the SDK's own
+  `max_retries` must be 0 when this policy is in place.
+- **Evaluated on:** tests passing, a constant key per logical call, permanent errors never retried, and the
+  original exception surfacing after exhaustion.
 
 ## Why it exists
 - **Remote calls fail transiently, constantly.** A production AI service makes thousands of chat

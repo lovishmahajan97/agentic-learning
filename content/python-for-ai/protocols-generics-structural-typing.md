@@ -5,7 +5,8 @@ name: Protocols, generics and structural typing
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/type-hints
@@ -37,6 +38,218 @@ without inheritance. Generics keep element types flowing, so `first(xs: list[Mes
   retry and tracing decorators with `ParamSpec` so tool calls stay checked.
 - **What you can skip.** Deep variance theory. Remember "accept `Sequence`, return `list`" and that
   `@runtime_checkable` checks names only.
+
+## Lab
+### Task
+Finish a provider-agnostic agent core: a scripted fake LLM that drives the loop in tests, an adapter
+that fits a vendor search client to your `Tool` Protocol without inheritance, and a retry decorator
+typed with `ParamSpec` so the checker still sees the wrapped tool's signature.
+
+Time box: 60-90 minutes. Do "How it works" here and the `type-hints` lesson first.
+- **Implement** `ScriptedLLM.complete`, `SearchTool.run` and `retry` in `lab.py`.
+- **Keep** `run_agent`, the Protocols and `VendorSearch` unchanged; they are the contract and the
+  third-party code.
+- **Run** on Python 3.10+ with pytest and mypy (checked on Python 3.12.14, pytest 9.1.1, mypy 2.4.0).
+
+### Starter code
+Save as `lab.py`. It runs and stops at the first unimplemented part.
+
+```python
+"""lab.py: a provider-agnostic agent core behind small Protocols."""
+from __future__ import annotations
+
+import functools
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any, ParamSpec, Protocol, TypeVar, runtime_checkable
+
+@dataclass
+class Reply:
+    text: str | None = None
+    tool: str | None = None
+    args: dict[str, object] = field(default_factory=dict)
+
+class LLMClient(Protocol):
+    def complete(self, messages: list[dict[str, str]], /) -> Reply: ...
+
+@runtime_checkable
+class Tool(Protocol):
+    @property
+    def name(self) -> str: ...
+    def run(self, args: dict[str, object], /) -> str: ...
+
+def run_agent(llm: LLMClient, tools: dict[str, Tool], task: str, max_steps: int = 5) -> str:
+    messages = [{"role": "user", "content": task}]
+    for _ in range(max_steps):
+        r = llm.complete(messages)
+        if r.tool is None:
+            return r.text or ""
+        result = tools[r.tool].run(r.args) if r.tool in tools else f"unknown tool {r.tool}"
+        messages.append({"role": "tool", "content": result})
+    return "stopped: step limit"
+
+class VendorSearch:                       # third-party client: you cannot change it
+    DOCS = [{"title": "Refund policy", "path": "docs/refunds.md"},
+            {"title": "Shipping times", "path": "docs/shipping.md"}]
+    def search(self, query: str, k: int = 3) -> list[dict[str, str]]:
+        words = query.lower().split()
+        return [d for d in self.DOCS if any(w in d["title"].lower() for w in words)][:k]
+
+class ScriptedLLM:
+    """Fake LLMClient: returns `replies` in order and records a snapshot of every messages list."""
+    def __init__(self, replies: list[Reply]) -> None:
+        self.replies = list(replies)
+        self.seen: list[list[dict[str, str]]] = []
+    def complete(self, messages: list[dict[str, str]], /) -> Reply:
+        raise NotImplementedError("LAB: ScriptedLLM.complete")
+
+class SearchTool:
+    """Adapter that satisfies Tool without inheriting from it. run({"query": q}) returns
+    'Top hit: <title> (<path>)' for the first vendor result, or 'no results'."""
+    def __init__(self, vendor: VendorSearch) -> None:
+        self.vendor = vendor
+    @property
+    def name(self) -> str:
+        return "search"
+    def run(self, args: dict[str, object], /) -> str:
+        raise NotImplementedError("LAB: SearchTool.run")
+
+class TransientError(Exception): ...
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def retry(times: int):  # type: ignore[no-untyped-def]
+    # LAB: retry on TransientError up to `times` attempts in total (re-raise the last one),
+    # let every other exception through at once, and keep the wrapped signature
+    # (Callable[P, R] -> Callable[P, R] plus functools.wraps). Remove the type: ignore.
+    def deco(fn: Callable[..., Any]) -> Callable[..., Any]:
+        def inner(*args: Any, **kwargs: Any) -> Any:
+            return fn(*args, **kwargs)
+        return inner
+    return deco
+
+ATTEMPTS = [0]
+
+@retry(3)
+def flaky_lookup(order_id: str) -> str:
+    ATTEMPTS[0] += 1
+    if ATTEMPTS[0] < 3:
+        raise TransientError("orders API timed out")
+    return f"{order_id}: shipped"
+
+def main() -> None:
+    llm = ScriptedLLM([Reply(tool="search", args={"query": "refund"}), Reply(text="See the refund policy.")])
+    print("answer:", run_agent(llm, {"search": SearchTool(VendorSearch())}, "How do refunds work?"))
+    print("tool result seen by the model:", llm.seen[-1][-1]["content"])
+    print("flaky_lookup:", flaky_lookup("ORD-1"), "after", ATTEMPTS[0], "attempts")
+
+if __name__ == "__main__":
+    print("SearchTool is a Tool:", isinstance(SearchTool(VendorSearch()), Tool))
+    try:
+        main()
+    except (NotImplementedError, TransientError) as e:
+        print(f"not done yet: {type(e).__name__}: {e}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints:
+
+```
+SearchTool is a Tool: True
+answer: See the refund policy.
+tool result seen by the model: Top hit: Refund policy (docs/refunds.md)
+flaky_lookup: ORD-1: shipped after 3 attempts
+```
+
+### Tests
+Save as `test_lab.py` and run `python -m pytest -q`. On the starter all five fail: four on
+`NotImplementedError` or a missing retry, and the checker test because mypy reports an untyped decorator.
+
+```python
+import inspect, pathlib, shutil, subprocess, sys
+import pytest
+import lab
+from lab import Reply, ScriptedLLM, SearchTool, Tool, TransientError, VendorSearch, retry, run_agent
+
+def test_loop_runs_on_the_fake_and_adapter():
+    llm = ScriptedLLM([Reply(tool="search", args={"query": "refund"}), Reply(text="See the refund policy.")])
+    assert run_agent(llm, {"search": SearchTool(VendorSearch())}, "refunds?") == "See the refund policy."
+    assert len(llm.seen) == 2
+    assert len(llm.seen[0]) == 1, "seen must hold snapshots, not the loop's live list"
+    assert llm.seen[1][-1] == {"role": "tool", "content": "Top hit: Refund policy (docs/refunds.md)"}
+
+def test_adapter_no_results_and_structural_match():
+    tool = SearchTool(VendorSearch())
+    assert tool.run({"query": "weather"}) == "no results"
+    assert isinstance(tool, Tool) and not isinstance(VendorSearch(), Tool)
+
+def test_retry_retries_transient_only():
+    calls: list[str] = []
+    @retry(3)
+    def f(x: str) -> str:
+        calls.append(x)
+        if len(calls) < 3:
+            raise TransientError("blip")
+        return x.upper()
+    assert f("a") == "A" and len(calls) == 3
+
+    @retry(2)
+    def always() -> None:
+        calls.append("x"); raise TransientError("down")
+    calls.clear()
+    with pytest.raises(TransientError):
+        always()
+    assert len(calls) == 2
+
+    @retry(5)
+    def bug() -> None:
+        calls.append("b"); raise KeyError("text")
+    calls.clear()
+    with pytest.raises(KeyError):
+        bug()
+    assert calls == ["b"], "a bug must not be retried"
+
+def test_retry_keeps_name_and_signature():
+    def g(order_id: str, *, verbose: bool = False) -> str: return order_id
+    w = retry(2)(g)
+    assert w.__name__ == "g" and inspect.signature(w) == inspect.signature(g)
+
+def test_checker_sees_through_the_decorator(tmp_path: pathlib.Path):
+    pytest.importorskip("mypy")
+    shutil.copy(lab.__file__, tmp_path / "lab.py")
+    (tmp_path / "check_types.py").write_text(
+        "from lab import LLMClient, ScriptedLLM, SearchTool, Tool, VendorSearch, flaky_lookup\n"
+        "llm: LLMClient = ScriptedLLM([])\n"
+        "tool: Tool = SearchTool(VendorSearch())\n"
+        "flaky_lookup(123)\n")
+    out = subprocess.run([sys.executable, "-m", "mypy", "--strict", "--no-error-summary", "check_types.py"],
+                         cwd=tmp_path, capture_output=True, text=True).stdout
+    errors = [ln for ln in out.splitlines() if ": error:" in ln]
+    assert len(errors) == 1 and errors[0].startswith("check_types.py:4:"), out
+    assert 'incompatible type "int"' in errors[0], out
+```
+
+### Failure scenarios
+- **Store the live list: `self.seen.append(messages)`.** The first test fails on `len(llm.seen[0]) == 1`,
+  because `run_agent` keeps appending to the one list every snapshot points at. Print `id()` of each
+  stored list; identical ids mean aliasing, so copy the messages.
+- **Leave out `functools.wraps`.** Retries work but `__name__` is `inner` and the signature is
+  `(*args, **kwargs)`, so traces and tool registries that read the signature break. Check with
+  `inspect.signature(flaky_lookup)`.
+- **Catch `Exception` in the retry loop.** The `KeyError` case is called five times instead of once, a
+  bug retried at provider prices. The `calls` list in the test shows the repeat count.
+- **Type the decorator `Callable[..., Any]`.** mypy accepts `flaky_lookup(123)`, so the checker test
+  finds zero errors in `check_types.py`. Add `reveal_type(flaky_lookup)` and look for `def (*Any, **Any)`.
+
+### Submission
+- **`lab.py` and `test_lab.py`,** plus the `python -m pytest -q` output showing 5 passed.
+- **The output of `mypy --strict lab.py`,** clean, with the `type: ignore` removed.
+- **One more adapter:** a second `Tool` around a different fake vendor shape (for example a
+  `lookup(id)` method returning a dict), added to `run_agent` with a scripted reply that calls it.
+- **A short note:** which failure scenario you reproduced and what the debugging step showed.
+- **Evaluation:** tests pass unmodified, no class in `lab.py` inherits from `Tool` or `LLMClient`, and
+  mypy reports nothing.
 
 ## Why it exists
 - **Python code targets behaviour, not names.** "Anything with an `embed(texts)` method" is a complete

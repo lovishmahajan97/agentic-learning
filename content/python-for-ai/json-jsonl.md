@@ -5,7 +5,8 @@ name: JSON / JSONL
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - prompting/structured-outputs-json-mode
@@ -38,6 +39,166 @@ stream and survive crashes. Watch NaN, big integers and encoding.
   line numbers, one writer per file, and a stable ID per record for resumable eval and batch jobs.
 - **What you can skip.** The RFC's grammar details. Know the six types, what Python emits that is not
   valid JSON, and why JSONL beats one big array.
+
+## Lab
+### Task
+Build the trace I/O an agent's eval dashboard depends on: a strict writer for tool-step records, a fixed
+reader that survives a killed worker and scraped text, and a per-tool error rate computed in streaming
+fashion. Time box: 45 minutes.
+- **Prerequisites:** this lesson's How it works, plus generators and pytest.
+- **The reader is shipped buggy:** it uses `str.splitlines()` and has no torn-tail or line-number handling.
+  Fix it rather than rewriting the tests.
+
+### Starter code
+```python
+# trace_io.py  (stdlib only, checked on Python 3.9 and later)
+import json
+import math
+import tempfile
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+
+LS = chr(0x2028)   # LINE SEPARATOR: str.splitlines() splits on it, JSONL must not
+
+
+def dumps_strict(record: dict) -> str:
+    # FILL IN 1: one JSONL line ending in "\n": no indent, UTF-8 text kept (no \u escapes),
+    # NaN or Infinity anywhere raises ValueError, datetime -> isoformat(), Decimal -> str,
+    # set -> sorted list, any other unknown type raises TypeError naming the type.
+    raise NotImplementedError
+
+
+def iter_trace(path: Path):
+    """Yield (lineno, record) for each step. BUGGY: fix it (FILL IN 2)."""
+    # Must split on "\n" only, skip blank lines, silently drop a torn LAST line
+    # (no trailing newline), and raise ValueError("<path>:<lineno>: ...") for any other bad line.
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        yield lineno, json.loads(line)
+
+
+def tool_error_rate(path: Path) -> dict:
+    # FILL IN 3: {tool: share of that tool's steps whose result has an "error" key}, rounded to 2
+    # places, keys sorted. Use iter_trace so a 2 GB trace streams in flat memory.
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    steps = [
+        {"step": 1, "tool": "search", "at": datetime(2026, 1, 5, 9, 30), "result": {"hits": 3}},
+        {"step": 2, "tool": "lookup_order", "result": {"error": "order_id must be a string"}},
+        {"step": 3, "tool": "lookup_order", "result": {"text": "Café" + LS + "note", "total": Decimal("42.50")}},
+        {"step": 4, "tool": "search", "result": {"hits": 0, "tags": {"b", "a"}}},
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "trace.jsonl"
+        with p.open("w", encoding="utf-8") as f:
+            for s in steps:
+                f.write(dumps_strict(s))
+            f.write('{"step": 5, "tool": "sea')          # the worker was killed mid-write
+        print("line 1:", p.read_text(encoding="utf-8").split("\n")[0])
+        try:
+            dumps_strict({"score": math.nan})
+        except ValueError:
+            print("nan rejected: ValueError")
+        print("records read:", sum(1 for _ in iter_trace(p)))
+        print("error rate:", tool_error_rate(p))
+```
+
+### Expected output
+```text
+line 1: {"step": 1, "tool": "search", "at": "2026-01-05T09:30:00", "result": {"hits": 3}}
+nan rejected: ValueError
+records read: 4
+error rate: {'lookup_order': 0.5, 'search': 0.0}
+```
+
+### Tests
+```python
+# test_trace_io.py  (run: pytest -q)
+import json
+import math
+from datetime import datetime
+from decimal import Decimal
+
+import pytest
+
+from trace_io import dumps_strict, iter_trace, tool_error_rate
+
+
+def line(obj):                     # plain writer, so reader tests do not depend on dumps_strict
+    return json.dumps(obj, ensure_ascii=False) + "\n"
+
+
+def write(tmp_path, text):
+    p = tmp_path / "t.jsonl"
+    p.write_text(text, encoding="utf-8")
+    return p
+
+
+def test_one_line_and_types():
+    out = dumps_strict({"at": datetime(2026, 1, 5), "amt": Decimal("1.10"), "tags": {"b", "a"},
+                         "text": "a\nb Café"})
+    assert out.endswith("\n") and out.count("\n") == 1
+    assert "Café" in out
+    assert json.loads(out) == {"at": "2026-01-05T00:00:00", "amt": "1.10", "tags": ["a", "b"],
+                                "text": "a\nb Café"}
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf])
+def test_nan_rejected_at_write_time(bad):
+    with pytest.raises(ValueError):
+        dumps_strict({"score": bad})
+
+
+def test_unknown_type_names_type():
+    with pytest.raises(TypeError, match="complex"):
+        dumps_strict({"z": 1j})
+
+
+def test_u2028_does_not_split_a_record(tmp_path):
+    p = write(tmp_path, line({"text": "x" + chr(0x2028) + "y"}) + line({"text": "z"}))
+    assert [r["text"] for _, r in iter_trace(p)] == ["x" + chr(0x2028) + "y", "z"]
+
+
+def test_torn_last_line_dropped(tmp_path):
+    p = write(tmp_path, line({"step": 1}) + '{"step": 2, "to')
+    assert [r["step"] for _, r in iter_trace(p)] == [1]
+
+
+def test_bad_middle_line_names_line(tmp_path):
+    p = write(tmp_path, line({"step": 1}) + "\n" + "{oops\n" + line({"step": 3}))
+    with pytest.raises(ValueError, match=r"t\.jsonl:3"):
+        list(iter_trace(p))
+
+
+def test_error_rate(tmp_path):
+    rows = [{"tool": "a", "result": {"error": "x"}}, {"tool": "a", "result": {}},
+            {"tool": "a", "result": {}}, {"tool": "b", "result": {"ok": 1}}]
+    p = write(tmp_path, "".join(line(r) for r in rows))
+    assert tool_error_rate(p) == {"a": 0.33, "b": 0.0}
+```
+On the starter all 8 fail: the writer and error-rate tests with `NotImplementedError`, the U+2028 and
+torn-tail tests with `JSONDecodeError` from the buggy reader, and the middle-line test because the error
+does not name `t.jsonl:3`.
+
+### Failure scenarios
+- **Inject `indent=2` in the writer.** The one-line test fails and the reader dies on line 1 with a lone
+  `{`. Debug by `head -c 200` on the file: a record that spans lines is the tell.
+- **Inject dropping `allow_nan=False`.** The NaN test fails, and in a real run a TypeScript dashboard
+  rejects the file while Python reads it. Grep the file for `NaN` or `Infinity`.
+- **Inject the torn-tail rule on every line, not just the last.** Real corruption in the middle is
+  silently skipped and error rates drift. Count lines with `wc -l` against records read.
+- **Inject `str.splitlines()` back.** Only records with scraped text break, with "Unterminated string".
+  Print the failing line number and inspect it for U+2028 or U+0085.
+
+### Submission
+- **Code:** `trace_io.py` plus the unchanged test file.
+- **Test run:** `pytest -q` showing 8 passed and the Python version.
+- **Output:** the four demo lines, matching Expected output exactly.
+- **Memory note:** one sentence on why `tool_error_rate` stays flat in memory on a 2 GB trace.
+- **Evaluation:** tests pass unmodified, the reader never calls `read_text()` or `splitlines()`, and a
+  bad middle line raises with its line number.
 
 ## Why it exists
 - **Agent data is nested records.** A transcript with a variable number of messages, a tool call with

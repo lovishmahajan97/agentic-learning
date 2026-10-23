@@ -5,7 +5,8 @@ name: Tokens per second
 kind: metric
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - serving-inference/tpot
@@ -154,7 +155,54 @@ flowchart TD
     G --> C["Cost per million output tokens"]
 ```
 
+## Misconceptions
+- **"A vendor's tokens/s tells me how fast my users will see text."** It is usually aggregate output, or
+  even input plus output, at high concurrency. A user sees the per-stream rate, about `1 / TPOT`, which
+  falls as concurrency rises.
+- **"Single-stream speed is enough to size a cluster."** One replica at concurrency 64 can produce over
+  ten times the output of concurrency 1, so sizing from a concurrency-1 benchmark overshoots replicas
+  and cost by about that factor.
+- **"Output tokens/s is the load my agents put on the GPU."** Agent steps re-send long transcripts and
+  emit short outputs; in the worked example input is 53× output, so uncached prefill is often the
+  binding number.
+- **"Higher tokens/s means the faster model."** A coarser tokenizer emits fewer tokens for the same text,
+  so compare characters, words or seconds per completed task, not raw tokens/s.
+- **"Throughput at the plateau is my capacity."** Tokens that arrive after the TTFT or TPOT SLO do not
+  count; the sellable figure is goodput at the concurrency where the curves still meet the SLO.
+
 ## Examples
+### Agent scenario: sizing a replica for agent runs
+Illustrative: 50 agent runs per minute, 10 steps each, 8k input and 150 output tokens per step, on a
+replica with 64 in flight, TTFT 500 ms and TPOT 25 ms.
+
+```python
+import math
+
+def aggregate_tok_s(concurrency, n_out, ttft_s, tpot_s):
+    return concurrency * n_out / (ttft_s + (n_out - 1) * tpot_s)
+
+runs_per_min, steps, inp, out = 50, 10, 8_000, 150
+need_out = runs_per_min * steps * out / 60          # output tok/s the agents need
+need_in = runs_per_min * steps * inp / 60           # input tok/s re-sent by the agents
+agg = aggregate_tok_s(64, out, 0.5, 0.025)          # short agent outputs: ~2,272 tok/s
+print(f"need {need_out:,.0f} out tok/s and {need_in:,.0f} in tok/s ({need_in / need_out:.0f}x)")
+print(f"replica gives {agg:,.0f} out tok/s -> {math.ceil(need_out / agg)} replica by output alone")
+# need 1,250 out tok/s and 66,667 in tok/s (53x)
+# replica gives 2,272 out tok/s -> 1 replica by output alone
+```
+
+| Question | Answer | Lesson |
+|---|---|---|
+| Is output capacity enough? | Yes, about 1,250 of ~2,272 tok/s | Output tokens/s says "one replica" |
+| What else is needed? | ~66,667 input tok/s, 53× the output | Measure prefill load before trusting that |
+| Cheapest lever | Prefix caching, so each step prefills only its new tokens | Cuts the input term, not the output one |
+
+- **Why the input term matters.** For an 8B model, the TTFT lesson's illustrative prefill rule (about
+  4.5e14 effective FLOP/s, `2 × N` FLOPs per token) gives roughly 28,000 prefill tokens/s per GPU, so
+  66,667 uncached input tok/s is over two GPUs of prefill alone.
+- **With prefix caching** most of each step's 8k tokens are already cached, and the uncached input rate
+  can fall several-fold.
+
 ### Closed-loop load generator for the concurrency curve
 A small closed-loop load generator against any OpenAI-compatible streaming server: *c* workers each
 send a request, wait for it to finish, and send the next, so concurrency stays near *c* for the
@@ -228,38 +276,6 @@ print(f"${cost_per_million(3.0, 200):.2f} per million at c=1 (200 tok/s)")
 # $0.33 per million at c=64
 # $4.17 per million at c=1 (200 tok/s)
 ```
-
-### Agent scenario: sizing a replica for agent runs
-Illustrative: 50 agent runs per minute, 10 steps each, 8k input and 150 output tokens per step, on a
-replica with 64 in flight, TTFT 500 ms and TPOT 25 ms.
-
-```python
-import math
-
-def aggregate_tok_s(concurrency, n_out, ttft_s, tpot_s):
-    return concurrency * n_out / (ttft_s + (n_out - 1) * tpot_s)
-
-runs_per_min, steps, inp, out = 50, 10, 8_000, 150
-need_out = runs_per_min * steps * out / 60          # output tok/s the agents need
-need_in = runs_per_min * steps * inp / 60           # input tok/s re-sent by the agents
-agg = aggregate_tok_s(64, out, 0.5, 0.025)          # short agent outputs: ~2,272 tok/s
-print(f"need {need_out:,.0f} out tok/s and {need_in:,.0f} in tok/s ({need_in / need_out:.0f}x)")
-print(f"replica gives {agg:,.0f} out tok/s -> {math.ceil(need_out / agg)} replica by output alone")
-# need 1,250 out tok/s and 66,667 in tok/s (53x)
-# replica gives 2,272 out tok/s -> 1 replica by output alone
-```
-
-| Question | Answer | Lesson |
-|---|---|---|
-| Is output capacity enough? | Yes, about 1,250 of ~2,272 tok/s | Output tokens/s says "one replica" |
-| What else is needed? | ~66,667 input tok/s, 53× the output | Measure prefill load before trusting that |
-| Cheapest lever | Prefix caching, so each step prefills only its new tokens | Cuts the input term, not the output one |
-
-- **Why the input term matters.** For an 8B model, the TTFT lesson's illustrative prefill rule (about
-  4.5e14 effective FLOP/s, `2 × N` FLOPs per token) gives roughly 28,000 prefill tokens/s per GPU, so
-  66,667 uncached input tok/s is over two GPUs of prefill alone.
-- **With prefix caching** most of each step's 8k tokens are already cached, and the uncached input rate
-  can fall several-fold.
 
 ## Production patterns
 - **Report cost and time per agent run.** Sum input and output tokens per run from usage fields and

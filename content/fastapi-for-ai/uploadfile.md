@@ -5,7 +5,8 @@ name: UploadFile
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/request-size-limits-and-upload-security
@@ -36,6 +37,166 @@ key, and add your own safety checks.
   hashing for dedup, and passing a key (never the `UploadFile` object) into the agent's run context.
 - **What you can skip.** Multipart parsing internals; know that the whole body is parsed before your
   handler runs, and that the temp file dies with the request.
+
+## Lab
+### Task
+A chat endpoint hands the agent run its `UploadFile` objects, and the run fails with "I/O operation on
+closed file". You persist each attachment in bounded chunks under a generated key, hash and cap it
+while copying, dedupe repeats per tenant, and give the run keys its `read_document` tool can load.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** async endpoints, BackgroundTasks, and this lesson's "Attachments in an agent run".
+- **Runs offline:** a temp directory plays object storage and `asyncio.create_task` plays the agent
+  worker, so the run really outlives the request.
+- **Needs:** `fastapi`, `httpx`, `python-multipart`, `pytest`; checked with FastAPI 0.115.6 and 0.161.1
+  on Python 3.12.
+
+### Starter code
+```python
+# attach_lab.py: chat attachments that outlive the request (FastAPI UploadFile, local "object storage")
+import asyncio, hashlib, os, tempfile, time, uuid
+from fastapi import FastAPI, Form, HTTPException, UploadFile
+from fastapi.testclient import TestClient
+
+CHUNK, MAX_FILE = 64 * 1024, 256 * 1024     # small caps so the lab runs fast
+STORE = tempfile.mkdtemp()                  # stand-in for object storage
+BY_HASH: dict[str, str] = {}                # (tenant:sha256) -> key, for dedup
+RUNS: dict[str, dict] = {}                  # run_id -> result, written by the background run
+
+async def read_document(ref) -> str:
+    """The agent's tool: load an attachment by storage key."""
+    with open(os.path.join(STORE, ref), "rb") as f:
+        return f.read().decode(errors="replace")
+
+async def run_agent(run_id: str, message: str, attachments: list):
+    """Runs after the request has returned, like a real agent run on a worker."""
+    await asyncio.sleep(0.05)
+    try:
+        # YOUR CODE (last): once attachments are dicts with a "key", read by key instead
+        texts = [(await a.read()).decode() for a in attachments]
+        RUNS[run_id] = {"status": "done", "read": texts}
+    except Exception as e:
+        RUNS[run_id] = {"status": "failed", "error": f"{type(e).__name__}: {e}"}
+
+async def persist(tenant: str, f: UploadFile) -> dict:
+    """Copy the upload in CHUNK reads to STORE under a generated key; hash and cap it while copying.
+    Return {"key", "name", "bytes", "sha256", "deduped"}; reuse the stored key for a repeat upload."""
+    # YOUR CODE
+    raise NotImplementedError
+
+app = FastAPI()
+
+@app.post("/v1/chat", status_code=202)
+async def chat(message: str = Form(), tenant: str = Form("t_1"),
+               files: list[UploadFile] | None = None):
+    run_id = uuid.uuid4().hex[:8]
+    attachments = list(files or [])          # YOUR CODE: persist each file before the run starts
+    asyncio.create_task(run_agent(run_id, message, attachments))
+    return {"run_id": run_id,
+            "attachments": [a["key"] if isinstance(a, dict) else a.filename for a in attachments]}
+
+def wait_run(run_id: str, timeout: float = 2.0) -> dict:
+    t0 = time.monotonic()
+    while run_id not in RUNS and time.monotonic() - t0 < timeout:
+        time.sleep(0.02)
+    return RUNS.get(run_id, {"status": "missing"})
+
+if __name__ == "__main__":
+    with TestClient(app) as c:
+        files = [("files", ("../../etc/notes.txt", b"refund window is 30 days", "text/plain"))]
+        r = c.post("/v1/chat", data={"message": "what is the refund window?"}, files=files)
+        body = r.json()
+        print(r.status_code, "| key looks generated:", ".." not in str(body["attachments"]))
+        print("run:", wait_run(body["run_id"]))
+        again = c.post("/v1/chat", data={"message": "again"}, files=files).json()
+        print("same file twice, same key:", again["attachments"] == body["attachments"])
+```
+
+As given it prints `key looks generated: False` and
+`run: {'status': 'failed', 'error': 'ValueError: I/O operation on closed file.'}`: the run started
+after the request closed its upload files.
+
+### Expected output
+```
+202 | key looks generated: True
+run: {'status': 'done', 'read': ['refund window is 30 days']}
+same file twice, same key: True
+```
+
+### Tests
+```python
+# test_attach_lab.py: run with `pytest -q`
+import asyncio, hashlib, io, os
+import pytest
+from fastapi import UploadFile
+from fastapi.testclient import TestClient
+import attach_lab as m
+
+DOC = b"refund window is 30 days"
+
+@pytest.fixture
+def c():
+    m.BY_HASH.clear(); m.RUNS.clear()
+    with TestClient(m.app) as client:          # keeps the event loop alive for background runs
+        yield client
+
+def send(c, *parts, tenant="t_1"):
+    return c.post("/v1/chat", data={"message": "hi", "tenant": tenant},
+                  files=[("files", p) for p in parts])
+
+def test_files_are_stored_under_generated_keys(c):
+    r = send(c, ("../../etc/notes.txt", DOC, "text/plain"))
+    assert r.status_code == 202
+    key = r.json()["attachments"][0]
+    assert ".." not in key and "notes" not in key
+    with open(os.path.join(m.STORE, key), "rb") as f:
+        assert f.read() == DOC
+
+def test_agent_reads_the_attachment_after_the_request(c):
+    r = send(c, ("notes.txt", DOC, "text/plain"))
+    assert m.wait_run(r.json()["run_id"]) == {"status": "done", "read": [DOC.decode()]}
+
+def test_repeat_upload_is_deduplicated_per_tenant(c):
+    k1 = send(c, ("a.txt", DOC, "text/plain")).json()["attachments"][0]
+    k2 = send(c, ("b.txt", DOC, "text/plain")).json()["attachments"][0]
+    k3 = send(c, ("a.txt", DOC, "text/plain"), tenant="t_2").json()["attachments"][0]
+    assert k1 == k2 and k3 != k1
+
+def test_oversized_file_is_rejected(c):
+    r = send(c, ("big.bin", b"\0" * (m.MAX_FILE + 1), "application/octet-stream"))
+    assert r.status_code == 413
+
+def test_persist_reads_in_chunks():
+    sizes = []
+    class Spy(UploadFile):
+        async def read(self, size=-1):
+            sizes.append(size)
+            return await super().read(size)
+    f = Spy(io.BytesIO(b"x" * (3 * m.CHUNK)), filename="x.bin")
+    rec = asyncio.run(m.persist("t_9", f))
+    assert rec["bytes"] == 3 * m.CHUNK and rec["sha256"] == hashlib.sha256(b"x" * (3 * m.CHUNK)).hexdigest()
+    assert sizes and all(s == m.CHUNK for s in sizes)   # never a single whole-file read()
+```
+
+All five fail on the starter: client filenames as keys, the closed-file error, no dedup, no cap, and
+`persist` not implemented.
+
+### Failure scenarios
+- **Inject the original bug:** pass the `UploadFile` list to `run_agent` again. The run result shows
+  `ValueError: I/O operation on closed file.` Debug by logging, inside the run, whether `a.file.closed`
+  is true; anything that outlives the request must get a key, not the object.
+- **Inject `await f.read()` with no size.** Everything still works, but `test_persist_reads_in_chunks`
+  sees one read of `-1`: the whole file lands in memory, which OOMs a pod at 10 parallel 300 MB uploads.
+- **Inject `key = f.filename`.** The generated-key test fails and `../../etc/notes.txt` resolves
+  outside `STORE`. Print `os.path.realpath` of the target before writing to see the traversal.
+
+### Submission
+- **Your `attach_lab.py`** with `persist`, the handler change and the key-based `run_agent`.
+- **A `pytest -q` run** showing 5 passed (then delete the `STORE` temp directory).
+- **The script's printed output**, matching the expected lines.
+- **A short note** on what changes when `STORE` becomes S3 (multipart upload, tenant check in
+  `read_document`) and why the size check here does not protect the API's own temp disk.
+- **Evaluated on:** green tests, chunked reads, generated keys, and no `UploadFile` crossing the
+  request boundary.
 
 ## Why it exists
 - **Files arrive as multipart.** Browsers and HTTP clients send a body split into parts by a boundary

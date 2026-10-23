@@ -5,7 +5,8 @@ name: Retrieval granularity
 kind: decision
 difficulty: core
 est_minutes: 12
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -43,6 +44,59 @@ return the parent, or let the agent expand hits.
   per tool call, and whether expansion is automatic or a decision the agent makes.
 - **What you can skip.** Proposition rewriting and late-interaction models until a golden set shows
   small-to-big with parent dedupe is not enough.
+
+## Decision case
+### Scenario
+A legal-ops team runs a contract-review agent over 12,000 customer contracts, about 15,000 tokens each,
+so 180M tokens. Today it matches and returns 1,024-token chunks (about 176,000 vectors). Pointed
+questions ("what is the liability cap?") are 70% of traffic and often get the clause with the number at
+rank four. Constraints (illustrative figures):
+- **Evidence budget:** at most 4,000 tokens per search call; tasks average three searches.
+- **Index cap:** the current vector-store plan holds 2M vectors; a bigger plan needs a budget request
+  that would land after the deadline.
+- **Latency:** p95 under 8 seconds per task; each extra model step costs roughly 1-2 seconds.
+- **Freshness:** about 50 contracts change per day and must be searchable the same day.
+- **Team and deadline:** two engineers, three weeks, no labelling budget beyond a 60-question golden set.
+
+### Options
+| Option | How it works | Index size | Evidence per call | Latency | Fit to constraints |
+|---|---|---|---|---|---|
+| A. Keep 1,024-token chunks, add a reranker | rerank top 20 chunks, return top 3 | ~176k vectors | 3 × 1,024 = 3,072 tokens | +1 rerank call | cheap, but the diluted cap clause must first reach the top 20 |
+| B. Small-to-big | 128-token children with `parent_id`; return clause parents capped at 1,000 tokens, deduped, max-child scoring | 180M / 128 ≈ 1.41M vectors | ≤ 4 × 1,000 = 4,000 tokens | no extra model step | fits the cap, budget and deadline |
+| C. Sentence snippets plus `read_section` | ~25-token sentences; agent reads parents on demand | 180M / 25 = 7.2M vectors | ~150-token snippets + ~500 per read | +1 model step per read, up to +3 per task | breaks the 2M cap and risks the p95 |
+| D. Proposition retrieval | LLM rewrites the corpus into standalone facts | well above C | small | none at query time | an LLM pass over 180M tokens and on every daily change; too slow to build in three weeks |
+
+### Decision
+Ship **B**, with max-child scoring for pointed questions and a cross-encoder over the deduped parents.
+- **Why it fits:** 128-token children sharpen matching on the cap sentence, and 1.41M vectors stays under
+  the 2M cap. Returning bounded clauses keeps exceptions next to the number at ≤ 4,000 tokens a call,
+  and ≤ 12,000 a task over three searches. It adds no model step, so the p95 is unchanged.
+- **Why not A:** a reranker can only reorder what the diluted vectors retrieve; it treats the symptom.
+- **Why not C:** 7.2M vectors is 3.6 times the cap, and three reads would add about 3-6 seconds.
+- **What would change it:** an approved larger plan and a model that reliably reads before quoting
+  makes C attractive (about 650 tokens per searched-and-expanded hit). Explanatory traffic above
+  roughly half moves scoring to sum or auto-merging. A static corpus with budget makes D worth a trial.
+
+### Trade-offs accepted
+- **Eight times the vectors of today (1.41M vs ~176k).** Watch query p95 and store memory; alert at 80%
+  of the 2M cap, because new contracts keep adding vectors.
+- **Parents capped at 1,000 tokens split long clauses.** Watch the golden-set questions whose answer
+  sits in a split clause, and log how often two parts of one clause both rank.
+- **Max-child scoring favours pointed questions.** Track recall@4 for the 30% explanatory slice
+  separately so a regression there is not hidden by the blended score.
+- **Re-index is a full rebuild once.** Build B into a new index and switch the agent's tool over only
+  after parent-level recall@4 beats A on the golden set.
+
+### Review rubric
+- **Constraints are explicit and numeric:** budget per call, index cap, latency and freshness each get a
+  number, and every option is checked against each one.
+- **Arithmetic is shown and consistent:** vector counts come from corpus tokens ÷ unit size, and evidence
+  per call from k × parent size, with no figure that contradicts another.
+- **Match and return units are named separately,** with parent dedupe and the scoring rule stated.
+- **The rejected options are rejected for a stated constraint,** not by preference.
+- **The write-up names what would flip the decision** and the metric that would show it (for example
+  parent-level recall@k by question type, tokens per step, p95 per task).
+- **Each accepted trade-off has a monitor** with a threshold or a golden-set slice.
 
 ## Why it exists
 - **It is a different question from chunking.** Chunking decides how a document is cut; granularity

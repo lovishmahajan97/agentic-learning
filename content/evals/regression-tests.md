@@ -5,7 +5,8 @@ name: Regression tests
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -152,6 +153,22 @@ flowchart TD
     RV --> MG["Merge"]
     CRON["Scheduled run, no diff"] -.->|"drift vs stored baseline"| FL
 ```
+
+## Misconceptions
+- **"Temperature 0 makes regression runs deterministic."** Batched inference, floating-point ordering and
+  provider-side changes still move outputs. Run each case *k* times and read flips against that noise.
+- **"If the aggregate pass rate held, nothing regressed."** 80% to 80% can hide 9 pass-to-fail flips,
+  two of them incident cases. Gate on per-item flip lists and critical tags, not the average.
+- **"No commit means no regression."** Hosted models are updated and re-routed, and indexes get rebuilt.
+  Only a scheduled run with no diff sees drift that arrives without a pull request.
+- **"A stored baseline from the last release is good enough to diff against."** It differs from today's
+  candidate by the change and by drift, so the flip list mixes both. Run the production config in the
+  same job.
+- **"A strict suite asserts the exact text or the exact tool sequence."** Both fail on harmless
+  rephrasings or an extra lookup step, and a suite that cries wolf gets disabled. Assert required and
+  forbidden calls, key arguments, a step budget and the end state.
+- **"A regression suite tells you whether the new version is better."** It is a safety net of known
+  behaviour built from incidents; capability needs a held-out golden set.
 
 ## Examples
 ### Agent scenario: a trajectory case and its deterministic grader

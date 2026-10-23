@@ -5,7 +5,8 @@ name: Cost allocation by tenant & feature
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/finops
@@ -36,6 +37,65 @@ by an explicit driver, or tiers cannot be priced.
   driver for shared GPU and vector-store cost, and whether idle capacity is spread or shown separately.
 - **What you can skip.** Formal chargeback mechanics until internal teams pay from their own budgets.
   Showback with trustworthy, reconciled numbers is where agent platforms start.
+
+## Decision case
+### Scenario
+An agent platform shares one self-hosted model fleet ($30,000 a month) across three tenants. Two
+contracts renew next month and sales needs per-tenant cost to price them. All figures are illustrative.
+
+| Tenant | Requests per month | Mean prompt tokens | Mean output tokens | Mean request duration | Contract | Direct API spend |
+|---|---|---|---|---|---|---|
+| A: contract-review agent | 20,000 | 60,000 | 1,000 | 40 s | $12,000 | $1,500 |
+| B: support chat agent | 600,000 | 2,000 | 300 | 8 s | $15,000 | $2,000 |
+| C: coding agent (internal) | 180,000 | 20,000 | 800 | 25 s | none | $3,000 |
+
+- **What binds the fleet:** engine metrics show KV-cache usage above 90% at peak with preemptions, while
+  compute stays near 40%. Memory, not arithmetic, limits how many requests fit.
+- **Idle:** the fleet is busy about 70% of the time, so about $9,000 a month is idle or headroom.
+- **Data available:** the engine logs prompt tokens, output tokens and start and end times per request.
+- **Constraints:** one engineer, 3 weeks; the method must be explainable to customer A's finance team.
+
+### Options
+Decode tokens are weighted 10× prefill in option 2 (an illustrative ratio; profile your own engine). Occupancy
+in option 3 is (prompt + output ÷ 2) × duration.
+
+| Option | Driver | A's GPU share | B's GPU share | C's GPU share | Fits the constraint? |
+|---|---|---|---|---|---|
+| 1. Request count | Requests | 2.5%, $750 | 75%, $22,500 | 22.5%, $6,750 | Ignores size entirely |
+| 2. Phase-weighted tokens | Prompt + 10 × output tokens | 14.8%, $4,449 | 31.8%, $9,534 | 53.4%, $16,017 | Tracks compute, which is not what binds |
+| 3. KV-cache occupancy | Context tokens × seconds resident | 32.2%, $9,647 | 6.9%, $2,057 | 61.0%, $18,297 | Tracks memory, the binding resource |
+
+### Decision
+Choose **option 3**, KV-cache occupancy, computed from the request logs the engine already writes.
+- **Causation:** the fleet runs out of KV memory first, so the resource a tenant consumes is context held
+  over time. A's 60,000-token prompts held for 40 s crowd out many short chats, which request count and
+  token count both miss.
+- **Pricing consequence:** under request count, A shows a $9,750 monthly margin (12,000 − 1,500 − 750) and
+  B a $9,500 loss. Under option 3, A is at about +$853 and B at about +$10,943. Option 1 would have sent sales to
+  raise B's price and renew A at a loss-making discount.
+- **Effort and explainability:** the inputs are three logged fields, and "context size times time held"
+  can be explained to A's finance team in one sentence.
+
+**What would change it:** if compute becomes the binding constraint (for example after KV-cache
+quantization frees memory), switch to phase-weighted tokens and re-run history under a new policy
+version. If a tenant moves to a dedicated pool, its cost becomes direct and leaves the driver.
+
+### Trade-offs accepted
+- **An approximate driver.** Occupancy assumes context grows evenly during decode. Compare the allocation
+  against engine KV-usage samples each quarter.
+- **Idle shown separately.** Showback lists the $9,000 idle line as platform overhead so utilization stays
+  owned. Pricing still has to recover it, so renewals use the fully spread figures above.
+- **Every tenant's number moves.** C, an internal team, sees its share rise from 22.5% to 61%. Publish the
+  policy and one month of side-by-side numbers before switching.
+- **Thin margin on A.** At about $853 a month, A is the renewal to re-price or move to a long-document tier.
+
+### Review rubric
+- Identifies the resource that binds the shared pool (compute, memory, storage) with evidence, and picks a
+  driver that follows it.
+- Shows each tenant's allocation under every option, and how the margin picture changes.
+- Uses only data the platform already logs, or states what new instrumentation it needs and its cost.
+- States an explicit idle-capacity policy and how it differs between showback and pricing.
+- Names the condition that would change the driver and how history is handled when it does.
 
 ## Why it exists
 - **Invoices say how much, not who.** A hosted model invoice is one number per model per month; a

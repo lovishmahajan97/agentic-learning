@@ -5,7 +5,8 @@ name: Rate limiting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - serving-inference/backpressure
@@ -169,6 +170,23 @@ flowchart TD
     G -.->|"atomic reserve"| B
     P -.->|"remaining-quota headers"| G
 ```
+
+## Misconceptions
+- **"Requests per minute is the limit that matters."** One request can carry 200 tokens or 200,000, so a
+  request counter is green while a few long prompts exhaust tokens per minute. Weight the bucket in LLM
+  tokens.
+- **"The provider's 429 is our rate limiter."** It is reactive, it hits every caller in the organisation
+  at once, it cannot prioritise tenants, and every rejection comes back as a retry. Limit inbound per
+  tenant and outbound at about 80% of quota.
+- **"You cannot limit what you cannot count yet."** Output length is unknown, but `max_tokens` bounds it:
+  reserve prompt tokens plus an estimate at admission, then settle on the reported usage, refunding or
+  debiting the difference.
+- **"Each replica can keep its own counter."** Read-decide-write across replicas lets each one admit the
+  last unit, so overshoot grows with replica count. Use one atomic check-and-reserve in Redis, or
+  partition the quota explicitly.
+- **"Per-request limits contain a runaway agent."** Every call in a tool cycle looks normal; the
+  transcript just grows each step. Only a per-run step and token budget keyed on the run id sees that
+  twenty calls are one runaway.
 
 ## Examples
 ### Cost-aware token bucket with reserve and settle

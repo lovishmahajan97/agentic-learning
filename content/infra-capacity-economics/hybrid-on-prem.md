@@ -5,7 +5,8 @@ name: Hybrid / on-prem
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/cloud-ai-architecture
@@ -37,6 +38,61 @@ go to the cloud.
   and evals for the agent, and whether a planner on a frontier model may hand work to an on-prem executor.
 - **What you can skip.** Rack, power and procurement detail. Know the routing order, the sizing rule and
   why owned GPUs must stay busy.
+
+## Decision case
+### Scenario
+A hospital group builds a clinical agent that plans from public guidelines, then reads patient records
+through a labelled records tool. Loads are illustrative, in replicas of one open-weight model, and
+match the sizing scenario below.
+- **Restricted steps** (after any records lookup) peak at 3 replicas on weekday afternoons and fall to
+  1 overnight.
+- **Eligible interactive steps** run at 2 replicas through the weekday daytime (about 12 hours) and
+  peak at 6.
+- **Overnight batch** (re-indexing, agent evals) could use 4 replicas for 8 hours on weekdays.
+- **Constraints:** patient data may never leave the group's datacenter; the agent eval set shows
+  planning needs a hosted frontier model; capital budget covers at most 6 replicas of GPUs; GPU
+  procurement takes about 4 months; a platform team of two.
+
+### Options
+| Option | How it works | Data rule | Owned replicas | Planning quality | Owned GPUs busy? |
+|---|---|---|---|---|---|
+| A. All hosted | Every step to the cloud platform | Broken by the first records lookup | 0 | Frontier everywhere | n/a |
+| B. All on-prem, sized for total peak | 3 restricted + 6 eligible + 1 spare | Met | 10, over the budget of 6 | Open-weight only; fails the planning eval | Mostly idle outside the daytime peak |
+| C. Hybrid, owned pool for the restricted peak | Own 3 + 1 spare = 4; route each step by the run's high-water mark; eligible peaks burst to the cloud; batch backflows overnight | Met | 4 | Frontier planner, on-prem executor | Day: restricted plus eligible slack; night: 1 restricted + 3 batch |
+| D. Hybrid with 2 extra for the eligible base | As C plus 2 replicas for daytime eligible work | Met | 6 | As C | Extra 2: (2 × 60 + 1 × 8 × 5) ÷ (2 × 168) ≈ 48% of the week |
+
+### Decision
+Choose **C**, because:
+- **Restricted work has nowhere else to go,** so its peak plus a spare (4 replicas) is the floor, and it
+  fits the budget with room to spare.
+- **Everything else is filled or rented:** the spare and restricted slack take eligible daytime work, and
+  overnight 1 + 3 = 4 replicas keep the pool busy around the clock.
+- **D's extra replicas would be busy under half the week** (about 160 of 336 replica-hours), below the
+  break-even the team's TCO model needs, so that load is cheaper rented.
+- **Frontier planning survives:** the cloud planner sees only task metadata and public guidelines; every
+  step after the first restricted tool result runs on-prem.
+
+**What would change it:**
+- **Eligible load becoming present most of the week** (for example a second shift): the extra replicas
+  in D clear break-even.
+- **An open-weight model passing the planning eval:** the cloud path shrinks to bursts only.
+- **Restricted peak growth:** order GPUs 4 months before the forecast reaches 4 replicas of demand.
+
+### Trade-offs accepted
+- **Runs switch model mid-run** at the first records lookup. Watch plan-follow failures on the on-prem
+  executor and eval task success on the mixed route.
+- **Burst cost is variable.** Watch daily burst volume and its cost against the price of owning more.
+- **Two routes to evaluate and prompt.** Watch the per-route eval score gap in CI.
+- **A small team owns hardware.** Watch time-to-repair after a node failure; the spare covers one.
+
+### Review rubric
+- **Routing is per step by the run's high-water mark,** with tool outputs labelled at the source.
+- **Owned capacity is sized from the restricted peak plus a spare,** not from total peak.
+- **Extra owned capacity is justified by utilization arithmetic** across the whole week.
+- **Every burst path is gated by classification,** with zero cloud steps after a restricted result as a
+  monitored invariant.
+- **Quality is checked per route** on the same eval set.
+- **Reversal triggers include procurement lead time,** not just a load threshold.
 
 ## Why it exists
 - **Regulation and contracts push on-prem.** Health, financial, defence and public-sector data often may

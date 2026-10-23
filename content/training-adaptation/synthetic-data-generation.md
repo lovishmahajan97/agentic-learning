@@ -5,7 +5,8 @@ name: Synthetic data generation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - training-adaptation/data-curation
@@ -166,6 +167,23 @@ flowchart TD
     E --> F["Inspect failures"]
     F -->|"adjust the specification"| SP
 ```
+
+## Misconceptions
+- **"A stronger generator is what makes synthetic data good."** Generation is cheap and errors are the
+  norm; the verifier deciding which samples survive sets the quality. For agent tasks, an executed end
+  state or a construction-first label beats any generator upgrade.
+- **"Turn up the temperature to get diversity."** A sampled generator collapses onto its favourite names,
+  openings and structures at any temperature. Diversity comes from seeds with a novelty filter, evolution
+  axes, personas and grounding in real artefacts, measured with distinct-n.
+- **"An LLM judge reading the transcript can verify an agent task."** A judge accepts a confident "refund
+  issued" message; only checking the sandbox's end state shows whether there was no refund, or two.
+- **"A high score on a synthetic eval predicts production."** If the eval came from the same generator
+  and prompt as training, it measures template-matching. Wall evals off, use a different simulator model,
+  and confirm on real held-out traffic.
+- **"Synthetic data inevitably causes model collapse, and a student can never beat its generator."**
+  Collapse comes from recursively replacing real data with unfiltered output. With real data accumulated
+  in the mix and a verifier that adds outside information (tests, ground truth), self-improvement loops
+  can exceed the generator.
 
 ## Examples
 ### Construction-first generation with a round-trip check

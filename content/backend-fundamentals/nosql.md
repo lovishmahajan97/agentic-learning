@@ -5,7 +5,8 @@ name: NoSQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - backend-fundamentals/database-design
@@ -40,6 +41,189 @@ agent's exact queries and you accept weaker reads.
   state, and which reads must be strongly consistent.
 - **What you can skip.** Dynamo paper internals and LSM compaction tuning. Know quorums, hot partitions,
   item size limits and access-pattern-first modelling; that is what agent state stores need.
+
+## Lab
+### Task
+An agent keeps its step log in a DynamoDB-style table, and three incidents came in: after step 12 a
+restarted worker resumed from step 9, a racing worker silently replaced a recorded step, and a fetched
+web page made a checkpoint fail.
+
+You will fix the key design and write path against an in-memory fake that enforces the same rules
+(lexical sort-key order, conditional puts, a 400 KB item cap), so no AWS account is needed. Time box:
+45-75 minutes.
+- **Prerequisites:** this lesson's Modelling and Agent state sections, and the DynamoDB sessions example
+  and step-log scenario under Examples.
+- **Setup:** Python 3.11+, standard library only, `pip install pytest` (checked against pytest 9.1.1).
+  Save the starter as `step_store.py` and the tests as `test_step_store.py` in one directory. The fake
+  approximates item size as JSON bytes; real DynamoDB counts attribute names and values.
+- **Goal:** resume finds the true last step, an own retry is a no-op while a conflicting write raises,
+  and results over `INLINE_LIMIT` live in the blob store behind a pointer.
+
+### Starter code
+```python
+"""step_store.py: an agent's step log in a DynamoDB-style table (in-memory fake, same rules).
+Resume picked the wrong step, a racing worker overwrote a step, and a fetched page broke a checkpoint."""
+import json
+
+
+class ConditionalCheckFailed(Exception):
+    pass
+
+
+class ItemTooLarge(Exception):
+    pass
+
+
+class FakeTable:
+    """One table: items by (pk, sk), a 400 KB item cap (approximated as JSON bytes), conditional
+    puts, and queries inside one partition in lexical sort-key order, like DynamoDB."""
+    MAX_ITEM_BYTES = 400 * 1024
+
+    def __init__(self):
+        self.items = {}
+
+    def put_item(self, item, if_not_exists=False):
+        size = item_bytes(item)
+        if size > self.MAX_ITEM_BYTES:
+            raise ItemTooLarge(f"{size} bytes")
+        key = (item["pk"], item["sk"])
+        if if_not_exists and key in self.items:
+            raise ConditionalCheckFailed(key)
+        self.items[key] = dict(item)
+
+    def get_item(self, pk, sk):
+        return self.items.get((pk, sk))
+
+    def query(self, pk, sk_prefix, newest_first=False, limit=None):
+        rows = sorted((v for (p, s), v in self.items.items() if p == pk and s.startswith(sk_prefix)),
+                      key=lambda v: v["sk"], reverse=newest_first)
+        return rows[:limit] if limit else rows
+
+
+def item_bytes(item):
+    return len(json.dumps(item).encode())
+
+
+INLINE_LIMIT = 64 * 1024     # results bigger than this go to the blob store (object storage)
+
+
+def append_step(table, blobs, session_id, step_no, tool, result):
+    """Write one step item. A retry of the same step with the same content is a no-op; a different
+    writer's content under the same step number must raise ConditionalCheckFailed."""
+    item = {"pk": f"SESSION#{session_id}", "sk": f"STEP#{step_no}",   # EXERCISE 1: sort order
+            "step_no": step_no, "tool": tool, "result": result}      # EXERCISE 3: large results
+    table.put_item(item)                                             # EXERCISE 2: never overwrite
+
+
+def last_step(table, session_id):
+    rows = table.query(f"SESSION#{session_id}", "STEP#", newest_first=True, limit=1)
+    return rows[0] if rows else None
+
+
+def step_result(blobs, item):
+    return item["result"] if "result" in item else blobs[item["result_ref"]]
+
+
+if __name__ == "__main__":
+    table, blobs = FakeTable(), {}
+    for n in range(1, 13):
+        append_step(table, blobs, "s1", n, "search", f"result {n}")
+    append_step(table, blobs, "s1", 12, "search", "result 12")          # own retry: must be a no-op
+    print("resume from step:", last_step(table, "s1")["step_no"])
+    try:
+        append_step(table, blobs, "s1", 12, "search", "a racing worker's result")
+        print("conflict: overwritten silently")
+    except ConditionalCheckFailed:
+        print("conflict: rejected")
+    try:
+        append_step(table, blobs, "s1", 13, "fetch", "x" * 500_000)    # a fetched web page
+        item = last_step(table, "s1")
+        print("step", item["step_no"], "inline:", "result" in item,
+              "| result chars:", len(step_result(blobs, item)))
+    except ItemTooLarge as e:
+        print("step 13 rejected:", e)
+```
+
+### Expected output
+The starter prints `resume from step: 9`, `conflict: overwritten silently` and
+`step 13 rejected: 500083 bytes`. After the fix, `python step_store.py` prints:
+
+```text
+resume from step: 12
+conflict: rejected
+step 13 inline: False | result chars: 500000
+```
+
+### Tests
+On the starter 3 of 4 fail: `assert 9 == 12`, `DID NOT RAISE ConditionalCheckFailed`, and
+`ItemTooLarge: 500081 bytes`. The own-retry test passes before and after; it catches a fix that makes
+every retry raise.
+
+```python
+import pytest
+
+from step_store import (INLINE_LIMIT, ConditionalCheckFailed, FakeTable, append_step, item_bytes,
+                        last_step, step_result)
+
+
+@pytest.fixture
+def store():
+    return FakeTable(), {}
+
+
+def test_resume_picks_highest_step(store):
+    table, blobs = store
+    for n in range(1, 13):
+        append_step(table, blobs, "s1", n, "search", f"r{n}")
+    assert last_step(table, "s1")["step_no"] == 12
+
+
+def test_own_retry_is_a_noop(store):
+    table, blobs = store
+    append_step(table, blobs, "s1", 3, "search", "r3")
+    append_step(table, blobs, "s1", 3, "search", "r3")
+    assert len(table.items) == 1
+
+
+def test_racing_writer_is_rejected(store):
+    table, blobs = store
+    append_step(table, blobs, "s1", 3, "search", "r3")
+    with pytest.raises(ConditionalCheckFailed):
+        append_step(table, blobs, "s1", 3, "search", "someone else's r3")
+    assert step_result(blobs, last_step(table, "s1")) == "r3"
+
+
+def test_large_result_is_offloaded(store):
+    table, blobs = store
+    page = "x" * 500_000
+    append_step(table, blobs, "s1", 1, "fetch", page)
+    item = last_step(table, "s1")
+    assert item_bytes(item) < INLINE_LIMIT
+    assert step_result(blobs, item) == page
+```
+
+### Failure scenarios
+- **Inject: `if_not_exists=True` with no read-back on conflict.** The racing-writer test passes, but
+  the own-retry test raises, so every network retry after a lost acknowledgement crashes the run. Debug:
+  on `ConditionalCheckFailed`, compare the stored item with yours; equal means your earlier attempt landed.
+- **Inject: blob key `f"{session_id}/{step_no}"`.** A racing worker's large result overwrites the
+  first writer's blob before its conditional put fails, so step 13 now points at the wrong page. Debug:
+  add a racing test with two large results; key blobs by a content hash such as SHA-256.
+- **Inject: pad to 2 digits (`:02d`).** Tests pass, then step 100 sorts before step 99. Debug: list the
+  sort keys around the boundary; pad to the widest step number you will ever write, such as 8 digits.
+- **Inject: resume through an eventually consistent read** (in real DynamoDB, `ConsistentRead` left
+  off). The fake cannot show it; in production a restart repeats the tool call it just recorded. Debug:
+  trace the resume `Query` parameters and set `ConsistentRead=True` on that path only.
+
+### Submission
+- **Your fixed `step_store.py`**, with the given tests unchanged.
+- **A `pytest -v` log** with all 4 passing, plus the starter's failing run for comparison.
+- **The `python step_store.py` output** after the fix.
+- **One extra test** of your own, for example the racing large-result case from Failure scenarios.
+- **A three-line note** mapping each fix to the DynamoDB feature it stands for: a zero-padded sort key,
+  `ConditionExpression="attribute_not_exists(sk)"`, and an object-storage pointer.
+- **Evaluated by:** the given tests pass unmodified, your test fails on the starter, and no step item
+  carries a result over `INLINE_LIMIT`.
 
 ## Why it exists
 - **One machine has a ceiling.** A relational database answers any SQL question, but only within one

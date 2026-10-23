@@ -5,7 +5,8 @@ name: Agentic architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/agent-loop
@@ -38,6 +39,60 @@ tracing. The model owns judgment; the architecture owns guarantees.
   budgets, where state is checkpointed, which calls need approval, and the terminal states you alert on.
 - **What you can skip.** Framework-specific syntax until you need it. Every framework maps onto the six
   layers below, so learn the layers and read any framework's docs as answers to them.
+
+## Decision case
+### Scenario
+An online retailer is moving its refund support agent from demo to production and must pick the
+orchestration runtime. All figures are illustrative.
+- **Volume:** 20,000 tickets a day, about 6 steps per run, so 120,000 checkpoint writes a day, about
+  1.4 writes per second on average.
+- **Approvals:** refunds above 500 need a human; 8% of runs pause, 1,600 a day, and an approver may take
+  up to 48 hours, so up to 3,200 runs can be waiting at once.
+- **Constraints:** zero duplicate refunds; workers are redeployed several times a day; auditors want a
+  per-step record; a team of 4 Python engineers with no Temporal experience; 8 weeks to launch; the
+  existing Postgres must hold the state.
+
+### Options
+| Option | How it works | Resume and approvals | Fit with team and deadline | New infrastructure |
+|---|---|---|---|---|
+| A. Hand-rolled loop | A `while` loop plus a checkpoint table keyed by run id, as in the example below | You build resume, interrupts and replay yourself | Familiar code, but the 8 weeks go on plumbing | None |
+| B. LangGraph with a Postgres checkpointer | Graph nodes for model and tool calls, a checkpoint per step, interrupts for approval | Built in: a paused run is a saved thread resumed by an event | Python, learnable within weeks | None beyond the existing Postgres |
+| C. Temporal workflow | One activity per model or tool call, durable timers for approval waits | Strongest: retries, timers and replay are the engine's job | Steep: workflow code must be deterministic | A Temporal cluster or a managed service |
+
+### Decision
+Choose **B, LangGraph on the existing Postgres**, because:
+- **Load is small:** about 1.4 checkpoint writes per second and 3,200 parked threads are routine for the
+  Postgres the team already runs.
+- **Approval-as-interrupt is native:** a paused run holds no worker, survives the daily redeploys and
+  resumes from the approval event.
+- **The deadline rules out the extremes:** A spends the 8 weeks rebuilding what B ships with, and C adds
+  an engine and a programming model the team has not used.
+- **Zero duplicates still comes from the tool layer:** every refund carries the key `run_id:step`,
+  whatever runtime is chosen.
+
+**What would change it:** runs that span several services with compensation steps (refund, restock,
+reship) and multi-day timers at much higher volume would favour Temporal; a short, read-only agent
+would make the hand-rolled in-memory loop enough.
+
+### Trade-offs accepted
+- **Framework version churn.** Pin the version and replay recorded trajectories as regression tests
+  before each upgrade. Watch: completion rate per task type after upgrades.
+- **Checkpoints per step, not per side effect.** A crash between the refund call and the checkpoint
+  re-runs the step. Watch: duplicate refunds per thousand runs, which must stay at zero.
+- **Approvals can stall.** Runs parked 48 hours need an expiry path. Watch: runs that expire in
+  `awaiting_approval` and approval latency per tool.
+- **Abstraction lock-in.** Business predicates stay in plain tool-layer functions so they move with you
+  if the runtime changes.
+
+### Review rubric
+- **Load is derived:** runs, steps and pause rates turn into checkpoint writes per second and parked
+  runs, with the arithmetic shown.
+- **Durability is argued per failure:** the write-up says what happens on a redeploy mid-step and why no
+  side effect repeats.
+- **Approvals are interrupts:** a paused run holds no worker, and the approved call executes as stored.
+- **Team and deadline constraints decide between options**, not feature lists alone.
+- **Reversal conditions are concrete:** at least one change in workload that would flip the choice.
+- **Each accepted trade-off names a metric** someone can alert on.
 
 ## Why it exists
 - **Some tasks have no fixed path.** "Resolve this support ticket", "find out why this deploy failed",

@@ -5,7 +5,8 @@ name: Dependency injection & interface boundaries
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/protocols-generics-structural-typing
@@ -39,6 +40,185 @@ milliseconds and swap providers in one file.
   that picks real implementations per environment.
 - **What you can skip.** DI containers and their decorators. A hand-written root plus constructor
   injection covers almost every agent service.
+
+## Lab
+### Task
+Implement a tool-calling agent loop that receives its model, tools and clock from outside, plus the
+composition root that picks the real adapter from config. The goal is an agent whose routing, error
+handling and step budget are proven in CI with no key, no network and no flaky text. Time box: 45-60 min.
+- **Prerequisites:** Protocols, generics & structural typing; Test doubles, mocks & fixtures.
+- **Setup:** Python 3.10+ and `pip install pytest`. Save the starter as `lab.py` and the tests as
+  `test_lab.py` in one folder.
+- **Rules:** fill in the two `YOUR CODE HERE` functions only; `lab.py` must import cleanly with no
+  environment variables set.
+
+### Starter code
+```python
+"""Lab: an agent loop that runs with injected model, tools and clock. Run: python lab.py"""
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Callable, Protocol
+
+@dataclass(frozen=True)
+class ToolCall:
+    name: str
+    args: dict
+
+@dataclass(frozen=True)
+class Step:                                  # your type: adapters translate vendor replies into it
+    text: str = ""
+    tool_call: ToolCall | None = None
+
+class Model(Protocol):                       # the port
+    def next_step(self, transcript: list[dict]) -> Step: ...
+
+class StepBudgetExceeded(RuntimeError):
+    pass
+
+@dataclass(frozen=True)
+class RunResult:
+    answer: str
+    tools_called: list[str]
+    elapsed_s: float
+
+class Agent:
+    def __init__(self, model: Model, tools: dict[str, Callable[..., str]],
+                 clock: Callable[[], float], max_steps: int = 4) -> None:
+        self.model, self.tools, self.clock, self.max_steps = model, tools, clock, max_steps
+
+    def run(self, task: str) -> RunResult:
+        # YOUR CODE HERE
+        # - transcript starts as [{"role": "user", "content": task}]
+        # - read self.clock() once at the start and once just before returning
+        # - final answer (tool_call is None): return RunResult(answer, tools_called, elapsed_s)
+        # - tool call: append {"role": "tool", "name": name, "content": result}
+        # - unknown tool, or a tool that raises: content is "error: <message>", the run continues
+        # - after max_steps model calls without an answer: raise StepBudgetExceeded
+        raise NotImplementedError
+
+class HostedModel:                           # the real adapter: needs a key and a network
+    def __init__(self, api_key: str) -> None:
+        self.api_key = api_key
+    def next_step(self, transcript: list[dict]) -> Step:
+        raise ConnectionError("no network in this lab")
+
+def build_agent(env: dict[str, str], tools: dict[str, Callable[..., str]],
+                clock: Callable[[], float]) -> Agent:
+    # YOUR CODE HERE: composition root, the only place that reads config
+    # - env["MODEL_PROVIDER"] == "hosted" -> Agent(HostedModel(env["API_KEY"]), tools, clock)
+    # - missing API_KEY -> ValueError mentioning API_KEY (at build time, never at import)
+    # - any other provider -> ValueError mentioning the provider name
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    class Replay:                            # a dumb scripted fake
+        def __init__(self, steps): self.steps = list(steps)
+        def next_step(self, transcript): return self.steps.pop(0)
+    ticks = iter([100.0, 102.5])
+    order = Replay([Step(tool_call=ToolCall("lookup_order", {"order_id": "A17"})),
+                    Step(text="Order A17 has shipped.")])
+    r = Agent(order, {"lookup_order": lambda order_id: "shipped"}, clock=lambda: next(ticks)).run("Where is A17?")
+    print("answer:", r.answer)
+    print("tools:", r.tools_called)
+    print("elapsed_s:", r.elapsed_s)
+    loop = Replay([Step(tool_call=ToolCall("lookup_order", {"order_id": "A17"}))] * 9)
+    try:
+        Agent(loop, {"lookup_order": lambda order_id: "shipped"}, clock=lambda: 0.0).run("loop")
+    except StepBudgetExceeded:
+        print("budget: StepBudgetExceeded after", 9 - len(loop.steps), "model calls")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+answer: Order A17 has shipped.
+tools: ['lookup_order']
+elapsed_s: 2.5
+budget: StepBudgetExceeded after 4 model calls
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution
+passes all 5 (checked with Python 3.12 and pytest 9.1).
+
+```python
+import pytest
+from lab import Agent, HostedModel, Step, StepBudgetExceeded, ToolCall, build_agent
+
+class Scripted:                                   # replays steps, records every transcript it saw
+    def __init__(self, steps):
+        self.steps, self.seen = list(steps), []
+    def next_step(self, transcript):
+        self.seen.append([dict(m) for m in transcript])
+        return self.steps.pop(0)
+
+def clock(*ticks):
+    it = iter(ticks)
+    return lambda: next(it)
+
+def call(name, **args):
+    return Step(tool_call=ToolCall(name, args))
+
+def test_routes_tool_and_feeds_result_back():
+    m = Scripted([call("lookup_order", order_id="A17"), Step(text="Shipped.")])
+    r = Agent(m, {"lookup_order": lambda order_id: f"{order_id}: shipped"}, clock(10.0, 12.5)).run("A17?")
+    assert (r.answer, r.tools_called, r.elapsed_s) == ("Shipped.", ["lookup_order"], 2.5)
+    assert m.seen[1][-1] == {"role": "tool", "name": "lookup_order", "content": "A17: shipped"}
+
+def test_tool_error_goes_back_to_the_model():
+    def lookup_order(order_id):
+        raise KeyError(f"order {order_id} not found")
+    m = Scripted([call("lookup_order", order_id="Z99"), Step(text="I could not find Z99.")])
+    r = Agent(m, {"lookup_order": lookup_order}, clock(0.0, 1.0)).run("Z99?")
+    assert r.answer == "I could not find Z99."
+    assert m.seen[1][-1]["content"].startswith("error:") and "Z99" in m.seen[1][-1]["content"]
+
+def test_unknown_tool_is_an_error_result_not_a_crash():
+    m = Scripted([call("refund", order_id="A17"), Step(text="I cannot refund.")])
+    r = Agent(m, {}, clock(0.0, 1.0)).run("refund A17")
+    assert r.tools_called == ["refund"] and "refund" in m.seen[1][-1]["content"]
+    assert m.seen[1][-1]["content"].startswith("error:")
+
+def test_step_budget_counts_model_calls():
+    m = Scripted([call("ping")] * 10)
+    with pytest.raises(StepBudgetExceeded):
+        Agent(m, {"ping": lambda: "pong"}, clock(0.0, 1.0), max_steps=3).run("loop")
+    assert len(m.seen) == 3
+
+def test_root_validates_config_at_build_time():
+    with pytest.raises(ValueError, match="API_KEY"):
+        build_agent({"MODEL_PROVIDER": "hosted"}, {}, clock(0.0))
+    with pytest.raises(ValueError, match="mystery"):
+        build_agent({"MODEL_PROVIDER": "mystery", "API_KEY": "k"}, {}, clock(0.0))
+    agent = build_agent({"MODEL_PROVIDER": "hosted", "API_KEY": "k"}, {}, clock(0.0))
+    assert isinstance(agent.model, HostedModel) and agent.model.api_key == "k"
+```
+
+### Failure scenarios
+- **Inject `time.time()` inside `run` instead of `self.clock()`.** `test_routes_tool_and_feeds_result_back`
+  fails with an elapsed value like `0.0001` instead of `2.5`. Debug by grepping `run` for any clock,
+  network or environment access that did not come through the constructor.
+- **Let a tool exception propagate.** `test_tool_error_goes_back_to_the_model` fails with
+  `KeyError: 'order Z99 not found'` and the model never sees the error. Fix by catching inside the loop
+  and appending an `error:` tool message, so the model can correct its arguments.
+- **Build `HostedModel(os.environ["API_KEY"])` at module top level.** `import lab` fails with `KeyError`
+  during test collection, before any test runs. Find it by running `python -c "import lab"` with no
+  environment set; move construction into `build_agent`.
+- **Run the tool but forget to append its result to the transcript.** The routing test fails because
+  `m.seen[1][-1]` is still the user message; against a real model the agent calls the same tool again
+  until the budget trips. Print `len(t)` for each transcript in `m.seen`: it should grow by one per tool.
+
+### Submission
+- **`lab.py` with both functions implemented** and no other changes to the starter's public names.
+- **A green `pytest -q test_lab.py` run** (5 passed), pasted as text.
+- **The output of `python lab.py`**, matching the expected output exactly.
+- **One added test of your own** for a tool that returns an empty string, with a note on what the model
+  should see.
+- **A three-line note:** which file would change to add an Anthropic or vLLM adapter, and why `Agent`
+  would not.
+- **Evaluated on:** tests passing, no clock, network or `os.environ` access inside `Agent`, and a root
+  that fails at build time, not at import.
 
 ## Why it exists
 - **Agents are glue around external services.** Models, tools, vector stores and memory are slow,

@@ -5,7 +5,8 @@ name: Property-based testing (Hypothesis)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/pytest
@@ -36,6 +37,126 @@ counterexample. Tool-argument parsing, chunking and memory bugs hide there.
   build valid inputs directly, and per-lane example budgets so the pull-request lane stays fast.
 - **What you can skip.** Judging model quality with it. Generated inputs test your deterministic code;
   whether the model chooses well is an eval question.
+
+## Lab
+### Task
+A `get_forecast` tool parses the model's JSON arguments. It crashes the agent loop on truncated JSON and
+on arrays, and it silently coerces `"3"` and `true` into a day count. You will let Hypothesis find and
+shrink those inputs, then make the parser total: a result or an error result for every string.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** pytest, JSON and JSONL, and this lesson's Properties, Strategies and Running,
+  shrinking and remembering sections.
+- **Setup:** Python 3.10+, `pip install pytest hypothesis` (checked against Hypothesis 6.170.8 and pytest
+  9.1.1). Save the starter as `tool_args.py` and the tests as `test_tool_args.py`.
+- **Goal:** every property passes, the two pinned `@example`s stay in the file, and no error case is
+  "fixed" by coercing the value.
+
+### Starter code
+```python
+"""tool_args.py: parse the JSON arguments of a get_forecast tool call from the model."""
+import json
+
+SCHEMA = {"city": str, "days": int}
+
+
+def parse_tool_args(raw: str) -> dict:
+    """Return {"ok": {"city": str, "days": int}} or {"error": message}. Must never raise."""
+    # EXERCISE: make this total. Bad JSON, non-objects, missing keys and wrong types
+    # (including True for days and "3" for days) become {"error": ...}; extra keys are dropped.
+    args = json.loads(raw)
+    return {"ok": {"city": str(args["city"]), "days": int(args["days"])}}
+
+
+if __name__ == "__main__":
+    for raw in ['{"city": "Oslo", "days": 3, "units": "C"}', '{"city": "Oslo", "days": "3"}',
+                '{"city": "Oslo", "days": true}', '["Oslo", 3]', '{"city": "Oslo"']:
+        try:
+            print(f"{raw!r:45} -> {parse_tool_args(raw)}")
+        except Exception as e:
+            print(f"{raw!r:45} -> CRASH {type(e).__name__}")
+```
+
+### Expected output
+`python tool_args.py` after the fix (error wording is yours; the shape is not). The starter prints `ok`
+with `days` 3 and 1 for rows two and three, and `CRASH TypeError` and `CRASH JSONDecodeError` for the
+last two.
+
+```text
+'{"city": "Oslo", "days": 3, "units": "C"}'   -> {'ok': {'city': 'Oslo', 'days': 3}}
+'{"city": "Oslo", "days": "3"}'               -> {'error': 'wrong type: days'}
+'{"city": "Oslo", "days": true}'              -> {'error': 'wrong type: days'}
+'["Oslo", 3]'                                 -> {'error': 'arguments must be a JSON object'}
+'{"city": "Oslo"'                             -> {'error': "arguments are not valid JSON: Expecting ',' delimiter"}
+```
+
+`pytest -v` then reports `4 passed` in a few seconds.
+
+### Tests
+On the starter, 3 of 4 fail: the pinned examples raise `JSONDecodeError` and `TypeError`, and the
+wrong-type property reports a shrunk counterexample such as `days=False`.
+
+```python
+import json
+
+from hypothesis import example, given, settings, strategies as st
+
+from tool_args import parse_tool_args
+
+scalars = st.none() | st.booleans() | st.integers() | st.text()
+json_values = st.recursive(scalars, lambda inner: st.lists(inner) | st.dictionaries(st.text(), inner),
+                           max_leaves=10)
+
+
+def is_result_or_error(out):
+    return isinstance(out, dict) and set(out) in ({"ok"}, {"error"})
+
+
+@settings(max_examples=300)
+@given(st.text())
+@example('{"city": "Oslo"')                       # truncated JSON, seen in production
+def test_any_text_gives_result_or_error(raw):
+    assert is_result_or_error(parse_tool_args(raw))
+
+
+@settings(max_examples=300)
+@given(json_values)
+@example(["Oslo", 3])                            # an array instead of an object
+def test_any_json_value_gives_result_or_error(value):
+    assert is_result_or_error(parse_tool_args(json.dumps(value)))
+
+
+@given(city=st.text(), days=st.integers(), extra=st.dictionaries(st.text(), scalars))
+def test_valid_args_pass_through_and_extras_are_dropped(city, days, extra):
+    raw = json.dumps({**extra, "city": city, "days": days})
+    assert parse_tool_args(raw) == {"ok": {"city": city, "days": days}}
+
+
+@given(city=st.text(), days=st.booleans() | st.text() | st.floats(allow_nan=False) | st.none())
+def test_wrong_type_for_days_is_an_error_not_a_coercion(city, days):
+    out = parse_tool_args(json.dumps({"city": city, "days": days}))
+    assert set(out) == {"error"}, out
+```
+
+### Failure scenarios
+- **Inject: `isinstance(args[k], t)` as the type check.** The wrong-type property fails and shrinks to
+  `days=False`, because `bool` is a subclass of `int`. Debug: read the falsifying example, then compare
+  types exactly for JSON scalars.
+- **Inject: `st.text().filter(lambda s: s.startswith('{"city'))`.** Hypothesis raises
+  `FailedHealthCheck` after 50 filtered inputs and 0 kept. Debug: build the valid shape directly with
+  `st.builds` or `json.dumps` of a dictionary strategy instead of filtering.
+- **Inject: pin `@example("[" * 100_000)`.** Your parser crashes with `RecursionError`, not
+  `JSONDecodeError`, on deeply nested input. Debug: catching only the decode error is not total; decide
+  whether to catch `RecursionError` or reject oversized arguments before parsing.
+
+### Submission
+- **The fixed `tool_args.py`**, with the given tests and both `@example` lines unchanged.
+- **The starter's failing run**, with each falsifying example Hypothesis printed.
+- **One new pinned example** from the failure scenarios (or a real model output), with your decision on
+  how the parser treats it.
+- **A short note** naming the property shape of each test: total function, round-trip style
+  pass-through, or invariant.
+- **Evaluated by:** all properties pass under a `ci` profile with `max_examples=1000`, and no wrong-typed
+  value is coerced into `ok`.
 
 ## Why it exists
 - **Examples test only what the author imagined.** A chunker passes "a paragraph", "exactly one chunk

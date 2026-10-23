@@ -5,7 +5,8 @@ name: Graceful shutdown & worker draining
 kind: practice
 difficulty: advanced
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/lifespan
@@ -39,6 +40,198 @@ outlast the default 30-second grace, so drain needs a budget and a plan.
   to resume).
 - **What you can skip.** Signal-handling internals of Uvicorn and Gunicorn. Know the SIGTERM-to-SIGKILL
   timeline and the budget formula.
+
+## Lab
+### Task
+Make a support agent's loop survive a rolling deploy. Today it ignores the drain flag, saves the plan
+only after tools run, and calls tools without idempotency keys, so a deploy either SIGKILLs runs or
+replays a ticket creation. You will add the three missing pieces at the right points in the loop.
+
+Time box: 45-75 minutes.
+- **Prerequisites:** Idempotency keys, Health / readiness endpoints, and this lesson's "The agent
+  loop's part".
+- **Setup:** Python 3.12, stdlib only, plus `pip install pytest`. The store, model, tool backend and
+  drain flag are local fakes; `Killed` stands in for SIGKILL. Save the starter as `lab_drain.py` and
+  the tests as `test_lab_drain.py`.
+- **Constraint:** check the flag only at a step boundary, never between a tool's side effect and its
+  checkpoint.
+
+### Starter code
+```python
+"""Lab: an agent loop that survives deploys (stdlib only, checked on Python 3.12)."""
+import asyncio, copy
+
+
+class Killed(Exception):
+    """Stands in for SIGKILL: nothing after it runs."""
+
+
+class Store:                                   # checkpoint store shared by every pod (Postgres, Redis)
+    def __init__(self):
+        self.rows = {}
+
+    def load(self, run_id):
+        state, status = self.rows.get(run_id, ({"messages": [], "step": 0, "pending": []}, "new"))
+        return copy.deepcopy(state), status
+
+    def save(self, run_id, state, status):
+        self.rows[run_id] = (copy.deepcopy(state), status)
+
+
+class FakeLLM:                                 # scripted model: reply depends on the transcript only
+    SCRIPT = [
+        {"tool_calls": [{"id": "c1", "name": "lookup_order", "args": {"order": "42"}}]},
+        {"tool_calls": [{"id": "c2", "name": "create_ticket", "args": {"order": "42"}}]},
+        {"text": "Ticket opened for order 42."},
+    ]
+
+    def __init__(self):
+        self.calls = 0                         # paid model calls
+
+    async def complete(self, messages):
+        self.calls += 1
+        return self.SCRIPT[sum(m["role"] == "assistant" for m in messages)]
+
+
+class FakeTools:                               # a tool backend that honours idempotency keys
+    def __init__(self, kill_after=None):
+        self.side_effects, self.seen, self.kill_after = [], {}, kill_after
+
+    async def call(self, name, args, idempotency_key=None):
+        if idempotency_key is not None and idempotency_key in self.seen:
+            return self.seen[idempotency_key]
+        await asyncio.sleep(0)
+        self.side_effects.append(name)
+        result = f"{name} ok"
+        if idempotency_key is not None:
+            self.seen[idempotency_key] = result
+        if name == self.kill_after:
+            raise Killed(name)                 # side effect happened, the pod died before recording it
+        return result
+
+
+class Drain:                                   # the preStop hook flips this (a file in production)
+    def __init__(self, after_checks):
+        self.checks, self.after = 0, after_checks
+
+    def __call__(self):
+        self.checks += 1
+        return self.checks > self.after
+
+
+async def run_agent(run_id, store, llm, tools, draining, max_steps=10):
+    state, _ = store.load(run_id)
+    events = []
+    while state["step"] < max_steps:
+        if not state["pending"]:
+            # LAB 1: this is a step boundary. If draining(): save status "interrupted",
+            #        append "resume" to events and return them.
+            reply = await llm.complete(state["messages"])
+            state["messages"].append({"role": "assistant", **reply})
+            if "text" in reply:
+                store.save(run_id, state, "done")
+                events.append("done")
+                return events
+            state["pending"] = reply["tool_calls"]
+            # LAB 2: checkpoint the plan here, before any side effect runs.
+        for call in state["pending"]:
+            result = await tools.call(call["name"], call["args"],
+                                      idempotency_key=None)       # LAB 3: stable key per run and call
+            state["messages"].append({"role": "tool", "id": call["id"], "content": result})
+        state["pending"] = []
+        state["step"] += 1
+        store.save(run_id, state, "running")
+        events.append(f"step {state['step']}")
+    store.save(run_id, state, "max_steps")
+    events.append("max_steps")
+    return events
+
+
+async def main():
+    store, llm, tools = Store(), FakeLLM(), FakeTools()
+    events = await run_agent("r1", store, llm, tools, Drain(after_checks=1))      # pod A, deploy starts
+    print("pod A:", events, "status:", store.load("r1")[1])
+    if store.load("r1")[1] == "interrupted":
+        events = await run_agent("r1", store, llm, tools, Drain(after_checks=99))  # pod B, new version
+        print("pod B:", events, "status:", store.load("r1")[1])
+    print("model calls:", llm.calls, "side effects:", tools.side_effects)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+As given, pod A ignores the deploy and prints `pod A: ['step 1', 'step 2', 'done'] status: done`: on a
+real pod that run would have been SIGKILLed partway.
+
+### Expected output
+```
+pod A: ['step 1', 'resume'] status: interrupted
+pod B: ['step 2', 'done'] status: done
+model calls: 3 side effects: ['lookup_order', 'create_ticket']
+```
+
+### Tests
+```python
+import asyncio
+import pytest
+import lab_drain as lab
+
+
+def run(*args):
+    return asyncio.run(lab.run_agent(*args))
+
+
+def test_drain_stops_at_the_next_step_boundary():
+    store, llm, tools = lab.Store(), lab.FakeLLM(), lab.FakeTools()
+    assert run("r1", store, llm, tools, lab.Drain(after_checks=1)) == ["step 1", "resume"]
+    state, status = store.load("r1")
+    assert status == "interrupted" and state["step"] == 1 and state["pending"] == []
+    assert tools.side_effects == ["lookup_order"]
+
+
+def test_resume_on_a_new_pod_finishes_without_repeating_work():
+    store, llm, tools = lab.Store(), lab.FakeLLM(), lab.FakeTools()
+    run("r1", store, llm, tools, lab.Drain(after_checks=1))
+    assert store.load("r1")[1] == "interrupted"
+    assert run("r1", store, llm, tools, lab.Drain(after_checks=99)) == ["step 2", "done"]
+    assert llm.calls == 3
+    assert tools.side_effects == ["lookup_order", "create_ticket"]
+
+
+def test_kill_mid_tool_call_does_not_duplicate_the_side_effect():
+    store, llm, tools = lab.Store(), lab.FakeLLM(), lab.FakeTools(kill_after="create_ticket")
+    with pytest.raises(lab.Killed):
+        run("r1", store, llm, tools, lab.Drain(after_checks=99))
+    tools.kill_after = None                                   # replacement pod, same tool backend
+    assert run("r1", store, llm, tools, lab.Drain(after_checks=99)) == ["step 2", "done"]
+    assert tools.side_effects.count("create_ticket") == 1    # idempotency key matched the first call
+    assert llm.calls == 3                                     # the saved plan was replayed, not re-asked
+```
+
+On the starter all three fail: the first two because the flag is ignored (`'done' == 'interrupted'`), the
+third because the resumed run creates a second ticket. Each LAB item is tested on its own: keys without
+the early checkpoint still fail on `llm.calls == 4`, and the checkpoint without keys duplicates the ticket.
+
+### Failure scenarios
+- **Inject: on pod B, start from a fresh state instead of `store.load(run_id)`.** Observe: pod B emits
+  `step 1` again and `llm.calls` rises from 3 to 4, paying for work already done. Debug: log the loaded `step`
+  and status at the start of every run; a resumed run must begin where the checkpoint says.
+- **Inject: build the key from `uuid4()` instead of `run_id` and the call id.** Observe: the kill test
+  creates two tickets. Debug: log each key on the tool side; a key must be identical when the same
+  planned call is replayed.
+- **Inject: let the store keep a reference instead of a deep copy.** Observe: a loop with keys but no
+  early checkpoint now passes all three tests, because the "checkpoint" sees mutations made after the
+  save. Debug: assert the stored state is unchanged after you mutate the in-memory one, as a real
+  database would behave.
+
+### Submission
+- The fixed `lab_drain.py` and a `pytest -q` run showing 3 passed.
+- Your output of `python lab_drain.py`, matching the expected output.
+- A grace budget for this agent with steps of about 6 s: `terminationGracePeriodSeconds` from the
+  formula above, with each term named.
+- A short note: what still goes wrong if a tool backend ignores idempotency keys, and how you would
+  detect it from logs.
 
 ## Why it exists
 - **Processes are stopped far more often than they crash.** Every rolling deploy, autoscaler scale-down,

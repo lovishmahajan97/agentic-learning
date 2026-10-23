@@ -5,7 +5,8 @@ name: Domain-driven design & bounded contexts
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/modular-monolith-vs-microservices
@@ -40,6 +41,59 @@ data ownership and the adapters that translate meaning so the model never has to
 - **What you can skip.** Tactical DDD ceremony (repositories, factories, layered patterns) unless you own
   the upstream services. For agent work, bounded contexts, anticorruption layers and published languages
   carry most of the value.
+
+## Decision case
+### Scenario
+A SaaS vendor wants its support agent to answer "can this customer upgrade?" from a CRM, a vendor
+billing system and the support desk, each with its own "customer" and "status". All figures are
+illustrative.
+- **Volume:** about 5,000 eligibility questions a month.
+- **Upstream surface:** the three APIs expose about 285 endpoints between them, and billing ships new
+  plans roughly monthly.
+- **Hard rule:** never tell a customer more than 14 days past due that they can upgrade.
+- **Constraints:** three different teams own the upstream systems; the agent team has 6 weeks; tool
+  definitions cost about 150 tokens each in every model call.
+
+### Options
+| Option | How it works | Tool definitions per call | Who reconciles "customer" | Upstream change |
+|---|---|---|---|---|
+| A. Conform: generate tools from the API specs | One tool per endpoint, vendor field names exposed | 285 × 150 = 42,750 tokens | The model, at runtime | Leaks straight into answers ("ent", `past_due_since`) |
+| B. One tool group per upstream context | About 3 tools per system behind adapters, each in its own system's language | 9 × 150 = 1,350 tokens | Still the model, across three vocabularies | Contained per system |
+| C. An Eligibility context owned by the agent team | One published tool, `check_upgrade_eligibility`, plus `lookup_customer`, with three anticorruption adapters behind them | 2 × 150 = 300 tokens | Adapter code, unit-tested | An unmapped value raises and alerts |
+
+### Decision
+Choose **C**, because:
+- **The hard rule becomes code:** the 14-day past-due rule lives in the billing adapter of the
+  Eligibility context, tested and versioned, instead of being re-derived by the model per request.
+- **Monthly plan launches fail loudly:** explicit maps raise on an unmapped plan, so a new plan is an
+  alert on day one, not customers silently treated as free tier.
+- **The agent sees one vocabulary:** tier, payment standing and open escalations, which keeps tool
+  definitions to about 300 tokens instead of 42,750 (A) and removes runtime reconciliation (B).
+- **No upstream team must change anything,** which fits three owners and a 6-week deadline.
+
+**What would change it:** if the agent must answer open-ended account questions beyond eligibility,
+add B-style context tools for those; if one upstream is tiny and stable, conform to it rather than
+maintain a translation.
+
+### Trade-offs accepted
+- **The agent team maintains three adapters** that change when either side changes. Watch: contract
+  tests against each upstream sandbox in CI.
+- **Unmapped values fail the call,** so some questions get "cannot determine, escalating" during an
+  upstream launch. Watch: unmapped-value errors per adapter and time to add each mapping.
+- **New questions need new tools,** because the published language is narrow. Watch: questions the agent
+  declines for lack of a tool, reviewed monthly.
+- **Upstream changes arrive late through events.** Watch: event consumer lag, since eligibility read from
+  a stale model gives a wrong answer.
+
+### Review rubric
+- **The meanings are mapped:** the write-up lists which term means what in each system before choosing
+  tools.
+- **Translation has a named home** in adapters, with the prompt free of upstream vocabulary.
+- **Unknown upstream values have a defined failure** (raise, alert, escalate), not a default.
+- **Tool-surface cost is computed** from the number of tools and tokens per definition.
+- **Ownership is explicit:** who owns each adapter and the published language, and what upstream teams
+  must or need not change.
+- **Reversal conditions are stated,** such as broader question scope or a stable upstream.
 
 ## Why it exists
 - **One word, three meanings.** Ask billing, support and sales what a "customer" is. Billing: a legal

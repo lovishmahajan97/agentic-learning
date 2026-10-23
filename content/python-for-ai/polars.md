@@ -5,7 +5,8 @@ name: polars
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/pandas
@@ -36,6 +37,159 @@ multi-gigabyte jobs typically run much faster; the API is stricter.
   prompt text when you only need token counts), file layout for skipping, and deterministic ordering.
 - **What you can skip.** The streaming-engine internals and most of the API surface. Expressions,
   `scan_*` plus `collect`, `explain()` and `group_by` are the working set.
+
+## Lab
+### Task
+Turn an eager, type-guessing trace loader into a lazy nightly rollup: scan step-level agent traces with an
+explicit schema, then build per-tool health and run-length tables (did runs hit the step budget?) as
+lazy plans with deterministic order. A small NDJSON file stands in for the fleet's export. Time box: 60
+minutes.
+- **Prerequisites:** this lesson's How it works (expressions, lazy plans), plus json-jsonl and pandas.
+- **Done means:** every function returns a `LazyFrame`, and `explain()` shows the filter and projection
+  inside the scan.
+
+### Starter code
+```python
+# trace_rollup.py  (checked with polars 1.36.1, Python 3.9+)
+import json
+import tempfile
+from pathlib import Path
+
+import polars as pl
+
+SCHEMA = {"run_id": pl.String, "step": pl.Int64, "tool": pl.String, "status": pl.String,
+          "latency_ms": pl.Float64, "in_tokens": pl.Int64, "prompt": pl.String}
+
+
+def scan_traces(path) -> pl.LazyFrame:
+    """BUGGY (FILL IN 1): reads eagerly and infers types from the data.
+    Must return a lazy scan of the NDJSON file with SCHEMA, so nothing is read before collect()."""
+    return pl.read_ndjson(path).lazy()
+
+
+def tool_health(lf: pl.LazyFrame) -> pl.LazyFrame:
+    # FILL IN 2: lazily, per non-null tool: calls, error_rate (share of status == "error", rounded
+    # to 2), max_latency_ms; sorted by error_rate descending, then tool. Expressions only.
+    raise NotImplementedError
+
+
+def run_lengths(lf: pl.LazyFrame, budget: int) -> pl.LazyFrame:
+    # FILL IN 3: lazily, per run_id: n_steps, in_tokens (sum), hit_budget (n_steps >= budget);
+    # sorted by run_id so reports diff cleanly.
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    rows = [
+        ("r1", 1, "search", "ok", 120, 3000), ("r1", 2, "lookup_order", "error", 340, 3600),
+        ("r1", 3, None, "ok", 900, 4100), ("r2", 1, "search", "ok", 95, 2900),
+        ("r3", 1, "lookup_order", "error", 310, 3100), ("r3", 2, "lookup_order", "ok", 280, 3700),
+        ("r3", 3, None, "ok", 1000, 4300),
+    ]
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "steps.jsonl"
+        p.write_text("".join(json.dumps(dict(zip(SCHEMA, r + ("long prompt text",)))) + "\n"
+                             for r in rows))
+        lf = scan_traces(p)
+        print("schema latency_ms:", lf.collect_schema()["latency_ms"])
+        print("tools:", tool_health(lf).collect().to_dicts())
+        print("runs:", run_lengths(lf, budget=3).collect().to_dicts())
+```
+Run as given, it prints `schema latency_ms: Int64` (inferred, because every latency in the file happens to
+be a whole number), then raises `NotImplementedError`.
+
+### Expected output
+```text
+schema latency_ms: Float64
+tools: [{'tool': 'lookup_order', 'calls': 3, 'error_rate': 0.67, 'max_latency_ms': 340.0}, {'tool': 'search', 'calls': 2, 'error_rate': 0.0, 'max_latency_ms': 120.0}]
+runs: [{'run_id': 'r1', 'n_steps': 3, 'in_tokens': 10700, 'hit_budget': True}, {'run_id': 'r2', 'n_steps': 1, 'in_tokens': 2900, 'hit_budget': False}, {'run_id': 'r3', 'n_steps': 3, 'in_tokens': 11100, 'hit_budget': True}]
+```
+Check: `lookup_order` has 2 errors in 3 calls (0.67); `r3` sums 3,100 + 3,700 + 4,300 = 11,100 tokens.
+
+### Tests
+```python
+# test_trace_rollup.py  (run: pytest -q)
+import json
+
+import polars as pl
+import pytest
+
+from trace_rollup import SCHEMA, run_lengths, scan_traces, tool_health
+
+ROWS = [{"run_id": "a", "step": 1, "tool": "t1", "status": "error", "latency_ms": 10,
+         "in_tokens": 100, "prompt": "p"},
+        {"run_id": "a", "step": 2, "tool": "t2", "status": "ok", "latency_ms": 30,
+         "in_tokens": 200, "prompt": "p"},
+        {"run_id": "b", "step": 1, "tool": "t1", "status": "ok", "latency_ms": 20,
+         "in_tokens": 300, "prompt": "p"},
+        {"run_id": "b", "step": 2, "tool": None, "status": "ok", "latency_ms": 5,
+         "in_tokens": 50, "prompt": "p"}]
+
+
+@pytest.fixture
+def path(tmp_path):
+    p = tmp_path / "s.jsonl"
+    p.write_text("".join(json.dumps(r) + "\n" for r in ROWS))
+    return p
+
+
+def test_scan_is_lazy_with_explicit_schema(path):
+    lf = scan_traces(path)
+    assert isinstance(lf, pl.LazyFrame)
+    assert dict(lf.collect_schema()) == SCHEMA          # latency_ms is Float64 though JSON has ints
+    path.unlink()                                       # a real scan has read nothing yet
+    with pytest.raises(Exception):
+        lf.collect()
+
+
+def test_tool_health(path):
+    out = tool_health(scan_traces(path))
+    assert isinstance(out, pl.LazyFrame)
+    assert out.collect().to_dicts() == [
+        {"tool": "t1", "calls": 2, "error_rate": 0.5, "max_latency_ms": 20.0},
+        {"tool": "t2", "calls": 1, "error_rate": 0.0, "max_latency_ms": 30.0},
+    ]
+
+
+def test_run_lengths(path):
+    out = run_lengths(scan_traces(path), budget=2)
+    assert isinstance(out, pl.LazyFrame)
+    assert out.collect().to_dicts() == [
+        {"run_id": "a", "n_steps": 2, "in_tokens": 300, "hit_budget": True},
+        {"run_id": "b", "n_steps": 2, "in_tokens": 350, "hit_budget": True},
+    ]
+    assert run_lengths(scan_traces(path), budget=3).collect()["hit_budget"].to_list() == [False, False]
+
+
+def test_order_is_deterministic(path):
+    first = tool_health(scan_traces(path)).collect()
+    for _ in range(20):
+        assert tool_health(scan_traces(path)).collect().equals(first)
+```
+On the starter all 4 fail: the schema assertion (inferred `Int64`), then `NotImplementedError` for the
+two rollups and the order check.
+
+### Failure scenarios
+- **Inject `pl.read_ndjson(path).lazy()` back.** The plan's leaf becomes an in-memory `DF [...]` node and
+  the whole file, prompt text included, is read up front. Compare `explain()`: a correct plan shows
+  `NDJson SCAN` with `PROJECT 3/7 COLUMNS` for `tool_health`.
+- **Inject dropping the final `sort`.** Output order now depends on thread scheduling and the
+  determinism test fails intermittently. Repeat the collect 20 times, as the test does, before trusting
+  a single green run.
+- **Inject a row with `"latency_ms": "timeout"`.** With the explicit schema, `collect()` raises on that
+  value; with inference it either errors or quietly becomes a string column. Log the source file and
+  quarantine the row instead of loosening the schema.
+- **Inject `map_elements` for `error_rate`.** Results match, but the work runs in Python per element.
+  Look for `python_udf()` in `explain()` (Polars also warns and suggests the expression) and time both on a 1-million-row file.
+
+### Submission
+- **Code:** `trace_rollup.py` plus the unchanged tests.
+- **Test run:** `pytest -q` showing 4 passed, with `pl.__version__`.
+- **Output:** the three demo lines, matching Expected output.
+- **Plan evidence:** the `explain()` text for `tool_health`, with the scan, selection and projection
+  lines highlighted.
+- **Evaluation:** no `.collect()` inside the functions, no Python UDFs, and every report ends in an
+  explicit sort.
 
 ## Why it exists
 - **pandas was designed for one core and a few hundred megabytes.** Each operation runs eagerly,

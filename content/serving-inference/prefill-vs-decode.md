@@ -5,7 +5,8 @@ name: Prefill vs decode
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -131,6 +132,21 @@ flowchart TD
     L["Long prompt from another agent"] -.->|"unchunked, stalls the step"| D
     L -.->|"chunked, rides along"| C["Chunk plus decode batch"]
 ```
+
+## Misconceptions
+- **"GPU cost is proportional to total tokens."** An input token and an output token cost very different
+  GPU time. A 200-token prompt with a 1,000-token answer occupies the GPU about 13x longer than a
+  4,000-token prompt with a 50-token answer, because every output token re-streams the weights.
+- **"Prefill is cheap, so long agent prompts do not matter."** Per token it is cheap, but an agent
+  re-sends its growing transcript every step. At 20,000 tokens an uncached step prefills for ~356 ms
+  against ~18 ms with the prefix cached, and that cost grows every step while decode stays flat.
+- **"A faster GPU speeds up both phases."** Prefill is compute-bound and gains from more FLOPs; decode is
+  bandwidth-bound and barely moves unless memory bandwidth grows too.
+- **"Batching helps prefill and decode alike."** A prefill is already a large matmul over *P* rows, so
+  batching adds little. Decode reads the weights once for all *B* requests, which is where batching earns
+  its ~25x throughput gain at batch 32.
+- **"Chunked prefill makes prefill faster."** It makes the long prompt's own TTFT slightly worse (~120 ms
+  instead of ~100 ms in the example). What it buys is that no iteration stalls the other users' decode.
 
 ## Examples
 ### A phase cost calculator

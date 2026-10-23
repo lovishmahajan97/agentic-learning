@@ -5,7 +5,8 @@ name: Trade-off analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/nfrs
@@ -39,6 +40,62 @@ is usually task success vs latency vs cost per task.
   choice.
 - **What you can skip.** Formal ATAM workshops and twelve-column matrices. Constraints, three options,
   graded evidence, one flip condition and a reversibility note decide most agent choices.
+
+## Decision case
+### Scenario
+A legal-research agent retrieves from 200 million chunks embedded with an older model. Failed traces
+show retrieval misses drive most task failures, so the team must decide whether and how to change the
+embedding model. All figures are illustrative.
+- **Size and traffic:** about 500 tokens per chunk, so a full re-embed is 100B tokens; agents issue
+  about 3 million retrieval queries a day of about 30 tokens each.
+- **Evidence:** recall@10 on a 400-query golden set (measured unless stated).
+- **Constraints, used as filters:**
+  - Recall@10 at least 0.82 on the interval's lower bound, the floor the task-success analysis needs.
+  - No retrieval downtime during the change.
+  - A migration budget of $10,000.
+  - A decision within 4 weeks.
+  - A team of 4 with no GPU serving experience.
+
+### Options
+| Option | How it works | Recall@10 (grade) | Cost (grade) | Reversibility |
+|---|---|---|---|---|
+| A. Keep the current model | No change | 0.78 on 400 (measured), lower bound 0.739: filtered | $0 | n/a |
+| B. Hosted new model, big-bang re-index | Re-embed everything, swap the index in one cut-over | 0.86 on 400 (measured), lower bound 0.826 | 100B tokens at an assumed $0.02 per 1M = $2,000 (estimated) | One-way at cut-over: a bad index is live for every agent at once |
+| C. Self-hosted open-weight model | Serve the embedding model on own GPUs, then re-index | 0.84 on a 40-query sample (prototyped), ±11 points, lower bound 0.726 | GPU time plus serving operations the team has never run (asserted) | Same cut-over risk, plus a new serving tier |
+| D. Hosted new model behind the retriever, dual index | Write both embeddings, shadow-compare live queries, shift traffic by percentage, keep `embedding_version` on each chunk | Same as B (measured) | $2,000 plus about 1.2 TB of extra float32 vectors (1,536 dimensions) during migration (estimated) | Two-way until the old index is deleted |
+
+### Decision
+Choose **D, the hosted model behind a dual index**, because:
+- **The constraints filter first:** A fails the recall floor; C's cell is too weakly graded to pass it,
+  since 40 queries give an interval of about ±11 points.
+- **The cost cells do not decide it:** re-embedding is about $2,000 and query embedding about
+  90 million tokens a day, about $54 a month at the assumed price, so vendor lock-in is cheap to undo.
+- **The real risk is the cut-over,** a one-way door in B. D turns it into a two-way door with shadow
+  comparison and percentage routing, for a temporary storage cost.
+- **The team constraint weighs against C:** a GPU serving tier adds operations for a cost line that is
+  already small.
+
+**What would change it:** a full 400-query run putting C above B with a lower bound over 0.82, plus a
+residency rule the hosted provider cannot meet, would make C worth its serving cost. A hosted price high
+enough to make re-embedding a large share of the budget would make lock-in matter.
+
+### Trade-offs accepted
+- **Double storage and writes during migration.** Watch: index size and ingestion lag on both indexes,
+  and a dated deletion of the old index.
+- **Dependence on one embedding vendor.** Watch: the provider's price and model deprecation notices,
+  linked to the ADR as revisit triggers.
+- **Golden-set recall may not match live traffic.** Watch: shadow recall agreement between the indexes
+  and agent task success per traffic percentage.
+- **C was not fully evaluated.** Watch: re-run it on the full set if a residency requirement appears.
+
+### Review rubric
+- **Hard constraints filter options before scoring**, with the filtered options and reasons listed.
+- **Every cell carries a grade and a range**, and weak evidence is not allowed to pass a floor.
+- **Costs are recomputed from stated inputs** (chunks, tokens, assumed price), labelled illustrative.
+- **Reversibility is scored explicitly:** the write-up names the one-way door and how the design avoids
+  or contains it.
+- **A flip condition is concrete** and wired to a revisit trigger in the ADR.
+- **Each accepted trade-off names a metric** someone can watch.
 
 ## Why it exists
 - **Everything is a trade-off.** Richards and Ford's first law; their corollary is that if you think a

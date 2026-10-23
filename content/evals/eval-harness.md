@@ -5,7 +5,8 @@ name: Eval harness
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -152,6 +153,23 @@ sequenceDiagram
     H->>H: per-slice pass rate with interval, paired diff vs baseline
     H-->>CI: exit code from thresholds and slice floors
 ```
+
+## Misconceptions
+- **"Items that error out should be left out of the score."** Timeouts hit the hardest, longest items,
+  so dropping them makes the score rise on the day the provider has an outage. Report errors, retry
+  transient ones, and never shrink the denominator silently.
+- **"Temperature 0 makes one run per item a measurement."** Hosted models often return different text at
+  temperature 0 and treat seeds as best-effort. Run the unchanged baseline twice, count the flips, and
+  gate on beating that noise floor.
+- **"Grading inside the run loop is simpler and just as good."** Running is the expensive part and
+  graders change often. Store raw outputs and trajectories first, so a rubric fix is a cheap re-grade
+  instead of a full re-run.
+- **"Retries make agent runs robust."** Retry only provider errors. A looping agent that hits its step
+  budget is an agent failure; retrying it triples the cost and hides the bug, so record it once as a
+  failure.
+- **"Pinning the model name is enough to reproduce a run."** An alias such as `latest` can move, and so
+  can the prompt, retrieval index, tool descriptions, dataset and grader versions. The manifest pins all
+  of them, so a diff between two manifests explains a diff between two scores.
 
 ## Examples
 ### A minimal harness in one file

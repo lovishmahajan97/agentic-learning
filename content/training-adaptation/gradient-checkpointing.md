@@ -5,8 +5,9 @@ name: Gradient checkpointing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
 agent_relevance: useful
+lesson_type: concept
 related:
   - training-adaptation/checkpointing
   - training-adaptation/peft
@@ -159,6 +160,25 @@ flowchart TD
     B --> FR["Free block k internals"]
     FR -->|"move to block k minus 1"| G
 ```
+
+## Misconceptions
+- **"Gradient checkpointing saves the model to disk."** Nothing leaves the GPU: it is activation
+  recomputation. Saving state for resumability is a separate setting, and turning this flag on writes
+  no file.
+- **"It shrinks the whole training footprint."** It cuts only activations. Weights, gradients and
+  optimizer state (about 16 bytes per parameter with AdamW in mixed precision) are untouched; PEFT and
+  quantization attack those.
+- **"It doubles the cost of a step."** Only the forward pass is repeated, and forward is roughly a
+  third of a step's FLOPs, so the worst case is about a third more compute (20-30% wall clock,
+  illustrative). Spend the freed memory on a bigger micro-batch and tokens per second often rises.
+- **"With checkpointing on, any sequence length fits."** One live block is still rebuilt in full, so
+  eager attention leaves its `5·a·s²·b` score tensors (about 10.7 GB for a 7B layer at 8k) as a floor.
+  Only FlashAttention or SDPA removes it, and long-vocabulary logits need a chunked loss.
+- **"If the loss goes down, checkpointing is working."** In reentrant mode with frozen embeddings, LoRA
+  adapters can get no gradient at all while nothing crashes. Check that every trainable parameter has a
+  non-`None` gradient after step one.
+- **"It will also speed up or slim down my agent at inference."** Serving stores no activations for
+  backward, so latency and the KV cache are unchanged; this is a training-only flag.
 
 ## Examples
 ### Worked scenario: fine-tuning a 7B tool-calling agent on full trajectories

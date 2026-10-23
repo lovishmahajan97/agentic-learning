@@ -5,7 +5,8 @@ name: Regression
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/classification
@@ -139,6 +140,19 @@ flowchart TD
     MAE --> EV
     QL --> EV
 ```
+
+## Misconceptions
+- **"The loss is just a training detail; any of them predicts the value."** Each loss estimates a
+  different statistic: MSE the conditional mean, MAE the median, pinball the chosen quantile. On 100, 110,
+  120 and 2,000 ms, MSE predicts 582.5 ms and MAE anything from 110 to 120 ms.
+- **"A p95 is the mean plus 1.645 standard deviations."** That holds only for Gaussian, constant-variance
+  residuals. Agent run lengths and latencies are skewed, so fit the 0.95 quantile directly.
+- **"Fitting on log(cost) and exponentiating gives the expected cost."** It gives the geometric mean,
+  which is biased low; summed budgets come out short until you apply a correction such as smearing.
+- **"A near-perfect offline R² means a great predictor."** It is the signature of leakage, such as
+  output token count used to predict latency. Only features known before the run starts are allowed.
+- **"An average judge score that rose from 3.2 to 3.4 shows the agent improved."** 1–5 judge scores are
+  ordinal, so the mean has no fixed meaning; compare pass rates at a rubric threshold or pairwise wins.
 
 ## Examples
 ### Agent scenario: setting a step budget from run logs

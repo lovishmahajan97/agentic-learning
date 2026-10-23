@@ -5,7 +5,8 @@ name: Supervised vs unsupervised vs self-supervised learning
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/classification
@@ -154,6 +155,22 @@ flowchart TD
     U --> E3["Stability or decision changed"]
     SS -.->|"pre-trained encoder"| S
 ```
+
+## Misconceptions
+- **"Self-supervised is just another name for unsupervised."** Next-token prediction is cross-entropy
+  against a specific known target per position, so the supervised toolkit applies; only the source of the
+  label differs. Unsupervised objectives score a global property and have no per-example target.
+- **"Clustering can sort data into my categories without labels."** k-means groups by whatever
+  similarity dominates the embedding space, which need not match your taxonomy, and gives no accuracy
+  number. Clusters tell you what to label and how to sample, not what is correct.
+- **"Logged agent actions are free, clean labels."** They are free but carry the agent's mistakes: train
+  on every logged tool call and the model learns the failures too. Filter by verified outcome, and
+  measure noise by having experts re-label a sample.
+- **"A model that keeps failing needs to be bigger."** If annotators agree on only 85% of examples, the
+  ceiling is near 85% and the rest is disagreement. Check agreement and coverage before scaling.
+- **"Lower pre-training loss means a better agent."** The pretext task is a proxy: perplexity can fall
+  while instruction following or tool calling does not move. Judge self-supervised work by downstream
+  task score.
 
 ## Examples
 ### Agent scenario: three signals from one month of agent traces

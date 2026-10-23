@@ -5,7 +5,8 @@ name: PagedAttention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -152,6 +153,23 @@ flowchart TD
     X -.->|"frees blocks"| P
     K["Attention kernel"] -->|"walks table row"| P
 ```
+
+## Misconceptions
+- **"PagedAttention is a faster attention kernel."** The block-table indirection makes the kernel slightly
+  slower. The 2–4× throughput gain comes from fitting more sequences into the batch, so a GPU running one
+  long request sees no benefit.
+- **"Paging means the KV cache lives in CPU memory, like OS swap."** Blocks are GPU memory; "paging" names
+  the logical-to-physical translation. Data leaves the GPU only when the scheduler preempts a sequence,
+  and vLLM's V1 engine recomputes instead of swapping.
+- **"Paging removes all waste, so memory can no longer run out."** Each sequence still wastes up to B − 1
+  tokens in its last block, and on-demand growth can drain the pool mid-generation. Exhaustion shows up as
+  preemptions and latency jitter, not as an OOM.
+- **"Prefix caching shares any prompts that start with similar text."** Only complete blocks whose content
+  and entire preceding prefix are identical are shared. A date on the first line of the system prompt
+  changes every block after it, so the hit rate drops to near zero.
+- **"Agents get the same 5× gain as chat."** The 5× comes from short chats under a long limit. Long agent
+  runs use much of their limit, so paging alone gives about 1.6× in the worked scenario; prefix sharing
+  supplies most of the rest.
 
 ## Examples
 ### Capacity: contiguous vs paged on an 80 GB GPU

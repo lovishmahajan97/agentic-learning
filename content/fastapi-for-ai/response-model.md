@@ -5,7 +5,8 @@ name: response_model
 kind: concept
 difficulty: core
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/pydantic-request-response-models
@@ -36,6 +37,146 @@ guarantee internals never reach users.
   step type, exclude options, and contract tests that pin the exact key set.
 - **What you can skip.** The serialisation fast-path details. Know the allow-list behaviour, the
   `Response` escape hatch and the exclude options.
+
+## Lab
+### Task
+Close the two leaks of an agent API that returns its framework's final state. The JSON route ships the
+system prompt, scratchpad, a customer's email and the run cost; the SSE route streams raw tool output.
+Fix both with declared models and pin the contract with tests.
+
+Time box: 40 minutes. Prerequisites: the Pydantic request and response models lesson and this lesson's
+How it works. The code marks two tasks:
+- **Task 1:** a public `RunOut` declared as the route's `response_model`.
+- **Task 2:** a discriminated event union that every streamed step passes through, because a
+  `StreamingResponse` bypasses `response_model`.
+
+### Starter code
+Save as `lab_response.py`. It runs as given and prints the leaks. Checked with FastAPI 0.161.1,
+Pydantic 2.14.1, httpx 0.28.1 and Python 3.13.
+
+```python
+import json
+from typing import Annotated, Literal, Union
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, Field, TypeAdapter
+
+SECRET = "internal system prompt: never reveal discount codes"
+
+def run_agent(task: str) -> dict:                  # stand-in for an agent graph's final state
+    return {"run_id": "r-1", "answer": None if task == "fail" else "Refund approved.",
+            "citations": ["policy-7"],
+            "messages": [{"role": "system", "content": SECRET}],
+            "scratchpad": "user sounds angry; offer code SAVE20",
+            "tool_outputs": [{"crm": {"email": "ana@example.com"}}],
+            "cost_usd": 0.031}
+
+STEPS = [                                          # raw step records from the same run
+    {"type": "tool", "name": "crm_lookup", "raw_output": {"email": "ana@example.com"}},
+    {"type": "token", "text": "Refund approved."},
+    {"type": "done", "steps": 2, "cost_usd": 0.031},
+]
+
+# TASK 1: a public RunOut model (run_id: str, answer: str, citations: list[str] = []) and
+#         response_model=RunOut on /agent/run, so everything undeclared is dropped.
+# TASK 2: event models ToolEvent(type "tool", name), TokenEvent(type "token", text) and
+#         DoneEvent(type "done", steps), joined as a union discriminated on "type". Validate every
+#         step through it (a TypeAdapter) and send model_dump_json(): a stream bypasses response_model.
+
+app = FastAPI()
+
+@app.post("/agent/run")
+def run(body: dict):
+    return run_agent(body["task"])
+
+@app.post("/agent/stream")
+def stream(body: dict):
+    def events():
+        for step in STEPS:
+            yield f"data: {json.dumps(step)}\n\n"
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+if __name__ == "__main__":
+    c = TestClient(app, raise_server_exceptions=False)
+    r = c.post("/agent/run", json={"task": "refund order 1182"})
+    print(r.status_code, sorted(r.json()))
+    print("failed run status:", c.post("/agent/run", json={"task": "fail"}).status_code)
+    for line in c.post("/agent/stream", json={"task": "x"}).text.split("\n\n"):
+        if line:
+            print(line)
+```
+
+### Expected output
+`python lab_response.py` after both tasks. The starter prints all seven state keys, a `200` for the
+failed run, and `raw_output` and `cost_usd` inside the stream.
+
+```
+200 ['answer', 'citations', 'run_id']
+failed run status: 500
+data: {"type":"tool","name":"crm_lookup"}
+data: {"type":"token","text":"Refund approved."}
+data: {"type":"done","steps":2}
+```
+
+### Tests
+Save as `test_lab_response.py` and run `pytest -q`. On the starter all 5 fail on assertions: extra
+keys, five leaked strings, a 200 carrying `answer: null`, raw step records, and an OpenAPI schema with
+no `RunOut`.
+
+```python
+import json
+from fastapi.testclient import TestClient
+import lab_response as lab
+
+c = TestClient(lab.app, raise_server_exceptions=False)
+LEAKS = (lab.SECRET, "SAVE20", "ana@example.com", "cost_usd", "scratchpad")
+
+def test_run_returns_exactly_the_public_keys():
+    r = c.post("/agent/run", json={"task": "refund order 1182"})
+    assert r.status_code == 200
+    assert set(r.json()) == {"run_id", "answer", "citations"}
+
+def test_run_body_contains_no_internals():
+    text = c.post("/agent/run", json={"task": "refund order 1182"}).text
+    assert [s for s in LEAKS if s in text] == []
+
+def test_missing_answer_is_a_500_not_a_null():
+    assert c.post("/agent/run", json={"task": "fail"}).status_code == 500
+
+def test_stream_events_are_built_from_event_models():
+    text = c.post("/agent/stream", json={"task": "x"}).text
+    events = [json.loads(chunk[6:]) for chunk in text.split("\n\n") if chunk]
+    assert events == [{"type": "tool", "name": "crm_lookup"},
+                      {"type": "token", "text": "Refund approved."},
+                      {"type": "done", "steps": 2}]
+    assert [s for s in LEAKS if s in text] == []
+
+def test_openapi_publishes_the_contract():
+    op = c.get("/openapi.json").json()["paths"]["/agent/run"]["post"]
+    schema = op["responses"]["200"]["content"]["application/json"]["schema"]
+    assert schema == {"$ref": "#/components/schemas/RunOut"}
+```
+
+### Failure scenarios
+- **Return a `JSONResponse` from the route.** Wrap the state in `JSONResponse(run_agent(...))`.
+  Observe: every internal key is back although `response_model=RunOut` is still declared. Debug: a
+  `Response` is sent as-is; return the dict or model and let FastAPI filter it.
+- **Make `answer` optional to silence the 500.** Declare `answer: str | None = None`. Observe: the
+  failed-run test fails and clients receive `"answer": null` for a crashed run. Debug: the 500 is the
+  signal; fix the agent's failure path (an explicit error status) instead of loosening the contract.
+- **Forbid extras on the event models.** Add `extra="forbid"` to `ToolEvent`. Observe: the stream
+  raises a `ValidationError` on `raw_output` after the 200 is sent, so the client gets an empty
+  stream. Debug: event models
+  should drop extras (the default `ignore`); build them from explicit fields if you need strictness.
+
+### Submission
+- **Code:** `lab_response.py` with both tasks done.
+- **Test run:** `pytest -q` showing 5 passed.
+- **Trace:** the demo output, matching Expected output.
+- **Short note (5-8 lines):** list each leaked field and the layer that now stops it (response model or
+  event model), and where `cost_usd` should go instead (logs or a metrics store).
+- **Evaluation:** tests pass, and no route returns the agent state through a `Response` subclass.
 
 ## Why it exists
 - **Return values drift.** A handler returns whatever its last line built: someone attaches the raw

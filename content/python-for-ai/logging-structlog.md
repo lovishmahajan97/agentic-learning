@@ -5,7 +5,8 @@ name: logging / structlog
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - observability/logging
@@ -39,6 +40,158 @@ cost $4?" becomes a query.
   trace ID that joins a log line to its trace.
 - **What you can skip.** Custom handler classes and logging-config dict files. One `structlog.configure`
   call plus stdout is enough for most agent services.
+
+## Lab
+### Task
+Instrument an async agent loop so every model and tool call is one JSON event bound to `run_id` and
+`step`, secrets are redacted in the processor chain, and two concurrent runs never mix their context.
+The agent goal: answer "which run, which step, which tool failed?" with a field query, not a regex.
+Time box: 45-75 min.
+- **Prerequisites:** async / await; Conversation & execution identifiers.
+- **Setup:** Python 3.10+, `pip install structlog pytest` (checked with structlog 26.1.0). Save the
+  starter as `lab.py`, the tests as `test_lab.py`.
+- **Deterministic by design:** no timestamps and `sort_keys=True`, so output can be compared exactly.
+
+### Starter code
+```python
+"""Lab: structured, run-scoped, redacted agent events with structlog. Run: python lab.py"""
+from __future__ import annotations
+import asyncio, hashlib, io, json, sys
+import structlog
+
+SENSITIVE = {"api_key", "authorization", "prompt"}
+
+class ScriptedModel:                          # async fake: replays steps, yields to the event loop
+    def __init__(self, steps: list[dict]) -> None:
+        self.steps = list(steps)
+    async def next_step(self) -> dict:
+        await asyncio.sleep(0)                # lets concurrent runs interleave
+        return self.steps.pop(0)
+
+def args_sha(args: dict) -> str:
+    return hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()[:12]
+
+def redact(logger, method_name, event_dict):
+    # YOUR CODE HERE: replace the value of every SENSITIVE key present with "[redacted]"
+    raise NotImplementedError
+
+def configure(stream) -> None:
+    # YOUR CODE HERE: structlog.configure(...) so each event is one JSON line on `stream`
+    # - processors: merge_contextvars, add_log_level, redact, JSONRenderer(sort_keys=True)
+    # - logger_factory=structlog.PrintLoggerFactory(file=stream), cache_logger_on_first_use=False
+    raise NotImplementedError
+
+async def run_agent(run_id: str, model: ScriptedModel, tools: dict) -> str:
+    # YOUR CODE HERE
+    # - clear_contextvars(), then bind run_id for the whole run
+    # - step n (from 1): bind step=n only while the step runs (structlog.contextvars.bound_contextvars)
+    #   and emit "llm_call"; a {"tool": ..., "args": ...} step then runs the tool and emits "tool_call"
+    #   with tool, args_sha=args_sha(args), status "ok" (info) or "error" (warning, the run continues)
+    # - an {"answer": ...} step ends the run: emit "run_end" with steps=<model calls>, outside any step
+    # - never log raw tool args
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    buf = io.StringIO()
+    configure(buf)
+    structlog.contextvars.bind_contextvars(api_key="sk-test-123")   # bound into context by mistake
+    structlog.get_logger().info("config_loaded")
+    def lookup_order(order_id: str, email: str) -> str:
+        return "shipped"
+    model = ScriptedModel([{"tool": "lookup_order", "args": {"order_id": "A17", "email": "ann@example.com"}},
+                           {"answer": "Order A17 has shipped."}])
+    print(asyncio.run(run_agent("run-1", model, {"lookup_order": lookup_order})))
+    sys.stdout.write(buf.getvalue())
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly this. The `api_key` line is redacted, and the run's
+lines lack it because `clear_contextvars()` runs inside the run's own task context.
+
+```
+Order A17 has shipped.
+{"api_key": "[redacted]", "event": "config_loaded", "level": "info"}
+{"event": "llm_call", "level": "info", "run_id": "run-1", "step": 1}
+{"args_sha": "a8cc5e26b791", "event": "tool_call", "level": "info", "run_id": "run-1", "status": "ok", "step": 1, "tool": "lookup_order"}
+{"event": "llm_call", "level": "info", "run_id": "run-1", "step": 2}
+{"event": "run_end", "level": "info", "run_id": "run-1", "steps": 2}
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 4 error in the fixture with `NotImplementedError`; a
+correct solution passes all 4 (Python 3.12, structlog 26.1.0, pytest 9.1).
+
+```python
+import asyncio, io, json
+import pytest, structlog
+from lab import ScriptedModel, args_sha, configure, run_agent
+
+@pytest.fixture
+def events():
+    buf = io.StringIO()
+    configure(buf)
+    structlog.contextvars.clear_contextvars()
+    return lambda: [json.loads(line) for line in buf.getvalue().splitlines()]
+
+def order_tool(order_id, email):
+    return "shipped"
+
+def test_events_are_bound_to_run_and_step(events):
+    model = ScriptedModel([{"tool": "lookup_order", "args": {"order_id": "A17", "email": "a@b.co"}},
+                           {"answer": "done"}])
+    assert asyncio.run(run_agent("r1", model, {"lookup_order": order_tool})) == "done"
+    ev = events()
+    assert [(e["event"], e.get("step")) for e in ev] == [
+        ("llm_call", 1), ("tool_call", 1), ("llm_call", 2), ("run_end", None)]
+    assert all(e["run_id"] == "r1" for e in ev) and ev[-1]["steps"] == 2
+    assert ev[1]["args_sha"] == args_sha({"order_id": "A17", "email": "a@b.co"})
+    assert "a@b.co" not in json.dumps(ev)
+
+def test_tool_error_is_a_warning_and_the_run_continues(events):
+    def broken(**_):
+        raise TimeoutError("orders API timed out")
+    model = ScriptedModel([{"tool": "lookup_order", "args": {}}, {"answer": "sorry"}])
+    asyncio.run(run_agent("r2", model, {"lookup_order": broken}))
+    tool = [e for e in events() if e["event"] == "tool_call"][0]
+    assert (tool["status"], tool["level"]) == ("error", "warning")
+
+def test_redaction_runs_after_context_merge(events):
+    structlog.contextvars.bind_contextvars(api_key="sk-live-999")
+    structlog.get_logger().info("config_loaded", prompt="Summarize the contract")
+    structlog.contextvars.clear_contextvars()
+    (e,) = events()
+    assert e["api_key"] == "[redacted]" and e["prompt"] == "[redacted]"
+
+def test_concurrent_runs_do_not_mix_context(events):
+    async def both():
+        a = ScriptedModel([{"tool": "search", "args": {"q": "x"}}] * 3 + [{"answer": "a"}])
+        b = ScriptedModel([{"tool": "refund", "args": {"id": 1}}] * 3 + [{"answer": "b"}])
+        await asyncio.gather(run_agent("ra", a, {"search": lambda q: "hit"}),
+                             run_agent("rb", b, {"refund": lambda id: "ok"}))
+    asyncio.run(both())
+    tools = {(e["run_id"], e["tool"]) for e in events() if e["event"] == "tool_call"}
+    assert tools == {("ra", "search"), ("rb", "refund")}
+```
+
+### Failure scenarios
+- **Put `redact` before `merge_contextvars`.** `test_redaction_runs_after_context_merge` shows the raw
+  `sk-live-999`, because the key arrives from context after redaction ran. Print the processor list and
+  read it top to bottom: each processor sees only what earlier ones added.
+- **Bind `step` with `bind_contextvars` and never unbind it.** `run_end` carries `"step": 2` and the first
+  test fails on `("run_end", 2)`. Use the `bound_contextvars` context manager so the field leaves with the step.
+- **Store `run_id` in a module-level variable instead of context.** The concurrency test sees `rb` on
+  `search` events, since both runs write one global. Filter events by `tool` and look at the `run_id`s.
+- **Log `args=step["args"]`.** The e-mail address appears in the output and the PII assertion fails. Grep
+  the JSON for any argument value; log `args_sha` and the argument names instead.
+
+### Submission
+- **`lab.py`** with `redact`, `configure` and `run_agent` implemented.
+- **A green test run** (4 passed) and the output of `python lab.py`.
+- **One added field of your choice** (for example `latency_ms` from an injected clock) with a test.
+- **A note of three log queries** you would write over these events (for example: runs with more than 8
+  steps, error rate by `tool`), naming the fields each one uses.
+- **Evaluated on:** exact event sequence, redaction order, no raw arguments, and no context leaking
+  between concurrent runs or out of a step.
 
 ## Why it exists
 - **Concurrency makes prose logs useless.** `print()` and f-string log lines work until there are many

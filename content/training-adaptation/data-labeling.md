@@ -5,7 +5,8 @@ name: Data labeling
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/data-curation
@@ -174,6 +175,22 @@ flowchart TD
     V --> AU["Out-of-fold audit of likely label errors"]
     AU -->|"hand review"| A
 ```
+
+## Misconceptions
+- **"High raw agreement means the labels are reliable."** On skewed tasks raters agree by chance on the
+  common class; 96% raw agreement on a rare fraud class can be kappa 0.31. Report chance-corrected
+  agreement and read where the disagreements sit.
+- **"An LLM judge that matches humans 85% of the time can gate releases."** Most agent steps are fine, so
+  a lenient judge scores high while catching half the failures. Measure its kappa and its recall on
+  human-flagged failures against adjudicated labels.
+- **"Low kappa means careless annotators."** It usually means the guideline does not separate two classes.
+  The confusion matrix shows which pair; worked boundary cases fix it, not stricter supervision.
+- **"Label noise averages out with more data."** Only random noise does, and only slowly; consistent noise
+  becomes model behaviour, and a 2,000-example fine-tuning set has no averaging to hide it.
+- **"Model pre-fill gives the same labels, faster."** Annotators anchor on plausible suggestions, so
+  agreement measures agreement with the model. Keep a blind subset, and keep the eval set human-only.
+- **"A run that ends with the right answer needs one pass/fail label."** A correct final answer can hide a
+  refund issued before the eligibility check. Label each step as well as the run.
 
 ## Examples
 ### Calibrating an LLM judge on agent steps

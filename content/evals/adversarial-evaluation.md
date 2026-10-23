@@ -5,7 +5,8 @@ name: Adversarial evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -159,6 +160,22 @@ flowchart TD
     JD --> GT
     AM -.->|"new successes promoted"| SU
 ```
+
+## Misconceptions
+- **"Jailbreaks typed by the user are the main threat."** For an agent the dangerous channel is indirect:
+  an instruction inside a retrieved page, email or tool result that triggers `send_email` or a refund.
+  Test each (channel, goal) cell separately.
+- **"Average attack success across techniques is the security number."** The attacker picks the
+  technique, so report the worst case per goal: a mean of 8% hid a 40% attachment channel.
+- **"Zero successes means the attack does not work."** Zero in *n* trials only bounds the rate at about
+  3/*n*; 20 clean trials still allow roughly 14%. Attacks are stochastic and attackers retry, so gate
+  critical cells on any success in *k* samples.
+- **"A polite refusal in the reply means the attack failed."** The injected tool call may already have
+  run. Grade tool goals on the trace, with canaries, not on the final text.
+- **"Driving ASR to zero is the goal."** Refusing everything gets there. Every ASR gate needs an
+  over-refusal ceiling on a benign-but-edgy set, or hardening is optimised blind.
+- **"Red-teaming once before launch is enough."** Prompt edits and model updates reopen holes, and
+  defences overfit a fixed set. Version the suite, run it on every change and keep held-out templates.
 
 ## Examples
 ### Indirect-injection suite with canary grading

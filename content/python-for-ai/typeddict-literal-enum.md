@@ -5,7 +5,8 @@ name: TypedDict, Literal and Enum
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/type-hints
@@ -39,6 +40,185 @@ gives finish reasons behaviour.
   (`Literal` or `StrEnum`), and where validation happens, since TypedDict checks nothing at runtime.
 - **What you can skip.** Enum flags, `IntFlag` and the functional Enum API. Know `StrEnum`, `NotRequired`
   and `assert_never`.
+
+## Lab
+### Task
+Build the boundary of an agent loop that receives recorded provider turns: validate each JSON turn
+into a `TypedDict` that stays a plain dict, map the raw finish reason onto a `StrEnum` with a counted
+`UNKNOWN` fallback, and route with an exhaustive `match` the checker polices.
+
+Time box: 45-75 minutes. Do "How it works" here and the `type-hints` lesson first.
+- **Implement** `load_turn`, `parse_finish` and `next_step` in `lab.py`.
+- **Keep** the types and `RECORDED` unchanged; the recorded turns replace a live API, so no key or
+  network is needed.
+- **Run** on Python 3.11+ with `pydantic`, `pytest` and `mypy` (checked on Python 3.12.14,
+  Pydantic 2.14.1, pytest 9.1.1, mypy 2.4.0).
+
+### Starter code
+Save as `lab.py`. It runs and reports each turn as not implemented.
+
+```python
+"""lab.py: validate provider turns at the boundary, then route on closed types."""
+from __future__ import annotations
+
+import json
+from collections import Counter
+from enum import StrEnum
+from typing import Literal, NotRequired, TypedDict, assert_never
+
+from pydantic import TypeAdapter, ValidationError
+
+ToolName = Literal["search", "calculator"]
+Next = Literal["run_tools", "respond", "continue", "escalate"]
+
+class ToolCall(TypedDict):
+    id: str
+    name: ToolName
+    arguments: str                       # JSON text, exactly as the API sends it
+
+class Turn(TypedDict):
+    role: Literal["assistant"]
+    content: str | None
+    finish_reason: str                   # raw wire value: providers add new ones
+    tool_calls: NotRequired[list[ToolCall]]
+
+class Finish(StrEnum):
+    STOP = "stop"
+    LENGTH = "length"
+    TOOL_CALLS = "tool_calls"
+    UNKNOWN = "unknown"                  # any wire value this code does not know yet
+
+UNKNOWN_SEEN: Counter[str] = Counter()
+TURN = TypeAdapter(Turn)                 # built once at import, reused per turn
+
+def load_turn(text: str) -> Turn | list[tuple[int | str, ...]]:
+    """Validate JSON text with TURN.validate_json. Return the plain dict, or the list of every
+    error's `loc` tuple (malformed JSON included, so this never raises)."""
+    raise NotImplementedError("LAB: load_turn")
+
+def parse_finish(raw: str) -> Finish:
+    """Wire value -> Finish member. Unknown values become Finish.UNKNOWN and are counted in UNKNOWN_SEEN."""
+    raise NotImplementedError("LAB: parse_finish")
+
+def next_step(turn: Turn, finish: Finish) -> Next:
+    """A match over `finish` that ends in `case _: assert_never(finish)`:
+    TOOL_CALLS -> 'run_tools' if the turn has tool_calls, else 'respond'; STOP -> 'respond';
+    LENGTH -> 'continue'; UNKNOWN -> 'escalate'."""
+    raise NotImplementedError("LAB: next_step")
+
+RECORDED = [   # recorded provider turns, one JSON text each
+    '{"role": "assistant", "content": null, "finish_reason": "tool_calls",'
+    ' "tool_calls": [{"id": "c1", "name": "search", "arguments": "{\\"q\\": \\"refunds\\"}"}]}',
+    '{"role": "assistant", "content": "Here is the policy.", "finish_reason": "stop"}',
+    '{"role": "assistant", "content": "The policy says", "finish_reason": "length"}',
+    '{"role": "assistant", "content": null, "finish_reason": "pause_turn"}',
+    '{"role": "assistant", "content": null, "finish_reason": "tool_calls",'
+    ' "tool_calls": [{"id": "c2", "name": "weather", "arguments": "{}"}]}',
+    '{"role": "assistant", "finish_reason": "stop"}',
+]
+
+if __name__ == "__main__":
+    for text in RECORDED:
+        try:
+            t = load_turn(text)
+            if isinstance(t, list):
+                print("rejected:", t)
+                continue
+            finish = parse_finish(t["finish_reason"])
+            print(json.dumps({"next": next_step(t, finish), "finish": finish}))
+        except NotImplementedError as e:
+            print("not implemented:", e)
+    print("unknown finish reasons:", dict(UNKNOWN_SEEN))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+{"next": "run_tools", "finish": "tool_calls"}
+{"next": "respond", "finish": "stop"}
+{"next": "continue", "finish": "length"}
+{"next": "escalate", "finish": "unknown"}
+rejected: [('tool_calls', 0, 'name')]
+rejected: [('content',)]
+unknown finish reasons: {'pause_turn': 1}
+```
+
+### Tests
+Save as `test_lab.py` and run `python -m pytest -q`. On the starter four tests fail with
+`NotImplementedError`, and the checker test fails because no `assert_never` guards the router yet.
+
+```python
+import json, pathlib, shutil, subprocess, sys
+import pytest
+import lab
+from lab import RECORDED, UNKNOWN_SEEN, Finish, load_turn, next_step, parse_finish
+
+def test_valid_turn_stays_a_plain_dict():
+    t = load_turn(RECORDED[0])
+    assert type(t) is dict and t["tool_calls"][0]["name"] == "search"
+
+def test_invalid_turns_return_every_loc():
+    assert load_turn(RECORDED[4]) == [("tool_calls", 0, "name")]
+    assert load_turn(RECORDED[5]) == [("content",)]
+    assert load_turn('{"role": "assistant", "content": "hi", "finish_reason": "stop"} Sure!') == [()]
+
+def test_parse_finish_is_a_str_and_counts_unknowns():
+    UNKNOWN_SEEN.clear()
+    assert parse_finish("stop") is Finish.STOP and parse_finish("stop") == "stop"
+    assert json.dumps({"f": parse_finish("length")}) == '{"f": "length"}'
+    assert parse_finish("pause_turn") is Finish.UNKNOWN
+    parse_finish("pause_turn"); parse_finish("refusal")
+    assert UNKNOWN_SEEN == {"pause_turn": 2, "refusal": 1}
+
+def test_next_step_branches():
+    tools = {"role": "assistant", "content": None, "finish_reason": "tool_calls",
+             "tool_calls": [{"id": "c1", "name": "search", "arguments": "{}"}]}
+    bare = {"role": "assistant", "content": "x", "finish_reason": "tool_calls"}
+    assert next_step(tools, Finish.TOOL_CALLS) == "run_tools"
+    assert next_step(bare, Finish.TOOL_CALLS) == "respond"
+    assert next_step(bare, Finish.STOP) == "respond"
+    assert next_step(bare, Finish.LENGTH) == "continue"
+    assert next_step(bare, Finish.UNKNOWN) == "escalate"
+
+def mypy(path: pathlib.Path) -> str:
+    return subprocess.run([sys.executable, "-m", "mypy", "--strict", "--no-error-summary", path.name],
+                          cwd=path.parent, capture_output=True, text=True).stdout
+
+def test_checker_flags_a_new_unhandled_member(tmp_path: pathlib.Path):
+    pytest.importorskip("mypy")
+    src = pathlib.Path(lab.__file__).read_text()
+    (tmp_path / "lab.py").write_text(src)
+    assert mypy(tmp_path / "lab.py") == "", "lab.py must pass mypy --strict"
+    marker = '    UNKNOWN = "unknown"'
+    assert marker in src
+    (tmp_path / "lab.py").write_text(src.replace(marker, marker + '\n    PAUSE = "pause_turn"', 1))
+    assert '"assert_never"' in mypy(tmp_path / "lab.py"), "adding a member must fail at assert_never"
+```
+
+### Failure scenarios
+- **Parse with `TURN.validate_python(json.loads(text))`.** The trailing-text case raises
+  `json.JSONDecodeError` instead of returning `[()]`, so one bad completion crashes the loop. The
+  traceback starts in `json.decoder`; switch to `validate_json`, which reports malformed JSON as a
+  `json_invalid` error.
+- **Declare `class Finish(Enum)` instead of `StrEnum`.** `parse_finish("stop") == "stop"` is `False`
+  and `json.dumps` of a member raises `TypeError`. The parse test fails on the equality; print
+  `type(Finish.STOP).__mro__` to see whether `str` is in it.
+- **Forget the `UNKNOWN` case.** mypy reports `Argument 1 to "assert_never" has incompatible type
+  "Literal[Finish.UNKNOWN]"`, so the checker test fails on the unmodified file. Read the literal in the
+  message: it names the member you did not handle.
+- **Call `Finish(raw)` without a fallback.** `pause_turn` raises `ValueError` mid-run. Count unknowns
+  at the boundary instead, then alert on `UNKNOWN_SEEN`.
+
+### Submission
+- **`lab.py` and `test_lab.py`,** with the `python -m pytest -q` output showing 5 passed.
+- **The output of `python lab.py`,** matching the expected block.
+- **The extension:** add `CONTENT_FILTER = "content_filter"` to `Finish` and paste the mypy error it
+  causes, then the fix (a new `Next` value such as `"refuse"` and its case).
+- **A note of 2-4 sentences:** why `Turn` is a `TypedDict` here rather than a Pydantic model, and
+  where in a real agent you would alert on `UNKNOWN_SEEN`.
+- **Evaluation:** tests pass unmodified, `mypy --strict lab.py` is clean, and the extension's mypy
+  error names the new member.
 
 ## Why it exists
 - **Wire data arrives as dicts.** Provider responses, tool-call arguments and agent state typed as

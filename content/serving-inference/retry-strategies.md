@@ -5,7 +5,8 @@ name: Retry strategies
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - serving-inference/timeouts
@@ -163,6 +164,21 @@ flowchart TD
     D -->|"yes"| R["Retry the call"]
     R -.->|"fails again"| F
 ```
+
+## Misconceptions
+- **"More retries make the system more reliable."** That holds only for independent failures. During an
+  incident failures are correlated, so three attempts per request triple load on a saturated provider; a
+  retry budget of about 10% keeps amplification near 1.1×.
+- **"Exponential backoff is enough on its own."** Every client that failed at the same instant computes
+  the same schedule and returns in waves at 1, 2 and 4 seconds. Full jitter spreads those waves.
+- **"Adding retries at my layer is harmless."** Layers multiply: 3 SDK attempts × 4 service attempts × 4
+  browser attempts is 48 calls for one click. Pick one retrying layer, usually the SDK, and use a breaker
+  and fallback above it.
+- **"A timeout means the call did nothing, so retrying is safe."** A timed-out model or tool call may
+  already have run its side effect. Retry only under the same idempotency key, or reconcile first.
+- **"Every failed tool call should be retried in code."** Retry transport faults (5xx, timeouts) in code,
+  but return semantic errors such as "customer 4412 not found" to the model as the tool result, because a
+  blind retry fails identically and the model can change the call.
 
 ## Examples
 ### Retry helper with full jitter, Retry-After and a budget

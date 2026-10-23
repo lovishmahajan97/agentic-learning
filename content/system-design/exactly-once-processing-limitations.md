@@ -5,7 +5,8 @@ name: Exactly-once processing limitations
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/outbox-inbox-patterns
@@ -40,6 +41,62 @@ transactions included, stops there; your agent's external APIs and LLM calls are
   duplicates from.
 - **What you can skip.** Kafka transaction internals and Flink checkpoint barriers. Know the two generals
   argument, the boundary test and the memoisation rule.
+
+## Decision case
+### Scenario
+A marketplace runs a refund agent. It consumes `RefundRequested` events from Kafka, asks a model to
+decide the amount within policy, calls the payment provider's refund API, writes a ledger row to
+Postgres and emits `RefundIssued`. After a double-refund incident, the product manager asks the team to
+"turn on exactly-once". All figures are illustrative.
+- **Scale:** 50,000 refund events a day, average refund $40.
+- **Failure rate:** about 0.1% of deliveries crash between effect and offset commit (deploys,
+  rebalances), so plain at-least-once means about 50 duplicates a day.
+- **Constraints:** refunds within 15 minutes; no customer refunded twice and none silently dropped;
+  dead-lettered events may be replayed up to 3 days later; in this contract the provider retains
+  idempotency keys for 24 hours; 4 engineers, 3 weeks.
+
+### Options
+| Option | How it works | Payment API call | Model decision on retry | Lost or duplicated per day | Effort |
+|---|---|---|---|---|---|
+| A. Kafka transactions end to end | `exactly_once_v2` on the processing job | Outside the transaction: still at-least-once | Re-asked, may pick a different amount | About 50 duplicates, about $2,000 refunded twice | A config change, solves nothing that hurts |
+| B. At-least-once plus per-effect idempotence | Memoise the model's decision in `step_results` under `{event_id}:refund`; send that key to the provider; ledger row and stored offset in one Postgres transaction; a `sent` marker right after the call | Deduped by the provider within 24 hours, by our marker and reconciliation after that | Replayed from the stored row | Duplicates only when a crash before the marker meets a replay after 24 hours and reconciliation misses it | About 3 weeks |
+| C. At-most-once plus manual repair | Commit the offset before processing; support fixes gaps by hand | Never repeated | Never re-asked | About 50 refunds lost a day, found by complaints | Small, but breaks "none dropped" |
+
+### Decision
+Choose **B**, because:
+- **The effects that hurt are outside Kafka.** Transactions cover offsets and output records only; the
+  refund call and the ledger write sit outside, so A leaves the $2,000 a day of double refunds untouched.
+- **The amount must not change on retry.** The model is non-deterministic, so the decided amount is
+  memoised before the refund is sent; a replay reads it back.
+- **Each effect gets the cheapest mechanism that holds.** The ledger uses offset-in-sink (atomic with the
+  effect); the refund uses the provider's key; `RefundIssued` consumers dedupe on `event_id`.
+- **The dedupe window is the binding constraint.** A 3-day DLQ replay outlives the 24-hour provider
+  window, so before any call the worker checks the `sent` marker and, for steps left `decided`, queries the
+  provider by correlation id.
+- **C violates "none dropped"** outright.
+
+**What would change it:** a stage whose input and output are both Kafka topics (say, enrichment) should
+use transactions there; a provider without keys would put refunds behind reconciliation-first or a human
+gate; a DLQ replay limit under 24 hours would make the provider key alone sufficient.
+
+### Trade-offs accepted
+- **A residual duplicate window.** Watch: refunds whose correlation id appears twice at the provider
+  (target zero), and `decided` rows older than 15 minutes.
+- **More state per event.** One `step_results` row and one offset row per partition. Watch: table growth,
+  and keep rows longer than the 3-day replay limit.
+- **Frozen decisions.** A poor memoised amount is not regenerated; a deliberate re-decision uses a new key.
+  Watch: support overrides per week.
+- **Reconciliation adds latency to stale steps.** Watch: refunds completed past the 15-minute target.
+
+### Review rubric
+- **Each effect is classified** (ledger write, external refund, model call, downstream event) with the
+  mechanism that makes it effectively-once.
+- **The broker guarantee's boundary is stated:** what Kafka transactions cover and what they do not.
+- **Keys are stable:** derived from the event or step id, never per attempt, with the model output
+  memoised before any effect.
+- **Dedupe windows are compared** with the longest redelivery or replay delay, and the gap is handled.
+- **The residual risk is stated honestly** with its conditions, not promised away.
+- **Duplicate and loss counts recompute** from the stated volume and failure rate.
 
 ## Why it exists
 - **Everyone eventually asks "can you guarantee this runs exactly once?"** The honest answer needs the

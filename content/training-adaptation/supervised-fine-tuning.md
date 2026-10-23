@@ -5,7 +5,8 @@ name: Supervised fine-tuning (SFT)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/instruction-tuning
@@ -149,6 +150,25 @@ flowchart TD
     E -->|"no"| D
     E -->|"yes"| B["Stop, keep best checkpoint"]
 ```
+
+## Misconceptions
+- **"Fine-tuning on our transcripts teaches the model our facts."** SFT teaches the style of stating
+  facts, not the facts: demonstrations the base cannot ground teach confident invention. Put facts in a
+  tool result or retrieved context inside the trace, so the model learns to answer from it.
+- **"Low training loss means the fine-tune worked."** Unmasked prompts, memorised rows and a broken
+  template all give low loss. Gate on held-out task success and valid tool-call rate, with held-out
+  examples split by intent or tool sequence, not by row.
+- **"Train on the whole trace so the model learns the full interaction."** Supervising user turns and
+  tool results teaches the agent to write them itself, so it invents a tool result instead of waiting
+  for one. Supervise assistant turns only, end-of-turn token included.
+- **"More traces always help."** About a thousand careful demonstrations can beat many noisy ones, and
+  failed or lucky agent runs teach failure. Keep only verified runs and deduplicate near-copies.
+- **"The chat template is a formatting detail."** It is part of the model's contract: train with one and
+  serve with another and the model misses the system turn, never stops, or emits calls your parser
+  rejects. Diff token ids between a training render and a production request.
+- **"SFT can teach the model to prefer the better answer."** It only ever sees the demonstrated answer,
+  so it cannot learn that a fluent wrong answer or a needless tool call is worse. That needs comparisons
+  (DPO, RLHF) or a verifiable reward.
 
 ## Examples
 ### One masked SFT step on a tool-calling trace

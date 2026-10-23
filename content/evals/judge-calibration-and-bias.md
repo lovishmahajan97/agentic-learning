@@ -5,7 +5,8 @@ name: Judge calibration & bias
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -187,7 +188,59 @@ flowchart TD
     G -.->|"model or prompt changes"| J
 ```
 
+## Misconceptions
+- **"Run the judge several times and average, and its errors go away."** Averaging only shrinks
+  variance. Position, length and family bias are systematic, so every repeat reproduces them and the
+  wrong answer just looks more certain.
+- **"A judge that agrees with humans 90% of the time is a good gate."** On a set where 90% of items
+  pass, a judge that passes everything also scores 90%. Split agreement into TPR and TNR; a lenient
+  judge is weak on TNR, which is exactly where agent failures hide.
+- **"A lenient judge inflates the numbers but keeps the comparison honest."** It also shrinks every gap
+  by TPR + TNR − 1. At TPR 0.95 and TNR 0.70 a real 10-point gap shows as 6.5 points, so small real gains
+  fall into noise.
+- **"The strongest model is an unbiased judge."** Stronger judges show the same biases, only less, and
+  are more likely to share a family with the agent under test, which adds self-preference.
+- **"Judge-versus-majority above human-versus-human means the judge beats humans."** A majority label is
+  less noisy than one annotator, so the comparison is not like for like. Labels written by humans cannot
+  show a judge is better than them.
+- **"Grading the agent's final reply is enough."** The judge then takes the agent's word: "refund
+  issued" passes even when `issue_refund` returned an error. Show it the tool calls and results.
+
 ## Examples
+### Agent scenario: a "ticket resolved" judge that read only the final reply
+A support agent calls `lookup_order`, `issue_refund` and `send_email` tools. The team calibrates a
+"ticket resolved" judge on 300 human-labeled traces (200 human-pass, 100 human-fail), first showing the
+judge only the final reply, then the reply plus every tool call and result. Numbers are illustrative.
+
+| Judge input | Passes of 200 human-pass | Fails of 100 human-fail | TPR | TNR | TPR + TNR − 1 |
+|---|---|---|---|---|---|
+| Final reply only | 192 | 60 | 0.96 | 0.60 | 0.56 |
+| Reply plus tool calls and results | 190 | 85 | 0.95 | 0.85 | 0.80 |
+
+- **Why TNR was low:** most of the 40 missed failures were replies that claimed an action ("your
+  refund is on its way") whose tool call had returned an error. The judge took the agent's word.
+- **What it does to a release decision:** agent v2 truly resolves 80% of tickets versus 75% for v1.
+
+| Judge | Shows v1 | Shows v2 | Visible gap |
+|---|---|---|---|
+| Final reply only | 0.96 × 0.75 + 0.40 × 0.25 = 82% | 84.8% | 2.8 points |
+| With tool results | 0.95 × 0.75 + 0.15 × 0.25 = 75% | 79% | 4 points |
+
+```python
+def judge_view(trace, include_tools=True):
+    """Render the slice of an agent trace the judge sees. trace: list of step dicts."""
+    lines = []
+    for step in trace:
+        if step["type"] == "tool_call" and include_tools:
+            lines.append(f"TOOL CALL {step['name']}({step['args']})")
+        elif step["type"] == "tool_result" and include_tools:
+            lines.append(f"TOOL RESULT {step['name']}: {step['output']}")   # errors included verbatim
+        elif step["type"] == "assistant":
+            lines.append(f"AGENT: {step['text']}")
+    return "\n".join(lines)
+# Calibrate each view on the same labeled traces; keep the one whose TNR clears your bar.
+```
+
 ### Both-order calibration harness
 Runs each pair in both orders and measures position inconsistency, agreement with human labels on the
 consistent pairs, and the judge's preference for the longer answer relative to the humans'. The `judge`
@@ -269,40 +322,6 @@ print(bootstrap(judge, human, p_obs=0.82))     # roughly (0.75, 0.85) on this se
 - **Why 100 human-fail items:** with only 20, the standard error of TNR grows by about √5 ≈ 2.2×
   (it scales with 1/√n), and the corrected interval widens with it.
 - **The 0.05 floor** on TPR + TNR − 1 is an illustrative guard, not a standard.
-
-### Agent scenario: a "ticket resolved" judge that read only the final reply
-A support agent calls `lookup_order`, `issue_refund` and `send_email` tools. The team calibrates a
-"ticket resolved" judge on 300 human-labeled traces (200 human-pass, 100 human-fail), first showing the
-judge only the final reply, then the reply plus every tool call and result. Numbers are illustrative.
-
-| Judge input | Passes of 200 human-pass | Fails of 100 human-fail | TPR | TNR | TPR + TNR − 1 |
-|---|---|---|---|---|---|
-| Final reply only | 192 | 60 | 0.96 | 0.60 | 0.56 |
-| Reply plus tool calls and results | 190 | 85 | 0.95 | 0.85 | 0.80 |
-
-- **Why TNR was low:** most of the 40 missed failures were replies that claimed an action ("your
-  refund is on its way") whose tool call had returned an error. The judge took the agent's word.
-- **What it does to a release decision:** agent v2 truly resolves 80% of tickets versus 75% for v1.
-
-| Judge | Shows v1 | Shows v2 | Visible gap |
-|---|---|---|---|
-| Final reply only | 0.96 × 0.75 + 0.40 × 0.25 = 82% | 84.8% | 2.8 points |
-| With tool results | 0.95 × 0.75 + 0.15 × 0.25 = 75% | 79% | 4 points |
-
-```python
-def judge_view(trace, include_tools=True):
-    """Render the slice of an agent trace the judge sees. trace: list of step dicts."""
-    lines = []
-    for step in trace:
-        if step["type"] == "tool_call" and include_tools:
-            lines.append(f"TOOL CALL {step['name']}({step['args']})")
-        elif step["type"] == "tool_result" and include_tools:
-            lines.append(f"TOOL RESULT {step['name']}: {step['output']}")   # errors included verbatim
-        elif step["type"] == "assistant":
-            lines.append(f"AGENT: {step['text']}")
-    return "\n".join(lines)
-# Calibrate each view on the same labeled traces; keep the one whose TNR clears your bar.
-```
 
 ## Production patterns
 - **Calibration job in the agent's CI.** When the judge model, judge prompt, the agent's tools or the

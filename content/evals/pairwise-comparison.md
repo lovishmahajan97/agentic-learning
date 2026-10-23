@@ -5,7 +5,8 @@ name: Pairwise comparison
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -167,7 +168,44 @@ flowchart TD
     D -->|"no"| M["More comparisons or reject"]
 ```
 
+## Misconceptions
+- **"Pairwise is just scoring both outputs and comparing the averages."** Separate scores carry each
+  session's scale noise and drift, and a lone answer hides what it omitted. A side-by-side verdict
+  removes the scale and answers "is B better than A" directly.
+- **"A high win rate means the agent is good enough to ship."** Pairwise has no absolute bar: 80% wins
+  over a weak baseline can still be unusable. Anchor to production and keep rubric gates the candidate
+  must pass on its own.
+- **"57 wins out of 100 is a clear improvement."** The 95% interval is roughly 48–66% and includes 50%.
+  Telling 55% from 50% takes about 381 comparisons, and halving an interval costs 4× the comparisons.
+- **"A better reply can make up for a failed task."** For agents, outcome is checked in code first; a
+  failed run loses outright, and preference is judged only where both runs succeeded.
+- **"Elo and Bradley–Terry give the same ranking."** On a static dataset Elo depends on the order
+  comparisons are fed in. A batch Bradley–Terry fit is order-independent and can be bootstrapped.
+
 ## Examples
+### Agent scenario: new planner prompt versus the production agent
+Both agent versions replay 300 support tasks from fresh sandboxes. Outcome is checked in code first;
+the pairwise judge sees only tasks both versions solved. Numbers are illustrative.
+
+| Outcome per task | Count |
+|---|---|
+| Both succeeded | 210 |
+| Only the new agent succeeded | 30 |
+| Only production succeeded | 18 |
+| Both failed | 42 |
+
+| Number | Calculation | Reading |
+|---|---|---|
+| Task success | new 240/300 = 80% vs production 228/300 = 76% | the 4-point gain rests on 30 vs 18 discordant tasks; read those 48 traces |
+| Preference on the 210 both-succeeded | new 98, production 82, ties 30 → (98 + 15) / 210 ≈ 0.54 | SE ≈ √(0.54 × 0.46 / 210) ≈ 0.034, so roughly 47–61%: no clear reply-quality win |
+| Mean tool calls per solved task | new 6.1 vs production 4.3 | check whether the judge's wins sit in the longer runs |
+
+- **The outcome gain is suggestive, not yet decisive.** A paired (McNemar) test on the 30 vs 18
+  discordant tasks gives z = 12 / √48 ≈ 1.7, p ≈ 0.08, so add tasks or re-run before calling it.
+- **The reply preference is a tie.** Its interval includes 50%, so it neither helps nor blocks.
+- **Before shipping,** read the 48 discordant traces and confirm the 18 production-only tasks are not
+  a safety-relevant category.
+
 ### Fitting Bradley–Terry strengths for four systems
 Four systems compared on 100 prompts per pair; `wins[i, j]` counts how often system i beat system j,
 with ties pre-split as 0.5. The MM iteration fits strengths; the last line converts two strengths into a
@@ -238,30 +276,6 @@ print(comparisons_needed(0.60, 0.035))                  # 753: halving the inter
 | Is 57/100 a win? | interval ≈ 48–66% includes 50%: not yet |
 | Comparisons to resolve a five-point difference | ≈ 381 |
 | Cost of halving the interval | about 4× the comparisons, because SE scales with 1/√n |
-
-### Agent scenario: new planner prompt versus the production agent
-Both agent versions replay 300 support tasks from fresh sandboxes. Outcome is checked in code first;
-the pairwise judge sees only tasks both versions solved. Numbers are illustrative.
-
-| Outcome per task | Count |
-|---|---|
-| Both succeeded | 210 |
-| Only the new agent succeeded | 30 |
-| Only production succeeded | 18 |
-| Both failed | 42 |
-
-| Number | Calculation | Reading |
-|---|---|---|
-| Task success | new 240/300 = 80% vs production 228/300 = 76% | the 4-point gain rests on 30 vs 18 discordant tasks; read those 48 traces |
-| Preference on the 210 both-succeeded | new 98, production 82, ties 30 → (98 + 15) / 210 ≈ 0.54 | SE ≈ √(0.54 × 0.46 / 210) ≈ 0.034, so roughly 47–61%: no clear reply-quality win |
-| Mean tool calls per solved task | new 6.1 vs production 4.3 | check whether the judge's wins sit in the longer runs |
-
-- **The outcome gain is suggestive, not yet decisive.** A paired (McNemar) test on the 30 vs 18
-  discordant tasks gives z = 12 / √48 ≈ 1.7, p ≈ 0.08, so add tasks or re-run before calling it.
-- **The reply preference is a tie.** Its interval includes 50%, so it neither helps nor blocks.
-- **Before shipping,** read the 48 discordant traces and confirm the 18 production-only tasks are not
-  a safety-relevant category.
-
 ## Production patterns
 - **Anchor every candidate to the production agent.** Keep a frozen task set with production runs, and
   judge each new agent variant against them in both orders on every pull request. Monitor win rate with

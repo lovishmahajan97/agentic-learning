@@ -5,7 +5,8 @@ name: PEFT (LoRA, QLoRA)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/supervised-fine-tuning
@@ -172,6 +173,23 @@ flowchart TD
     E -->|"one agent"| M["Merge: zero extra latency"]
     E -->|"many agents"| K["Keep separate: one base, many adapters"]
 ```
+
+## Misconceptions
+- **"LoRA makes fine-tuning fast."** It makes it fit. Backprop still runs through every frozen layer and
+  activation memory is unchanged; only optimizer state, master weights and weight gradients shrink, so a
+  step is at best about a third cheaper in FLOPs.
+- **"Raising the rank is the main quality knob."** Which matrices you adapt matters more: adding the MLP
+  projections usually beats doubling r on attention only, and past the point where loss stops improving
+  extra rank only adds memory and overfitting risk.
+- **"An adapter is a portable plug-in for any similar model."** It is a delta against exact weights. A
+  different base revision, quantization or chat template gives a quietly different model, so pin the base
+  sha and the template with the adapter.
+- **"Merging a QLoRA adapter is lossless."** The adapter learned around the NF4 base's rounding error;
+  merging into a bf16 copy, or re-quantizing for serving, shifts behaviour slightly, so re-run the agent
+  eval on the final artifact.
+- **"LoRA can teach the model new facts as well as full fine-tuning."** The low-rank bet holds for style,
+  format and tool-call behaviour; for large knowledge or language shifts it underfits, and retrieval or
+  full fine-tuning is the better tool.
 
 ## Examples
 ### QLoRA setup with adapters on all linear layers

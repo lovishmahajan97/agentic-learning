@@ -5,7 +5,8 @@ name: BM25 internals
 kind: concept
 difficulty: core
 est_minutes: 17
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -184,7 +185,35 @@ flowchart TD
     M -->|"sum over query terms"| S["BM25 score, query-relative"]
 ```
 
+## Misconceptions
+- **"A higher BM25 score means a more relevant document, whatever the query."** Scores are unnormalized
+  sums over query terms. The same right document scores about 9.6 for a wordy agent query matching four
+  terms and about 4.56 for the one-term retry, so cut by rank or per-query normalized score, never a raw constant.
+- **"Each extra occurrence adds the same evidence."** Term frequency saturates: at k1 = 1.2 the TF factor
+  is 1.00 at one occurrence, 1.96 at ten and only 2.15 at fifty. Repetition past a handful barely moves
+  the score.
+- **"When BM25 misses an exact match, the scoring is wrong."** Most misses happen before scoring: index
+  and query analyzers tokenized the text differently, so the term never matched. Compare both sides with
+  `_analyze` before touching k1 or b.
+- **"k1 = 1.2 and b = 0.75 are universal constants."** They were tuned on TREC-style collections. Tweets,
+  200-page manuals or corpora where length signals quality can want very different values, found by a
+  grid search on labeled queries.
+- **"Postgres `ts_rank` is BM25."** It has no IDF and no BM25-style saturation, so a true BM25 arm in
+  Postgres needs an extension that implements it.
+
 ## Examples
+### Worked scenario: one term, three documents
+N = 1,000 documents, avgdl = 200 tokens, k1 = 1.2, b = 0.75 (so k1 + 1 = 2.2).
+
+| Document | Term, IDF | Length, count | L | Denominator | Term score |
+|---|---|---|---|---|---|
+| A | "indemnification" (in 10 docs), 4.56 | 100 tokens, f = 3 | 1 − 0.75 + 0.75·0.5 = 0.625 | 3 + 1.2·0.625 = 3.75 | 4.56 × 6.6 / 3.75 ≈ 8.0 |
+| B | same, 4.56 | 400 tokens, f = 3 | 1.75 | 3 + 2.1 = 5.1 | 4.56 × 6.6 / 5.1 ≈ 5.9 |
+| C | "contract" (in 600 docs), 0.51 | average length, f = 10 | 1 | TF factor 1.96 | 0.51 × 1.96 ≈ 1.0 |
+
+- Same counts, roughly a quarter lower score for the document four times longer.
+- A common word repeated ten times is worth an eighth of a rare word mentioned three times.
+
 ### Worked scenario: a raw-score cutoff that breaks on agent queries
 A support agent's keyword tool drops hits below a raw BM25 score of 8.0, tuned on the agent's own wordy
 queries. Collection as in the IDF table: N = 1,000, each hit at average length with f = 1, so the TF
@@ -265,18 +294,6 @@ for q in ["indemnification cap", "contract term", "the"]:
 - **"the"** scores every document low and nearly equally, because it appears in all three.
 - **"indemnification cap"** prefers A (two occurrences of a rarer term plus the only "cap") over C.
 - **"contract term"** prefers B. Set `k1=0` and watch A's advantage from repetition disappear.
-
-### Worked scenario: one term, three documents
-N = 1,000 documents, avgdl = 200 tokens, k1 = 1.2, b = 0.75 (so k1 + 1 = 2.2).
-
-| Document | Term, IDF | Length, count | L | Denominator | Term score |
-|---|---|---|---|---|---|
-| A | "indemnification" (in 10 docs), 4.56 | 100 tokens, f = 3 | 1 − 0.75 + 0.75·0.5 = 0.625 | 3 + 1.2·0.625 = 3.75 | 4.56 × 6.6 / 3.75 ≈ 8.0 |
-| B | same, 4.56 | 400 tokens, f = 3 | 1.75 | 3 + 2.1 = 5.1 | 4.56 × 6.6 / 5.1 ≈ 5.9 |
-| C | "contract" (in 600 docs), 0.51 | average length, f = 10 | 1 | TF factor 1.96 | 0.51 × 1.96 ≈ 1.0 |
-
-- Same counts, roughly a quarter lower score for the document four times longer.
-- A common word repeated ten times is worth an eighth of a rare word mentioned three times.
 
 ### Production snippet: tuning k1 and b in Elasticsearch
 A custom similarity is declared in index settings and assigned per field; `explain` shows the IDF and TF

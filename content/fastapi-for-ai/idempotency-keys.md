@@ -5,7 +5,8 @@ name: Idempotency keys
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/timeouts
@@ -37,6 +38,178 @@ retry cannot send, charge or bill twice.
   call id), never from the attempt; what outcomes you store; and passing a derived key downstream.
 - **What you can skip.** Building waiting or pub/sub for in-progress duplicates; a 409 with
   `Retry-After` is enough for agent workers, which already loop.
+
+## Lab
+### Task
+Make an agent's `create_ticket` tool server safe to retry. You implement the claim-and-replay
+dependency, free the claim on a transient failure, and derive the tool call's key from the run so a
+resumed step replays the stored ticket instead of filing a second one.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** dependency injection, HTTPException handling, and this lesson's state machine.
+- **Runs offline:** an in-memory `Store` stands in for Redis (`set_nx` plays `SET NX`).
+- **Needs:** `fastapi`, `httpx`, `pytest`; checked with FastAPI 0.115.6 and 0.161.1 on Python 3.12.
+
+### Starter code
+```python
+# idem_tools.py: make an agent's create_ticket tool safe to retry (FastAPI, in-memory store)
+import asyncio, hashlib, json, uuid
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+
+class Store:
+    """Stand-in for Redis. set_nx is atomic: no await between the check and the write."""
+    def __init__(self): self.data = {}
+    async def set_nx(self, k, v):
+        if k in self.data:
+            return False
+        self.data[k] = v
+        return True
+    async def get(self, k): return self.data.get(k)
+    async def set(self, k, v): self.data[k] = v
+    async def delete(self, k): self.data.pop(k, None)
+
+app = FastAPI()
+store = Store()
+TICKETS: list[dict] = []                 # the side effect we must not repeat
+FAULTS = {"fail_next": 0, "work_s": 0.0}  # inject a transient 503 or a slow backend
+
+class Replay(Exception):
+    def __init__(self, status: int, body: dict): self.status, self.body = status, body
+
+@app.exception_handler(Replay)
+async def replay(_, e: Replay):
+    return JSONResponse(e.body, status_code=e.status, headers={"Idempotent-Replayed": "true"})
+
+def tool_key(run_id: str, step: int, index: int, name: str) -> str:
+    """Key for one side-effecting tool call; must be identical on every retry and resume."""
+    # YOUR CODE: derive it from the arguments instead of minting a fresh one per attempt
+    return str(uuid.uuid4())
+
+async def idem(request: Request, tenant: str = Header(...),
+               idempotency_key: str | None = Header(None)):
+    """Return (store_key, fingerprint) when this attempt owns the key, else raise."""
+    # YOUR CODE: 400 if the key is missing; fingerprint method, path and body; claim
+    # f"idem:{tenant}:{key}" with set_nx as in_progress; on an existing record: 422 if the
+    # fingerprint differs, 409 with Retry-After: 2 if in progress, Replay(...) if completed
+    return None, None
+
+@app.post("/v1/tickets", status_code=201)
+async def create_ticket(body: dict, claim: tuple = Depends(idem)):
+    k, fp = claim
+    await asyncio.sleep(FAULTS["work_s"])
+    if FAULTS["fail_next"]:
+        FAULTS["fail_next"] -= 1
+        raise HTTPException(503, "ticket backend unavailable")
+    ticket = {"id": f"T-{len(TICKETS) + 1}", "title": body["title"]}
+    TICKETS.append(ticket)
+    # YOUR CODE: free the claim on a failure above, store the completed record here
+    return ticket
+
+if __name__ == "__main__":
+    c = TestClient(app)
+    key = tool_key("run_42", 3, 0, "create_ticket")
+    h = {"tenant": "t_1", "idempotency-key": key}
+    first = c.post("/v1/tickets", json={"title": "Refund order 991"}, headers=h)
+    resumed = tool_key("run_42", 3, 0, "create_ticket")      # the run resumes at step 3
+    again = c.post("/v1/tickets", json={"title": "Refund order 991"},
+                   headers={**h, "idempotency-key": resumed})
+    print(first.status_code, first.json(), "| retry:", again.status_code,
+          again.headers.get("idempotent-replayed"), "| tickets:", len(TICKETS))
+    print("missing key:", c.post("/v1/tickets", json={"title": "x"}, headers={"tenant": "t_1"}).status_code)
+    print("reused key, new body:", c.post("/v1/tickets", json={"title": "other"},
+                                         headers={**h, "idempotency-key": resumed}).status_code)
+```
+
+As given it prints `retry: 201 None | tickets: 2`, then 201 for both bad requests: every attempt files a
+new ticket.
+
+### Expected output
+```
+201 {'id': 'T-1', 'title': 'Refund order 991'} | retry: 201 true | tickets: 1
+missing key: 400
+reused key, new body: 422
+```
+
+### Tests
+```python
+# test_idem_tools.py: run with `pytest -q`
+import asyncio
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+import idem_tools as m
+
+@pytest.fixture(autouse=True)
+def fresh():
+    m.store.data.clear(); m.TICKETS.clear()
+    m.FAULTS.update(fail_next=0, work_s=0.0)
+
+c = TestClient(m.app)
+H = {"tenant": "t_1", "idempotency-key": "k-1"}
+BODY = {"title": "Refund order 991"}
+
+def test_retry_replays_instead_of_filing_twice():
+    a = c.post("/v1/tickets", json=BODY, headers=H)
+    b = c.post("/v1/tickets", json=BODY, headers=H)
+    assert (a.status_code, b.status_code) == (201, 201)
+    assert b.json() == a.json() and b.headers.get("idempotent-replayed") == "true"
+    assert len(m.TICKETS) == 1
+
+def test_missing_key_is_rejected():
+    assert c.post("/v1/tickets", json=BODY, headers={"tenant": "t_1"}).status_code == 400
+    assert m.TICKETS == []
+
+def test_reused_key_with_other_body_is_a_client_error():
+    c.post("/v1/tickets", json=BODY, headers=H)
+    assert c.post("/v1/tickets", json={"title": "other"}, headers=H).status_code == 422
+
+def test_concurrent_duplicate_gets_409():
+    m.FAULTS["work_s"] = 0.2
+    async def both():
+        t = httpx.ASGITransport(app=m.app)
+        async with httpx.AsyncClient(transport=t, base_url="http://x") as ac:
+            return await asyncio.gather(*[ac.post("/v1/tickets", json=BODY, headers=H) for _ in range(2)])
+    rs = asyncio.run(both())
+    assert sorted(r.status_code for r in rs) == [201, 409]
+    assert any(r.headers.get("retry-after") == "2" for r in rs)
+    assert len(m.TICKETS) == 1
+
+def test_transient_failure_is_not_stored():
+    m.FAULTS["fail_next"] = 1
+    assert c.post("/v1/tickets", json=BODY, headers=H).status_code == 503
+    ok = c.post("/v1/tickets", json=BODY, headers=H)          # the retry must run the work
+    again = c.post("/v1/tickets", json=BODY, headers=H)       # and then replay it
+    assert ok.status_code == 201 and again.json() == ok.json()
+    assert len(m.TICKETS) == 1
+
+def test_tool_key_is_stable_across_resume():
+    k = m.tool_key("run_42", 3, 0, "create_ticket")
+    assert k == m.tool_key("run_42", 3, 0, "create_ticket")
+    assert k != m.tool_key("run_42", 4, 0, "create_ticket")
+    assert k != m.tool_key("run_42", 3, 1, "create_ticket")
+```
+
+All six fail on the starter, each on a duplicate ticket, a missing 400, 409 or 422, or an unstable key.
+
+### Failure scenarios
+- **Inject check-then-insert:** replace `set_nx` with `get`, then `await asyncio.sleep(0)`, then `set`.
+  The concurrent test now files two tickets. Debug by logging which attempt saw "absent"; both did,
+  because the check and the claim were two steps.
+- **Inject a stored 503:** write the completed record before checking for the failure. The transient
+  test fails forever with a replayed 503. Look at the store's record for the key; a `status` of 503
+  means a transient outcome was made permanent.
+- **Inject a per-attempt key:** keep `uuid4()` in `tool_key`. The server logic is correct but the
+  resume still files a second ticket. Count distinct keys per `(run_id, step, index)`; more than one
+  is the bug.
+
+### Submission
+- **Your `idem_tools.py`** with `tool_key`, `idem` and the claim handling in `create_ticket` done.
+- **A `pytest -q` run** showing 6 passed.
+- **The script's printed output**, matching the expected lines.
+- **A short note** on what you would change to move `Store` to Redis (lease TTL, retention TTL, owner
+  token) and why the lease must outlast the request deadline.
+- **Evaluated on:** green tests, one atomic claim, no stored 5xx, and keys derived from run and step.
 
 ## Why it exists
 - **Retries are essential but ambiguous.** Timeouts, dropped connections and 502s from proxies are

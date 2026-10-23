@@ -5,7 +5,8 @@ name: Google Agent Development Kit (ADK)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/frameworks
@@ -37,6 +38,185 @@ Engine.
   and memory services persist state, and which callbacks gate model and tool calls.
 - **What you can skip.** Vertex-specific services if you are not on Google Cloud; the core agent, runner
   and in-memory or database session services run anywhere.
+
+## Lab
+### Task
+Make a banking agent unable to read an account before the caller is verified, whatever the model
+decides. You implement a `verify_identity` tool that records a flag in session state and a
+`before_tool_callback` that blocks account tools until that flag is set. This is the Check yourself
+fix, built and proven.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** this lesson's state scopes and callbacks; Python async basics.
+- **Runs offline:** `ScriptedLlm` subclasses ADK's `BaseLlm` and replays a fixed plan of tool calls, so
+  the model "forgets" to verify on cue, with no API key.
+- **Needs:** `pip install google-adk pytest`; checked with google-adk 2.12.0 on Python 3.12.
+
+### Starter code
+```python
+# adk_guard.py: enforce "verify identity before account tools" in an ADK agent, offline
+import asyncio
+from typing import AsyncGenerator
+from google.adk.agents import Agent
+from google.adk.models import BaseLlm, LlmRequest, LlmResponse
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.adk.tools import ToolContext
+from google.genai import types
+
+PINS = {"u1": "4321"}                       # stand-in for your identity service
+ACCOUNTS = {"AC-9": {"owner": "u1", "balance": 120}}
+ACCOUNT_TOOLS = {"get_account"}             # tools that need a verified caller
+
+class ScriptedLlm(BaseLlm):
+    """Fake model: replays a fixed plan of tool calls, then reports the last tool result."""
+    plan: list = []
+    def model_post_init(self, _ctx):
+        self._steps = iter(self.plan)
+    async def generate_content_async(self, llm_request: LlmRequest, stream: bool = False
+                                     ) -> AsyncGenerator[LlmResponse, None]:
+        step = next(self._steps, None)
+        if step is None:                    # plan for this turn is done: answer from the last result
+            last = [p.function_response for c in llm_request.contents for p in c.parts or []
+                    if p.function_response]
+            text = f"{last[-1].name} -> {last[-1].response}" if last else "no tool result"
+            yield LlmResponse(content=types.Content(role="model", parts=[types.Part(text=text)]))
+            return
+        name, args = step
+        call = types.Part(function_call=types.FunctionCall(name=name, args=args))
+        yield LlmResponse(content=types.Content(role="model", parts=[call]))
+
+def verify_identity(pin: str, tool_context: ToolContext) -> dict:
+    """Verify the caller with their PIN. Call this before any account tool."""
+    # YOUR CODE: compare pin with PINS[tool_context.user_id]; on a match record the verified
+    # flag in session state (scoped to THIS session, not to the user) and return ok True
+    return {"ok": True}
+
+def get_account(account_id: str, tool_context: ToolContext) -> dict:
+    """Return the balance of one of the caller's accounts."""
+    acct = ACCOUNTS.get(account_id)
+    if not acct or acct["owner"] != tool_context.user_id:
+        return {"error": "not found"}
+    return {"account_id": account_id, "balance": acct["balance"]}
+
+def guard(tool, args: dict, tool_context: ToolContext) -> dict | None:
+    """before_tool_callback: return a dict to skip the real tool, None to let it run."""
+    # YOUR CODE: block every tool in ACCOUNT_TOOLS until the session is verified,
+    # returning {"error": "identity not verified"} instead of running it
+    return None
+
+def make_agent(plan: list) -> Agent:
+    return Agent(name="bank_agent", model=ScriptedLlm(model="scripted", plan=plan),
+                 instruction="Verify identity, then answer account questions.",
+                 tools=[verify_identity, get_account], before_tool_callback=guard)
+
+async def turn(sessions, plan, session_id="s1", user_id="u1", text="What is my balance?"):
+    runner = Runner(agent=make_agent(plan), app_name="bank", session_service=sessions)
+    msg = types.Content(role="user", parts=[types.Part(text=text)])
+    final = None
+    async for ev in runner.run_async(user_id=user_id, session_id=session_id, new_message=msg):
+        if ev.is_final_response() and ev.content and ev.content.parts:
+            final = ev.content.parts[0].text
+    return final
+
+async def main():
+    sessions = InMemorySessionService()
+    for sid in ("s1", "s2"):
+        await sessions.create_session(app_name="bank", user_id="u1", session_id=sid)
+    print("skip verify:", await turn(sessions, [("get_account", {"account_id": "AC-9"})]))
+    print("wrong pin:  ", await turn(sessions, [("verify_identity", {"pin": "0000"}),
+                                                ("get_account", {"account_id": "AC-9"})]))
+    print("verified:   ", await turn(sessions, [("verify_identity", {"pin": "4321"}),
+                                                ("get_account", {"account_id": "AC-9"})]))
+    print("next turn:  ", await turn(sessions, [("get_account", {"account_id": "AC-9"})]))
+    print("new session:", await turn(sessions, [("get_account", {"account_id": "AC-9"})], "s2"))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+As given, all five lines print the balance: the model skipped verification and nothing stopped it. ADK
+also logs telemetry warnings about missing token usage on stderr; they are expected with a fake model.
+
+### Expected output
+```
+skip verify: get_account -> {'error': 'identity not verified'}
+wrong pin:   get_account -> {'error': 'identity not verified'}
+verified:    get_account -> {'account_id': 'AC-9', 'balance': 120}
+next turn:   get_account -> {'account_id': 'AC-9', 'balance': 120}
+new session: get_account -> {'error': 'identity not verified'}
+```
+
+### Tests
+```python
+# test_adk_guard.py: run with `pytest -q -p no:warnings`
+import asyncio
+import pytest
+from google.adk.sessions import InMemorySessionService
+import adk_guard as m
+
+PLAN_SKIP = [("get_account", {"account_id": "AC-9"})]
+PLAN_OK = [("verify_identity", {"pin": "4321"}), ("get_account", {"account_id": "AC-9"})]
+PLAN_BAD = [("verify_identity", {"pin": "0000"}), ("get_account", {"account_id": "AC-9"})]
+
+@pytest.fixture
+def sessions():
+    s = InMemorySessionService()
+    for sid in ("s1", "s2"):
+        asyncio.run(s.create_session(app_name="bank", user_id="u1", session_id=sid))
+    return s
+
+def run(sessions, plan, sid="s1"):
+    return asyncio.run(m.turn(sessions, plan, session_id=sid))
+
+def state(sessions, sid="s1"):
+    s = asyncio.run(sessions.get_session(app_name="bank", user_id="u1", session_id=sid))
+    return s.state
+
+def test_account_tool_blocked_before_verification(sessions):
+    assert "identity not verified" in run(sessions, PLAN_SKIP)
+    assert "balance" not in run(sessions, PLAN_SKIP)
+
+def test_wrong_pin_does_not_verify(sessions):
+    assert "identity not verified" in run(sessions, PLAN_BAD)
+    assert not state(sessions).get("verified")
+
+def test_correct_pin_unlocks_account_tools(sessions):
+    assert "'balance': 120" in run(sessions, PLAN_OK)
+
+def test_verified_flag_persists_through_events(sessions):
+    run(sessions, PLAN_OK)
+    assert state(sessions).get("verified") is True        # written via tool_context.state
+    assert "'balance': 120" in run(sessions, PLAN_SKIP)   # a later turn in the same session
+
+def test_verification_does_not_leak_to_other_sessions(sessions):
+    run(sessions, PLAN_OK)
+    assert "identity not verified" in run(sessions, PLAN_SKIP, sid="s2")
+    assert not any(k.startswith(("user:", "app:")) for k in state(sessions))
+```
+
+On the starter, four tests fail because the account tool runs unguarded; the correct-PIN test already
+passes and stays as a regression check.
+
+### Failure scenarios
+- **Store the flag as `user:verified`.** The new-session test fails: verifying once unlocks every future
+  session for that user. Debug by printing `session.state` for both sessions and reading the prefix
+  rules in How it works.
+- **Mutate a fetched session object instead of `tool_context.state`.** The persistence test fails
+  because the change never becomes an event delta. Debug by listing `session.events` and checking
+  `event.actions.state_delta` after the verify call.
+- **Guard by checking the instruction or the model's text.** Tests stay red, because `ScriptedLlm`
+  ignores instructions just as a real model sometimes does. The fix belongs in code: the callback.
+- **Return a string from the callback.** ADK expects a dict or `None`; inspect the function response
+  event the model receives and confirm it carries your error dict.
+
+### Submission
+- **Code:** `adk_guard.py` with both `YOUR CODE` parts done; no change to `ScriptedLlm`, `turn` or the tests.
+- **Test run:** the output of `pytest -q -p no:warnings` showing 5 passed.
+- **Program output:** the five lines from `python adk_guard.py`, matching Expected output.
+- **Event trace:** for the verified turn, the list of events with author, function call or response,
+  and any `state_delta`, showing the flag written once.
+- **Short note (5 lines):** why a callback beats an instruction here, and what you would add for
+  production (database session service, an eval case where the model skips verification).
 
 ## Why it exists
 - **Agents need both reasoning and control flow.** Pure LLM routing is flexible but unpredictable; pure

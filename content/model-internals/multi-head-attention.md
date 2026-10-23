@@ -5,7 +5,8 @@ name: Multi-head attention
 kind: concept
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - model-internals/self-attention
@@ -136,6 +137,22 @@ flowchart TD
     C --> O["W_O mixes heads"]
     O --> S["Residual stream"]
 ```
+
+## Misconceptions
+- **"More heads means more parameters and more compute."** Heads are slices of the same d×d projections,
+  so parameters stay 4d² per layer and score FLOPs stay 2·n²·d; only the materialized `[B, h, n, n]`
+  tensor and per-head rank change.
+- **"KV cache per token follows the number of attention heads."** It follows KV heads:
+  2 × layers × KV heads × head_dim × bytes. Llama-2-7B and Llama-3-8B both have 32 query heads, yet need
+  0.5 and 0.125 MiB per token.
+- **"Each head has one clean job, so a head's attention map explains the output."** Many heads are
+  redundant and can be pruned with little loss, and roles spread across heads and layers; test a head's
+  role by ablating it.
+- **"Any number of GPUs can shard any model with tensor parallelism."** Heads are the shard unit, so the
+  head count must divide by the TP degree: 32 heads split on 1, 2, 4 or 8 GPUs, not 6.
+- **"A wider head_dim just gives each head more room."** Fused kernels support bounded head dimensions
+  (FlashAttention-2 up to 256); outside them attention silently falls back to a slow path whose memory
+  grows with n².
 
 ## Examples
 ### A multi-head attention module where h changes only the attention shape

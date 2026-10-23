@@ -5,7 +5,8 @@ name: Faithfulness / groundedness
 kind: metric
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -154,6 +155,23 @@ flowchart TD
     AG --> T["Report with relevance and abstention rate"]
     G --> T
 ```
+
+## Misconceptions
+- **"A faithful answer is a correct answer."** Faithfulness only asks whether the context supports each
+  claim. A reply faithful to a stale tool result is wrong, and a correct reply from memory is
+  unfaithful; measure correctness separately.
+- **"One grounded-or-not verdict per answer is enough."** A paragraph-level verdict misses the one
+  wrong figure among six correct sentences. Atomic claims localise the failure and give a ratio.
+- **"Higher faithfulness is always better."** "I could not find that" contains no claims and scores 1.
+  Read it next to answer relevance, abstention rate and, for agents, task success.
+- **"Unsupported is unsupported."** A claim the context contradicts is worse than one it is silent on;
+  merging them lets a reply that contradicts policy ship at 0.8. Keep three verdicts and gate on
+  contradictions.
+- **"For an agent, the context is the retrieved chunks."** It is every tool result plus the record of
+  tool calls made. "I have issued a $240 refund" is supported only by a successful refund call.
+- **"A strong LLM verifier sticks to the context it is given."** Judges lean on their own knowledge.
+  If scores do not collapse toward zero on shuffled contexts, the verifier is not measuring
+  faithfulness.
 
 ## Examples
 ### Extract-then-verify pipeline

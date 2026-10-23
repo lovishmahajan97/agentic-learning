@@ -5,7 +5,8 @@ name: Query rewriting
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -137,6 +138,23 @@ flowchart TD
     R --> F["Weighted RRF, original down-weighted if not standalone"]
     F -->|"top-k chunks"| G
 ```
+
+## Misconceptions
+- **"A good rewrite replaces the user's query."** Rewrites drift, so keep retrieving for the original and
+  fuse. But give a non-standalone original like "and on Android?" a lower fusion weight, or plain RRF hands
+  its generic hits about half the top-k.
+- **"The generator should answer the rewritten question."** The rewrite is written for the index. The
+  generator still gets the user's own words, because a rewrite can narrow or shift what was asked.
+- **"Cleaning up the query always helps."** Normalisation that "fixes" `ERR_4012` into `error 4012`
+  destroys the one exact BM25 match. Quoted strings, codes, numbers and versions must pass through untouched.
+- **"My agent sees the whole chat, so rewriting is solved."** The agent condenses references for free when
+  it writes the `query` argument, but it can still drop a literal, invent a product name or over-specify.
+  You still steer it through the tool description and guard it inside the tool.
+- **"More rewrite forms means better retrieval."** Each form fixes one mismatch and costs latency or
+  retrievals; multi-query expansion adds noise when vocabulary was never the problem. Enable only the
+  forms your failure review calls for.
+- **"The rewriter only sees our own prompt, so it is safe."** It is an LLM reading user text, so injected
+  instructions can steer filters or queries. Constrain the output to validated JSON or an enum.
 
 ## Examples
 ### Condensing plus expansion with weighted RRF

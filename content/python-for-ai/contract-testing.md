@@ -5,7 +5,8 @@ name: Contract testing
 kind: practice
 difficulty: advanced
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/test-doubles-mocks-fixtures
@@ -38,6 +39,172 @@ consumer records what it relies on, the provider verifies it.
   deployed versions.
 - **What you can skip.** Running a broker for interfaces one team owns end to end; shared Pydantic
   models and a schema snapshot are enough there.
+
+## Lab
+### Task
+The agent reads `doc_id`, `score` and `text` from a retrieval service owned by another team. You will
+write the provider-side verifier that replays the agent's contract against each provider version, so a
+rename or retype fails the provider's build with a message naming the agent.
+
+Pydantic does the schema work; you write the replay loop that Pact automates.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** Pydantic, Test doubles, mocks and fixtures, and this lesson's Consumer-driven
+  contracts and Evolving a contract sections.
+- **Setup:** Python 3.10+, `pip install pytest pydantic` (checked against Pydantic 2.14.1 and pytest
+  9.1.1). Save the starter as `contract_lab.py` and the tests as `test_contract_lab.py`.
+- **Goal:** compatible providers (`v1`, and `expanded` with an extra `content` field) pass; `renamed`,
+  `retyped`, an unseeded state and a moved endpoint each produce exactly one readable failure.
+
+### Starter code
+```python
+"""contract_lab.py: an agent's contract with a retrieval service, and provider variants to verify."""
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+
+class Hit(BaseModel):                       # consumer side: only the fields the agent reads
+    model_config = ConfigDict(extra="ignore", strict=True)
+    doc_id: str
+    score: float
+    text: str
+
+
+class SearchResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+    hits: list[Hit]
+
+
+CONTRACT = {
+    "consumer": "agent-service", "provider": "retrieval-service",
+    "interactions": [{
+        "description": "search returns scored hits",
+        "provider_state": "index contains doc d1 about refunds",
+        "request": {"method": "POST", "path": "/search", "json": {"query": "refund policy", "k": 3}},
+        "response": {"status": 200, "schema": SearchResponse, "min_hits": 1},
+    }],
+}
+
+
+def make_provider(variant="v1"):
+    """A stand-in for the provider's real app: handle(method, path, body) -> (status, json body)."""
+    index = []
+
+    def seed(state):
+        index.clear()
+        if state == "index contains doc d1 about refunds":
+            index.append({"doc_id": "d1", "score": 0.9, "body": "Refunds take 5 days."})
+
+    def handle(method, path, body):
+        if (method, path) != ("POST", "/search"):
+            return 404, {"error": "not found"}
+        hits = []
+        for d in index[: body["k"]]:
+            hit = {"doc_id": d["doc_id"], "score": d["score"], "text": d["body"]}
+            if variant == "renamed":
+                hit["content"] = hit.pop("text")
+            elif variant == "expanded":
+                hit["content"] = hit["text"]
+            elif variant == "retyped":
+                hit["score"] = str(hit["score"])
+            hits.append(hit)
+        return 200, {"hits": hits, "took_ms": 3}
+
+    return seed, handle
+
+
+def verify(contract, seed, handle):
+    """Replay every interaction against the provider; return a list of failure messages (empty = pass).
+
+    Each message names the consumer, the interaction description and what broke.
+    """
+    raise NotImplementedError("EXERCISE: seed the state, replay the request, check status and schema")
+
+
+if __name__ == "__main__":
+    for variant in ["v1", "expanded", "renamed", "retyped"]:
+        seed, handle = make_provider(variant)
+        try:
+            failures = verify(CONTRACT, seed, handle)
+            print(f"{variant:9} {'PASS' if not failures else 'FAIL'} {failures}")
+        except NotImplementedError as e:
+            print(f"{variant:9} not verified: {e}")
+```
+
+### Expected output
+`python contract_lab.py` with a working `verify` (message wording is yours, but it must name the
+consumer, the interaction and the field). The starter prints `not verified` four times.
+
+```text
+v1        PASS []
+expanded  PASS []
+renamed   FAIL ['agent-service / search returns scored hits: hits.0.text: Field required']
+retyped   FAIL ['agent-service / search returns scored hits: hits.0.score: Input should be a valid number']
+```
+
+`pytest -v` then reports `6 passed`.
+
+### Tests
+All 6 fail on the starter with `NotImplementedError`, which is the unimplemented verifier.
+
+```python
+import pytest
+
+from contract_lab import CONTRACT, make_provider, verify
+
+
+@pytest.mark.parametrize("variant", ["v1", "expanded"])
+def test_compatible_providers_pass(variant):
+    assert verify(CONTRACT, *make_provider(variant)) == []      # extra fields are fine
+
+
+def test_renamed_field_fails_and_names_the_consumer():
+    failures = verify(CONTRACT, *make_provider("renamed"))
+    assert len(failures) == 1
+    assert "agent-service" in failures[0]
+    assert "search returns scored hits" in failures[0]
+    assert "text" in failures[0]
+
+
+def test_retyped_score_fails_under_strict_validation():
+    failures = verify(CONTRACT, *make_provider("retyped"))
+    assert len(failures) == 1 and "score" in failures[0]
+
+
+def test_provider_state_is_seeded_not_assumed():
+    seed, handle = make_provider("v1")
+    empty_state = {**CONTRACT, "interactions": [
+        {**CONTRACT["interactions"][0], "provider_state": "index is empty"}]}
+    failures = verify(empty_state, seed, handle)
+    assert len(failures) == 1 and "hit" in failures[0]           # min_hits=1 not met
+
+
+def test_wrong_status_is_reported():
+    seed, handle = make_provider("v1")
+    moved = {**CONTRACT, "interactions": [{**CONTRACT["interactions"][0],
+             "request": {"method": "POST", "path": "/v2/search", "json": {"query": "q", "k": 3}}}]}
+    failures = verify(moved, seed, handle)
+    assert len(failures) == 1 and "404" in failures[0]
+```
+
+### Failure scenarios
+- **Inject: drop `strict=True` from `Hit`.** The retyped test fails because lax mode coerces the string
+  `"0.9"` back into a float and verification passes. Debug: validate the raw body and print
+  `e.errors()`; a retype that passes here still breaks a consumer that does not coerce.
+- **Inject: `extra="forbid"` on `Hit`.** The `expanded` provider now fails, so the expand step of a
+  rename is blocked. Debug: contracts must allow additions, or every provider change becomes a flag day.
+- **Inject: skip `seed()` in `verify`.** The index stays empty and `v1` fails on hit count, or, without
+  `min_hits`, passes on the empty path only. Debug: assert the promised state produced data.
+- **Inject: add `chunk_id: str` to `Hit` although the agent never reads it.** Every provider fails.
+  Debug: the contract must list only fields the real adapter uses, or the provider can change nothing.
+
+### Submission
+- **Your `verify` implementation**, with the given tests unchanged and all 6 passing.
+- **The demo output** for all four variants.
+- **An expand-and-contract walk-through:** a fifth provider variant that returns only `content`, and a
+  second consumer contract that reads `content`, with a note on which contract blocks removing `text`.
+- **A short note** on what this verifier cannot catch (a provider returning the right shape with the
+  wrong document).
+- **Evaluated by:** one failure per broken interaction, every message naming consumer, interaction and
+  field, and no failures for additive changes.
 
 ## Why it exists
 - **AI systems are services talking over interfaces.** An agent service calls a retrieval service, a

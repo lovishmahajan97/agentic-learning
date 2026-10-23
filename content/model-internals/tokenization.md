@@ -5,7 +5,8 @@ name: Tokenization (BPE, SentencePiece)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - model-internals/embeddings
@@ -153,6 +154,23 @@ flowchart TD
     E --> IDS["Token ids to the model"]
     IDS -->|"concatenate, decode UTF-8"| D["Text back out"]
 ```
+
+## Misconceptions
+- **"A token is about four characters, so characters divided by four is a fine budget."** That holds for
+  English prose only; JSON, IDs, code and many non-Latin scripts cost far more per character, and a
+  36-character UUID can take 34 tokens.
+- **"Any tokenizer gives close enough counts."** Vocabularies differ (32,000 for Llama 2, 128,256 for
+  Llama 3) and providers wrap tool schemas in their own formatting; count with the serving model's
+  tokenizer and reconcile against usage fields.
+- **"Tool schemas are a one-time cost."** They are re-sent on every step, so 40 schemas over a 12-step run
+  can dominate input tokens unless you retrieve tools per step and keep the block stable for prefix
+  caching.
+- **"The model reads characters, so counting letters or exact string edits are easy."** It sees subword
+  chunks, never characters; route character-level work to a tool.
+- **"Decoding each streamed token as it arrives is safe."** Byte-level tokens can end mid-character, which
+  leaks `U+FFFD` into the stream; use an incremental UTF-8 decoder.
+- **"`decode(encode(x))` always returns `x`."** SentencePiece normalizes (NFKC by default), so full-width
+  characters and ligatures can come back changed; compare normalized text when round-tripping.
 
 ## Examples
 ### A BPE trainer and encoder in about thirty lines

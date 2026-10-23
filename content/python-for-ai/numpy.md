@@ -5,7 +5,8 @@ name: numpy
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/pandas
@@ -37,6 +38,163 @@ bugs hide in shapes, dtypes, broadcasting and views.
   you assert at boundaries, batch sizes for big score matrices, and when to hand off to a real index.
 - **What you can skip.** Linear algebra beyond dot products and norms, and most of the API. Shapes,
   broadcasting, views, dtype promotion and `argpartition` are the working set.
+
+## Lab
+### Task
+Fix and finish an agent's in-process semantic memory: `add` must store normalized, C-contiguous float32
+copies and refuse bad rows; `search` must return a JSON-safe cosine top-k without a full sort. No
+embedding API is needed; vectors are hand-made or seeded random. Time box: 60 minutes.
+- **Prerequisites:** this lesson's How it works (views, broadcasting, dtypes), plus pytest.
+- **The bugs are real ones:** the shipped `add` aliases the caller's buffer, keeps float64 and never
+  normalizes.
+
+### Starter code
+```python
+# memory_store.py  (checked with numpy 2.0.2, Python 3.9+)
+import numpy as np
+
+
+class MemoryStore:
+    """In-process semantic memory for an agent: one row per memory embedding."""
+
+    def __init__(self, dim: int):
+        self.dim = dim
+        self.ids = []
+        self.vecs = np.empty((0, dim), dtype=np.float32)
+
+    def add(self, ids, vecs) -> None:
+        """BUGGY (FILL IN 1): stores whatever it is given."""
+        # Must: make a C-contiguous float32 (n, dim) copy, check len(ids) and dim (ValueError),
+        # reject rows whose norm is zero or NaN (ValueError naming their ids), L2-normalize rows.
+        arr = np.asarray(vecs)
+        self.ids += list(ids)
+        self.vecs = arr if len(self.vecs) == 0 else np.concatenate([self.vecs, arr])
+
+    def search(self, query, k: int = 5) -> list:
+        # FILL IN 2: cosine top-k as [(id, python float)], best first, at most len(self.ids) items.
+        # Use argpartition rather than a full sort, and never mutate the caller's query.
+        raise NotImplementedError
+
+
+if __name__ == "__main__":
+    store = MemoryStore(dim=4)
+    store.add(["m1", "m2", "m3", "m4"],
+              [[2, 0, 0, 0], [0.9, 0.1, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]])
+    print("dtype:", store.vecs.dtype, "contiguous:", store.vecs.flags["C_CONTIGUOUS"])
+    print("norms:", np.linalg.norm(store.vecs, axis=1).round(3).tolist())
+    q = np.array([1.0, 0.2, 0.0, 0.0])
+    hits = store.search(q, k=2)
+    print("top-2:", [(i, round(s, 4)) for i, s in hits])
+    print("score type:", type(hits[0][1]).__name__)
+    print("query untouched:", q.tolist())
+```
+Run as given, it prints `dtype: float64` and `norms: [2.0, 0.906, 1.0, 1.0]`, then raises
+`NotImplementedError`.
+
+### Expected output
+```text
+dtype: float32 contiguous: True
+norms: [1.0, 1.0, 1.0, 1.0]
+top-2: [('m2', 0.9962), ('m1', 0.9806)]
+score type: float
+query untouched: [1.0, 0.2, 0.0, 0.0]
+```
+Check the numbers by hand: `|q|` is about 1.0198, so `m1` scores 1/1.0198 = 0.9806, and `m2` (0.9, 0.1)
+normalized is (0.9939, 0.1104), giving (0.9939 + 0.0221)/1.0198 = 0.9962.
+
+### Tests
+```python
+# test_memory_store.py  (run: pytest -q)
+import json
+
+import numpy as np
+import pytest
+
+from memory_store import MemoryStore
+
+
+def test_stored_float32_contiguous_normalized():
+    s = MemoryStore(3)
+    s.add(["a", "b"], [[3.0, 4.0, 0.0], [0.0, 0.0, 2.0]])      # Python floats: float64 by default
+    assert s.vecs.dtype == np.float32 and s.vecs.flags["C_CONTIGUOUS"]
+    np.testing.assert_allclose(np.linalg.norm(s.vecs, axis=1), [1.0, 1.0], rtol=1e-6)
+
+
+def test_add_copies_instead_of_aliasing():
+    s, arr = MemoryStore(4), np.ones((2, 4), dtype=np.float32)
+    s.add(["a", "b"], arr)
+    arr[:] = 0                                                # the caller reuses its buffer
+    assert np.all(s.vecs != 0)
+
+
+def test_append_keeps_dtype():
+    s = MemoryStore(2)
+    s.add(["a"], np.array([[1.0, 0.0]], dtype=np.float32))
+    s.add(["b"], np.array([[0.0, 1.0]]))                     # float64 batch must not upcast the store
+    assert s.vecs.shape == (2, 2) and s.vecs.dtype == np.float32 and s.ids == ["a", "b"]
+
+
+@pytest.mark.parametrize("ids,vecs", [(["a"], [[1.0, 0.0]]), (["a", "b"], [[1.0, 0.0, 0.0]])])
+def test_rejects_wrong_shape(ids, vecs):
+    with pytest.raises(ValueError):
+        MemoryStore(3).add(ids, vecs)
+
+
+def test_rejects_zero_and_nan_rows():
+    with pytest.raises(ValueError, match="empty_tool_result") as e:
+        MemoryStore(2).add(["ok", "empty_tool_result", "bad"], [[1, 0], [0, 0], [np.nan, 1]])
+    assert "bad" in str(e.value)
+
+
+def test_search_matches_brute_force():
+    rng = np.random.default_rng(0)
+    data = rng.standard_normal((2000, 64))
+    s = MemoryStore(64)
+    s.add([f"m{i}" for i in range(2000)], data)
+    q = rng.standard_normal(64)
+    unit = data / np.linalg.norm(data, axis=1, keepdims=True)
+    want = [f"m{i}" for i in np.argsort(-(unit @ (q / np.linalg.norm(q))))[:10]]
+    assert [i for i, _ in s.search(q, k=10)] == want
+
+
+def test_results_are_json_safe_sorted_and_query_untouched():
+    s = MemoryStore(2)
+    s.add(["x", "y", "z"], [[1, 0], [1, 1], [0, 1]])
+    q = np.array([2.0, 1.0])
+    hits = s.search(q, k=2)
+    json.dumps(hits)                                         # float32 scalars would raise TypeError
+    assert [i for i, _ in hits] == ["y", "x"] and hits[0][1] >= hits[1][1]
+    assert q.tolist() == [2.0, 1.0]
+
+
+def test_k_larger_than_store():
+    s = MemoryStore(2)
+    s.add(["x", "y"], [[1, 0], [0, 1]])
+    assert len(s.search([1, 0], k=5)) == 2
+```
+On the starter all 9 fail: dtype, aliasing and normalization assertions, `DID NOT RAISE` for the bad
+rows, and `NotImplementedError` for search.
+
+### Failure scenarios
+- **Inject `np.linalg.norm(arr, axis=1)` without `keepdims` or `[:, None]` in the division.** With `n`
+  rows of `dim` columns it raises a broadcast error (or, when `n == dim`, silently divides columns).
+  Print the shape of the norm array next to `arr.shape`.
+- **Inject `q /= np.linalg.norm(q)`.** The caller's query vector changes after search, so the next
+  agent step searches with a different vector. The untouched-query test catches it; `np.shares_memory`
+  confirms the alias.
+- **Inject `np.argpartition(-sc, k)` with `k == len(ids)`.** It raises "kth out of bounds". Clamp `k`
+  first and use `k - 1` as the partition index.
+- **Inject returning `sc[i]` instead of `sc[i].item()`.** `json.dumps` raises `TypeError` for `float32`
+  when the hits become a tool result. Log `type(score)` at the tool boundary.
+
+### Submission
+- **Code:** `memory_store.py` plus the unchanged tests.
+- **Test run:** `pytest -q` with 9 passed, plus `python -c "import numpy; print(numpy.__version__)"`.
+- **Output:** the five demo lines, matching Expected output.
+- **Memory check:** `store.vecs.nbytes` after adding 100,000 random 768-d rows, compared with this
+  lesson's 307,200,000-byte figure.
+- **Evaluation:** no Python loop over vector elements, no full `argsort` over all scores, and no aliasing
+  of caller arrays.
 
 ## Why it exists
 - **A Python list of floats is pointers to boxed objects.** Each element is a separate heap object with

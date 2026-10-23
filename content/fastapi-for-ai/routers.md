@@ -5,7 +5,8 @@ name: Routers (APIRouter)
 kind: pattern
 difficulty: intro
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/dependency-injection
@@ -36,6 +37,166 @@ so auth applies once per group and the app still has one route table and one Ope
   guards each group (user auth, service token, admin), and the order in which routers are included.
 - **What you can skip.** Starlette's routing internals. Know that inclusion copies routes, that first
   match wins, and that middleware cannot be scoped to a router.
+
+## Lab
+### Task
+Harden a small agent service whose tool routes are guarded one decorator at a time: the newest tool,
+`send_email`, ships with no guard at all, and a parameterised admin route shadows `/prompts/active`.
+
+You will move the auth checks onto the routers, fix the route order, and write the CI route audit that
+stops this from happening again. Time box: 45-60 minutes.
+- **Prerequisites:** Dependency injection (Depends), HTTPException handling, and this lesson's
+  How it works.
+- **Setup:** Python 3.12 with `pip install fastapi httpx pytest` (checked on FastAPI 0.161,
+  Starlette 1.9). Save the starter as `lab_routers.py` and the tests as `test_lab_routers.py`.
+- **Done:** `python lab_routers.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: guard every tool route once, at the router level (checked on FastAPI 0.161, Python 3.12)."""
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from fastapi.testclient import TestClient
+
+SERVICE_TOKEN, ADMIN_KEY = "svc-test", "admin-test"     # test values; load from settings in real code
+
+
+async def require_service_token(x_service_token: str = Header(default="")):
+    if x_service_token != SERVICE_TOKEN:
+        raise HTTPException(status_code=403, detail="agent runtime only")
+
+
+async def require_admin(x_api_key: str = Header(default="")):
+    if x_api_key != ADMIN_KEY:
+        raise HTTPException(status_code=403, detail="admin only")
+
+
+# LAB 1: guards sit on each decorator and the newest tool forgot its guard.
+#        Move each guard onto its router: APIRouter(..., dependencies=[...]).
+tools = APIRouter(tags=["tools"])
+admin = APIRouter(tags=["admin"])
+
+
+@tools.post("/refund", dependencies=[Depends(require_service_token)])
+async def refund(order_id: str) -> dict:
+    return {"ok": True, "order_id": order_id}
+
+
+@tools.post("/send_email")                              # added in week 3, no guard
+async def send_email(to: str) -> dict:
+    return {"sent": True, "to": to}
+
+
+# LAB 2: the parameterised route shadows the literal one. Fix it.
+@admin.get("/prompts/{version}", dependencies=[Depends(require_admin)])
+async def get_prompt(version: str) -> dict:
+    return {"version": version}
+
+
+@admin.get("/prompts/active", dependencies=[Depends(require_admin)])
+async def active_prompt() -> dict:
+    return {"version": "v14"}
+
+
+def create_app() -> FastAPI:
+    v1 = APIRouter(prefix="/v1")
+    v1.include_router(tools, prefix="/tools")
+    v1.include_router(admin, prefix="/admin", include_in_schema=False)
+    app = FastAPI(title="agent-api")
+    app.include_router(v1)
+    return app
+
+
+GUARDS = {"/v1/tools": require_service_token, "/v1/admin": require_admin}
+
+
+def audit_routes(app: FastAPI, guards: dict) -> list[str]:
+    """LAB 3: for every APIRoute under a prefix in `guards` whose dependencies lack that guard,
+    return 'METHOD path missing guard_name'. Sorted; [] when everything is guarded."""
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    app = create_app()
+    c = TestClient(app)
+    print("send_email without token:", c.post("/v1/tools/send_email", params={"to": "a@b.c"}).status_code)
+    print("active prompt:", c.get("/v1/admin/prompts/active", headers={"x-api-key": ADMIN_KEY}).json())
+    print("audit:", audit_routes(app, GUARDS))
+```
+
+As given, it prints `send_email without token: 200` and `active prompt: {'version': 'active'}`, then
+raises `NotImplementedError`: both bugs are live.
+
+### Expected output
+```
+send_email without token: 403
+active prompt: {'version': 'v14'}
+audit: []
+```
+
+### Tests
+```python
+from fastapi.testclient import TestClient
+import lab_routers as lab
+
+
+def test_every_tool_route_needs_the_service_token():
+    c = TestClient(lab.create_app())
+    assert c.post("/v1/tools/send_email", params={"to": "a@b.c"}).status_code == 403
+    assert c.post("/v1/tools/refund", params={"order_id": "o1"}).status_code == 403
+    ok = c.post("/v1/tools/send_email", params={"to": "a@b.c"},
+                headers={"x-service-token": lab.SERVICE_TOKEN})
+    assert ok.status_code == 200
+
+
+def test_guards_live_on_the_routers():
+    assert any(d.dependency is lab.require_service_token for d in lab.tools.dependencies)
+    assert any(d.dependency is lab.require_admin for d in lab.admin.dependencies)
+
+
+def test_literal_route_wins():
+    r = TestClient(lab.create_app()).get("/v1/admin/prompts/active", headers={"x-api-key": lab.ADMIN_KEY})
+    assert r.json() == {"version": "v14"}
+
+
+def test_audit_catches_a_route_added_outside_the_router():
+    app = lab.create_app()
+    assert lab.audit_routes(app, lab.GUARDS) == []
+
+    @app.post("/v1/tools/delete_account")          # a new tool registered straight on the app
+    async def delete_account() -> dict:
+        return {}
+
+    assert lab.audit_routes(app, lab.GUARDS) == [
+        "POST /v1/tools/delete_account missing require_service_token"]
+
+
+def test_admin_routes_stay_out_of_the_tool_schema():
+    paths = lab.create_app().openapi()["paths"]
+    assert paths and not any(p.startswith("/v1/admin") for p in paths)
+```
+
+On the starter, four tests fail: `send_email` answers 200, the routers carry no dependencies, the
+literal route returns `"active"`, and the audit raises `NotImplementedError`. The schema test already
+passes; it guards against a regression while you refactor. Starlette 1.x may print a deprecation warning
+about `httpx` in the test client; it does not affect the results.
+
+### Failure scenarios
+- **Inject: register a tool on `tools` after `create_app()` has run**, as a plugin imported late would.
+  Observe: a 404 for a route that is in the file. Debug: print `[(r.path, r.methods) for r in app.routes]`
+  and note that inclusion copied the router's list at that moment.
+- **Inject: put `prefix="/tools"` on both `APIRouter(...)` and `include_router(...)`.** Observe: every
+  tool test gets 404 while the audit still passes, because the doubled routes are still guarded. Debug:
+  dump the route table, find `/v1/tools/tools/...`, and snapshot the expected paths in CI.
+- **Inject: write the audit to compare dependency names as strings.** Observe: it passes even when a
+  look-alike `require_service_token` from another module is used. Debug: compare the callables
+  (`d.call is guard`), as in the CI example above.
+
+### Submission
+- The fixed `lab_routers.py`, with each guard declared exactly once, on its router.
+- A `pytest -q` run showing 5 passed.
+- The output of `python lab_routers.py`, matching the expected output.
+- Proof the audit bites: the failing test output after you delete one router-level dependency.
+- A two-sentence note: why the route order matters, and why the audit compares callables, not names.
 
 ## Why it exists
 - **Single-file services outgrow themselves.** One `main.py` with `@app.post("/chat")` soon holds chat,

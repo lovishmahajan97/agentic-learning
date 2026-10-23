@@ -5,7 +5,8 @@ name: Chunk overlap
 kind: concept
 difficulty: intro
 est_minutes: 10
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -128,6 +129,21 @@ flowchart TD
     G --> K["Top-k distinct spans"]
     K --> L["Tool result in agent context"]
 ```
+
+## Misconceptions
+- **"20% overlap costs 20% more index."** Inflation is `S / (S − O)`, not `1 + O/S`: 20% of a 400-token
+  chunk is a stride of 320, so 1.25× the chunks, and 50% overlap already doubles the index.
+- **"Setting `chunk_overlap=100` guarantees 100 shared tokens at every boundary."** Piece-based recursive
+  splitters carry forward only whole trailing pieces that fit, so a boundary after a long paragraph can
+  share nothing. Measure real shared text on a sample.
+- **"More overlap means more context for the agent."** Overlap only repairs damage within a sentence or
+  two of the cut. Headings and definitions further away need heading paths, contextual prefixes or parent
+  retrieval, and extra overlap mostly buys duplicate hits.
+- **"Duplicate hits are harmless; the model ignores repeats."** Each copy takes a top-k slot and tool
+  tokens, so distinct evidence ranked sixth never reaches the agent. Collapse adjacent hits by offsets
+  before cutting to k.
+- **"Every splitter needs overlap."** With one chunk per section, function or FAQ entry, or with
+  small-to-big retrieval, zero overlap often matches 10–20% on recall@k at lower cost.
 
 ## Examples
 ### A token sliding window and its inflation

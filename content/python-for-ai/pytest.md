@@ -5,7 +5,8 @@ name: pytest
 kind: tool
 difficulty: intro
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/pytest-asyncio
@@ -37,6 +38,153 @@ parametrized case tables make thirty cases as cheap as three.
   cannot stall CI.
 - **What you can skip.** Writing plugins and hook functions yourself. Know that plugins exist and change
   fixture behaviour (xdist, asyncio); you rarely author one.
+
+## Lab
+### Task
+Production traces show a tool-calling loop crashing when the model names a tool that does not exist or
+sends the wrong arguments, and billing one model call too many on runaway loops.
+
+You will reproduce both defects with an offline pytest suite and a scripted model, read the rewritten assertion failures,
+fix the loop, and extend the case table. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's Fixtures and Parametrization sections; Test doubles, mocks and
+  fixtures for the scripted-model idea.
+- **Setup:** Python 3.11+, `pip install pytest` (checked against pytest 9.1.1). Save the starter as
+  `agent_loop.py` and the tests as `test_agent_loop.py` in one directory.
+- **Goal:** every malformed tool call becomes an error result the model can read, and the loop calls the
+  model at most `max_steps` times.
+
+### Starter code
+```python
+"""agent_loop.py: a tiny tool-calling loop. Two defects were reported from production."""
+import json
+
+
+class ScriptedLLM:
+    """Stub plus spy: replays scripted replies and records every message list it was sent."""
+
+    def __init__(self, replies):
+        self.replies, self.calls = list(replies), []
+
+    def complete(self, messages):
+        self.calls.append([dict(m) for m in messages])
+        if not self.replies:
+            raise AssertionError("script exhausted: the loop called the model more often than scripted")
+        return self.replies.pop(0)
+
+
+TOOLS = {
+    "get_weather": lambda city: {"city": city, "temp_c": 18},
+    "add": lambda a, b: {"sum": a + b},
+}
+
+
+def run_agent(llm, user_msg, tools=TOOLS, max_steps=3):
+    messages = [{"role": "user", "content": user_msg}]
+    for _ in range(max_steps + 1):                      # EXERCISE: the budget is max_steps model calls
+        reply = llm.complete(messages)
+        if reply["type"] == "final":
+            return reply["text"], messages
+        result = tools[reply["name"]](**reply["args"])  # EXERCISE: bad calls must become error results
+        messages.append({"role": "tool", "name": reply["name"], "content": json.dumps(result)})
+    raise RuntimeError("step budget exhausted")
+
+
+if __name__ == "__main__":
+    call = {"type": "tool", "name": "get_weather", "args": {"city": "Oslo"}}
+    llm = ScriptedLLM([call, {"type": "final", "text": "18 C in Oslo"}])
+    text, messages = run_agent(llm, "weather in Oslo?")
+    print("final:", text, "| tool message:", messages[-1]["content"])
+    runaway = ScriptedLLM([call] * 10)
+    try:
+        run_agent(runaway, "loop forever", max_steps=3)
+    except RuntimeError as e:
+        print("runaway:", e, "| model calls:", len(runaway.calls))
+```
+
+### Expected output
+`python agent_loop.py` after the fix (the starter prints `model calls: 4`), then `pytest -v`:
+
+```text
+final: 18 C in Oslo | tool message: {"city": "Oslo", "temp_c": 18}
+runaway: step budget exhausted | model calls: 3
+
+test_agent_loop.py::test_tool_result_reaches_model PASSED
+test_agent_loop.py::test_bad_call_becomes_error_result[unknown-tool] PASSED
+test_agent_loop.py::test_bad_call_becomes_error_result[missing-arg] PASSED
+test_agent_loop.py::test_bad_call_becomes_error_result[wrong-arg-name] PASSED
+test_agent_loop.py::test_loop_stops_at_budget[1] PASSED
+test_agent_loop.py::test_loop_stops_at_budget[2] PASSED
+test_agent_loop.py::test_loop_stops_at_budget[3] PASSED
+7 passed
+```
+
+### Tests
+On the starter, 6 of 7 fail: the three bad-call rows with `KeyError` or `TypeError`, the budget rows
+with `assert 2 == 1`, `assert 3 == 2` and `assert 4 == 3`.
+
+```python
+import json
+
+import pytest
+
+from agent_loop import ScriptedLLM, run_agent
+
+CALL = {"type": "tool", "name": "get_weather", "args": {"city": "Oslo"}}
+FINAL = {"type": "final", "text": "18 C in Oslo"}
+
+
+@pytest.fixture
+def make_llm():
+    return lambda *replies: ScriptedLLM(replies)
+
+
+def test_tool_result_reaches_model(make_llm):
+    llm = make_llm(CALL, FINAL)
+    text, _ = run_agent(llm, "weather in Oslo?")
+    assert text == "18 C in Oslo"
+    assert json.loads(llm.calls[1][-1]["content"])["temp_c"] == 18
+
+
+@pytest.mark.parametrize("bad_call", [
+    {"type": "tool", "name": "rm_rf", "args": {}},
+    {"type": "tool", "name": "get_weather", "args": {}},
+    {"type": "tool", "name": "add", "args": {"a": 1, "c": 2}},
+], ids=["unknown-tool", "missing-arg", "wrong-arg-name"])
+def test_bad_call_becomes_error_result(make_llm, bad_call):
+    llm = make_llm(bad_call, FINAL)
+    text, messages = run_agent(llm, "go")
+    assert text == "18 C in Oslo"                        # the loop kept going
+    assert "error" in json.loads(messages[-1]["content"])  # and the model was told why
+
+
+@pytest.mark.parametrize("budget", [1, 2, 3])
+def test_loop_stops_at_budget(make_llm, budget):
+    llm = make_llm(*[CALL] * (budget + 1))               # a model that never finishes
+    with pytest.raises(RuntimeError, match="budget"):
+        run_agent(llm, "loop forever", max_steps=budget)
+    assert len(llm.calls) == budget
+```
+
+### Failure scenarios
+- **Inject: catch `Exception` around the tool call.** All tests pass, but a typo inside a tool now
+  reaches the model as an "error" too. Debug: add a row whose tool raises `ZeroDivisionError` and decide
+  whether it should crash the run; narrow the `except` to argument errors.
+- **Inject: share one `ScriptedLLM` at module scope.** The second test pops replies the first already
+  used and fails with "script exhausted". Debug: run the failing id alone with `-k`; it passes, which
+  points at shared state; keep the fixture function-scoped.
+- **Inject: drop `ids=`.** Failures report `bad_call0` instead of `unknown-tool`. Debug: `--collect-only`
+  shows the ids; restore names so a red run says which reply shape broke.
+- **Inject: `max_steps=0` from config.** The loop raises before calling the model at all. Debug: add a
+  budget row for 0 and decide whether a zero budget is a configuration error to reject at startup.
+
+### Submission
+- **Your fixed `agent_loop.py`**, with no change to the given tests.
+- **A `pytest -v` log** showing all 7 ids passing, plus the starter's failing run for comparison.
+- **Two new parametrized rows** with readable ids, one from a real reply shape you have seen (for
+  example arguments sent as a JSON string instead of a dict).
+- **A three-line note** naming which assertion message located each defect without a debugger.
+- **Evaluated by:** the given tests pass unmodified, your rows fail on the starter, and the loop never
+  calls the model more than `max_steps` times.
 
 ## Why it exists
 - **unittest is a JUnit port with ceremony.** Every test lives in a `TestCase` subclass, every assertion

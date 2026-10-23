@@ -5,7 +5,8 @@ name: OpenAPI contract testing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/openapi-docs
@@ -37,6 +38,186 @@ checks responses match it, with the LLM stubbed.
   diff against, the fake LLM client used in the contract suite, and the trace sample you replay.
 - **What you can skip.** Writing your own fuzzer or diff engine. Use the tools; understand the rule they
   enforce.
+
+## Lab
+### Task
+A pull request to a chat tool renames `usage.total_tokens`, adds a required `tenant_id`, drops
+`temperature` and narrows the `mode` enum. Unit tests are green. You will build the two checks that
+block it: a breaking-change classifier over two real `app.openapi()` documents (the asymmetric rule),
+and a replay of recorded agent tool calls against the new request model.
+
+Time box: 60-90 minutes.
+- **Prerequisites:** OpenAPI docs, Pydantic request / response models, and this lesson's Layer 1 and
+  Layer 3.
+- **Setup:** Python 3.12 with `pip install fastapi pytest` (checked on FastAPI 0.161, Pydantic 2.14).
+  Save the starter as `lab_contract.py` and the tests as `test_lab_contract.py`.
+- **Scope:** the classifier must find the request and response models itself, from `paths`, including
+  models nested inside the response (here `Usage`).
+
+### Starter code
+```python
+"""Lab: catch tool-schema breaks before an agent does (checked on FastAPI 0.161, Pydantic 2.14, Python 3.12)."""
+from typing import Literal, Optional
+from fastapi import FastAPI
+from pydantic import BaseModel, ConfigDict, ValidationError
+
+
+def make_app(ChatIn, ChatOut) -> FastAPI:
+    app = FastAPI(title="chat-tool")
+
+    @app.post("/v1/chat", response_model=ChatOut, operation_id="chat")
+    async def chat(body: ChatIn):
+        raise NotImplementedError("the contract, not the handler, is under test")
+
+    return app
+
+
+def released_models():                        # release 1.4: what agents' cached tool lists use
+    class Usage(BaseModel):
+        prompt_tokens: int
+        total_tokens: int
+
+    class ChatIn(BaseModel):
+        messages: list[str]
+        mode: Literal["fast", "deep", "auto"] = "auto"
+        temperature: float = 0.2
+
+    class ChatOut(BaseModel):
+        text: str
+        usage: Usage
+
+    return ChatIn, ChatOut
+
+
+def candidate_models():                       # the pull request under review
+    class Usage(BaseModel):
+        prompt_tokens: int
+        tokens: int                           # renamed from total_tokens
+
+    class ChatIn(BaseModel):
+        messages: list[str]
+        tenant_id: str                        # new and required
+        mode: Literal["fast", "deep"] = "fast"
+        seed: Optional[int] = None            # new and optional: safe
+
+    class ChatOut(BaseModel):
+        text: str
+        usage: Usage
+        citations: list[str] = []             # new response field: safe
+
+    return ChatIn, ChatOut
+
+
+RECORDED_CALLS = [                            # tool arguments sampled from agent traces
+    {"messages": ["hi"], "mode": "auto"},
+    {"messages": ["refund order 42"], "temperature": 0.0},
+    {"messages": ["status?"], "mode": "fast"},
+]
+
+
+def breaking_changes(old: dict, new: dict) -> list[str]:
+    """LAB 1: compare two OpenAPI documents. Request models are the requestBody $refs, response
+    models the 200 $refs plus every model they reference. Report, sorted by model name, then in
+    this order within a model:
+      '<Model>: new required request field <f>'
+      '<Model>: request field <f> removed'
+      '<Model>: request enum <f> lost <value>'
+      '<Model>: response field <f> removed'
+      '<Model>: response field <f> no longer required'"""
+    raise NotImplementedError
+
+
+def replay_failures(calls: list[dict], model) -> list[str]:
+    """LAB 2: validate each recorded call against `model` with unknown fields forbidden.
+    One line per failing call: 'call <i>: <loc>, <loc>' with the error locations sorted."""
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    old = make_app(*released_models()).openapi()
+    new = make_app(*candidate_models()).openapi()
+    for line in breaking_changes(old, new):
+        print(line)
+    for line in replay_failures(RECORDED_CALLS, candidate_models()[0]):
+        print(line)
+```
+
+### Expected output
+```
+ChatIn: new required request field tenant_id
+ChatIn: request field temperature removed
+ChatIn: request enum mode lost auto
+Usage: response field total_tokens removed
+call 0: mode, tenant_id
+call 1: temperature, tenant_id
+call 2: tenant_id
+```
+
+### Tests
+```python
+from typing import Optional
+from pydantic import BaseModel
+import lab_contract as lab
+
+OLD = lab.make_app(*lab.released_models()).openapi()
+NEW = lab.make_app(*lab.candidate_models()).openapi()
+
+
+def test_classifier_reports_every_break_and_nothing_else():
+    assert lab.breaking_changes(OLD, NEW) == [
+        "ChatIn: new required request field tenant_id",
+        "ChatIn: request field temperature removed",
+        "ChatIn: request enum mode lost auto",
+        "Usage: response field total_tokens removed",
+    ]
+
+
+def test_identical_and_additive_changes_are_clean():
+    assert lab.breaking_changes(OLD, OLD) == []
+    BaseIn, BaseOut = lab.released_models()
+
+    class ChatIn(BaseIn):
+        seed: Optional[int] = None              # new optional request field
+
+    class ChatOut(BaseOut):
+        model: str                              # new, always-present response field
+
+    additive = lab.make_app(ChatIn, ChatOut).openapi()
+    assert lab.breaking_changes(OLD, additive) == []
+
+
+def test_replay_finds_the_calls_agents_would_now_fail():
+    assert lab.replay_failures(lab.RECORDED_CALLS, lab.candidate_models()[0]) == [
+        "call 0: mode, tenant_id",
+        "call 1: temperature, tenant_id",
+        "call 2: tenant_id",
+    ]
+
+
+def test_replay_is_clean_against_the_release():
+    assert lab.replay_failures(lab.RECORDED_CALLS, lab.released_models()[0]) == []
+```
+
+On the starter all four tests fail with `NotImplementedError`. The second test is the trap: a classifier
+that flags every difference also fails it, because additive changes must pass.
+
+### Failure scenarios
+- **Inject: validate the replay with the plain model instead of `extra="forbid"`.** Observe: `call 1`
+  loses `temperature` from its error list, because the default `extra="ignore"` drops it silently. Debug:
+  print `model.model_config` in the replay; this is the sneaky case from Layer 1.
+- **Inject: only inspect the 200 response's top-level model.** Observe: the `Usage` line disappears and
+  the rename ships. Debug: follow `$ref` pointers in response properties until no new model appears.
+- **Inject: diff against the previous commit's schema instead of the release.** Observe: after the PR
+  merges, the next PR's diff is clean while clients still break. Debug: pin `OLD` to the tagged
+  release's snapshot file, as in the "break that slips into the baseline" scenario.
+
+### Submission
+- `lab_contract.py` with both functions, and a `pytest -q` run showing 4 passed.
+- The output of `python lab_contract.py`, matching the expected output.
+- A CI step (shell or YAML) that runs the classifier against the last release's snapshot and fails on
+  any line.
+- A short note proposing how to make this PR non-breaking (alias, default for `tenant_id`, or a new
+  version), with a re-run of the classifier showing what is left.
 
 ## Why it exists
 - **Unit tests move with the code.** The same people change both: rename `usage.total_tokens` to

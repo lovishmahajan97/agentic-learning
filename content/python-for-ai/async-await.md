@@ -5,7 +5,8 @@ name: async / await
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/asyncio
@@ -38,6 +39,162 @@ does nothing for CPU-bound work.
   timeout, and keeping every call in the loop on an async client so one sync call cannot stall them all.
 - **What you can skip.** Writing your own event loop or awaitables; the generator machinery under
   `await` beyond "the frame is parked".
+
+## Lab
+### Task
+Turn a sequential tool executor into the one an agent turn needs: the model asked for four tools at
+once, one of them hangs and one is a blocking sync SDK. Simulated tools stand in for the network, so
+the lab runs offline. The step should cost the slowest bounded call, not the sum.
+
+Time box: 45-75 minutes. Do "How it works" here first; `asyncio` and cancellation have their own
+lessons.
+- **Rewrite** `run_tool_calls`: all calls concurrent, at most `max_parallel` in flight, each under
+  `budget_s`, results in call order, and sync tools moved off the loop.
+- **Keep** the tools, `STATS` and `CALLS` unchanged.
+- **Run** on Python 3.11+ (for `asyncio.timeout`) with pytest (checked on Python 3.12.14, pytest
+  9.1.1).
+
+### Starter code
+Save as `lab.py`. It runs, sequentially, in about 3.8 s.
+
+```python
+"""lab.py: run one agent turn's tool calls concurrently, with a cap and a per-tool timeout."""
+from __future__ import annotations
+
+import asyncio
+import time
+
+STATS = {"in_flight": 0, "peak": 0}
+
+async def _network(seconds: float) -> None:      # simulated network wait that records concurrency
+    STATS["in_flight"] += 1
+    STATS["peak"] = max(STATS["peak"], STATS["in_flight"])
+    try:
+        await asyncio.sleep(seconds)
+    finally:
+        STATS["in_flight"] -= 1
+
+async def search(arg: str) -> str:
+    await _network(0.3); return f"3 docs for {arg!r}"
+async def weather(arg: str) -> str:
+    await _network(0.2); return f"{arg}: 14C"
+async def crm(arg: str) -> str:
+    await _network(3.0); return "too late"       # a hung dependency
+def legacy_lookup(arg: str) -> str:              # a sync SDK you cannot change: it blocks the thread
+    time.sleep(0.3); return f"{arg}: gold tier"
+
+ASYNC_TOOLS = {"search": search, "weather": weather, "crm": crm}
+SYNC_TOOLS = {"legacy": legacy_lookup}
+
+async def run_tool_calls(calls: list[dict[str, str]], max_parallel: int = 3,
+                         budget_s: float = 1.0) -> list[dict[str, object]]:
+    """One result per call, in call order: {"tool_use_id": id, "content": text}, or on timeout
+    {"tool_use_id": id, "content": f"{name} timed out", "is_error": True}.
+    LAB: this version is sequential, blocks on the sync tool and has no timeout. Make it run all calls
+    concurrently, at most `max_parallel` at a time, each under `budget_s`, with sync tools off the loop."""
+    out: list[dict[str, object]] = []
+    for c in calls:
+        if c["name"] in SYNC_TOOLS:
+            content = SYNC_TOOLS[c["name"]](c["arg"])
+        else:
+            content = await ASYNC_TOOLS[c["name"]](c["arg"])
+        out.append({"tool_use_id": c["id"], "content": content})
+    return out
+
+CALLS = [{"id": "t1", "name": "crm", "arg": "acme"},
+         {"id": "t2", "name": "search", "arg": "refund policy"},
+         {"id": "t3", "name": "weather", "arg": "Oslo"},
+         {"id": "t4", "name": "legacy", "arg": "acme"}]
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+    for r in asyncio.run(run_tool_calls(CALLS)):
+        print(r)
+    print(f"step took {time.perf_counter() - t0:.1f}s")
+```
+
+### Expected output
+The starter takes 3.0 + 0.3 + 0.2 + 0.3 = 3.8 s and returns `too late` for `crm`. A correct solution
+prints the following; `crm`, `search` and `weather` take the three slots, `legacy` starts when
+`weather` frees one at 0.2 s, and the step ends at the 1.0 s budget:
+
+```
+{'tool_use_id': 't1', 'content': 'crm timed out', 'is_error': True}
+{'tool_use_id': 't2', 'content': "3 docs for 'refund policy'"}
+{'tool_use_id': 't3', 'content': 'Oslo: 14C'}
+{'tool_use_id': 't4', 'content': 'acme: gold tier'}
+step took 1.0s
+```
+
+### Tests
+Save as `test_lab.py` and run `python -m pytest -q` (about 3.3 s on a solution, 11 s on the
+starter). On the starter five fail on timing, peak or error-result assertions; the ordering test
+passes, because sequential code is ordered by construction. Timing bounds leave wide margins.
+
+```python
+import asyncio, time
+from lab import CALLS, STATS, run_tool_calls
+
+def timed(calls, **kw):
+    STATS["peak"] = 0
+    t0 = time.perf_counter()
+    out = asyncio.run(run_tool_calls(calls, **kw))
+    return out, time.perf_counter() - t0
+
+def call(i, name, arg="x"):
+    return {"id": f"t{i}", "name": name, "arg": arg}
+
+def test_results_keep_call_order():
+    out, _ = timed([call(1, "search", "kv"), call(2, "weather", "Oslo"), call(3, "legacy", "acme")])
+    assert out == [{"tool_use_id": "t1", "content": "3 docs for 'kv'"},
+                   {"tool_use_id": "t2", "content": "Oslo: 14C"},
+                   {"tool_use_id": "t3", "content": "acme: gold tier"}]
+
+def test_step_costs_the_slowest_call_not_the_sum():
+    _, s = timed([call(1, "search"), call(2, "weather"), call(3, "search")])   # sum 0.8 s
+    assert s < 0.5
+
+def test_hung_tool_becomes_an_error_result():
+    out, s = timed([call(1, "crm"), call(2, "weather")], budget_s=0.5)
+    assert out[0] == {"tool_use_id": "t1", "content": "crm timed out", "is_error": True}
+    assert out[1]["content"] == "x: 14C" and s < 0.9
+
+def test_cap_bounds_concurrency():
+    _, s = timed([call(i, "search") for i in range(6)], max_parallel=2)    # 3 waves of 0.3 s
+    assert STATS["peak"] == 2 and 0.85 < s < 1.3
+
+def test_sync_tool_does_not_block_the_loop():
+    _, s = timed([call(1, "legacy"), call(2, "legacy"), call(3, "search")])  # sequential 0.9 s
+    assert s < 0.6
+
+def test_the_recorded_turn():
+    out, s = timed(CALLS)
+    assert [r.get("is_error", False) for r in out] == [True, False, False, False]
+    assert 0.95 < s < 1.4
+```
+
+### Failure scenarios
+- **Call `legacy_lookup` directly inside the coroutine.** It never awaits, so the loop freezes for
+  0.3 s per call and the sync test takes about 0.9 s. Time each call; latencies that add up although
+  the code looks concurrent mean a blocking call. Use `await asyncio.to_thread(...)`.
+- **Put the semaphore inside the timeout.** With 6 searches, a cap of 2 and a 0.5 s budget, the
+  last four calls time out while queueing for a slot (they would finish at 0.6 s and 0.9 s). Print
+  when each call acquires the slot; the budget should start there.
+- **Give the sync tool a 2 s sleep under a 1 s budget.** The result says `timed out` at 1 s, yet
+  `asyncio.run` returns after 2 s, because a cancelled `to_thread` call cannot stop its thread and
+  the loop waits for the executor at shutdown. Fix it in the SDK (its own timeout), not in asyncio.
+- **Collect results with `asyncio.as_completed`.** Results arrive fastest first, so `tool_use_id`
+  pairing breaks the order test. Keep `gather`, which returns in argument order.
+
+### Submission
+- **`lab.py` and `test_lab.py`,** plus three consecutive `python -m pytest -q` runs showing 6 passed.
+- **The output of `python lab.py`,** with a two-line timeline of when each call started and ended.
+- **One extension:** a fifth tool that depends on `search`'s result, run after the parallel batch,
+  with a test that it starts only once `search` is done.
+- **A note of 2-4 sentences:** how you would pick `max_parallel` and `budget_s` for a real provider,
+  and why a semaphore alone does not enforce a requests-per-minute quota.
+- **Evaluation:** tests pass unmodified on repeated runs, no blocking call runs on the event loop, and
+  a hung tool never delays the step beyond its budget.
 
 ## Why it exists
 - **AI workloads are mostly waiting.** An LLM request takes on the order of seconds (illustrative; it

@@ -5,7 +5,8 @@ name: asyncio vs threads vs multiprocessing
 kind: decision
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - python-for-ai/asyncio
@@ -37,6 +38,78 @@ and GIL-releasing C code, processes for CPU-bound Python. Keep an async core, br
   `initializer=`, `chunksize=` and start method, and how many server workers fit your memory budget.
 - **What you can skip.** Writing your own process orchestration or shared-memory schemes. Learn the
   decision procedure and the bridges; reach for a job queue when CPU work outgrows one machine.
+
+## Decision case
+### Scenario
+A support-automation team runs a document-QA agent as a FastAPI service on three 8-core, 16 GB VMs.
+At peak each VM holds 300 concurrent chat sessions. All figures below are illustrative.
+
+| Tool | Work | Peak rate per VM |
+|---|---|---|
+| Web search | Async `httpx`, about 0.4 s network | Most steps |
+| CRM lookup | Sync vendor SDK, about 0.3 s network | 20 calls/s |
+| PDF attachment parser | Pure Python, about 0.6 s CPU per PDF | 3 uploads/s during 10-minute peaks |
+
+**Constraints:**
+- **Latency:** p95 time to first token at most 1.5 s, and no visible stalls in other users' streams.
+- **Memory:** 16 GB per VM; each process that serves chat loads a 1.5 GB local reranker.
+- **Team and time:** three Python developers, no queue infrastructure or ops headcount, ship in 3 weeks.
+- **Runtime:** standard CPython 3.12, so the GIL applies.
+
+**The numbers that drive it:**
+- **Parse demand:** 3 × 0.6 = 1.8 core-seconds of Python per second per VM.
+- **One process's ceiling:** under the GIL, parsing tops out at 1 ÷ 0.6 ≈ 1.67 PDFs/s wherever it runs
+  in that process (inline or `to_thread`).
+- **CRM threads:** by Little's law, 20 calls/s × 0.3 s ≈ 6 threads busy on average.
+
+### Options
+| Option | How it works | Parse capacity per VM (need 3/s) | Other sessions' streams | Memory per VM | Ships in 3 weeks |
+|---|---|---|---|---|---|
+| A. One async process, everything sync via `to_thread` | Loop awaits search; CRM and parser in the default thread pool | 1.67/s: backlog grows 1.33/s, about 800 PDFs after 10 minutes | Loop unblocked, but parses hold the GIL about 100% of the time, so every step waits for handovers | 1.5 GB reranker | Yes, smallest change |
+| B. Async core, CRM via `to_thread`, parser in a `ProcessPoolExecutor(4)` | Loop dispatches each tool by kind; parse runs in 4 spawned workers | 4 ÷ 0.6 ≈ 6.67/s, 45% busy at peak | Smooth: parse CPU is on other cores and other GILs | 1.5 GB + 4 parser-only workers | Yes, about a week |
+| C. Async API plus a separate queue-fed parse service | API enqueues a job; workers parse and write results back | Scales by adding workers; jobs survive restarts | Smooth | Separate service, sized on its own | No: new queue, deploy and alerts with no ops headcount |
+| D. Four Uvicorn workers, parser via `to_thread` in each | More processes, same code | 4 × 1.67 ≈ 6.67/s | Each worker's 75 sessions jitter whenever that worker parses | 4 × 1.5 = 6 GB of rerankers | Yes |
+
+### Decision
+**Choose B.** It is the only option that meets the parse rate, keeps streams smooth and fits the
+memory budget inside the deadline:
+- **A fails the rate constraint:** 1.67/s against 3/s, and the last PDF of a 10-minute peak would wait
+  roughly 800 ÷ 1.67 ≈ 480 s.
+- **D meets the rate but not the latency constraint,** because parsing still shares a GIL with each
+  worker's event loop. It also spends 4.5 GB more on duplicated rerankers.
+- **C is the right long-term shape** but fails the team and time constraint today.
+
+**Implementation notes:** spawn the pool with `initializer=` loading only the parser (never the
+reranker at import), bound the default executor to 16 threads for the CRM SDK (6 busy on average), and
+send PDF bytes per task after checking pickling cost against the 0.6 s of work.
+
+**What would change the decision:**
+- **Move to C** when sustained uploads pass about 5/s per VM (75% of B's 6.67/s), or when parse jobs must
+  survive deploys and be retried.
+- **Move to threads** if the parser is replaced by native code whose CPU/wall ratio with N threads
+  measures close to N.
+- **Re-evaluate** if the service moves to a free-threaded CPython build and every dependency supports it.
+
+### Trade-offs accepted
+- **In-flight parses die with the process.** A deploy or crash drops queued PDFs. Watch: count parse
+  jobs abandoned on shutdown, and tell users to re-upload until C exists.
+- **Pickling and memory per worker.** Each PDF crosses a pipe and each worker holds a parser. Watch:
+  per-worker RSS and the share of task time spent outside the parse function.
+- **A shared pool can still queue.** A burst above 6.67/s waits in the executor. Watch: executor queue
+  depth and p95 time from upload to parsed, against the 5/s trigger.
+- **Spawn discipline.** Workers re-import modules, so a stray import-time model load multiplies memory.
+  Watch: worker start time and RSS right after start.
+
+### Review rubric
+- **Constraints are explicit and numeric** (rate, latency, memory, team, deadline) before any option is
+  discussed.
+- **Capacity is computed, not asserted:** the write-up derives demand and per-option capacity, such as
+  3 × 0.6 = 1.8 core-seconds against 1 ÷ 0.6 per GIL.
+- **Each rejected option fails a named constraint,** stated with its number.
+- **The GIL effect on streaming is addressed,** not only throughput: where parsing shares a GIL with
+  the event loop.
+- **Triggers to revisit are measurable** (an upload rate, a CPU/wall ratio, a durability requirement).
+- **Accepted trade-offs each have a metric** someone will actually watch.
 
 ## Why it exists
 - **Agent backends do two kinds of work.** Most wall-clock time is waiting (model provider, embedding API,

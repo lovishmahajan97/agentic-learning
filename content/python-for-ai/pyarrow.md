@@ -5,7 +5,8 @@ name: pyarrow
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/pandas
@@ -37,6 +38,147 @@ pandas, Polars, DuckDB and Hugging Face swap tables without serializing.
   that keep zero-copy.
 - **What you can skip.** The C Data Interface details and most of `pyarrow.compute`; let Polars or DuckDB
   do the queries.
+
+## Lab
+### Task
+Build the Parquet source of truth behind an agent's RAG index: an explicitly typed chunk table tagged
+with its embedding model, written hive-partitioned by tenant, and a loader that hands one tenant's vectors
+to the index builder as a float32 NumPy array and refuses vectors from the wrong model.
+
+No vector database or embedding API is needed. Time box: 60 minutes.
+- **Prerequisites:** this lesson's How it works, plus numpy and json-jsonl.
+- **The shipped `build_table` infers types,** so embeddings arrive as `list<double>`, not
+  `fixed_size_list<float>`.
+
+### Starter code
+```python
+# chunk_store.py  (checked with pyarrow 21.0.0, numpy 2.0.2, Python 3.9+)
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import pyarrow as pa
+import pyarrow.dataset as ds
+
+
+def build_table(doc_ids, tenants, chunks, emb: np.ndarray, model: str) -> pa.Table:
+    """BUGGY (FILL IN 1): types are inferred. Use an explicit schema: doc_id string, tenant string,
+    chunk large_string, embedding fixed_size_list<float32>[d], plus schema metadata
+    {"embedding_model": model} so vectors from two models can never be mixed silently."""
+    return pa.table({"doc_id": doc_ids, "tenant": tenants, "chunk": chunks,
+                     "embedding": emb.tolist()})
+
+
+def write_partitioned(table: pa.Table, root: Path) -> None:
+    # FILL IN 2: hive-partitioned Parquet by tenant (root/tenant=t1/...), overwriting earlier runs.
+    raise NotImplementedError
+
+
+def load_tenant_vectors(root: Path, tenant: str, model: str):
+    # FILL IN 3: read ONLY doc_id and embedding for one tenant (filter prunes other directories);
+    # raise ValueError if the stored embedding_model differs from `model`; return
+    # (doc_ids sorted ascending, float32 array of shape (n, d) in the same order).
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    n, d = 9, 4
+    emb = (np.arange(n * d, dtype=np.float32) / 4).reshape(n, d)
+    table = build_table([f"doc-{i}" for i in range(n)], [f"t{i % 3}" for i in range(n)],
+                        [f"text of chunk {i}" for i in range(n)], emb, model="embed-v1")
+    print("embedding type:", table.schema.field("embedding").type)
+    with tempfile.TemporaryDirectory() as d_:
+        root = Path(d_) / "chunks"
+        write_partitioned(table, root)
+        print("partitions:", sorted(p.name for p in root.iterdir()))
+        ids, vecs = load_tenant_vectors(root, "t1", model="embed-v1")
+        print("t1:", ids, vecs.shape, vecs.dtype)
+        print("first vector:", vecs[0].tolist())
+        try:
+            load_tenant_vectors(root, "t1", model="embed-v2")
+        except ValueError as e:
+            print("error:", e)
+```
+Run as given, it prints `embedding type: list<item: double>`, then raises `NotImplementedError`.
+
+### Expected output
+```text
+embedding type: fixed_size_list<item: float>[4]
+partitions: ['tenant=t0', 'tenant=t1', 'tenant=t2']
+t1: ['doc-1', 'doc-4', 'doc-7'] (3, 4) float32
+first vector: [1.0, 1.25, 1.5, 1.75]
+error: stored embedding_model 'embed-v1' != requested 'embed-v2'
+```
+The error wording is yours, but it must name both models. `doc-1` is row 1, so its vector is
+`[4, 5, 6, 7] / 4`.
+
+### Tests
+```python
+# test_chunk_store.py  (run: pytest -q)
+import numpy as np
+import pyarrow as pa
+import pytest
+
+from chunk_store import build_table, load_tenant_vectors, write_partitioned
+
+N, D = 12, 8
+EMB = np.random.default_rng(0).standard_normal((N, D)).astype(np.float32)
+IDS = [f"d{i:02d}" for i in range(N)]
+TENANTS = ["acme" if i % 4 == 0 else "globex" for i in range(N)]
+
+
+def table():
+    return build_table(IDS, TENANTS, [f"chunk {i}" for i in range(N)], EMB, model="m1")
+
+
+def test_explicit_schema_and_model_metadata():
+    s = table().schema
+    assert s.field("embedding").type == pa.list_(pa.float32(), D)
+    assert s.field("chunk").type == pa.large_string()
+    assert s.metadata[b"embedding_model"] == b"m1"
+
+
+def test_hive_partitions(tmp_path):
+    write_partitioned(table(), tmp_path / "c")
+    assert sorted(p.name for p in (tmp_path / "c").iterdir()) == ["tenant=acme", "tenant=globex"]
+    write_partitioned(table(), tmp_path / "c")                     # a rerun must not fail
+
+
+def test_load_one_tenant(tmp_path):
+    write_partitioned(table(), tmp_path / "c")
+    ids, vecs = load_tenant_vectors(tmp_path / "c", "acme", model="m1")
+    assert ids == ["d00", "d04", "d08"]
+    assert vecs.dtype == np.float32 and vecs.shape == (3, D)
+    np.testing.assert_array_equal(vecs, EMB[[0, 4, 8]])
+
+
+def test_model_mismatch_refused(tmp_path):
+    write_partitioned(table(), tmp_path / "c")
+    with pytest.raises(ValueError, match="m1"):
+        load_tenant_vectors(tmp_path / "c", "acme", model="m2")
+```
+On the starter all 4 fail: the schema assertion (`list<item: double>`), then `NotImplementedError`.
+
+### Failure scenarios
+- **Inject the inferred `emb.tolist()` column.** The loader gets float64 vectors at twice the memory, and
+  a C extension expecting float32 rejects or copies them. Print `table.schema` before writing; the
+  `fixed_size_list` type is the contract.
+- **Inject dropping `existing_data_behavior`.** The rerun in `test_hive_partitions` raises because the
+  directory is not empty. Note that `overwrite_or_ignore` replaces same-named files but keeps a partition
+  you no longer write, so delete stale tenants explicitly.
+- **Inject a write with `model="embed-v2"` into the same root.** Old and new vectors now share a
+  dataset and similarity scores are meaningless. Read `dset.schema.metadata` in the loader, and write each
+  model version to its own root.
+- **Inject a read without `columns=`.** Results are identical, but the chunk text is decoded too. Compare
+  `t.nbytes` with and without the projection on a 100,000-chunk table.
+
+### Submission
+- **Code:** `chunk_store.py` plus the unchanged tests.
+- **Test run:** `pytest -q` showing 4 passed, with `pa.__version__`.
+- **Output:** the five demo lines, matching Expected output.
+- **Layout evidence:** a `find` listing of the dataset root showing one `tenant=` directory per tenant.
+- **Evaluation:** an explicit `pa.schema`, a filtered and projected read, float32 vectors with no Python
+  loop, and a model mismatch that raises.
 
 ## Why it exists
 - **Every tool had its own memory layout.** Moving a table from a database client to pandas, then Spark,

@@ -5,7 +5,8 @@ name: Logits
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - model-internals/softmax
@@ -124,6 +125,21 @@ flowchart TD
     Z -.->|"log_softmax"| L["Logprobs, perplexity"]
     G["Tool schema or JSON grammar"] -->|"mask per step"| M
 ```
+
+## Misconceptions
+- **"A logit of 12 means the model is more confident than a logit of 8 on another prompt."** Adding a
+  constant to every logit changes nothing after softmax, so absolute values carry no meaning. Compare
+  logprobs, or differences within one vector.
+- **"A logit bias of +5 adds a fixed amount of probability."** It multiplies the token's odds against
+  every other token by `e^b`, about 148× for +5. The resulting probability depends on the rest of the vector.
+- **"Banning a word means biasing its token id."** A word has variants (leading space, capitals, plurals)
+  and often several pieces, so biasing one id lets it leak. Also, −100 is finite; only a −∞ mask gives
+  exactly zero probability.
+- **"Constrained decoding makes tool calls correct."** It guarantees the call parses against the schema,
+  not that the arguments are right; masking the token the model wanted can produce valid JSON with a wrong
+  value. Measure task accuracy alongside parse failures.
+- **"A high logprob means the step is right."** Instruction-tuned models are often confidently wrong, so
+  raw logprobs are an uncalibrated signal. Set any gating threshold on labelled agent traces.
 
 ## Examples
 ### Reading and editing GPT-2's next-token logits

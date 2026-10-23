@@ -5,7 +5,8 @@ name: Attention mechanism
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 related:
   - model-internals/self-attention
@@ -143,6 +144,22 @@ flowchart TD
     V["Values v1 to vn"] --> W
     W --> O["Output: blend of values"]
 ```
+
+## Misconceptions
+- **"Attention picks the most relevant item."** Softmax gives every unmasked key some weight, so the output
+  is a blend: a query equal to one key still mixes in the others (weights 0.474, 0.174, 0.351 in the first
+  example).
+- **"If it is in the context window, the agent will use it."** A fact buried in a long tool result gets a
+  small share of attention among thousands of tokens; put critical facts in short, structured fields and
+  eval whether they are used.
+- **"Attention weights tell you what the answer was based on."** One head's map is a blend that does not
+  reliably explain a prediction; provenance comes from retrieval ids, explanations from attribution or
+  ablation.
+- **"Dividing by √d_k is a cosmetic normalization."** Unscaled scores have variance d_k (standard
+  deviation 8 at d_k = 64), which saturates the softmax and stalls learning.
+- **"Vector search and attention are unrelated tools."** Top-k dot-product retrieval is the same lookup
+  with the softmax replaced by a hard selection, done outside the model; RAG chains the hard version in
+  front of the soft one.
 
 ## Examples
 ### Attention by hand, then why the scaling matters

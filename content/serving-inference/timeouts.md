@@ -5,7 +5,8 @@ name: Timeouts
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - serving-inference/streaming
@@ -150,7 +151,59 @@ flowchart TD
     D -->|"no"| P["Partial result or clear failure"]
 ```
 
+## Misconceptions
+- **"The SDK default timeout is a sensible bound."** The OpenAI Python client defaults to 10 minutes and
+  two retries, so a hung call can take half an hour to surface; set `timeout` and `max_retries`
+  yourself.
+- **"If every call is inside its timeout, the run is inside its SLO."** Per-call budgets add up across
+  six model calls and three tools. Only one absolute run deadline, passed down as `remaining`, bounds
+  the whole run.
+- **"A longer timeout is the safe choice for slow LLMs."** Long flat timeouts let dead upstreams pin
+  slots and feed the retry spiral. Split the timers: a short first-token and idle timer catches dead
+  calls fast, and the total covers long healthy ones.
+- **"The timeout I configured is the one that fires."** The shortest timer on the path wins, often a
+  60 s proxy or load balancer idle timeout in front of a non-streaming call.
+- **"When my timeout fires, the work stops."** Raising an exception leaves the engine decoding and the
+  provider billing until the connection is closed or the request aborted; every timeout must trigger
+  cancellation.
+- **"Retrying a timeout is like retrying any transient error."** The first attempt may still be running
+  or may have written data, and timeouts usually mean overload. Retry only within the deadline, with an
+  idempotency key, or fall back.
+
 ## Examples
+### One deadline shared by an agent's steps
+Runnable with sleeps standing in for LLM and tool calls: a 1 s budget for four steps. Each step gets at
+most what is left, and the last one is skipped because it could not finish usefully.
+
+```python
+import asyncio, time
+
+class Deadline:
+    def __init__(self, seconds: float):
+        self.at = time.monotonic() + seconds          # absolute, so it survives being passed around
+    def remaining(self) -> float:
+        return self.at - time.monotonic()
+
+async def step(name, duration, deadline, min_useful=0.2):
+    left = deadline.remaining()
+    if left < min_useful:                             # fail fast instead of starting doomed work
+        raise TimeoutError(f"skipped {name}: only {left:.1f}s left")
+    await asyncio.wait_for(asyncio.sleep(duration), timeout=left)   # never longer than what is left
+    return name
+
+async def agent(budget_s=1.0):
+    d, done = Deadline(budget_s), []
+    try:
+        for name, dur in [("plan", 0.3), ("search", 0.2), ("draft", 0.4), ("review", 0.3)]:
+            done.append(await step(name, dur, d))
+    except (TimeoutError, asyncio.TimeoutError) as e:
+        return done, f"partial ({e})"
+    return done, "complete"
+
+print(asyncio.run(agent()))
+# (['plan', 'search', 'draft'], 'partial (skipped review: only 0.1s left)')
+```
+
 ### Layered timeouts around a streaming call
 Layered timeouts around a streaming call with `httpx`: a short connect timeout, a cumulative first-token
 timer, an idle timer that resets on every line (heartbeats included), and a total deadline derived from
@@ -197,39 +250,6 @@ async def stream_completion(client: httpx.AsyncClient, payload: dict, deadline: 
         phase = "first-token" if not text else "idle-or-total"
         raise TimeoutError(f"{phase} timeout after {len(text)} chunks") from e
     return "".join(text)
-```
-
-### One deadline shared by an agent's steps
-Runnable with sleeps standing in for LLM and tool calls: a 1 s budget for four steps. Each step gets at
-most what is left, and the last one is skipped because it could not finish usefully.
-
-```python
-import asyncio, time
-
-class Deadline:
-    def __init__(self, seconds: float):
-        self.at = time.monotonic() + seconds          # absolute, so it survives being passed around
-    def remaining(self) -> float:
-        return self.at - time.monotonic()
-
-async def step(name, duration, deadline, min_useful=0.2):
-    left = deadline.remaining()
-    if left < min_useful:                             # fail fast instead of starting doomed work
-        raise TimeoutError(f"skipped {name}: only {left:.1f}s left")
-    await asyncio.wait_for(asyncio.sleep(duration), timeout=left)   # never longer than what is left
-    return name
-
-async def agent(budget_s=1.0):
-    d, done = Deadline(budget_s), []
-    try:
-        for name, dur in [("plan", 0.3), ("search", 0.2), ("draft", 0.4), ("review", 0.3)]:
-            done.append(await step(name, dur, d))
-    except (TimeoutError, asyncio.TimeoutError) as e:
-        return done, f"partial ({e})"
-    return done, "complete"
-
-print(asyncio.run(agent()))
-# (['plan', 'search', 'draft'], 'partial (skipped review: only 0.1s left)')
 ```
 
 ### Agent scenario: a tool timeout returned to the model

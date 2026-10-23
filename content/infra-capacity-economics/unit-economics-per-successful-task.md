@@ -5,7 +5,8 @@ name: Unit economics per successful task
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - infra-capacity-economics/cost-modeling
@@ -33,6 +34,61 @@ Compare it with task value to know whether the agent makes money.
   k, the step cap, which model each step uses, and when the agent hands off to a human.
 - **What you can skip.** Full product accounting with amortized fixed costs when choosing between agent
   designs; marginal cost per successful task is enough for that comparison.
+
+## Decision case
+### Scenario
+A logistics company's ticket-triage agent runs the small-model design from the first example below: $0.02
+per attempt, 60% success, a $0.005 verifier catching 80% of failures, up to 3 attempts. Human handling is
+$4.00 a ticket and a silent misroute costs $20. All figures are illustrative.
+- **Volume and cost:** 50,000 tickets a month at $2.442 fully loaded, about $122,100 a month.
+- **Latency:** triage within 20 s at p95. One agent attempt takes 7 s; the cheap verifier 1 s, a
+  stronger judge 2 s.
+- **Compliance:** silent misroutes must stay at or below 1% of tickets.
+- **Budget:** model plus verifier spend at most $6,500 a month.
+- **Candidate verifier:** a judge on a larger model at $0.03 per check, which caught 95% of failures on
+  a 400-ticket labelled sample.
+
+### Options
+Computed with `per_task` from the first example; large model is $0.08 per attempt at 90% success.
+
+| Option | Fully loaded per task | Silent misroutes | Worst-case latency | AI spend per month |
+|---|---|---|---|---|
+| Current: small, k=3, cheap verifier | $2.442 | 11.4%: fails | 3 × 8 = 24 s: fails | $1,780 |
+| A. Large, k=1, cheap verifier | $0.805 | 2.0%: fails | 8 s | $4,250 |
+| B. Large, k=2, cheap verifier | $0.549 | 2.2%: fails | 16 s | $4,590 |
+| C. Small, k=3, strong judge | $0.905 | 3.1%: fails | 3 × 9 = 27 s: fails | $3,810 |
+| D. Large, k=2, strong judge | $0.266 | 0.55% | 2 × 9 = 18 s | $6,025 |
+
+### Decision
+Choose **D**: the large model, the stronger judge and at most 2 attempts.
+- **Unit cost:** $0.266 fully loaded per ticket, about $13,300 a month against $122,100 today, and a
+  margin of about $3.73 a ticket against the $4.00 human baseline.
+- **Compliance:** D is the only option under the 1% silent-misroute bar. Detection, not model accuracy,
+  moves that number: B and D share a model, and B's silent rate is four times D's.
+- **Latency and budget:** two attempts of 9 s fit inside 20 s; three do not. AI spend of $6,025 fits the
+  $6,500 cap, with little room.
+- **Why not C:** a better judge on the small model still lets 3.1% through, because the small model fails
+  four times as often, and its 3 attempts break the latency target.
+
+**What would change it:** if the second attempt rarely succeeds (correlated failures), D at k=1 costs
+$0.59 with the same 0.5% silent rate, still the best compliant choice. If the judge's true detection on
+live traffic falls well below 95%, the silent rate rises and the 1% bar must be re-checked.
+
+### Trade-offs accepted
+- **The highest AI spend of any option.** Spend per success rises to about $0.12, triple the current
+  $0.04. Report fully loaded cost next to AI spend so the rise is not read as a regression.
+- **Budget headroom of about 7%.** Volume growth above roughly 8% eats it; alert on monthly AI spend at
+  90% of the cap.
+- **Detection measured on 400 tickets.** Re-estimate d monthly from sampled human review of
+  judge-passed tickets.
+- **Independence assumption.** Track second-attempt success; if it is far below 90%, drop to k=1.
+
+### Review rubric
+- Defines success and the cost of each failure path (escalation, silent error) before comparing options.
+- Computes fully loaded cost per task for every option, not AI spend per success alone.
+- Checks each option against every hard constraint (compliance, latency, budget) and says which it fails.
+- Separates the effect of detection from the effect of model accuracy.
+- States the assumptions (independence, detection rate) and the measurement that would overturn the choice.
 
 ## Why it exists
 - **Dashboards show cost per call because providers bill per token.** That answers the wrong question.

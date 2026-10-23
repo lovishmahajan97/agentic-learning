@@ -5,7 +5,8 @@ name: OpenTelemetry
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - observability/tracing

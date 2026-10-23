@@ -5,7 +5,8 @@ name: Catastrophic forgetting
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/overfitting
@@ -158,7 +159,40 @@ flowchart TD
     RR --> F
 ```
 
+## Misconceptions
+- **"The task metric went up, so the fine-tune is an improvement."** The loss had no term for skills it
+  never showed, so a tone fine-tune can gain 28 points while valid tool calls fall from 94% to 71%. Only
+  a general and agent suite run before and after shows the loss.
+- **"Forgetting needs a big, aggressive fine-tune."** A few thousand benign rows repeated for a few epochs
+  at a healthy rate can erode refusals and tool use; larger models are no reliable protection.
+- **"LoRA cannot forget because the base weights are frozen."** The base is preserved, but behaviour
+  changes wherever the adapter is active; a high-rank adapter trained hard regresses like a full
+  fine-tune. LoRA reduces forgetting and also learns less of the target.
+- **"Forgetting is just overfitting."** Overfitting is a held-out gap on the task; forgetting is losing
+  behaviours absent from the training data. Regularisation does not bring them back; replay gives the
+  loss a term for them.
+- **"Fine-tuning is how you teach the agent new facts."** Facts that change belong in retrieval, which
+  moves no weights and forgets nothing; fine-tune for behaviour and format.
+- **"Chaining each release from the last model is cheaper and equivalent."** Each hop forgets a little of
+  every earlier batch; retrain from base on the union of the data.
+
 ## Examples
+### Worked scenario: the agent that stopped calling tools
+Illustrative numbers. A support agent's model is fine-tuned on 6,000 final-answer examples (no tool
+calls in them) to adopt a house tone, then run against the agent's own held-out evals.
+
+| Eval | Base model | After fine-tune | After replay re-run |
+|---|---|---|---|
+| Tone rubric (task) | 61% | 89% | 86% |
+| Valid tool call when one is needed | 94% | 71% | 92% |
+| End-to-end task success (sandbox) | 78% | 58% | 79% |
+| Refusal of unsafe actions | 0.97 | 0.88 | 0.96 |
+
+- **Reading it.** The task metric rose 28 points while the agent got worse: it now answers from memory
+  instead of calling the order lookup. Only the agent evals saw it.
+- **Fix.** Replay with tool-calling trajectories and safety examples, retrained from base; the re-run
+  keeps most of the tone gain and recovers tool use.
+
 ### Replay mix plus an agent regression gate
 A team fine-tunes the model behind its contracts agent on 5,000 legal-clause extraction examples.
 - **Attempt 1** (full fine-tune, three epochs, task data only) lifts the extraction metric, but the
@@ -198,22 +232,6 @@ gate(before, after)                                 # fails the release if any m
   the suite.
 - **The key design choice:** the suite runs before training too. A drop can only be recognised against
   the base model's own number.
-
-### Worked scenario: the agent that stopped calling tools
-Illustrative numbers. A support agent's model is fine-tuned on 6,000 final-answer examples (no tool
-calls in them) to adopt a house tone, then run against the agent's own held-out evals.
-
-| Eval | Base model | After fine-tune | After replay re-run |
-|---|---|---|---|
-| Tone rubric (task) | 61% | 89% | 86% |
-| Valid tool call when one is needed | 94% | 71% | 92% |
-| End-to-end task success (sandbox) | 78% | 58% | 79% |
-| Refusal of unsafe actions | 0.97 | 0.88 | 0.96 |
-
-- **Reading it.** The task metric rose 28 points while the agent got worse: it now answers from memory
-  instead of calling the order lookup. Only the agent evals saw it.
-- **Fix.** Replay with tool-calling trajectories and safety examples, retrained from base; the re-run
-  keeps most of the tone gain and recovers tool use.
 
 ### Averaging back toward the base
 When a strong task checkpoint has already regressed, interpolate its weights with the base and pick the

@@ -5,7 +5,8 @@ name: NFRs (non-functional requirements)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/trade-off-analysis
@@ -38,6 +39,66 @@ scenario traced to a test, SLO or eval gate.
   per-step budgets.
 - **What you can skip.** Filling in every ISO/IEC 25010 category. Rigour goes on the five to eight NFRs
   that force a structural choice in the agent; the rest stay a checklist.
+
+## Decision case
+### Scenario
+A procurement team wants a contract-review agent: it reads a supplier contract, calls a clause-lookup
+tool and a policy tool, and returns flagged clauses with citations. The FDE has turned "fast, accurate,
+cheap" into NFRs and must pick the agent's model architecture. All figures are illustrative.
+- **Volume and shape:** 2,000 contracts a month, about 12 model calls per run.
+- **NFRs, in the written priority order:**
+  1. Task success at least 0.90 on golden set v2 (300 cases), gated on the 95% interval's lower bound.
+  2. At most $0.50 per successful task.
+  3. Run time within 60 s at p95.
+  4. 99.9% of runs complete without an infrastructure failure.
+- **Constraints:** EU residency through the provider's EU endpoint; a team of 3; pilot acceptance in 6
+  weeks.
+
+### Options
+Measured on golden set v2 in staging (illustrative):
+
+| Option | How it works | Task success, lower bound (n = 300) | Cost per run, per successful task | p95 run time |
+|---|---|---|---|---|
+| A. Large model every step | One large model for all 12 calls | 0.94, 0.913: passes | $0.60, $0.64: fails | 75 s: fails |
+| B. Small model every step | One small model for all 12 calls | 0.80, 0.755: fails | $0.12, $0.15: passes | 30 s: passes |
+| C. Router | Small model for tool-selection steps, large model for clause judgement and the final answer | 0.93, 0.901: passes | $0.30, $0.32: passes | 50 s: passes |
+
+Availability is the same problem for all three: 0.999¹² ≈ 98.8% of runs survive without retries,
+below the 99.9% NFR, while one retry per call gives about 99.999%.
+
+### Decision
+Choose **C, the router**, with per-call retries in every option, because:
+- **It is the only option that meets the top three NFRs:** A fails cost and latency, B fails the
+  quality gate by a wide margin.
+- **The written priority settles ties:** if routing had cost quality, quality would win and the cost
+  ceiling would be renegotiated with its price attached, not quietly missed.
+- **The availability NFR forces structure, not a model choice:** idempotent tools and one retry per call
+  through the gateway turn 98.8% into about 99.999%.
+- **Margin is thin on quality:** 0.901 clears 0.90 by a hair, so the release gate becomes a paired
+  comparison against the current release, and the golden set grows before launch.
+
+**What would change it:** if the business moved latency to the top (an interactive review in a
+meeting), C's 50 s would need streaming partial results or a smaller judgement model. If the large
+model's price fell by half, A would cost about $0.32 per successful task but still miss the 60 s
+target.
+
+### Trade-offs accepted
+- **Two models to evaluate and pin.** Watch: task success per model version on every release, and
+  misrouted steps (hard clauses sent to the small model) from traces.
+- **Quality margin of about one point.** Watch: the paired gate's result on each release, and its
+  flakiness across reruns of one build.
+- **Retries add latency and cost.** Watch: retry rate per step and its effect on p95 run time and cost
+  per successful task.
+- **The step cap bounds hard contracts.** Watch: share of runs hitting the 12-call cap.
+
+### Review rubric
+- **Every NFR has metric, target, method, condition and enforcement point**, with the priority order
+  written down.
+- **Options are scored on measured numbers**, and cost is per successful task, not per call or per run.
+- **Statistical gates show their uncertainty:** the lower bound or a paired test, with the sample size.
+- **Availability is multiplied per step** and turned into a structural fix.
+- **The decision names which NFR decided it**, and what change in priority or price would flip it.
+- **Each accepted trade-off names a metric** someone can watch.
 
 ## Why it exists
 - **Features do not determine architecture; quality attributes do.** Two agents with the same tool list

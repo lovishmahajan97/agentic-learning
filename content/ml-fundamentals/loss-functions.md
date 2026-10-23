@@ -5,7 +5,8 @@ name: Loss functions (cross-entropy, contrastive)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/classification
@@ -166,7 +167,53 @@ flowchart TD
     G --> U["Optimizer step"]
 ```
 
+## Misconceptions
+- **"A falling loss means the agent is getting better."** The loss is a surrogate. Without an
+  assistant-only mask, 5,800 of 6,000 tokens in a trajectory are inputs, so the loss collapses while
+  tool-call accuracy stays flat. Track the task metric next to the loss.
+- **"Squared error on probabilities is fine for classes."** Through a sigmoid its gradient carries a
+  p(1 − p) factor: at p = 0.01 for the true class it is about −0.0098 against −0.99 for cross-entropy, so
+  it stalls exactly when the model is confidently wrong.
+- **"Contrastive learning is a different kind of objective from classification."** InfoNCE is
+  cross-entropy over a softmax of similarities divided by τ, where the correct class is the positive
+  you constructed. That free label is why it is self-supervised.
+- **"Softmax in the model plus `F.cross_entropy` is the same as passing logits."** The fused op applies
+  log-softmax itself, so probabilities get softmaxed twice and the loss floors well above zero. Pass
+  logits.
+- **"A lower loss beats a higher loss, whatever the model."** Per-token cross-entropy depends on the
+  tokeniser: 2.0 versus 1.8 nats per token can reverse once normalised per byte. Compare bits per byte on
+  the same text.
+
 ## Examples
+### Cross-entropy gradient and InfoNCE in one script
+Two things in one script: cross-entropy's gradient really is prediction minus target, and InfoNCE really
+is cross-entropy over a similarity matrix, as used to tune a RAG retriever.
+
+```python
+import torch, torch.nn.functional as F
+
+# 1) Cross-entropy on logits and its gradient (softmax(z) - onehot(y))
+z = torch.tensor([[2.0, 0.5, -1.0]], requires_grad=True)   # one example, three classes
+y = torch.tensor([0])
+loss = F.cross_entropy(z, y)                               # takes logits; applies log-softmax inside
+loss.backward()
+print(round(loss.item(), 4))                               # 0.2413  (softmax = [0.786, 0.175, 0.039])
+print(z.grad)                                              # [[-0.2144, 0.1753, 0.0391]]
+print(z.softmax(-1).detach() - F.one_hot(y, 3))            # identical: the gradient is the error
+
+# 2) InfoNCE, CLIP-style symmetric version, over a batch of (anchor, positive) embeddings
+def info_nce(a, b, tau=0.07):
+    a, b = F.normalize(a, dim=-1), F.normalize(b, dim=-1)  # cosine similarity
+    sim = a @ b.T / tau                                    # [N, N]; sim[i, i] is the true pair
+    target = torch.arange(a.size(0))                       # "row i's correct class is column i"
+    return (F.cross_entropy(sim, target) + F.cross_entropy(sim.T, target)) / 2
+
+N, d = 256, 64
+q = torch.randn(N, d); pos = q + 0.3 * torch.randn(N, d)   # positives: noisy copies of the anchors
+print(round(info_nce(q, pos).item(), 3))                   # near 0: each anchor finds its own positive
+print(round(info_nce(q, torch.randn(N, d)).item(), 3))     # ~7 here, above log(256) ≈ 5.5: no better than chance
+```
+
 ### Masking an agent trajectory for SFT
 Only assistant tokens (reasoning, tool calls, final answer) are supervised; system prompt, user turn and
 tool results get the label `-100`, PyTorch's default `ignore_index`.
@@ -210,35 +257,6 @@ A team fine-tunes on 2,000 trajectories shaped like the one above. Numbers are i
   write, and the repeated system prompt is trivially easy to predict.
 - **Log supervised tokens per batch** next to the loss; a sudden jump to the full sequence length means the
   mask broke.
-
-### Cross-entropy gradient and InfoNCE in one script
-Two things in one script: cross-entropy's gradient really is prediction minus target, and InfoNCE really
-is cross-entropy over a similarity matrix, as used to tune a RAG retriever.
-
-```python
-import torch, torch.nn.functional as F
-
-# 1) Cross-entropy on logits and its gradient (softmax(z) - onehot(y))
-z = torch.tensor([[2.0, 0.5, -1.0]], requires_grad=True)   # one example, three classes
-y = torch.tensor([0])
-loss = F.cross_entropy(z, y)                               # takes logits; applies log-softmax inside
-loss.backward()
-print(round(loss.item(), 4))                               # 0.2413  (softmax = [0.786, 0.175, 0.039])
-print(z.grad)                                              # [[-0.2144, 0.1753, 0.0391]]
-print(z.softmax(-1).detach() - F.one_hot(y, 3))            # identical: the gradient is the error
-
-# 2) InfoNCE, CLIP-style symmetric version, over a batch of (anchor, positive) embeddings
-def info_nce(a, b, tau=0.07):
-    a, b = F.normalize(a, dim=-1), F.normalize(b, dim=-1)  # cosine similarity
-    sim = a @ b.T / tau                                    # [N, N]; sim[i, i] is the true pair
-    target = torch.arange(a.size(0))                       # "row i's correct class is column i"
-    return (F.cross_entropy(sim, target) + F.cross_entropy(sim.T, target)) / 2
-
-N, d = 256, 64
-q = torch.randn(N, d); pos = q + 0.3 * torch.randn(N, d)   # positives: noisy copies of the anchors
-print(round(info_nce(q, pos).item(), 3))                   # near 0: each anchor finds its own positive
-print(round(info_nce(q, torch.randn(N, d)).item(), 3))     # ~7 here, above log(256) ≈ 5.5: no better than chance
-```
 
 ### Worked numbers: why squared error stalls when confidently wrong
 Logit gradient for a true label y = 1 as the predicted probability falls (pure Python below reproduces it).

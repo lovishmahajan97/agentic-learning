@@ -5,8 +5,9 @@ name: Tooling (Unsloth, Axolotl, TRL)
 kind: tool
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
 agent_relevance: useful
+lesson_type: lab
 related:
   - training-adaptation/peft
   - training-adaptation/supervised-fine-tuning
@@ -42,6 +43,215 @@ single-GPU LoRA. These train models; LangChain and LangGraph run agents.
   held-out agent eval.
 - **What you can skip.** Writing a training loop, Triton kernels and GRPO internals, unless you are doing
   RL on agent rewards. Managed fine-tuning APIs hide this layer entirely.
+
+## Lab
+### Task
+Fix the two silent bugs these tools exist to prevent: loss over context tokens and packing that glues
+agent traces together. You turn tool-calling trajectories into training rows by hand, with a toy ChatML
+tokenizer, so the lab needs no GPU, no model download and no TRL install.
+
+The agent goal: a tuned model that learns to emit tool calls, answer and stop, never to imitate users
+or tool results.
+
+Time box: 45-75 minutes. Prerequisites: this lesson's Examples (the render check and the pre-flight
+label check), plus the PEFT and Supervised fine-tuning lessons. The code marks four TASKs:
+- **TASK 1:** labels of -100 for system, user and tool turns and every turn header; assistant bodies and
+  their closing `<|im_end|>` keep their ids.
+- **TASK 2:** `position_ids` restart at 0 for each packed row.
+- **TASK 3:** a row is never split across two packs.
+- **TASK 4:** rows longer than `max_len` are dropped and counted, never truncated.
+
+### Starter code
+Save as `lab_sft_rows.py`. It runs as given and shows the bugs: row 0 trains on 50 of 50 tokens and the
+packs are cut at fixed 110-token boundaries. Checked with Python 3.12 (standard library only; pytest
+9.1 for the tests).
+
+```python
+import json, re
+
+# ---- a toy ChatML tokenizer, so the lab needs no model download or GPU ----
+class ToyTokenizer:
+    """One id per whitespace-separated piece; ChatML and tool-call markers and newlines are own tokens."""
+    PIECE = re.compile(r"<\|im_start\|>|<\|im_end\|>|</?tool_call>|\n|[^\s<]+|<")
+    def __init__(self):
+        self.vocab, self.inv = {}, []
+    def encode(self, text: str) -> list:
+        ids = []
+        for p in self.PIECE.findall(text):
+            if p not in self.vocab:
+                self.vocab[p] = len(self.inv); self.inv.append(p)
+            ids.append(self.vocab[p])
+        return ids
+    def decode(self, ids) -> str:
+        return " ".join(self.inv[i] for i in ids).replace(" \n ", "\n")
+
+def turn_text(m: dict) -> str:
+    """The body of one turn; an assistant tool call is wrapped in <tool_call> tags, Qwen-style."""
+    if m["role"] == "assistant" and m.get("tool_calls"):
+        return " ".join("<tool_call> " + json.dumps(c["function"]) + " </tool_call>"
+                        for c in m["tool_calls"])
+    return m["content"]
+
+def render(messages: list) -> str:
+    """ChatML: <|im_start|>{role}\\n{content}<|im_end|>\\n for every turn."""
+    return "".join(f"<|im_start|>{m['role']}\n{turn_text(m)}<|im_end|>\n" for m in messages)
+
+def render_with_labels(tok: ToyTokenizer, messages: list):
+    """Return (input_ids, labels) for one trajectory.
+
+    TASK 1: this version trains on EVERY token. Labels must be -100 for system, user and tool
+    turns and for each turn's '<|im_start|>role\\n' header. Only an assistant turn's body and
+    its closing <|im_end|> keep their ids, so the model learns to emit tool calls, answer, and stop.
+    Hint: tokenise turn by turn, so you know which span each token came from.
+    """
+    ids = tok.encode(render(messages))
+    return ids, list(ids)
+
+def pack(rows: list, max_len: int):
+    """Greedily pack (ids, labels) rows, in order, into sequences of at most max_len tokens.
+
+    Returns (packs, dropped): packs are dicts with input_ids, labels and position_ids.
+    TASK 2: position_ids must restart at 0 for each row, so a padding-free attention path
+            keeps rows from attending to their neighbours.
+    TASK 3: a row is never split across two packs: start a new pack when it does not fit.
+    TASK 4: a row longer than max_len is dropped and counted, never truncated (a cut trace
+            teaches an agent that never answers).
+    """
+    flat_ids, flat_labels = [], []
+    for ids, labels in rows:
+        flat_ids += ids; flat_labels += labels
+    packs = []
+    for i in range(0, len(flat_ids), max_len):
+        chunk = flat_ids[i:i + max_len]
+        packs.append({"input_ids": chunk, "labels": flat_labels[i:i + max_len],
+                      "position_ids": list(range(i, i + len(chunk)))})
+    return packs, 0
+
+TOOLS_PROMPT = "You are a support agent. Tools: lookup_order(order_id), refund(order_id)."
+def trace(order: str, status: str, answer: str) -> list:
+    return [
+        {"role": "system", "content": TOOLS_PROMPT},
+        {"role": "user", "content": f"Where is order {order}?"},
+        {"role": "assistant", "content": "", "tool_calls": [{"type": "function", "function": {
+            "name": "lookup_order", "arguments": {"order_id": order}}}]},
+        {"role": "tool", "content": json.dumps({"status": status})},
+        {"role": "assistant", "content": answer},
+    ]
+
+TRACES = [
+    trace("8812", "shipped", "Order 8812 has shipped."),
+    trace("9907", "delayed", "Order 9907 is delayed, sorry. I can refund it if you prefer."),
+    trace("4410", "lost", "Order 4410 was lost in transit. " + "Here is what happens next. " * 12),
+]
+
+if __name__ == "__main__":
+    tok = ToyTokenizer()
+    rows = [render_with_labels(tok, t) for t in TRACES]
+    ids, labels = rows[0]
+    kept = [i for i, l in zip(ids, labels) if l != -100]
+    print(f"row 0: {len(ids)} tokens, {len(kept)} carry loss ({len(kept) / len(ids):.0%})")
+    print("TRAINED ON:", tok.decode(kept).replace("\n", " "))
+    packs, dropped = pack(rows, max_len=110)
+    print(f"packs {len(packs)}, dropped {dropped}, lengths {[len(p['input_ids']) for p in packs]}")
+    print("pack 0 row starts at positions:", [j for j, p in enumerate(packs[0]["position_ids"]) if p == 0])
+```
+
+### Expected output
+`python lab_sft_rows.py` with all four TASKs done. The three traces render to 50, 58 and 112 tokens, so
+the first two share one 108-token pack and the third is dropped.
+
+```
+row 0: 50 tokens, 13 carry loss (26%)
+TRAINED ON: <tool_call> {"name": "lookup_order", "arguments": {"order_id": "8812"}} </tool_call> <|im_end|> Order 8812 has shipped. <|im_end|>
+packs 1, dropped 1, lengths [108]
+pack 0 row starts at positions: [0, 50]
+```
+
+### Tests
+Save as `test_lab_sft_rows.py` next to the starter and run `pytest -q`. On the starter five fail, each
+for its bug: user text in the loss, five trained `<|im_end|>` instead of two, one position start
+instead of two, a row split across packs, and nothing dropped.
+
+The first test is a guard that the
+training ids still match the serving render, so it passes before and after.
+
+```python
+import lab_sft_rows as lab
+
+def rows_and_tok():
+    tok = lab.ToyTokenizer()
+    return tok, [lab.render_with_labels(tok, t) for t in lab.TRACES]
+
+def trained_text(tok, ids, labels):
+    return tok.decode([i for i, l in zip(ids, labels) if l != -100])
+
+def test_ids_match_the_serving_render():
+    tok, rows = rows_and_tok()
+    for t, (ids, labels) in zip(lab.TRACES, rows):
+        assert ids == tok.encode(lab.render(t)), "training ids differ from what serving renders"
+        assert len(labels) == len(ids)
+
+def test_only_assistant_turns_carry_loss():
+    tok, rows = rows_and_tok()
+    text = trained_text(tok, *rows[0])
+    assert '"order_id": "8812"}}' in text and "Order 8812 has shipped." in text
+    for context in ("Where is order", "support agent", '"status":', "user", "system"):
+        assert context not in text, f"context token trained on: {context!r}"
+
+def test_each_assistant_turn_learns_to_stop():
+    tok, rows = rows_and_tok()
+    ids, labels = rows[0]
+    end = tok.vocab["<|im_end|>"]
+    trained_ends = sum(1 for i, l in zip(ids, labels) if i == end and l != -100)
+    assert trained_ends == 2, f"expected 2 trained <|im_end|> (one per assistant turn), got {trained_ends}"
+
+def test_pack_keeps_rows_whole_and_restarts_positions():
+    tok, rows = rows_and_tok()
+    packs, dropped = lab.pack(rows[:2], max_len=110)
+    assert dropped == 0 and len(packs) == 1
+    p = packs[0]
+    assert p["input_ids"] == rows[0][0] + rows[1][0]
+    starts = [j for j, pos in enumerate(p["position_ids"]) if pos == 0]
+    assert starts == [0, len(rows[0][0])], f"rows would attend to each other: starts {starts}"
+
+def test_pack_never_splits_a_row():
+    tok, rows = rows_and_tok()
+    packs, _ = lab.pack(rows[:2], max_len=60)
+    assert [p["input_ids"] for p in packs] == [rows[0][0], rows[1][0]]
+
+def test_overlong_rows_are_dropped_not_truncated():
+    tok, rows = rows_and_tok()
+    packs, dropped = lab.pack(rows, max_len=110)
+    assert dropped == 1
+    assert all(len(p["input_ids"]) <= 110 for p in packs)
+    assert "Here is what happens next." not in " ".join(tok.decode(p["input_ids"]) for p in packs)
+```
+
+### Failure scenarios
+- **Mask the tool result as trained.** The trained share of row 0 jumps from 26% and the decoded loss
+  text contains `{"status": "shipped"}`; a real model then learns to invent tool outputs. Debug by
+  printing TRAINED ON for one row, the same move as this lesson's pre-flight label check.
+- **Leave the closing `<|im_end|>` at -100.** Tests pass the "no context" check but fail the stop
+  check; in serving, the tuned agent rambles past its answer. Debug by counting trained end tokens
+  per assistant turn.
+- **Build ids from turn bodies only, skipping the headers or the newline between turns.** Ids drift
+  from `tok.encode(render(...))` and the guard test fails, which in a real stack is a training/serving
+  template mismatch. Debug by diffing the two id lists at the first mismatch.
+- **Drop the position restart.** Packs look right by length, but `position_ids` show one start; with
+  a padding-free attention path the second trace attends to the first. Debug by printing the indices
+  where the position is 0.
+
+### Submission
+- **Your `lab_sft_rows.py`** with the four TASKs done and no other changes to the toy tokenizer or
+  traces.
+- **A `pytest -q` run** showing 6 passed, and the starter run showing 5 failed.
+- **The script's output,** matching Expected output line for line.
+- **A short note (5-8 lines)** mapping each TASK to the TRL or Axolotl setting that does it for you
+  (`assistant_only_loss`, `packing`, `max_length`, sample packing), and one way the real setting can
+  still fail (for example a template without `{% generation %}` markers, or a length limit that
+  truncates long traces where TASK 4 drops them).
+- **Evaluated on:** all tests green, the 26% trained share, and a note that names the failure each
+  setting prevents rather than restating the setting.
 
 ## Why it exists
 - **The hard part was never the loop.** Before these tools every fine-tune was a bespoke script, and the

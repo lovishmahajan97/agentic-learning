@@ -5,7 +5,8 @@ name: scikit-learn basics
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - ml-fundamentals/train-test-leakage
@@ -39,6 +40,158 @@ scores inside agent evals. Often good enough that no LLM call is needed.
   version of the artifact you ship.
 - **What you can skip.** Most of the algorithm zoo. Pipelines, logistic regression, splitters, metrics
   and `DummyClassifier` cover the agent use cases.
+
+## Lab
+### Task
+Build the intent router that sits in front of a tool-calling agent: a TF-IDF plus logistic regression
+pipeline, grouped evaluation so one customer never sits on both sides of a split, a score against a
+majority baseline, and a confidence threshold that sends uncertain requests to the full agent loop.
+
+The data is 18 inline requests, so no embedding API is needed. Time box: 60 minutes.
+- **Prerequisites:** this lesson's How it works (pipelines, honest evaluation), plus numpy and pandas.
+- **The shipped splitter leaks:** it uses shuffled `KFold`, which ignores customers.
+
+### Starter code
+```python
+# router.py  (checked with scikit-learn 1.6.1, numpy 2.0.2, Python 3.9+)
+import numpy as np
+from sklearn.dummy import DummyClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score
+from sklearn.model_selection import GroupKFold, KFold
+from sklearn.pipeline import Pipeline
+
+INTENTS = {
+    "billing": ["charged twice on my card", "refund the extra charge", "invoice shows the wrong amount",
+                "billing charge is too high", "cancel the duplicate charge", "need a refund for this charge"],
+    "order_status": ["where is my order", "my order has not arrived", "track my order shipment",
+                     "when will my order ship", "order delivery is late", "shipment status of my order"],
+    "faq": ["what are your opening hours", "do you ship internationally", "what is the return policy",
+            "how do I reset my password", "opening hours on sunday", "return policy for sale items"],
+}
+TEXTS = [t for ts in INTENTS.values() for t in ts]
+LABELS = [k for k, ts in INTENTS.items() for _ in ts]
+CUSTOMERS = [i % 6 for i in range(len(TEXTS))]          # each customer sent one request per intent
+
+
+def build_router() -> Pipeline:
+    # FILL IN 1: Pipeline with steps named "tfidf" (TfidfVectorizer, sublinear_tf=True) and
+    # "clf" (LogisticRegression, C=10, max_iter=1000), so the vocabulary is refit inside every fold.
+    raise NotImplementedError
+
+
+def grouped_splits(groups, n_splits=3):
+    """BUGGY (FILL IN 2): one customer's requests land on both sides of a split.
+    Return [(train_idx, test_idx), ...] with no group on both sides."""
+    X = np.zeros((len(groups), 1))
+    return list(KFold(n_splits, shuffle=True, random_state=0).split(X))
+
+
+def evaluate(texts, labels, groups) -> dict:
+    """Macro-F1 averaged over grouped folds for the router and a most-frequent baseline, rounded to 2."""
+    texts, labels = np.asarray(texts, dtype=object), np.asarray(labels)
+    scores = {"model": [], "baseline": []}
+    for tr, te in grouped_splits(groups):
+        for name, est in (("model", build_router()), ("baseline", DummyClassifier())):
+            est.fit(texts[tr], labels[tr])
+            scores[name].append(f1_score(labels[te], est.predict(texts[te]), average="macro"))
+    return {k: round(float(np.mean(v)), 2) for k, v in scores.items()}
+
+
+def route(router: Pipeline, text: str, threshold: float) -> str:
+    # FILL IN 3: the predicted intent when its probability >= threshold, else "agent"
+    # (the full tool-calling loop). Return a plain str.
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    splits = grouped_splits(CUSTOMERS)
+    leak = any(set(np.take(CUSTOMERS, tr)) & set(np.take(CUSTOMERS, te)) for tr, te in splits)
+    print("customer on both sides:", leak)
+    print("macro-F1:", evaluate(TEXTS, LABELS, CUSTOMERS))
+    router = build_router().fit(TEXTS, LABELS)
+    for text in ["refund this duplicate charge", "where is my order", "is my refund shipped"]:
+        print(f"{text!r} -> {route(router, text, threshold=0.75)}")
+```
+Run as given, it prints `customer on both sides: True`, then raises `NotImplementedError`.
+
+### Expected output
+```text
+customer on both sides: False
+macro-F1: {'model': 0.88, 'baseline': 0.17}
+'refund this duplicate charge' -> billing
+'where is my order' -> order_status
+'is my refund shipped' -> agent
+```
+The baseline is exact: each test fold holds 2 requests per intent, the dummy always predicts `billing`
+(the first of three tied classes), so `billing` F1 is 2 × (1/3 × 1) / (1/3 + 1) = 0.5 and macro-F1 is
+0.5 / 3 ≈ 0.17.
+
+The model's 0.88 can move slightly across scikit-learn versions; the tests do not pin it.
+
+### Tests
+```python
+# test_router.py  (run: pytest -q)
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+
+from router import CUSTOMERS, LABELS, TEXTS, build_router, evaluate, grouped_splits, route
+
+
+def test_pipeline_steps():
+    pipe = build_router()
+    assert [n for n, _ in pipe.steps] == ["tfidf", "clf"]
+    assert isinstance(pipe.named_steps["tfidf"], TfidfVectorizer)
+    assert isinstance(pipe.named_steps["clf"], LogisticRegression)
+
+
+def test_grouped_splits_never_share_a_customer():
+    rng = np.random.default_rng(1)
+    for groups in (CUSTOMERS, list(rng.integers(0, 9, size=40))):
+        splits = grouped_splits(groups)
+        tested = np.sort(np.concatenate([te for _, te in splits]))
+        assert tested.tolist() == list(range(len(groups)))         # every request tested once
+        for tr, te in splits:
+            assert not set(np.take(groups, tr)) & set(np.take(groups, te))
+
+
+def test_router_beats_majority_baseline():
+    res = evaluate(TEXTS, LABELS, CUSTOMERS)
+    assert res["baseline"] == 0.17                                  # always "billing": 0.5 / 3
+    assert res["model"] >= res["baseline"] + 0.5
+
+
+def test_route_confident_and_fallback():
+    router = build_router().fit(TEXTS, LABELS)
+    out = route(router, "refund this duplicate charge", threshold=0.75)
+    assert out == "billing" and type(out) is str                   # not np.str_, safe for JSON
+    assert route(router, "is my refund shipped", threshold=0.75) == "agent"
+    assert route(router, "is my refund shipped", threshold=0.0) in {"billing", "order_status"}
+```
+On the starter all 4 fail: the splitter test on a shared customer, the rest with `NotImplementedError`.
+
+### Failure scenarios
+- **Inject `TfidfVectorizer().fit(TEXTS)` once, outside the pipeline.** Every fold's features now carry
+  vocabulary and document frequencies from its test rows. Scores here barely move, but on near-duplicate
+  tickets they inflate. Keep the vectorizer inside `Pipeline` and grep for any `fit` on the full data.
+- **Inject the shuffled `KFold` back.** The same customer's phrasing trains and tests the model, which
+  overstates production accuracy when customers repeat themselves. The splitter test names the overlap.
+- **Inject an out-of-domain request, `"my landlord is angry"`, at `threshold=0.6`.** It routes to
+  `order_status` with probability 0.68, because only `my` and `is` are known words. Probability is not
+  out-of-domain detection; log routed confidence and review low-margin cases.
+- **Inject returning `router.classes_[...]` unconverted.** The value is `np.str_`, which works until a
+  strict type check or schema in the agent graph compares types. Convert with `str()` at the boundary.
+
+### Submission
+- **Code:** `router.py` plus the unchanged tests.
+- **Test run:** `pytest -q` showing 4 passed, with `sklearn.__version__`.
+- **Output:** the five demo lines, with your macro-F1 values.
+- **Threshold note:** for thresholds 0.5, 0.75 and 0.9, how many of the 18 training texts would reach the
+  agent, and what that trade costs per this lesson's router-savings scenario.
+- **Evaluation:** a single pipeline object, grouped splits, a dummy baseline reported next to the model,
+  and a fallback to the agent below the threshold.
 
 ## Why it exists
 - **The same chores in every project.** Scale features, encode categories, vectorize text, fit a model,

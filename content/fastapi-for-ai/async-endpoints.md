@@ -5,7 +5,8 @@ name: Async endpoints
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/async-await
@@ -39,6 +40,148 @@ freezes them all.
   leaves.
 - **What you can skip.** Event-loop internals. Know the two execution paths, what blocks, and the
   Little's-law ceiling per process; that covers almost every agent latency cliff.
+
+## Lab
+### Task
+Fix the tool executor that an `async def /agent/step` endpoint awaits when the model returns several
+tool calls in one turn. The starter is correct but slow and dangerous: it runs tools one after another,
+calls a sync-only tool on the event loop, and lets a hung tool stall the run.
+
+Time box: 45 minutes. Prerequisites: asyncio basics (`gather`, `wait_for`, `to_thread`) and this
+lesson's How it works. The code marks three tasks:
+- **Task 1:** run the turn's tool calls concurrently, results in call order.
+- **Task 2:** offload the sync tool so the loop stays free for every other run and health check.
+- **Task 3:** give each tool a timeout and turn any failure into a tool observation.
+
+### Starter code
+Save as `lab_async.py`. Pure asyncio with fake tools (sleeps stand in for HTTP, vector search and a
+sync file library), so it needs no network. Checked with Python 3.13; pytest 9.1 for the tests.
+
+```python
+import asyncio, time
+
+async def web_search(q: str) -> str:
+    await asyncio.sleep(0.2)                      # async HTTP tool
+    return f"results for {q}"
+
+async def vector_lookup(q: str) -> str:
+    await asyncio.sleep(0.3)                      # async vector database client
+    return f"chunks for {q}"
+
+def read_file_sync(path: str) -> str:
+    time.sleep(0.15)                              # sync-only library: holds its thread
+    return f"contents of {path}"
+
+async def flaky_api(q: str) -> str:
+    await asyncio.sleep(2)                        # a tool that hangs
+    return "too late"
+
+TOOL_TIMEOUT_S = 0.5
+
+async def run_tool(call: dict) -> dict:
+    name, arg = call["name"], call["arg"]
+    # TASK 2: read_file_sync blocks the event loop; offload it with asyncio.to_thread.
+    # TASK 3: bound every tool with asyncio.wait_for(..., TOOL_TIMEOUT_S) and turn any exception
+    #         into the observation "error: <ExceptionClassName>" instead of crashing the step.
+    if name == "read_file":
+        out = read_file_sync(arg)
+    elif name == "web_search":
+        out = await web_search(arg)
+    elif name == "vector_lookup":
+        out = await vector_lookup(arg)
+    elif name == "flaky_api":
+        out = await flaky_api(arg)
+    else:
+        out = f"unknown tool {name}"
+    return {"tool_call_id": call["id"], "content": out}
+
+async def execute_tool_calls(calls: list[dict]) -> list[dict]:
+    # TASK 1: the model asked for these in ONE turn; run them concurrently, results in call order.
+    return [await run_tool(c) for c in calls]
+
+async def lag_probe(samples: list, interval: float = 0.01):
+    while True:                                   # how late does a 10 ms timer fire?
+        t0 = time.perf_counter()
+        await asyncio.sleep(interval)
+        samples.append(time.perf_counter() - t0 - interval)
+
+async def measure(calls: list[dict]):
+    samples: list = []
+    probe = asyncio.create_task(lag_probe(samples))
+    await asyncio.sleep(0)                        # let the probe start
+    t0 = time.perf_counter()
+    results = await execute_tool_calls(calls)
+    elapsed = time.perf_counter() - t0
+    await asyncio.sleep(0.03)                     # let the probe record a late timer
+    probe.cancel()
+    return results, elapsed, max(samples, default=0.0)
+
+TURN = [{"id": "c1", "name": "web_search", "arg": "refund policy"},
+        {"id": "c2", "name": "vector_lookup", "arg": "refund policy"},
+        {"id": "c3", "name": "read_file", "arg": "policy.md"}]
+
+if __name__ == "__main__":
+    results, elapsed, lag = asyncio.run(measure(TURN))
+    print([r["tool_call_id"] for r in results])
+    print("turn under 0.4 s:", elapsed < 0.4, "| worst loop lag under 80 ms:", lag < 0.08)
+    hung, elapsed, _ = asyncio.run(measure([{"id": "c4", "name": "flaky_api", "arg": "x"}]))
+    print(hung[0]["content"], "| step freed under 1 s:", elapsed < 1)
+```
+
+### Expected output
+`python lab_async.py` after all three tasks. The turn takes about 0.3 s (the slowest tool) instead of
+0.65 s (the sum); the starter prints `False` on every check and `too late` after 2 s.
+
+```
+['c1', 'c2', 'c3']
+turn under 0.4 s: True | worst loop lag under 80 ms: True
+error: TimeoutError | step freed under 1 s: True
+```
+
+### Tests
+Save as `test_lab_async.py` and run `pytest -q`. On the starter all three fail on assertions: about
+0.65 s for the turn, about 150 ms of loop lag, and the hung tool's `too late` after 2 s. Each test maps
+to one task, so a partial fix shows which task is still open.
+
+```python
+import asyncio
+import lab_async as lab
+
+def test_parallel_tool_calls_take_the_slowest_not_the_sum():
+    results, elapsed, _ = asyncio.run(lab.measure(lab.TURN))
+    assert [r["tool_call_id"] for r in results] == ["c1", "c2", "c3"]
+    assert results[2]["content"] == "contents of policy.md"
+    assert elapsed < 0.4, f"{elapsed:.2f}s: tools ran one after another (0.2 + 0.3 + 0.15 = 0.65 s)"
+
+def test_sync_tool_does_not_freeze_the_loop():
+    _, _, lag = asyncio.run(lab.measure(lab.TURN))
+    assert lag < 0.08, f"loop blocked for {lag * 1000:.0f} ms: every other run and health check waited"
+
+def test_hung_tool_becomes_an_observation_not_a_hang():
+    results, elapsed, _ = asyncio.run(lab.measure([{"id": "c4", "name": "flaky_api", "arg": "x"}]))
+    assert results == [{"tool_call_id": "c4", "content": "error: TimeoutError"}]
+    assert elapsed < 1
+```
+
+### Failure scenarios
+- **Gather without offloading.** Do Task 1 only. Observe: the turn test passes (about 0.3 s) but the lag
+  test reports about 150 ms, the length of the sync call. Debug: the lag probe is the tell; find the
+  call that never awaits and wrap it in `asyncio.to_thread`.
+- **Timeout the thread, not the step.** Wrap `read_file_sync` in `wait_for` with a 0.05 s timeout.
+  Observe: the step gets `error: TimeoutError` quickly, but the thread keeps running to completion and
+  holds one of the pool's threads. Debug: log inside the sync function; a blocked thread cannot be
+  cancelled from outside.
+- **Let one exception escape `gather`.** Skip the `try/except` in Task 3. Observe: the whole turn
+  raises `TimeoutError` and the other tools' results are lost. Debug: catch per tool, or use
+  `return_exceptions=True` and map exceptions to observations.
+
+### Submission
+- **Code:** `lab_async.py` with the three tasks done.
+- **Test run:** `pytest -q` showing 3 passed, run three times in a row (timing tests must be stable).
+- **Trace:** the demo output, matching Expected output.
+- **Short note (5-8 lines):** the measured turn latency and loop lag before and after, and what a 150 ms
+  stall means for 40 concurrent agent runs in one worker.
+- **Evaluation:** tests pass, no sync call runs on the loop, and every tool has its own timeout.
 
 ## Why it exists
 - **AI endpoints mostly wait.** A hosted chat completion takes anywhere from two to sixty seconds; the

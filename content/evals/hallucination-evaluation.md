@@ -5,7 +5,8 @@ name: Hallucination evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -160,6 +161,24 @@ flowchart TD
     R1 --> RP["Per-slice report: 4 numbers"]
     M --> RP
 ```
+
+## Misconceptions
+- **"A good groundedness score means the agent tells the truth."** Context-grounded checks measure
+  support by the trace, not truth in the world. A true fact absent from the tool results still counts as
+  unsupported, and a stale KB passage makes a false claim look supported.
+- **"High claim precision means few users see wrong answers."** Precision is per claim, exposure is per
+  response. At 98% precision and about 10 claims per answer, roughly 18% of answers can contain an error,
+  so report the response-level rate next to it.
+- **"An LLM judge can verify action claims like 'I issued the refund'."** A judge reading text can only
+  guess. Whether a call succeeded is a fact in the tool-call log, so action claims are checked
+  deterministically against successful calls, on all traffic.
+- **"Lower hallucination rate is always better."** The cheapest way to zero is refusing to answer.
+  Fabrication on unanswerable items only means something next to false abstention on answerable ones.
+- **"Self-consistency across samples catches hallucinations."** It catches confabulation that varies
+  between samples. A false belief the model holds firmly is reproduced every time and passes.
+- **"Any model can be the verifier, including the generator."** Models sharing training data share false
+  beliefs and approve each other's fabrications. Use another family and measure its kappa against human
+  claim labels first.
 
 ## Examples
 ### Agent scenario: grounding a support agent's answer in its own trace

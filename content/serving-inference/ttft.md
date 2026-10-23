@@ -5,7 +5,8 @@ name: TTFT (time to first token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - serving-inference/prefill-vs-decode
@@ -150,7 +151,46 @@ flowchart TD
     H -.->|"tool result appended"| A
 ```
 
+## Misconceptions
+- **"TTFT is mostly network latency."** Network and handshakes are a small fixed floor on a pooled
+  connection. The two large, variable terms are the admission queue and prefill over every prompt token.
+- **"The first token is one decode step."** It falls out of the prefill pass itself, so its cost scales
+  with the whole prompt (about `2 × N × n_prompt` FLOPs), not with output length.
+- **"Speculative decoding or KV quantisation will fix slow TTFT."** Those target decode. TTFT moves with
+  fewer prompt tokens, prefix caching, capacity and admission control, and (since prefill is
+  compute-bound) faster GPUs or tensor parallelism.
+- **"An agent pays TTFT once per run."** It pays it on every step, over a transcript that keeps growing,
+  so a regression is multiplied by the step count unless an append-only prefix stays cached.
+- **"The first SSE frame marks TTFT."** That frame is often a role-only chunk or `message_start` sent
+  before prefill ends; stop the clock at the first non-empty content delta.
+- **"Rising p99 TTFT means prompts got longer."** If prompt-length buckets are unchanged, it means
+  queueing: a capacity signal, which is why TTFT is reported per prompt-length bucket.
+
 ## Examples
+### Agent scenario: TTFT across a 10-step tool loop
+An 8B agent with a 4k-token prefix (system prompt plus tool schemas) appends ~1k tokens per step (tool
+call plus result). Prefill uses the illustrative 2 × N × tokens ÷ (1e15 × 0.45) rule from How it works.
+
+```python
+def prefill_ms(params, tokens, peak=1e15, util=0.45):
+    return 2 * params * tokens / (peak * util) * 1000
+
+prefix, per_step, steps = 4_000, 1_000, 10
+no_cache = sum(prefill_ms(8e9, prefix + per_step * s) for s in range(steps))
+cached = prefill_ms(8e9, prefix) + sum(prefill_ms(8e9, per_step) for s in range(1, steps))
+print(f"no prefix reuse: {no_cache:.0f} ms   append-only + prefix cache: {cached:.0f} ms")
+# no prefix reuse: 3022 ms   append-only + prefix cache: 462 ms
+```
+
+| Step | Prompt tokens | Prefill without reuse | Prefill with prefix cache |
+|---|---|---|---|
+| 1 | 4,000 | ~142 ms | ~142 ms (cache written) |
+| 5 | 8,000 | ~284 ms | ~36 ms (new 1k only) |
+| 10 | 13,000 | ~462 ms | ~36 ms |
+| Total, 10 steps | | ~3.0 s | ~0.46 s |
+
+Queueing adds to every step on top of this, so under load the gap between the two columns widens.
+
 ### Probe TTFT and TPOT against any OpenAI-compatible server
 A short probe against any OpenAI-compatible streaming server (a provider, or vLLM/SGLang locally)
 that measures TTFT to the first content delta and TPOT over the rest, then shows how TTFT grows with
@@ -208,30 +248,6 @@ for label, n, toks in [("8B, chat 500", 8e9, 500), ("8B, RAG 8k", 8e9, 8_000),
 | 70B, RAG | 8,000 | ~2.5 s | Nearly nine times the 8B cost |
 
 Real numbers will be worse once queueing and attention overhead are added; the ratios are the point.
-
-### Agent scenario: TTFT across a 10-step tool loop
-An 8B agent with a 4k-token prefix (system prompt plus tool schemas) appends ~1k tokens per step (tool
-call plus result). Prefill uses the same illustrative 2 × N × tokens ÷ (1e15 × 0.45) rule.
-
-```python
-def prefill_ms(params, tokens, peak=1e15, util=0.45):
-    return 2 * params * tokens / (peak * util) * 1000
-
-prefix, per_step, steps = 4_000, 1_000, 10
-no_cache = sum(prefill_ms(8e9, prefix + per_step * s) for s in range(steps))
-cached = prefill_ms(8e9, prefix) + sum(prefill_ms(8e9, per_step) for s in range(1, steps))
-print(f"no prefix reuse: {no_cache:.0f} ms   append-only + prefix cache: {cached:.0f} ms")
-# no prefix reuse: 3022 ms   append-only + prefix cache: 462 ms
-```
-
-| Step | Prompt tokens | Prefill without reuse | Prefill with prefix cache |
-|---|---|---|---|
-| 1 | 4,000 | ~142 ms | ~142 ms (cache written) |
-| 5 | 8,000 | ~284 ms | ~36 ms (new 1k only) |
-| 10 | 13,000 | ~462 ms | ~36 ms |
-| Total, 10 steps | | ~3.0 s | ~0.46 s |
-
-Queueing adds to every step on top of this, so under load the gap between the two columns widens.
 
 ## Production patterns
 - **Append-only agent transcripts.** Keep system prompt and tool schemas first and fixed, append tool

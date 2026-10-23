@@ -5,7 +5,8 @@ name: Graceful degradation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/model-fallback-strategies
@@ -38,6 +39,61 @@ change the provider; degradation changes the function.
   so.
 - **What you can skip.** Elaborate load-shedding infrastructure for an internal prototype. Even then, keep
   a kill switch and a step cap; they are cheap and stop the worst incidents.
+
+## Decision case
+### Scenario
+A subscription software company runs a support agent that can look up accounts, search the knowledge
+base and issue refunds. Figures are illustrative.
+- **Normal day:** about 3,000 runs. Level 0 uses 12 strong-model steps at about $0.05 each, $0.60 a run
+  and $1,800 a day. Launch weeks double traffic to 6,000 runs, which would be $3,600 a day.
+- **Constraints:** a hard daily model budget of $2,000. Paying customers (40% of runs) have an SLO of 99%
+  of sessions at Level 0. Refunds may only be issued while the policy-check tool is healthy and no
+  prompt-injection alert is open.
+- **Team:** one on-call engineer who must be able to mitigate without a deploy.
+- **The free tier is the sales funnel,** so product will not accept free users losing the agent
+  entirely.
+- **Reduced level:** a fast model at about $0.01 a step with a 5-step cap, $0.05 a run.
+
+### Options
+| Option | How it works | Spike-day cost | Paying SLO | Refund safety and funnel |
+|---|---|---|---|---|
+| A. Kill switch at the cap | Agent turns off for everyone when $2,000 is spent | $2,000, then nothing | Breaks: if spend is even, the cap is reached after about 13 h, and everyone loses the agent for the rest of the day | Free users lose the agent too |
+| B. Fallback provider only | Second provider on errors; no budget behaviour | $3,600, over the cap | Holds during outages only | Does not address refunds or budget |
+| C. Global step-down on projected burn | Everyone moves to Reduced | 6,000 × $0.05 = $300 | Breaks: paying users drop to Reduced | Free users keep an answer |
+| D. Tiered ladder | Paying runs stay at Level 0 and free runs drop to Reduced on projected burn. A read-only level removes refunds when the policy check or injection signal fails. Then cached answers, search results and a human handoff | 2,400 × $0.60 + 3,600 × $0.05 = $1,620 | Holds | Refunds drafted for a human when unsafe; free users still answered |
+
+### Decision
+Choose **D**.
+- **Budget and SLO:** it is the only option that keeps the cap and the paying SLO at once. The
+  projected-burn trigger (`spent + current_rate × hours_left > cap`) sees $3,600 against $2,000 within
+  the first hour of a spike day. Stepping free runs down then holds the day near $1,620.
+- **Refund safety:** write tools go before read tools. The refund constraint becomes the read-only
+  level's trigger rather than a reason to switch the agent off.
+- **On-call:** every level is a runtime flag named in the runbook, so the engineer can mitigate without
+  a deploy.
+- **Run pinning:** the level is read once per run, so no run loses its tools halfway through.
+
+**What would change it:** if growth matters more than revenue this quarter, shed batch and background
+agents before free users. If paying traffic alone exceeds the cap ($2,000 / $0.60 ≈ 3,333 paying runs a
+day), the budget or the Level 0 step count must change; no ladder fixes that.
+
+### Trade-offs accepted
+- **Free users get visibly weaker answers on spike days.** Label them, and watch completion and handoff
+  rates for free sessions at Reduced.
+- **Several code paths to keep alive.** Run a synthetic check per level and a game day before each
+  launch week.
+- **Drafted refunds wait for humans in read-only mode.** Monitor the drafted-action backlog and approval
+  latency.
+- **Hysteresis keeps users one level down a little longer** after recovery; review the thresholds with
+  the SLO.
+
+### Review rubric
+- Defines every level by what the user sees, what it costs and who gets it.
+- Recomputes daily cost per option under the stated peak and compares it with the cap.
+- Uses projected burn, not spend so far, and adds hysteresis with a dwell time.
+- Sheds by priority class at admission, before any tokens are spent.
+- Removes write tools before read tools, and pins the level per run.
+- Labels degraded output and names the metric (share of sessions at Level 0) that proves the SLO.
 
 ## Why it exists
 - **Most AI features enhance a product that already worked:** search, support, editors, dashboards. A

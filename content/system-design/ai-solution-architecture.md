@@ -5,7 +5,8 @@ name: AI / solution architecture
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/reference-architectures
@@ -38,6 +39,62 @@ where each piece lives so the agent stays testable, safe and affordable.
   model change must pass.
 - **What you can skip.** Enterprise architecture frameworks and heavyweight modelling notation. A C4
   sketch, an NFR table with budgets, a threat model and a few ADRs are enough for an agent system.
+
+## Decision case
+### Scenario
+A mid-size EU bank wants an agent that prepares loan-review memos for relationship managers: it pulls
+the customer's account history and the credit policy, drafts the memo and can file a note in the CRM.
+All figures are illustrative.
+- **Load:** 300 managers × 15 runs a day = 4,500 runs a day.
+- **Latency:** first visible progress within 2 s; finished memo within 60 s.
+- **Budget:** at most 150 units a day of model spend.
+- **Data:** EU residency; a manager may only see customers in their own portfolio.
+- **Risk:** no CRM write without the manager's approval.
+- **Team and deadline:** three engineers, ten weeks.
+
+Assume a 5-step run whose transcript grows from 4,000 to 6,400 input tokens (26,000 in total) with
+300 output tokens per step, a mid-tier price of 0.5 units per million input and 2 per million output
+tokens, and a frontier tier at about ten times that.
+
+Each step takes about 0.5 s of prefill, decodes at about 50 tokens/s and spends 0.4 s in its tool.
+
+### Options
+| Option | How it works | Budget | Latency | Data and risk | Team and deadline |
+|---|---|---|---|---|---|
+| **A. Hardened prototype** | one frontier call with account data pasted in, about 12,000 in and 800 out | 4,500 × 0.076 ≈ 342 a day: fails | one call ≈ 17 s, no progress until it ends | no retrieval ACL, no approval gate: fails | fastest |
+| **B. Six layers as modules in one service** | agent loop, open-source gateway, ACL-aware retrieval, control layer with approval on the CRM tool, traces and a golden set | 4,500 × 0.016 = 72 a day on the mid tier | 5 × (0.5 + 6 + 0.4) ≈ 34.5 s, progress streamed per step | filters at retrieval, gate on writes | fits ten weeks |
+| **C. One service per layer plus a managed agent runtime** | same layers as B, deployed separately, loop hosted by a vendor | same tokens as B, plus runtime fees | B plus a network hop per step | depends on the vendor's EU region and trace export | the most to build and run |
+
+### Decision
+**Choose B.** It is the only option that passes every constraint:
+- The mid tier keeps spend near half the budget; moving every step to the frontier tier (about 720 a
+  day) or using option A (about 342) does not fit.
+- Per-step streaming meets the 2 s progress target, and 34.5 s is inside the 60 s memo budget.
+- Entitlement filters at retrieval and the approval gate on the CRM tool enforce the data and risk
+  rules in code, not in the prompt.
+- Modules rather than services keep three engineers within ten weeks.
+
+**What would change it.** A second product calling the same models makes the gateway a shared service
+(part of C). Volume growing about tenfold reopens routing between tiers. A vendor runtime in an EU
+region with exportable traces makes C's managed loop worth pricing.
+
+### Trade-offs accepted
+- **Mid-tier quality.** Memo drafts may be weaker than the frontier's; the golden set of reviewed memos
+  gates every change, and the share of memos managers rewrite is tracked weekly.
+- **A 35-second run.** Managers wait for the full memo; time to first progress and p95 run time are
+  dashboard metrics with alerts.
+- **Shared deployment.** Layers in one process scale and fail together; module boundaries and
+  interfaces are kept so a layer can be split out when load or a second team demands it.
+- **Approval friction.** Every CRM note needs a click; the approval rate and edits before approval are
+  logged to decide whether low-risk notes can skip the gate later.
+
+### Review rubric
+- States load, latency, budget, data and risk constraints as numbers or yes/no rules before any option.
+- Computes cost per run and per day from steps and tokens, and the arithmetic reproduces.
+- Places permissions at retrieval and approvals at the tool boundary, not in the prompt.
+- Compares at least two genuinely different architectures against every constraint in one table.
+- Names the trigger that would change the decision and the metric that watches each accepted
+  trade-off.
 
 ## Why it exists
 - **The prototype is one function, and its failures are not in the model.** Build a prompt, call the

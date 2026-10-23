@@ -5,7 +5,8 @@ name: Data consistency
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/distributed-systems
@@ -41,6 +42,63 @@ idempotency keys strong; let index, cache and memory lag visibly.
   shows "indexing" instead of pretending the index is current.
 - **What you can skip.** Formal definitions of sequential consistency and CRDT proofs. Know the ladder,
   write skew, read-your-writes and the derived-copy permission problem.
+
+## Decision case
+### Scenario
+A multi-tenant research-assistant platform runs agents whose checkpoints, memory, ACL mirror and usage
+dashboards all live in one Postgres primary, now at 85% CPU. The team adds two asynchronous read
+replicas and must decide which reads may use them. All figures are illustrative.
+- **Read mix (6,000 reads/s):** run checkpoints and step results 15%, in-run memory 20%, ACL lookups for
+  retrieval 10%, dashboards and run history 55%.
+- **Replica lag:** p50 50 ms, p99 2 s under load; agents read memory about 300 ms after writing it.
+- **Constraints:** move at least half of reads off the primary; a revoked user must never retrieve a
+  document; an agent must never repeat a side effect because of a stale read; dashboards may lag
+  seconds; 3 engineers, 4 weeks. Token budgets already debit with one conditional `UPDATE` on the primary.
+
+### Options
+| Option | How it works | Reads off the primary | Stale checkpoints or memory | Revoked access | Complexity |
+|---|---|---|---|---|---|
+| A. All reads to replicas | Repository layer points every read at a replica | 100% | Yes, at p99 lag a resumed run misses its last step and repeats it | Leaks for the lag window | Lowest |
+| B. All reads to primary | Replicas only as standbys | 0% | No | No | None, but CPU stays at 85% |
+| C. Route per invariant | Checkpoints and ACL lookups on the primary; in-run memory on a replica only when it has replayed past the write's LSN token; dashboards on replicas | About 74% (below) | No | No | Routing rules in the repository layer plus one token check |
+| D. Sticky primary window | Any session that wrote in the last 5 s reads from the primary | 55%: agents write every step, so all agent reads stay on the primary | No while lag stays under 5 s | No, while ACL reads stay on the primary | Simple, but the guarantee breaks when lag exceeds the window |
+
+### Decision
+Choose **C**, because:
+- **Strong reads go only where a stale read costs money or access.** Checkpoints (15%) and ACL lookups
+  (10%) stay on the primary, so a resumed run never re-executes a step and revocation takes effect at the
+  next query.
+- **Read-your-writes is bought per session, not globally.** Memory reads carry the LSN token from the
+  write; with a 300 ms gap and a 50 ms median lag, say 5% fall back to the primary, so 20% × 5% = 1%.
+  The primary serves 15% + 10% + 1% = 26%, and 74% moves off, beating the 50% target.
+- **D meets the target only narrowly,** with no headroom, and its correctness rests on lag staying under
+  5 s, exactly when the system is under stress.
+- **A violates two hard constraints;** B fails the capacity goal.
+
+**What would change it:** if token fallbacks rose above about a third of memory reads, keeping in-run
+memory in the run state the loop already holds is simpler; ACLs mirrored from an external source (such as
+SharePoint) need the query-time check against that source; a dashboard cache that cut primary load enough
+would make B viable.
+
+### Trade-offs accepted
+- **An extra replica round trip** for every token read. Watch: memory-read latency p95 and the token
+  fallback fraction.
+- **Replica outages shift load back.** With both replicas down the primary takes 100% of reads again.
+  Watch: per-replica lag in `pg_stat_replication`; shed dashboard reads first when lag or CPU crosses the
+  alert line.
+- **Dashboards show stale numbers.** Show "as of" timestamps. Watch: replica lag against the few seconds
+  the product promises.
+- **Routing rules can be bypassed.** A new query may default to a replica. Watch: share of runtime-table
+  reads served by replicas (target near zero), enforced by a repository test.
+
+### Review rubric
+- **Every piece of state has a named level** (strong, session, eventual) and the cost of a stale read.
+- **The read mix is quantified,** and the offload share recomputes from the routing rules.
+- **Permissions are enforced against the authoritative copy** at query time, not by a lagging mirror.
+- **Read-your-writes has a mechanism** (version token or window) and a stated failure condition.
+- **Multi-row invariants such as quotas** use an atomic update, a lock or serializable isolation, named
+  explicitly.
+- **Lag and fallback are measured** with thresholds and a degradation order.
 
 ## Why it exists
 - **One serializable database lets you forget this topic.** Every read sees every committed write, and

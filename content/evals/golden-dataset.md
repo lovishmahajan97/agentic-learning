@@ -5,7 +5,8 @@ name: Golden dataset (eval dataset)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -166,6 +167,25 @@ flowchart TD
     HO --> P["Shipped agent in production"]
     P -.->|"new failures become items"| E
 ```
+
+## Misconceptions
+- **"Golden means big and perfect."** It means agreed and authoritative: SMEs signed off on what success
+  looks like. A few hundred stratified, well-labeled tasks beat ten thousand unlabeled transcripts.
+- **"A random sample of production logs is the most representative eval."** Traffic is long-tailed, so
+  uniform sampling yields hundreds of the easy intent and almost none of the rare one that escalates.
+  Sample with per-slice quotas and re-weight by traffic for a headline number.
+- **"A logged agent trace is a ready-made test case."** The tool state it ran against has since changed,
+  so it cannot be replayed. A task needs a seed for every backend its tools touch and an expected end
+  state written by a person.
+- **"Letting the model write the expected answers saves labeling time."** If the generator also writes
+  the references, the eval measures the model's agreement with itself. Synthetic inputs can fill gaps,
+  but humans label them and they stay tagged as synthetic.
+- **"To detect a 5-point gain I always need about 1,000 items."** That holds for two independent runs
+  at p = 0.8. Paired on the same items, only flips carry information: at a 13% flip rate roughly 400
+  items suffice, so measure your flip rate first.
+- **"Once built, the set is done."** Items go stale when policies or tool schemas change, and a set
+  every candidate passes no longer separates versions. Version it like code and re-run the baseline on
+  each new version before comparing.
 
 ## Examples
 ### Agent scenario: one golden task record

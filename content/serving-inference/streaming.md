@@ -5,7 +5,8 @@ name: Streaming (SSE)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - serving-inference/ttft
@@ -174,6 +175,21 @@ sequenceDiagram
     S-->>C: event done or event error, then close
     Note over C: no terminal event means partial run
 ```
+
+## Misconceptions
+- **"Streaming makes the answer faster."** It changes when the user first sees text (about TTFT), not
+  when generation finishes; total time is still `TTFT + (n_tokens − 1) × TPOT`, or slightly more.
+- **"A `200` means the call succeeded."** The status is sent before the first token. Model errors,
+  filter stops and upstream timeouts arrive later as in-band events, so only a terminal `done` event
+  marks success.
+- **"One network read is one event."** Framing is the blank line. A read can hold half an event, three
+  events or half a UTF-8 character, so the client buffers bytes until the blank line before parsing.
+- **"I can act on tool-call arguments as they stream."** `input_json_delta` fragments are not valid JSON
+  until the block ends; execute the tool only after `content_block_stop` and schema validation.
+- **"If it streams on localhost, it streams in production."** Every proxy, gateway and compression layer
+  may buffer the body; the symptom is all events arriving in the last moment, so check each hop.
+- **"Closing the browser tab stops the model."** Nothing upstream knows unless the server notices the
+  disconnect and cancels the producer and the provider stream; otherwise you keep paying for tokens.
 
 ## Examples
 ### SSE endpoint with heartbeats, in-band errors and disconnect handling

@@ -5,7 +5,8 @@ name: Clustering
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/supervised-vs-unsupervised-vs-self-supervised-learning
@@ -164,7 +165,39 @@ flowchart TD
     NM --> USE["Fix queue, eval sample, drift watch"]
 ```
 
+## Misconceptions
+- **"k-means finds the clusters that are in the data."** It finds a local minimum of within-cluster
+  squared distance that depends on the seeds: on six 1-D points in three pairs, bad seeds converge to a
+  sum of squares of 101 against 1.5. Use k-means++ seeding and several restarts.
+- **"The algorithm choice matters most."** What you embed (request only, or request plus the tool
+  error) and the encoder's notion of similarity change the clusters more than k-means versus HDBSCAN.
+- **"A good silhouette means the clusters are meaningful."** Silhouette is a sanity check, and low values
+  in high dimensions are normal. Only reading central examples, and sampling members to measure purity,
+  tells you whether a cluster is a real failure mode.
+- **"Cluster ids can serve as stable categories."** Re-running renumbers and reshapes clusters, so a
+  router or dashboard built on "cluster 7" silently breaks. Name and review clusters, label a sample and
+  train a classifier for the production path.
+- **"Euclidean k-means on raw embeddings is the same as cosine."** Only for unit vectors, where
+  ||a − b||² = 2 − 2·cos(a, b). Unnormalised, vector norm (often text length) drives the partition.
+
 ## Examples
+### Worked scenario: a week of failed support-agent runs
+A support agent handles 40,000 runs a week; 9% (3,600) end in a failure flag or a thumbs down. The team
+clusters them with k = 20 and reads ten central runs per cluster. Figures are illustrative.
+
+| Cluster (named after reading) | Runs | Share | Action |
+|---|---|---|---|
+| Refund tool called with an order id from the wrong account | 1,050 | 29% | fix the tool schema and add an account check |
+| Loops calling the search tool with the same query | 700 | 19% | add a repeated-call guard and a step budget |
+| Asks about a product the knowledge base lacks | 540 | 15% | add documents to the RAG index |
+| Greeting-template boilerplate (not a real failure) | 430 | 12% | strip the template, re-cluster |
+| Remaining 16 clusters | 880 | 24% | sample 5 each into the eval set |
+
+- **Two fixes cover about half the failures,** found in an afternoon instead of reading 3,600 traces.
+- **The boilerplate cluster is a warning,** not a finding: cleaning should have removed it before embedding.
+- **Stratified sampling** of 5 runs from each of the 16 smaller clusters adds 80 eval cases that a random
+  sample of 80 would mostly have drawn from the top three clusters.
+
 ### Finding failure modes in agent traces
 Embed a one-line description of each failed run, normalise, sweep k with a silhouette check, then print
 the most central runs per cluster. The silhouette picks a k; the printed examples tell you whether the
@@ -201,23 +234,6 @@ for c in np.argsort(-sizes)[:5]:                               # five largest fa
     for i in members[np.argsort(d)[:3]]:                       # most central runs: read these
         print("  -", texts[i][:100])
 ```
-
-### Worked scenario: a week of failed support-agent runs
-A support agent handles 40,000 runs a week; 9% (3,600) end in a failure flag or a thumbs down. The team
-clusters them with k = 20 and reads ten central runs per cluster. Figures are illustrative.
-
-| Cluster (named after reading) | Runs | Share | Action |
-|---|---|---|---|
-| Refund tool called with an order id from the wrong account | 1,050 | 29% | fix the tool schema and add an account check |
-| Loops calling the search tool with the same query | 700 | 19% | add a repeated-call guard and a step budget |
-| Asks about a product the knowledge base lacks | 540 | 15% | add documents to the RAG index |
-| Greeting-template boilerplate (not a real failure) | 430 | 12% | strip the template, re-cluster |
-| Remaining 16 clusters | 880 | 24% | sample 5 each into the eval set |
-
-- **Two fixes cover about half the failures,** found in an afternoon instead of reading 3,600 traces.
-- **The boilerplate cluster is a warning,** not a finding: cleaning should have removed it before embedding.
-- **Stratified sampling** of 5 runs from each of the 16 smaller clusters adds 80 eval cases that a random
-  sample of 80 would mostly have drawn from the top three clusters.
 
 ### Bad seeds in pure Python
 The hand-worked example from How it works, runnable with no libraries. Same algorithm, same data; only the

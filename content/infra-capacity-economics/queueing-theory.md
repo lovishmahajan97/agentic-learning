@@ -5,7 +5,8 @@ name: Queueing theory
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/capacity-planning
@@ -37,6 +38,59 @@ it eight times.
   loop, `max_tokens` per step, and whether long batch agents share a queue with interactive ones.
 - **What you can skip.** Deriving Erlang C. Know Little's law, the ρ/(1−ρ) knee, and that variability
   makes it worse; use the code below for the numbers.
+
+## Decision case
+### Scenario
+A B2B support platform self-hosts one model for an interactive triage agent. The capacity review must
+fix the replica count and pool layout for the next quarter. Figures are illustrative, not vendor numbers.
+- **Load:** 0.6 tasks/s at peak, 8 model calls per task, 10% of steps retried, so λ = 0.6 × 8 × 1.1 =
+  5.28 calls/s. Each call holds a slot for 3 s measured at target concurrency, so the Little's law floor
+  is 5.28 × 3 = 15.84 busy slots.
+- **Replica shape:** `--max-num-seqs 4`, so capacity comes in blocks of 4 slots.
+- **SLO:** p99 queue wait per call ≤ 1 s, because the 8-step task budget leaves no room for tail waits.
+- **Budget:** at most 8 replicas (32 slots) this quarter. Traffic is forecast to grow 30%.
+- **Ask:** two enterprise tenants, each about half the traffic, request dedicated pools for isolation.
+
+### Options
+| Option | How it works | p99 Wq now | At +30% traffic | Budget |
+|---|---|---|---|---|
+| A. Floor plus 25% | 15.84 × 1.25 ≈ 20 slots, 5 replicas, one FIFO queue | ~2.3 s at ρ 0.79: fails | Worse | 5 of 8 |
+| B. Dedicated pool per tenant | 2.64 calls/s each; 3 replicas (12 slots) each gives ~1.9 s, so each needs 4 (16 slots) | ~0 s with 8 replicas | Each needs 17 slots, so 2 × 5 = 10 replicas | 8 now, 10 later: over |
+| C. One pool sized from the tail | M/M/c gives 23 slots, rounded up to 6 replicas (24 slots), ρ 0.66, gateway cap with fast 429 | ~0.5 s | 7 replicas (28 slots), ~0.86 s | 6 now, 7 later |
+
+### Decision
+Choose **C**: one shared pool of 6 replicas, a bounded gateway queue, and per-tenant concurrency caps.
+- **SLO:** 24 shared slots meet the 1 s p99 at ρ 0.66. A fails because sizing on the mean ignores the
+  tail: at ρ 0.79 the p99 wait is more than twice the target.
+- **Budget:** C leaves 2 replicas of the 8 in reserve and absorbs the +30% forecast with one more. B
+  uses the whole budget today and needs 10 replicas after growth.
+- **Pooling:** B with the same 6 replicas (two pools of 12) misses the SLO at ~1.9 s, because a burst in
+  one pool cannot use idle slots in the other. That is the dedicated-pool tax in one number.
+- **Isolation without pools:** per-tenant in-flight caps at the gateway stop one tenant from filling the
+  queue, which addresses the noisy-neighbour concern behind the ask.
+
+**What would change it:** a contractual or compliance requirement for physical isolation makes B
+correct, with its price (2 extra replicas now, 3 after growth) put in the contract. A large spread of
+service times (a long-output batch agent on the same model) adds a separate batch pool to C.
+
+### Trade-offs accepted
+- **Soft isolation only.** A tenant can still raise the shared wait up to its cap. Watch p99 queue wait
+  per tenant and rejection rate per tenant.
+- **Utilization of 0.66.** About a third of slot time is idle at peak. Track slot occupancy; revisit the
+  count when peak occupancy stays below 0.55 for a month.
+- **Retry sensitivity.** A 30% step-retry storm raises λ to 6.24 calls/s (ρ 0.78) and p99 to ~1.6 s.
+  Keep one retry layer with a budget and alert on attempted calls versus completed steps.
+- **Model assumptions.** M/M/c assumes exponential service; LLM traffic with Cs above 1 waits longer.
+  Confirm the 6-replica count with an open-loop replay of real agent traces before the quarter starts.
+
+### Review rubric
+- Converts task traffic into call traffic (tasks × calls per task × retry factor) before any sizing.
+- States the Little's law floor and explains why headroom above it comes from a tail estimate, not a
+  flat percentage.
+- Computes p99 queue wait (or cites a load test) for each option against the stated SLO and budget.
+- Prices the pooling loss of dedicated pools in replicas, now and after forecast growth.
+- Names the monitored signals (queue wait p99, occupancy, retries, per-tenant rejections) that would
+  trigger revisiting the decision.
 
 ## Why it exists
 - **The naive model is division.** A replica handles 4 requests per second, peak traffic is 40, so buy

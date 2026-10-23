@@ -5,7 +5,8 @@ name: Benchmarking (MMLU, HumanEval, SWE-bench, GPQA)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -205,7 +206,40 @@ flowchart TD
     SL --> G["Decide on your golden dataset, scaffold, cost and latency"]
 ```
 
+## Misconceptions
+- **"The model at the top of the leaderboard is the better model."** On GPQA Diamond (198 items) a
+  score near 60% carries about ±7 points at 95%, so a 4-point lead from one run each is a tie. Check the
+  protocol and the interval before ranking anything.
+- **"pass@k numbers are comparable whatever k is."** With 10 samples of which 3 pass, pass@1 is 0.30
+  and pass@5 about 0.92. pass@k assumes a verifier picks the passing sample; a user with one shot gets
+  pass@1.
+- **"A SWE-bench score is a property of the model."** It is a system score: the agent loop, tools and
+  retries move it as much as the model. A vendor's 70% in its own scaffold can become 58% in yours.
+- **"The highest resolved rate picks the coding agent's model."** A model that resolves 3 more points
+  but costs $1.90 per resolved issue against $0.82 may lose on what your budget sees. Report cost per
+  resolved task next to the rate.
+- **"Higher scores on a saturated benchmark still separate the best models."** Near the ceiling, label
+  errors and contamination dominate, so the gap shows which models agree with the mistakes. Shortlist on
+  benchmarks, then decide on your own golden tasks.
+
 ## Examples
+### Agent scenario: picking the model for a coding agent
+Numbers illustrative. Three candidates run 500 SWE-bench Verified instances through *your* agent loop
+and tools, one attempt each, with token cost logged per task.
+
+| Model | Resolved | 95% interval | Mean cost per task | Cost per resolved issue |
+|---|---|---|---|---|
+| A (vendor reports 70% in its own scaffold) | 58% | ±4.3 points | $1.10 | $1.90 |
+| B | 55% | ±4.4 points | $0.45 | $0.82 |
+| C | 47% | ±4.4 points | $0.30 | $0.64 |
+
+- **A versus B is not settled:** a 3-point gap sits inside the interval; a paired count of instances
+  only one model resolved is the next step.
+- **The vendor's 70% was the scaffold:** in your loop A drops 12 points, which is the system-score
+  effect in numbers.
+- **Decision:** shortlist A and B, then run both on your own repository tasks; B is the default if the
+  paired result is a tie, because it costs less than half per resolved issue.
+
 ### pass@k and benchmark intervals in pure Python
 The unbiased pass@k estimator and a confidence interval for a reported score. With 10 samples per
 problem of which 3 pass, pass@1 is 0.30 but pass@5 is about 0.92, so the two must never be compared as
@@ -240,23 +274,6 @@ for name, n in benchmarks.items():
 - **The intervals are the point:** a 5-point lead on GPQA Diamond or HumanEval is inside the noise of a
   single evaluation run, while on MMLU it is not.
 - **Only a paired comparison** on the same items with the same protocol can tighten that.
-
-### Agent scenario: picking the model for a coding agent
-Numbers illustrative. Three candidates run 500 SWE-bench Verified instances through *your* agent loop
-and tools, one attempt each, with token cost logged per task.
-
-| Model | Resolved | 95% interval | Mean cost per task | Cost per resolved issue |
-|---|---|---|---|---|
-| A (vendor reports 70% in its own scaffold) | 58% | ±4.3 points | $1.10 | $1.90 |
-| B | 55% | ±4.4 points | $0.45 | $0.82 |
-| C | 47% | ±4.4 points | $0.30 | $0.64 |
-
-- **A versus B is not settled:** a 3-point gap sits inside the interval; a paired count of instances
-  only one model resolved is the next step.
-- **The vendor's 70% was the scaffold:** in your loop A drops 12 points, which is the system-score
-  effect in numbers.
-- **Decision:** shortlist A and B, then run both on your own repository tasks; B is the default if the
-  paired result is a tie, because it costs less than half per resolved issue.
 
 ### Worked scenario: auditing a vendor's leaderboard claim
 A vendor table (numbers illustrative) shows model A ahead of model B. Walk the checklist before it

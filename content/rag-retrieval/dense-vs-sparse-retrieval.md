@@ -5,7 +5,8 @@ name: Dense vs sparse retrieval
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -173,43 +174,24 @@ flowchart TD
     F --> K["Top k into agent context"]
 ```
 
+## Misconceptions
+- **"Embeddings made keyword search obsolete."** A single vector loses rare, high-information tokens such
+  as "PX-200" or "E4012", because the tokenizer splits them into pieces shared with unrelated strings.
+  Agents pass exactly these tokens between tools, and out of domain BM25 often beats dense retrievers.
+- **"BM25 is just word counting, a weak baseline."** IDF, saturation and length normalization make it hard
+  to beat without in-domain labels. Any dense model must beat it on your labeled queries before it earns
+  its embedding and re-indexing cost.
+- **"Dense retrieval understands the query, so it handles negation and constraints."** "Flights not via
+  Frankfurt" averages out in one vector, and term matching ignores the "not" too. Hard constraints belong
+  in filters or a reranker, not in either retriever.
+- **"If dense has higher recall, a sparse arm adds nothing."** What decides is the overlap, not the
+  average. In the toy ablation below, recall@1 is 0.75 for BM25 and 0.50 for dense, yet their union is
+  1.00. Drop an arm only when its hits are a subset of the other's.
+- **"SPLADE and ColBERT are just better dense models."** SPLADE is learned sparse: term weights with
+  expansion, served from an inverted index on CPU. ColBERT keeps one vector per token, so its index is
+  many times larger and it often serves as a reranking stage.
+
 ## Examples
-### One fused search tool vs two tools for the agent
-Two ways to expose retrieval. Separate tools let the model pick, but it will misroute some queries
-(an id sent to semantic search); a single tool that runs both arms and fuses is the safer default. The routing regex mirrors the
-identifier detector below.
-
-```python
-import re
-
-ID = re.compile(r"\b(?:[A-Za-z]{1,5}-?\d{2,}|\d{4,})\b")   # identifier-style tokens
-
-# Option A: two tools, the model chooses (descriptions carry the routing rule)
-TOOLS = [
-    {"name": "keyword_search",
-     "description": "Exact-term search. Use for error codes, ticket ids, SKUs, names.",
-     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
-                      "required": ["query"]}},
-    {"name": "semantic_search",
-     "description": "Meaning-based search. Use for natural-language questions.",
-     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
-                      "required": ["query"]}},
-]
-
-# Option B: one tool, both arms always run, fused by reciprocal rank
-def search(query, bm25_search, dense_search, k=5, rrf_k=60):
-    sparse, dense = bm25_search(query, 50), dense_search(query, 50)   # lists of doc ids
-    w_sparse = 2.0 if ID.search(query) else 1.0                       # lean on exact terms for ids
-    scores = {}
-    for w, ranked in ((w_sparse, sparse), (1.0, dense)):
-        for rank, doc in enumerate(ranked, start=1):
-            scores[doc] = scores.get(doc, 0.0) + w / (rrf_k + rank)
-    return sorted(scores, key=scores.get, reverse=True)[:k]
-```
-
-- **Log which arm contributed** each returned chunk; the trace is how you later see that a wrong answer
-  came from a dense-only miss on an identifier.
-
 ### BM25 vs a bi-encoder on two query types
 Five support passages, two queries: an exact error code that dense retrieval tends to blur, and a
 paraphrase that BM25 cannot bridge.
@@ -247,6 +229,42 @@ for q in queries:
   "billing" without a stemmer), so `argmax` just returns the first passage with a score of 0.0. The dense
   model ranks the cancellation passage first.
 - **Margins depend on the model,** which is the point: the behavior is structural, the numbers are not.
+
+### One fused search tool vs two tools for the agent
+Two ways to expose retrieval. Separate tools let the model pick, but it will misroute some queries
+(an id sent to semantic search); a single tool that runs both arms and fuses is the safer default. The routing regex mirrors the
+identifier detector below.
+
+```python
+import re
+
+ID = re.compile(r"\b(?:[A-Za-z]{1,5}-?\d{2,}|\d{4,})\b")   # identifier-style tokens
+
+# Option A: two tools, the model chooses (descriptions carry the routing rule)
+TOOLS = [
+    {"name": "keyword_search",
+     "description": "Exact-term search. Use for error codes, ticket ids, SKUs, names.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+                      "required": ["query"]}},
+    {"name": "semantic_search",
+     "description": "Meaning-based search. Use for natural-language questions.",
+     "input_schema": {"type": "object", "properties": {"query": {"type": "string"}},
+                      "required": ["query"]}},
+]
+
+# Option B: one tool, both arms always run, fused by reciprocal rank
+def search(query, bm25_search, dense_search, k=5, rrf_k=60):
+    sparse, dense = bm25_search(query, 50), dense_search(query, 50)   # lists of doc ids
+    w_sparse = 2.0 if ID.search(query) else 1.0                       # lean on exact terms for ids
+    scores = {}
+    for w, ranked in ((w_sparse, sparse), (1.0, dense)):
+        for rank, doc in enumerate(ranked, start=1):
+            scores[doc] = scores.get(doc, 0.0) + w / (rrf_k + rank)
+    return sorted(scores, key=scores.get, reverse=True)[:k]
+```
+
+- **Log which arm contributed** each returned chunk; the trace is how you later see that a wrong answer
+  came from a dense-only miss on an identifier.
 
 ### Per-retriever ablation: which queries does each arm win?
 The decision number is the overlap. Record each retriever's top-k per labeled query (for an agent, the

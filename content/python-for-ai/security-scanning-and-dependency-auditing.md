@@ -5,7 +5,8 @@ name: Security scanning & dependency auditing (pip-audit, Bandit)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
@@ -40,6 +41,171 @@ Both run in seconds in CI; neither proves an agent safe.
   agent may install packages at runtime, from which index.
 - **What you can skip.** Building your own vulnerability database or data-flow analyzer. Prompt
   injection and tool authorization are design problems; scanners will not find them.
+
+## Lab
+### Task
+Build the CI gate that sits after `pip-audit` on an agent service's exported lock: de-duplicate findings,
+turn fixable ones into one upgrade action per package, block unfixed ones, and honor only written
+exceptions with a reason and a review date that has not passed. Time box: 45-75 min.
+- **Prerequisites:** Lockfiles & dependency pinning; the triage order in How it works below.
+- **Setup:** Python 3.11+ (for `tomllib`), `pip install packaging pytest` (checked with packaging 26.3).
+  Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **Offline by design:** the report is a recorded `pip-audit -f json` output, so the lab needs no
+  vulnerability service. The date is injected, so expiry is testable.
+
+### Starter code
+```python
+"""Lab: a CI vulnerability gate over a recorded pip-audit JSON report. Run: python lab.py"""
+from __future__ import annotations
+import datetime as dt, json, tomllib
+from packaging.version import Version
+
+# Shape recorded from `pip-audit -r req.txt --no-deps --disable-pip -f json` (pip-audit 2.10.1),
+# trimmed. The jinja2 entries are real advisories; example-parser and DEMO-2026-0001 are invented.
+# pip-audit really did list some jinja2 advisories twice in this run.
+REPORT = json.loads('''{
+  "dependencies": [
+    {"name": "jinja2", "version": "3.1.2", "vulns": [
+      {"id": "PYSEC-2026-1473", "fix_versions": ["3.1.3"], "aliases": ["CVE-2024-22195"]},
+      {"id": "PYSEC-2026-1474", "fix_versions": ["3.1.4"], "aliases": ["CVE-2024-34064"]},
+      {"id": "PYSEC-2026-1471", "fix_versions": ["3.1.6"], "aliases": ["CVE-2025-27516"]},
+      {"id": "PYSEC-2026-1473", "fix_versions": ["3.1.3"], "aliases": ["CVE-2024-22195"]}]},
+    {"name": "markupsafe", "version": "2.1.5", "vulns": []},
+    {"name": "example-parser", "version": "0.9.1", "vulns": [
+      {"id": "DEMO-2026-0001", "fix_versions": [], "aliases": []}]}
+  ],
+  "fixes": []
+}''')
+
+EXCEPTIONS = '''
+[[exception]]
+id = "DEMO-2026-0001"
+reason = "only parses PDFs we generate; no untrusted input reaches it"
+review_by = 2026-12-01
+'''
+
+def load_exceptions(toml_text: str) -> dict[str, dict]:
+    # YOUR CODE HERE: {id: entry} from [[exception]] tables; tomllib parses review_by as a date
+    # - an entry without a non-empty reason or without review_by -> ValueError naming its id
+    raise NotImplementedError
+
+def gate(report: dict, exceptions: dict[str, dict], today: dt.date) -> tuple[int, list[str]]:
+    # YOUR CODE HERE: return (exit_code, sorted action lines)
+    # - de-duplicate findings by (package, id); an exception matches a finding by id or by any alias
+    # - exception with review_by >= today: "defer <id> until <review_by>: <reason>"   (passes)
+    # - exception past review_by:          "expired <id> (review by <review_by>)"     (fails)
+    # - unexcepted findings with fixes:    one "upgrade <pkg> <version> -> <highest fix>" per package
+    #   (compare with Version)                                                       (fails)
+    # - unexcepted finding with no fix:    "block <pkg> <id>: no fix and no exception" (fails)
+    # - exit_code is 1 if any line fails, else 0
+    raise NotImplementedError
+
+def ignore_args(exceptions: dict[str, dict], today: dt.date) -> list[str]:
+    # YOUR CODE HERE: ["--ignore-vuln", id, ...] for unexpired exceptions only, sorted by id
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    exc = load_exceptions(EXCEPTIONS)
+    for today in (dt.date(2026, 10, 23), dt.date(2027, 1, 4)):
+        code, lines = gate(REPORT, exc, today)
+        print(f"{today} exit={code}")
+        for line in lines:
+            print("  " + line)
+        print("  pip-audit", " ".join(ignore_args(exc, today)) or "(no ignores)")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly this. The build fails on both dates: today because
+`jinja2` has fixes waiting, later also because the exception expired.
+
+```
+2026-10-23 exit=1
+  defer DEMO-2026-0001 until 2026-12-01: only parses PDFs we generate; no untrusted input reaches it
+  upgrade jinja2 3.1.2 -> 3.1.6
+  pip-audit --ignore-vuln DEMO-2026-0001
+2027-01-04 exit=1
+  expired DEMO-2026-0001 (review by 2026-12-01)
+  upgrade jinja2 3.1.2 -> 3.1.6
+  pip-audit (no ignores)
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 7 fail with `NotImplementedError`; a correct solution
+passes all 7 (Python 3.12, packaging 26.3, pytest 9.1).
+
+```python
+import copy, datetime as dt
+import pytest
+from lab import EXCEPTIONS, REPORT, gate, ignore_args, load_exceptions
+
+TODAY = dt.date(2026, 10, 23)
+
+def test_exceptions_need_reason_and_review_date():
+    assert load_exceptions(EXCEPTIONS)["DEMO-2026-0001"]["review_by"] == dt.date(2026, 12, 1)
+    with pytest.raises(ValueError, match="X-1"):
+        load_exceptions('[[exception]]\nid = "X-1"\nreview_by = 2026-12-01\n')
+    with pytest.raises(ValueError, match="X-2"):
+        load_exceptions('[[exception]]\nid = "X-2"\nreason = "fine"\n')
+
+def test_gate_upgrades_through_the_highest_fix_and_defers_the_excepted():
+    code, lines = gate(REPORT, load_exceptions(EXCEPTIONS), TODAY)
+    assert code == 1
+    assert lines == [
+        "defer DEMO-2026-0001 until 2026-12-01: only parses PDFs we generate; no untrusted input reaches it",
+        "upgrade jinja2 3.1.2 -> 3.1.6",
+    ]
+
+def test_expired_exception_fails_the_build():
+    code, lines = gate(REPORT, load_exceptions(EXCEPTIONS), dt.date(2027, 1, 4))
+    assert code == 1 and "expired DEMO-2026-0001 (review by 2026-12-01)" in lines
+
+def test_unexcepted_finding_without_fix_blocks():
+    code, lines = gate(REPORT, {}, TODAY)
+    assert "block example-parser DEMO-2026-0001: no fix and no exception" in lines
+
+def test_exception_matches_by_alias_and_lowers_the_target():
+    exc = load_exceptions(EXCEPTIONS + '''
+[[exception]]
+id = "CVE-2025-27516"
+reason = "sandboxed templates are never rendered from user input"
+review_by = 2026-11-30
+''')
+    code, lines = gate(REPORT, exc, TODAY)
+    assert "upgrade jinja2 3.1.2 -> 3.1.4" in lines
+    assert any(l.startswith("defer CVE-2025-27516") for l in lines)
+
+def test_clean_report_passes():
+    clean = copy.deepcopy(REPORT)
+    for dep in clean["dependencies"]:
+        dep["vulns"] = []
+    assert gate(clean, {}, TODAY) == (0, [])
+
+def test_ignore_args_only_for_live_exceptions():
+    exc = load_exceptions(EXCEPTIONS)
+    assert ignore_args(exc, TODAY) == ["--ignore-vuln", "DEMO-2026-0001"]
+    assert ignore_args(exc, dt.date(2027, 1, 4)) == []
+```
+
+### Failure scenarios
+- **Skip de-duplication.** Sorted, de-duplicated lines can still look right, but any count you report
+  says 4 open `jinja2` findings instead of 3, and an open-findings metric drifts from reality. Print
+  `len(vulns)` against `len({v["id"] for v in vulns})` per package on the recorded report.
+- **Pick the fix with `max(fix_versions)` on strings.** Works here by luck, then picks `3.1.9` over
+  `3.1.10` on a later report. Test `max(["3.1.9", "3.1.10"])` against `max(..., key=Version)`.
+- **Match exceptions by advisory ID only.** The alias test fails: the team wrote the CVE number, pip-audit
+  reported a `PYSEC` ID, and the finding is treated as unexcepted. Print each finding's
+  `[id, *aliases]` next to the exception keys.
+- **Let an exception without `review_by` default to "forever".** A deferral nobody revisits becomes a
+  permanent hole. The loader test fails; read the offending entry's id from the `ValueError`.
+
+### Submission
+- **`lab.py`** with `load_exceptions`, `gate` and `ignore_args` implemented.
+- **A green test run** (7 passed) and the output of `python lab.py`.
+- **A real run:** export a lock from any uv project (`uv export --format requirements-txt --no-hashes`),
+  run `pip-audit -r req.txt --no-deps --disable-pip -f json > audit.json`, and feed it to `gate`.
+- **A two-line CI snippet** showing where the gate runs relative to `pip-audit` and what fails the build.
+- **Evaluated on:** tests passing, one upgrade line per package at the highest fix, alias matching, and
+  expired or reason-less exceptions failing loudly.
 
 ## Why it exists
 - **An AI service is mostly third-party code:** an LLM SDK, an HTTP stack, a web framework, tokenizers,

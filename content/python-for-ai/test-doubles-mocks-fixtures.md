@@ -5,7 +5,8 @@ name: Test doubles, mocks and fixtures
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/pytest
@@ -39,6 +40,166 @@ by what you verify: result or interaction.
   output, mess included.
 - **What you can skip.** Arguing taxonomy. Know the difference between replaying and computing, and
   between asserting on state and on calls; that decides every test.
+
+## Lab
+### Task
+An agent step has two defects that a live model would trigger only occasionally: it runs a destructive
+tool before asking for approval, and its retry after a timeout passes a misspelled keyword to the real
+client. You will expose both with the right double for each, then fix the code.
+- **Time box:** 40-60 minutes.
+- **Prerequisites:** pytest (fixtures) and this lesson's State vs behaviour verification and
+  unittest.mock mechanics sections.
+- **Setup:** Python 3.10+, `pip install pytest` (checked against pytest 9.1.1 on Python 3.12). Save the
+  starter as `agent_step.py` and the tests as `test_agent_step.py`.
+- **Goal:** a denied destructive tool records zero runs, and the retry call matches the real
+  `LLMClient.complete` signature.
+
+### Starter code
+```python
+"""agent_step.py: one agent step with an approval gate, and a model call with one retry."""
+
+
+class LLMClient:
+    """The real client's interface (the SDK wrapper used in production)."""
+
+    def complete(self, messages: list[dict], *, model: str, temperature: float = 1.0) -> str:
+        raise NotImplementedError("network call: never used in unit tests")
+
+
+def run_step(action, tools, approve):
+    """Run the tool the model asked for; destructive tools need approval first."""
+    tool = tools.get(action["tool"])
+    if tool is None:
+        return {"error": f"unknown tool {action['tool']}"}
+    result = tool(**action["args"])                     # EXERCISE: check approval before running
+    if tool.destructive and not approve(action):
+        return {"error": "denied by approval policy"}
+    return {"result": result}
+
+
+def ask(client, question, *, model="large"):
+    """Ask the model; on a timeout, retry once at temperature 0."""
+    messages = [{"role": "user", "content": question}]
+    try:
+        return client.complete(messages, model=model)
+    except TimeoutError:
+        return client.complete(messages, model=model, temprature=0)   # EXERCISE: a real-client bug
+
+
+if __name__ == "__main__":
+    class Tool:
+        def __init__(self, fn, destructive=False):
+            self.fn, self.destructive = fn, destructive
+
+        def __call__(self, **kw):
+            return self.fn(**kw)
+
+    deleted = []
+    tools = {"search": Tool(lambda q: [f"doc about {q}"]),
+             "delete_file": Tool(lambda path: deleted.append(path) or "deleted", destructive=True)}
+    print(run_step({"tool": "search", "args": {"q": "refunds"}}, tools, approve=lambda a: True))
+    print(run_step({"tool": "delete_file", "args": {"path": "/data/a.csv"}}, tools, approve=lambda a: False))
+    print("files actually deleted:", deleted)
+```
+
+### Expected output
+`python agent_step.py` after the fix. The starter prints the same denial but
+`files actually deleted: ['/data/a.csv']`: the step said no after the damage was done.
+
+```text
+{'result': ['doc about refunds']}
+{'error': 'denied by approval policy'}
+files actually deleted: []
+```
+
+`pytest -v` then reports `5 passed`.
+
+### Tests
+On the starter, 2 of 5 fail: the approval test with `assert [{'path': '/data/a.csv'}] == []`, and the
+retry test with `TypeError: got an unexpected keyword argument 'temprature'` raised by the autospec.
+The last test passes on both versions on purpose: it shows the bare `MagicMock` hiding the bug.
+
+```python
+from unittest.mock import MagicMock, create_autospec
+
+import pytest
+
+from agent_step import LLMClient, ask, run_step
+
+
+class FakeTool:
+    """Fake plus spy: returns a canned result and records every call."""
+
+    def __init__(self, result, destructive=False):
+        self.result, self.destructive, self.runs = result, destructive, []
+
+    def __call__(self, **kwargs):
+        self.runs.append(kwargs)
+        return self.result
+
+
+def test_read_tool_result_is_returned():
+    search = FakeTool(["doc-7", "doc-2"])
+    out = run_step({"tool": "search", "args": {"q": "refund policy"}}, {"search": search}, approve=lambda a: True)
+    assert out == {"result": ["doc-7", "doc-2"]}
+    assert search.runs == [{"q": "refund policy"}]
+
+
+def test_destructive_tool_never_runs_without_approval():
+    delete = FakeTool("deleted", destructive=True)
+    action = {"tool": "delete_file", "args": {"path": "/data/a.csv"}}
+    out = run_step(action, {"delete_file": delete}, approve=lambda a: False)
+    assert out == {"error": "denied by approval policy"}
+    assert delete.runs == []                     # the interaction is the requirement
+
+
+def test_approved_destructive_tool_gets_its_arguments():
+    delete = FakeTool("deleted", destructive=True)
+    action = {"tool": "delete_file", "args": {"path": "/data/a.csv"}}
+    assert run_step(action, {"delete_file": delete}, approve=lambda a: True) == {"result": "deleted"}
+    assert delete.runs == [{"path": "/data/a.csv"}]
+
+
+@pytest.fixture
+def client():
+    llm = create_autospec(LLMClient, instance=True)   # rejects calls the real class would reject
+    llm.complete.side_effect = [TimeoutError(), "ok"]  # timeout, then success
+    return llm
+
+
+def test_retry_after_timeout_uses_temperature_zero(client):
+    assert ask(client, "hi", model="small") == "ok"
+    assert client.complete.call_count == 2
+    assert client.complete.call_args.kwargs == {"model": "small", "temperature": 0}
+
+
+def test_bare_magicmock_would_hide_the_bug():
+    llm = MagicMock()                                  # accepts any keyword: the anti-pattern
+    llm.complete.side_effect = [TimeoutError(), "ok"]
+    assert ask(llm, "hi") == "ok"                      # passes on the starter and the fix alike
+```
+
+### Failure scenarios
+- **Inject: `MagicMock()` in the `client` fixture.** The retry test now fails only on the kwargs
+  assertion, not at the call. Delete that assertion and the typo passes. Debug: this is why every client
+  double is autospecced; the signature check must not depend on someone remembering an assertion.
+- **Inject: `side_effect=TimeoutError()` instead of a list.** The exception is raised on every call, so
+  the retry raises too. Debug: an iterable is consumed one item per call; an exception instance is
+  raised each time.
+- **Inject: move `runs = []` to a class attribute of `FakeTool`.** The denial test fails or passes
+  depending on test order, because runs leak between instances. Debug: run it alone with `-k`, then the
+  whole file; keep recording state on the instance.
+- **Inject: assert the exact call sequence of `approve` and the tool.** A harmless reorder breaks the
+  test. Debug: keep behaviour checks only where the call is the requirement, as in `delete.runs == []`.
+
+### Submission
+- **The fixed `agent_step.py`** with the given tests unchanged and all 5 passing.
+- **The starter's failing log**, showing the list diff and the autospec `TypeError`.
+- **One more test of your own** for an unknown tool name, using state verification only.
+- **A short note** classifying each double used here (fake, spy, autospecced mock, bare mock) and why it
+  fits what that test verifies.
+- **Evaluated by:** no network or key needed, a denied tool records zero runs, and no bare `MagicMock`
+  stands in for a client outside the demonstration test.
 
 ## Why it exists
 - **Real dependencies are unaffordable in unit tests.** A real LLM call costs money, takes hundreds of

@@ -5,7 +5,8 @@ name: Transformer
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 related:
   - model-internals/attention-mechanism
@@ -175,6 +176,21 @@ flowchart TD
     R2 --> H["Final norm and LM head"]
     H --> O["Next-token logits"]
 ```
+
+## Misconceptions
+- **"Attention is where the model's knowledge lives."** Attention routes information between positions;
+  the per-position MLP holds roughly two thirds of each layer's weights and is where stored associations
+  appear to live.
+- **"Inference costs 2N FLOPs per token, whatever the context."** There is also an attention-score term of
+  about 4·n·d per layer per token; it equals the weight FLOPs near n ≈ 6d, about 24k tokens for d = 4096.
+- **"An agent run costs roughly steps times cost per step."** Cost follows transcript tokens and their
+  positions: without prefix reuse each step re-reads the whole transcript, and even with it late tokens
+  are dearer.
+- **"Instructions placed after a tool result change how the model reads that result."** Attention is
+  causal: the result's tokens were encoded before the instruction existed. Only tokens after the
+  instruction see both, so put guidance before the content it should shape.
+- **"Any transformer works for any agent step."** An encoder-only model cannot generate, and a
+  decoder's last hidden state is not a good embedding out of the box; match layout to the step.
 
 ## Examples
 ### Worked scenario: compute for a 10-step agent on a self-hosted 7B model

@@ -5,7 +5,8 @@ name: Outbox / inbox patterns
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/event-driven-architecture
@@ -39,6 +40,63 @@ effect. Together: effectively-once between databases over at-least-once delivery
   key to external APIs, which the inbox cannot protect.
 - **What you can skip.** WAL internals and Debezium connector tuning. Know the dual-write problem, why
   the relay must select `published_at IS NULL`, and where the guarantee ends.
+
+## Decision case
+### Scenario
+A customer-support platform runs reply agents whose runtime keeps runs and checkpoints in managed
+Postgres. Today it commits a step and then calls Kafka and the email provider directly. Finance found
+unbilled runs; customers report replies that never arrived. All figures are illustrative.
+- **Scale:** at peak 3,000 runs an hour, about 10 events each (step completed, run completed), so 30,000
+  events an hour, about 8.3 a second; plus 1,500 pending email replies an hour.
+- **Consumers:** a billing ledger (a duplicate changes the total), an eval sampler (upserts by run id),
+  and an audit log.
+- **Constraints:** billing and evals may lag up to 1 minute; replies must be sent within 10 s at p95 and
+  never twice; the DBA must approve any replication slot, because a stalled slot retains WAL on a
+  500 GB disk; 2 platform engineers, no Kafka Connect experience; 4 weeks.
+
+### Options
+| Option | How it works | Lost events | Latency | Ordering per run | Ops fit |
+|---|---|---|---|---|---|
+| A. Keep direct publish, add retries | Commit, then publish and send from the same process with retries | Still lost when the process dies after commit; retries die with it | Lowest | Per run, if keyed by run id | Nothing new, but the bug stays |
+| B. Polling outbox relay, woken by `NOTIFY` | Events and pending actions committed with the checkpoint; one relay claims `published_at IS NULL` rows with `SKIP LOCKED`; a separate executor sends emails keyed by row id | None: rows exist if and only if the step committed | Milliseconds after commit via `LISTEN`, 1 s poll as a safety net | Yes, with one relay or relays partitioned by run | Plain SQL in a database the team runs |
+| C. CDC with Debezium's outbox router | Same outbox table; a connector tails the WAL and routes rows to topics | None | Milliseconds, no polling | Commit order from one log | Needs a replication slot and a Connect cluster to operate |
+
+### Decision
+Choose **B**, with a separate `pending_actions` table and an inbox only where duplicates matter, because:
+- **The loss is a dual write, so retries cannot fix it.** In-flight events at any moment are about
+  8.3/s × 0.05 s (a 50 ms publish window) ≈ 0.4, so roughly one event is lost for every two or three
+  abrupt restarts. Each is
+  an unbilled run or a missing reply, and nothing logs an error.
+- **The volume is far inside polling's range.** About 8 events a second costs one small indexed query per
+  wake-up, and `NOTIFY` on commit keeps reply latency well under the 10 s budget.
+- **It avoids the replication-slot risk** and a Connect cluster the team cannot operate in 4 weeks.
+- **Inbox where the effect is not idempotent.** The billing ledger gets an inbox keyed on `event_id`; the
+  eval sampler already upserts by run id and skips it; the email executor passes `outbox-{id}` as the
+  provider's idempotency key, since an inbox cannot protect an external send.
+
+**What would change it:** event volume growing by around 100 times, or several relays that must keep
+commit order, favours C once the DBA approves a slot with lag alerting; a broker that is itself the system
+of record would remove the outbox entirely.
+
+### Trade-offs accepted
+- **One extra write per event.** At most 720,000 outbox rows a day (peak rate for 24 hours); at 7-day retention about 5 million rows.
+  Watch: table size and dead tuples, and prune in small batches.
+- **One relay is a throughput ceiling.** Partition by run id before adding relays. Watch: oldest
+  unpublished row age against the 1-minute budget.
+- **Locks held during publish.** Small batches and a short publish timeout. Watch: relay transaction
+  duration.
+- **Duplicates still reach consumers.** Watch: inbox duplicate rate, provider dedupe hits, and keep inbox
+  rows longer than the broker's maximum redelivery delay.
+
+### Review rubric
+- **The dual write is located precisely:** which commit and which publish or send, and why a retry dies
+  with the process.
+- **The relay choice is tied to volume, latency and ops constraints,** with the relay query selecting
+  `published_at IS NULL`, not a high-water mark.
+- **Event relay and action executor are separated,** so an action row is never marked published unsent.
+- **Inbox placement is justified per consumer:** used for non-idempotent effects, skipped for upserts.
+- **External effects carry their own idempotency key,** derived from a stable row or event id.
+- **Lag, size and duplicate signals are named** with thresholds tied to the stated budgets.
 
 ## Why it exists
 A service cannot atomically commit a database row and publish a message, yet every producer must commit

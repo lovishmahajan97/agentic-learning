@@ -5,7 +5,8 @@ name: Softmax
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 related:
   - model-internals/logits
@@ -145,6 +146,22 @@ flowchart TD
     W --> V["Weighted sum of values"]
     P --> S["Truncate and sample"]
 ```
+
+## Misconceptions
+- **"A router that says 0.95 is right 95% of the time."** Softmax guarantees a distribution, not
+  calibration; trained models are often overconfident. Fit a temperature on labelled agent decisions
+  before any escalation threshold relies on the number.
+- **"Changing temperature changes which option is best."** Dividing by *T* preserves the ranking; it only
+  moves confidence and how often lower-ranked tokens are sampled. Logits `[2.0, 1.0, 0.1]` keep the same
+  leader at `T = 0.5`, 1 and 2.
+- **"At low temperature a bad token cannot appear."** Any `T > 0` leaves every finite logit with positive
+  probability, so over thousands of agent steps a rare token eventually gets sampled. Only truncation or a
+  `−∞` mask removes it.
+- **"Softmax is the natural head for picking tools."** Its outputs sum to one, which forces labels to
+  compete; a request that needs both search and calendar wants independent sigmoids.
+- **"The first tokens of a long session are the safest to evict."** Because attention weights must sum
+  to one, models park spare attention on the first tokens. Evicting these sink tokens collapses quality,
+  so pin them.
 
 ## Examples
 ### Stable softmax and temperature

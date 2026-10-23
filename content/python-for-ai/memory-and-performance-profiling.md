@@ -5,7 +5,8 @@ name: Memory & performance profiling
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/gil
@@ -40,6 +41,165 @@ measure wall versus CPU time first.
   (step caps, compaction, TTL eviction), worker recycling, and which benchmarks gate a performance change.
 - **What you can skip.** Micro-optimizing prompt-building or JSON parsing code. In an agent it is rarely
   more than a sliver of a step that waits seconds on a model.
+
+## Lab
+### Task
+Diagnose and fix the two classic agent-server tickets on a local stand-in: a step that is slow because
+three independent tool calls run one after another, and a session cache whose heap grows without bound.
+You build the measurements first (wall vs CPU, tracemalloc growth), then the fixes, and prove both with
+numbers. Time box: 60-90 min.
+- **Prerequisites:** asyncio vs threads vs multiprocessing; Generators (for bounded buffers).
+- **Setup:** Python 3.10+, `pip install pytest`; standard library otherwise. Save the starter as `lab.py`,
+  the tests as `test_lab.py`.
+- **Stand-ins:** `asyncio.sleep` plays a network tool call, a string loop plays CPU work, and 2 KB strings
+  play large tool outputs kept in transcripts.
+
+### Starter code
+```python
+"""Lab: profile a slow, leaky agent step, then fix it. Run: python lab.py"""
+from __future__ import annotations
+import asyncio, time, tracemalloc
+from collections import OrderedDict, deque
+from typing import Awaitable, Callable
+
+async def call_tool(name: str, latency_s: float) -> str:    # stands in for an HTTP tool call
+    await asyncio.sleep(latency_s)
+    return f"{name}: ok"
+
+async def step_sequential(tools: dict[str, float]) -> list[str]:   # the slow version
+    return [await call_tool(n, s) for n, s in tools.items()]
+
+def tokenize_loop(n: int = 300_000) -> None:                # pure-Python CPU work
+    sum(len(w) for w in ("the quick brown fox " * n).split())
+
+def profile_step(fn: Callable[[], Awaitable | None]) -> dict:
+    # YOUR CODE HERE: run fn() (asyncio.run it if it returns a coroutine) and return
+    # {"wall_s": ..., "cpu_s": ..., "verdict": "waiting" if cpu < 0.5 * wall else "cpu-bound"}
+    # using time.perf_counter() for wall time and time.process_time() for CPU time
+    raise NotImplementedError
+
+async def step_concurrent(tools: dict[str, float]) -> list[str]:
+    # YOUR CODE HERE: run the independent tool calls concurrently; keep the input order
+    raise NotImplementedError
+
+def heap_growth(fn: Callable[[], object]) -> int:
+    # YOUR CODE HERE: bytes of Python heap still allocated after fn() returns, measured with
+    # tracemalloc snapshots taken before and after (sum of size_diff over compare_to(..., "filename"))
+    raise NotImplementedError
+
+class BoundedSessions:
+    """In-process cache of agent transcripts: LRU over sessions, last max_turns turns per session."""
+    def __init__(self, max_sessions: int, max_turns: int) -> None:
+        self._d: OrderedDict[str, deque[str]] = OrderedDict()
+        self.max_sessions, self.max_turns = max_sessions, max_turns
+    def append(self, sid: str, turn: str) -> None:
+        # YOUR CODE HERE: append the turn, mark sid most recently used, evict the least recently
+        # used session when there are more than max_sessions
+        raise NotImplementedError
+    def turns(self, sid: str) -> list[str]:
+        return list(self._d.get(sid, ()))
+    def __len__(self) -> int:
+        return len(self._d)
+
+def workload(store) -> object:                              # 2,000 sessions x 10 steps x ~2 KB
+    for i in range(20_000):
+        store.append(f"s{i % 2_000}", f"tool result {i}: " + "x" * 2_000)
+    return store
+
+class Unbounded(dict):
+    def append(self, sid: str, turn: str) -> None:
+        self.setdefault(sid, []).append(turn)
+
+KEEP: list = []                                             # keeps results alive for heap_growth
+
+if __name__ == "__main__":
+    tools = {"crm": 0.2, "orders": 0.2, "kb": 0.2}
+    for name, fn in [("sequential step", lambda: step_sequential(tools)), ("cpu loop", tokenize_loop),
+                     ("concurrent step", lambda: step_concurrent(tools))]:
+        p = profile_step(fn)
+        print(f"{name:<16} wall={p['wall_s']:.1f}s verdict={p['verdict']}")
+    for name, factory in [("unbounded", Unbounded), ("bounded", lambda: BoundedSessions(200, 5))]:
+        mb = heap_growth(lambda: KEEP.append(workload(factory()))) / 1e6
+        print(f"{name:<16} heap growth={mb:.0f} MB")
+```
+
+### Expected output
+Key lines from a correct solution (Python 3.12 on an Apple-silicon laptop). The verdicts and the step wall
+times are stable; the CPU loop's wall time and the heap numbers vary a little by machine and Python version.
+
+```
+sequential step  wall=0.6s verdict=waiting
+cpu loop         wall=0.1s verdict=cpu-bound
+concurrent step  wall=0.2s verdict=waiting
+unbounded        heap growth=42 MB
+bounded          heap growth=1 MB
+```
+
+The bounded store keeps only 200 turns, not 1,000: the workload cycles through 2,000 sessions, so each is
+evicted before its second turn arrives. That is LRU doing its job, and a hint to size `max_sessions` from
+real traffic.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution
+passes all 5 in about a second (Python 3.12, pytest 9.1).
+
+```python
+import asyncio
+from lab import (BoundedSessions, Unbounded, heap_growth, profile_step, step_concurrent,
+                 step_sequential, tokenize_loop, workload)
+
+TOOLS = {"crm": 0.1, "orders": 0.1, "kb": 0.1}
+
+def test_profile_tells_waiting_from_cpu_bound():
+    slow = profile_step(lambda: step_sequential(TOOLS))
+    assert slow["verdict"] == "waiting" and slow["wall_s"] >= 0.3
+    assert profile_step(tokenize_loop)["verdict"] == "cpu-bound"
+
+def test_concurrent_step_is_faster_and_keeps_order():
+    p = profile_step(lambda: step_concurrent(TOOLS))
+    assert p["wall_s"] < 0.2
+    assert asyncio.run(step_concurrent(TOOLS)) == ["crm: ok", "orders: ok", "kb: ok"]
+
+def test_heap_growth_sees_retained_bytes_only():
+    kept = []
+    assert heap_growth(lambda: kept.append("x" * 1_000_000)) >= 1_000_000
+    assert heap_growth(lambda: len("x" * 1_000_000)) < 100_000
+
+def test_sessions_are_lru_and_capped():
+    s = BoundedSessions(max_sessions=2, max_turns=2)
+    for sid, turn in [("a", "1"), ("b", "1"), ("a", "2"), ("a", "3"), ("c", "1")]:
+        s.append(sid, turn)
+    assert len(s) == 2 and s.turns("a") == ["2", "3"] and s.turns("b") == []
+
+def test_bounded_store_stops_the_growth():
+    kept = []
+    unbounded = heap_growth(lambda: kept.append(workload(Unbounded())))
+    bounded = heap_growth(lambda: kept.append(workload(BoundedSessions(200, 5))))
+    assert unbounded > 30_000_000 and bounded < 4_000_000
+```
+
+### Failure scenarios
+- **Measure CPU with `perf_counter` twice.** Every verdict becomes `cpu-bound`, including the sequential
+  step that only sleeps. Print `wall_s` and `cpu_s` side by side: for a waiting step CPU time should be
+  near zero.
+- **"Parallelize" with a loop that awaits each task right after creating it.** The concurrent step still
+  takes about 0.3 s and the speed test fails. Wrap each `call_tool` in a timer, or log start times: they
+  should all start within a millisecond.
+- **Take the "after" snapshot inside `fn`, or let `fn`'s result die before it.** `heap_growth` reports
+  near zero for the unbounded store, hiding the leak. Retain the result (the `KEEP` list) until the
+  second snapshot, then print `compare_to(before, "lineno")[:3]` to see the growing line.
+- **Mark a session as used without moving it to the end of the `OrderedDict`.** The LRU test evicts `a`
+  instead of `b`. Print `list(s._d)` after each append and check the order.
+
+### Submission
+- **`lab.py`** with the four `YOUR CODE HERE` parts implemented, standard library only.
+- **A green test run** (5 passed) and your `python lab.py` output.
+- **A before/after table** of step wall time and heap growth, with your machine and Python version.
+- **One `compare_to(before, "lineno")` top entry** for the unbounded store, naming the line that grows.
+- **A note:** why tracemalloc would *not* have found this leak if the transcripts were PyTorch CPU tensors,
+  and which tool you would use instead.
+- **Evaluated on:** tests passing, correct verdicts, a real concurrency fix, and numbers that support the
+  conclusion.
 
 ## Why it exists
 - **Two tickets dominate.** "The pipeline is slow" and "the worker gets OOM-killed after a few hours", and

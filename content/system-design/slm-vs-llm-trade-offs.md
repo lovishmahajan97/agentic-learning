@@ -5,7 +5,8 @@ name: SLM vs LLM trade-offs
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - model-internals/small-language-models
@@ -39,6 +40,62 @@ long tool use and world knowledge stay on the LLM. Decide per step.
   evaluate and serve.
 - **What you can skip.** Scaling-law fitting and the details of distillation losses. Know which
   capabilities shrink first, the bandwidth arithmetic, and how to calibrate a cascade.
+
+## Decision case
+### Scenario
+A field-service company runs a technician agent: 40,000 runs a day, 8 steps each. Every step passes a
+guardrail check (PII and safety policy) on the tool result before the planner sees it, so there are
+320,000 checks a day. The planner stays on an LLM; the question is the guardrail step. All figures are
+illustrative.
+- **Latency:** guardrail checks may add at most 2 s to a run.
+- **Quality:** at least 97% accuracy on a 2,000-item human-labelled test set (interval about ±0.75
+  points at that rate).
+- **Cost:** each check is about 400 input and 5 output tokens; the API LLM costs 1 unit per million
+  input and 3 per million output, so 0.000415 a check. A self-hosted GPU node costs a fixed 100 units a
+  day and carries the average of about 3.7 checks a second.
+- **Team:** one ML engineer, half-time, owns serving. Sending check inputs to the API is allowed by
+  contract.
+
+Measured latencies per check: about 0.8 s on the LLM, about 0.08 s on the self-hosted SLM.
+
+### Options
+| Option | How it works | Added latency per run | Accuracy | Cost per day | Operations |
+|---|---|---|---|---|---|
+| **A. LLM API on every check** | one API call per step | 8 × 0.8 = 6.4 s: fails | 97.5% | 320,000 × 0.000415 ≈ 133 | none |
+| **B. Fine-tuned SLM only** | 7B distilled from logged LLM decisions, self-hosted | 8 × 0.08 = 0.64 s | 95.5%: fails | 100, plus about 6,400 extra wrong checks a day | one model to serve and retrain |
+| **C. Cascade** | SLM first; below the calibrated threshold (10% of checks) escalate to the LLM | 8 × (0.08 + 0.1 × 0.8) = 1.28 s | 97.1% | 100 + 0.1 × 133 ≈ 113 | B plus a threshold to recalibrate |
+
+### Decision
+**Choose C.** The binding constraint is latency, not price:
+- A fails the 2 s budget by more than three times, whatever it costs.
+- B meets latency but misses the accuracy bar by 1.5 points; on 320,000 checks that is a daily stream of
+  misclassified tool results reaching the planner.
+- C meets both. Its 0.4-point gap to A sits inside the test set's interval, and its cost is close to
+  A's, so the cascade is bought for latency and quality.
+
+**What would change it.**
+- **Escalation creep.** Latency allows at most 21% escalation, since 8 × (0.08 + 0.8e) ≤ 2 gives
+  e ≤ 0.2125. If recalibration pushes escalation past that, retrain the SLM rather than lowering the bar.
+- **Lower volume.** Below about 241,000 checks a day (100 ÷ 0.000415) the GPU costs more than the API
+  calls it replaces; latency still rules out A, so a hosted small-model API with fine-tuning becomes
+  the candidate.
+- **No serving owner.** If the half-time engineer leaves, the same hosted option replaces self-hosting.
+
+### Trade-offs accepted
+- **A calibrated threshold to maintain.** It drifts with inputs; it is recalibrated monthly on fresh
+  human labels, with escalation rate and accepted-item accuracy on the dashboard.
+- **Two code paths.** An escalation pays both calls; p95 added latency per run is tracked against 2 s.
+- **A retraining treadmill.** New tools change what tool results look like; schema and label changes
+  per month are counted as the signal to re-distil.
+- **One GPU node.** A node failure routes all checks to the LLM, which breaks the latency budget but not
+  safety; the fallback share has an alert.
+
+### Review rubric
+- Identifies which agent steps are narrow and high-frequency, and keeps planning on the LLM.
+- Computes per-run latency, per-day cost and the GPU break-even from stated figures, reproducibly.
+- Tests the exact deployed artefact on a human-labelled set and states the interval.
+- Includes the error-cost or accuracy-gap term, not only price per token.
+- Derives the escalation rate at which the cascade stops meeting the budget, and the action taken then.
 
 ## Why it exists
 - **What "small" means.** Roughly up to the low tens of billions of parameters, runnable on one GPU or a

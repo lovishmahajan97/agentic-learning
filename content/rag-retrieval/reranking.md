@@ -5,7 +5,8 @@ name: Reranking (cross-encoder)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -166,7 +167,63 @@ flowchart TD
     CE -.->|"timeout"| FB["Fall back to first-stage order"]
 ```
 
+## Misconceptions
+- **"A reranker improves recall."** It only reorders the n candidates the first stage returned. If the
+  answer is not among them, no reranker can surface it; check recall@n first and widen n.
+- **"More candidates always means better answers."** Reranker cost is linear in n: 20 candidates cost
+  8,400 encoder tokens per query, 200 cost 84,000. Past the knee of the recall@n curve, the extra pairs
+  buy only latency, paid on every agent search.
+- **"Reranker scores are probabilities, so one cutoff works for any model."** A cross-encoder emits a
+  logit whose scale depends on the model and its training. A "no relevant context" threshold must be
+  calibrated on labeled queries per model version.
+- **"The reranker reads the whole passage."** BERT-derived rerankers stop at 512 tokens, and longer
+  candidates are silently truncated, so only their beginning is scored. Window long chunks and take the
+  best window.
+- **"The top k after reranking is a good set."** Each pair is scored in isolation, so near-duplicates all
+  win slots, and a rule and its exception are not kept together. Deduplicate or cap per source, and keep
+  k large enough for passages that only work together.
+
 ## Examples
+### Two-stage retrieval with public models
+A small bi-encoder retrieves five candidates by cosine; an MS MARCO cross-encoder rescores each pair
+jointly.
+
+Vocabulary overlap is a bad guide here: the price-match and warranty passages share "30 days"
+and "laptops" with the query but answer nothing, while the real answer needs two passages, the general
+30-day rule and the 14-day exception for laptops.
+
+```python
+import numpy as np
+from sentence_transformers import SentenceTransformer, CrossEncoder
+
+passages = [
+    "Returns are accepted within 30 days of delivery if the item is unopened.",
+    "Laptops and tablets may be returned within 14 days; the box must be unopened.",
+    "Opened software cannot be returned; unopened software follows the 30-day policy.",
+    "Our 30-day price-match guarantee covers laptops bought in store or online.",
+    "Return shipping labels can be printed from your order page.",
+    "Warranty claims for laptops older than 30 days go through the manufacturer.",
+]
+query = "Can I return an unopened laptop after 20 days?"
+
+bi = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+P = bi.encode(passages, normalize_embeddings=True)
+q = bi.encode(query, normalize_embeddings=True)
+stage1 = np.argsort(-(P @ q))[:5]                     # top-5 by cosine: cheap, precomputable
+print("stage 1:", [passages[i][:40] for i in stage1])
+
+pairs = [(query, passages[i]) for i in stage1]
+scores = ce.predict(pairs)                            # one joint forward pass per pair
+for i, s in sorted(zip(stage1, scores), key=lambda t: -t[1]):
+    print(f"{s:+6.2f}  {passages[i][:60]}")
+# One run (sentence-transformers 5.1): the 14-day laptop rule +5.79 first, unopened software +3.61,
+# the general 30-day rule +2.27, then warranty -1.98 and price-match -7.45 at the bottom. The order
+# of the top three varies by model, and neither model reasons that the exception overrides the rule:
+# that is the LLM's job, so k must be large enough (here 3) for the rule and exception to survive.
+```
+
 ### Worked scenario: what reranking saves an agent in context tokens
 A research agent searches 5 times per task. Chunks are 400 tokens, and every tool result stays in the
 transcript for the remaining steps.
@@ -211,46 +268,6 @@ def search_tool(query, first_stage, n=50, k=3):
 
 - **Log `reranked` and the top score** in the trace; a rising fallback rate or a shifted score
   distribution is the first sign of GPU trouble or a model change.
-
-### Two-stage retrieval with public models
-A small bi-encoder retrieves five candidates by cosine; an MS MARCO cross-encoder rescores each pair
-jointly.
-
-Vocabulary overlap is a bad guide here: the price-match and warranty passages share "30 days"
-and "laptops" with the query but answer nothing, while the real answer needs two passages, the general
-30-day rule and the 14-day exception for laptops.
-
-```python
-import numpy as np
-from sentence_transformers import SentenceTransformer, CrossEncoder
-
-passages = [
-    "Returns are accepted within 30 days of delivery if the item is unopened.",
-    "Laptops and tablets may be returned within 14 days; the box must be unopened.",
-    "Opened software cannot be returned; unopened software follows the 30-day policy.",
-    "Our 30-day price-match guarantee covers laptops bought in store or online.",
-    "Return shipping labels can be printed from your order page.",
-    "Warranty claims for laptops older than 30 days go through the manufacturer.",
-]
-query = "Can I return an unopened laptop after 20 days?"
-
-bi = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
-P = bi.encode(passages, normalize_embeddings=True)
-q = bi.encode(query, normalize_embeddings=True)
-stage1 = np.argsort(-(P @ q))[:5]                     # top-5 by cosine: cheap, precomputable
-print("stage 1:", [passages[i][:40] for i in stage1])
-
-pairs = [(query, passages[i]) for i in stage1]
-scores = ce.predict(pairs)                            # one joint forward pass per pair
-for i, s in sorted(zip(stage1, scores), key=lambda t: -t[1]):
-    print(f"{s:+6.2f}  {passages[i][:60]}")
-# One run (sentence-transformers 5.1): the 14-day laptop rule +5.79 first, unopened software +3.61,
-# the general 30-day rule +2.27, then warranty -1.98 and price-match -7.45 at the bottom. The order
-# of the top three varies by model, and neither model reasons that the exception overrides the rule:
-# that is the LLM's job, so k must be large enough (here 3) for the rule and exception to survive.
-```
 
 ### Production snippet: windowed scoring plus a per-source cap
 Long candidates are split into overlapping windows (by words here, as a stand-in for tokens) so nothing

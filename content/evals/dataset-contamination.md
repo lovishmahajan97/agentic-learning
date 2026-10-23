@@ -5,7 +5,8 @@ name: Dataset contamination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -165,6 +166,25 @@ flowchart TD
     V -->|"yes"| M["Memorization signal: quote clean score"]
     V -->|"no"| ND["Not detectably contaminated, these routes only"]
 ```
+
+## Misconceptions
+- **"The vendor decontaminated, so the benchmark is clean."** That usually means n-gram filtering
+  against known benchmarks. It catches verbatim copies and misses paraphrases, translations, worked
+  solutions and transitive leaks through another model's synthetic data.
+- **"Contamination is a pretraining problem, not mine."** The routes teams most often get wrong are
+  their own: few-shot examples from the eval split, fine-tuning on a dump that contains golden items,
+  and for agents a search tool, a sandbox repo or a shared memory store that hands over the answer.
+- **"Flagged items scoring higher than clean ones proves memorization."** Widely copied items tend to
+  be the famous, easier ones, so any model may score higher on them. Only a gap larger than a control
+  model's, one that could not have seen the corpus, is a memorization signal.
+- **"Passing the overlap check means uncontaminated."** It means not detectably contaminated by
+  near-verbatim text. The scoped claim names the routes checked; it is never "clean".
+- **"A search-enabled agent's benchmark score measures its reasoning."** If the fetched page publishes
+  the benchmark, the pass measures lookup. Scan tool results for the reference answer and report the
+  score with those passes counted as unverified.
+- **"Switching to a newer benchmark solves it."** It helps until the benchmark is on GitHub and in the
+  next crawl, often within months. Contamination is a standing condition to measure, not a bug fixed
+  once.
 
 ## Examples
 ### Corpus-side overlap check with split scores

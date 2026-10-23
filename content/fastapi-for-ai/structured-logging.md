@@ -5,7 +5,8 @@ name: Structured logging
 kind: practice
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/middleware-ordering
@@ -38,6 +39,195 @@ Structured logging emits each event as one JSON object with named fields (`reque
   into threads and queues.
 - **What you can skip.** Logging framework internals and handler zoo. One pipeline, one schema, JSON to
   stdout is enough; tracing tools (Langfuse, LangSmith, OpenTelemetry) cover the span view.
+
+## Lab
+### Task
+A support agent's logs cannot answer "which tool failed in run r1?": no line carries `run_id`, `step`
+or `tool`, a sync CRM client logs from a thread pool with no context at all, and the raw tool arguments
+put a customer's email into the logs.
+
+Fix the pipeline and the loop so every line is attributable and
+only the shape of content is logged.
+
+Time box: 45-60 minutes.
+- **Prerequisites:** Middleware ordering, Async endpoints, and this lesson's "Request context with
+  contextvars" and "Where context does not follow".
+- **Setup:** Python 3.12 with `pip install structlog pytest` (checked on structlog 26.1). The model and
+  tools are local fakes. Save the starter as `lab_logs.py` and the tests as `test_lab_logs.py`.
+- **Constraint:** keep the tools synchronous; fix how they are called, not the tools.
+
+### Starter code
+```python
+"""Lab: run, step and tool on every agent log line, and no content (structlog 26.1, Python 3.12)."""
+import asyncio, hashlib, io, json, time
+import structlog
+
+SENSITIVE = {"prompt", "messages", "arguments", "api_key"}
+
+
+def configure(stream) -> None:
+    """LAB 1: JSON lines to `stream`. Add, in order: merge contextvars, log level, a processor that
+    replaces any SENSITIVE key's value with "[redacted]", then the JSON renderer."""
+    structlog.configure(
+        processors=[structlog.processors.add_log_level, structlog.processors.JSONRenderer()],
+        logger_factory=structlog.PrintLoggerFactory(file=stream),
+        cache_logger_on_first_use=False,
+    )
+
+
+log = structlog.get_logger()
+
+
+class FakeLLM:                                       # scripted model replies
+    def __init__(self):
+        self.replies = iter([
+            {"model": "model-a", "usage": (812, 40), "tool_calls": [
+                {"name": "lookup_order", "args": {"order": "42", "email": "ana@example.com"}},
+                {"name": "search_kb", "args": {"query": "refund window"}}]},
+            {"model": "model-a", "usage": (1020, 85), "text": "Your refund is on its way."},
+        ])
+
+    async def complete(self):
+        return next(self.replies)
+
+
+class FakeTools:                                     # sync clients, as many SDKs still are
+    def lookup_order(self, order, email):
+        time.sleep(0.01)
+        log.info("crm_request", rows=1)              # a library log line from inside the tool
+        return {"order": order, "status": "refunded"}
+
+    def search_kb(self, query):
+        raise TimeoutError("kb timed out")
+
+
+def arg_shape(args: dict) -> dict:
+    blob = json.dumps(args, sort_keys=True).encode()
+    return {"arg_keys": sorted(args), "arg_hash": hashlib.sha256(blob).hexdigest()[:12]}
+
+
+async def call_sync_tool(fn, args):
+    # LAB 3: run_in_executor does not copy contextvars, so crm_request loses its context here.
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: fn(**args))
+
+
+async def run_agent(run_id: str, llm, tools, max_steps: int = 5):
+    # LAB 2: bind run_id for the whole run, step per iteration and tool per call
+    #        (structlog.contextvars.bound_contextvars), and log arg_shape(...) instead of the arguments.
+    for step in range(1, max_steps + 1):
+        reply = await llm.complete()
+        log.info("llm_call_finished", model=reply["model"],
+                 prompt_tokens=reply["usage"][0], completion_tokens=reply["usage"][1])
+        if "text" in reply:
+            log.info("agent_run_finished", stop_reason="done", steps=step)
+            return reply["text"]
+        for call in reply["tool_calls"]:
+            outcome = "ok"
+            try:
+                await call_sync_tool(getattr(tools, call["name"]), call["args"])
+            except Exception:
+                outcome = "error"
+            log.info("tool_call_finished", outcome=outcome, arguments=call["args"])
+    log.warning("agent_run_finished", stop_reason="max_steps", steps=max_steps)
+
+
+if __name__ == "__main__":
+    buf = io.StringIO()
+    configure(buf)
+    asyncio.run(run_agent("r1", FakeLLM(), FakeTools()))
+    for line in buf.getvalue().splitlines():
+        e = json.loads(line)
+        print(e["event"], *(f"{k}={e.get(k, '-')}" for k in ("run_id", "step", "tool", "outcome")))
+    print("content leaked:", "ana@example.com" in buf.getvalue())
+```
+
+As given, every line prints `run_id=- step=- tool=-` and the last line is `content leaked: True`.
+
+### Expected output
+```
+llm_call_finished run_id=r1 step=1 tool=- outcome=-
+crm_request run_id=r1 step=1 tool=lookup_order outcome=-
+tool_call_finished run_id=r1 step=1 tool=lookup_order outcome=ok
+tool_call_finished run_id=r1 step=1 tool=search_kb outcome=error
+llm_call_finished run_id=r1 step=2 tool=- outcome=-
+agent_run_finished run_id=r1 step=2 tool=- outcome=-
+content leaked: False
+```
+
+### Tests
+```python
+import asyncio, io, json
+import lab_logs as lab
+
+
+def run():
+    buf = io.StringIO()
+    lab.configure(buf)
+    asyncio.run(lab.run_agent("r1", lab.FakeLLM(), lab.FakeTools()))
+    return buf.getvalue(), [json.loads(line) for line in buf.getvalue().splitlines()]
+
+
+def by_event(events, name):
+    return [e for e in events if e["event"] == name]
+
+
+def test_every_line_carries_the_run_and_a_level():
+    _, events = run()
+    assert len(events) == 6
+    assert all(e.get("run_id") == "r1" and e.get("level") for e in events)
+
+
+def test_tool_lines_know_their_step_and_tool_even_from_a_thread():
+    _, events = run()
+    crm = by_event(events, "crm_request")
+    assert crm and crm[0]["step"] == 1 and crm[0]["tool"] == "lookup_order"
+    tools = by_event(events, "tool_call_finished")
+    assert [(e["tool"], e["outcome"]) for e in tools] == [("lookup_order", "ok"), ("search_kb", "error")]
+
+
+def test_tool_context_does_not_leak_into_the_next_step():
+    _, events = run()
+    second = by_event(events, "llm_call_finished")[1]
+    assert second["step"] == 2 and "tool" not in second
+
+
+def test_shape_not_content():
+    text, events = run()
+    assert "ana@example.com" not in text
+    first = by_event(events, "tool_call_finished")[0]
+    assert first["arg_keys"] == ["email", "order"] and len(first["arg_hash"]) == 12
+
+
+def test_redaction_is_a_safety_net_for_any_logger_call():
+    buf = io.StringIO()
+    lab.configure(buf)
+    lab.log.info("debug_dump", prompt="my card is 4111", api_key="sk-test")
+    e = json.loads(buf.getvalue())
+    assert e["prompt"] == "[redacted]" and e["api_key"] == "[redacted]"
+```
+
+All five fail on the starter: no `run_id` or `step` on any line, the email appears in the
+`tool_call_finished` line, and nothing is redacted.
+
+### Failure scenarios
+- **Inject: keep `run_in_executor` but fix everything else.** Observe: only `crm_request` loses
+  `run_id`, `step` and `tool`, which in production looks like an orphan CRM line nobody can attribute.
+  Debug: compare which paths copy context (table above); switch to `asyncio.to_thread`.
+- **Inject: use `bind_contextvars(tool=...)` without unbinding.** Observe: step 2's
+  `llm_call_finished` claims `tool=search_kb`. Debug: the leak test fails; use the
+  `bound_contextvars` context manager so values reset when the block exits.
+- **Inject: put the redact processor after `JSONRenderer`.** Observe: a crash or nothing redacted,
+  because the renderer has already turned the event into a string. Debug: print the processor list;
+  the renderer must be last.
+
+### Submission
+- The fixed `lab_logs.py` and a `pytest -q` run showing 5 passed.
+- Your output of `python lab_logs.py`.
+- One log-platform query (in the syntax you use) that finds runs where the same `arg_hash` repeats more
+  than 3 times, as in the looping-agent scenario.
+- A short note: one field you would add to `tool_call_finished` for your own agent, and why it is safe
+  to log.
 
 ## Why it exists
 - **Sentences do not scale.** `INFO: chat done for acme in 2.3s using gpt-x (812 tokens)` is readable once.

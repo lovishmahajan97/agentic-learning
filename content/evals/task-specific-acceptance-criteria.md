@@ -5,7 +5,8 @@ name: Task-specific acceptance criteria
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -151,6 +152,24 @@ flowchart TD
     HARD --> MON["Production monitor on every request"]
     MON -.->|"new failure patterns"| O
 ```
+
+## Misconceptions
+- **"A good criteria list can be written from the spec before seeing any outputs."** Armchair criteria
+  restate the prompt ("concise and helpful") and miss what actually breaks. Derive them from clusters of
+  real failures, then revise after each error analysis.
+- **"A 99% pass rate on the PII check is good enough."** Averaging a catastrophic failure with cosmetic
+  ones hides it. Anything where one occurrence is unacceptable is a hard criterion: one violation blocks
+  the release.
+- **"Zero violations on 300 golden items proves the agent never does it."** By the rule of three, 0 of
+  300 is consistent with a true rate of up to about 1%. Every hard criterion also needs a runtime guard,
+  such as a check inside the `issue_refund` handler.
+- **"Never worse than baseline is the safest gate."** On noisy slices, a harmless change lands below
+  baseline close to half the time per slice, so most changes fail somewhere. Use a non-inferiority
+  margin such as "no slice more than 3 points below baseline".
+- **"A per-slice floor always protects that slice."** An 85% floor on 40 items carries roughly ±11
+  points of noise; it blocks and passes by chance. Size the slice behind the floor or loosen the floor.
+- **"If the agent's final reply is right, the task passed."** A polite "refund processed" can sit on top
+  of a refund to the wrong order. Criteria must cover the final state and the tool calls in the trace.
 
 ## Examples
 ### Criteria for support-ticket triage, as checks

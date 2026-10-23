@@ -5,7 +5,8 @@ name: Instruction tuning
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/supervised-fine-tuning
@@ -139,6 +140,22 @@ flowchart TD
     EV -->|"no: add tasks and phrasings"| P
     EV -->|"yes"| NX["Preference and safety training"]
 ```
+
+## Misconceptions
+- **"Instruction tuning is a different algorithm from SFT."** Mechanically it is SFT: next-token loss on
+  the output, instruction masked. What differs is the data, many tasks and phrasings, and the goal,
+  following instructions the model never saw.
+- **"More examples of my task make a better instruction follower."** Per-task gains saturate quickly;
+  generalisation comes from distinct tasks and phrasings. Twelve fixed tool schemas teach those tools,
+  not "read a schema and call it", so the 13th tool fails.
+- **"Proportional mixing is the neutral choice."** With tasks of 500,000, 20,000 and 2,000 examples it
+  gives the small one about 0.4% of samples, so your tool traces barely train. Cap large tasks first.
+- **"Held-out rows prove it generalises."** Rows from seen tasks measure multi-task recall. Hold out whole
+  task families and whole tools, and score paraphrases never used in training.
+- **"An instruction-tuned model is aligned."** It follows harmful instructions as readily as benign ones;
+  refusals come from preference and safety training, which matters more once the agent holds tools.
+- **"Instruction tuning can teach a small model new skills."** It surfaces latent ability; small models
+  in the original FLAN work got worse on held-out tasks. Check the base's few-shot ability first.
 
 ## Examples
 ### A miniature mixture with a tool-calling task family

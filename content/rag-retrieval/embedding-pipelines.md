@@ -5,7 +5,8 @@ name: Embedding pipelines
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -42,6 +43,216 @@ embedding at index time and query time.
   propagation, the metadata (tenant, ACL, dates) the agent's search later filters on, and freshness SLA.
 - **What you can skip.** A general data platform: one idempotent per-document function, a golden-vector
   test and deletion handling cover most agent knowledge bases.
+
+## Lab
+### Task
+Build the incremental sync step behind an agent's knowledge-base search tool. Time box: 60-90 minutes.
+Do Chunking strategies and Embedding models first.
+- **Done means:** a re-run on an unchanged corpus embeds nothing, an edit re-embeds only the chunk it
+  touched, a removed document vanishes from search, a model upgrade re-embeds everything, and a crash
+  halfway leaves an index the next run repairs.
+- **Runs locally:** a counting fake embedder and an in-memory store stand in for the hosted API and the
+  vector database, so no key or service is needed.
+- **You implement:** `index_document` and `sync`. Keep the given `chunk` and `chunk_id`.
+
+### Starter code
+Save as `pipeline.py`. Checked with Python 3.12.14 and 3.9.6, standard library only.
+
+```python
+# pipeline.py  (Python 3.9+, standard library only)
+from __future__ import annotations
+import hashlib
+
+MODEL = "fake-embed/v1"
+
+
+def chunk(text: str) -> list[str]:
+    """Deterministic chunker: one chunk per non-empty paragraph."""
+    return [p.strip() for p in text.split("\n\n") if p.strip()]
+
+
+def chunk_id(model: str, doc_id: str, idx: int, text: str) -> str:
+    return hashlib.sha256(f"{model}\x00{doc_id}\x00{idx}\x00{text}".encode()).hexdigest()[:32]
+
+
+class CountingEmbedder:
+    """Stand-in for the shared embed function. Counts texts; can fail once a budget is used up."""
+    def __init__(self, fail_after: int | None = None):
+        self.calls, self.texts, self.fail_after = 0, 0, fail_after
+
+    def __call__(self, texts: list[str]) -> list[list[float]]:
+        if self.fail_after is not None and self.texts + len(texts) > self.fail_after:
+            raise ConnectionError("embedding endpoint dropped the connection")
+        self.calls += 1
+        self.texts += len(texts)
+        return [[float(len(t)), 1.0] for t in texts]
+
+
+class DictStore:
+    """In-memory vector store with upsert, delete and ids by document."""
+    def __init__(self):
+        self.rows: dict[str, dict] = {}
+
+    def ids_for_doc(self, doc_id: str) -> set[str]:
+        return {k for k, r in self.rows.items() if r["doc_id"] == doc_id}
+
+    def doc_ids(self) -> set[str]:
+        return {r["doc_id"] for r in self.rows.values()}
+
+    def upsert(self, rows: list[dict]) -> None:
+        self.rows.update({r["id"]: r for r in rows})
+
+    def delete(self, ids) -> None:
+        for i in ids:
+            self.rows.pop(i, None)
+
+
+def index_document(doc_id: str, text: str, store, embed_fn, model: str = MODEL,
+                   batch_size: int = 2) -> dict:
+    """YOUR CODE: chunk the text, embed only chunks whose id is not already in the store, and upsert them
+    batch_size at a time. Each row holds id, vector, doc_id, chunk_index, model and text. Only after
+    all upserts, delete this document's stale ids. Return {"embedded", "deleted", "unchanged"}."""
+    raise NotImplementedError("index_document")
+
+
+def sync(corpus: dict[str, str], store, embed_fn, model: str = MODEL) -> dict:
+    """YOUR CODE: index every document in corpus order, delete all chunks of documents that are no longer
+    in the corpus (count them as deleted), and return the summed counts."""
+    raise NotImplementedError("sync")
+
+
+if __name__ == "__main__":
+    corpus = {"refunds": "Refunds take 5-7 days.\n\nRefunds go to the original card.",
+              "billing": "Cancel under Billing.\n\nInvoices are monthly.\n\nPayment is due in 30 days."}
+    store, emb = DictStore(), CountingEmbedder()
+    try:
+        print("run 1:  ", sync(corpus, store, emb))
+        print("run 2:  ", sync(corpus, store, emb))
+        corpus["billing"] = corpus["billing"].replace("monthly", "quarterly")
+        print("edit:   ", sync(corpus, store, emb))
+        del corpus["refunds"]
+        print("delete: ", sync(corpus, store, emb))
+        print("upgrade:", sync(corpus, store, emb, model="fake-embed/v2"))
+        print("rows:", len(store.rows), "texts embedded:", emb.texts)
+    except NotImplementedError as e:
+        print("not implemented yet:", e)
+```
+
+### Expected output
+The starter prints `not implemented yet: sync`. A correct solution prints:
+
+```
+run 1:   {'embedded': 5, 'deleted': 0, 'unchanged': 0}
+run 2:   {'embedded': 0, 'deleted': 0, 'unchanged': 5}
+edit:    {'embedded': 1, 'deleted': 1, 'unchanged': 4}
+delete:  {'embedded': 0, 'deleted': 2, 'unchanged': 3}
+upgrade: {'embedded': 3, 'deleted': 3, 'unchanged': 0}
+rows: 3 texts embedded: 9
+```
+
+### Tests
+Save next to `pipeline.py` and run `pytest -q` (checked with pytest 9.1.1 and 8.4.2). On the starter all
+five fail with `NotImplementedError`; a correct solution passes all five.
+
+```python
+# test_pipeline.py  (run: pytest -q)
+import pytest
+from pipeline import CountingEmbedder, DictStore, sync
+
+
+def corpus():
+    return {"refunds": "Refunds take 5-7 days.\n\nRefunds go to the original card.",
+            "billing": "Cancel under Billing.\n\nInvoices are monthly.\n\nPayment is due in 30 days."}
+
+
+class OrderStore(DictStore):
+    """Records the order of non-empty writes."""
+    def __init__(self):
+        super().__init__()
+        self.ops = []
+
+    def upsert(self, rows):
+        if rows:
+            self.ops.append("upsert")
+        super().upsert(rows)
+
+    def delete(self, ids):
+        ids = list(ids)
+        if ids:
+            self.ops.append("delete")
+        super().delete(ids)
+
+
+def test_second_run_embeds_nothing():
+    store, emb = DictStore(), CountingEmbedder()
+    assert sync(corpus(), store, emb) == {"embedded": 5, "deleted": 0, "unchanged": 0}
+    assert sync(corpus(), store, emb) == {"embedded": 0, "deleted": 0, "unchanged": 5}
+    assert emb.texts == 5
+
+
+def test_edit_reembeds_only_the_changed_chunk():
+    c, store = corpus(), OrderStore()
+    sync(c, store, CountingEmbedder())
+    c["billing"] = c["billing"].replace("monthly", "quarterly")
+    store.ops.clear()
+    assert sync(c, store, CountingEmbedder()) == {"embedded": 1, "deleted": 1, "unchanged": 4}
+    assert store.ops == ["upsert", "delete"], "write the replacement before deleting the stale chunk"
+    assert any("quarterly" in r["text"] for r in store.rows.values())
+    assert not any("monthly" in r["text"] for r in store.rows.values())
+
+
+def test_removed_document_disappears():
+    c, store = corpus(), DictStore()
+    sync(c, store, CountingEmbedder())
+    del c["refunds"]
+    assert sync(c, store, CountingEmbedder()) == {"embedded": 0, "deleted": 2, "unchanged": 3}
+    assert store.doc_ids() == {"billing"}
+
+
+def test_model_upgrade_reembeds_everything():
+    store = DictStore()
+    sync(corpus(), store, CountingEmbedder())
+    out = sync(corpus(), store, CountingEmbedder(), model="fake-embed/v2")
+    assert out == {"embedded": 5, "deleted": 5, "unchanged": 0}
+    assert {r["model"] for r in store.rows.values()} == {"fake-embed/v2"}
+
+
+def test_crash_then_rerun_matches_a_clean_run():
+    clean = DictStore()
+    sync(corpus(), clean, CountingEmbedder())
+    store = DictStore()
+    with pytest.raises(ConnectionError):
+        sync(corpus(), store, CountingEmbedder(fail_after=3))
+    committed = len(store.rows)
+    assert 0 < committed < 5, "batches before the failure should already be upserted"
+    out = sync(corpus(), store, CountingEmbedder())
+    assert out["embedded"] == 5 - committed, "the rerun must not re-embed committed chunks"
+    assert set(store.rows) == set(clean.rows)
+```
+
+### Failure scenarios
+- **Build ids with the module constant `MODEL` instead of the `model` argument.** The upgrade run embeds
+  nothing and every row still says `fake-embed/v1`, so only `test_model_upgrade_reembeds_everything`
+  fails. Debug: print the ids for one chunk under both model labels; identical ids mean the version is
+  not part of identity.
+- **Delete stale ids before upserting the replacements.** Counts look right, but the edit test fails on
+  `ops == ["upsert", "delete"]`. In production a crash between the two leaves the document
+  unsearchable. Debug: log every store write with its doc id and read the order.
+- **Index only the documents you are given.** Removed documents keep their chunks, so the agent cites a
+  deleted page. Debug: diff `store.doc_ids()` against the corpus keys after each run.
+- **Make chunking non-deterministic** (for example strip whitespace differently per run). Run 2 embeds
+  everything again. Debug: run twice on an unchanged corpus and diff the two id sets.
+
+### Submission
+- **`pipeline.py` and `test_pipeline.py`** in a repo or gist, with no edits to the tests.
+- **A `pytest -q` run** showing 5 passed, and the output of `python pipeline.py` matching the expected
+  block line for line.
+- **One injected fault** from the list above, with the failing test's output pasted and one sentence on
+  how you found it.
+- **A short note (under 150 words)** on how you would add a golden-vector check and a per-document
+  content-hash early exit, and why that hash must include the model version.
+- **Evaluated on:** all tests green, no chunk embedded twice across the crash test, and a note that
+  names the failure each guard prevents.
 
 ## Why it exists
 - **The demo works once.** Read every file, split, embed, insert: three things break it.

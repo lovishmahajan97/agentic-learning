@@ -5,7 +5,8 @@ name: KV-cache paging & eviction
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - serving-inference/pagedattention
@@ -152,6 +153,26 @@ flowchart TD
     R --> A
     S --> A
 ```
+
+## Misconceptions
+- **"Paging means spilling the cache to CPU memory, like OS swap."** Paging is indirection inside VRAM: a
+  block table maps logical positions to fixed-size physical blocks. Copying blocks to host memory is a
+  separate preemption mode (swap), used only when the pool runs out.
+- **"Paged KV memory eliminates waste."** It bounds it: only each sequence's last block can be partly
+  empty, so waste is under one block per sequence (8 slots for a 600-token request in 16-token blocks)
+  instead of most of an 8,192-token reservation.
+- **"When the pool fills, the engine trims a little from every request."** A sequence needs all its
+  blocks to take even one step, so engines first reclaim unreferenced cached blocks and then preempt
+  whole sequences, newest first.
+- **"Recompute is the wasteful mode, so swap is always better."** It is arithmetic. A thin GQA cache
+  swaps faster (~42 ms vs ≥71 ms at 4,000 tokens on the 8B model), but a fat MHA cache recomputes faster
+  (~62 ms vs ~168 ms), and a slow or shared host link tilts it further.
+- **"My agent's cache stays reserved while its tool runs."** Between steps no request references the
+  transcript, so its blocks are LRU-evictable cached prefix. After a slow tool on a busy pool the next
+  step can re-prefill ~15,000-21,000 tokens, a few hundred milliseconds on an 8B model.
+- **"Dropping old tokens is a safe way to fit long contexts."** It is exact only for sliding-window
+  layers. On full-attention models it changes outputs, sometimes badly on recall-heavy tasks, so gate it
+  on an agent eval.
 
 ## Examples
 ### A toy block allocator

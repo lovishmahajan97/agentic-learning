@@ -5,7 +5,8 @@ name: Outlines
 kind: tool
 difficulty: advanced
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/instructor
@@ -36,6 +37,144 @@ access, so closed hosted APIs are out.
   describes the format, the chat template, and whether you constrain at all for a given step.
 - **What you can skip.** Building FSM indexes by hand and grammar internals. Know that the constraint
   fixes syntax, never correctness, and that compile cost lands on the first request per schema.
+
+## Lab
+### Task
+Write the decode loop that a serving engine runs for a constrained tool call: compile a Pydantic
+tool-call schema into an `outlines-core` index once, then mask, pick and advance token by token. A fake
+model stands in for a local LLM, so no GPU or model download is needed. Time box: 60 minutes.
+- **Prerequisites:** the Pydantic lesson (JSON Schema from models) and the sampling strategies lesson
+  (logits and greedy decoding).
+- **Setup:** Python 3.10+, `pip install "outlines-core==0.2.14" pydantic pytest` (checked against
+  outlines-core 0.2.14, the engine underneath Outlines 1.x). Save the starter as `decode.py` and the tests
+  as `test_decode.py`.
+- **Goal for the agent:** every tool call parses on the first pass, the compile cost is paid once per
+  schema, and a runaway generation fails loudly instead of returning half a JSON object.
+
+### Starter code
+```python
+"""Lab: constrained decoding of a tool call with outlines-core and a fake local model (no GPU)."""
+import json
+import string
+from typing import Literal
+
+from outlines_core import Index, Vocabulary
+from outlines_core.json_schema import build_regex_from_schema
+from pydantic import BaseModel
+
+# A toy tokenizer: every printable character plus a few multi-character tokens, as real BPE has.
+TOKENS = list(string.printable[:95]) + ['{"', '":', '"tool', "get_ticket", "search_docs", "Sure"]
+EOS = len(TOKENS)
+VOCAB = Vocabulary(EOS, {tok: [i] for i, tok in enumerate(TOKENS)})
+
+
+class Call(BaseModel):
+    tool: Literal["search_docs", "get_ticket"]
+    ticket_id: int
+
+
+class FakeModel:
+    """Stands in for a small local LLM. It most wants to open with 'Sure', then tries to spell
+    `wants`, preferring the longest matching token. Anything else scores 0."""
+    def __init__(self, wants: str):
+        self.wants = wants
+
+    def logits(self, text: str) -> dict[int, float]:
+        scores = {i: (1.0 + len(t)) if self.wants.startswith(text + t) else 0.0
+                  for i, t in enumerate(TOKENS)}
+        scores[TOKENS.index("Sure")] = 10.0                 # the prose habit the mask must remove
+        scores[EOS] = 5.0 if text == self.wants else -1.0
+        return scores
+
+
+class Truncated(Exception):
+    """Raised when max_tokens runs out before the output reaches a final state."""
+
+
+COMPILES = {"count": 0}                                     # tests read this to check caching
+
+
+def get_index(schema: type[BaseModel]) -> Index:
+    """Compile `schema` to an Index once and reuse it for every later call with the same schema.
+    Increment COMPILES["count"] each time you actually build an Index."""
+    raise NotImplementedError("YOUR CODE: build_regex_from_schema -> Index(regex, VOCAB), cached")
+
+
+def generate(index: Index, model: FakeModel, max_tokens: int = 64) -> str:
+    """Greedy constrained decoding: at each step keep only index.get_allowed_tokens(state), pick the
+    highest score (ties: lowest token id), stop on EOS, raise Truncated if max_tokens runs out."""
+    raise NotImplementedError("YOUR CODE: the mask-and-pick loop")
+
+
+if __name__ == "__main__":
+    index = get_index(Call)
+    for wants in ['{"tool": "get_ticket", "ticket_id": 42}', '{"tool": "lookup", "ticket_id": 42}']:
+        out = generate(index, FakeModel(wants))
+        print(out, "->", Call.model_validate_json(out))
+    print("compiles:", COMPILES["count"])
+```
+
+### Expected output
+```
+{"tool": "get_ticket", "ticket_id": 42} -> tool='get_ticket' ticket_id=42
+{"tool": "get_ticket","ticket_id":0} -> tool='get_ticket' ticket_id=0
+compiles: 1
+```
+The second line is the lesson in miniature: the model wanted a tool that does not exist, the mask forced
+a valid one, and the output parses while being wrong. `pytest -q test_decode.py` reports `4 passed`.
+
+### Tests
+```python
+import pytest
+from decode import COMPILES, Call, FakeModel, Truncated, generate, get_index
+
+GOOD = '{"tool": "get_ticket", "ticket_id": 42}'
+
+
+def test_mask_removes_the_prose_opening():
+    out = generate(get_index(Call), FakeModel(GOOD))
+    assert out == GOOD                                     # 'Sure' had the top score but was masked
+
+
+def test_invented_tool_still_parses_but_may_be_wrong():
+    out = generate(get_index(Call), FakeModel('{"tool": "lookup", "ticket_id": 42}'))
+    call = Call.model_validate_json(out)                   # syntax is guaranteed ...
+    assert call.tool in ("search_docs", "get_ticket")      # ... correctness is not
+
+
+def test_index_is_compiled_once_per_schema():
+    first = get_index(Call)
+    before = COMPILES["count"]
+    assert get_index(Call) is first and COMPILES["count"] == before
+
+
+def test_running_out_of_tokens_raises_truncated():
+    with pytest.raises(Truncated):
+        generate(get_index(Call), FakeModel(GOOD), max_tokens=5)
+```
+
+### Failure scenarios
+- **Build the cache key with `json.dumps(schema, sort_keys=True)` and compile from it.** The first test
+  fails with `{"ticket_id":0,"tool":"get_ticket"}`: sorting reordered the properties, so the regex now
+  forces `ticket_id` first. Debug by printing the regex; field order is generation order.
+- **Pick from all tokens and only check validity afterwards.** `Sure` wins every step and
+  `get_next_state` returns `None` for it. Debug by asserting the pick is in
+  `index.get_allowed_tokens(state)` before advancing.
+- **Return the partial text when the loop ends.** The truncation test fails, and in an agent the
+  caller gets unclosed JSON despite the constraint. Raise `Truncated` and alert on it, the same signal
+  as generations that stop at `max_new_tokens`.
+- **Compile inside `generate`.** Outputs stay correct but `COMPILES["count"]` grows per call. Time it:
+  this is the per-request compile cost the lesson moves to worker startup.
+
+### Submission
+- **`decode.py`** with `get_index` and `generate` implemented; `FakeModel`, the vocabulary and the tests
+  unchanged.
+- **A `pytest -q` run** showing `4 passed`, and the `python decode.py` output matching Expected output.
+- **The printed regex** for `Call`, with one sentence on why the second output is valid but wrong.
+- **A short note** comparing compile time with per-step time (use `time.perf_counter`) and saying where
+  you would compile in a serving worker.
+- **Evaluated on:** tests passing unmodified, no invalid token ever advanced, and an index cached by
+  schema without changing its field order.
 
 ## Why it exists
 - **Sampling knows nothing about your format.** A model samples one token at a time over its whole

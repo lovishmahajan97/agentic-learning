@@ -5,7 +5,8 @@ name: Saga pattern & distributed transactions
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/outbox-inbox-patterns
@@ -40,6 +41,61 @@ order tools around the irreversible pivot, gate it, and make every call idempote
   persisting the model's chosen arguments so retries replay them instead of re-asking the model.
 - **What you can skip.** Three-phase commit and XA internals. Know why 2PC cannot include SaaS APIs, the
   compensatable, pivot and retriable split, and the unknown-outcome rule.
+
+## Decision case
+### Scenario
+An IT-services company builds a procurement agent that equips new hires: it checks policy, reserves a
+laptop in the internal inventory database, pays on the corporate card, places a custom-configured order
+with a supplier API (no cancellation once accepted), then creates an asset record and emails the hire.
+All figures are illustrative.
+- **Scale:** 400 orders a day; 2% fail at some step for business reasons; 0.5% of supplier calls time
+  out with an unknown outcome.
+- **Approval:** orders above $2,000 (30% of them) need a manager; median wait 6 hours, p99 3 days; 10%
+  of approvals are rejected.
+- **Constraints:** card authorisations in this payment contract lapse after 7 days; no hire may be
+  charged for, or receive, a laptop twice; 3 engineers who know Python and Postgres, none has run a
+  workflow engine; 10 weeks to ship.
+
+### Options
+| Option | How it works | Supplier and payment APIs | 3-day approval wait | Unknown outcomes (2 a day) | Team and deadline fit |
+|---|---|---|---|---|---|
+| A. Two-phase commit (XA) | One coordinator prepares and commits all participants | Excluded: neither exposes a prepare phase | Locks held for days | Not applicable | Not buildable |
+| B. Choreographed saga | Each service reacts to the previous step's event and emits failure events for compensation | Yes, via adapters | The wait lives in whichever service holds the order; no single timer | Each service reconciles on its own | Fits the stack, but no one place answers "where is order 42" |
+| C. Orchestrated saga in Postgres | A saga log table, a tool layer that enforces step classes, a durable approval pause, a reaper for stuck sagas | Yes, each call keyed `{saga_id}:{step}` | Run paused and checkpointed; a timer checks authorisation age | Reaper queries the supplier by key before deciding | Uses known tools; the team writes the reaper and timers |
+| D. Durable-execution engine | Workflow code with activities and a compensation list, replayed from history (for example Temporal) | Yes, same keys | Built-in timers and signals | Activity retry policy plus a query step | Least custom code; a new system to learn and run |
+
+### Decision
+Choose **C**, ordered as policy check, reserve laptop, authorise card (capture later), approval gate,
+supplier order as the pivot, then capture payment, asset record and email retried forward. Because:
+- **Two external participants rule out A,** so the only real choice is how to coordinate a saga.
+- **The pivot needs one owner.** The supplier order is irreversible, so ordering and the approval gate
+  must be enforced in one tool layer, not spread across services as in B.
+- **Authorise-then-capture makes rejections invisible.** 400 × 30% × 10% = 12 rejected orders a day end
+  in a void, not 12 refunds on statements; the p99 wait of 3 days leaves 4 days before the 7-day lapse.
+- **Volume is small.** About 8 compensations and 2 reconciliations a day fit a Postgres log and a reaper
+  the team can build in 10 weeks.
+
+**What would change it:** a second and third workflow of this kind, or waits that approach the 7-day
+authorisation window, make D's timers and history worth learning; a supplier that offers holds would let
+the order become a compensatable try-confirm step and move the pivot later.
+
+### Trade-offs accepted
+- **Custom saga machinery.** The team owns the log, reaper and timers. Watch: sagas whose last log entry
+  is older than one hour outside an approval pause, and the manual-repair count.
+- **No isolation.** A manager can edit an order mid-saga. Semantic lock (`PENDING`) plus a version check
+  on compensations. Watch: rejected stale writes.
+- **Authorisations can still lapse.** Watch: approvals pending longer than 5 days; escalate before day 7.
+- **Unknown outcomes stall a saga until reconciled.** Watch: steps resolved by reconciliation per day; a
+  rise above the expected 2 points at the supplier.
+
+### Review rubric
+- **Every step is classified** as compensatable, pivot or retriable, with its compensation named.
+- **The pivot is as late as possible** and sits directly behind the approval gate.
+- **Timeouts are reconciled by key,** never compensated blindly, and every step and compensation carries
+  an idempotency key.
+- **Wait times are checked against hold or authorisation expiry,** with the margin computed.
+- **2PC is rejected for a stated reason** (no prepare phase, blocking), not by habit.
+- **The coordination choice is tied to team and volume,** with a concrete trigger for moving to an engine.
 
 ## Why it exists
 - **No shared transaction across systems.** "Place order" reserves stock in inventory, charges the card

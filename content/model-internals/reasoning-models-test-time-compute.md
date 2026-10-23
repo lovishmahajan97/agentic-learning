@@ -5,7 +5,8 @@ name: Reasoning models / test-time compute
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/chain-of-thought
@@ -165,6 +166,23 @@ flowchart TD
     MORE --> A
     A -->|"no, n_max reached"| ESC
 ```
+
+## Misconceptions
+- **"Chain of thought is just the model explaining itself."** Each generated token is another forward
+  pass whose result later steps read, so a longer trace is literally more serial computation, not
+  narration of an answer already computed.
+- **"Turn reasoning on for the whole agent and it gets smarter everywhere."** Gains concentrate on
+  planning, recovery and verifiable steps; on parsing or formatting, long traces add cost and can hurt.
+  In the 15-step example, thinking on every step costs about 3.7× the output tokens of planner-only.
+- **"The thinking trace is an audit log of why the agent acted."** Visible traces are not guaranteed to
+  reflect the factors that drove the answer, so log tool calls, inputs and verifier results as the
+  record instead.
+- **"More samples always help."** Majority voting needs discrete answers and wrong paths that scatter;
+  if the model is consistently wrong, more samples agree on the wrong value. Without a verifier,
+  coverage does not turn into accuracy.
+- **"A high pass@k means the agent is reliable."** pass@k counts at least one success and fits
+  best-of-N with a checker. An agent that gets one shot needs pass^k: 7 of 10 runs succeeding gives
+  pass@5 of 1.00 but pass^5 of only 0.08.
 
 ## Examples
 ### Self-consistency with early stopping and an escalation signal

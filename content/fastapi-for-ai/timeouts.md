@@ -5,7 +5,8 @@ name: Timeouts
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/shared-httpx-asyncclient
@@ -39,6 +40,163 @@ known errors: phase timeouts per call, one run deadline, innermost first.
   not a crashed run).
 - **What you can skip.** Tuning uvicorn keep-alive or gunicorn worker timeouts; they do not bound request
   duration, so they rarely explain an agent hang.
+
+## Lab
+### Task
+Fix an agent loop that hangs when one tool stalls and never stops when the model loops. You add a run
+deadline, a step cap and per-tool limits capped by the budget left, so a slow tool becomes an
+observation the model routes around.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** async endpoints, shared httpx AsyncClient, and this lesson's "Budgets for an agent
+  loop".
+- **Runs offline:** a scripted fake model and two fake tools, scaled to seconds so tests are fast.
+- **Needs:** Python 3.11+ (for `asyncio.timeout`) and `pytest`; checked with Python 3.12 and pytest 9.1.
+
+### Starter code
+```python
+# agent_budget.py: put a time budget on a tool-calling agent loop (Python 3.11+, no network)
+import asyncio, json, time
+
+RUN_BUDGET = 2.0          # seconds for the whole run; pretend the proxy gives up at 2.5 s
+TOOL_TIMEOUT = 0.5        # per-tool limit before the budget is taken into account
+FINAL_TURN_RESERVE = 0.3  # keep this much for the model's final answer
+MAX_STEPS = 4             # model turns per run
+
+class RunTimeout(Exception):
+    """The whole run overran RUN_BUDGET; the route maps this to its own 504."""
+
+# ---- fakes: a scripted model and two tools ----
+def scripted_llm(script, turn_s=0.05):
+    state = {"i": 0}
+    async def llm(messages, timeout):
+        await asyncio.sleep(turn_s)                         # one model turn
+        reply = script[min(state["i"], len(script) - 1)]    # last turn repeats forever
+        state["i"] += 1
+        return dict(reply)
+    return llm
+
+async def search(q):                  # this provider has stalled
+    await asyncio.sleep(5.0)
+    return {"hits": [q]}
+
+async def fetch_doc(doc_id):
+    await asyncio.sleep(0.05)
+    return {"doc": doc_id, "text": "refund window is 30 days"}
+
+TOOLS = {"search": search, "fetch_doc": fetch_doc}
+
+def call(i, name, **args):
+    return {"id": f"c{i}", "name": name, "args": args}
+
+HAPPY = [                             # search stalls, the model falls back to fetch_doc
+    {"role": "assistant", "tool_calls": [call(1, "search", q="refund policy")]},
+    {"role": "assistant", "tool_calls": [call(2, "fetch_doc", doc_id="kb-7")]},
+    {"role": "assistant", "content": "Refunds are accepted for 30 days."},
+]
+LOOPING = [{"role": "assistant", "tool_calls": [call(9, "fetch_doc", doc_id="kb-7")]}]
+
+# ---- the code under test ----
+async def run_tool(name: str, args: dict, limit: float) -> dict:
+    """Run one tool; on timeout return {"error": "<name> timed out after <limit>s"}, never raise."""
+    # YOUR CODE: bound the call with asyncio.timeout(limit) and turn TimeoutError into data
+    return await TOOLS[name](**args)
+
+async def run_agent(llm, messages: list) -> str:
+    """Return the final answer, or "stopped: step limit reached"; raise RunTimeout past RUN_BUDGET."""
+    # YOUR CODE: a run deadline around the loop, a step cap, and per-tool limits of
+    # min(TOOL_TIMEOUT, budget left - FINAL_TURN_RESERVE); skip tools when the reserve is reached
+    while True:
+        reply = await llm(messages, timeout=None)
+        messages.append(reply)
+        if not reply.get("tool_calls"):
+            return reply["content"]
+        for c in reply["tool_calls"]:
+            result = await run_tool(c["name"], c["args"], limit=TOOL_TIMEOUT)
+            messages.append({"role": "tool", "tool_call_id": c["id"], "content": json.dumps(result)})
+
+async def guarded(coro, s=3.0):     # lab harness only: stops a run that would hang
+    try:
+        return await asyncio.wait_for(coro, s)
+    except TimeoutError:
+        return f"GUARD: still running after {s}s"
+
+if __name__ == "__main__":
+    msgs, t0 = [], time.monotonic()
+    answer = asyncio.run(guarded(run_agent(scripted_llm(HAPPY), msgs)))
+    print("happy:", answer, "| under budget:", time.monotonic() - t0 < RUN_BUDGET)
+    print("tool results:", [m["content"] for m in msgs if m["role"] == "tool"])
+    msgs = []
+    print("looping:", asyncio.run(guarded(run_agent(scripted_llm(LOOPING), msgs))),
+          "| model turns:", sum(m["role"] == "assistant" for m in msgs))
+```
+
+As given, both runs end at the harness guard (`GUARD: still running after 3.0s`), because nothing
+bounds the stalled `search` or the looping model.
+
+### Expected output
+```
+happy: Refunds are accepted for 30 days. | under budget: True
+tool results: ['{"error": "search timed out after 0.5s"}', '{"doc": "kb-7", "text": "refund window is 30 days"}']
+looping: stopped: step limit reached | model turns: 4
+```
+
+### Tests
+```python
+# test_agent_budget.py: run with `pytest -q`
+import asyncio, time
+import pytest
+from agent_budget import (HAPPY, LOOPING, MAX_STEPS, RUN_BUDGET, RunTimeout,
+                          run_agent, run_tool, scripted_llm)
+
+def run(coro, guard=3.0):                    # a hang fails the test instead of blocking it
+    return asyncio.run(asyncio.wait_for(coro, guard))
+
+def test_tool_timeout_is_an_observation():
+    t0 = time.monotonic()
+    out = run(run_tool("search", {"q": "x"}, limit=0.2))
+    assert out == {"error": "search timed out after 0.2s"}
+    assert time.monotonic() - t0 < 0.4
+
+def test_run_survives_a_stalled_tool_and_answers_in_budget():
+    msgs, t0 = [], time.monotonic()
+    assert run(run_agent(scripted_llm(HAPPY), msgs)) == "Refunds are accepted for 30 days."
+    assert time.monotonic() - t0 < RUN_BUDGET
+    assert "timed out" in msgs[1]["content"]          # the model saw the timeout as data
+
+def test_step_cap_stops_a_looping_model():
+    msgs = []
+    assert run(run_agent(scripted_llm(LOOPING), msgs)) == "stopped: step limit reached"
+    assert sum(m["role"] == "assistant" for m in msgs) == MAX_STEPS
+
+def test_run_deadline_fires_before_the_proxy():
+    t0 = time.monotonic()
+    with pytest.raises(RunTimeout):
+        run(run_agent(scripted_llm(LOOPING, turn_s=0.8), []))   # slow model turns
+    assert time.monotonic() - t0 < RUN_BUDGET + 0.2
+```
+
+On the starter all four fail with the guard's `TimeoutError`: the stalled tool and the endless loop
+both outlive 3 s.
+
+### Failure scenarios
+- **Inject a swallowed cancellation:** make `search` catch `BaseException` around its sleep and sleep
+  again. The per-tool limit seems not to work and the happy run ends in `RunTimeout` at 2.0 s. Debug by
+  printing the exception type in that handler; it is `CancelledError`, which must be re-raised.
+- **Inject a blind retry:** have `run_tool` call the tool a second time after a timeout, with the same
+  limit. At `turn_s=0.05` the run still answers (about 1.2 s), but at `turn_s=0.45` it raises
+  `RunTimeout`, while the correct version answers in about 1.9 s. Log `left()` before each tool call to
+  see the retry eat the final turn's reserve.
+- **Remove the step cap.** The deadline test still passes but the looping run ends in `RunTimeout`
+  instead of a clean stop. Count assistant turns in the transcript to spot it.
+
+### Submission
+- **Your `agent_budget.py`** with both functions implemented and no edits to the fakes or tests.
+- **A `pytest -q` run** showing 4 passed in under 5 seconds.
+- **The script's printed output**, matching the expected lines.
+- **A short note (3-5 sentences)** on how you would map `RunTimeout` to your own 504 in a FastAPI route
+  and what you would log.
+- **Evaluated on:** all tests green, no swallowed `CancelledError`, and per-tool limits derived from
+  the remaining budget rather than a constant.
 
 ## Why it exists
 - **An LLM endpoint is mostly waiting.** On the model provider, the vector store, a tool's API. Most

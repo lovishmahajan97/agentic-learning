@@ -37,6 +37,205 @@ in order to debug them.
 - **What you can skip.** Building a tracer yourself or the internals of the collector pipeline. Know the
   data model, self time, the critical path and context propagation; that is enough to debug agents.
 
+## Lab
+### Task
+Make one agent turn's trace tell the truth. The model asked for three tools in one step; the starter
+runs them in a thread pool, which silently splits the turn into four traces. Its self-time maths also
+double-counts parallel children, and it cannot name the critical path, so you cannot say which tool to
+speed up. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's How it works (context propagation, self time, the critical path) and
+  the first example's thirty-line tracer; spans if span fields are new to you.
+- **Setup:** Python 3.12, standard library only, plus `pip install pytest` (checked on pytest 9.1). Save the
+  starter as `lab_trace.py` and the tests as `test_lab_trace.py`.
+- **Done:** `python lab_trace.py` prints the expected tree and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: make one agent turn's trace tell the truth (checked on Python 3.12, stdlib only)."""
+import contextvars, time, uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+
+_current = contextvars.ContextVar("current_span", default=None)
+SPANS: list[dict] = []                      # finished spans; production code hands them to an exporter
+
+
+@contextmanager
+def span(name, **attrs):
+    parent = _current.get()
+    s = {"trace_id": parent["trace_id"] if parent else uuid.uuid4().hex,
+         "span_id": uuid.uuid4().hex[:16],
+         "parent_id": parent["span_id"] if parent else None,
+         "name": name, "attrs": attrs, "start": time.perf_counter()}
+    token = _current.set(s)
+    try:
+        yield s
+    finally:
+        s["end"] = time.perf_counter(); _current.reset(token); SPANS.append(s)
+
+
+def tool(name, seconds):                    # stand-in for an HTTP tool call
+    with span(f"tool.{name}"):
+        time.sleep(seconds)
+        return f"{name}: ok"
+
+
+def run_parallel(calls):
+    """LAB 1: the model asked for three tools in one step; run them in a thread pool so that
+    every tool span is a child of the current agent.step (same trace_id, parent_id = step)."""
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        futures = [pool.submit(tool, n, s) for n, s in calls]    # BUG: pool threads start with an empty context
+        return [f.result() for f in futures]
+
+
+def run_turn(task):
+    with span("agent.run", task=task):
+        with span("agent.step", iteration=1):
+            with span("generation"):
+                time.sleep(0.10)                                 # model picks three tools
+            run_parallel([("order_status", 0.30), ("search_docs", 0.20), ("get_policy", 0.15)])
+        time.sleep(0.05)                                         # history compaction, untraced
+        with span("agent.step", iteration=2):
+            with span("generation"):
+                time.sleep(0.10)                                 # model writes the final answer
+        return "Your order ships Friday."
+
+
+def children(s, spans):
+    return [c for c in spans if c["parent_id"] == s["span_id"]]
+
+
+def self_time(s, spans):
+    """LAB 2: duration minus the time covered by children. Parallel children overlap, so
+    subtract the UNION of their [start, end] intervals, not the sum of their durations."""
+    kids = children(s, spans)
+    return (s["end"] - s["start"]) - sum(c["end"] - c["start"] for c in kids)    # BUG: sums overlaps
+
+
+def critical_path(s, spans):
+    """LAB 3: names on the chain that sets s's duration, in time order, starting with s.
+    Take the child that ends last, then repeatedly the child that ends latest at or before the
+    chosen one's start; recurse into each chosen child. Parallel siblings off the path are skipped."""
+    raise NotImplementedError
+
+
+def print_tree(spans):
+    roots = [s for s in spans if s["parent_id"] is None]
+    print("traces:", len({s["trace_id"] for s in spans}))
+    root = next(s for s in roots if s["name"] == "agent.run")
+
+    def show(s, depth):
+        label = "  " * depth + s["name"]
+        print(f"{label:<22} total {s['end'] - s['start']:.2f} s  self {self_time(s, spans):.2f} s")
+        for c in sorted(children(s, spans), key=lambda c: (round(c["start"] - root["start"], 2), c["name"])):
+            show(c, depth + 1)
+
+    show(root, 0)
+    try:
+        print("critical path:", " > ".join(critical_path(root, spans)))
+    except NotImplementedError:
+        print("critical path: TODO")
+
+
+if __name__ == "__main__":
+    run_turn("Where is order A-103?")
+    print_tree(SPANS)
+```
+
+As given, it runs and prints `traces: 4`, a first `agent.step` with only its generation under it and
+0.30 s of unexplained self time, and `critical path: TODO`: the tool spans became orphan traces.
+
+### Expected output
+```
+traces: 1
+agent.run              total 0.55 s  self 0.05 s
+  agent.step           total 0.40 s  self 0.00 s
+    generation         total 0.10 s  self 0.10 s
+    tool.get_policy    total 0.15 s  self 0.15 s
+    tool.order_status  total 0.30 s  self 0.30 s
+    tool.search_docs   total 0.20 s  self 0.20 s
+  agent.step           total 0.10 s  self 0.00 s
+    generation         total 0.10 s  self 0.10 s
+critical path: agent.run > agent.step > generation > tool.order_status > agent.step > generation
+```
+
+Durations can read 0.01-0.02 s higher because `time.sleep` overshoots; the tree shape, the self times
+of the steps and the critical path line must match. The step's 0.40 s is 0.10 s of generation plus the
+slowest tool (0.30 s), not the 0.75 s sum of everything under it.
+
+### Tests
+```python
+import pytest
+import lab_trace as lab
+
+
+def sp(name, sid, parent, start, end):
+    return {"trace_id": "t1", "span_id": sid, "parent_id": parent, "name": name, "attrs": {},
+            "start": start, "end": end}
+
+
+@pytest.fixture
+def turn():
+    lab.SPANS.clear()
+    lab.run_turn("Where is order A-103?")
+    return list(lab.SPANS)
+
+
+def test_tool_spans_join_the_turn_trace(turn):
+    assert len({s["trace_id"] for s in turn}) == 1, "tool spans started a trace of their own"
+    step1 = next(s for s in turn if s["name"] == "agent.step" and s["attrs"]["iteration"] == 1)
+    tools = [s for s in turn if s["name"].startswith("tool.")]
+    assert len(tools) == 3 and all(t["parent_id"] == step1["span_id"] for t in tools)
+
+
+def test_self_time_subtracts_the_union_of_parallel_children():
+    parent = sp("agent.step", "p", None, 0.0, 1.0)
+    spans = [parent, sp("tool.a", "a", "p", 0.1, 0.5), sp("tool.b", "b", "p", 0.2, 0.6),
+             sp("generation", "g", "p", 0.7, 0.8)]
+    assert lab.self_time(parent, spans) == pytest.approx(0.4)    # covered: 0.1-0.6 and 0.7-0.8
+
+
+def test_critical_path_follows_the_slowest_parallel_branch():
+    spans = [sp("agent.run", "r", None, 0.0, 1.0),
+             sp("agent.step", "s1", "r", 0.0, 0.6), sp("agent.step", "s2", "r", 0.7, 1.0),
+             sp("generation", "g1", "s1", 0.0, 0.1), sp("tool.slow", "t1", "s1", 0.1, 0.6),
+             sp("tool.fast", "t2", "s1", 0.1, 0.3), sp("generation", "g2", "s2", 0.7, 1.0)]
+    assert lab.critical_path(spans[0], spans) == [
+        "agent.run", "agent.step", "generation", "tool.slow", "agent.step", "generation"]
+
+
+def test_real_turn_self_time_and_path(turn):
+    root = next(s for s in turn if s["name"] == "agent.run")
+    assert lab.self_time(root, turn) == pytest.approx(0.05, abs=0.03)   # the untraced compaction
+    assert "tool.order_status" in lab.critical_path(root, turn)
+    assert "tool.search_docs" not in lab.critical_path(root, turn)
+```
+
+On the starter all four fail for the intended reason: 4 trace ids instead of 1, a self time of 0.1
+instead of 0.4 because overlapping children are summed, and `NotImplementedError` from the
+critical path in the last two.
+
+### Failure scenarios
+- **Inject: capture `copy_context()` once, outside the loop, and reuse it for all three tasks.**
+  Observe: `RuntimeError: cannot enter context: ... is already entered` as two threads run the same
+  context at once. Debug: read which call raised; a `Context` can be entered by one thread at a time,
+  so copy it per task.
+- **Inject: remove the `_current.reset(token)` call.** Observe: the second `agent.step` is nested under
+  the first and the root's self time looks negative or tiny. Debug: print each span's `parent_id`; a
+  span that never restores its parent leaves later siblings attached to it.
+- **Inject: run the tools with `asyncio.gather` on tasks created before `agent.step` opens.** Observe:
+  tool spans hang off the root instead of the step. Debug: a task copies the context at creation, so
+  create tasks inside the span that should parent them.
+
+### Submission
+- **Code:** your `lab_trace.py` with LAB 1-3 done and no `# BUG` line left as it was.
+- **Test run:** `pytest -q` showing 4 passed, plus your script output next to Expected output.
+- **One traced turn of your own agent:** a printed tree or backend screenshot with parallel tool calls
+  nested under their step.
+- **A short note (3-5 sentences):** which tool you would speed up from your critical path and why
+  shaving the others changes nothing the user sees.
+- **Evaluation:** tests pass, the tree has one trace id, and the note names a span on the critical path.
+
 ## Why it exists
 - **LLM failures do not throw.** "The assistant told the customer their order shipped, but it hadn't."
   HTTP 200 everywhere. In a chain of six steps (rewrite the query, retrieve eight chunks, rerank, call an

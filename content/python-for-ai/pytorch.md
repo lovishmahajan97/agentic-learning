@@ -5,7 +5,8 @@ name: PyTorch (tensors, autograd, nn.Module, DataLoader, device)
 kind: tool
 difficulty: core
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/numpy
@@ -39,6 +40,143 @@ decide whether your agent's tool models fit, stay fast and stop leaking memory.
 - **What you can skip.** Writing training loops from scratch for standard LLM fine-tuning, and the
   autograd internals beyond "gradients accumulate and graphs hold memory". Literacy is enough to debug
   OOMs, NaNs and accidental CPU fallbacks.
+
+## Lab
+### Task
+Fix a local router tool that an agent calls once per batch of pending turns from concurrent sessions.
+The handler works, but it records an autograd graph, routes identical turns differently, and stores
+tensors in session memory, so GPU memory would climb with open sessions. Time box: 45-60 minutes, CPU only.
+- **Prerequisites:** NumPy, Backpropagation, and this lesson's Autograd and nn.Module sections.
+- **Goal:** one batched forward pass per call, no graph, eval-mode layers, and only plain Python values
+  crossing the tool boundary.
+- **Checked against:** Python 3.12, `torch` 2.14 (CPU wheel); the APIs used are stable since 2.0.
+
+### Starter code
+Save as `lab.py`. Edit only the lines marked `LAB`.
+
+```python
+"""Lab: make a local router tool safe to call from many agent sessions (CPU is fine)."""
+import torch
+from torch import nn
+
+
+class Router(nn.Module):                        # turn embedding (384-d) -> [answer, search]
+    def __init__(self, dim: int = 384):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim, 64), nn.ReLU(), nn.Dropout(0.3), nn.Linear(64, 2))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class RouterTool:
+    """Tool handler the agent calls with one batch of pending turns from concurrent sessions."""
+
+    def __init__(self, model: nn.Module):
+        self.model = model                      # LAB 1: put the model in the right mode once, here
+        self.memory = {}                        # session_id -> last routing record, kept all session
+
+    def route(self, session_ids: list[str], embeddings: torch.Tensor) -> list[str]:
+        # LAB 2: this runs, but it records a graph, is non-deterministic, and leaks tensors.
+        probs = self.model(embeddings).softmax(-1)
+        decisions = []
+        for sid, p in zip(session_ids, probs):
+            d = "search" if p[1] > 0.5 else "answer"
+            self.memory[sid] = {"decision": d, "p_search": p[1]}   # LAB 3: plain Python values only
+            decisions.append(d)
+        return decisions
+
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    tool = RouterTool(Router())
+    x, ids = torch.randn(16, 384), [f"s{i}" for i in range(16)]
+    first = tool.route(ids, x)
+    p1 = [float(tool.memory[s]["p_search"]) for s in ids]
+    tool.route(ids, x)
+    p2 = [float(tool.memory[s]["p_search"]) for s in ids]
+    rec = tool.memory["s0"]
+    print("decisions:", len(first))
+    print("same probabilities twice:", p1 == p2)
+    print("memory value types:", sorted({type(v).__name__ for v in rec.values()}))
+    print("graph kept in memory:", any(getattr(v, "grad_fn", None) is not None for v in rec.values()))
+```
+
+### Expected output
+The starter prints `False`, `['Tensor', 'str']` and `True` on the last three lines. A correct fix prints:
+
+```
+decisions: 16
+same probabilities twice: True
+memory value types: ['float', 'str']
+graph kept in memory: False
+```
+
+### Tests
+Save as `test_lab.py` next to `lab.py` and run `pytest -q`. On the starter, three tests fail: dropout
+changes the probabilities, memory holds a `Tensor`, and the forward hook sees autograd on.
+
+```python
+import torch
+from lab import Router, RouterTool
+
+
+def make():
+    torch.manual_seed(0)
+    return RouterTool(Router()), torch.randn(16, 384), [f"s{i}" for i in range(16)]
+
+
+def test_one_decision_per_session():
+    tool, x, ids = make()
+    out = tool.route(ids, x)
+    assert len(out) == 16 and set(out) <= {"answer", "search"}
+
+
+def test_identical_turns_route_identically():         # dropout must be off
+    tool, x, ids = make()
+    tool.route(ids, x)
+    a = [float(tool.memory[s]["p_search"]) for s in ids]
+    tool.route(ids, x)
+    b = [float(tool.memory[s]["p_search"]) for s in ids]
+    assert a == b
+
+
+def test_memory_holds_plain_python_values():          # nothing pins tensors or graphs
+    tool, x, ids = make()
+    tool.route(ids, x)
+    for rec in tool.memory.values():
+        assert isinstance(rec["decision"], str)
+        assert type(rec["p_search"]) is float and 0.0 <= rec["p_search"] <= 1.0
+
+
+def test_one_forward_pass_without_autograd():
+    tool, x, ids = make()
+    seen = []
+    tool.model.register_forward_hook(
+        lambda m, i, o: seen.append((torch.is_grad_enabled(), m.training, o.requires_grad)))
+    tool.route(ids, x)
+    assert seen == [(False, False, False)]            # one batched call, no graph, eval mode
+```
+
+### Failure scenarios
+- **Remove `eval()` but keep `inference_mode`.** Memory is fine, but identical turns get different
+  probabilities. Debug: run the same batch twice and diff `p_search`; check `model.training` in a hook.
+- **Drop `inference_mode` and append each output tensor to a list.** On a GPU,
+  `torch.cuda.memory_allocated()` climbs per call. Debug: log it before and after a burst of 100 calls, then
+  look for anything with a `grad_fn` stored outside the handler.
+- **Loop over sessions and call the model once per row.** Results are correct but latency scales with
+  sessions. Debug: the forward hook fires 16 times instead of once; batch the rows back into one call.
+- **Run the model on `cuda` and build a mask with `torch.zeros(n)` inside `forward`.** You get "Expected
+  all tensors to be on the same device". Debug: print `x.device` next to the new tensor's device and create
+  it with `device=x.device`.
+
+### Submission
+- **`lab.py` with only the `LAB` lines changed**, and the four tests passing under `pytest -q`.
+- **The script's output** matching Expected output.
+- **A three-line note** naming which of the three fixes stops the memory leak, which stops the
+  non-determinism, and why `eval()` alone fixes neither the graph nor the tensor-in-memory leak.
+- **Evaluation:** tests pass, the handler makes one forward call per batch, and no tensor appears in
+  `tool.memory`.
 
 ## Why it exists
 - **NumPy lacks three things training needs.** The derivative of a scalar loss with respect to millions

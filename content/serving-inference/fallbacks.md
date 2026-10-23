@@ -5,7 +5,8 @@ name: Fallbacks
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - system-design/model-fallback-strategies
@@ -170,6 +171,23 @@ flowchart TD
     SM -->|"ok"| OK
     SM -->|"fails or deadline spent"| DG["Degraded answer or honest error"]
 ```
+
+## Misconceptions
+- **"A fallback is a try/except that calls model B."** Model B may reject your tool schema, JSON mode or
+  context length, may never have been evaluated, and may have no quota when the whole fleet moves at
+  once. A fallback is a designed, evaluated and warm subsystem.
+- **"Order the ladder from most to least expensive."** Order it by behavioural distance from the
+  primary: the same model in another region keeps prompts and evals valid, so it comes before any
+  cheaper or different model.
+- **"Any error should fail over."** A 400 or context-length overflow fails identically on an equivalent
+  target, and auth or billing faults need a human. Only transient capacity errors and latency over budget
+  justify the next rung.
+- **"A circuit breaker should open after N failures in a row."** At a 20% independent error rate five in
+  a row happen about once in 3,125 windows, and at 60% the breaker flaps. Use a failure rate over a
+  window with a minimum call count.
+- **"If the agent step failed, the fallback can simply redo it."** The primary may have timed out after
+  dispatching a tool call. Check the step's idempotency key or result store first, then continue the
+  same transcript instead of regenerating the side effect.
 
 ## Examples
 ### Fallback chain with a rate-based breaker

@@ -5,7 +5,8 @@ name: Perplexity
 kind: metric
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/loss-functions
@@ -164,6 +165,22 @@ flowchart TD
     N -->|"end of text"| P["PPL = exp of mean NLL"]
     N -->|"end of text"| B["Bits per byte"]
 ```
+
+## Misconceptions
+- **"Lower perplexity means a better agent model."** Perplexity measures how well a model predicts a
+  fixed text, not tool use, instruction following or facts. RLHF models often score worse on raw web text
+  while being far more useful, so agent evals decide.
+- **"You can compare perplexity across models."** Only with the same tokenizer, text, window and stride.
+  The same document can score 7.4 with a 32k vocabulary and 20.1 with a 128k one at identical quality;
+  bits per byte is the comparable unit.
+- **"Low perplexity on a tool call means the call is correct."** It measures confidence, not
+  correctness, and an average can hide one shaky argument token. Check the worst token too, and keep
+  schema and business-rule validation.
+- **"Sampling temperature affects measured perplexity."** It is computed by teacher forcing in one
+  forward pass over the real text; no sampling happens, so temperature plays no role unless you rescale
+  the logits yourself.
+- **"A good enough model drives perplexity toward 1."** Text has irreducible entropy H(P), so perplexity
+  cannot fall below e^H(P); gains shrink near that floor, and a fluent false sentence can still score low.
 
 ## Examples
 ### Agent scenario: gate a tool call on its own perplexity

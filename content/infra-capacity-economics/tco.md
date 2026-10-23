@@ -5,7 +5,8 @@ name: TCO (total cost of ownership)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/break-even-analysis
@@ -35,6 +36,60 @@ the token bill, so compare equal outcomes and report a range.
   estimates for keeping the agent working.
 - **What you can skip.** Accounting depreciation rules and finance's choice of discount rate; take the rate
   as an input and focus on getting the cost lines and the flip assumption right.
+
+## Decision case
+### Scenario
+An EU insurer wants a customer-support agent and must choose how to run it. Every figure is illustrative,
+in thousands of dollars, and reuses the support-agent example below (50,000 runs a month, $0.10 of tokens
+per run, $200k per loaded engineer-year).
+- **Adoption range:** flat at 50,000 runs a month, or growing to 75,000 and 100,000 in years 2 and 3.
+- **Deadline:** launch within one quarter, with a team of three engineers.
+- **Data:** customer data must stay in an EU region; every option below offers one.
+- **Horizon and rate:** three years, discounted at finance's 10%.
+- **Quality:** each option must pass the same agent eval set at the same run success rate.
+
+### Options
+| Option | How it works | Three-year total (flat / growth) | NPV (flat / growth) | Meets the launch deadline? |
+|---|---|---|---|---|
+| A. Build on a hosted API | the table below: 340 to build, then 330 a year (tokens 60 to 120 as runs grow) | 1,330 / 1,420 | 1,161 / 1,231 | no: 1.5 FTE-years is six months for three engineers |
+| B. Hosted agent platform | $0.40 per run (illustrative) with a 7% escalator, 120 for integration, security review and a vendor-neutral eval set, 0.4 FTE of admin | 1,132 / 1,535 | 956 / 1,268 | yes: 0.6 FTE-years is about ten weeks |
+| C. Self-host an open-weight model | same 340 build, two GPU replicas at 72 a year, 1.5 FTE of upkeep | 1,666 / 1,666 | 1,439 / 1,439 | no |
+
+- **B's exit is contingent:** 150 to export traces, memory and embeddings and re-integrate, at a judged
+  30% probability by year 3, about 34 in expected NPV.
+- **C carries more people,** so it loses at this volume whatever the GPU price.
+
+### Decision
+Choose **B** on a 12-month term, with a capped per-run price and a contractual export of traces, memory
+and embeddings.
+- **Only B meets the deadline;** A and C would launch a quarter late.
+- **The cost answer is adoption-dependent:** B wins by about 205 NPV if usage stays flat, and A wins by
+  about 38 in the growth case, a gap smaller than the uncertainty in the inputs.
+- **The flip point is measurable:** A becomes cheaper above about 92,000 year-3 runs a month, or about
+  85,000 once B's expected exit cost is added. The first year of B measures exactly that.
+- **Price is the strongest negotiating lever:** at $0.30 per run B wins in both scenarios; at $0.50 A
+  wins the growth case by about 275.
+
+**What would change it:**
+- **Year-1 runs trend toward 85,000 or more by year 3:** start the build so it is ready at renewal.
+- **The vendor refuses the price cap or the export clause:** exit cost becomes unbounded, so build.
+- **A relaxed deadline:** A becomes feasible, and the choice rests on adoption alone.
+
+### Trade-offs accepted
+- **Cost that scales with adoption:** track monthly runs against the 85,000 threshold.
+- **Lock-in:** run an export drill before signing and again before each renewal.
+- **The vendor chooses model upgrades:** re-run the vendor-neutral eval set on every model change the
+  vendor announces.
+- **Less control over agent logic and tools:** log tool-call failures handled by humans, a cost line that
+  belongs in the next TCO.
+
+### Review rubric
+- Fixes the outcome, quality bar, horizon and discount rate before any comparison.
+- Fills all four buckets for every option, including people at loaded cost and contingent exit.
+- Shows undiscounted totals and NPV under at least two adoption scenarios.
+- Checks hard constraints, such as deadline and residency, separately from cost.
+- Names the flip assumption with its threshold, and a pilot or term that measures it.
+- Keeps risk events as probability times impact, apart from firm costs.
 
 ## Why it exists
 - **Decisions get framed by the most visible price:** dollars per million tokens, per GPU hour, per seat.

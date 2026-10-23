@@ -5,7 +5,8 @@ name: Lifespan (load model / client once)
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/asgi-lifecycle
@@ -40,6 +41,137 @@ fails the deploy, not the first user.
   flight (drain timeout, checkpoint per step).
 - **What you can skip.** The raw ASGI lifespan messages beyond knowing they gate traffic. Know the
   `yield` shape, the exit stack, per-worker multiplication and what does not run lifespan in tests.
+
+## Lab
+### Task
+Move an agent server's boot out of import time and into `lifespan`. The starter opens its LLM client
+and tool-server session when the module is imported, never closes them, and serves runs even when a
+tool has no description the model could read.
+
+Time box: 45 minutes. Prerequisites: the ASGI lifecycle lesson and this lesson's How it works. The code
+marks two tasks:
+- **Task 1:** open both clients in `lifespan` with an `AsyncExitStack`, yield them as lifespan state,
+  and read them from `request.state` in the route.
+- **Task 2:** make `check_tools` fail startup on a blank description, after the LLM client is open, so
+  the exit stack must close it.
+
+### Starter code
+Save as `lab_lifespan.py`. `FakeClient` stands in for `httpx.AsyncClient` or an MCP client session and
+logs every open and close. It runs as given and shows two clients opened at import and never closed.
+Checked with FastAPI 0.161.1, Starlette 1.9.0, httpx 0.28.1 and Python 3.13.
+
+```python
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+
+EVENTS: list[str] = []                           # open/close log, in order
+TOOL_CONFIG = [{"name": "search_docs", "description": "Search internal docs by keyword."},
+               {"name": "create_ticket", "description": "Open a support ticket."}]
+
+class FakeClient:                                # stand-in for httpx.AsyncClient or an MCP session
+    def __init__(self, name: str):
+        self.name = name
+        EVENTS.append(f"open {name}")
+    async def aclose(self):
+        EVENTS.append(f"close {self.name}")
+    async def call(self, payload: str) -> str:
+        await asyncio.sleep(0)
+        return f"{self.name} handled {payload!r}"
+
+def check_tools(config: list[dict]) -> list[str]:
+    # TASK 2: raise RuntimeError naming the tool if any description is empty or blank, because the
+    #         model chooses tools by reading their descriptions. Return the tool names.
+    return [t["name"] for t in config]
+
+# TASK 1: nothing may open at import time. Inside lifespan, use an AsyncExitStack: open the "llm"
+#         client, register its aclose (push_async_callback), run check_tools(TOOL_CONFIG), then open
+#         the "tools" client the same way, and yield {"llm": ..., "tools": ..., "tool_names": ...}.
+#         The route must read all three from request.state.
+LLM = FakeClient("llm")
+TOOLS = FakeClient("tools")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield {}
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/agent/run")
+async def run(request: Request, task: str):
+    return {"answer": await LLM.call(task), "tool": await TOOLS.call("search_docs"),
+            "tools": check_tools(TOOL_CONFIG)}
+
+if __name__ == "__main__":
+    print("at import:", EVENTS)
+    with TestClient(app) as c:
+        print(c.post("/agent/run", params={"task": "refund?"}).json())
+    print("after shutdown:", EVENTS)
+```
+
+### Expected output
+`python lab_lifespan.py` after both tasks. The starter prints `['open llm', 'open tools']` on the first
+and last lines: opened at import, never closed.
+
+```
+at import: []
+{'answer': "llm handled 'refund?'", 'tool': "tools handled 'search_docs'", 'tools': ['search_docs', 'create_ticket']}
+after shutdown: ['open llm', 'open tools', 'close tools', 'close llm']
+```
+
+### Tests
+Save as `test_lab_lifespan.py` and run `pytest -q`. The fixture reloads the module, so `EVENTS` shows
+exactly what an import does. On the starter all 3 fail on assertions: two opens at import, no closes,
+and a bad config that does not raise.
+
+```python
+import importlib
+import pytest
+from fastapi.testclient import TestClient
+import lab_lifespan
+
+@pytest.fixture
+def lab():
+    mod = importlib.reload(lab_lifespan)         # fresh module: EVENTS shows what import did
+    yield mod
+
+def test_import_opens_nothing(lab):
+    assert lab.EVENTS == [], f"opened at import time: {lab.EVENTS}"
+
+def test_clients_open_before_traffic_and_close_in_reverse(lab):
+    with TestClient(lab.app) as c:
+        assert lab.EVENTS == ["open llm", "open tools"]
+        r = c.post("/agent/run", params={"task": "refund?"})
+        assert r.json()["tools"] == ["search_docs", "create_ticket"]
+    assert lab.EVENTS == ["open llm", "open tools", "close tools", "close llm"]
+
+def test_bad_tool_config_fails_startup_and_unwinds(lab, monkeypatch):
+    monkeypatch.setattr(lab, "TOOL_CONFIG", [{"name": "search_docs", "description": "  "}])
+    with pytest.raises(RuntimeError, match="search_docs"):
+        with TestClient(lab.app):
+            pass
+    assert lab.EVENTS == ["open llm", "close llm"]
+```
+
+### Failure scenarios
+- **Use `TestClient(app)` without `with`.** Observe: the route fails with `AttributeError: 'State'
+  object has no attribute 'llm'`, because lifespan never ran. Debug: lifespan runs only inside the
+  context manager; put it in a fixture so every agent test boots the real startup path.
+- **Close after `yield` by hand instead of the exit stack.** Observe: the happy path passes, but on the
+  bad config the log is `['open llm']`, a leaked client per failed boot. Debug: check the log on the
+  failure path; register each close on the stack the moment the resource opens.
+- **Validate tools after opening every client.** Observe: the unwind test sees four events instead of
+  two. Debug: cheap checks that can fail (config, schemas, required env vars) go before expensive opens.
+
+### Submission
+- **Code:** `lab_lifespan.py` with both tasks done and no module-level clients left.
+- **Test run:** `pytest -q` showing 3 passed.
+- **Trace:** the demo output, matching Expected output.
+- **Short note (5-8 lines):** how many clients four Uvicorn workers would open, and what a failed
+  `check_tools` does to a rolling deploy.
+- **Evaluation:** tests pass, every open has its close registered on the stack, and the route reads only
+  `request.state`.
 
 ## Why it exists
 - **Some objects are slow to build and meant to be shared.** A tokenizer and model that take seconds and

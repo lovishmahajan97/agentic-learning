@@ -5,7 +5,8 @@ name: Workflow orchestration (Temporal, Prefect, Airflow)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - reliability/durable-workflow-execution
@@ -39,6 +40,63 @@ code, which fits long agent runs that wait for approvals.
   you change a running agent's code.
 - **What you can skip.** Airflow executor internals and Temporal's server operations if you buy a hosted
   service. Know the three recovery models and the determinism rule.
+
+## Decision case
+### Scenario
+An insurer runs two AI workloads and must decide which engine runs each. All figures are illustrative.
+- **Ingestion:** nightly re-chunk and re-embed of changed policy documents behind the claims agent's
+  retrieval, with occasional backfills over past days. The data team already operates Airflow.
+- **Agent runs:** 4,000 claims a day, about 10 model and tool activities each, so about 40,000 activity
+  completions a day. 30% of runs wait for an adjuster's approval, on average 2 days and at most 5,
+  before a payment tool runs.
+- **Waiting runs at any moment (Little's law):** 4,000 × 0.3 × 2 days = 2,400.
+- **Constraints:** payments must never repeat; workers deploy daily, so every deploy meets in-flight
+  runs; a platform team of 3; launch in one quarter.
+
+### Options
+| Option | Ingestion | Agent runs | Five-day waits and daily deploys | New to operate |
+|---|---|---|---|---|
+| A. Airflow for both | Strong fit: data intervals, backfills | Poor: batch scheduler, no durable signal per run | Fake it with polling DAGs | Nothing |
+| B. Airflow plus Temporal | Unchanged | Activity per model and tool call, approval as a signal with a timeout | Native timers and signals; deploys need `workflow.patched` | A Temporal server, run or bought |
+| C. Prefect for both | Good, after migrating DAGs | Suspended flows re-run from the top, skipping cached tasks | Workable, but not its design centre | Prefect, plus the migration |
+| D. Airflow plus LangGraph with a Postgres checkpointer | Unchanged | Graph checkpoints per node, `interrupt()` for approval | Resume works; expiry timers and reminders are yours to build | Nothing beyond Postgres |
+
+### Decision
+Choose **B: keep Airflow for ingestion, run agent runs on Temporal**, because:
+- **The workloads have different shapes:** scheduled batch with backfills versus long, stateful runs
+  that wait on humans, and each engine fits one of them.
+- **Waits of up to 5 days across daily deploys** are exactly what durable timers, signals and replay
+  are for; 2,400 parked runs hold no worker.
+- **Payment safety is explicit:** the payment activity carries a key built from the workflow id and
+  step, so a retry after a crash is deduplicated by the provider.
+- **The data team's working Airflow stays untouched,** which protects the quarter's deadline better than
+  migrating ingestion (C).
+
+D is the runner-up. It avoids a new engine, but expiry, reminders and per-tool retry policies would be
+hand-built for runs the lesson's own rule says belong to a durable engine.
+
+**What would change it:** approval waits of minutes rather than days, or a platform team that cannot run
+or buy Temporal, would make D enough; ingestion that becomes event-driven per document would favour
+Prefect for that side.
+
+### Trade-offs accepted
+- **Determinism discipline.** No clock, random or I/O in workflow code. Watch: non-determinism errors
+  after each deploy.
+- **Versioning on every deploy,** since some run is always in flight. Watch: open runs on old patch
+  versions, and remove patches once they drain.
+- **History grows with the transcript.** Watch: history event count and size per workflow; keep tool
+  results as short summaries and use continue-as-new for long runs.
+- **Two orchestrators to understand.** Watch: on-call incidents by engine, and keep one runbook each.
+
+### Review rubric
+- **Workloads are separated by shape** (batch, runtime-shaped pipeline, long-lived stateful run) before
+  any tool is named.
+- **Waiting load is computed:** runs per day, wait share and wait time give the number of parked runs.
+- **The side-effect story is explicit:** which step can repeat after a crash and which key deduplicates
+  it.
+- **Deploys with in-flight runs are addressed:** versioning or draining is part of the plan.
+- **The existing team and tools are weighed,** with the cost of migration stated.
+- **Reversal conditions are concrete,** such as wait length or the ability to operate an engine.
 
 ## Why it exists
 - **Multi-step processes all need the same machinery.** Remember which steps completed, retry failures

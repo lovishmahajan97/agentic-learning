@@ -5,7 +5,8 @@ name: Health / readiness endpoints
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/lifespan
@@ -37,6 +38,175 @@ loads. Shared dependencies belong in readiness, or nowhere, never in liveness.
   probe timings; and the drain flag.
 - **What you can skip.** Probe types other than HTTP (exec, gRPC, TCP). The three questions and the
   default timings are what you need.
+
+## Lab
+### Task
+An agent service has one `/health` endpoint, used as liveness and readiness, that awaits the LLM
+provider and every tool backend. A provider outage or one dead CRM tool therefore pulls every replica
+out of rotation. Split it into `/livez` and `/readyz` built from local state only, and add the
+degraded mode that hides failing tools from the agent instead.
+
+Time box: 45-60 minutes.
+- **Prerequisites:** Lifespan (load model / client once), Async endpoints, and this lesson's
+  "Classifying an agent's dependencies" table.
+- **Setup:** Python 3.12 with `pip install fastapi httpx pytest` (checked on FastAPI 0.161). The
+  provider and tool backends are local fakes, so nothing external is called. Save the starter as
+  `lab_health.py` and the tests as `test_lab_health.py`.
+- **Constraint:** a tool that hangs for 5 s must not make a health refresh take 5 s.
+
+### Starter code
+```python
+"""Lab: probes that do not take an agent service down with its tools (FastAPI 0.161, Python 3.12)."""
+import asyncio, time
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Response
+from fastapi.testclient import TestClient
+
+
+class FakeBackend:
+    """Stands in for the LLM provider, a tool backend or an MCP server."""
+    def __init__(self, name, up=True, delay_s=0.0):
+        self.name, self.up, self.delay_s = name, up, delay_s
+
+    async def ping(self) -> bool:
+        await asyncio.sleep(self.delay_s)
+        if not self.up:
+            raise ConnectionError(self.name)
+        return True
+
+
+def create_app(provider: FakeBackend, tools: dict) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.prompts_loaded = True        # stand-in for loading prompt versions
+        app.state.tools = tools                # stand-in for building the tool registry
+        app.state.tool_ok = {}
+        app.state.draining = False
+        yield
+        app.state.draining = True
+
+    app = FastAPI(lifespan=lifespan)
+
+    # LAB 1: one endpoint answers every probe and awaits shared dependencies.
+    #        Replace it with /livez (local only) and /readyz (local flags only: prompts loaded,
+    #        tools registered, not draining; 503 before lifespan has run).
+    @app.get("/health")
+    async def health(response: Response):
+        ok = True
+        for backend in [provider, *tools.values()]:
+            try:
+                await backend.ping()
+            except Exception:
+                ok = False
+        response.status_code = 200 if ok else 503
+        return {"ok": ok}
+
+    @app.post("/internal/drain", include_in_schema=False)
+    async def drain():
+        app.state.draining = True
+        return {"draining": True}
+
+    return app
+
+
+async def refresh_tool_health(app: FastAPI, timeout_s: float = 0.2) -> dict:
+    """LAB 2: ping every tool concurrently, each bounded by timeout_s; store the results in
+    app.state.tool_ok and return them. A failing or slow tool is False."""
+    raise NotImplementedError
+
+
+def available_tools(app: FastAPI) -> list:
+    """LAB 3: names of the tools the agent may offer the model this step; unknown counts as healthy."""
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    provider = FakeBackend("llm", up=False)                        # provider outage
+    tools = {"search": FakeBackend("search"), "crm": FakeBackend("crm", up=False),
+             "docs": FakeBackend("docs", delay_s=5)}
+    app = create_app(provider, tools)
+    with TestClient(app) as c:
+        print("livez", c.get("/livez").status_code, "readyz", c.get("/readyz").status_code)
+        t0 = time.perf_counter()
+        health = asyncio.run(refresh_tool_health(app))
+        print("tool health", health, f"in {time.perf_counter() - t0:.1f}s")
+        print("offered", available_tools(app))
+        c.post("/internal/drain")
+        print("readyz while draining", c.get("/readyz").status_code)
+```
+
+As given, it prints `livez 404 readyz 404` and then raises `NotImplementedError`.
+
+### Expected output
+The timing line can read 0.2s or 0.3s depending on the machine; everything else is exact.
+
+```
+livez 200 readyz 200
+tool health {'search': True, 'crm': False, 'docs': False} in 0.2s
+offered ['search']
+readyz while draining 503
+```
+
+### Tests
+```python
+import asyncio, time
+from fastapi.testclient import TestClient
+from lab_health import FakeBackend, available_tools, create_app, refresh_tool_health
+
+
+def test_provider_outage_keeps_the_pod_in_rotation():
+    app = create_app(FakeBackend("llm", up=False), {"search": FakeBackend("search")})
+    with TestClient(app) as c:
+        assert c.get("/livez").status_code == 200
+        assert c.get("/readyz").status_code == 200
+
+
+def test_not_ready_before_startup_or_while_draining():
+    app = create_app(FakeBackend("llm"), {"search": FakeBackend("search")})
+    assert TestClient(app).get("/readyz").status_code == 503      # lifespan has not run yet
+    with TestClient(app) as c:
+        c.post("/internal/drain")
+        assert c.get("/readyz").status_code == 503
+        assert c.get("/livez").status_code == 200                 # draining is not a reason to restart
+
+
+def test_failing_and_slow_tools_are_hidden_not_fatal():
+    tools = {"search": FakeBackend("search"), "crm": FakeBackend("crm", up=False),
+             "docs": FakeBackend("docs", delay_s=5)}
+    app = create_app(FakeBackend("llm"), tools)
+    with TestClient(app) as c:
+        assert available_tools(app) == ["search", "crm", "docs"]  # nothing measured yet
+        t0 = time.perf_counter()
+        assert asyncio.run(refresh_tool_health(app, timeout_s=0.2)) == {
+            "search": True, "crm": False, "docs": False}
+        assert time.perf_counter() - t0 < 1.0                     # concurrent and bounded
+        assert available_tools(app) == ["search"]
+        assert c.get("/readyz").status_code == 200
+```
+
+On the starter, the first two tests fail with 404 (no `/livez` or `/readyz`) and the third with
+`NotImplementedError`. A `TestClient` used without `with` does not run lifespan, which is how the second
+test sees a pod that has not finished starting.
+
+### Failure scenarios
+- **Inject: read `app.state.prompts_loaded` directly in `/readyz`.** Observe: the not-yet-started test
+  errors with `AttributeError` (the test client re-raises it; a real probe would get a 500, not a 503),
+  because the attribute does not exist before lifespan. Debug: read the traceback; use
+  `getattr(app.state, "prompts_loaded", False)`.
+- **Inject: ping tools one after another instead of with `asyncio.gather`.** Observe: still under a
+  second here, but with ten slow tools the refresh takes ten times the timeout and readings go stale.
+  Debug: time the refresh per tool count; the bound should not grow with the number of tools.
+- **Inject: call `refresh_tool_health` from inside `/readyz`.** Observe: readiness latency now equals
+  the slowest tool's timeout and a slow MCP server fails the 1 s probe. Debug: time the probe; run the
+  refresh in a background task and let `/readyz` read flags only.
+
+### Submission
+- The fixed `lab_health.py` and a `pytest -q` run showing 3 passed.
+- Your output of `python lab_health.py`.
+- The three probe blocks for the pod spec (`startupProbe`, `livenessProbe`, `readinessProbe`) for a
+  90 s prompt and tool-registry load, with the arithmetic for `failureThreshold`.
+- A short note: one dependency you would add to readiness for your own agent, and why only this instance
+  can lose it.
 
 ## Why it exists
 - **Orchestrators need two cheap, automatic decisions per instance:** send it requests or not, and kill

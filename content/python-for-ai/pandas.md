@@ -5,7 +5,8 @@ name: pandas
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/numpy
@@ -37,6 +38,140 @@ RAM; watch alignment, copies and memory.
   `dropna=False` in reports, and vectorized column math instead of `apply`.
 - **What you can skip.** MultiIndex gymnastics, time-series resampling and most of the API. Reading,
   joining, grouping and safe assignment cover agent analysis.
+
+## Lab
+### Task
+Harden the weekly agent trace report: cost per run must not inflate when the price table gains a
+duplicate row or deflate when a new model has no price, and the per-tool error table must use built-in
+aggregations. The data is a small inline trace, so no tracing service is needed. Time box: 45 minutes.
+- **Prerequisites:** this lesson's How it works (joins, group-by), numpy and json-jsonl.
+- **The shipped report is buggy:** an unvalidated left join, a silent NaN cost, and a row-wise `apply`.
+
+### Starter code
+```python
+# trace_report.py  (checked with pandas 2.3.3, Python 3.9+)
+import pandas as pd
+
+STEPS = pd.DataFrame({         # in practice: pd.read_json("traces.jsonl", lines=True)
+    "run_id": ["r1", "r1", "r1", "r2", "r2", "r3", "r3", "r3", "r3"],
+    "model":  ["small"] * 3 + ["large"] * 2 + ["small"] * 4,
+    "tool":   ["search", "lookup_order", None, "search", None,
+               "lookup_order", "lookup_order", "lookup_order", None],
+    "status": ["ok", "error", "ok", "ok", "ok", "error", "error", "ok", "ok"],
+    "in_tokens":  [3000, 3600, 4100, 2900, 3400, 3100, 3700, 4300, 4900],
+    "out_tokens": [80, 60, 220, 70, 180, 50, 50, 60, 240],
+})
+PRICES = pd.DataFrame({"model": ["small", "large"],            # illustrative prices
+                       "usd_per_1k_in": [0.00015, 0.0025], "usd_per_1k_out": [0.0006, 0.01]})
+
+
+def cost_per_run(steps: pd.DataFrame, prices: pd.DataFrame) -> pd.DataFrame:
+    """One row per run_id: n_steps, in_tokens, out_tokens, cost_usd (rounded to 6), by run_id.
+    BUGGY (FILL IN 1): a duplicated price row multiplies steps, and an unpriced model
+    silently costs 0. Make both raise, keep the step count, and replace the row-wise apply."""
+    df = steps.merge(prices, on="model", how="left")
+    df["cost_usd"] = df.apply(lambda r: r.in_tokens / 1000 * r.usd_per_1k_in
+                              + r.out_tokens / 1000 * r.usd_per_1k_out, axis=1)
+    out = (df.groupby("run_id")
+             .agg(n_steps=("run_id", "size"), in_tokens=("in_tokens", "sum"),
+                  out_tokens=("out_tokens", "sum"), cost_usd=("cost_usd", "sum"))
+             .reset_index())
+    out["cost_usd"] = out["cost_usd"].round(6)
+    return out
+
+
+def tool_error_table(steps: pd.DataFrame) -> pd.DataFrame:
+    # FILL IN 2: columns tool, calls, errors, error_rate (rounded to 2); model-only steps (no tool)
+    # excluded; sorted by error_rate descending then tool; built-in aggregations only, no lambdas.
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    print("cost:", cost_per_run(STEPS, PRICES).to_dict("records"))
+    print("tools:", tool_error_table(STEPS).to_dict("records"))
+```
+
+### Expected output
+```text
+cost: [{'run_id': 'r1', 'n_steps': 3, 'in_tokens': 10700, 'out_tokens': 360, 'cost_usd': 0.001821}, {'run_id': 'r2', 'n_steps': 2, 'in_tokens': 6300, 'out_tokens': 250, 'cost_usd': 0.01825}, {'run_id': 'r3', 'n_steps': 4, 'in_tokens': 16000, 'out_tokens': 400, 'cost_usd': 0.00264}]
+tools: [{'tool': 'lookup_order', 'calls': 4, 'errors': 3, 'error_rate': 0.75}, {'tool': 'search', 'calls': 2, 'errors': 0, 'error_rate': 0.0}]
+```
+Recompute one row: `r2` is 6,300 input tokens × 0.0025 / 1,000 = 0.01575 plus 250 output tokens × 0.01 /
+1,000 = 0.0025, so 0.01825.
+
+### Tests
+```python
+# test_trace_report.py  (run: pytest -q)
+import pandas as pd
+import pytest
+
+from trace_report import PRICES, STEPS, cost_per_run, tool_error_table
+
+
+def test_cost_per_run_values():
+    out = cost_per_run(STEPS, PRICES).set_index("run_id")
+    assert out.loc["r3", "n_steps"] == 4 and out.loc["r3", "in_tokens"] == 16000
+    assert out.loc["r2", "cost_usd"] == pytest.approx(6300 / 1000 * 0.0025 + 250 / 1000 * 0.01)
+
+
+def test_duplicate_price_row_raises():
+    dup = pd.concat([PRICES, PRICES.iloc[[0]]], ignore_index=True)
+    with pytest.raises(pd.errors.MergeError):
+        cost_per_run(STEPS, dup)
+
+
+def test_unpriced_model_raises_and_names_it():
+    steps = STEPS.copy()
+    steps.loc[steps["run_id"] == "r2", "model"] = "experimental"
+    with pytest.raises(ValueError, match="experimental"):
+        cost_per_run(steps, PRICES)
+
+
+def test_input_not_mutated():
+    before = STEPS.copy()
+    cost_per_run(STEPS, PRICES)
+    pd.testing.assert_frame_equal(STEPS, before)
+
+
+def test_no_row_wise_apply(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("row-wise apply used")
+    monkeypatch.setattr(pd.DataFrame, "apply", boom)
+    cost_per_run(STEPS, PRICES)
+
+
+def test_tool_error_table():
+    t = tool_error_table(STEPS)
+    assert list(t.columns) == ["tool", "calls", "errors", "error_rate"]
+    assert t.to_dict("records") == [
+        {"tool": "lookup_order", "calls": 4, "errors": 3, "error_rate": 0.75},
+        {"tool": "search", "calls": 2, "errors": 0, "error_rate": 0.0},
+    ]
+```
+On the starter 4 of 6 fail for the intended reasons (`DID NOT RAISE` for the duplicate and unpriced
+cases, the `apply` guard, and `NotImplementedError`); the value and no-mutation tests already pass and
+guard against regressions while you refactor.
+
+### Failure scenarios
+- **Inject the duplicate price row with the starter's join.** `r1` reports 6 steps and double the cost,
+  and nothing errors. Compare `len(df)` before and after the merge; `validate="many_to_one"` turns it
+  into a `MergeError`.
+- **Inject an unpriced model.** `sum` skips NaN, so the run costs `0.0` and the expensive variant looks
+  free in the weekly report. Check `df["usd_per_1k_in"].isna().sum()` after the join.
+- **Inject `groupby("tool")` without dropping missing tools first.** Here the default `dropna=True` hides
+  the model-only steps, so the result looks right; with `dropna=False` they appear as a `NaN` tool row.
+  Make the exclusion explicit rather than relying on the default.
+- **Inject `steps["cost_usd"] = ...` inside the function.** The no-mutation test fails, because the
+  caller's frame gains a column. Work on the merged copy.
+
+### Submission
+- **Code:** `trace_report.py` plus the unchanged tests.
+- **Test run:** `pytest -q` showing 6 passed, with `pd.__version__`.
+- **Output:** the two demo lines, matching Expected output.
+- **Finding note:** two sentences on what the `lookup_order` error rate and the `r3` step count tell an
+  agent team, as in this lesson's first example.
+- **Evaluation:** no `apply` or Python loop over rows, every join has `validate=`, and bad price data
+  raises with the model's name.
 
 ## Why it exists
 - **Agent data is mixed-type rows.** An eval run produces a case ID, model name, category string, pass/fail

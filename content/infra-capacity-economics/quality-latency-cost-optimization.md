@@ -5,7 +5,8 @@ name: Quality–latency–cost optimization
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/model-routing-cascading
@@ -36,6 +37,61 @@ configurations, and choose from the Pareto frontier under hard constraints.
   per step, a stable cacheable prefix, the step budget, and the eval that defines a successful run.
 - **What you can skip.** Serving-side levers (quantization, speculative decoding) unless you self-host; on
   a hosted API they are the provider's job, and you only see their effect in the latency and price.
+
+## Decision case
+### Scenario
+A B2B software company runs the 8-step support agent from the first example (4,000-token prefix, ~600
+tool tokens per step) on a large hosted model. All prices, timings and pass rates are illustrative, using
+the same placeholder price table as that example (small model at a tenth of the large one's prices).
+- **Volume:** 120,000 runs a month today, forecast 200,000 within two quarters.
+- **Quality floor:** run success of at least 88% on a 300-task eval, each task run twice (600 runs).
+- **Latency:** p95 model time per run of at most 20 s, because users wait on the agent in a chat panel.
+- **Budget:** $8,000 a month of model spend.
+- **Team and deadline:** two engineers, six weeks; no fine-tuning this quarter.
+
+### Options
+| Option | How it works | Success | p95 model time | Cost per run | Per month at 120k | Cost per success |
+|---|---|---|---|---|---|---|
+| A. Today | large model, 300 output tokens per step, no caching | 0.91 | 51.2 s | $0.2076 | $24,912 | $0.2281 |
+| B. Large, capped and cached | 80-token terse steps, prompt caching on the prefix | 0.90 | 16.0 s | $0.0486 | $5,832 | $0.0540 |
+| C. Run-level cascade | whole run on the small model; a verifier sends the 20% that fail to a full B run | 0.89 | about 32 s | $0.0146 | $1,748 | $0.0164 |
+| D. Per-step routing | large model plans and answers (steps 1 and 8), small model runs the six tool steps | 0.88 | 16.0 s | $0.0339 | $4,068 | $0.0385 |
+
+- **C's cost** is `s + e·l` = 0.00486 + 0.20 × 0.0486; its p95 is an escalated run, two runs back to back.
+- **D saves less than expected** because each model keeps its own prompt cache: every switch re-reads the
+  transcript at the uncached rate.
+
+### Decision
+Ship **B** now and run D in shadow mode to decide before volume grows.
+- **A fails twice:** three times the budget and 2.5 times the latency limit.
+- **C fails the latency constraint:** 20% of runs escalate, so the p95 is an escalated run at about 32 s,
+  even though it is the cheapest by far.
+- **D sits on the floor:** at q = 0.90 and n = 600 the standard error is about 1.2 points, so 0.88 is
+  indistinguishable from failing it.
+- **B meets every constraint:** 0.90 ties A within noise (paired test on the same 600 runs), 16 s is under
+  20 s, and $5,832 is under $8,000.
+
+**What would change it:**
+- **Volume:** B fits the budget only up to about 164,000 runs a month ($8,000 / $0.0486); at 200,000 it
+  costs $9,720, while D costs $6,780. Prove D on a 1,200-run paired eval before that.
+- **An asynchronous product mode:** if the latency limit is relaxed, C's cost per success wins outright.
+- **Fine-tuning budget next quarter:** a distilled small model shifts the frontier, so re-run the table.
+
+### Trade-offs accepted
+- **About one point of success versus A,** inside the noise; a weekly paired eval on sampled traffic
+  alerts if the gap grows beyond two standard errors.
+- **Dependence on the cache:** cost assumes every step after the first hits the prefix cache; alert when
+  cached input tokens per step drop, which signals a prompt or tool-schema edit.
+- **Terse steps may truncate:** monitor the share of calls stopped for length per step type.
+- **Shrinking budget headroom:** track monthly runs against the 164,000 ceiling and forecast it.
+
+### Review rubric
+- States the success floor, latency limit and budget as numbers before comparing options.
+- Reports cost per successful run, not per call, and recomputes each option from per-step tokens.
+- Treats differences within the eval's standard error as ties and names the paired test used.
+- Checks the tail: computes p95 for any cascade from the escalation rate, not the average.
+- Rejects options that miss a hard constraint even when they win on cost.
+- Names the volume or constraint change that flips the choice, with the threshold computed.
 
 ## Why it exists
 - **The usual history.** A prototype agent ships on the largest model with a long, example-stuffed prompt.

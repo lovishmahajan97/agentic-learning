@@ -5,7 +5,8 @@ name: ACL-aware retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -184,6 +185,26 @@ sequenceDiagram
     R-->>A: top-k permitted chunks only
     A->>L: next step with permitted context
 ```
+
+## Misconceptions
+- **"A system prompt telling the model not to reveal restricted documents is a control."** The model does
+  not know the user's permissions, has already read the chunk, and follows instructions only
+  probabilistically. Authorization is a predicate inside the search, derived from the session.
+- **"Late binding alone is the safest design."** Checking the source per candidate after an unfiltered
+  search is post-filtering: low-privilege users get empty results, and every candidate costs a
+  rate-limited API call. Filter early inside the search, then late-check only the final top-k.
+- **"Listing every member user on a chunk is more exact and fresher."** It bloats payloads and forces a
+  re-index on every membership change. Store the group principal and expand groups at query time, so a
+  removal takes effect within the principal-cache TTL.
+- **"A summary of two documents gets the intersection of their `allowed` lists."** `[group:finance] ∩
+  [group:legal]` is empty as strings, yet a user in both groups may read both. Store the conjunction of
+  source ACLs and require a match on each.
+- **"If the retriever filters correctly, the agent cannot leak."** Semantic caches keyed on query text,
+  shared agent memory notes, result counts and traces all carry content. Scope each by the same
+  principals.
+- **"The sign-in token's group claim is the user's group list."** Identity providers cap or omit it for
+  heavily grouped users (Entra ID sends an overage indicator). Expand transitive groups from the directory
+  server-side and fail closed if that lookup fails.
 
 ## Examples
 ### Agent tool handler: identity from the session, never from the model

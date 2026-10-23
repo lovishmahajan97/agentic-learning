@@ -5,7 +5,8 @@ name: OpenAPI docs
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/pydantic-request-response-models
@@ -37,6 +38,169 @@ field descriptions and enums become what the model reads.
   constraints), declared error `responses`, and which routes appear at all (`include_in_schema`).
 - **What you can skip.** The OpenAPI specification's long tail (callbacks, links, security scheme
   variants). Know paths, operations, request and response schemas, and `components/schemas`.
+
+## Lab
+### Task
+An orders tool service is imported into an agent as tools, and the model keeps calling it badly: the
+tool is named `search_orders_v1_tools_orders_search_post`, `status` is a free-form string, `limit` is
+unbounded, the 429 error shape is undeclared, and a debug route shows up as a second tool.
+
+Fix the schema at its source (the FastAPI code), then write a small linter that fails CI when a tool
+definition is too vague for a model. Time box: 45-75 minutes.
+- **Prerequisites:** Pydantic request / response models, Routers (APIRouter), and this lesson's
+  "What feeds it" table.
+- **Setup:** Python 3.12 with `pip install fastapi pytest` (checked on FastAPI 0.161, Pydantic 2.14).
+  Save the starter as `lab_openapi.py` and the tests as `test_lab_openapi.py`.
+- **Done:** `pytest -q` passes and `python lab_openapi.py` shows one well-named tool with an empty lint.
+
+### Starter code
+```python
+"""Lab: a schema an agent can call correctly (checked on FastAPI 0.161, Pydantic 2.14, Python 3.12)."""
+from fastapi import APIRouter, FastAPI
+from pydantic import BaseModel
+
+
+class SearchIn(BaseModel):              # LAB 1: describe every field; only these statuses exist
+    query: str                          #        "open", "shipped", "any"; limit must be 1..50
+    status: str = "any"
+    limit: int = 10
+
+
+class SearchOut(BaseModel):
+    order_ids: list[str]
+
+
+class ErrorOut(BaseModel):
+    code: str
+    message: str
+
+
+tools = APIRouter(tags=["tools"])
+
+
+@tools.post("/orders/search", response_model=SearchOut)   # LAB 2: a real description, declared 429
+async def search_orders(body: SearchIn) -> SearchOut:
+    return SearchOut(order_ids=["o_1"])
+
+
+@tools.post("/debug/reindex")                              # LAB 3: must never become a tool
+async def reindex() -> dict:
+    return {"ok": True}
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="orders-tools")                    # LAB 4: readable operation ids
+    app.include_router(tools, prefix="/v1/tools")
+    return app
+
+
+def resolve(node, components):
+    if isinstance(node, dict):
+        if "$ref" in node:
+            return resolve(components[node["$ref"].split("/")[-1]], components)
+        return {k: resolve(v, components) for k, v in node.items()}
+    if isinstance(node, list):
+        return [resolve(v, components) for v in node]
+    return node
+
+
+def tools_from_openapi(schema: dict, tag: str) -> list[dict]:
+    components = schema.get("components", {}).get("schemas", {})
+    out = []
+    for path, ops in schema["paths"].items():
+        for method, op in ops.items():
+            if tag in op.get("tags", []):
+                body = op.get("requestBody", {}).get("content", {}).get("application/json", {})
+                out.append({"name": op["operationId"],
+                            "description": op.get("description") or op.get("summary", ""),
+                            "input_schema": resolve(body.get("schema", {"properties": {}}), components)})
+    return out
+
+
+def lint_tools(defs: list[dict]) -> list[str]:
+    """LAB 5: return 'name: problem' lines, in this order per tool:
+    'description under 5 words', then per argument (schema order)
+    'argument X has no description' and 'integer X has no minimum/maximum'."""
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    defs = tools_from_openapi(create_app().openapi(), tag="tools")
+    for t in defs:
+        print(t["name"], "|", t["description"])
+    print("lint:", lint_tools(defs))
+```
+
+As given, it prints `search_orders_v1_tools_orders_search_post | Search Orders` and
+`reindex_v1_tools_debug_reindex_post | Reindex`, then raises `NotImplementedError`. Note that FastAPI
+fills `summary` from the function name, so "has a description" is not the same as "has a useful one".
+
+### Expected output
+The description line is your own text (a docstring of 5+ words); the name and the lint result are exact.
+
+```
+tools_search_orders | Find a customer's orders by email or order number; returns order ids only.
+lint: []
+```
+
+### Tests
+```python
+import lab_openapi as lab
+
+
+def defs():
+    return lab.tools_from_openapi(lab.create_app().openapi(), tag="tools")
+
+
+def test_only_real_tools_with_readable_names():
+    assert [t["name"] for t in defs()] == ["tools_search_orders"]
+
+
+def test_arguments_are_constrained_and_described():
+    props = defs()[0]["input_schema"]["properties"]
+    assert props["status"]["enum"] == ["open", "shipped", "any"]
+    assert props["limit"]["minimum"] == 1 and props["limit"]["maximum"] == 50
+    assert all(p.get("description") for p in props.values())
+
+
+def test_error_shape_is_declared():
+    op = lab.create_app().openapi()["paths"]["/v1/tools/orders/search"]["post"]
+    ref = op["responses"]["429"]["content"]["application/json"]["schema"]["$ref"]
+    assert ref.endswith("/ErrorOut")
+
+
+def test_lint_flags_weak_tools_and_passes_yours():
+    bad = [{"name": "x_post", "description": "Search Orders",
+            "input_schema": {"properties": {"q": {"type": "string"}, "n": {"type": "integer"}}}}]
+    assert lab.lint_tools(bad) == [
+        "x_post: description under 5 words",
+        "x_post: argument q has no description",
+        "x_post: argument n has no description",
+        "x_post: integer n has no minimum/maximum",
+    ]
+    assert lab.lint_tools(defs()) == []
+```
+
+On the starter all four fail for the reasons the agent sees: two noisy tool names, `KeyError: 'enum'`
+(no allowed values), `KeyError: '429'` (undeclared error) and `NotImplementedError` in the linter.
+
+### Failure scenarios
+- **Inject: declare `responses={429: {"model": ErrorOut}}` but `raise HTTPException(429, "quota")` in
+  the handler.** Observe: the schema test passes, yet the body is `{"detail": "quota"}`. Debug: call the
+  route with the test client and validate the body against `ErrorOut`; the schema documents, it does not
+  enforce.
+- **Inject: give two tagged routes the same function name in different modules.** Observe: FastAPI warns
+  about a duplicate operation ID and the importer emits two tools with one name. Debug: assert the names
+  from `tools_from_openapi` are unique in CI.
+- **Inject: add a nested model to `SearchIn` that refers to itself.** Observe: `resolve` recurses until
+  `RecursionError`. Debug: track visited `$ref` names and stop, or forbid recursive models in tool inputs.
+
+### Submission
+- The fixed `lab_openapi.py` with `Field` descriptions, a `Literal` status, bounds on `limit`, a
+  docstring, a declared 429 and `include_in_schema=False` on the debug route.
+- A `pytest -q` run showing 4 passed.
+- The JSON of your one tool definition as the model would receive it.
+- A short note: which single change you expect to cut bad tool calls most, and why.
 
 ## Why it exists
 - **Every API has a contract anyway.** Field names, types, which fields are required, which status codes

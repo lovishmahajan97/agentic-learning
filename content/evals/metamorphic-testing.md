@@ -5,7 +5,8 @@ name: Metamorphic testing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -145,6 +146,24 @@ flowchart TD
     FL -->|"yes"| TR["Human or correctness judge picks wrong side"]
     TR --> RG["Labelled regression case"]
 ```
+
+## Misconceptions
+- **"Passing metamorphic tests means the agent is correct."** A relation checks consistency, not truth:
+  an agent that picks the wrong tool every time, in every phrasing, passes tool-choice invariance. Pair
+  relations with a labelled golden set.
+- **"Any violation is a bug."** Models are nondeterministic, so some pairs disagree even on identical
+  input. Only the excess over the identity floor, sized statistically, is a finding: 3% vs 6% on 200
+  questions is not distinguishable from chance.
+- **"When the transformed output differs, the transformed output is the wrong one."** A violation proves
+  at least one side is wrong without saying which. Triage both, or a "fix" may enshrine the original
+  wrong answer.
+- **"A correctness judge makes a good comparator."** That brings the oracle problem back and adds judge
+  noise. The comparator should ask only "do these agree", as strictly as the task allows: exact match
+  on tool name and arguments for agents.
+- **"Invariances hold everywhere."** Casing inside code, IDs or case-sensitive names changes meaning.
+  Scope each relation to inputs where the task really is independent of that surface feature.
+- **"Checking the final text is enough for agents."** Replies can look the same while a different tool
+  ran. Compare logged tool calls and end state exactly.
 
 ## Examples
 ### Agent scenario: tool-choice invariance on unlabelled requests

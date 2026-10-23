@@ -5,7 +5,8 @@ name: Memory architecture
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/agent-memory
@@ -38,6 +39,62 @@ and their write, read, update and delete policies; the hard part is what to reme
   deletion.
 - **What you can skip.** Cognitive-science taxonomies beyond the five types below, and building your own
   vector index. A small typed-slot table plus a scoped vector search covers most agents.
+
+## Decision case
+### Scenario
+A B2B account-management assistant serves 40,000 users across 300 customer tenants and must remember
+preferences, account facts and past cases across sessions. All figures are illustrative.
+- **Usage:** 3 sessions per user per week, about 30 turns each, so 3.6M turns a week; long sessions
+  reach 200 turns.
+- **Facts change:** account tier, region and preferred answer style get corrected, and a stale value
+  produces wrong advice.
+- **Constraints:** at most 4,000 tokens of context per call; legal requires any case data purged within
+  24 hours of a request; no data may cross tenants; a team of 2 engineers.
+- **Token model (from Budget arithmetic below):** about 150 tokens per turn.
+
+### Options
+| Option | How it works | Tokens per call at turn 200 | Corrected facts | 24-hour purge |
+|---|---|---|---|---|
+| A. Verbatim replay, no long-term memory | Send the whole transcript every call | 150 × 200 = 30,000, about 3.0M over the conversation | Only within one session | Easy, but nothing persists across sessions |
+| B. Embed every utterance | 3.6M vectors a week, top-k by similarity | Bounded by k | Fails: "Berlin" and "Lisbon" both surface | Rows map to turns, but contradictions persist until purged |
+| C. Tiered memory | Session store plus rolling summary, typed slots upserted by key, scoped episodic vectors with lineage, extraction at session end | 1,500 + 400 + 800 = 2,700, at most about 0.6M per conversation | Deterministic for slots, adjudicated for free text | Lineage query deletes rows, vectors and summaries |
+
+### Decision
+Choose **C**, because:
+- **It is the only option under the per-call cap:** about 2,700 tokens, flat, against A's 30,000 at turn
+  200.
+- **Supersession is guaranteed where it matters:** facts that drive advice (tier, region, answer style)
+  live in typed slots with a unique `(tenant_id, user_id, slot)` key, so no read can surface both values.
+- **The purge requirement becomes a query:** every memory, vector and summary records its source event
+  ids, so one lineage query finds every derived copy within the 24-hour window.
+- **Scope is part of the row:** tenant and user filters run inside every read, which closes the
+  cross-tenant constraint.
+- **Session-end extraction fits a 2-person team's budget:** about 40,000 × 3 = 120,000 extraction runs a
+  week instead of 3.6M per-turn calls.
+
+**What would change it:** sessions short enough that replay stays under the cap and no continuity
+requirement would make A plus session state enough; a need to act on facts mid-session in other agents
+would move extraction to every turn.
+
+### Trade-offs accepted
+- **Facts land in long-term memory only at session end.** The current session still has them in session
+  state. Watch: complaints that another device or agent missed a fact said minutes ago.
+- **Summaries remove detail from the prompt.** The full transcript stays in the session store. Watch:
+  answers that miss a detail present in the transcript, sampled from traces.
+- **Adjudication can misjudge free text.** Watch: contradiction rate in sampled working sets.
+- **Lineage adds columns and a purge job to maintain.** Watch: a scheduled canary that plants a fact,
+  purges it and asserts no read surfaces it, plus time to completed purge.
+
+### Review rubric
+- **Memory types are named and placed** (working, session, episodic, semantic, procedural), with knowledge
+  kept in RAG, not memory.
+- **Token arithmetic recomputes:** per-call and per-conversation figures follow from stated turn sizes and
+  budgets.
+- **Supersession is deterministic for behaviour-driving facts,** with the key that enforces it.
+- **The deletion story reaches every derived copy** (embeddings, summaries, extracted facts) and has a
+  test that proves it.
+- **Scope filters run inside the query,** and the write path rejects non-user sources.
+- **Reversal conditions are stated** in terms of session length or freshness needs.
 
 ## Why it exists
 - **Every model call starts from zero.** The model knows only what the application puts in the prompt.

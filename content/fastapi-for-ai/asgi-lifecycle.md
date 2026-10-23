@@ -5,7 +5,8 @@ name: ASGI lifecycle
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/lifespan
@@ -38,6 +39,170 @@ process, under every FastAPI agent server.
   middleware and proxies pass stream chunks through untouched.
 - **What you can skip.** Writing raw ASGI apps day to day. Know the message sequence well enough to debug
   a buffered stream, an agent that keeps running after the user left, or a 200 that ends mid-step.
+
+## Lab
+### Task
+Build the raw ASGI core of a streaming agent server, with no framework, and drive it with a tiny fake
+server so every message is visible. The agent goal: a run that boots its tools before traffic, rejects
+bad input with a real 422, and stops paying for steps once the user closes the tab.
+
+Time box: 45-60 minutes. Prerequisites: asyncio basics (tasks, `asyncio.Event`) and this lesson's How
+it works. The code marks four tasks:
+- **TASK 1:** answer the lifespan handshake (startup and shutdown).
+- **TASK 2:** read a body that arrives in several `http.request` chunks.
+- **TASK 3:** send the 422 before any `http.response.start` with status 200.
+- **TASK 4:** watch `receive()` for `http.disconnect` in a background task and stop between steps.
+
+### Starter code
+Save as `lab_asgi.py`. It runs as given and stops with `NotImplementedError` at TASK 1. Checked with
+Python 3.13 (standard library only; pytest 9.1 for the tests).
+
+```python
+import asyncio, json
+
+STATE: dict = {}        # filled by the lifespan handshake
+STEPS_RUN: list = []    # every agent step that actually started (what you pay for)
+
+async def run_step(task: str, i: int) -> dict:
+    await asyncio.sleep(0.05)                       # stand-in: one LLM call plus one tool call
+    STEPS_RUN.append(i)
+    return {"step": i, "tool": STATE["tools"][i % 2], "done": i == 3}
+
+async def app(scope, receive, send):
+    if scope["type"] == "lifespan":
+        # TASK 1: loop on receive(). On lifespan.startup set STATE["tools"] = ["search", "calculator"]
+        # and send lifespan.startup.complete; on lifespan.shutdown clear STATE, send
+        # lifespan.shutdown.complete and return.
+        raise NotImplementedError("lifespan handshake")
+    assert scope["type"] == "http"
+    # TASK 2: read the WHOLE body: loop on receive() joining http.request chunks until more_body is False.
+    body = (await receive()).get("body", b"")
+    task = json.loads(body or b"{}").get("task", "").strip()
+    # TASK 3: if task is empty, send a 422 response BEFORE any 200 start message, then return.
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(b"content-type", b"text/event-stream")]})
+    # TASK 4: start a background task that awaits receive() and sets an asyncio.Event on
+    # http.disconnect; check the event before every step and stop when it is set.
+    for i in range(8):
+        ev = await run_step(task, i)
+        await send({"type": "http.response.body", "body": f"data: {json.dumps(ev)}\n\n".encode(),
+                    "more_body": True})
+        if ev["done"]:
+            break
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+# ---- a tiny fake ASGI server, so the lab needs no network or Uvicorn ----
+async def lifespan_roundtrip(app) -> list[str]:
+    inbox, sent = asyncio.Queue(), []
+    async def send(m): sent.append(m["type"])
+    await inbox.put({"type": "lifespan.startup"})
+    task = asyncio.create_task(app({"type": "lifespan", "asgi": {"version": "3.0"}}, inbox.get, send))
+    while not sent and not task.done(): await asyncio.sleep(0)   # traffic waits for startup
+    sent.append(f"tools={STATE.get('tools')}")
+    await inbox.put({"type": "lifespan.shutdown"})
+    await task
+    return sent
+
+async def http_call(app, chunks: list[bytes], disconnect_after: int | None = None) -> list[dict]:
+    """Feed body chunks, then block; send http.disconnect once `disconnect_after` events arrived."""
+    sent, gone = [], asyncio.Event()
+    pending = [{"type": "http.request", "body": c, "more_body": i < len(chunks) - 1}
+               for i, c in enumerate(chunks)]
+    async def receive():
+        if pending: return pending.pop(0)
+        await gone.wait()
+        return {"type": "http.disconnect"}
+    async def send(m):
+        sent.append(m)
+        events = [x for x in sent if x.get("more_body")]
+        if disconnect_after is not None and len(events) >= disconnect_after: gone.set()
+    scope = {"type": "http", "method": "POST", "path": "/agent/run", "headers": []}
+    await asyncio.wait_for(app(scope, receive, send), 5)
+    return sent
+
+async def demo():
+    print(*await lifespan_roundtrip(app), sep=" | ")
+    STATE["tools"] = ["search", "calculator"]
+    full = await http_call(app, [b'{"task": "find ', b'the refund policy"}'])
+    print("status", full[0]["status"], "events", sum(1 for m in full if m.get("more_body")))
+    bad = await http_call(app, [b'{"task": ""}'])
+    print("empty task status", bad[0]["status"])
+    STEPS_RUN.clear()
+    await http_call(app, [b'{"task": "long run", "x": 1}'], disconnect_after=1)
+    print("steps run after early disconnect", len(STEPS_RUN))
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+### Expected output
+`python lab_asgi.py` with all four tasks done. Two steps start in the disconnect case: step 0, then the
+step already past its check when the watcher saw the close.
+
+```
+lifespan.startup.complete | tools=['search', 'calculator'] | lifespan.shutdown.complete
+status 200 events 4
+empty task status 422
+steps run after early disconnect 2
+```
+
+### Tests
+Save as `test_lab_asgi.py` next to the starter and run `pytest -q`. On the starter all four fail: the
+`NotImplementedError`, a `JSONDecodeError` from the half-read body, a 200 where 422 belongs, and four
+steps run for a user who left.
+
+```python
+import asyncio, json
+import lab_asgi as lab
+
+def setup_function():
+    lab.STATE.clear(); lab.STATE["tools"] = ["search", "calculator"]; lab.STEPS_RUN.clear()
+
+def test_lifespan_handshake_gates_traffic_and_cleans_up():
+    lab.STATE.clear()
+    trace = asyncio.run(lab.lifespan_roundtrip(lab.app))
+    assert trace == ["lifespan.startup.complete", "tools=['search', 'calculator']",
+                     "lifespan.shutdown.complete"]
+    assert lab.STATE == {}
+
+def test_body_split_across_chunks_is_read_whole():
+    sent = asyncio.run(lab.http_call(lab.app, [b'{"task": "find ', b'the refund policy"}']))
+    assert sent[0] == {"type": "http.response.start", "status": 200,
+                       "headers": [(b"content-type", b"text/event-stream")]}
+    events = [json.loads(m["body"][6:]) for m in sent if m.get("more_body")]
+    assert [e["step"] for e in events] == [0, 1, 2, 3]
+    assert sent[-1] == {"type": "http.response.body", "body": b"", "more_body": False}
+
+def test_empty_task_is_rejected_before_any_200():
+    sent = asyncio.run(lab.http_call(lab.app, [b'{"task": "  "}']))
+    starts = [m for m in sent if m["type"] == "http.response.start"]
+    assert len(starts) == 1 and starts[0]["status"] == 422
+    assert lab.STEPS_RUN == []
+
+def test_disconnect_stops_the_agent_loop():
+    asyncio.run(lab.http_call(lab.app, [b'{"task": "long run"}'], disconnect_after=1))
+    assert len(lab.STEPS_RUN) <= 2, f"kept spending after the user left: {lab.STEPS_RUN}"
+```
+
+### Failure scenarios
+- **Validate inside the stream.** Move the empty-task check after the 200 start message. Observe: the
+  422 test sees two start messages, and a real client gets a 200 with an error body. Debug: print every
+  `send` message type in order; anything that can fail must come before `http.response.start`.
+- **Forget to cancel the watcher.** Drop the `cancel()` on the disconnect task. Observe: tests still
+  pass, but `len(asyncio.all_tasks())` printed after each `http_call` in the demo grows by one per run;
+  under Uvicorn each finished run leaves a task parked on `receive()`. Debug: print the task count and
+  `asyncio.all_tasks()` after every call.
+- **Read the body inside the watcher too.** Start the watcher before the body loop. Observe: chunks are
+  stolen, so the JSON is truncated or the call hangs. Debug: log each `receive()` result with the caller
+  that took it; a message is delivered only once.
+
+### Submission
+- **Code:** `lab_asgi.py` with the four tasks done and no solution hints left in comments.
+- **Test run:** `pytest -q` output showing 4 passed.
+- **Trace:** the demo output, matching Expected output exactly.
+- **Short note (5-8 lines):** which ASGI message each test exercises, and why the disconnect case
+  runs 2 steps rather than 1.
+- **Evaluation:** tests pass, the 422 is sent before any 200, and the watcher task is always cancelled.
 
 ## Why it exists
 - **WSGI holds a thread per request.** The previous contract, `app(environ, start_response)`, is a

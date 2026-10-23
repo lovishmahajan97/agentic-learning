@@ -5,7 +5,8 @@ name: Server-Sent Events
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/streamingresponse
@@ -36,6 +37,153 @@ tools, and resumption via `Last-Event-ID`.
   path, event ids plus a per-run buffer for resumption, and the explicit `done` that ends a run.
 - **What you can skip.** Memorising every vendor's event names; write one adapter and check the vendor
   docs when you build it. `EventSource` internals matter only if you write the frontend.
+
+## Lab
+### Task
+Build the resumable SSE reader for an agent run: the worker writes events to a per-run buffer, and your
+route replays, tails and keeps the stream alive. Time box: 60-90 minutes. Prerequisites:
+StreamingResponse and BackgroundTasks (for the strong-reference task pattern).
+- **Frame format:** `event:`, `id:` and JSON `data:` lines, then the blank line that dispatches.
+- **Keepalive:** a `: ping` comment whenever nothing new arrives for `PING_EVERY` seconds.
+- **Resume:** a request carrying `Last-Event-ID` gets only the events after that id, without a second run.
+- **Termination and safety:** stop right after `done`; an unknown run id is a 404.
+
+### Starter code
+Save as `lab_sse.py`. Needs `pip install fastapi httpx` (checked with FastAPI 0.161.1, Starlette 1.9.0,
+httpx 0.28.1, Python 3.12). It runs until the first YOUR CODE path raises `NotImplementedError`.
+
+```python
+import asyncio, json, itertools
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
+
+app = FastAPI()
+PING_EVERY = 0.1                       # seconds here; 10-20 s in production, below every idle timeout
+RUNS: dict[str, list[tuple[int, str, dict]]] = {}     # per-run buffer: (event id, event, data)
+_ids, _tasks = itertools.count(1), set()
+
+async def fake_agent(run_id: str) -> None:
+    """The worker: runs independently of any HTTP connection and appends to the run's buffer."""
+    buf, n = RUNS[run_id], itertools.count(1)
+    buf.append((next(n), "tool_call", {"name": "web_search"}))
+    await asyncio.sleep(0.35)                          # a silent tool: longer than PING_EVERY
+    buf.append((next(n), "tool_result", {"summary": "3 results"}))
+    for w in ["SSE ", "frames ", "agent ", "events."]:
+        await asyncio.sleep(0.02)
+        buf.append((next(n), "token", {"delta": w}))
+    buf.append((next(n), "done", {}))
+
+@app.post("/runs")
+async def start_run():
+    run_id = f"r{next(_ids)}"
+    RUNS[run_id] = []
+    task = asyncio.create_task(fake_agent(run_id))
+    _tasks.add(task); task.add_done_callback(_tasks.discard)   # strong reference
+    return {"run_id": run_id}
+
+def sse(event: str, data: dict, id: int) -> str:
+    # YOUR CODE 1: format one event (event, id and JSON data fields) ending with the blank line.
+    raise NotImplementedError
+
+@app.get("/runs/{run_id}/events")
+async def events(run_id: str, last_event_id: int = Header(0)):   # reads the Last-Event-ID header
+    # YOUR CODE 2: unknown run id -> 404 (in real code also check the caller owns the run).
+    async def stream():
+        # YOUR CODE 3: replay buffered events with id > last_event_id, then tail new ones live.
+        # YOUR CODE 4: when nothing new arrives for PING_EVERY seconds, yield the comment ": ping\n\n".
+        # YOUR CODE 5: stop right after sending the "done" event.
+        raise NotImplementedError
+        yield
+    return StreamingResponse(stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+def parse_sse(text: str):
+    """Minimal WHATWG-style parser: yields (event, data, id); comments are dropped."""
+    for block in text.split("\n\n"):
+        fields = dict(line.split(": ", 1) for line in block.split("\n") if line and not line.startswith(":"))
+        if "data" in fields:
+            yield fields.get("event", "message"), json.loads(fields["data"]), int(fields["id"])
+
+if __name__ == "__main__":
+    with TestClient(app) as client:                    # one event loop for every request
+        run_id = client.post("/runs").json()["run_id"]
+        body = client.get(f"/runs/{run_id}/events").text
+        print("pings seen:", ": ping" in body)
+        for ev in parse_sse(body):
+            print(ev)
+        resumed = client.get(f"/runs/{run_id}/events", headers={"Last-Event-ID": "5"}).text
+        print("resumed:", [ev[2] for ev in parse_sse(resumed)])
+```
+
+### Expected output
+`python lab_sse.py` with a correct solution prints:
+
+```
+pings seen: True
+('tool_call', {'name': 'web_search'}, 1)
+('tool_result', {'summary': '3 results'}, 2)
+('token', {'delta': 'SSE '}, 3)
+('token', {'delta': 'frames '}, 4)
+('token', {'delta': 'agent '}, 5)
+('token', {'delta': 'events.'}, 6)
+('done', {}, 7)
+resumed: [6, 7]
+```
+
+### Tests
+Save as `test_lab_sse.py` and run `pytest -q`. On the starter all four fail: `NotImplementedError` from
+`sse()`, empty streams, and a 200 for an unknown run.
+
+```python
+import pytest
+from fastapi.testclient import TestClient
+from lab_sse import app, parse_sse, sse
+
+@pytest.fixture
+def client():
+    with TestClient(app, raise_server_exceptions=False) as c:
+        yield c
+
+def test_frame_format():
+    assert sse("token", {"delta": "Hi"}, 7) == 'event: token\nid: 7\ndata: {"delta": "Hi"}\n\n'
+
+def test_full_run_streams_typed_events_with_keepalive(client):
+    run_id = client.post("/runs").json()["run_id"]
+    r = client.get(f"/runs/{run_id}/events")
+    assert r.headers["content-type"].startswith("text/event-stream")
+    evs = list(parse_sse(r.text))
+    assert [e[0] for e in evs] == ["tool_call", "tool_result", "token", "token", "token", "token", "done"]
+    assert [e[2] for e in evs] == [1, 2, 3, 4, 5, 6, 7]
+    assert "\n: ping\n\n" in r.text or r.text.startswith(": ping\n\n")   # silent tool kept alive
+
+def test_reconnect_with_last_event_id_replays_only_the_gap(client):
+    run_id = client.post("/runs").json()["run_id"]
+    client.get(f"/runs/{run_id}/events")                       # first reader sees the whole run
+    r = client.get(f"/runs/{run_id}/events", headers={"Last-Event-ID": "3"})
+    assert [e[2] for e in parse_sse(r.text)] == [4, 5, 6, 7]   # no duplicates, no second run
+
+def test_unknown_run_is_404(client):
+    assert client.get("/runs/nope/events").status_code == 404
+```
+
+### Failure scenarios
+- **End each event with one newline instead of two.** The parser glues fields into one block, so
+  events vanish or merge. Debug: print `repr()` of the raw body and look for `\n\n` between events.
+- **Remove the keepalive branch.** The ping assertion fails; behind a real proxy the stream would die
+  during the 0.35 s tool (60 s in production). Debug: log the gap between consecutive yields.
+- **Replay with `>=` instead of `>`.** The resume test sees event 3 twice. Debug: log the incoming
+  `Last-Event-ID` and the first id you send back.
+- **Use `TestClient(app)` without `with`.** The worker task can die with the per-request event loop,
+  and the stream hangs or ends early. Debug: check whether `fake_agent` ever appends `done`.
+
+### Submission
+- **Code:** `lab_sse.py` with all five YOUR CODE steps done and `fake_agent` unchanged.
+- **Test run:** `pytest -q` showing 4 passed, run three times in a row to show it is not flaky.
+- **Trace:** the output of `python lab_sse.py`, matching the expected output.
+- **Note (3-5 sentences):** how you would move `RUNS` to a Redis list with a TTL, and where the
+  ownership check goes on resume.
+- **Evaluated on:** passing tests, no duplicate or missing ids on resume, and pings only during silence.
 
 ## Why it exists
 - **Bytes are not messages.** `StreamingResponse` gets bytes out early, but a chat client must tell a

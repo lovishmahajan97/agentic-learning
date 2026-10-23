@@ -5,7 +5,8 @@ name: Long-context vs RAG
 kind: decision
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -45,6 +46,68 @@ permissioned or high-volume ones, because agents re-send their context every ste
   tokens are cheap only while the prefix is byte-identical and warm, and recall degrades mid-context.
 - **The same decision applies to agent memory.** Keeping the full conversation history is long-context;
   retrieving past memories on demand is RAG. The arithmetic below decides both.
+
+## Decision case
+### Scenario
+A B2B HR-software company is building an internal support agent for 400 support reps. All figures are
+illustrative.
+- **Corpus:** a 90,000-token admin guide, edited every weekly release and readable by every rep; plus
+  configuration notes for 2,500 customer accounts, about 12,000 tokens each on average and 250,000 for
+  the largest, edited daily. A rep may only see accounts assigned to them.
+- **Load:** 3,000 agent runs a day across an 8-hour shift (one run starting every 9.6 s), 8 steps per
+  run, about 1,200 new transcript tokens per step, and a 3,000-token system prompt with tool schemas.
+- **Constraints:** an input-token budget of $400/day; a model window of 200,000 tokens; p95
+  time-to-first-token under 3 s per step; a pilot in 4 weeks; the team already runs Postgres but has
+  never operated a vector store.
+- **Cost model:** $3 per million input tokens, cached reads at *d* = 0.1, the shared prefix warm across
+  runs (starts are far closer together than any cache TTL), no cache-write premium, embedding costs
+  excluded. Searches add about 750 tokens per step for account notes, 1,500 when the guide is searched too.
+
+### Options
+| Option | How it works | Daily input cost | Context at step 8 | Permissions and freshness | Delivery risk |
+|---|---|---|---|---|---|
+| A. Preload guide and account notes | guide as cached prefix, the rep's account notes appended per run | ≈ $952 ($0.317/run) | ≈ 113k tokens average; 343k for the largest account, over the window | runtime picks the account, so ACL holds; daily note edits only touch the private part | two code paths, because large accounts need retrieval anyway |
+| B. Preload guide, search account notes | guide as cached prefix; `search_account_notes` tool filtered by the rep's accounts | ≈ $829 ($0.276/run) | ≈ 107k tokens | ACL in the tool; weekly guide edit is one cache rewrite | low for the guide, one index for the notes |
+| C. Search both | 3k prefix; `search` over guide sections and notes, plus `read_section` for whole guide sections | ≈ $243 ($0.081/run) | ≈ 22k tokens | ACL filter on `account_id`; both re-indexed per changed document | an index for both, built in pgvector on the Postgres they run |
+
+- **Why B is not cheap:** cached reads of the 93,000-token prefix alone are 93,000 × 0.1 × 8 steps ×
+  3,000 runs × $3/M ≈ $670/day, before any transcript.
+
+### Decision
+Choose **C**. It is the only option under the $400/day budget, with about $157/day left for embeddings,
+storage and question tokens.
+- **Window and latency:** its step-8 context is about a fifth of B's (22k vs 107k), so the TTFT target
+  has room as runs get longer.
+- **Rules out A:** the largest accounts do not fit the window at all.
+- **Fits the team:** pgvector keeps the new infrastructure inside Postgres, which suits the 4-week
+  deadline.
+- **Guarding guide quality:** `read_section` returns whole guide sections, so cross-referenced
+  procedures are read intact rather than as top-5 chunks.
+- **What would change it:** a budget above about $850/day, or volume under about 1,450 runs a day (when
+  B's $0.276 per run fits $400), makes B attractive, because it removes the guide's retrieval failure surface.
+  So would a guide retrieval eval where gold sections miss the top 5 too often to fix quickly.
+
+### Trade-offs accepted
+- **Guide answers can fail at retrieval.** Watch: recall at final k on a labelled guide question set,
+  and the share of runs that never call `search` on a guide question.
+- **The agent must decide to search.** Watch: search-call rate per question type in traces, with a
+  search-first rule in the system prompt if it drops.
+- **More moving parts:** an ingestion job, an index and an ACL filter. Watch: staleness lag on edited
+  account notes and denied-access events.
+- **The cost forecast assumes warm caches and 8 steps.** Watch: cached-token share and steps per run
+  from usage fields, and re-run the model when either moves.
+
+### Review rubric
+- States corpus size, change rate, volume, steps per run and permission scope as numbers before
+  choosing.
+- Computes per-run and daily cost for each option at a stated cache assumption, and the arithmetic
+  reproduces.
+- Checks the late-step context (corpus plus transcript) against the window, including the largest
+  tenant, not just the average.
+- Places permission enforcement in the runtime or tool layer, never in a shared prompt.
+- Names at least one measurable trigger (volume, budget, recall or corpus growth) that flips the
+  choice.
+- Lists what the chosen option gives up and the metric that watches each loss.
 
 ## Why it exists
 - **RAG began as a necessity.** Early context windows held a few thousand tokens, so you had to select.

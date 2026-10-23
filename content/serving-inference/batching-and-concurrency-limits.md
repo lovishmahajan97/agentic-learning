@@ -5,7 +5,8 @@ name: Batching & concurrency limits
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - serving-inference/continuous-batching
@@ -162,7 +163,54 @@ flowchart TD
     Q -.->|"queue full"| E["Fail fast: 429 or 503"]
 ```
 
+## Misconceptions
+- **"Batching always trades per-user latency for throughput."** Decode is bandwidth-bound, so up to the
+  knee extra sequences reuse the same weight read almost for free: 64 short sequences take 7.3 ms per step
+  versus 4.8 ms for one. Latency climbs only past the knee.
+- **"The safe concurrency limit is a request count."** Each sequence adds its own KV reads, which do not
+  amortise. The same 64 sequences at 6,144 tokens take about 20 ms per step, so the knee moves with
+  context length and limits belong in tokens.
+- **"Concurrency means users or agent runs."** The engine sees LLM calls. One run makes a call per step,
+  and a planner fanning out to 5 subagents adds 5 in-flight calls at once, so count calls per second ×
+  residence time per call.
+- **"A smarter scheduler setting can drain a growing queue."** If arrival rate × residence time exceeds
+  the knee, Little's law says the queue grows without bound. Only more replicas, a smaller model, shorter
+  outputs or load shedding fix it.
+- **"Client retries make agents more robust under load."** Retrying on timeouts while the first request
+  is still running doubles load exactly when the engine is saturated. Retry only on an explicit
+  `Retry-After`, within one budget per run.
+
 ## Examples
+### Step-time model: why context length moves the knee
+A roofline estimate of the formula above in pure Python. It ignores fixed overhead, so treat outputs as
+illustrative orders of magnitude, not benchmarks.
+
+```python
+BW, PEAK = 3.35e12, 989e12          # H100 SXM: bytes/s, dense bf16 FLOP/s (published figures)
+W_BYTES, PARAMS = 16e9, 8e9         # Llama-3-8B-class in bf16
+KV_PER_TOKEN = 128 * 1024           # 32 layers x 8 KV heads x 128 dim x 2 (K,V) x 2 bytes
+
+def step_ms(batch, ctx):
+    bytes_read = W_BYTES + batch * ctx * KV_PER_TOKEN      # weights once + every sequence's cache
+    flops = 2 * PARAMS * batch                             # one token per sequence
+    return max(bytes_read / BW, flops / PEAK) * 1e3        # ignores fixed overhead
+
+for batch, ctx in [(1, 1000), (64, 1000), (64, 6144), (256, 1000)]:
+    ms = step_ms(batch, ctx)
+    print(f"batch={batch:3d} ctx={ctx:5d} step={ms:5.1f}ms "
+          f"per-user={1e3/ms:4.0f} tok/s total={batch*1e3/ms:6.0f} tok/s")
+```
+
+| Batch | Context | Step | Per user | Total |
+|---|---|---|---|---|
+| 1 | 1,000 | 4.8 ms | ~208 tok/s | ~208 tok/s |
+| 64 | 1,000 | 7.3 ms | ~137 tok/s | ~8,800 tok/s |
+| 64 | 6,144 | 20.2 ms | ~50 tok/s | ~3,200 tok/s |
+| 256 | 1,000 | 14.8 ms | ~68 tok/s | ~17,300 tok/s |
+
+Same batch of 64, six times the context: total throughput falls by almost two thirds, because the KV
+reads, not the weights, now set the step time.
+
 ### Load sweep against an OpenAI-compatible endpoint
 The client-side semaphore is the concurrency limit; the script reports throughput and tail latency per
 level so you can see where the curve flattens. Streaming separates TTFT and TPOT; each streamed chunk
@@ -201,36 +249,6 @@ for level in (1, 4, 16, 64):
 # Expect tok/s to climb steeply then flatten while p95 TPOT bends upward: that bend is the knee.
 # Re-run with your real prompt and output length distribution before choosing limits.
 ```
-
-### Step-time model: why context length moves the knee
-A roofline estimate of the formula above in pure Python. It ignores fixed overhead, so treat outputs as
-illustrative orders of magnitude, not benchmarks.
-
-```python
-BW, PEAK = 3.35e12, 989e12          # H100 SXM: bytes/s, dense bf16 FLOP/s (published figures)
-W_BYTES, PARAMS = 16e9, 8e9         # Llama-3-8B-class in bf16
-KV_PER_TOKEN = 128 * 1024           # 32 layers x 8 KV heads x 128 dim x 2 (K,V) x 2 bytes
-
-def step_ms(batch, ctx):
-    bytes_read = W_BYTES + batch * ctx * KV_PER_TOKEN      # weights once + every sequence's cache
-    flops = 2 * PARAMS * batch                             # one token per sequence
-    return max(bytes_read / BW, flops / PEAK) * 1e3        # ignores fixed overhead
-
-for batch, ctx in [(1, 1000), (64, 1000), (64, 6144), (256, 1000)]:
-    ms = step_ms(batch, ctx)
-    print(f"batch={batch:3d} ctx={ctx:5d} step={ms:5.1f}ms "
-          f"per-user={1e3/ms:4.0f} tok/s total={batch*1e3/ms:6.0f} tok/s")
-```
-
-| Batch | Context | Step | Per user | Total |
-|---|---|---|---|---|
-| 1 | 1,000 | 4.8 ms | ~208 tok/s | ~208 tok/s |
-| 64 | 1,000 | 7.3 ms | ~137 tok/s | ~8,800 tok/s |
-| 64 | 6,144 | 20.2 ms | ~50 tok/s | ~3,200 tok/s |
-| 256 | 1,000 | 14.8 ms | ~68 tok/s | ~17,300 tok/s |
-
-Same batch of 64, six times the context: total throughput falls by almost two thirds, because the KV
-reads, not the weights, now set the step time.
 
 ### Worked scenario: from benchmark to replica count
 | Step | Number |

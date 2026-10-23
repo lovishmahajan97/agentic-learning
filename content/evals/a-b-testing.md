@@ -5,7 +5,8 @@ name: A/B testing
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -164,6 +165,24 @@ flowchart TD
     G -->|"yes"| A["Primary metric: effect and CI at planned n"]
     A --> DEC["Decide and record in experiment log"]
 ```
+
+## Misconceptions
+- **"If the dashboard shows p < 0.05 on any day, the change works."** Stopping at the first significant
+  daily look turns a nominal 5% false-positive rate into roughly 1 in 5 over fourteen looks. Read the
+  result once at the planned sample size, or use a sequential method.
+- **"Counting requests gives more data and a tighter test."** Under user-level assignment, one user's
+  requests are correlated, so treating them as independent understates variance and manufactures wins.
+  Analyse per user, or use the delta method.
+- **"A significant lift on the primary metric means ship."** Guardrails can veto it: the booking
+  planner gained about 3 points of completion but breached the step-limit guardrail and cost 28% more
+  per completed task.
+- **"A small imbalance between arms is harmless."** A planned 50/50 that logs 4,100 vs 4,350 users has an
+  SRM p-value of about 0.007, so assignment or logging is broken and the result is void, whatever its
+  p-value says.
+- **"Comparing this week with last week is a cheap A/B."** Seasonality, campaigns and silent provider
+  updates move outcomes too. Only randomisation leaves the change as the one systematic difference.
+- **"Model X vs model Y stays a fair comparison for the whole test."** Unpinned snapshots can change
+  mid-test, and shared caches leak latency and cost between arms. Pin versions and key caches per arm.
 
 ## Examples
 ### Agent scenario: a new planner prompt for a booking agent

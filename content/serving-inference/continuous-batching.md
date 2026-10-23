@@ -5,7 +5,8 @@ name: Continuous batching
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - serving-inference/batching-and-concurrency-limits
@@ -138,35 +139,25 @@ flowchart TD
     RT -.->|"free KV blocks"| MEM
 ```
 
+## Misconceptions
+- **"Continuous batching makes each request faster."** It raises aggregate throughput. A lone request
+  still decodes at the bandwidth floor, and in a busy batch each user's TPOT rises, because every step
+  reads more cache.
+- **"It is dynamic batching with a timeout, as in classic model servers."** Those still run a batch as
+  one unit until its longest member finishes. Here membership changes every decode step: a finished
+  sequence frees its slot and blocks at once and a waiting one joins the next step.
+- **"Set `max_num_seqs` as high as memory allows."** Every extra sequence adds TPOT that an agent pays on
+  every step of every run. Size the cap from Little's law and a TPOT budget, then add replicas.
+- **"Each agent run holds a batch slot for its whole life."** Only generating steps do. 100 runs with
+  2 s tool waits and 150-token steps at ~25 ms TPOT need about 65 slots, and faster tools raise that to
+  about 95.
+- **"Twice the traffic needs twice the batch."** Bigger batches raise TPOT, which lengthens each
+  sequence's time in flight. In the day-versus-night example below, doubling 5 req/s to 10 req/s moves the needed
+  in-flight count from 30 to 75.
+
 ## Examples
-### Agent scenario: how many slots does a 100-run agent fleet need?
-Each step decodes a 150-token tool call at ~25 ms TPOT, then waits on a tool. Illustrative numbers.
-
-```python
-def agent_fleet(active_runs, out_tokens, tpot_ms, tool_wait_s, new_prompt_tokens):
-    gen_s = out_tokens * tpot_ms / 1000                 # time one step spends decoding
-    step_s = gen_s + tool_wait_s                        # one loop iteration of one agent run
-    in_flight = active_runs * gen_s / step_s            # Little's law: only generating steps hold a slot
-    steps_per_s = active_runs / step_s
-    return round(in_flight), round(steps_per_s, 1), round(steps_per_s * new_prompt_tokens)
-
-print(agent_fleet(100, 150, 25, 2.0, 1_500))    # (65, 17.4, 26087)  prefix hits: newest tool result only
-print(agent_fleet(100, 150, 25, 2.0, 20_000))   # (65, 17.4, 347826) misses: whole transcript every step
-print(agent_fleet(100, 150, 25, 0.2, 1_500))    # (95, 25.3, 37975)  fast tools: runs come back sooner
-```
-
-| Case | Sequences in flight | Steps admitted per s | Prefill tokens per s |
-|---|---|---|---|
-| 2 s tools, prefix cache hits | 65 | 17.4 | ~26k |
-| 2 s tools, cache misses | 65 | 17.4 | ~348k |
-| 0.2 s tools, prefix cache hits | 95 | 25.3 | ~38k |
-
-- **Read it as:** a `max_num_seqs` of 32 would queue these steps; and cache misses multiply prefill work
-  per iteration about 13x, which is what turns admissions into TPOT stalls without chunked prefill.
-- **Faster tools raise demand,** because runs spend less time off the GPU.
-
 ### Static versus continuous batching, simulated
-Same workload, an illustrative step-time model (a fixed weight-read time plus a small per-token cost), and
+One workload under both schedulers, an illustrative step-time model (a fixed weight-read time plus a small per-token cost), and
 deliberately skewed output lengths, as real traffic is.
 
 ```python
@@ -210,6 +201,32 @@ for name, fn in (("static", static_batching), ("continuous", continuous_batching
   responsible for.
 - **Extend it:** add a random long prefill to `step_ms` for newcomers and you reproduce the TPOT spike that
   chunked prefill exists to smooth.
+
+### Agent scenario: how many slots does a 100-run agent fleet need?
+Each step decodes a 150-token tool call at ~25 ms TPOT, then waits on a tool. Illustrative numbers.
+
+```python
+def agent_fleet(active_runs, out_tokens, tpot_ms, tool_wait_s, new_prompt_tokens):
+    gen_s = out_tokens * tpot_ms / 1000                 # time one step spends decoding
+    step_s = gen_s + tool_wait_s                        # one loop iteration of one agent run
+    in_flight = active_runs * gen_s / step_s            # Little's law: only generating steps hold a slot
+    steps_per_s = active_runs / step_s
+    return round(in_flight), round(steps_per_s, 1), round(steps_per_s * new_prompt_tokens)
+
+print(agent_fleet(100, 150, 25, 2.0, 1_500))    # (65, 17.4, 26087)  prefix hits: newest tool result only
+print(agent_fleet(100, 150, 25, 2.0, 20_000))   # (65, 17.4, 347826) misses: whole transcript every step
+print(agent_fleet(100, 150, 25, 0.2, 1_500))    # (95, 25.3, 37975)  fast tools: runs come back sooner
+```
+
+| Case | Sequences in flight | Steps admitted per s | Prefill tokens per s |
+|---|---|---|---|
+| 2 s tools, prefix cache hits | 65 | 17.4 | ~26k |
+| 2 s tools, cache misses | 65 | 17.4 | ~348k |
+| 0.2 s tools, prefix cache hits | 95 | 25.3 | ~38k |
+
+- **Read it as:** a `max_num_seqs` of 32 would queue these steps; and cache misses multiply prefill work
+  per iteration about 13x, which is what turns admissions into TPOT stalls without chunked prefill.
+- **Faster tools raise demand,** because runs spend less time off the GPU.
 
 ### Sizing `max_num_seqs` with Little's law
 The section's numbers as a calculator: what the loop must hold, and how fast a cap lets it retire work.

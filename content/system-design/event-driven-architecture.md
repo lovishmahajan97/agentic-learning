@@ -5,7 +5,8 @@ name: Event-driven architecture
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/synchronous-vs-asynchronous-execution
@@ -41,6 +42,69 @@ at the price of eventual consistency, at-least-once delivery and no single stack
   limits and the dead-letter policy, and how many agent runs a consumer group may start at once.
 - **What you can skip.** Broker internals such as replication protocols and log compaction tuning. Know
   per-partition ordering, at-least-once delivery, the outbox and consumer lag.
+
+## Decision case
+### Scenario
+A support-software company runs a document assistant and a ticket-triage agent. Today the upload request
+calls parser, chunker, embedder, indexer, billing and audit in sequence, and large PDFs time out. All
+figures are illustrative.
+- **Scale:** 30,000 uploads a day, peaking at 2,000 an hour; 20,000 tickets a day, each starting one
+  triage run; after an upstream outage, bursts of 5,000 tickets arrive within 10 minutes.
+- **Consumers:** embedder, billing meter and audit on documents; billing, an eval sampler and audit on
+  run events. The eval team will add new samplers and wants to backfill them from history.
+- **Constraints:** upload p95 under 1 s; documents searchable within 5 minutes; run events replayable for
+  90 days; the model provider allows 60 concurrent runs; first triage within 2 hours; a team of 4 who know
+  Postgres and AWS; 8 weeks to ship.
+
+### Options
+| Option | How it works | Upload path availability (99.9% each) | 90-day replay | Duplicates and bursts | Team and ops fit |
+|---|---|---|---|---|---|
+| A. Keep the synchronous chain | Upload request calls all six services | 0.999⁷ ≈ 99.3%, latency is the sum of 7 | None: calls are ephemeral | No bus duplicates, but a burst hits the model directly | Nothing new to run; fails the 1 s p95 |
+| B. Outbox plus a queue per consumer | Outbox relay publishes to a fan-out topic with one queue per consumer (for example SNS to SQS) | 0.999² ≈ 99.8% | No: a consumed message is deleted, and SQS keeps unconsumed ones at most 14 days | Inbox per consumer; queue depth absorbs the burst | Fully managed, familiar to the team |
+| C. Outbox plus a partitioned log | Outbox relay publishes to a managed Kafka-compatible log keyed by document or ticket id; one consumer group per consumer | 0.999² ≈ 99.8% | Yes: set retention to 90 days and start a new group at the oldest offset | Inbox per consumer; lag absorbs the burst | New system to learn: partitions, offsets, a schema registry |
+
+### Decision
+Choose **C**, because:
+- **Replay is a hard requirement that only the log meets.** A new eval sampler must read 90 days of
+  `RunCompleted` facts; in B those messages are gone once the existing consumers acknowledge them.
+- **The upload path drops to two dependencies.** The handler writes the document row and outbox row in
+  one transaction and returns, so p95 stays near one database write; availability rises from about 99.3%
+  to 99.8%.
+- **Keys give the ordering the index needs.** Keying by document id keeps `DocumentDeleted` behind
+  `DocumentUploaded` for the same document.
+- **The burst fits the deadline.** With a cap of 50 concurrent runs (under the provider's 60) and runs
+  averaging 40 s, the group drains 1.25 runs/s, so 5,000 tickets take 4,000 s, about 67 minutes, inside
+  the 2-hour first-triage target.
+- **Ops risk is bought down, not ignored:** a managed service, not a self-run cluster, plus a schema
+  registry from day one.
+
+**What would change it:** if backfills can read the Postgres run table instead of the log, B wins on
+simplicity; if one consumer remained and the user needed the result in the same interaction, A plus a
+stream would do; bursts above the 2-hour budget mean asking for a higher provider limit, not more
+consumers.
+
+### Trade-offs accepted
+- **Eventual freshness.** Documents become searchable after the embedder catches up. Watch: lag per
+  consumer group against the 5-minute budget, and the age of the oldest outbox row.
+- **Duplicates are normal.** Every consumer dedupes on `event_id`, and the refund and reply tools take
+  keys derived from it. Watch: runs started per ticket event (should be 1.0) and duplicate-key hits.
+- **Partition count is fixed early.** 12 partitions cap the embedder at 12 consumers; at 1.5 s per
+  document that is 8 documents/s (28,800 an hour), 14 times the peak. A 90-day re-index of 2.7 million
+  uploads takes about 94 hours. Watch: per-partition lag, and plan a separate replay group.
+- **Poison messages cost ordering or flow.** Documents park the key; telemetry goes to a retry topic.
+  Watch: DLQ depth and one partition lagging while the others sit at zero.
+
+### Review rubric
+- **Constraints come first and are numeric:** volumes, burst size, latency, freshness, retention, rate
+  limit, team and deadline are stated before options.
+- **Each option is scored on the same constraints,** including replay and burst handling, not only
+  coupling.
+- **Burst arithmetic recomputes:** concurrency cap, run time and drain time are shown and compared with
+  the response target.
+- **Partition keys and ordering are named** per topic, with the poison-message strategy chosen per topic.
+- **Idempotence covers trigger and effects:** an inbox for runs and idempotency keys for side-effecting
+  tools, each with a signal to watch.
+- **Reversal conditions are concrete:** at least two changes in requirements that would flip the choice.
 
 ## Why it exists
 The naive design: the ingestion endpoint receives a PDF and, in the same request, calls the parser,

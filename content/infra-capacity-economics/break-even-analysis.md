@@ -5,7 +5,8 @@ name: Break-even analysis (hosted API vs self-hosting)
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/self-host-vs-api
@@ -35,6 +36,68 @@ cost more than GPU list price.
   moves `V`, `p` or `u` in the formulas below.
 - **What you can skip.** Building the GPU cluster yourself to "find out". Run the sign test on a
   spreadsheet first; it often points to an API or a managed open-weight endpoint.
+
+## Decision case
+### Scenario
+A legal-tech company pays $140,000 a month for two agent workloads on one hosted frontier API, at a
+committed-use blended price of $2 per million tokens. Every figure is illustrative and reuses the
+calculator's inputs above ($3,000 per replica-month, 2,000 tokens per second at SLO, 20% headroom,
+$16,000 a month of `F`).
+- **Interactive contract-review agent:** 20,000M tokens a month, peak-to-average 2.5.
+- **Nightly clause-extraction batch agent:** 50,000M tokens a month, scheduled flat (peak-to-average 1.2).
+- **Quality:** a candidate open-weight model is within 1 point on the extraction eval but 6 points lower
+  on the interactive agent's tool-calling eval; the product floor allows at most 2 points.
+- **Horizon:** the model choice is revisited in 12 months; the API commitment renews in 3.
+- **Team:** one platform engineer is available, the person already priced into `F`.
+- **Data:** a managed open-weight endpoint in the same region has passed security review.
+
+### Options
+| Option | How it works | Monthly cost | One-off `M` | Payback | 12-month net saving | Quality floor |
+|---|---|---|---|---|---|---|
+| A. Stay on the API | both workloads hosted | $140,000 | $0 | n/a | $0 | passes |
+| B. Self-host both | 12 + 14 replicas, one `F` | $94,000 | larger than C | n/a | n/a | fails: interactive −6 |
+| C. Hybrid, self-host batch | 14 replicas + `F` = $58,000; interactive on API $40,000 | $98,000 | $140,000 | 3.3 months | $364,000 | passes |
+| D. Managed endpoint for batch | 50,000M × $1.20 (illustrative) = $60,000; interactive on API $40,000 | $100,000 | $30,000 | 0.75 months | $450,000 | passes |
+
+- **The sign test passes for batch:** flat load gives u ≈ 0.69 and `c_self` ≈ $0.83 per million, below $2.
+- **It barely passes for interactive:** `c_self` ≈ $1.74, and the quality gap rules it out anyway.
+
+### Decision
+Choose **D**: keep the interactive agent on the frontier API and move the batch agent to the managed
+open-weight endpoint.
+- **B is out on quality,** although it has the lowest bill: a 6-point tool-calling gap compounds into
+  failed runs and retries.
+- **C saves only $2,000 a month more than D** and needs $110,000 more upfront, which takes 55 months to
+  recover, far beyond the 12-month horizon.
+- **D also meets the deadline:** an endpoint and a gateway route ship before the renewal in 3 months; a
+  load-tested self-hosted pool is unlikely to.
+- **The saving came from the model, not from operating it,** which is the bundling the lesson warns about.
+
+**What would change it:**
+- **More flat volume:** at about 75,000M batch tokens a month, C's 12-month net passes D's (+$22,000), as
+  the fixed `F` amortizes.
+- **An API price cut to $1:** batch on the hosted API costs $50,000, below both D and C; re-run the sign
+  test.
+- **Managed price rises:** above about $1.34 per million, C wins over 12 months.
+- **A sub-processor or residency rule** that forbids the managed provider makes C the answer.
+
+### Trade-offs accepted
+- **Two serving paths and two eval baselines:** run the extraction eval on both paths weekly and alert on
+  a gap above 1 point.
+- **Exposure to the managed provider's price and quotas:** track the effective price per million and the
+  nightly job's completion time against its deadline.
+- **Leaving the cheapest bill (B) on the table:** re-test the open-weight model on the interactive eval at
+  each new release.
+- **Not building self-hosting skills yet:** keep the calculator live and re-run it quarterly on actual
+  batch volume against the 75,000M threshold.
+
+### Review rubric
+- Splits volume by workload and traffic shape, with peak-to-average from logs, not one blended number.
+- Runs the sign test per workload before computing any crossover.
+- Applies the quality floor per workload and rejects options that fail it.
+- Prices a managed open-weight endpoint as its own row, separating model choice from operating model.
+- Compares payback and net saving against the stated horizon, including one-off migration cost.
+- Names the volume, price and constraint thresholds that flip the choice, each recomputed.
 
 ## Why it exists
 - **The question arrives with the first five-figure API invoice:** "would it not be cheaper to run this

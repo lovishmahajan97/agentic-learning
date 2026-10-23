@@ -5,7 +5,8 @@ name: Retrieval failure diagnosis
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -156,6 +157,23 @@ flowchart TD
     K -->|"no"| G5["Ranking or context: reranker, budget"]
     K -->|"yes"| G6["Generation: grounding prompt or model"]
 ```
+
+## Misconceptions
+- **"Wrong answers mean we need a better embedding model."** The embedding only owns recall at depth.
+  If recall@100 is 91% and recall@5 is 62%, most misses are ranking, and a reranker or better fusion is
+  the targeted fix; a re-embed moves aggregate scores by noise.
+- **"An LLM judge score tells us what to fix."** It gives the failure rate, not the location. Only
+  tracing gold evidence stage by stage separates a parser bug from a ranking or prompt problem.
+- **"Gold missing from the prompt means the retriever never found it."** It may have been filtered
+  out, ranked 6th with a final k of 5, dropped by the token budget, or compacted away in a later agent
+  step. Candidate lists per retriever are what tell these apart.
+- **"Healthy offline retrieval evals mean the agent retrieves well."** Offline evals use the user's
+  question; the agent writes its own query, picks a tool, or skips search. Replay the raw question
+  against the agent's query arguments to find a query-argument loss.
+- **"Fix every stage that looks bad in the failing run."** Once evidence is lost, every later stage
+  fails as a consequence. Only the first loss has a fix that recovers the query, so count first losses.
+- **"Chunk IDs are good enough as gold labels."** They are an artifact of the current chunker and break
+  on the next re-chunk. Label the document and the answer span, and resolve to chunks at eval time.
 
 ## Examples
 ### Agent scenario: first loss across an agent's tool calls

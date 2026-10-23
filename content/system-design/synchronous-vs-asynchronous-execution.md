@@ -5,7 +5,8 @@ name: Synchronous vs asynchronous execution
 kind: decision
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/event-driven-architecture
@@ -41,6 +42,65 @@ longer than proxies and people wait, so most go async or stream.
   queue bound and the result retention window.
 - **What you can skip.** Event-loop internals and HTTP/2 framing. Know Little's law, the three shapes, and
   that an error means "not delivered", not "not done".
+
+## Decision case
+### Scenario
+A legal-tech startup ships a contract-review agent that reads a contract, calls about 12 tools (clause
+search, precedent lookup, risk scoring) and writes review comments into the customer's document system.
+All figures are illustrative, taken from a week of traces.
+- **Callers:** lawyers in a web UI (peak 1 run/s, someone is watching), and the customer's document
+  system submitting 3,000 contracts each night in a 6-hour window (no one watching).
+- **Run times:** mean 40 s, p99 150 s; 18% of runs exceed 60 s.
+- **Constraints:** the customer's corporate proxy has a 60 s idle timeout the team cannot change; the
+  model provider allows 100 concurrent runs; comments must never be posted twice; the team deploys twice
+  a day; 3 engineers who know FastAPI and Postgres; 6 weeks to ship.
+
+### Options
+| Option | How it works | Runs past 60 s (18%) | Deploy twice a day | Duplicate comments | Team and deadline fit |
+|---|---|---|---|---|---|
+| A. Synchronous, longer timeouts | `POST /review` holds the connection until done | Cut by the proxy; caller retries a run still in progress | Drops every in-flight run (about 40 at peak, 1/s × 40 s) | Likely: each retry is a new run | Trivial, but needs a proxy change nobody can make |
+| B. Stream everything over SSE | Same request, tokens and tool progress pushed as events | Survive the idle timeout only while events or heartbeats flow | Still drops in-flight runs | Reconnect without resume re-runs | Easy for the UI, useless to the nightly machine caller |
+| C. Async run in Postgres, stream on top | `POST /runs` returns `202`; workers claim with `SKIP LOCKED` and a lease, checkpoint each step; UI subscribes to the run's events, batch gets a signed webhook | Unaffected: only the submit is inside the timeout | Lease expires, another worker resumes at the last checkpoint | Submit key plus per-step tool keys | Uses the team's stack; fits 6 weeks |
+| D. Durable workflow engine | Each run is a workflow (for example Temporal) with activities per tool | Unaffected | Resumes from history | Built in, tools still need keys | New system to learn and operate |
+
+### Decision
+Choose **C**, because:
+- **The timeout is fixed and outside the team's control,** so any shape that holds the connection fails
+  for 18% of runs; only a submit that returns in milliseconds is safe.
+- **Deploys stop costing runs.** Checkpoints after each step mean a killed worker's run resumes, instead
+  of up to 40 runs lost per deploy.
+- **One run, two views.** The UI streams the same run (resumable with `Last-Event-ID`), the nightly caller
+  gets a webhook, so there is one execution path to test.
+- **Capacity fits the provider limit.** Interactive load holds about 40 runs in flight (Little's law);
+  capping batch at 20 workers adds 20, so 60 of 100. The batch takes 3,000 × 40 s / 20 = 6,000 s, about
+  1.7 hours of the 6-hour window.
+- **Postgres is enough at this volume** (roughly 1 submit/s plus the batch), and the team already runs it.
+
+**What would change it:** runs that pause days for human approval or need compensation across several
+services favour D; a p99 that drops below about 20 s with only human callers makes plain streaming (B)
+sufficient.
+
+### Trade-offs accepted
+- **More machinery.** A job table, worker fleet, reaper and status API. Watch: age of the oldest
+  `running` job and runs reaching the `attempt` cap.
+- **The lease can expire under a live run.** A 60 s lease is shorter than a slow tool call; heartbeat
+  from a background task. Watch: runs claimed by two workers, and steps re-executed after resume.
+- **Batch can starve interactive users.** Separate queues with interactive claimed first. Watch: queue
+  wait p95 per queue during the nightly window.
+- **Polling and retention costs.** Watch: polls per submit, and enforce a 30-day result TTL on the job
+  table.
+
+### Review rubric
+- **The shape follows from p99 and the smallest timeout,** with the share of runs past that timeout
+  stated, not the median.
+- **Each caller type is handled:** a person watching and a machine caller get a delivery channel that
+  suits them.
+- **Restart behaviour is explicit:** leases, checkpoints and what happens to a run during a deploy.
+- **Duplicate side effects are prevented at two levels:** an idempotency key on submit and keys on each
+  side-effecting tool.
+- **Capacity arithmetic recomputes:** in-flight runs from Little's law and batch duration against the
+  provider limit and the window.
+- **Reversal conditions are measurable,** for example a p99 threshold or a new approval-wait requirement.
 
 ## Why it exists
 - **AI work outlives connections.** A classic web request completes in tens of milliseconds, so holding

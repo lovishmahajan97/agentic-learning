@@ -5,7 +5,8 @@ name: Multi-hop retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -172,6 +173,22 @@ sequenceDiagram
     P->>A: question plus all evidence from both hops
     A-->>U: Bob Ruiz, citing both passages
 ```
+
+## Misconceptions
+- **"A better retriever or a reranker will find the second hop."** "Alice Chen reports to Bob Ruiz"
+  shares nothing with "incident 4812", so it is never a candidate. A reranker cannot promote what was not
+  retrieved, and no rewrite can name Alice before the report is read.
+- **"Asking the model to stop when done is enough."** A prompt is a signal, not a guarantee. Enforce the
+  hop cap and the no-progress check (repeated query, zero new passage ids) in the harness, or the agent
+  loops and the bill grows.
+- **"Each hop is 90% reliable, so the chain is too."** Hops compound: illustratively 0.9 × 0.9 ≈ 0.81 for
+  two and ≈ 0.73 for three, because a wrong bridge entity yields a confidently wrong next query. Per-hop
+  precision is worth more here than in single-shot RAG.
+- **"Comparison questions are multi-hop."** "Compare A and B" names both entities up front, so it fans out
+  in parallel (query decomposition). Multi-hop is for bridge questions, where the next query depends on an
+  answer you do not have yet.
+- **"Hops are cheap because each search is cheap."** Every hop is a sequential model call that re-reads
+  the whole transcript. Input tokens grow faster than hop count (~10,500 over three calls in the example).
 
 ## Examples
 ### A bounded multi-hop loop

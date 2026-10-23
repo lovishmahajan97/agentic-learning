@@ -5,7 +5,8 @@ name: Python
 kind: tool
 difficulty: intro
 est_minutes: 10
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/async-await
@@ -39,6 +40,206 @@ work. (Orientation; deep dive: `python-for-ai`.)
   arguments it sends back.
 - **What you can skip.** CPython internals and bytecode details. Know what the GIL blocks, when it is
   released, and the one rule: no blocking call inside a coroutine.
+
+## Lab
+### Task
+Fix the tool runner of one agent step. The model asked for five tool calls in one turn; the starter
+runs them one after another, calls a sync-only SDK straight on the event loop, and passes the model's
+arguments through unvalidated. Make the step concurrent, capped, non-blocking and validated.
+Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's How it works (asyncio and Pydantic), plus async-await and pydantic
+  in `python-for-ai` if they are new.
+- **Setup:** Python 3.12 with `pip install pydantic pytest` (checked on Pydantic 2.14, pytest 9.1). Save
+  the starter as `lab_agent_step.py` and the tests as `test_lab_agent_step.py`.
+- **Done:** `python lab_agent_step.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: one agent step, run concurrently, capped and validated (checked on Python 3.12, Pydantic 2.14)."""
+import asyncio, json, threading, time
+from pydantic import BaseModel, ValidationError
+
+MAX_PARALLEL = 2                                # provider and tool rate limits allow 2 tool calls at once
+STATS = {"in_flight": 0, "peak": 0}
+_lock = threading.Lock()
+
+
+def _enter() -> None:
+    with _lock:
+        STATS["in_flight"] += 1
+        STATS["peak"] = max(STATS["peak"], STATS["in_flight"])
+
+
+def _exit() -> None:
+    with _lock:
+        STATS["in_flight"] -= 1
+
+
+class SearchArgs(BaseModel):
+    query: str
+    top_k: int = 5
+
+
+class WeatherArgs(BaseModel):
+    city: str
+
+
+async def search_docs(a: SearchArgs) -> str:     # async I/O: a vector store over HTTP
+    _enter()
+    try:
+        await asyncio.sleep(0.4)
+        return f"{a.top_k} hits for {a.query!r}"
+    finally:
+        _exit()
+
+
+def get_weather(a: WeatherArgs) -> str:          # sync-only vendor SDK: blocks its thread
+    _enter()
+    try:
+        time.sleep(0.4)
+        return f"sunny in {a.city}"
+    finally:
+        _exit()
+
+
+TOOLS = {"search_docs": (SearchArgs, search_docs), "get_weather": (WeatherArgs, get_weather)}
+
+
+async def run_tool(call: dict) -> dict:
+    """Run one tool call from the model: {"id", "name", "arguments": <JSON string>}.
+
+    LAB 1: validate the arguments with the tool's schema. On a ValidationError return
+           {"id": ..., "error": <first error's msg>}; for an unknown tool return
+           {"id": ..., "error": "unknown tool <name>"}. Never raise: the error goes back to the model.
+    LAB 2: await async tools; run sync tools with asyncio.to_thread so the loop keeps serving.
+    Success returns {"id": ..., "content": <tool output>}.
+    """
+    schema, fn = TOOLS[call["name"]]
+    args = schema.model_construct(**json.loads(call["arguments"]))   # BUG: skips validation
+    out = fn(args)                                                   # BUG: a sync tool blocks the loop
+    if asyncio.iscoroutine(out):
+        out = await out
+    return {"id": call["id"], "content": out}
+
+
+async def run_step(calls: list[dict]) -> list[dict]:
+    """LAB 3: run all calls concurrently, at most MAX_PARALLEL tools at once,
+    and return the results in the same order as `calls`."""
+    return [await run_tool(c) for c in calls]                        # BUG: one after another
+
+
+CALLS = [
+    {"id": "1", "name": "search_docs", "arguments": json.dumps({"query": "refund policy"})},
+    {"id": "2", "name": "get_weather", "arguments": json.dumps({"city": "Pune"})},
+    {"id": "3", "name": "search_docs", "arguments": json.dumps({"query": "late fee", "top_k": "many"})},
+    {"id": "4", "name": "get_weather", "arguments": json.dumps({"city": "Oslo"})},
+    {"id": "5", "name": "search_docs", "arguments": json.dumps({"query": "late fee", "top_k": 3})},
+]
+
+if __name__ == "__main__":
+    start = time.perf_counter()
+    for r in asyncio.run(run_step(CALLS)):
+        kind = "error" if "error" in r else "content"
+        print(r["id"], f"{kind}:", r[kind])
+    print(f"elapsed: {time.perf_counter() - start:.1f}s, peak in-flight: {STATS['peak']}")
+```
+
+As given, it runs and prints `3 content: many hits for 'late fee'` (the bad argument reached the tool)
+and `elapsed: 2.0s, peak in-flight: 1`: five 0.4 s tools ran back to back.
+
+### Expected output
+```
+1 content: 5 hits for 'refund policy'
+2 content: sunny in Pune
+3 error: Input should be a valid integer, unable to parse string as an integer
+4 content: sunny in Oslo
+5 content: 3 hits for 'late fee'
+elapsed: 0.8s, peak in-flight: 2
+```
+
+Four valid tools at 0.4 s each with a cap of 2 take two rounds, 0.8 s; the invalid call never runs.
+
+### Tests
+```python
+import asyncio, json, time
+import pytest
+import lab_agent_step as lab
+
+
+@pytest.fixture(autouse=True)
+def reset_stats():
+    lab.STATS.update(in_flight=0, peak=0)
+
+
+def call(i, name, **args):
+    return {"id": str(i), "name": name, "arguments": json.dumps(args)}
+
+
+def test_bad_arguments_come_back_as_a_tool_error():
+    r = asyncio.run(lab.run_tool(call(3, "search_docs", query="late fee", top_k="many")))
+    assert r["id"] == "3" and "content" not in r
+    assert r["error"].startswith("Input should be a valid integer")
+
+
+def test_unknown_tool_is_an_error_not_a_crash():
+    r = asyncio.run(lab.run_tool(call(9, "delete_account", user="u1")))
+    assert r == {"id": "9", "error": "unknown tool delete_account"}
+
+
+def test_step_runs_concurrently_under_the_cap_in_order():
+    calls = [call(i, "search_docs" if i % 2 else "get_weather", **({"query": "q"} if i % 2 else {"city": "X"}))
+             for i in range(1, 5)]
+    start = time.perf_counter()
+    results = asyncio.run(lab.run_step(calls))
+    elapsed = time.perf_counter() - start
+    assert [r["id"] for r in results] == ["1", "2", "3", "4"]
+    assert elapsed < 1.2, f"4 tools x 0.4 s with a cap of 2 should take ~0.8 s, took {elapsed:.2f} s"
+    assert lab.STATS["peak"] == lab.MAX_PARALLEL
+
+
+def test_sync_tool_does_not_freeze_other_agents():
+    async def scenario():
+        ticks, stop = 0, asyncio.Event()
+
+        async def other_agent():
+            nonlocal ticks
+            while not stop.is_set():
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        t = asyncio.create_task(other_agent())
+        await lab.run_tool(call(1, "get_weather", city="Pune"))
+        stop.set()
+        await t
+        return ticks
+
+    ticks = asyncio.run(scenario())
+    assert ticks >= 20, f"the loop was blocked: other agent ticked only {ticks} times in 0.4 s"
+```
+
+On the starter all four fail for the intended reason: the bad argument returns `content`, the unknown
+tool raises `KeyError`, the step takes 1.6 s with a peak of 1, and the other agent ticks 0 times while
+`get_weather` sleeps on the loop.
+
+### Failure scenarios
+- **Inject: create the `Semaphore` once at module level** instead of inside `run_step`. Observe: the
+  first `asyncio.run` works, a later one raises `RuntimeError: ... is bound to a different event loop`.
+  Debug: read the traceback to the `async with`; a primitive used under contention binds to that loop,
+  so create it per step or per running loop.
+- **Inject: drop the cap and call `asyncio.gather` directly.** Observe: the step drops to 0.4 s but the
+  peak is 4, which in production is a burst of 429s from the provider. Debug: log in-flight count per
+  tool and compare it with the provider's concurrency limit.
+- **Inject: call `get_weather(args)` inside `async def` without `to_thread`.** Observe: the timing test
+  may still look fine on a quiet laptop, but the ticker test reports 0 ticks. Debug: run with
+  `asyncio.run(main(), debug=True)` and look for the slow-callback warning naming the 0.4 s step.
+
+### Submission
+- **Code:** your `lab_agent_step.py` with all three LAB items done and no `model_construct` left.
+- **Test run:** `pytest -q` output showing 4 passed, plus the script output matching Expected output.
+- **Evidence of the cap:** a log line or test showing peak in-flight never exceeds `MAX_PARALLEL`.
+- **A short note (3-5 sentences):** why the validation error goes back to the model as a tool result
+  instead of raising, and where a pure-Python CPU tool would run instead.
+- **Evaluation:** tests pass, results stay in call order, and nothing blocking runs on the event loop.
 
 ## Why it exists
 - **An agent service is glue.** It takes a request, builds a prompt, calls one or more models, validates

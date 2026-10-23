@@ -5,7 +5,8 @@ name: asyncio
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/async-await
@@ -38,6 +39,165 @@ provided nothing on the loop blocks.
   with `asyncio.to_thread`.
 - **What you can skip.** Writing your own event loop, transports and protocols, or custom selectors.
   Know what happens at an `await`, why one blocking tool freezes every session, and how to measure lag.
+
+## Lab
+### Task
+Fix the tool-execution step of an agent loop. The model returned several tool calls in one turn, and the
+starter runs them one after another, calls a sync CRM SDK directly on the loop, lets a hung tool stall
+the turn and lets one bad tool crash it. Time box: 60 minutes. Do **async / await** first.
+- **Goal:** the step costs about the slowest tool, the loop never freezes, and every call returns a tool
+  message (results and errors alike) in the order the model asked.
+- **Constraints:** standard library only; Python 3.11+ (`TaskGroup`, `asyncio.timeout`). Checked on
+  Python 3.12.14 with pytest 9.1.
+
+### Starter code
+Save as `lab_asyncio.py`. It runs as given and prints the slow, crashing behaviour.
+
+```python
+import asyncio, inspect, json, time
+
+async def search(q):         await asyncio.sleep(0.3); return f"3 docs for {q}"
+async def lookup_order(order): await asyncio.sleep(0.2); return {"order": order, "status": "shipped"}
+def legacy_crm(user):        time.sleep(0.25); return {"user": user, "tier": "gold"}   # sync SDK
+async def flaky(x):          await asyncio.sleep(0.05); raise ValueError("bad input")
+async def hangs():           await asyncio.sleep(3)                                  # a stuck MCP server
+
+TOOLS = {"search": search, "lookup_order": lookup_order, "legacy_crm": legacy_crm,
+         "flaky": flaky, "hangs": hangs}
+
+def tool_result(call_id, content):
+    return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+async def run_tool(call, timeout=1.0):
+    fn = TOOLS[call["name"]]
+    # LAB 1: a sync tool must not block the loop (asyncio.to_thread)
+    # LAB 2: no tool may run longer than `timeout` (asyncio.timeout)
+    # LAB 3: any Exception becomes tool_result(id, f"error: {e!r}"); CancelledError must still propagate
+    if inspect.iscoroutinefunction(fn):
+        out = await fn(**call["args"])
+    else:
+        out = fn(**call["args"])
+    return tool_result(call["id"], json.dumps(out))
+
+async def run_step(calls, timeout=1.0):
+    # LAB 4: run every call concurrently and return results in the order of `calls`
+    return [await run_tool(c, timeout) for c in calls]
+
+async def main():
+    calls = [{"id": "a", "name": "search", "args": {"q": "refund policy"}},
+             {"id": "b", "name": "lookup_order", "args": {"order": 42}},
+             {"id": "c", "name": "legacy_crm", "args": {"user": 7}}]
+    t0 = time.perf_counter()
+    results = await run_step(calls)
+    print(f"{len(results)} results in {time.perf_counter() - t0:.1f}s")
+    bad = [{"id": "d", "name": "flaky", "args": {"x": 1}}, {"id": "e", "name": "hangs", "args": {}}]
+    try:
+        results += await run_step(bad, timeout=0.5)
+    except Exception as e:
+        print(f"step crashed: {e!r}")
+    for r in results:
+        print(r["tool_call_id"], r["content"])
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Expected output
+The starter prints `3 results in 0.8s` and `step crashed: ValueError('bad input')`. A correct solution
+prints (timing to one decimal):
+
+```
+3 results in 0.3s
+a "3 docs for refund policy"
+b {"order": 42, "status": "shipped"}
+c {"user": 7, "tier": "gold"}
+d error: ValueError('bad input')
+e error: TimeoutError()
+```
+
+### Tests
+Save as `test_lab_asyncio.py` and run `pytest -q`. On the starter four tests fail (0.76 s step,
+about 240 ms of loop lag, the `ValueError` escaping, the 3-second hang); the cancellation test guards
+against a handler that is too broad.
+
+```python
+import asyncio, time
+import lab_asyncio as lab
+
+CALLS = [{"id": "a", "name": "search", "args": {"q": "refund policy"}},
+         {"id": "b", "name": "lookup_order", "args": {"order": 42}},
+         {"id": "c", "name": "legacy_crm", "args": {"user": 7}}]
+
+def test_step_costs_the_slowest_tool_not_the_sum():
+    t0 = time.perf_counter()
+    out = asyncio.run(lab.run_step(CALLS))
+    elapsed = time.perf_counter() - t0
+    assert [r["tool_call_id"] for r in out] == ["a", "b", "c"]
+    assert elapsed < 0.45, f"step took {elapsed:.2f}s: tools ran one after another"
+
+def test_sync_tool_does_not_freeze_the_loop():
+    async def scenario():
+        lags = []
+        async def probe():
+            while True:
+                t = time.perf_counter()
+                await asyncio.sleep(0.02)
+                lags.append(time.perf_counter() - t - 0.02)
+        p = asyncio.create_task(probe())
+        await asyncio.sleep(0.05)
+        await lab.run_step([CALLS[2]])
+        await asyncio.sleep(0.05)               # let the probe record the gap
+        p.cancel()
+        return max(lags)
+    worst = asyncio.run(scenario())
+    assert worst < 0.1, f"loop lag {worst * 1000:.0f} ms: legacy_crm blocked every session"
+
+def test_tool_error_becomes_a_result():
+    out = asyncio.run(lab.run_step([{"id": "d", "name": "flaky", "args": {"x": 1}}]))
+    assert out[0]["tool_call_id"] == "d"
+    assert out[0]["content"].startswith("error:") and "ValueError" in out[0]["content"]
+
+def test_hung_tool_hits_its_timeout():
+    t0 = time.perf_counter()
+    out = asyncio.run(lab.run_step([{"id": "e", "name": "hangs", "args": {}}], timeout=0.3))
+    assert time.perf_counter() - t0 < 1.0
+    assert out[0]["content"].startswith("error:") and "TimeoutError" in out[0]["content"]
+
+def test_cancelling_a_tool_still_cancels():
+    async def scenario():
+        t = asyncio.create_task(lab.run_tool({"id": "a", "name": "search", "args": {"q": "x"}}))
+        await asyncio.sleep(0.05)
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        return t.cancelled()
+    assert asyncio.run(scenario()), "CancelledError was swallowed and turned into a result"
+```
+
+### Failure scenarios
+- **Inject `except BaseException` in `run_tool`.** The cancellation test fails because the cancelled
+  tool reports success. Debug: grep for broad handlers; `CancelledError` is a `BaseException`, so
+  `except Exception` is the right width for converting tool errors.
+- **Make `legacy_crm` an `async def` that still calls `time.sleep(0.25)`.** The loop-lag test fails at
+  about 240 ms even though the tool is "async". Debug: run with `PYTHONASYNCIODEBUG=1` and read the "Executing <Task ...>
+  took" warning, then switch to `asyncio.sleep` or `to_thread`.
+- **Inject `gather` without converting errors.** One `ValueError` escapes and the step loses the other
+  results. Debug: check which construct owns the children and where each exception is caught.
+- **Put the timeout around the whole step** instead of each tool. The deadline cancels every tool
+  and the step raises `TimeoutError`, so the good results are lost too. Debug: check which `async with`
+  owns the deadline; per-tool deadlines belong inside `run_tool`.
+
+### Submission
+- **Your `lab_asyncio.py`** with all four LAB markers resolved and no other behaviour changed.
+- **A `pytest -q` run** showing 5 passed, pasted into a short `NOTES.md`.
+- **The output of `python lab_asyncio.py`**, matching the expected block line for line (timing may
+  differ by 0.1 s).
+- **Two sentences in `NOTES.md`:** which change fixed the step time and which fixed the loop lag, with
+  the before and after numbers from your machine.
+- **Evaluation:** tests pass, sync tools go through `asyncio.to_thread`, no handler catches
+  `BaseException`, and results keep the model's call order.
 
 ## Why it exists
 - **Agents mostly wait.** An agent backend calling a model with a 3-second median response holds a

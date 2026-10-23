@@ -5,7 +5,8 @@ name: GIL (Global Interpreter Lock)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/asyncio-vs-threads-vs-multiprocessing
@@ -37,6 +38,114 @@ code thread-safe.
   build.
 - **What you can skip.** Eval-loop internals and the C API beyond knowing that native code can release the
   GIL. Learn the CPU/wall diagnostic and the threads-versus-processes rule.
+
+## Lab
+### Task
+Build the measurement your agent worker uses to place a CPU-heavy tool. The starter assumes every tool
+belongs in a thread pool; you will measure process CPU time over wall time with N threads and let that
+number pick threads or processes. Time box: 45 minutes. Do **asyncio vs threads vs multiprocessing**
+first.
+- **Goal:** `cpu_wall_ratio` returns about 1.0 for the pure-Python cleaner and close to 4 for hashing,
+  and `choose_executor` sends the cleaner to a process pool.
+- **Constraints:** standard library only; a machine with 4 or more cores. Checked on standard CPython
+  3.12.14 (10-core laptop) with pytest 9.1; the pure-Python tests skip on a free-threaded build.
+
+### Starter code
+Save as `lab_gil.py`. It runs as given and reports both tools as thread-pool tools.
+
+```python
+import hashlib, sys, sysconfig, threading, time
+
+def clean_docs():                       # pure-Python cleaning of retrieved docs: holds the GIL
+    return sum(i * i % 7 for i in range(2_000_000))
+
+BLOB = b"x" * 100_000_000               # built once, outside the threads
+def hash_blob():                        # dedup hashing of a big attachment: hashlib releases the GIL
+    return hashlib.sha256(BLOB).hexdigest()
+
+def gil_enabled() -> bool:
+    return sys._is_gil_enabled() if hasattr(sys, "_is_gil_enabled") else True   # 3.13+ has the check
+
+def cpu_wall_ratio(fn, n_threads=4) -> float:
+    """Start n_threads threads that each call fn once; return process CPU time / wall time.
+    LAB 1: about 1.0 means the GIL serialised the threads; close to n_threads means fn releases it."""
+    raise NotImplementedError("LAB 1")
+
+def choose_executor(fn, n_threads=4) -> str:
+    """Return "thread" when fn scales across threads (ratio above n_threads / 2), else "process".
+    LAB 2: decide from a measurement, not from an assumption."""
+    return "thread"                     # the assumption this lab replaces: threads always help
+
+if __name__ == "__main__":
+    build = "free-threaded" if sysconfig.get_config_var("Py_GIL_DISABLED") else "standard"
+    print(f"{build} build, GIL enabled: {gil_enabled()}")
+    for tool in (clean_docs, hash_blob):
+        try:
+            ratio = f"{cpu_wall_ratio(tool):.1f}"
+        except NotImplementedError:
+            ratio = "not measured yet"
+        print(f"{tool.__name__}: CPU/wall with 4 threads = {ratio}, run it in a {choose_executor(tool)} pool")
+```
+
+### Expected output
+On standard CPython with 4+ free cores (the hashing ratio was 3.5 to 3.9 across runs):
+
+```
+standard build, GIL enabled: True
+clean_docs: CPU/wall with 4 threads = 1.0, run it in a process pool
+hash_blob: CPU/wall with 4 threads = 3.9, run it in a thread pool
+```
+
+### Tests
+Save as `test_lab_gil.py` and run `pytest -q`. On the starter three tests fail with
+`NotImplementedError` and the placement test fails with `'thread' == 'process'`; the last one guards
+against "always process".
+
+```python
+import pytest
+import lab_gil as lab
+
+needs_gil = pytest.mark.skipif(not lab.gil_enabled(), reason="free-threaded run: pure Python scales")
+
+@needs_gil
+def test_pure_python_is_serialised():
+    ratio = lab.cpu_wall_ratio(lab.clean_docs, 4)
+    assert 0.5 < ratio < 1.5, f"ratio {ratio:.2f}: expected about 1.0 under the GIL"
+
+def test_hashlib_scales_across_threads():
+    ratio = lab.cpu_wall_ratio(lab.hash_blob, 4)
+    assert ratio > 2.5, f"ratio {ratio:.2f}: expected close to 4 (needs 4+ free cores)"
+
+def test_ratio_reflects_the_thread_count():
+    one, four = lab.cpu_wall_ratio(lab.hash_blob, 1), lab.cpu_wall_ratio(lab.hash_blob, 4)
+    assert one < 1.3 and four > one + 1, f"1 thread {one:.2f}, 4 threads {four:.2f}"
+
+@needs_gil
+def test_cpu_bound_tool_goes_to_processes():
+    assert lab.choose_executor(lab.clean_docs) == "process"
+
+def test_gil_releasing_tool_stays_in_threads():
+    assert lab.choose_executor(lab.hash_blob) == "thread"
+```
+
+### Failure scenarios
+- **Inject `time.time()` for CPU instead of `time.process_time()`.** Every ratio becomes 1.0, so hashing
+  is sent to processes. Debug: print both clocks; process CPU time must sum across all threads.
+- **Inject building the blob inside `hash_blob`** (`hashlib.sha256(b"x" * 100_000_000)`). The hashing
+  ratio drops well below 4, because creating the bytes is Python-level work that holds the GIL. Debug:
+  time the allocation and the hash separately.
+- **Run the tests on a busy machine or a 2-core CI runner.** The hashing tests fail on timing, not on
+  logic. Debug: check `os.cpu_count()` and load; the diagnostic is only meaningful with idle cores.
+- **Measure starting the threads outside the timed region.** Ratios jump around between runs. Debug:
+  start the wall and CPU clocks before `start()` and stop them after the last `join()`.
+
+### Submission
+- **Your `lab_gil.py`** with both LAB markers resolved, plus a `pytest -q` run showing 5 passed.
+- **The script's output on your machine**, with core count and Python build noted.
+- **A three-row table in `NOTES.md`** placing three tools from your own agent (one I/O-bound, one
+  pure-Python CPU, one native) with the ratio you measured for each.
+- **Evaluation:** the ratio uses `process_time` over `perf_counter`, placement comes from the
+  measurement, and the note explains why the cleaner gains nothing from threads under the GIL.
 
 ## Why it exists
 - **Reference counts change constantly.** Every CPython object's count is updated on nearly every

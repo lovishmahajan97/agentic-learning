@@ -5,7 +5,8 @@ name: Idempotency
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - serving-inference/retry-strategies
@@ -140,6 +141,23 @@ flowchart TD
     W -->|"transient error"| RL["Release claim, client retries"]
     S --> OK["200 with result"]
 ```
+
+## Misconceptions
+- **"With a reliable queue or network we can get exactly-once."** A timeout is ambiguous: the request may
+  be lost, running or done. Across a network you get at-least-once delivery, and idempotent processing
+  on a key turns that into effectively-once results.
+- **"Check whether the key exists, then do the work."** Two concurrent duplicates both see "absent" and
+  both act. The claim must be one atomic insert (`SET NX PX`, or `INSERT ... ON CONFLICT`) before any
+  work, with 409 for the loser.
+- **"The model's tool-call id is a fine idempotency key."** A regenerated turn or resumed run gets new
+  tool-call ids, so the effect repeats. Derive the key from run id, a stable step identifier, the tool
+  name and the effect-defining arguments.
+- **"Temperature zero makes generation idempotent."** Output is not guaranteed identical across hardware
+  and batch composition, and idempotency is about effects and cost, not text: a second call still bills
+  and may run tools again.
+- **"A key store closes the duplicate window completely."** Unless the side effect and the key store
+  share a transaction, a crash after the effect but before the record lets a retry repeat it, and a
+  lease shorter than the slowest tool does the same. Heartbeats and reconciliation jobs close the gap.
 
 ## Examples
 ### Minimal idempotency layer

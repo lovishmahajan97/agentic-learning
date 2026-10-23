@@ -5,7 +5,8 @@ name: Caching (semantic, prompt)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - serving-inference/prefix-caching
@@ -173,6 +174,22 @@ flowchart TD
     FULL --> G
     G -.->|"store with TTL"| N
 ```
+
+## Misconceptions
+- **"Prompt caching stores the model's answer."** It reuses the KV tensors of a shared prefix, so only
+  prefill is skipped: input cost and time to first token fall, while the answer is generated fresh and
+  output cost and decode speed are unchanged.
+- **"Similar prompts share the cache."** Matching is on the exact token sequence in order. One timestamp,
+  user name or reordered tool list near the top misses everything after it, on every agent step.
+- **"Turning caching on can only save money."** Anthropic cache writes cost about 1.25× input (2× for the
+  one-hour TTL), so a prefix nobody reads within the TTL costs more than no caching. Verify reads in
+  the usage fields.
+- **"A semantic cache is a smarter response cache for the agent's answers."** Embedding similarity is not
+  answer equivalence: "cancel my order" and "cancel my subscription" sit close together, and agent
+  answers depend on run state. Keep semantic caches to scoped, FAQ-like traffic with measured precision.
+- **"A high hit rate means the cache works."** Hits on short prefixes barely move the bill, and semantic
+  hits can be confidently wrong. Track cost and TTFT deltas, cache-read share of input, and sampled hit
+  precision.
 
 ## Examples
 ### Explicit prompt caching on the Anthropic API

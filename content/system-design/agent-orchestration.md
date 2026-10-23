@@ -5,7 +5,8 @@ name: Agent orchestration
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/workflows-vs-agents
@@ -38,6 +39,61 @@ control flow is code versus left to the model.
   event stream clients see.
 - **What you can skip.** Workflow-engine theory and graph formalisms. The pattern ladder, at-least-once
   execution and the interrupt-and-resume mechanics are what you need.
+
+## Decision case
+### Scenario
+A B2B SaaS company automates its support inbox and must choose how much control flow is code. All
+figures are illustrative, from a pilot eval set.
+- **Volume and mix:** 6,000 emails a day; billing 50%, how-to 35%, bug reports 15%.
+- **Shape of the work:** billing and how-to follow known steps; bug reports need open-ended
+  investigation of logs and past tickets.
+- **Constraints:** at least 90% weighted eval pass rate; the compliance grade must run on 100% of
+  replies; account credits above a threshold need a human, who may answer hours later; at most 80M
+  tokens a day.
+- **Measured per-email cost:** about 0.5k tokens to route, about 6k for a draft-grade chain, about 25k
+  for an autonomous loop including its final grade.
+
+### Options
+| Option | How it works | Weighted pass rate | Tokens per day | Compliance step |
+|---|---|---|---|---|
+| A. Autonomous loop for everything | One agent with all tools, told in its prompt to grade before sending | 0.5 × 90 + 0.35 × 92 + 0.15 × 80 = 89.2% | 6,000 × 25k = 150M | Skippable: it lives in the prompt |
+| B. Route, then chain, loop only for bugs | A code-checked classifier; billing and how-to run draft, grade, approval, send; bugs run a bounded loop, then the same grade node | 0.5 × 94 + 0.35 × 93 + 0.15 × 80 ≈ 91.6% | 6,000 × (0.5 + 0.85 × 6 + 0.15 × 25)k ≈ 56.1M | Always runs: it is a node |
+| C. Route, then chain everything | As B, but bugs follow a fixed checklist chain | 0.5 × 94 + 0.35 × 93 + 0.15 × 55 ≈ 87.8% | 6,000 × 6.5k = 39M | Always runs |
+
+### Decision
+Choose **B**, because:
+- **It is the only option that meets both the 90% bar and the budget:** A misses the bar and spends
+  about 150M tokens a day; C is cheapest but fails bug reports (55%), which need an open path.
+- **Required steps become nodes:** the compliance grade and the approval interrupt are edges in the
+  graph, so a run cannot skip them and tests can assert they ran.
+- **Autonomy is confined to the 15% that needs it,** following the pattern ladder: the most
+  deterministic pattern per path.
+- **Hours-long approvals hold no worker:** the approval node checkpoints with `waiting_approval` and an
+  event resumes it; the credit node carries an idempotency key from run id and node.
+
+**What would change it:** a much larger share of open-ended tickets (the loop's cost then dominates and
+A's simplicity wins back); or a cheaper loop that matches the chain on billing, which would justify
+collapsing paths.
+
+### Trade-offs accepted
+- **Router errors are a new failure mode.** A bug report routed to the how-to chain gets a shallow
+  answer. Watch: per-route pass rate and reopen rate by predicted class.
+- **Three paths to test and maintain.** Watch: per-node latency and failure rates per path in traces.
+- **New behaviour needs a code change,** because paths are explicit. Accept it; it is what makes every
+  path testable.
+- **Checkpoint writes add a round-trip per node.** Watch: p95 node latency, which matters little next
+  to model calls.
+
+### Review rubric
+- **Each path is placed on the pattern ladder** with a reason, and the most deterministic workable
+  pattern is chosen.
+- **Weighted metrics recompute** from the stated mix and per-path numbers.
+- **Required steps are nodes, not prompt instructions,** and the write-up says how a test asserts they
+  ran.
+- **Human waits are interrupts** with a checkpoint and an event-driven resume, and side effects carry
+  idempotency keys.
+- **Reversal conditions are stated** in terms of the mix or measured pass rates.
+- **The routing failure mode has a metric** someone will alert on.
 
 ## Why it exists
 - **Two dependent calls already make a program.** Add a second call that depends on the first, a tool

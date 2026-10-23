@@ -5,7 +5,8 @@ name: pass@k
 kind: metric
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -150,7 +151,50 @@ flowchart TD
     C -.->|"pool c and n: wrong"| B["1 - (1 - p)^k overestimates"]
 ```
 
+## Misconceptions
+- **"pass@k is the success rate users get from the agent."** Only if retries are safe and something
+  checks each attempt. A user shown one run gets pass@1; a user who runs the task every day gets pass^k,
+  which falls as k grows while pass@k rises.
+- **"Apply 1 − (1 − p)^k to the benchmark-wide pass rate."** Tasks differ and the curve is concave, so
+  the pooled shortcut overestimates: 0.875 against a true 0.588 on the five-problem example. Estimate per
+  task from (n, c), then average.
+- **"pass^k is just the observed rate to the power k."** p̂^k is biased upward because x^k is convex:
+  12 of 20 runs gives 0.6^4 ≈ 0.13, while the unbiased C(c, k) / C(n, k) gives 0.102.
+- **"pass@k measures the model alone."** It is tied to a temperature and a sample count. Greedy decoding
+  makes all k samples identical, so pass@10 equals pass@1; compare only under one stamped protocol.
+- **"A good mean pass^k means every task is reliable."** One flaky task dominates: at p = 0.95 a task
+  keeps pass^8 ≈ 0.66, at p = 0.6 it drops to about 0.02. Read the per-task table.
+
 ## Examples
+### pass@k versus pass^k for an agent (runnable)
+Pure Python with exact integers. One agent task run 20 times in a fresh sandbox; 12 runs succeeded.
+
+```python
+from math import comb
+
+def pass_at_k(n, c, k):            # at least one of k succeeds
+    return 1 - comb(n - c, k) / comb(n, k)
+
+def pass_hat_k(n, c, k):           # all k succeed (tau-bench's pass^k)
+    return comb(c, k) / comb(n, k)
+
+for k in (1, 2, 4, 8):
+    print(f"k={k}: pass@k={pass_at_k(20, 12, k):.3f}  pass^k={pass_hat_k(20, 12, k):.3f}")
+# k=1: pass@k=0.600  pass^k=0.600
+# k=2: pass@k=0.853  pass^k=0.347
+# k=4: pass@k=0.986  pass^k=0.102
+# k=8: pass@k=1.000  pass^k=0.004
+```
+
+| Claim on a slide | Number | What the daily user sees |
+|---|---|---|
+| "Succeeds within 4 tries" | pass@4 ≈ 99% | only if retries are free, safe and someone checks each one |
+| "Works every day for a 4-day week" | pass^4 ≈ 10% | the reliability promise; far lower |
+
+- **Why 0.102 and not 0.6^4 ≈ 0.13:** C(c, k) / C(n, k) draws k of the 20 observed runs without
+  replacement, which makes it unbiased for p^k. Plugging the observed rate into p̂^k is biased upward,
+  because x^k is convex.
+
 ### The estimator and the pooled shortcut
 The estimator in the numerically stable product form, applied to one problem and then to a small
 benchmark, with the pooled shortcut computed alongside to show how far off it is.
@@ -182,35 +226,6 @@ for k in (1, 5):
 
 - **The problem with c = 0 is why the shortcut fails:** no amount of sampling solves it, but pooling
   spreads its zero across the other problems as if sampling could.
-
-### pass@k versus pass^k for an agent (runnable)
-Pure Python with exact integers. One agent task run 20 times in a fresh sandbox; 12 runs succeeded.
-
-```python
-from math import comb
-
-def pass_at_k(n, c, k):            # at least one of k succeeds
-    return 1 - comb(n - c, k) / comb(n, k)
-
-def pass_hat_k(n, c, k):           # all k succeed (tau-bench's pass^k)
-    return comb(c, k) / comb(n, k)
-
-for k in (1, 2, 4, 8):
-    print(f"k={k}: pass@k={pass_at_k(20, 12, k):.3f}  pass^k={pass_hat_k(20, 12, k):.3f}")
-# k=1: pass@k=0.600  pass^k=0.600
-# k=2: pass@k=0.853  pass^k=0.347
-# k=4: pass@k=0.986  pass^k=0.102
-# k=8: pass@k=1.000  pass^k=0.004
-```
-
-| Claim on a slide | Number | What the daily user sees |
-|---|---|---|
-| "Succeeds within 4 tries" | pass@4 ≈ 99% | only if retries are free, safe and someone checks each one |
-| "Works every day for a 4-day week" | pass^4 ≈ 10% | the reliability promise; far lower |
-
-- **Why 0.102 and not 0.6^4 ≈ 0.13:** C(c, k) / C(n, k) draws k of the 20 observed runs without
-  replacement, which makes it unbiased for p^k. Plugging the observed rate into p̂^k is biased upward,
-  because x^k is convex.
 
 ### Agent scenario: a per-task reliability report from repeated runs
 A support agent's eval harness runs each task 10 times from a fresh sandbox and asserts the final

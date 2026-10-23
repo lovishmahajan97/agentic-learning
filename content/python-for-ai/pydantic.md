@@ -5,7 +5,8 @@ name: Pydantic
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/type-hints
@@ -37,6 +38,158 @@ the call.
   strictness for IDs and money, and the bounded repair loop around validation failures.
 - **What you can skip.** Custom core schemas, `wrap` validators for most tools, and v1 internals beyond
   recognising old idioms in copied snippets.
+
+## Lab
+### Task
+Harden a refund tool's argument model for model output and wrap it in a bounded validate-and-repair
+loop. A scripted model replays three recorded tool inputs, so the lab runs offline with no API key.
+
+The goal is the agent behaviour from the first example: every bad field reported in one message, and
+a hard stop when the budget is spent.
+
+Time box: 45-75 minutes. Do "How it works" here and the `type-hints` lesson first.
+- **Harden** `Refund`: `extra="forbid"`, an `ORD-` plus six digits pattern, strict and positive
+  `amount_cents`.
+- **Implement** `issues` and `call_with_repair` in `lab.py`.
+- **Run** on Python 3.10+ with Pydantic v2 and pytest (checked on Python 3.12.14, Pydantic 2.14.1,
+  pytest 9.1.1).
+
+### Starter code
+Save as `lab.py`. It runs as given; with the lax model the schema has no rules yet.
+
+```python
+"""lab.py: validate a model's tool call and run a bounded repair loop."""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
+class Refund(BaseModel):
+    # LAB: harden this for model output: forbid unknown keys, require ids like ORD-123456,
+    # and make amount_cents strict (no "1250" coercion) and greater than 0. Keep names and descriptions.
+    order_id: str = Field(description="Order id like ORD-123456")
+    amount_cents: int = Field(description="Refund amount in cents")
+
+class ScriptedModel:
+    """Stands in for the LLM: returns recorded tool inputs in order, records every feedback message."""
+    def __init__(self, inputs: list[dict[str, Any]]) -> None:
+        self.inputs = list(inputs)
+        self.feedback: list[str] = []
+    def call(self, feedback: str | None) -> dict[str, Any]:
+        if feedback is not None:
+            self.feedback.append(feedback)
+        return self.inputs.pop(0)
+
+@dataclass
+class Outcome:
+    args: Refund | None                               # None when the repair budget ran out
+    attempts: int                                     # model calls made
+    errors: list[str] = field(default_factory=list)   # every 'loc: msg' seen, in order
+
+def issues(e: ValidationError) -> list[str]:
+    """One 'loc: msg' string per error, with loc parts joined by '.'."""
+    raise NotImplementedError("LAB: issues")
+
+def call_with_repair(model: ScriptedModel, max_repairs: int = 2) -> Outcome:
+    """Call the model with feedback=None, validate with Refund.model_validate, and on failure call again
+    with 'Invalid arguments, fix and call again: ' + '; '.join(issues(e)). At most max_repairs repairs."""
+    raise NotImplementedError("LAB: call_with_repair")
+
+RECORDED = [                                           # what a model actually sent, turn by turn
+    {"order_id": "123456", "amount_cents": "1250", "reason": "late"},
+    {"order_id": "ORD-123456", "amount_cents": "1250"},
+    {"order_id": "ORD-123456", "amount_cents": 1250},
+]
+
+if __name__ == "__main__":
+    model = ScriptedModel(RECORDED)
+    try:
+        out = call_with_repair(model)
+        print(out.args, "after", out.attempts, "attempts")
+        for f in model.feedback:
+            print("feedback:", f)
+    except NotImplementedError as e:
+        print("not implemented:", e)
+    print("additionalProperties:", Refund.model_json_schema().get("additionalProperties"))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+order_id='ORD-123456' amount_cents=1250 after 3 attempts
+feedback: Invalid arguments, fix and call again: order_id: String should match pattern '^ORD-\d{6}$'; amount_cents: Input should be a valid integer; reason: Extra inputs are not permitted
+feedback: Invalid arguments, fix and call again: amount_cents: Input should be a valid integer
+additionalProperties: False
+```
+
+### Tests
+Save as `test_lab.py` and run `python -m pytest -q`. On the starter all four fail: the schema has no
+`additionalProperties`, the lax model accepts the bad input, and the loop is not implemented.
+
+```python
+import pytest
+from pydantic import ValidationError
+from lab import RECORDED, Refund, ScriptedModel, call_with_repair, issues
+
+def errors_for(data):
+    with pytest.raises(ValidationError) as info:
+        Refund.model_validate(data)
+    return issues(info.value)
+
+def test_schema_tells_the_model_the_rules():
+    s = Refund.model_json_schema()
+    assert s["additionalProperties"] is False
+    assert s["properties"]["order_id"]["pattern"] == r"^ORD-\d{6}$"
+    assert s["properties"]["amount_cents"]["exclusiveMinimum"] == 0
+
+def test_every_bad_field_reported_at_once():
+    assert errors_for(RECORDED[0]) == [
+        "order_id: String should match pattern '^ORD-\\d{6}$'",
+        "amount_cents: Input should be a valid integer",
+        "reason: Extra inputs are not permitted"]
+    assert errors_for({"order_id": "ORD-123456"}) == ["amount_cents: Field required"]
+    assert errors_for({"order_id": "ORD-123456", "amount_cents": 0}) == \
+        ["amount_cents: Input should be greater than 0"]
+
+def test_repairs_until_valid():
+    model = ScriptedModel(RECORDED)
+    out = call_with_repair(model)
+    assert out.args == Refund(order_id="ORD-123456", amount_cents=1250)
+    assert out.attempts == 3 and len(out.errors) == 4
+    assert model.feedback[1] == "Invalid arguments, fix and call again: amount_cents: Input should be a valid integer"
+
+def test_budget_is_bounded():
+    bad = {"order_id": "x", "amount_cents": 1}
+    model = ScriptedModel([bad] * 4)
+    out = call_with_repair(model, max_repairs=2)
+    assert out.args is None and out.attempts == 3
+    assert len(model.inputs) == 1, "the model must not be called after the budget is spent"
+```
+
+### Failure scenarios
+- **Keep the default `extra` (`ignore`).** `reason` vanishes silently and the first test of field
+  errors is missing its third line. Debug by logging the raw input next to `model_dump()`; a key in
+  one and not the other was dropped.
+- **Skip `strict=True` on `amount_cents`.** The second recorded input is accepted (`"1250"` coerced),
+  so the run ends after 2 attempts and `test_repairs_until_valid` fails. Print `type(out.args.amount_cents)`
+  and the attempt count to see the coercion.
+- **Send `str(e)` as feedback.** The text starts with an error count and adds documentation links, so
+  the feedback assertion fails and the model reads noise. Compare `str(e)` with your `issues(e)` output.
+- **Loop `range(max_repairs)`.** Only two calls happen, so the budget test sees 2 attempts. Count calls
+  with `len(model.feedback) + 1` while debugging.
+
+### Submission
+- **`lab.py` and `test_lab.py`,** plus the `python -m pytest -q` output showing 4 passed.
+- **The output of `python lab.py`,** matching the expected block.
+- **The schema you would send:** `Refund.model_json_schema()` printed as JSON, with `pattern`,
+  `exclusiveMinimum` and `additionalProperties` visible.
+- **A log line per failure** with tool name, attempt and each `loc`, plus 2-3 sentences on what you
+  would chart from those logs in production.
+- **Evaluation:** tests pass unmodified, feedback lists every field in one message, and the model is
+  never called after the budget is spent.
 
 ## Why it exists
 - **Type hints are inert.** A function typed `-> Ticket` will happily return a dict with a misspelled key.

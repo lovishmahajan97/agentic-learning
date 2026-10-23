@@ -5,7 +5,8 @@ name: Inverted indexes
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 mastery: implement
 code_tested: partial
@@ -153,7 +154,67 @@ flowchart TD
     H --> R["Merged top k"]
 ```
 
+## Misconceptions
+- **"Once the write call returns, the document is searchable."** It becomes searchable only when a
+  refresh flushes its segment, up to `refresh_interval` later. An agent that searches one step after
+  writing finds nothing and creates a duplicate; use `refresh=wait_for` or get by id.
+- **"Top-k pruning (WAND, MaxScore) trades accuracy for speed."** The pruning is exact: it skips only
+  documents whose score upper bound cannot enter the current top k, so the result is identical to
+  scoring every match.
+- **"Asking for the total hit count is free."** Counting every match defeats pruning. For "iphone15 case"
+  over ten million items, top-10 touches about 8,000 postings plus probes; an exact count touches about
+  4,008,000.
+- **"Deleting a document removes it from the index."** A delete sets a bit in the segment's live-docs
+  bitset; postings and document-frequency statistics stay until a merge rewrites the segment, so size
+  does not shrink and scores drift on high-churn indexes.
+- **"A new analyzer applies to the whole index at once."** Old segments keep tokens from the old rules,
+  so identical documents match differently by age. An analyzer change needs a full re-index behind an
+  alias.
+
 ## Examples
+### A tiny index by hand
+Build postings with positions, intersect sorted lists with two cursors, and answer a phrase query from
+positions: the three operations every engine performs.
+
+```python
+import re
+from collections import defaultdict
+
+docs = {1: "pgvector supports hnsw and ivfflat indexes",
+        2: "hnsw graphs trade memory for recall",
+        3: "ivfflat partitions vectors with k-means",
+        4: "recall measures how many true neighbors the index returns"}
+
+analyze = lambda text: re.findall(r"[a-z0-9]+", text.lower())   # shared by index and query
+postings = defaultdict(list)          # term -> [(doc_id, tf, [positions]) ...], doc ids ascending
+doc_len = {}
+for doc_id, text in sorted(docs.items()):                          # sorted => lists stay sorted
+    tokens = analyze(text); doc_len[doc_id] = len(tokens)
+    where = defaultdict(list)
+    for i, t in enumerate(tokens): where[t].append(i)
+    for t, pos in where.items(): postings[t].append((doc_id, len(pos), pos))
+
+def intersect(a, b):                  # AND of two sorted lists: O(|a| + |b|), no hashing
+    i = j = 0; out = []
+    while i < len(a) and j < len(b):
+        if a[i][0] == b[j][0]: out.append(a[i][0]); i += 1; j += 1
+        elif a[i][0] < b[j][0]: i += 1
+        else: j += 1
+    return out
+
+def phrase(t1, t2):                   # positions make "hnsw graphs" differ from "graphs hnsw"
+    p1 = {d: p for d, _, p in postings[t1]}; p2 = {d: p for d, _, p in postings[t2]}
+    return [d for d in sorted(p1.keys() & p2.keys()) if any(x + 1 in p2[d] for x in p1[d])]
+
+print(postings["hnsw"])                                    # [(1, 1, [2]), (2, 1, [0])]
+print(intersect(postings["hnsw"], postings["recall"]))     # [2]
+print(phrase("hnsw", "graphs"), phrase("graphs", "hnsw"))  # [2] []
+print({t: len(p) for t, p in postings.items() if len(p) > 1})  # df>1: {'hnsw': 2, 'ivfflat': 2, 'recall': 2}
+```
+
+Real engines add compression, skip pointers and segments on top, but the shape is exactly this: a
+dictionary of terms, sorted lists, and merge-style traversal.
+
 ### Worked scenario: the agent cannot find the ticket it just created
 A support agent calls `create_ticket`, then two steps later `search_tickets` to link related issues.
 Timings are illustrative.
@@ -198,49 +259,6 @@ def search_tickets(tenant_id: str, query: str, k: int = 5) -> list[dict]:
 
 - **Cost:** `wait_for` adds up to one refresh interval to the write call, which is fine for agent writes
   and wrong for bulk loads.
-
-### A tiny index by hand
-Build postings with positions, intersect sorted lists with two cursors, and answer a phrase query from
-positions: the three operations every engine performs.
-
-```python
-import re
-from collections import defaultdict
-
-docs = {1: "pgvector supports hnsw and ivfflat indexes",
-        2: "hnsw graphs trade memory for recall",
-        3: "ivfflat partitions vectors with k-means",
-        4: "recall measures how many true neighbors the index returns"}
-
-analyze = lambda text: re.findall(r"[a-z0-9]+", text.lower())   # shared by index and query
-postings = defaultdict(list)          # term -> [(doc_id, tf, [positions]) ...], doc ids ascending
-doc_len = {}
-for doc_id, text in sorted(docs.items()):                          # sorted => lists stay sorted
-    tokens = analyze(text); doc_len[doc_id] = len(tokens)
-    where = defaultdict(list)
-    for i, t in enumerate(tokens): where[t].append(i)
-    for t, pos in where.items(): postings[t].append((doc_id, len(pos), pos))
-
-def intersect(a, b):                  # AND of two sorted lists: O(|a| + |b|), no hashing
-    i = j = 0; out = []
-    while i < len(a) and j < len(b):
-        if a[i][0] == b[j][0]: out.append(a[i][0]); i += 1; j += 1
-        elif a[i][0] < b[j][0]: i += 1
-        else: j += 1
-    return out
-
-def phrase(t1, t2):                   # positions make "hnsw graphs" differ from "graphs hnsw"
-    p1 = {d: p for d, _, p in postings[t1]}; p2 = {d: p for d, _, p in postings[t2]}
-    return [d for d in sorted(p1.keys() & p2.keys()) if any(x + 1 in p2[d] for x in p1[d])]
-
-print(postings["hnsw"])                                    # [(1, 1, [2]), (2, 1, [0])]
-print(intersect(postings["hnsw"], postings["recall"]))     # [2]
-print(phrase("hnsw", "graphs"), phrase("graphs", "hnsw"))  # [2] []
-print({t: len(p) for t, p in postings.items() if len(p) > 1})  # df>1: {'hnsw': 2, 'ivfflat': 2, 'recall': 2}
-```
-
-Real engines add compression, skip pointers and segments on top, but the shape is exactly this: a
-dictionary of terms, sorted lists, and merge-style traversal.
 
 ### Worked scenario: "iphone15 case" over ten million items
 | Step | Postings touched | Why |

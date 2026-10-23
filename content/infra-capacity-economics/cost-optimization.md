@@ -5,7 +5,8 @@ name: Cost optimization
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - infra-capacity-economics/cost-modeling
@@ -36,6 +37,57 @@ models, buy capacity cheaper, then tune serving, each change gated by an eval.
   the step limit, which steps use a small model, output caps, and whether a run can wait for a batch lane.
 - **What you can skip.** Kernel tuning and price negotiation until the fleet is large. The token and step
   levers are bigger and safer for almost every agent team.
+
+## Decision case
+### Scenario
+A research-assistant agent is the 10-step agent from the first example below: 5,000-token prefix, 1,500
+tokens appended and 300 output tokens per step, no prompt caching. All prices and rates are illustrative.
+- **Volume and spend:** 200,000 tasks a month at $0.3975 each, so $79,500 a month in model spend.
+- **Quality:** 85% of tasks succeed. A failed task goes to a human analyst at about $4 of staff time.
+- **Ask:** finance wants model spend halved (at most $39,750 a month) within 6 weeks.
+- **Constraints:** success must stay at or above 85% on the 300-task eval set; one engineer; no change to
+  the product's latency target.
+- **The tempting shortcut:** a pilot ran the whole agent on a small model ($0.25 input, $1.25 output per
+  million, no cache discount assumed) and scored 70%.
+
+### Options
+| Option | How it works | Model cost per task | Success | Model spend per month | Cost per task incl. $4 per failure |
+|---|---|---|---|---|---|
+| Baseline | As today | $0.3975 | 85% | $79,500 | 0.3975 + 0.15 × 4 = $0.9975 |
+| A. Small model everywhere | Swap the model, same prompts | $0.0331 | 70% | $6,625 | 0.0331 + 0.30 × 4 = $1.2331 |
+| B. Prompt caching plus trimmed tool results | Append-only transcript; tools return only needed fields (1,500 to 600 tokens per step) | $0.0962 | 85% on eval | $19,236 | 0.0962 + 0.60 = $0.6962 |
+| C. B plus removing 3 redundant steps | Stop rule and merged lookups, 7 steps | $0.0690 | 85% on eval, behaviour changed | $13,800 | 0.0690 + 0.60 = $0.6690 |
+
+### Decision
+Ship **B** now and put **C** through a shadow period before it ships.
+- **Target:** B cuts model spend by 76% ($79,500 to $19,236), well past the 50% ask, so C is not needed
+  to hit it.
+- **Quality:** B changes what the model sees, not how the agent behaves, so the eval at 85% is strong
+  evidence. C changes the loop itself, so it needs live shadow traffic before anyone trusts the eval.
+- **Why not A:** model spend falls 92%, but 15 more failures per 100 tasks add $0.60 of analyst time per
+  task, so the fully loaded cost rises from $0.9975 to $1.2331. A wins only on the wrong denominator.
+- **Effort:** B is prompt layout and tool-output schemas, which one engineer can do in 6 weeks.
+
+**What would change it:** a routed design, where only routine steps go to the small model and success
+holds at 85% per route, could beat C; test it after C. If failures cost nothing (a user simply retries),
+A's 70% might be acceptable, so price the failure before rejecting a cheap model.
+
+### Trade-offs accepted
+- **Recall risk from trimmed tool results.** Track tool calls per task and re-run the eval on every tool
+  schema change; a rise in repeated lookups means a needed field was dropped.
+- **Dependence on the cache.** The saving needs an append-only transcript. Alert on the cached-token share
+  from the usage fields after each prompt deploy.
+- **Ignored cache-write premiums.** Prices here leave them out; confirm the saving against the next
+  invoice, not only the model.
+- **C's saving deferred.** About $5,400 a month more stays on the table until the shadow period ends.
+
+### Review rubric
+- Measures cost per successful task, or fully loaded cost per task, not cost per call.
+- Prices failure (human handling, retries, refunds) and shows it for every option.
+- Recomputes each lever on the base left by the previous one, from the agent's own token profile.
+- Separates levers that change only tokens from levers that change agent behaviour, and gates the latter
+  harder.
+- States the eval set, the success threshold and the signals watched after launch.
 
 ## Why it exists
 - **Every request has a marginal cost.** Often cents, scaling directly with usage and with design choices

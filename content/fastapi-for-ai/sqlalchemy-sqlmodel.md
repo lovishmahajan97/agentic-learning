@@ -5,7 +5,8 @@ name: SQLAlchemy / SQLModel
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/async-database-access-and-connection-pooling
@@ -36,6 +37,160 @@ one class both table and Pydantic schema.
   supplies.
 - **What you can skip.** Advanced mapping (polymorphism, hybrid properties) until your domain needs it,
   and the legacy `Query` API.
+
+## Lab
+### Task
+Fix the two data-layer bugs agent backends ship most often: an N+1 when building context from past runs,
+and a DB tool that pastes model output into SQL. In-memory SQLite, no server. Time box: 45-60 minutes.
+Prerequisites: Pydantic request and response models, and the SQL lesson.
+- **Context in 2 statements:** the user's 10 recent runs and their steps in one `SELECT` plus one `IN (...)`.
+- **Bound parameters:** the injection string becomes a plain value that matches nothing.
+- **Tenant from auth:** a `customer` argument supplied by the model is ignored.
+- **Bounded and validated:** at most 20 rows, and malformed arguments raise `ValidationError`.
+
+### Starter code
+Save as `lab_orm.py`. Needs `pip install sqlalchemy pydantic pytest` (checked with SQLAlchemy 2.1.6,
+Pydantic 2.14.1, pytest 9.1.1, Python 3.12). It uses plain SQLAlchemy 2.0 models; the same fix applies
+to SQLModel table classes, which are SQLAlchemy models underneath.
+
+```python
+from pydantic import BaseModel, Field
+from sqlalchemy import JSON, Column, ForeignKey, Integer, String, Table, create_engine, event, insert, select, text
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, selectinload
+
+class Base(DeclarativeBase):
+    pass
+
+class Run(Base):                                       # one agent run
+    __tablename__ = "run"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(32), index=True)
+    steps: Mapped[list["Step"]] = relationship(back_populates="run", order_by="Step.n")
+
+class Step(Base):                                      # one step: model output plus tool calls
+    __tablename__ = "step"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("run.id"), index=True)
+    n: Mapped[int]
+    content: Mapped[str]
+    tool_calls: Mapped[dict | None] = mapped_column(JSON)
+    run: Mapped[Run] = relationship(back_populates="steps")
+
+orders = Table("orders", Base.metadata, Column("id", Integer, primary_key=True),
+               Column("customer", String), Column("item", String), Column("status", String))
+
+engine = create_engine("sqlite://")
+Base.metadata.create_all(engine)
+with Session(engine) as s:
+    s.add_all([Run(user_id="u1", steps=[Step(n=j, content=f"r{i} step {j}", tool_calls={"tool": "search"})
+                                        for j in range(1, 5)]) for i in range(10)])
+    s.commit()
+with engine.begin() as c:
+    c.execute(insert(orders), [{"customer": "acme", "item": "laptop", "status": "shipped"}] * 25
+              + [{"customer": "globex", "item": "laptop", "status": "pending"}])
+
+STATEMENTS = {"n": 0}
+@event.listens_for(engine, "before_cursor_execute")
+def _count(*args):
+    STATEMENTS["n"] += 1
+
+def recent_runs_context(session: Session, user_id: str) -> list[list[str]]:
+    """Context for the agent: each of the user's recent runs as a list of step contents."""
+    # YOUR CODE 1: same result in 2 statements, not 1 + one per run (lazy loading = N+1).
+    runs = session.scalars(select(Run).where(Run.user_id == user_id).order_by(Run.id).limit(10))
+    return [[st.content for st in run.steps] for run in runs]
+
+class FindOrders(BaseModel):                           # the tool's schema, shown to the model
+    item: str | None = Field(default=None, max_length=64)
+    status: str | None = Field(default=None, pattern="^(pending|shipped|cancelled)$")
+
+def find_orders(args: dict, customer: str) -> list[dict]:
+    """DB tool the model calls. customer comes from the caller's auth, never from the model."""
+    # BUG: model-controlled values are pasted into SQL, the model can pick the tenant, no row cap.
+    # YOUR CODE 2: validate args with FindOrders, build select() with bound parameters, filter on
+    #              the auth customer only, and cap the result at 20 rows.
+    who = args.get("customer", customer)
+    sql = f"SELECT id, item, status FROM orders WHERE customer = '{who}'"
+    if args.get("item"):
+        sql += f" AND item = '{args['item']}'"
+    if args.get("status"):
+        sql += f" AND status = '{args['status']}'"
+    with engine.connect() as c:
+        return [dict(r._mapping) for r in c.execute(text(sql))]
+
+if __name__ == "__main__":
+    with Session(engine) as s:
+        STATEMENTS["n"] = 0
+        ctx = recent_runs_context(s, "u1")
+        print(len(ctx), "runs,", ctx[0][0], "| statements:", STATEMENTS["n"])
+    print("acme rows:", len(find_orders({}, customer="acme")))
+    print("injection rows:", len(find_orders({"item": "x' OR '1'='1"}, customer="acme")))
+    print("tenant switch rows:", len(find_orders({"customer": "globex"}, customer="acme")))
+```
+
+The starter prints `statements: 11`, then 25 acme rows, 26 injection rows (every tenant) and 1 row for
+the tenant switch (globex's).
+
+### Expected output
+With a correct solution, `python lab_orm.py` prints:
+
+```
+10 runs, r0 step 1 | statements: 2
+acme rows: 20
+injection rows: 0
+tenant switch rows: 20
+```
+
+### Tests
+Save as `test_lab_orm.py` and run `pytest -q`. All five fail on the starter: 11 statements, 26 rows
+for the injection, globex's row for the tenant switch, 25 rows uncapped, and no `ValidationError`.
+
+```python
+import pytest
+from pydantic import ValidationError
+from sqlalchemy.orm import Session
+from lab_orm import STATEMENTS, engine, find_orders, recent_runs_context
+
+def test_context_building_is_two_statements():
+    with Session(engine) as s:
+        STATEMENTS["n"] = 0
+        ctx = recent_runs_context(s, "u1")
+    assert len(ctx) == 10 and ctx[3] == [f"r3 step {j}" for j in range(1, 5)]
+    assert STATEMENTS["n"] == 2                       # one SELECT for runs, one IN (...) for steps
+
+def test_injection_string_is_just_a_value():
+    assert find_orders({"item": "x' OR '1'='1"}, customer="acme") == []
+
+def test_model_cannot_pick_the_tenant():
+    rows = find_orders({"customer": "globex"}, customer="acme")
+    assert rows and all(r["status"] == "shipped" for r in rows)   # acme's rows only
+
+def test_rows_are_capped_for_the_context_window():
+    assert len(find_orders({}, customer="acme")) == 20
+
+def test_malformed_model_arguments_are_rejected():
+    with pytest.raises(ValidationError):
+        find_orders({"status": "deleted"}, customer="acme")
+```
+
+### Failure scenarios
+- **Use `joinedload` with `.limit(10)` and forget `.unique()`.** SQLAlchemy 2.x raises an
+  `InvalidRequestError` asking for `unique()` on joined-eager collections. Debug: read the message;
+  add `.unique()`, or use `selectinload`, which needs none and keeps the run query simple.
+- **Escape quotes by hand instead of binding.** The injection test may pass, but the next payload will
+  not. Debug: `print(stmt.compile())` should show `:item_1`-style placeholders, never your values.
+- **Bind the parameters but keep `args.get("customer", customer)`.** SQL injection is gone, yet a prompt
+  injection still reads another tenant. Debug: grep the tool for any auth field read from `args`.
+- **Lock the fix in with `raiseload("*")`.** In a test, add it to the options and access a relationship
+  you did not load: you get an error instead of a silent lazy query.
+
+### Submission
+- **Code:** `lab_orm.py` with both YOUR CODE steps done and the seed data unchanged.
+- **Test run:** `pytest -q` showing 5 passed.
+- **Trace:** the output of `python lab_orm.py`, matching the expected output.
+- **Note (3-5 sentences):** what the statement count becomes at 500 runs with lazy loading versus your
+  fix, and why a bound parameter does not stop a prompt injection from choosing the tenant.
+- **Evaluated on:** passing tests, no f-string or `text()` built from model output, and a 20-row cap.
 
 ## Why it exists
 - **AI backends carry a lot of relational state.** Conversations and messages with JSON tool-call

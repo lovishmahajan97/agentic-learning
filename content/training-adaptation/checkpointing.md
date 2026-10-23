@@ -5,7 +5,8 @@ name: Checkpointing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/gradient-checkpointing
@@ -168,6 +169,23 @@ sequenceDiagram
     S-->>T: Full training state
     T->>T: Restore RNG, reseed sampler, skip consumed batches, resume
 ```
+
+## Misconceptions
+- **"A checkpoint is the model weights."** A resumable checkpoint also holds both AdamW moments, fp32
+  master weights, scheduler and step, scaler, RNG states and the data position. Resume from weights alone
+  and the loss spikes, warmup restarts and the run never rejoins its curve.
+- **"Ship the final checkpoint; it trained the longest."** Agent evals often peak mid-run: in the example,
+  `ckpt-600` has the best task success but loses 6 points of tool-call validity, so `ckpt-400` ships.
+- **"Saving once per epoch is enough."** With preemptions every four hours and a three-hour epoch, each
+  preemption loses about 1.5 hours on average. Size the interval from save cost and failure rate
+  (`T_opt ≈ sqrt(2 · C · M)`), and cut the save stall first.
+- **"`torch.save` then done is safe."** A crash mid-write leaves a truncated "latest" file. Write to a
+  temp path, flush, rename; on object storage write the manifest last.
+- **"A LoRA adapter file is a self-contained model."** It is only usable on the exact base it was trained
+  on; store the base model's name and hash with it.
+- **"Checkpointing, gradient checkpointing and LangGraph checkpointers are one idea."** The first persists
+  training state, the second recomputes activations to save memory, the third persists agent-run state
+  keyed by thread.
 
 ## Examples
 ### Picking the checkpoint to put behind the agent

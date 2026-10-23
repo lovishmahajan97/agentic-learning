@@ -5,7 +5,8 @@ name: Rubrics
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -178,6 +179,23 @@ flowchart TD
     S --> D["Per-criterion pass rates"]
     F --> D
 ```
+
+## Misconceptions
+- **"Listing what to consider (accuracy, completeness, tone) makes a rubric."** It names dimensions but
+  leaves every level boundary undefined. A rubric needs observable anchors that a second grader, or a
+  judge, can apply and reproduce.
+- **"A 1–5 scale captures more than yes/no."** Five levels give four boundaries to disagree on, so
+  agreement drops and the extra resolution is mostly noise. Add more binary criteria instead of more
+  levels.
+- **"A criterion that did not apply can count as a pass."** That adds free points: 2 of 3 real checks
+  plus 3 inapplicable ones reports 5/6 instead of 2/3. Mark N/A and keep it out of the denominator.
+- **"A weighted average is the fairest overall score."** Averaging lets a 4-out-of-5 reply with a
+  fabricated citation, or an unconfirmed `cancel_order`, pass. Gates override the average, and
+  per-criterion rates drive decisions.
+- **"Low agreement on one criterion means the annotators need training."** It usually means ambiguous
+  anchors or a double-barreled criterion; rewrite and re-pilot it.
+- **"Process criteria should encode the right tool sequence."** Scripting one path fails valid
+  shorter plans. Check outcome, then forbid wrong or wasteful steps.
 
 ## Examples
 ### Rubric as data, one judge call per criterion, gate before aggregation

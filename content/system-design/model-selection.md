@@ -5,7 +5,8 @@ name: Model selection
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - evals/model-evaluation
@@ -37,6 +38,61 @@ tasks. Quality has a threshold; cost is paid every step.
   model.
 - **What you can skip.** Leaderboard watching and arguing about which frontier model is "smartest". A
   private eval with intervals and a paired comparison answers the only question that matters.
+
+## Decision case
+### Scenario
+An online retailer is launching a returns agent: it reads the order, checks the returns policy, decides
+eligibility, creates the return label and messages the customer. All figures are illustrative.
+- **Load:** 20,000 runs a day; each step sends about 8,000 input tokens and returns about 300.
+- **Quality bar:** the lower 95% bound of run success on a 300-task private eval must be at least 0.80.
+- **Latency:** p95 end-to-end run time within 25 s.
+- **Budget:** at most 400 units a day of model spend.
+- **Hard constraints:** an EU endpoint and native tool calling; one otherwise strong candidate is
+  dropped at the filter because it has no EU endpoint.
+- **Deadline:** six weeks, with a second source configured before launch.
+
+Illustrative prices in units per million tokens: A 3 in and 15 out, B 0.5 and 2, C 0.1 and 0.4. Run
+time is a conservative sum of per-step p95: 3.5 s for A, 2.0 s for B, 1.0 s for C.
+
+### Options
+| Option | Steps per run | Run success (lower bound) | Cost per run | Per day | Cost per successful run | p95 run |
+|---|---|---|---|---|---|---|
+| **A. Frontier everywhere** | 6 | 0.91 (0.878) | 0.171 | 3,420 | 0.188 | 21 s |
+| **B. Mid tier everywhere** | 7 | 0.88 (0.843) | 0.0322 | 644 | 0.037 | 14 s |
+| **C. Small model everywhere** | 9 | 0.74 (0.690) | 0.0083 | 166 | 0.011 | 9 s |
+| **D. Split: B plans and picks tools, C does 4 routine steps** | 6 | 0.87 (0.832) | 0.0129 | 258 | 0.015 | 8 s |
+
+Lower bounds use 1.96 × √(p(1 − p) / 300), about ±3 to ±5 points at these rates.
+
+### Decision
+**Choose D, with B as the second source.**
+- C is the cheapest but its lower bound (0.690) fails the bar; its extra steps show where it fails.
+- A and B clear the bar, but A costs about 8.6 times the budget and B about 1.6 times.
+- D is the cheapest option whose lower bound clears 0.80 and whose p95 fits 25 s.
+- D versus B is 261 versus 264 successful tasks out of 300: a 1-point gap inside the noise. A paired
+  read of the discordant tasks before launch checks that the split loses no whole task category.
+
+**What would change it.** A budget of at least 644 units a day makes B attractive, because one model
+is simpler to evaluate and debug.
+
+A scheduled re-run where D's lower bound drops below 0.80, or a
+deprecation notice for either pinned version, reopens the funnel. A fine-tuned C that clears the bar
+on routine steps would only lower D's cost further.
+
+### Trade-offs accepted
+- **Two models in one run.** Hand-offs between planner and worker are a new failure point; tool-call
+  parse failures and run success are tracked per step type.
+- **A thin margin.** D clears the bar by about 3 points; the eval grows from 300 to more tasks as
+  production failures are labelled, which also narrows the interval.
+- **B as the fallback costs more.** An outage of C's provider moves routine steps to B and spend
+  towards 644 a day; fallback share and daily spend have alerts.
+
+### Review rubric
+- Applies the hard-constraint filter before any quality comparison, and says which candidate it removed.
+- Scores whole agent runs and reports lower confidence bounds, not means or leaderboard ranks.
+- Computes cost per run, per day and per successful run from steps and measured tokens, reproducibly.
+- Chooses by the rule (cheapest that clears the bar and the latency budget) and names the runner-up.
+- Pins versions, names a second source, and lists the triggers for re-selection.
 
 ## Why it exists
 - **The choice is multiplied by every request and every step.** At any moment dozens of plausible

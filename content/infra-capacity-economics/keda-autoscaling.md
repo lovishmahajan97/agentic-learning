@@ -5,7 +5,8 @@ name: KEDA autoscaling
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/serverless-gpus
@@ -35,6 +36,63 @@ counts only: nodes and GPU cold starts still take minutes.
 - **What you control.** The trigger and threshold per layer, `maxReplicaCount` at real GPU quota,
   scale-down damping and graceful drain, so neither a run nor a stream is cut off.
 - **What you can skip.** KEDA's internals and the scaler catalogue. Know the 0↔1 versus 1↔N split.
+
+## Decision case
+### Scenario
+A market-research firm runs background research agents for analysts. Tasks land on a Redis list; CPU
+workers run each agent loop against a self-hosted vLLM model on single-GPU replicas.
+- **Status quo:** an HPA on GPU utilisation at 70% keeps the model tier at its cap of 10 replicas 24
+  hours a day: 240 GPU-hours a day.
+- **Measured with replayed agent traces:** one replica holds its latency target at 8 in-flight
+  requests, not the 12 a chat load test gave. Runs spend 60% of their time waiting on the model.
+- **Traffic:** about 300 tasks queue between 09:00 and 09:15 on workdays; light afternoons; almost nothing
+  from 20:00 to 08:00.
+- **Platform facts:** a new GPU node plus weight load takes about 6 minutes; GPU quota is 10.
+- **Constraints:** no run may be killed mid-loop (runs write to analysts' workspaces); no run may time
+  out because the model tier is saturated; the first morning runs must start within 10 minutes.
+
+### Options
+| Option | Signals | Overnight GPUs | 09:00 burst of 300 tasks | Mid-run safety |
+|---|---|---|---|---|
+| A. Keep the GPU-util HPA | GPU utilisation | 10 | 10 replicas already up | Fine, but 240 GPU-h a day |
+| B. KEDA on both tiers, uncapped | Worker Deployment on list length; model on vLLM's own metrics, min 0 | 0, and it may never wake: the metric vanishes at zero | 300 runs × 0.6 = 180 requests want 23 replicas against a quota of 10, so runs time out | HPA scale-down kills workers mid-run |
+| C. ScaledJob capped from the model tier, model on running + waiting | Redis scaler per run, `accurate` strategy; model trigger threshold 8, cron pre-warm of all 10 replicas 08:45 to 09:30 on workdays, activation from the gateway queue | 0 | At most 10 × 8 ÷ 0.6 ≈ 133 concurrent runs; the rest wait in Redis, not mid-loop | Jobs run to completion |
+
+### Decision
+Choose **C**.
+- **No mid-loop timeouts:** capping Jobs at 133 keeps model demand at about 133 × 0.6 ≈ 80 in-flight
+  requests, which ceil(80 ÷ 8) = 10 replicas can hold within quota. Excess work queues where waiting is
+  free.
+- **No killed runs:** a Job per run is never scaled down by an HPA.
+- **Morning start:** the cron trigger brings all 10 replicas up 15 minutes before the burst, because
+  the run cap assumes the full tier. With only 4 warm (capacity for about 4 × 8 ÷ 0.6 ≈ 53 runs), 133
+  Jobs would queue on the model for the 6-minute node path.
+- **Waking from zero:** activation reads the gateway queue, which exists with no model pods.
+- **Cost:** an illustrative replay of the day profile gives about 65 GPU-hours a day against 240, a cut
+  of roughly 73%.
+
+**What would change it:**
+- **Interactive agents with a step SLO:** keep `minReplicaCount: 1` overnight and accept the idle card.
+- **Many short runs (seconds each):** Job start-up dominates, so use a worker Deployment with a drain hook
+  and long `terminationGracePeriodSeconds` instead.
+- **Faster tools:** runs waiting 80% on the model lower the cap to 10 × 8 ÷ 0.8 = 100 runs; recompute.
+
+### Trade-offs accepted
+- **A threshold tied to today's transcripts.** If agents grow longer contexts, 8 per replica is too
+  many; add vLLM KV usage as a second trigger and re-measure each quarter.
+- **Queue wait instead of failure.** Analysts may wait in Redis during the burst; alert on queue age.
+- **A cold night.** Overnight tasks wait about 6 minutes for a node; acceptable for background work.
+- **Paying for the pre-warm.** Ten GPUs run from 08:45 even on a quiet morning; compare queue depth at
+  09:00 with the cron count monthly and trim it if bursts shrink.
+- **Pending pods hide capacity problems.** Alert when GPU pods stay Pending beyond 10 minutes.
+
+### Review rubric
+- Rejects GPU utilisation and explains why it carries no proportional information.
+- Measures per-replica capacity with agent traces and derives the run cap from quota × capacity ÷ model
+  share.
+- Picks an activation signal that exists when the model tier is at zero.
+- Protects runs from scale-down (ScaledJob or drain) and justifies the choice from run length.
+- Accounts for node and weight-load time with a pre-warm or headroom, and states what would flip it.
 
 ## Why it exists
 - **The HPA assumes CPU rises with load.** The built-in Horizontal Pod Autoscaler was designed for

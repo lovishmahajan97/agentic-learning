@@ -5,7 +5,8 @@ name: Metadata filtering
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -207,7 +208,71 @@ flowchart TD
     X --> O
 ```
 
+## Misconceptions
+- **"Over-fetching fixes post-filtering."** Fetching k/s candidates restores the count on average, but
+  latency grows, ANN recall degrades at large k, and the true filtered top-k can rank outside the
+  unfiltered candidates (9/10 correct at k′ = 1,000 in the simulation below). Make the predicate part of
+  the search instead.
+- **"Writing the tenant or year into the chunk text is a cheap filter."** A short prefix barely moves an
+  embedding of hundreds of tokens, and similarity cannot express ranges, negation or list membership.
+  Hard constraints belong in typed fields with a payload index.
+- **"Filtered HNSW traversal gives the same recall as an unfiltered search."** It only admits passing
+  nodes, but graph edges ignore metadata, so a selective filter strands the walk among failing nodes.
+  Recall drops in roughly the 0.1% to 10% band; measure recall@k per selectivity bucket.
+- **"Each filter is mild, so the combined search is safe."** Selectivities multiply: two independent
+  filters that each keep 10% keep about 1% together. Agents stack type, date and language, which pushes
+  their searches into the dangerous band.
+- **"An empty result means no matching documents exist."** With post-filtering at k = 10 and s = 1%, the
+  expected survivors are 0.1, so empty is the arithmetic, not the corpus. Return a relax note so the agent
+  does not loop or answer "none found".
+- **"The tenant can be a tool argument if the prompt says to use the user's tenant."** The model is a
+  caller that prompt injection can steer. Inject tenant and ACL predicates from the authenticated
+  session and keep them out of the tool schema.
+
 ## Examples
+### Simulation: pre-filter versus post-filter
+200k random unit vectors split across 100 tenants, so any single tenant's filter keeps about 1% of rows.
+`pre_filter` evaluates the predicate first and does an exact search inside it; `post_filter` takes the
+unfiltered top-k′ and drops other tenants, as a post-filtering engine would.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+N, d, k = 200_000, 64, 10
+X = rng.standard_normal((N, d)).astype(np.float32); X /= np.linalg.norm(X, axis=1, keepdims=True)
+tenant = rng.integers(0, 100, N)                      # 100 tenants: each filter keeps ~1% of rows
+q = rng.standard_normal(d).astype(np.float32); q /= np.linalg.norm(q)
+sims = X @ q                                          # cosine similarity of every row to the query
+
+def pre_filter():                                     # predicate first, exact search inside it
+    allowed = np.flatnonzero(tenant == 7)             # ~2,000 ids, straight from a payload index
+    return allowed[np.argsort(-sims[allowed])[:k]]
+
+def post_filter(k_fetch):                             # unfiltered top-k_fetch, then drop other tenants
+    top = np.argpartition(-sims, k_fetch)[:k_fetch]
+    keep = top[tenant[top] == 7]
+    return keep[np.argsort(-sims[keep])][:k]
+
+truth = set(pre_filter())
+for kf in (10, 100, 1_000, 10_000):
+    got = post_filter(kf)
+    print(f"over-fetch {kf:>6}: {len(got):>2} results, {len(set(got) & truth):>2}/{k} correct")
+# Output with this seed: over-fetch 10 -> 0 results; 100 -> 0; 1,000 -> 9 results, 9/10 correct;
+# 10,000 -> 10 results, 10/10 correct, at 5x the candidate volume of the exact pre-filtered search.
+```
+
+| Over-fetch k′ | Expected k′·s | Results | Correct |
+|---|---|---|---|
+| 10 (a naive `top_k=10` call) | 0.1 | 0 | 0 |
+| 100 | 1 | 0 | 0 |
+| 1,000 | 10 | 9 | 9/10 |
+| 10,000 | 100 (capped at k) | 10 | 10/10 |
+
+- **Pre-filtering touched ~2,000 rows and was exact.** Post-filtering had to over-fetch 5% of the whole
+  corpus to match it.
+- **Count is fixed before correctness.** At k′ = 1,000 all nine survivors were correct, but the tenant's
+  tenth-nearest row ranked outside the unfiltered top-1,000, beyond any post-processing.
+
 ### Agent tool: a validated filter builder for model-chosen arguments
 The model proposes filters as tool arguments; code decides which survive. Security fields come only from
 the authenticated session. The filter is a Qdrant-style `must` list; adapt the shape to your engine.
@@ -254,49 +319,6 @@ print(f)  # tenant stays 'acme'; unknown 'year' dropped; doc_type kept
 
 - **The `note` field matters.** It tells the model the filter was relaxed, so it can say "no contracts
   from that period; here is the closest material" instead of presenting unfiltered hits as matches.
-
-### Simulation: pre-filter versus post-filter
-200k random unit vectors split across 100 tenants, so any single tenant's filter keeps about 1% of rows.
-`pre_filter` evaluates the predicate first and does an exact search inside it; `post_filter` takes the
-unfiltered top-k′ and drops other tenants, as a post-filtering engine would.
-
-```python
-import numpy as np
-rng = np.random.default_rng(0)
-N, d, k = 200_000, 64, 10
-X = rng.standard_normal((N, d)).astype(np.float32); X /= np.linalg.norm(X, axis=1, keepdims=True)
-tenant = rng.integers(0, 100, N)                      # 100 tenants: each filter keeps ~1% of rows
-q = rng.standard_normal(d).astype(np.float32); q /= np.linalg.norm(q)
-sims = X @ q                                          # cosine similarity of every row to the query
-
-def pre_filter():                                     # predicate first, exact search inside it
-    allowed = np.flatnonzero(tenant == 7)             # ~2,000 ids, straight from a payload index
-    return allowed[np.argsort(-sims[allowed])[:k]]
-
-def post_filter(k_fetch):                             # unfiltered top-k_fetch, then drop other tenants
-    top = np.argpartition(-sims, k_fetch)[:k_fetch]
-    keep = top[tenant[top] == 7]
-    return keep[np.argsort(-sims[keep])][:k]
-
-truth = set(pre_filter())
-for kf in (10, 100, 1_000, 10_000):
-    got = post_filter(kf)
-    print(f"over-fetch {kf:>6}: {len(got):>2} results, {len(set(got) & truth):>2}/{k} correct")
-# Output with this seed: over-fetch 10 -> 0 results; 100 -> 0; 1,000 -> 9 results, 9/10 correct;
-# 10,000 -> 10 results, 10/10 correct, at 5x the candidate volume of the exact pre-filtered search.
-```
-
-| Over-fetch k′ | Expected k′·s | Results | Correct |
-|---|---|---|---|
-| 10 (a naive `top_k=10` call) | 0.1 | 0 | 0 |
-| 100 | 1 | 0 | 0 |
-| 1,000 | 10 | 9 | 9/10 |
-| 10,000 | 100 (capped at k) | 10 | 10/10 |
-
-- **Pre-filtering touched ~2,000 rows and was exact.** Post-filtering had to over-fetch 5% of the whole
-  corpus to match it.
-- **Count is fixed before correctness.** At k′ = 1,000 all nine survivors were correct, but the tenant's
-  tenth-nearest row ranked outside the unfiltered top-1,000, beyond any post-processing.
 
 ### Worked scenario: an agent burning steps on empty filtered searches
 A support agent searches a post-filtering store with `top_k=10`. The user asks about one small

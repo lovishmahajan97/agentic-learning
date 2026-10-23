@@ -5,7 +5,8 @@ name: Lockfiles & dependency pinning
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/uv-poetry-pip
@@ -38,6 +39,200 @@ publish ranges.
   (dated model snapshots instead of moving aliases, prompt versions, embedding model revisions, base
   image digests), and record all of them with every eval run.
 - **What you can skip.** PEP 440 edge cases beyond `~=` and pre-releases, and lockfile format internals.
+
+## Lab
+### Task
+Build the reviewer that runs on every dependency-upgrade pull request: diff two `uv.lock` files,
+classify each change, decide which changes must pass the agent eval suite before merge, and compute the
+lock fingerprint to record with each eval run. Time box: 45-60 min.
+- **Prerequisites:** uv / poetry / pip; the specifier rules in How it works below.
+- **Setup:** Python 3.11+ (for `tomllib`), `pip install packaging pytest` (checked with packaging 26.3).
+  Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **The locks are trimmed `uv.lock` excerpts:** package names are real, versions are illustrative, and the
+  hashes and wheel lists a real lock carries are left out.
+
+### Starter code
+```python
+"""Lab: review a uv.lock diff on an upgrade PR and decide what needs the agent eval suite. Run: python lab.py"""
+from __future__ import annotations
+import hashlib, tomllib
+from packaging.version import Version
+
+CRITICAL = {"langchain-core", "langgraph", "openai", "anthropic"}   # change agent behaviour
+
+OLD_LOCK = '''\
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "support-agent"
+version = "0.4.0"
+source = { editable = "." }
+
+[[package]]
+name = "certifi"
+version = "2024.8.30"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "distro"
+version = "1.9.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "httpx"
+version = "0.27.2"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "langchain-core"
+version = "0.2.40"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "openai"
+version = "1.51.0"
+source = { registry = "https://pypi.org/simple" }
+'''
+
+NEW_LOCK = '''\
+version = 1
+requires-python = ">=3.12"
+
+[[package]]
+name = "support-agent"
+version = "0.5.0"
+source = { editable = "." }
+
+[[package]]
+name = "anthropic"
+version = "0.39.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "certifi"
+version = "2024.12.14"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "httpx"
+version = "0.27.0"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "langchain-core"
+version = "0.3.21"
+source = { registry = "https://pypi.org/simple" }
+
+[[package]]
+name = "openai"
+version = "1.51.2"
+source = { registry = "https://pypi.org/simple" }
+'''
+
+def packages(lock_text: str) -> dict[str, str]:
+    # YOUR CODE HERE: {name: version} for every [[package]], skipping the project itself
+    # (its source is editable or virtual, so it is not a third-party dependency)
+    raise NotImplementedError
+
+def classify(old: str | None, new: str | None) -> str:
+    # YOUR CODE HERE: "added" | "removed" | "downgrade" | "major" | "minor" | "patch"
+    # - compare with packaging.version.Version, never as strings
+    # - on 0.x versions a minor bump (0.2 -> 0.3) counts as "major": 0.x minors may break
+    raise NotImplementedError
+
+def review(old_lock: str, new_lock: str) -> dict:
+    # YOUR CODE HERE: return {
+    #   "changes": sorted [(name, old_version_or_None, new_version_or_None, kind)] for changed packages,
+    #   "needs_eval": sorted names where kind == "major", or name in CRITICAL and kind != "patch",
+    #   "fingerprint": first 12 hex chars of sha256 of new_lock (record it with every eval run)}
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    r = review(OLD_LOCK, NEW_LOCK)
+    for name, old, new, kind in r["changes"]:
+        print(f"{name:<15} {old or '-':>10} -> {new or '-':<10} {kind}")
+    print("needs eval:", r["needs_eval"])
+    print("fingerprint:", r["fingerprint"])
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+anthropic                - -> 0.39.0     added
+certifi          2024.8.30 -> 2024.12.14 minor
+distro               1.9.0 -> -          removed
+httpx               0.27.2 -> 0.27.0     downgrade
+langchain-core      0.2.40 -> 0.3.21     major
+openai              1.51.0 -> 1.51.2     patch
+needs eval: ['anthropic', 'langchain-core']
+fingerprint: 54aca76d8cc2
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 12 cases fail with `NotImplementedError`; a correct
+solution passes all 12 (Python 3.12, packaging 26.3, pytest 9.1).
+
+```python
+import hashlib
+import pytest
+from lab import NEW_LOCK, OLD_LOCK, classify, packages, review
+
+def test_packages_skip_the_project_itself():
+    pk = packages(OLD_LOCK)
+    assert "support-agent" not in pk
+    assert pk == {"certifi": "2024.8.30", "distro": "1.9.0", "httpx": "0.27.2",
+                  "langchain-core": "0.2.40", "openai": "1.51.0"}
+
+@pytest.mark.parametrize("old,new,kind", [
+    (None, "1.0", "added"), ("1.0", None, "removed"),
+    ("1.51.0", "1.51.2", "patch"), ("1.40.0", "1.51.0", "minor"), ("1.9.0", "2.0.0", "major"),
+    ("0.2.40", "0.3.21", "major"), ("0.2.40", "0.2.41", "patch"),
+    ("0.27.2", "0.27.0", "downgrade"), ("1.9.0", "1.10.0", "minor"),
+])
+def test_classify(old, new, kind):
+    assert classify(old, new) == kind
+
+def test_review_of_the_upgrade_pr():
+    r = review(OLD_LOCK, NEW_LOCK)
+    assert r["changes"] == [
+        ("anthropic", None, "0.39.0", "added"),
+        ("certifi", "2024.8.30", "2024.12.14", "minor"),
+        ("distro", "1.9.0", None, "removed"),
+        ("httpx", "0.27.2", "0.27.0", "downgrade"),
+        ("langchain-core", "0.2.40", "0.3.21", "major"),
+        ("openai", "1.51.0", "1.51.2", "patch"),
+    ]
+    assert r["needs_eval"] == ["anthropic", "langchain-core"]
+    assert r["fingerprint"] == hashlib.sha256(NEW_LOCK.encode()).hexdigest()[:12]
+
+def test_unchanged_lock_needs_nothing():
+    r = review(OLD_LOCK, OLD_LOCK)
+    assert r["changes"] == [] and r["needs_eval"] == []
+```
+
+### Failure scenarios
+- **Compare versions as strings.** `"1.10.0" < "1.9.0"` is true for strings, so the `1.9.0 -> 1.10.0`
+  case comes out as `downgrade`. Print `Version(a) < Version(b)` next to `a < b` for the failing pair.
+- **Treat 0.x like semver.** `langchain-core 0.2.40 -> 0.3.21` is called `minor` and skips the eval gate,
+  although 0.x minors are where agent frameworks change message and tool-call formats. Check
+  `Version(v).release[0] == 0` before deciding.
+- **Keep the project's own entry.** `support-agent 0.4.0 -> 0.5.0` shows up as a dependency change on
+  every release. Print each package's `source` table; the project has `editable` (or `virtual`).
+- **Fingerprint the parsed dict instead of the file bytes.** Two locks that differ only in hashes or
+  markers get the same fingerprint, so an eval result points at the wrong environment. Hash the exact
+  bytes you commit.
+
+### Submission
+- **`lab.py`** with `packages`, `classify` and `review` implemented.
+- **A green test run** (12 passed) and the output of `python lab.py`.
+- **A run against a real pair of locks:** `git show HEAD~1:uv.lock` versus `uv.lock` in any uv project,
+  with the review output pasted.
+- **A note** on whether the `httpx` downgrade should also trigger evals in your agent, and what signal
+  (a lock diff, an import test, an eval) would catch the worked failure described in Examples below.
+- **Evaluated on:** exact classification, a correct eval gate, a byte-exact fingerprint, and the project
+  entry excluded.
 
 ## Why it exists
 - **The graph is mostly not yours.** A typical AI service declares perhaps fifteen direct dependencies and

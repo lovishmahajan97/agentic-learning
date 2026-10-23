@@ -5,7 +5,8 @@ name: Latency budgets
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - reliability/slas-slos
@@ -37,6 +38,59 @@ A latency budget splits one user-facing target, such as "first token within 2 s 
   whether tool calls run in parallel, prompt length (prefill), and when to stream a partial answer.
 - **What you can skip.** Formal SLO maths. Know that percentiles do not add, that queue wait grows with
   load, and how to propagate a deadline; that covers most agent latency work.
+
+## Decision case
+### Scenario
+An insurer's claims-status agent runs in a web chat. Product wants the first answer text on screen within
+12 s at p95 at peak load. Compliance requires an output guardrail before any text is shown. All p95s
+below are illustrative measurements at peak load.
+- **Loop iteration:** main model picks a tool 1.8 s, the claims API answers in 0.9 s, so 2.7 s per
+  iteration.
+- **Final answer:** queue plus prefill to first token 2.0 s, then 25 ms per output token for about 300
+  tokens. The guardrail check takes 0.4 s per check.
+- **Reserve:** 1.5 s for jitter and one cheap retry.
+- **Task traces:** 62% of tasks need at most 2 tool iterations, 90% at most 3, 97% at most 4.
+- **Constraints:** no new GPUs this quarter, a team of three, and a 6-week deadline.
+
+### Options
+| Option | How it works | Time left for the loop | Iterations that fit | Tasks covered |
+|---|---|---|---|---|
+| A. Current: full-answer guardrail, `max_steps=4` | Decode all 300 tokens (7.5 s), check, then display | 12 − 1.5 − (2.0 + 7.5 + 0.4) = 0.6 s | 0, yet 4 run: 4 × 2.7 + 9.9 = 20.7 s | 97%, but every one breaks the target |
+| B. Stream with a sentence guardrail, time-aware loop | Check each sentence before showing it; first sentence about 20 tokens: 2.0 + 0.5 + 0.4 = 2.9 s | 12 − 1.5 − 2.9 = 7.6 s | 7.6 ÷ 2.7 = 2.8, so 2 | 62% |
+| C. B plus a small model for tool-selection steps | Router picks tools in 0.8 s, so 0.8 + 0.9 = 1.7 s per iteration; main model writes the answer | 7.6 s | 7.6 ÷ 1.7 = 4.5, so 4 | 97% |
+
+### Decision
+Choose **C**, gated on an eval.
+- **Latency:** the full-answer guardrail alone spends 9.9 s of the 12 s, so A cannot meet the target at any
+  step count. Moving the guardrail to sentence level is the change that makes a loop affordable at all.
+- **Task success:** B fits only 2 iterations, so 38% of tasks would end on the partial-answer path.
+  C fits 4 and covers the 97% the traces show.
+- **Constraints:** C needs no GPUs (the small model serves on the existing pool) and is two changes the
+  team can ship in 6 weeks: a guardrail mode and a model route for tool steps.
+- **Gate:** C ships only if the router's tool-selection accuracy on the agent's eval set is within an
+  agreed margin of the main model's, because faster wrong tool calls waste iterations.
+
+**What would change it:** a failing router eval leaves B plus a request to product for a 15 s target
+(15 − 1.5 − 2.9 = 10.6 s, 3 iterations, 90% of tasks). A compliance ruling that sentence checks are not
+enough moves the agent to a background task with status updates, where minutes are acceptable.
+
+### Trade-offs accepted
+- **Sentence-level guardrail.** A violation spread across sentences is caught later than with a full check.
+  Log the guardrail verdicts and sample full transcripts for review.
+- **Two models in one loop.** Routing quality can drift on model updates. Track tool-call error rate and
+  steps per task per model version.
+- **Partial answers for 3% of tasks.** Monitor the partial-answer share; a rise means iterations got
+  slower or tasks got harder.
+- **Load-bound numbers.** All p95s hold only up to the utilization they were measured at; re-measure when
+  peak occupancy rises.
+
+### Review rubric
+- States the target with a percentile, a load and the user-visible event it measures.
+- Lays out the critical path with the fixed parts (reserve, final answer, guardrail) subtracted first.
+- Derives the step limit by dividing the remaining time by the per-iteration p95, and ties it to the
+  traced distribution of steps per task.
+- Identifies the single largest line item and attacks it before tuning smaller ones.
+- Gates any quality-risking speedup on a named eval, and names the fallback if it fails.
 
 ## Why it exists
 - **An AI request is a pipeline, not a call.** A RAG answer may pass an edge proxy, auth, input

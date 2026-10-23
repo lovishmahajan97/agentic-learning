@@ -5,7 +5,8 @@ name: Cost modeling (cost per request, token economics)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - infra-capacity-economics/unit-economics-per-successful-task
@@ -36,6 +37,57 @@ roughly quadratically with turns, and runaway runs can dominate.
   enters context, turns per run, output and reasoning caps, prompt caching, and which model each step uses.
 - **What you can skip.** Provider-specific billing edge cases until you are near launch. The per-call
   formula, the T² growth term and the tail share cover most agent cost decisions.
+
+## Decision case
+### Scenario
+The research agent from the worked scenario below is about to launch. Sales has set the price at $0.15 per
+run, and finance requires at least 35% gross margin on model plus tool cost, so a run may cost at most
+$0.0975 on average. Prices and tool rates are the illustrative ones used in the examples.
+- **Prototype traces (500 runs):** 80% finish in 8 turns, 15% need 14 turns and succeed, 5% loop to 30
+  turns and almost never succeed.
+- **Cost per run, prefix caching on, tools included:** 8 turns $0.0837, 10 turns $0.1005, 14 turns
+  $0.1370, 16 turns $0.1567, 30 turns $0.3213.
+- **The sales forecast** priced off the typical 8-turn run: $0.0837, a 44% margin.
+- **Constraints:** launch in 4 weeks at 200,000 runs a month; the long 14-turn runs are the
+  highest-value tasks and must not be cut off.
+
+### Options
+| Option | How it works | Mean cost per run | Margin at $0.15 | Runaway share of spend | Effect on success |
+|---|---|---|---|---|---|
+| A. No cap | Forecast from the trace mean: 0.80 × 0.0837 + 0.15 × 0.1370 + 0.05 × 0.3213 | $0.1036 | 30.9%: fails | 15.5% | None |
+| B. Turn cap 16 plus a $0.16 per-run cost cap | Runaways stop at 16 turns: 0.80 × 0.0837 + 0.15 × 0.1370 + 0.05 × 0.1567 | $0.0954 | 36.4% | 8.2% | None: 14-turn runs fit |
+| C. Turn cap 10 | Long runs and runaways stop at 10: 0.80 × 0.0837 + 0.20 × 0.1005 | $0.0871 | 41.9% | None left | 15% of runs, the valuable ones, now fail |
+
+### Decision
+Choose **B**, and correct the forecast to $0.0954 per run (about $19,076 a month at 200,000 runs).
+- **Margin:** A fails the 35% bar once the tail is counted; the sales figure of 44% came from the
+  typical run, not the mean. B clears the bar with 1.4 points to spare.
+- **Success:** the cap sits above the 14 turns successful long runs need, so it only stops loops that were
+  failing anyway. C buys margin by failing the highest-value 15% of tasks.
+- **Tail:** B halves the runaway share of spend (15.5% to 8.2%), and the cost cap bounds any run whose
+  tool results are larger than the prototype's.
+
+**What would change it:** the margin is thin. If long runs grow to 20% of traffic (75% at 8 turns), B
+costs 0.75 × 0.0837 + 0.20 × 0.1370 + 0.05 × 0.1567 ≈ $0.0980, a 34.7% margin, below the bar.
+
+Then compaction for long runs or a higher price tier for them is the next move, not a tighter cap.
+
+### Trade-offs accepted
+- **Thin margin on a 500-run sample.** The 5% runaway rate is uncertain. Recompute the mean and tail
+  share weekly from production traces for the first month.
+- **Dependence on prefix caching.** Without it the 30-turn run costs $1.5115 and the no-cap mean is about
+  $0.306. Alert on the cached-token share after every prompt deploy.
+- **Some legitimate runs may hit the cap.** Log every capped run and sample them; if capped runs that
+  were close to finishing appear, raise the cap and re-price.
+- **Prices change.** The model reads prices from versioned config; a price change re-runs the forecast.
+
+### Review rubric
+- Builds the forecast from the run distribution (mean and tail share), not from a typical run.
+- Shows the arithmetic for each option against the stated margin or budget bar.
+- Sets caps from the turn counts of successful runs, and states which tasks a cap would fail.
+- Names the assumptions the result depends on (cache share, tail rate, sample size) and how each is
+  monitored.
+- Gives the threshold at which the decision flips, computed, not guessed.
 
 ## Why it exists
 - **Spend is metered per token.** Cost is set by the shape of each request, not by servers running.

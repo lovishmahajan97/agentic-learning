@@ -5,7 +5,8 @@ name: Decorators
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/tenacity
@@ -39,6 +40,158 @@ sync wrappers on async tools, and stacking order.
   or need approval.
 - **What you can skip.** Writing class-based decorators with `__get__` and elaborate generic typing unless
   you maintain a library. Know the desugaring, the factory pattern and the three edges.
+
+## Lab
+### Task
+Fix a tool layer that hits all three edges at once. The starter's `@traced` is a sync wrapper with no
+`functools.wraps`, and it sits above a registration decorator, so the framework registers bare
+functions, timings read 0 ms and tool errors escape instead of reaching the model. Time box: 45
+minutes. Do **async / await** first.
+- **Goal:** the registry holds the traced tool with its real name, docstring and parameters, timings
+  include the awaited work, errors come back as strings, and cancellation still propagates.
+- **Constraints:** standard library only; `TOOLS` stands in for a framework such as `@mcp.tool()`.
+  Checked on Python 3.12.14 with pytest 9.1.
+
+### Starter code
+Save as `lab_tools.py`. It runs as given: timings print 0 ms and the `KeyError` escapes.
+
+```python
+import asyncio, functools, inspect, time
+
+TOOLS: dict[str, dict] = {}                 # what the agent framework turns into tool schemas
+TIMINGS: list[tuple[str, float]] = []       # (tool name, elapsed ms) per call
+
+def tool(fn):
+    """Registration: records whatever object it receives."""
+    TOOLS[fn.__name__] = {"fn": fn, "doc": inspect.getdoc(fn),
+                          "params": list(inspect.signature(fn).parameters)}
+    return fn
+
+def traced(fn):
+    """Record (name, elapsed ms) for every call and return failures as "error: Type: msg".
+    LAB 1: keep the tool's name, docstring and signature (the model sees them).
+    LAB 2: for async tools, time and catch the awaited work, not coroutine creation.
+    Let CancelledError through."""
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            return f"error: {type(e).__name__}: {e}"
+        finally:
+            TIMINGS.append((fn.__name__, (time.perf_counter() - start) * 1000))
+    return wrapper
+
+# LAB 3: the framework must register the traced tool, not the bare function. Check the order.
+@traced
+@tool
+async def search_docs(query: str, k: int = 3) -> list[str]:
+    """Search the knowledge base."""
+    await asyncio.sleep(0.12)               # stands in for a vector-store query
+    return [f"{query} #{i}" for i in range(k)]
+
+@traced
+@tool
+async def get_weather(city: str) -> str:
+    """Current weather for a city."""
+    await asyncio.sleep(0.01)
+    if city == "Atlantis":
+        raise KeyError("unknown city")
+    return f"{city}: 18C"
+
+async def main():
+    for name, meta in TOOLS.items():
+        print(f"{name}{meta['params']} - {meta['doc']}")
+    print(await search_docs("refund", k=2))
+    try:
+        print(await get_weather("Atlantis"))
+    except Exception as e:
+        print(f"escaped the wrapper: {e!r}")
+    for name, ms in TIMINGS:
+        print(f"{name}: {round(ms, -1):.0f} ms")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Expected output
+Timings are rounded to 10 ms. The starter prints `escaped the wrapper: KeyError('unknown city')` and
+`0 ms` for both tools.
+
+```
+search_docs['query', 'k'] - Search the knowledge base.
+get_weather['city'] - Current weather for a city.
+['refund #0', 'refund #1']
+error: KeyError: 'unknown city'
+search_docs: 120 ms
+get_weather: 10 ms
+```
+
+### Tests
+Save as `test_lab_tools.py` and run `pytest -q`. On the starter five fail: the registry holds the bare
+function, `__name__` is `wrapper`, the tool is no longer a coroutine function, timing reads about
+0.001 ms and the `KeyError` escapes.
+
+```python
+import asyncio, inspect
+import pytest
+import lab_tools as lab
+
+@pytest.fixture(autouse=True)
+def clear_timings():
+    lab.TIMINGS.clear()
+
+def test_registry_holds_the_wrapped_tool():
+    assert lab.TOOLS["search_docs"]["fn"] is lab.search_docs, "framework registered the bare function"
+
+def test_schema_keeps_real_names_and_docs():
+    meta = lab.TOOLS["search_docs"]
+    assert meta["params"] == ["query", "k"] and meta["doc"] == "Search the knowledge base."
+    assert lab.search_docs.__name__ == "search_docs"
+    assert list(inspect.signature(lab.get_weather).parameters) == ["city"]
+
+def test_async_tools_stay_async():
+    assert inspect.iscoroutinefunction(lab.search_docs), "frameworks would not await this tool"
+
+def test_timing_covers_the_awaited_work():
+    asyncio.run(lab.search_docs("x"))
+    (name, ms), = lab.TIMINGS
+    assert name == "search_docs" and ms >= 100, f"timed {ms:.3f} ms: only coroutine creation"
+
+def test_tool_errors_come_back_as_results():
+    assert asyncio.run(lab.get_weather("Atlantis")) == "error: KeyError: 'unknown city'"
+    assert len(lab.TIMINGS) == 1
+
+def test_cancellation_is_not_turned_into_a_result():
+    async def scenario():
+        t = asyncio.create_task(lab.search_docs("x"))
+        await asyncio.sleep(0.02)
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+    asyncio.run(scenario())
+```
+
+### Failure scenarios
+- **Swap the order but keep the wrapper without `wraps`.** The registry now shows `wrapper` with params
+  `['args', 'kwargs']` and no docstring: the schema a model would guess against. Debug: print `TOOLS`
+  and `inspect.signature(tool)`; a missing `__wrapped__` is the cause.
+- **Inject `except BaseException` in the async wrapper.** The cancellation test fails: a Stop or a
+  timeout becomes a result string. Debug: cancel a call in a test and check `t.cancelled()`.
+- **Make the wrapper `async def` for every tool, sync ones included.** A sync tool now returns a
+  coroutine that sync callers never await, and Python warns "coroutine ... was never awaited". Debug:
+  branch on `inspect.iscoroutinefunction(fn)` and assert each wrapped tool keeps its original kind.
+- **Move the timer start into the decorator body.** Every call reports the time since import. Debug:
+  remember the decorator body runs once at definition; per-call work belongs in the wrapper.
+
+### Submission
+- **Your `lab_tools.py`** with the three LAB markers resolved; keep `traced` working for sync tools too.
+- **A `pytest -q` run** showing 6 passed, plus the starter's failing run, in `NOTES.md`.
+- **The fixed script's output**, matching the expected block (timings within 10 ms).
+- **Two sentences** on why the registration decorator must be on top, using the desugaring
+  `search_docs = tool(traced(search_docs))`.
+- **Evaluation:** tests pass, `functools.wraps` is on every wrapper, the async branch awaits the call,
+  and no handler is wider than `Exception`.
 
 ## Why it exists
 - **Every model and tool call needs the same wrapping:** retry on 429 and timeouts with backoff, record

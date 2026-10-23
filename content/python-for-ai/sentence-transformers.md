@@ -5,7 +5,8 @@ name: sentence-transformers
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/hugging-face
@@ -38,6 +39,182 @@ and training losses that turn a Hugging Face encoder into a usable search model.
   to fine-tune on your own queries.
 - **What you can skip.** Writing contrastive losses yourself and the Sentence-BERT paper's details. Know
   bi-encoder versus cross-encoder cost, and why vectors from different models never mix.
+
+## Lab
+### Task
+Turn a naive `search_docs` tool into one an agent can rely on: unit-length vectors, an index stamped with
+its model version, retrieve wide by cosine, rerank only the pool, and return the reranker's top k with
+ids. Time box: 45-75 minutes.
+- **Prerequisites:** NumPy, Embeddings, and this lesson's bi-encoder, cross-encoder and pitfalls sections.
+- **Offline stand-ins:** `FakeEncoder` and `FakeCrossEncoder` copy the call shapes of
+  `SentenceTransformer.encode` and `CrossEncoder.predict`, so the lab needs no download and gives exact
+  output. Hashing depends on the version, so two versions produce incomparable vectors, as real models do.
+- **Checked against:** Python 3.12 and NumPy 2.5; the stand-ins mirror the `sentence-transformers` 3.x to
+  6.x `encode(..., normalize_embeddings=True)` and `predict(pairs)` signatures.
+
+### Starter code
+Save as `lab.py`. Rewrite `build_index` and `search_docs` (the `LAB` comments); leave the stand-ins and
+`DOCS` alone.
+
+```python
+"""Lab: a search_docs tool for an agent, with offline stand-ins for SentenceTransformer and CrossEncoder."""
+import hashlib
+import re
+
+import numpy as np
+
+WORD = re.compile(r"[a-z0-9]+")
+STOP = {"a", "an", "and", "are", "be", "being", "do", "for", "how", "i", "in", "is", "me", "my",
+        "of", "on", "the", "to", "use", "with", "your"}
+
+
+def words(text: str) -> list[str]:
+    return [w for w in WORD.findall(text.lower()) if w not in STOP]
+
+
+class FakeEncoder:
+    """Same call shape as SentenceTransformer.encode. Vectors are hashed bags of words, NOT unit length,
+    and the hash depends on the model version, so two versions are as incomparable as two real models."""
+
+    def __init__(self, name: str = "fake-minilm", version: str = "1", dim: int = 256):
+        self.model_id, self.dim = f"{name}@{version}", dim
+
+    def encode(self, texts, normalize_embeddings: bool = False, batch_size: int = 32):
+        single = isinstance(texts, str)
+        out = np.zeros((1 if single else len(texts), self.dim), dtype=np.float32)
+        for row, text in enumerate([texts] if single else texts):
+            for w in words(text):
+                h = int(hashlib.md5(f"{self.model_id}:{w}".encode()).hexdigest(), 16)
+                out[row, h % self.dim] += 1.0 if (h >> 64) % 2 else -1.0
+        if normalize_embeddings:
+            out /= np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-12)
+        return out[0] if single else out
+
+
+class FakeCrossEncoder:
+    """Same call shape as CrossEncoder.predict: one score per (query, passage) pair."""
+
+    def __init__(self):
+        self.pairs_scored = 0
+
+    def predict(self, pairs):
+        self.pairs_scored += len(pairs)
+        return np.array([len(set(words(q)) & set(words(d))) / max(len(set(words(q))), 1)
+                         for q, d in pairs], dtype=np.float32)
+
+
+DOCS = [
+    "Refunds are issued within 14 days of a returned item being received.",
+    "Our warehouse ships orders Monday to Friday.",
+    "To reset your password, use the link on the sign-in page.",
+    "Returned items must be unused and in original packaging.",
+    "Help center: help with orders, help with shipping, help with accounts, help with billing, "
+    "help with returns, help with gift cards, help with anything.",
+]
+
+
+def build_index(docs: list[str], encoder) -> dict:
+    # LAB 1: store unit-length vectors AND the encoder's model_id with the index.
+    return {"ids": [f"doc-{i}" for i in range(len(docs))], "texts": list(docs),
+            "vectors": encoder.encode(docs)}
+
+
+def search_docs(index: dict, encoder, reranker, query: str, pool: int = 50, k: int = 2) -> list[dict]:
+    """Tool: passages that answer the query, as [{id, text, score}], best first."""
+    # LAB 2: refuse a query encoder whose model_id differs from the index's (raise ValueError).
+    # LAB 3: retrieve `pool` candidates by cosine, rerank only those, return the reranker's top k.
+    scores = index["vectors"] @ encoder.encode(query)
+    top = scores.argsort()[::-1][:k]
+    return [{"id": index["ids"][i], "text": index["texts"][i], "score": round(float(scores[i]), 3)}
+            for i in top]
+
+
+if __name__ == "__main__":
+    enc, ce = FakeEncoder(), FakeCrossEncoder()
+    index = build_index(DOCS, enc)
+    for q in ["help me reset my password", "how many days until refunds after a returned item"]:
+        print(q, "->", [(r["id"], r["score"]) for r in search_docs(index, enc, ce, q, pool=3, k=2)])
+    print("pairs reranked:", ce.pairs_scored)
+    try:
+        search_docs(index, FakeEncoder(version="2"), ce, "reset password")
+        print("version check: missing")
+    except ValueError as e:
+        print("version check:", e)
+```
+
+### Expected output
+The starter returns the repetitive help-center passage (`doc-4`, raw score 16.0) for the password query,
+reranks nothing and prints `version check: missing`. A correct tool prints the following; the last line's
+wording is yours, but it must name both versions.
+
+```
+help me reset my password -> [('doc-2', 0.667), ('doc-4', 0.333)]
+how many days until refunds after a returned item -> [('doc-0', 0.571), ('doc-3', 0.143)]
+pairs reranked: 6
+version check: index built with fake-minilm@1, query encoder is fake-minilm@2
+```
+
+- **Look closely:** even after normalising, cosine still ranks `doc-4` first for the password query
+  (about 0.84 against 0.60). The reranker reads query and passage together and fixes the order.
+
+### Tests
+Save as `test_lab.py` and run `pytest -q`. All four fail on the starter: raw vectors, no `model_id`, the
+help-center passage wins, and zero pairs are reranked.
+
+```python
+import numpy as np
+import pytest
+from lab import DOCS, FakeCrossEncoder, FakeEncoder, build_index, search_docs
+
+
+@pytest.fixture
+def setup():
+    enc = FakeEncoder()
+    return build_index(DOCS, enc), enc, FakeCrossEncoder()
+
+
+def test_index_is_normalised_and_versioned(setup):
+    index, enc, _ = setup
+    assert np.allclose(np.linalg.norm(index["vectors"], axis=1), 1.0, atol=1e-5)
+    assert index["model_id"] == enc.model_id
+
+
+def test_mixed_model_versions_are_refused(setup):
+    index, _, ce = setup
+    with pytest.raises(ValueError):
+        search_docs(index, FakeEncoder(version="2"), ce, "reset password")
+
+
+def test_long_generic_passage_does_not_win(setup):
+    index, enc, ce = setup
+    out = search_docs(index, enc, ce, "help me reset my password", pool=3, k=2)
+    assert out[0]["id"] == "doc-2"
+
+
+def test_reranker_sees_only_the_pool_and_decides_order(setup):
+    index, enc, ce = setup
+    out = search_docs(index, enc, ce, "how many days until refunds after a returned item", pool=3, k=2)
+    assert ce.pairs_scored == 3
+    assert len(out) == 2 and out[0]["id"] == "doc-0"
+    assert [r["score"] for r in out] == sorted((r["score"] for r in out), reverse=True)
+    assert all(type(r["score"]) is float and isinstance(r["text"], str) for r in out)
+```
+
+### Failure scenarios
+- **Normalise the documents but not the query.** Rankings for one query look right, but scores exceed 1
+  and any threshold breaks. Debug: print `np.linalg.norm` of the query vector inside the tool.
+- **Rerank the whole corpus instead of the pool.** Results stay correct, but `pairs_scored` equals the
+  corpus size and p95 latency grows with N. Debug: log pairs scored per call and compare with `pool`.
+- **Re-embed only new documents after an upgrade.** With the version check removed, old memories stop
+  matching. Debug: group stored vectors by `model_id`; more than one value in one index is the bug.
+
+### Submission
+- **`lab.py` passing all four tests**, and the script output matching Expected output.
+- **A swap-in run:** wrap real `SentenceTransformer` and `CrossEncoder` models in classes that expose
+  `model_id` (repo plus revision), run the same two queries, and paste the ids returned.
+- **A note** on the pool size you would pick for 100,000 passages and which metric (recall@pool, p95
+  rerank latency) you would watch to defend it.
+- **Evaluation:** tests pass, and the tool never reranks more than `pool` pairs.
 
 ## Why it exists
 - **Token vectors are not sentence vectors.** A BERT-style encoder emits one vector per token. Taking

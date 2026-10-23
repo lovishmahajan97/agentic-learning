@@ -5,7 +5,8 @@ name: Model merging
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/peft
@@ -177,6 +178,22 @@ flowchart TD
     G -->|"passes"| S["Ship one merged model"]
     G -->|"fails"| R["Keep routed specialists"]
 ```
+
+## Misconceptions
+- **"Any two models with the same architecture can be merged."** Arithmetic only makes sense for
+  fine-tunes of the identical base revision with matching tokenizer and vocabulary. Models from different
+  initialisations have permuted hidden units and average into noise.
+- **"Averaging two fine-tunes gives you both skills."** Plain averaging works for soups of the same task;
+  for different skills, deltas that disagree in sign cancel, which is the interference TIES and DARE exist
+  to reduce.
+- **"TIES resolves conflicts, so no skill is lost."** It decides them: per parameter the sign with more
+  magnitude wins and dissenting entries are dropped, so the losing parent's skill pays wherever it
+  depended on those weights.
+- **"Giving each parent a full weight keeps more of each skill."** Weights summing well above one, or too
+  high a λ, push activations out of the range the base expects and produce degenerate, repetitive text.
+- **"No training means a low-risk change."** Nothing in a merge is trained, so nothing is verified:
+  tool-call formatting, the chat template and refusals can all erode silently. A merge needs the same
+  release gate as a trained model, including replayed agent tasks.
 
 ## Examples
 ### TIES merge over Hugging Face state dicts

@@ -5,7 +5,8 @@ name: Hugging Face (transformers, datasets, tokenizers, accelerate, PEFT, TRL)
 kind: tool
 difficulty: core
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/pytorch
@@ -38,6 +39,164 @@ the right template, and LoRA-tune a model on agent traces with PEFT and TRL, wit
   swapped per tenant.
 - **What you can skip.** Training tokenizers, writing Accelerate configs by hand for a first run, and
   serving traffic from `generate()`; export to an inference engine instead.
+
+## Lab
+### Task
+Build the label mask for LoRA SFT on agent traces: loss only on assistant turns (the tool call and the
+final answer, each with its end-of-turn token), never on the system tool section, user turns or tool
+results. Getting it wrong produces the Check-yourself model that writes the customer's next message.
+
+Time box: 60-90 minutes, offline.
+- **Prerequisites:** PyTorch, Tokenization, and this lesson's chat-template and TRL sections.
+- **Why offline:** a tiny byte-level BPE tokenizer and Jinja template stand in for
+  `AutoTokenizer.from_pretrained`, so nothing is downloaded. The same code works on a real Hub tokenizer.
+- **Checked against:** Python 3.12, `transformers` 5.20 and `tokenizers` 0.23; `apply_chat_template` with
+  `tools=` and `return_offsets_mapping` are stable in 4.4x releases too.
+
+### Starter code
+Save as `lab.py`. Replace the line marked `LAB` in `build_labels`; keep `render` as the single rendering
+path for training and serving.
+
+```python
+"""Lab: mask SFT loss to assistant tokens of a tool-calling trace (offline, no Hub download)."""
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+from transformers import PreTrainedTokenizerFast
+
+SPECIAL = ["<|system|>", "<|user|>", "<|assistant|>", "<|tool|>", "<|end|>"]
+TEMPLATE = (                                    # a tiny chat template with a tool section
+    "{% if tools %}<|system|>Tools: {{ tools | tojson }}<|end|>\n{% endif %}"
+    "{% for m in messages %}<|{{ m.role }}|>"
+    "{% if m.tool_calls %}<call>{{ m.tool_calls | tojson }}</call>{% else %}{{ m.content }}{% endif %}"
+    "<|end|>\n{% endfor %}{% if add_generation_prompt %}<|assistant|>{% endif %}"
+)
+TOOLS = [{"type": "function", "function": {"name": "get_order", "parameters": {
+    "type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"]}}}]
+TRACE = [                                       # one successful agent trace
+    {"role": "user", "content": "Where is order A-1042?"},
+    {"role": "assistant", "tool_calls": [{"type": "function", "function": {
+        "name": "get_order", "arguments": {"order_id": "A-1042"}}}]},
+    {"role": "tool", "content": '{"status": "shipped"}'},
+    {"role": "assistant", "content": "It shipped on Monday."},
+]
+
+
+def make_tokenizer() -> PreTrainedTokenizerFast:
+    """Stand-in for AutoTokenizer.from_pretrained(repo, revision=sha): byte-level BPE plus a template."""
+    raw = Tokenizer(models.BPE())
+    raw.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    raw.decoder = decoders.ByteLevel()
+    raw.train_from_iterator(["Where is order A-1042? It shipped on Monday.", str(TOOLS)],
+                            trainers.BpeTrainer(vocab_size=300, special_tokens=SPECIAL, show_progress=False,
+                                                initial_alphabet=pre_tokenizers.ByteLevel.alphabet()))
+    tok = PreTrainedTokenizerFast(tokenizer_object=raw, additional_special_tokens=SPECIAL)
+    tok.chat_template = TEMPLATE
+    return tok
+
+
+def render(tok, messages, tools, add_generation_prompt=False) -> str:
+    """The ONE function used for both training data and serving prompts."""
+    return tok.apply_chat_template(messages, tools=tools, tokenize=False,
+                                   add_generation_prompt=add_generation_prompt)
+
+
+def build_labels(tok, messages, tools) -> tuple[list[int], list[int]]:
+    """Return (input_ids, labels); labels are -100 everywhere except assistant turns."""
+    text = render(tok, messages, tools)
+    ids = tok(text, add_special_tokens=False).input_ids
+    labels = list(ids)                          # LAB: trains on every token, users and tools included
+    return ids, labels
+
+
+def trained_segments(tok, ids, labels) -> list[str]:
+    segs, cur = [], []
+    for i, lab in zip(ids, labels):
+        if lab == -100:
+            if cur:
+                segs.append(cur)
+            cur = []
+        else:
+            cur.append(i)
+    if cur:
+        segs.append(cur)
+    return [tok.decode(s) for s in segs]
+
+
+if __name__ == "__main__":
+    tok = make_tokenizer()
+    ids, labels = build_labels(tok, TRACE, TOOLS)
+    for n, seg in enumerate(trained_segments(tok, ids, labels), 1):
+        print(f"trained segment {n}: {seg!r}")
+```
+
+- **Hint, not the solution:** an assistant turn's characters start where
+  `render(messages[:i], add_generation_prompt=True)` ends. Map characters to tokens with
+  `return_offsets_mapping=True`.
+
+### Expected output
+The starter prints one segment holding the whole transcript. A correct mask prints exactly two:
+
+```
+trained segment 1: '<call>[{"type": "function", "function": {"name": "get_order", "arguments": {"order_id": "A-1042"}}}]</call><|end|>\n'
+trained segment 2: 'It shipped on Monday.<|end|>\n'
+```
+
+### Tests
+Save as `test_lab.py` and run `pytest -q`. On the starter, the masking and segment tests fail because the
+system tool section, the user turn and the tool result are all trained.
+
+```python
+import pytest
+from lab import TOOLS, TRACE, build_labels, make_tokenizer, render, trained_segments
+
+CALL = ('<call>[{"type": "function", "function": {"name": "get_order", '
+        '"arguments": {"order_id": "A-1042"}}}]</call><|end|>\n')
+
+
+@pytest.fixture(scope="module")
+def tok():
+    return make_tokenizer()
+
+
+def test_labels_align_with_ids(tok):
+    ids, labels = build_labels(tok, TRACE, TOOLS)
+    assert len(ids) == len(labels)
+    assert all(lab in (-100, i) for i, lab in zip(ids, labels))
+
+
+def test_prompt_and_tool_results_are_masked(tok):
+    trained = "".join(trained_segments(tok, *build_labels(tok, TRACE, TOOLS)))
+    for leaked in ("Tools:", "Where is order", '"status": "shipped"', "<|user|>", "<|tool|>"):
+        assert leaked not in trained
+
+
+def test_assistant_turns_trained_with_end_token(tok):
+    segs = trained_segments(tok, *build_labels(tok, TRACE, TOOLS))
+    assert segs == [CALL, "It shipped on Monday.<|end|>\n"]
+
+
+def test_serving_prompt_is_prefix_of_training_render(tok):
+    serve = render(tok, TRACE[:3], TOOLS, add_generation_prompt=True)
+    assert render(tok, TRACE, TOOLS).startswith(serve) and "get_order" in serve
+```
+
+### Failure scenarios
+- **End each assistant span before `<|end|>`.** Training still looks fine, but the tuned model never
+  learns to stop and rambles. Debug: decode the trained segments and check each ends with the
+  end-of-turn token.
+- **Render training data with `tools=None` but serve with tools.** The parity test still passes on this
+  trace, but tool-call accuracy drops after deployment. Debug: diff the training render of one trace
+  against the exact prompt the server builds, character by character.
+- **Compute spans with a hand-written role marker instead of the template.** Switching to a real model
+  shifts every span and masks the wrong tokens. Debug: assert each span's text equals the assistant
+  message as the template renders it.
+
+### Submission
+- **`lab.py` with `build_labels` implemented** and all four tests passing.
+- **The script's output** matching Expected output.
+- **One real-tokenizer run:** call `build_labels` with a pinned Hub instruct tokenizer whose template
+  supports tools, and paste the decoded trained segments.
+- **A short note** on how you would plug these labels into your TRL version (assistant-only loss option
+  or a custom collator), and how you would spot-check one batch for -100 positions.
 
 ## Why it exists
 - **A model is more than a weights file.** You also need matching architecture code, the config (layer

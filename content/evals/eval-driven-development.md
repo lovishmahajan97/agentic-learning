@@ -5,7 +5,8 @@ name: Eval-driven development
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -153,19 +154,26 @@ flowchart TD
     S -->|"sample traces"| G
 ```
 
+## Misconceptions
+- **"Evals are something you add once the agent works."** Items written after the build describe what
+  the system already does, so they pass by construction. Write criteria, budgets and seed tasks first;
+  then the suite is a spec the agent has to meet.
+- **"Temperature zero makes the gate deterministic, so assert 100%."** It reduces variance but does not
+  remove it, and variance compounds over agent steps. Gate with *k* samples per task, a tolerance band
+  sized from repeated baseline runs, and a list of regressed items.
+- **"A higher mean means the change is better."** A 0.81 to 0.83 lift is inside the noise at 200 items:
+  one run's SE is about 0.016 and a difference about 0.023. Count paired flips and run a sign test; 14 up
+  and 4 down gives p ≈ 0.03.
+- **"If task success went up, ship it."** Budgets and hard criteria are part of the spec. A planner
+  change that lifts success but writes once without confirmation, or adds steps past the budget, fails
+  the gate even with the better mean.
+- **"Tuning on the whole suite is fine, it is our own data."** Iterating against the items you inspect
+  overfits them like training on the test set. Keep a held-out slice and watch the dev versus held-out
+  gap.
+- **"An LLM judge in CI is as good as a test."** An uncalibrated judge can reward longer or more
+  confident outputs. Measure its agreement with human labels before it blocks a merge.
+
 ## Examples
-### One iteration, concretely
-Illustrative round: a user reports the assistant quotes the 30-day refund window to customers on the
-annual plan, whose window is 14 days.
-
-| Step | What happens |
-|---|---|
-| Reproduce as an eval | add six items for annual-plan refund questions; current system passes 1 of 6, so the bug is now a failing eval, not an anecdote |
-| One change | add plan tier to the retrieval filter |
-| Eval diff on the PR | six new items 1 → 6 passing; across the other 194 items, 3 improved, 2 regressed; mean 0.81 → 0.84; every slice still above its floor |
-| Review regressions | of the two regressed traces, one is noise (passes on re-run), one is a real loss on a question spanning both tiers |
-| Grow the suite | that cross-tier case becomes an item; the next iteration starts from there |
-
 ### One iteration on a tool-calling agent
 Illustrative: a support agent on 120 golden tasks, *k* = 3, comparing a planner-prompt change against the
 last accepted baseline.
@@ -203,6 +211,18 @@ def used_required_tools(calls, required):          # required comes from the gol
 def within_budget(calls, max_steps=8):
     return len(calls) <= max_steps
 ```
+
+### One iteration, concretely
+Illustrative round: a user reports the assistant quotes the 30-day refund window to customers on the
+annual plan, whose window is 14 days.
+
+| Step | What happens |
+|---|---|
+| Reproduce as an eval | add six items for annual-plan refund questions; current system passes 1 of 6, so the bug is now a failing eval, not an anecdote |
+| One change | add plan tier to the retrieval filter |
+| Eval diff on the PR | six new items 1 → 6 passing; across the other 194 items, 3 improved, 2 regressed; mean 0.81 → 0.84; every slice still above its floor |
+| Review regressions | of the two regressed traces, one is noise (passes on re-run), one is a real loss on a question spanning both tiers |
+| Grow the suite | that cross-tier case becomes an item; the next iteration starts from there |
 
 ### CI gate in pytest
 It runs each golden item *k* times, scores with a deterministic check and a calibrated judge, and fails

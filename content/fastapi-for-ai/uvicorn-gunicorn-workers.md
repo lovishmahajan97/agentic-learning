@@ -5,7 +5,8 @@ name: Uvicorn / Gunicorn workers
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/asgi-lifecycle
@@ -38,6 +39,136 @@ by memory, and keep agent state out of process.
   `--preload`, the HTTP pool size per worker, and where run state lives (a database or Redis, not a dict).
 - **What you can skip.** Gunicorn's other worker classes and the internals of the pre-fork model. Know the
   four flags in the table below and the memory formula.
+
+## Lab
+### Task
+Your agent service moved to a bigger reranker and its pods started dying under load, deploys cut runs
+off, and a sync PDF tool gets workers killed.
+
+Write a linter that reads a Gunicorn config the way
+Gunicorn does (its own defaults, your overrides) and checks it against the measured agent workload.
+Then fix the config until the linter is clean.
+
+Time box: 45-60 minutes.
+- **Prerequisites:** Async endpoints, Lifespan (load model / client once), and this lesson's flag table
+  and sizing steps.
+- **Setup:** Python 3.12 with `pip install gunicorn pytest` (checked on gunicorn 26.2; nothing is
+  started, so it runs on macOS, Linux or in CI). Save the starter as `lab_workers.py` and the tests as
+  `test_lab_workers.py`.
+- **Rule:** read every value through `effective(...)`, never hard-code a default you remember.
+
+### Starter code
+```python
+"""Lab: lint a Gunicorn config against the agent workload (checked on gunicorn 26.2, Python 3.12)."""
+from gunicorn.config import Config
+
+# Measured on staging (illustrative): bigger reranker, research-agent runs, one sync PDF tool.
+WORKLOAD = {
+    "pod_mib": 8192, "headroom_mib": 1638, "rss_mib": 2662,   # per-worker RSS including the model
+    "longest_request_s": 53.5,                                # 10 x 4 s model + 9 x 1.5 s tools
+    "longest_blocking_s": 40,                                 # sync PDF parse on the event loop
+    "uses_gpu": False,
+}
+
+BROKEN = {"workers": 4, "worker_class": "uvicorn.workers.UvicornWorker", "max_requests": 5000}
+
+FIXED = dict(BROKEN)   # LAB 2: change only what the linter needs, keeping as many workers as memory allows
+
+
+def effective(overrides: dict) -> Config:
+    """Gunicorn's own defaults with our overrides on top (timeout 30, graceful_timeout 30, ...)."""
+    cfg = Config()
+    for key, value in overrides.items():
+        cfg.set(key, value)
+    return cfg
+
+
+def lint(overrides: dict, workload: dict) -> list[str]:
+    """LAB 1: return problems as '<setting>: <why>' in this order, skipping those that do not apply:
+    workers (RSS x workers above pod_mib - headroom_mib; say 'max N'), graceful_timeout (below the
+    longest request), timeout (below the longest blocking call), max_requests (set without
+    max_requests_jitter), worker_class (deprecated uvicorn.workers path), preload_app (with a GPU)."""
+    cfg = effective(overrides)
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    cfg = effective({})
+    print("defaults:", cfg.workers, cfg.timeout, cfg.graceful_timeout, cfg.max_requests_jitter)
+    for problem in lint(BROKEN, WORKLOAD):
+        print(problem)
+    print("fixed:", lint(FIXED, WORKLOAD))
+```
+
+As given, it prints `defaults: 1 30 30 0` (straight from Gunicorn) and then raises
+`NotImplementedError`.
+
+### Expected output
+The setting names before each colon, their order, `max 2` and `fixed: []` are exact; the wording after
+the colon is yours.
+
+```
+defaults: 1 30 30 0
+workers: 4 x 2662 MiB = 10648 MiB exceeds the 6554 MiB budget, max 2
+graceful_timeout: 30 s is shorter than the longest request (53.5 s)
+timeout: 30 s is shorter than the longest blocking call (40 s)
+max_requests: 5000 without max_requests_jitter restarts workers together
+worker_class: uvicorn.workers is deprecated, use uvicorn_worker.UvicornWorker
+fixed: []
+```
+
+### Tests
+```python
+import lab_workers as lab
+
+
+def settings(problems):
+    return [p.split(":")[0] for p in problems]
+
+
+def test_broken_config_reports_each_problem_in_order():
+    problems = lab.lint(lab.BROKEN, lab.WORKLOAD)
+    assert settings(problems) == ["workers", "graceful_timeout", "timeout", "max_requests", "worker_class"]
+    assert "max 2" in problems[0]                      # (8192 - 1638) // 2662
+
+
+def test_defaults_come_from_gunicorn_not_from_memory():
+    assert settings(lab.lint({}, lab.WORKLOAD)) == ["graceful_timeout", "timeout"]
+
+
+def test_gpu_preload_is_flagged():
+    gpu = dict(lab.WORKLOAD, uses_gpu=True, longest_request_s=1, longest_blocking_s=0)
+    assert settings(lab.lint({"preload_app": True}, gpu)) == ["preload_app"]
+    assert lab.lint({"preload_app": True}, dict(gpu, uses_gpu=False)) == []
+
+
+def test_fixed_config_is_clean_and_keeps_two_workers():
+    assert lab.lint(lab.FIXED, lab.WORKLOAD) == []
+    assert lab.FIXED["workers"] == 2
+    assert lab.FIXED["max_requests"] == 5000          # keep the leak cure, add jitter
+```
+
+All four fail on the starter with `NotImplementedError`. The memory budget is 8192 − 1638 = 6554 MiB, so
+4 workers need 10,648 MiB and only 2 fit (5,324 MiB).
+
+### Failure scenarios
+- **Inject: compare `cfg.worker_class` instead of `cfg.worker_class_str`.** Observe: the import of the
+  Gunicorn imports the class, so the check never matches a string, or `RuntimeError` is raised when the
+  `uvicorn-worker` package is not installed. Debug: print both attributes; the `_str` form is the
+  configured dotted path.
+- **Inject: pass the fixed config to a real `gunicorn` with `--timeout 60` but keep the PDF parse on the
+  loop.** Observe: no more worker kills, yet every agent run on that worker stalls for 40 s. Debug: log
+  event-loop lag; the real fix is `run_in_threadpool` or a process pool, then lower `timeout` again.
+- **Inject: keep run state in a module-level dict with `workers: 2`.** Observe: "approve tool call" for a
+  run started on the other worker returns 404 roughly half the time. Debug: log `os.getpid()` per request;
+  move run state to Redis or the database.
+
+### Submission
+- `lab_workers.py` with `lint` and `FIXED`, and a `pytest -q` run showing 4 passed.
+- Your output of `python lab_workers.py`.
+- The equivalent `gunicorn.conf.py` (or command line) for `FIXED`, as you would put in the Dockerfile.
+- A short note: which problem the linter cannot fix (the blocking tool) and what you would change in
+  the code instead.
 
 ## Why it exists
 - **FastAPI is a framework, not a server.** Something must open the socket, parse HTTP, speak ASGI to your

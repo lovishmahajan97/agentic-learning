@@ -5,7 +5,8 @@ name: RBAC
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/authentication-vs-authorization
@@ -40,6 +41,156 @@ can never do more than its user.
   which permissions the agent's own identity holds for background work.
 - **What you can skip.** The full NIST model taxonomy and policy-language details. Know users, roles,
   permissions, scope, default deny, and when to add ReBAC for per-document sharing.
+
+## Lab
+### Task
+A first draft of the permission guard in front of an agent's document tools passed review because the
+happy path works. You fix it so the agent can never do more than its user, its own deployment's
+allowlist, a guardrail deny or a missing approval allows, and every decision lands in an audit log.
+- **Agent goal:** `call_tool` is the only door between a model-proposed tool call and the documents;
+  the model's arguments are untrusted input, including the `project` it claims a document is in.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** authentication vs authorization, and this lesson's scope, explicit-deny and
+  "Authorizing an agent's tool calls" sections.
+- **Needs:** Python 3.10+ and `pytest`; checked with Python 3.12 and pytest 9.1.1. No other packages.
+
+### Starter code
+```python
+# rbac_lab.py: fix the permission guard in front of an agent's document tools
+PERMS = {"viewer": {"documents:read"}, "editor": {"documents:write"},
+         "admin": {"documents:delete", "members:manage"}}
+INHERITS = {"admin": "editor", "editor": "viewer"}              # senior -> junior
+PARENT = {"project:42": "org:acme", "project:7": "org:acme", "project:legal": "org:acme"}
+ASSIGNMENTS = {("alice", "org:acme"): {"viewer"}, ("alice", "project:42"): {"editor"},
+               ("root", "org:acme"): {"admin"}}
+DENY = {("documents:delete", "project:legal")}                  # guardrail: beats any allow, at or below
+DOC_SCOPE = {101: "project:42", 202: "project:7", 303: "project:legal"}   # stored owner of each doc
+TOOLS = {"read_doc": ("documents:read", False), "edit_doc": ("documents:write", False),
+         "delete_doc": ("documents:delete", True)}               # tool -> (permission, needs approval)
+AGENTS = {"support": {"documents:read", "documents:write"},      # agent deployment -> allowlist
+          "ops": {"documents:read", "documents:write", "documents:delete"}}
+AUDIT: list = []
+
+def permissions_of(role: str) -> set:
+    out = set()
+    while role:
+        out |= PERMS[role]; role = INHERITS.get(role, "")
+    return out
+
+# YOUR CODE: the two functions below are the insecure first draft. Fix them (see the tests).
+def allowed(subject: str, perm: str, scope: str) -> bool:
+    return any(perm in permissions_of(r) for r in ASSIGNMENTS.get((subject, scope), ()))
+
+def call_tool(agent: str, user: str, tool: str, args: dict, approved: bool = False) -> dict:
+    """args come from the model, e.g. {"doc_id": 202, "project": "project:42"}."""
+    perm, _ = TOOLS[tool]
+    if not allowed(user, perm, args.get("project", "")):
+        return {"error": "forbidden"}
+    return {"ok": True, "tool": tool, "doc": args["doc_id"]}
+
+if __name__ == "__main__":
+    cases = [("support", "alice", "edit_doc", {"doc_id": 101, "project": "project:42"}, False),
+             ("support", "alice", "read_doc", {"doc_id": 202, "project": "project:7"}, False),
+             ("support", "alice", "edit_doc", {"doc_id": 202, "project": "project:42"}, False),
+             ("support", "root", "delete_doc", {"doc_id": 101, "project": "project:42"}, True),
+             ("ops", "root", "delete_doc", {"doc_id": 101, "project": "project:42"}, False),
+             ("ops", "root", "delete_doc", {"doc_id": 101, "project": "project:42"}, True),
+             ("ops", "root", "delete_doc", {"doc_id": 303, "project": "project:legal"}, True)]
+    for agent, user, tool, args, ok in cases:
+        r = call_tool(agent, user, tool, args, approved=ok)
+        print(f"{agent:7} {user:5} {tool:10} doc {args['doc_id']}: {r.get('error', 'ok')}")
+    print("audit rows:", len(AUDIT))
+```
+
+As given, Alice cannot read project 7 although she is an org viewer, a model that claims doc 202 is
+in project 42 gets it edited, every admin delete is refused for the wrong reason, and nothing is
+audited.
+
+### Expected output
+```
+support alice edit_doc   doc 101: ok
+support alice read_doc   doc 202: ok
+support alice edit_doc   doc 202: forbidden
+support root  delete_doc doc 101: forbidden
+ops     root  delete_doc doc 101: approval_required
+ops     root  delete_doc doc 101: ok
+ops     root  delete_doc doc 303: forbidden
+audit rows: 7
+```
+
+### Tests
+```python
+# test_rbac_lab.py: run with `pytest -q`
+import pytest
+import rbac_lab as lab
+from rbac_lab import allowed, call_tool
+
+@pytest.fixture(autouse=True)
+def fresh_audit():
+    lab.AUDIT.clear()
+
+def test_roles_at_an_ancestor_scope_apply():
+    assert allowed("alice", "documents:read", "project:7")          # viewer at the org
+    assert allowed("root", "documents:delete", "project:42")        # admin at the org
+    assert not allowed("alice", "documents:write", "project:7")
+
+def test_explicit_deny_beats_inherited_admin():
+    assert not allowed("root", "documents:delete", "project:legal")
+    assert allowed("root", "documents:write", "project:legal")      # deny is per permission
+
+def test_scope_comes_from_the_stored_doc_not_the_model():
+    r = call_tool("support", "alice", "edit_doc", {"doc_id": 202, "project": "project:42"})
+    assert r == {"error": "forbidden"}                              # doc 202 lives in project 7
+    assert call_tool("support", "alice", "edit_doc", {"doc_id": 101})["ok"]
+    assert call_tool("support", "alice", "read_doc", {"doc_id": 999}) == {"error": "forbidden"}
+
+def test_agent_allowlist_caps_an_admin_user():
+    r = call_tool("support", "root", "delete_doc", {"doc_id": 101}, approved=True)
+    assert r == {"error": "forbidden"}
+
+def test_destructive_tools_need_approval():
+    assert call_tool("ops", "root", "delete_doc", {"doc_id": 101}) == {"error": "approval_required"}
+    assert call_tool("ops", "root", "delete_doc", {"doc_id": 101}, approved=True)["ok"]
+    assert call_tool("ops", "root", "delete_doc", {"doc_id": 303}, approved=True) == {"error": "forbidden"}
+
+def test_every_decision_is_audited():
+    call_tool("support", "alice", "edit_doc", {"doc_id": 101})
+    call_tool("support", "alice", "edit_doc", {"doc_id": 202})
+    call_tool("ops", "root", "delete_doc", {"doc_id": 101})
+    assert [row["decision"] for row in lab.AUDIT] == ["ok", "forbidden", "approval_required"]
+    row = lab.AUDIT[1]
+    assert (row["agent"], row["user"], row["tool"], row["permission"], row["scope"]) == \
+           ("support", "alice", "edit_doc", "documents:write", "project:7")
+
+def test_alice_keeps_her_legitimate_access():
+    assert call_tool("support", "alice", "edit_doc", {"doc_id": 101, "project": "project:42"})["ok"]
+```
+
+Five fail on the starter with `AssertionError`. Two pass already and are guards: the allowlist test
+passes only because the draft never walks up to root's org-level admin, so it fails the moment you fix
+inheritance without adding the allowlist, and Alice's own edit must stay allowed.
+
+### Failure scenarios
+- **Inject the DENY check after the allow walk** (return `True` on the first granting role). Doc 303
+  is deleted by `ops`. Debug by printing, per scope in the chain, which deny and which role matched;
+  deny must be evaluated over the whole chain before any allow.
+- **Inject `scope = args.get("project") or DOC_SCOPE[...]`.** The stored-scope test fails: the model
+  chose the scope, which is the insecure direct object reference from the Examples. Grep the guard for
+  any read of model arguments other than the resource id.
+- **Inject: remove the allowlist check from `call_tool`,** as if it lived only where the tool list is
+  built. The allowlist test fails: the support agent deletes doc 101 for root when the model names
+  `delete_doc` from an old turn. Test call-time checks with tool names the model was never offered.
+- **Inject an audit write only on success.** The audit test sees one row instead of three; denials,
+  the rows that reveal an injection attempt, are exactly what is missing.
+
+### Submission
+- **Your `rbac_lab.py`** with fixed `allowed` and `call_tool` and the data tables unchanged.
+- **A `pytest -q` run** showing 7 passed.
+- **The script's printed output**, matching the expected lines.
+- **A note of 3-5 sentences:** which control stops each refused call in the expected output, and the
+  order your guard evaluates them in.
+- **Evaluated on:** green tests, deny before allow, scope only from `DOC_SCOPE`, effective permission
+  as user roles intersected with the agent allowlist, and one audit row per decision.
 
 ## Why it exists
 - **Every request after login asks "may they do this".** Authentication answers "who is calling". The

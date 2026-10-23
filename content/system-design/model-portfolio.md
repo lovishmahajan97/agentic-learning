@@ -5,7 +5,8 @@ name: Model portfolio
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/model-selection
@@ -37,6 +38,65 @@ routing here cuts the bill most.
   check), when to route per step, and the eval baselines that must pass before a rotation.
 - **What you can skip.** Org-wide procurement and vendor negotiation detail. Know the tiers, the
   registry record, the entry and exit rules and the concentration metrics.
+
+## Decision case
+### Scenario
+A B2B software company runs four products with LLM features, two of them agents. Teams chose their own
+models: nine models across five providers, vendor IDs hard-coded in code. A deprecation notice was
+found only through billing, and three teams depended on that model. All figures are illustrative.
+- **Spend:** 600,000 units a month; agent workloads are 70% of it (420,000), everything else 180,000.
+- **Concentration:** 40% of requests land on frontier models.
+- **Target:** cut spend by at least 40%, to 360,000 or less, within two quarters.
+- **Governance:** customer PII may only reach models approved for that data class.
+- **Constraints:** a platform team of four; each new provider needs a security review of roughly six
+  weeks.
+
+Assume cheaper tiers save 60% on the easy non-agent families, and that about 60% of agent calls are
+routine steps (summarising tool results, formatting) that a workhorse at one tenth of the frontier
+price handles at the same step-level eval score, with the same tokens per call.
+
+### Options
+| Option | How it works | Monthly spend | Saving | Governance | Platform effort |
+|---|---|---|---|---|---|
+| **A. Keep team choice, add a spend report** | billing dashboards per team and provider | about 600,000 | about 0% | unchanged: no data-class check | low |
+| **B. Tiered portfolio, assignment only** | four tiers on two providers behind logical names; easy families move down a tier | 600,000 − 108,000 = 492,000 | 18% | registry with approved data classes, checked at the gateway | gateway, registry, migrations of nine models |
+| **C. B plus step-level routing in the agents** | agent steps tagged by type; routine types go to the workhorse after a step eval | 492,000 − 226,800 = 265,200 | about 56% | as B | B plus step tagging and step-level evals |
+
+C's agent line: 420,000 × (0.4 + 0.6 × 0.1) = 193,200, a saving of 226,800.
+
+### Decision
+**Choose C, sequenced.** Quarter one builds B: logical names enforced at the gateway, a registry entry
+per model with data classes and a fallback, and nine models cut to six (four tiers plus a second source
+for the frontier and workhorse tiers). Quarter two adds step-type routing to the two agents, one step
+type at a time.
+
+- **Why not B alone:** the 18% saving misses the 40% target, because 70% of spend sits in agent runs
+  that assignment leaves on the frontier.
+- **Why not A:** it neither saves nor closes the PII gap, and the next deprecation is found by billing
+  again.
+- **Why C clears the target with room:** about 56% leaves margin if fewer steps prove routable. The
+  target still holds if the agent line falls by only 132,000 (492,000 − 360,000).
+
+**What would change it.** If step-level evals show routing hurts run success more than the saving is
+worth, the agents keep one model each and the target moves to prefix caching and output caps. A
+residency requirement that only a third provider meets justifies a new entry under the entry rule.
+
+### Trade-offs accepted
+- **Slower experimentation.** Unregistered models are limited to a sandbox with its own budget cap;
+  registration requests and their time to approval are tracked.
+- **Hand-offs inside agent runs.** Each routed step is a new failure point; run success and spend per
+  step type are on the monthly report.
+- **Migration work now.** Moving nine models behind logical names costs most of quarter one; requests
+  that bypass the gateway are found from direct vendor keys in billing.
+- **Two providers.** Fewer reviews and contracts, less diversity; spend share per provider is in the
+  concentration report.
+
+### Review rubric
+- Breaks spend down by workload before proposing tiers, and finds where most of the money goes.
+- Computes the saving of each option against the stated target with reproducible arithmetic.
+- Puts data-class approval and logical names in the gateway, not in team conventions.
+- States entry and exit rules and the final size of the set, with second sources for critical tiers.
+- Names the concentration metrics and the step-level eval that gate routing.
 
 ## Why it exists
 - **Failure mode 1: one model for everything.** The frontier model classifies support intents at

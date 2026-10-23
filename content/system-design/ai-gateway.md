@@ -5,7 +5,8 @@ name: AI gateway (LiteLLM proxy, Portkey)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - python-for-ai/litellm
@@ -38,6 +39,69 @@ for an extra hop and a new single point of failure.
   streaming pass through intact.
 - **What you can skip.** Operating the gateway itself if a platform team owns it. You still need per-run
   step and cost caps in the agent, because gateway budgets are per key, not per task.
+
+## Decision case
+### Scenario
+A payments company has five teams shipping agents (support, disputes, onboarding, internal research
+and a coding assistant) across three model providers. Every service holds raw provider keys and the
+same retry code. Figures are illustrative.
+- **The incident that started this:** last month a research-agent bug looped 12 runs. Each step sent
+  about 40k input tokens at $3 per 1M ($0.12), at 5 steps a minute per run: 12 × 5 × $0.12 = $7.20 a
+  minute. The shared $300 daily budget was gone in about 42 minutes, which blocked support and disputes
+  too.
+- **Requirements:** finance wants spend per team and per agent monthly; security wants keys out of
+  application code and a way to revoke one caller in minutes; agents need tool calls and streaming to
+  pass through unchanged.
+- **Constraints:** prompts contain card-holder and dispute data, so any new processor needs a
+  data-processing agreement, which takes about a quarter here. Two platform engineers already run
+  Postgres and Redis on the company's Kubernetes clusters. The deliverable is due in 6 weeks.
+- **Scale:** a gateway would run 3 replicas, and the busiest key's provider quota is 500 requests a
+  minute.
+
+### Options
+| Option | How it works | Isolation and attribution | Data path | Operations and deadline |
+|---|---|---|---|---|
+| A. Shared client library | One retry and key module imported by every service | None enforced; keys stay in every service | Unchanged | Cheap, but teams pin old versions |
+| B. In-process LiteLLM `Router` | Routing and fallbacks inside each service | Budgets per process; no central revocation | Unchanged | No new hop; keys still everywhere |
+| C. Self-hosted LiteLLM proxy | Two or more replicas per region; Postgres for keys and budgets, Redis for counters | Virtual key per agent with budget and RPM/TPM; tags per run and step | Prompts stay in the network | Fits the team's existing stack and 6 weeks |
+| D. Hosted Portkey | Managed gateway with declarative configs | Strong; dashboards on day one | A new third-party processor | DPA takes a quarter, so it misses the deadline |
+
+### Decision
+Choose **C**.
+- **Isolation and revocation:** a virtual key per agent turns the next loop into one agent's outage.
+- **Run caps:** add per-run caps of 30 steps in each agent loop, which bound that bug's worst case at
+  12 × 30 × $0.12 = $43.20.
+- **Data path:** prompts never leave the network, so no new processor agreement is needed.
+- **Operations:** the platform team already runs Postgres and Redis, so the deadline holds.
+- **Shared counters:** with 3 replicas and in-process counters, a 500-per-minute limit would really be
+  1,500; Redis-backed counters keep the configured limit real.
+- **Budget checks fail open** with reconciliation for internal keys, so a Postgres restart does not take
+  every AI feature down.
+- **Why not A or B:** neither can revoke a key centrally or enforce an organisation-wide limit.
+- **Why not D:** it is blocked only by the processor agreement.
+
+**What would change it:** if the platform team cannot staff on-call for the proxy, take Portkey's
+open-source gateway deployed in the company's own environment, or start the agreement now and move to
+hosted Portkey next quarter. If only one team used models, B would be lighter.
+
+### Trade-offs accepted
+- **An extra hop on every agent step.** Measure p50 and p99 added latency and time-to-first-token
+  through the proxy in CI against a direct call.
+- **A new shared failure point.** Run at least two replicas per region with readiness checks; alert on
+  gateway availability separately from provider errors.
+- **Lagging provider features.** Replay the agents' tool-calling eval through the gateway on every
+  upgrade and pin the version that passed.
+- **Prompt logs become sensitive data.** Set retention and redaction before the first team migrates.
+
+### Review rubric
+- Quantifies the failure that motivates the gateway (burn rate, blast radius) and shows how the design
+  bounds it.
+- Separates what the gateway enforces (keys, budgets, limits) from what the agent must still enforce
+  (per-run step and token caps).
+- Lets the data path and processor approval decide between hosted and self-hosted.
+- States the failure mode when the gateway's database is down and justifies it.
+- Explains how rate-limit counters stay correct across replicas.
+- Lists the checks that prove tool calls and streaming pass through intact.
 
 ## Why it exists
 - **Without one, every team re-implements the same plumbing.** The second team copies the first team's

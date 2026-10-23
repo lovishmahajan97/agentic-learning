@@ -5,7 +5,8 @@ name: pydantic-settings
 kind: tool
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/pydantic
@@ -36,6 +37,169 @@ mid-run failures into deploy-time crashes.
 - **What you can skip.** Writing custom sources. The four default sources (init kwargs, env vars, dotenv,
   secret files) cover most deployments, and the package ships optional ones (YAML, TOML, JSON files and
   cloud secret stores) you enable in `settings_customise_sources`.
+
+## Lab
+### Task
+Finish the `Settings` class for a two-tool agent so a bad deploy fails before any model call: nested
+per-tool overrides from env vars, a bounded step budget, a masked key, a trace-safe config dump, and one
+report of every bad field. Time box: 60 minutes.
+- **Prerequisites:** pydantic and python-dotenv, plus pytest (the tests use `monkeypatch`).
+- **Rule:** make every test pass without editing the test file.
+
+### Starter code
+```python
+# agent_settings.py  (checked with pydantic 2.13.5, pydantic-settings 2.11.0, Python 3.9+)
+import os
+from typing import Literal
+
+from pydantic import BaseModel, Field, ValidationError
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ToolConfig(BaseModel):
+    enabled: bool = True
+    timeout_s: float = Field(10.0, gt=0)
+
+
+class Settings(BaseSettings):
+    # FILL IN 1: let APP_SEARCH__TIMEOUT_S set one nested field, and ignore foreign keys in a shared .env
+    model_config = SettingsConfigDict(env_prefix="APP_", env_file=".env")
+    env: Literal["dev", "staging", "prod"] = "dev"
+    model: str = "gpt-4o-mini"
+    max_steps: int = 8               # FILL IN 2: the agent loop budget must be 1..50
+    openai_api_key: str              # FILL IN 3: must never appear in repr, str, logs or traces
+    search: ToolConfig = ToolConfig()
+    code_exec: ToolConfig = ToolConfig(enabled=False, timeout_s=30.0)
+
+
+def enabled_tools(s: Settings) -> list:
+    # FILL IN 4: sorted names of the ToolConfig fields whose enabled is True
+    raise NotImplementedError
+
+
+def public_config(s: Settings) -> dict:
+    # FILL IN 5: a JSON-safe dict for a trace or startup log, with every secret field left out
+    raise NotImplementedError
+
+
+def config_errors() -> list:
+    # FILL IN 6: build Settings(_env_file=None) from the current environment; return [] when valid,
+    # else the sorted dotted locations of EVERY bad field, e.g. ["max_steps", "search.timeout_s"]
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    os.environ.update({"APP_OPENAI_API_KEY": "sk-demo", "APP_MAX_STEPS": "4",
+                       "APP_SEARCH__TIMEOUT_S": "5", "APP_CODE_EXEC__ENABLED": "true"})
+    s = Settings(_env_file=None)
+    print("max_steps:", s.max_steps)
+    print("search timeout:", s.search.timeout_s)
+    print("tools:", enabled_tools(s))
+    print("key shown as:", s.openai_api_key)
+    print("public:", public_config(s))
+    os.environ.update({"APP_MAX_STEPS": "0", "APP_SEARCH__TIMEOUT_S": "ten"})
+    print("errors:", config_errors())
+```
+
+### Expected output
+```text
+max_steps: 4
+search timeout: 5.0
+tools: ['code_exec', 'search']
+key shown as: **********
+public: {'env': 'dev', 'model': 'gpt-4o-mini', 'max_steps': 4, 'search': {'enabled': True, 'timeout_s': 5.0}, 'code_exec': {'enabled': True, 'timeout_s': 10.0}}
+errors: ['max_steps', 'search.timeout_s']
+```
+Note `code_exec` shows `10.0`, not `30.0`: once any `APP_CODE_EXEC__` variable is set, the nested model
+is rebuilt from the env dict, so unset fields fall back to `ToolConfig`'s class defaults, not the parent's
+default instance.
+
+### Tests
+```python
+# test_agent_settings.py  (run: pytest -q)
+import os
+
+import pytest
+from pydantic import ValidationError
+
+from agent_settings import Settings, config_errors, enabled_tools, public_config
+
+
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch):
+    for k in list(os.environ):
+        if k.startswith("APP_"):
+            monkeypatch.delenv(k)
+    monkeypatch.setenv("APP_OPENAI_API_KEY", "sk-test")
+
+
+def test_nested_override_keeps_other_defaults(monkeypatch):
+    monkeypatch.setenv("APP_SEARCH__TIMEOUT_S", "5")
+    s = Settings(_env_file=None)
+    assert s.search.timeout_s == 5.0 and s.search.enabled is True
+
+
+def test_false_string_disables_tool(monkeypatch):
+    monkeypatch.setenv("APP_SEARCH__ENABLED", "false")
+    assert enabled_tools(Settings(_env_file=None)) == []
+
+
+def test_enabled_tools_sorted(monkeypatch):
+    monkeypatch.setenv("APP_CODE_EXEC__ENABLED", "1")
+    assert enabled_tools(Settings(_env_file=None)) == ["code_exec", "search"]
+
+
+@pytest.mark.parametrize("steps", [0, 51])
+def test_max_steps_bounds(steps):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_steps=steps)
+
+
+def test_key_is_masked():
+    s = Settings(_env_file=None)
+    assert "sk-test" not in repr(s) and "sk-test" not in str(s)
+    assert s.openai_api_key.get_secret_value() == "sk-test"
+
+
+def test_public_config_has_no_secret():
+    d = public_config(Settings(_env_file=None))
+    assert "openai_api_key" not in d and "sk-test" not in str(d)
+    assert d["search"] == {"enabled": True, "timeout_s": 10.0}
+
+
+def test_all_errors_at_once(monkeypatch):
+    assert config_errors() == []
+    monkeypatch.setenv("APP_MAX_STEPS", "0")
+    monkeypatch.setenv("APP_SEARCH__TIMEOUT_S", "ten")
+    assert config_errors() == ["max_steps", "search.timeout_s"]
+
+
+def test_shared_dotenv_with_foreign_keys(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("APP_MODEL=gpt-4o\nAPP_TRACING_HOST=http://localhost:3000\n")
+    assert Settings(_env_file=env).model == "gpt-4o"
+```
+On the starter all 9 fail for the right reasons: the nested override is ignored (assertion), `max_steps=0`
+does not raise, the key is visible in `repr`, the foreign `.env` key is forbidden, and the helpers raise
+`NotImplementedError`.
+
+### Failure scenarios
+- **Inject removing `env_nested_delimiter`.** `APP_SEARCH__TIMEOUT_S` is silently ignored and the search
+  tool keeps `10.0`. Debug by printing `s.search` right after startup and grepping the env for `__`.
+- **Inject `extra` back to its default.** Only the dotenv test fails, with "Extra inputs are not
+  permitted" for `app_tracing_host`; env vars never trigger it, which is why it surprises people.
+- **Inject `public_config` as `s.model_dump()`.** The key appears as a `SecretStr` object today and as
+  plaintext the day someone adds `.get_secret_value()` to "fix" serialization. Grep a trace export for
+  `sk-` to prove it is clean.
+- **Inject returning only `e.errors()[0]`.** The operator fixes one field per redeploy. Count the
+  errors in the startup log against the number of bad variables.
+
+### Submission
+- **Code:** `agent_settings.py` plus the unchanged test file.
+- **Test run:** `pytest -q` showing 9 passed, with the `pydantic-settings` version you ran.
+- **Output:** the six demo lines, matching Expected output, with a sentence explaining the `10.0`.
+- **Startup log:** one line produced from `public_config` that you would attach to an agent trace.
+- **Evaluation:** no test edits, no `os.environ` reads outside `Settings`, and no secret in any printed line.
 
 ## Why it exists
 - **Everything is a string.** With `os.environ.get` scattered through the code, `TIMEOUT="30"` must be

@@ -5,7 +5,8 @@ name: FastAPI
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/asgi-lifecycle
@@ -39,6 +40,217 @@ contracts, SSE streaming of steps, and DI for shared clients. Sharp edge: one bl
   durable job queue).
 - **What you can skip.** ASGI protocol internals and Starlette's routing code. Know the request path, the
   `def` versus `async def` rule and the threadpool cap.
+
+## Lab
+### Task
+Harden an agent-run endpoint that streams steps over SSE. The starter accepts any budget, builds its
+model client inline so tests cannot swap it, lets one failing tool kill the stream, and ends a looping
+run with no final event.
+
+Fix all four so the endpoint is bounded, injectable and honest about how a run ended. Time box: 45-75
+minutes.
+- **Prerequisites:** the Python lesson's lab, then this lesson's sections on Pydantic contracts,
+  dependency injection and lifespan, and Serving an agent run.
+- **Setup:** Python 3.12 with `pip install fastapi httpx pytest` (checked on FastAPI 0.161,
+  Starlette 1.9, Pydantic 2.14). Save the starter as `lab_agent_api.py` and the tests as
+  `test_lab_agent_api.py`. No model server is needed: the planners are local fakes.
+- **Done:** `python lab_agent_api.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: a budgeted, testable agent-run endpoint (checked on FastAPI 0.161, Starlette 1.9, Python 3.12)."""
+import json
+from contextlib import asynccontextmanager
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+
+class ScriptedPlanner:
+    """Stand-in for a model client: two tool calls, then a final answer."""
+    async def next_action(self, task: str, step: int) -> dict:
+        if step < 2:
+            return {"tool": "search_docs", "args": {"query": task}}
+        return {"final": "Refunds take 5 days."}
+
+
+class LoopingPlanner:
+    """A model stuck in a loop: it never returns a final answer."""
+    async def next_action(self, task: str, step: int) -> dict:
+        return {"tool": "search_docs", "args": {"query": task}}
+
+
+async def search_docs(query: str) -> str:
+    return f"3 docs for {query!r}"
+
+
+async def lookup_order(order_id: str) -> str:
+    raise TimeoutError("order service timed out")
+
+
+TOOLS = {"search_docs": search_docs, "lookup_order": lookup_order}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.planner = ScriptedPlanner()        # one shared model client per process
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+def get_planner(request: Request):
+    return request.app.state.planner
+
+
+# LAB 1: bound the contract: task 1-8000 chars, max_steps 1-20 (default 8). Out of range -> 422.
+class RunRequest(BaseModel):
+    task: str
+    max_steps: int = 8
+
+
+def sse(event: dict) -> str:
+    return f"data: {json.dumps(event)}\n\n"
+
+
+@app.post("/v1/agent/runs")
+async def run_agent(body: RunRequest):
+    planner = ScriptedPlanner()                  # LAB 2: inject it with Depends(get_planner)
+    async def events():
+        for step in range(body.max_steps):
+            action = await planner.next_action(body.task, step)
+            if "final" in action:
+                yield sse({"type": "final", "text": action["final"]})
+                break
+            yield sse({"type": "tool_call", "step": step, **action})
+            # LAB 3: an unknown tool or a tool exception becomes a tool_result with "error"
+            #        ("unknown tool <name>" or "<ExcType>: <message>") and the run continues.
+            result = await TOOLS[action["tool"]](**action["args"])
+            yield sse({"type": "tool_result", "step": step, "content": result})
+        # LAB 4: when the steps run out without a final answer, yield
+        #        {"type": "final", "reason": "budget_exhausted"} before [DONE].
+        yield "data: [DONE]\n\n"
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
+def summary(text: str) -> str:
+    out = []
+    for line in text.splitlines():
+        if line.startswith("data: "):
+            data = line[len("data: "):]
+            e = {"type": data} if data == "[DONE]" else json.loads(data)
+            out.append(e["type"] + (f"({e['reason']})" if "reason" in e else ""))
+    return " ".join(out)
+
+
+if __name__ == "__main__":
+    with TestClient(app) as c:                   # the with-block runs lifespan
+        r = c.post("/v1/agent/runs", json={"task": "refund policy", "max_steps": 50})
+        print("max_steps=50 ->", r.status_code)
+        print("scripted:", summary(c.post("/v1/agent/runs", json={"task": "refund policy"}).text))
+        app.dependency_overrides[get_planner] = LoopingPlanner
+        r = c.post("/v1/agent/runs", json={"task": "refund policy", "max_steps": 3})
+        print("looping, max_steps=3:", summary(r.text))
+        app.dependency_overrides.clear()
+```
+
+As given, it prints `max_steps=50 -> 200`, and the looping run looks exactly like the scripted one,
+because the override never reaches a client built inside the handler.
+
+### Expected output
+```
+max_steps=50 -> 422
+scripted: tool_call tool_result tool_call tool_result final [DONE]
+looping, max_steps=3: tool_call tool_result tool_call tool_result tool_call tool_result final(budget_exhausted) [DONE]
+```
+
+Starlette 1.9 may also print a `StarletteDeprecationWarning` about `httpx` in the test client; it does
+not change the results.
+
+### Tests
+```python
+import json
+import pytest
+from fastapi.testclient import TestClient
+import lab_agent_api as lab
+
+URL = "/v1/agent/runs"
+
+
+class FailingToolPlanner:
+    async def next_action(self, task, step):
+        return [{"tool": "get_weather", "args": {"city": "Pune"}},
+                {"tool": "lookup_order", "args": {"order_id": "o1"}},
+                {"final": "Sorry, I could not check that."}][step]
+
+
+@pytest.fixture
+def client():
+    with TestClient(lab.app) as c:
+        yield c
+    lab.app.dependency_overrides.clear()
+
+
+def events(text):
+    return [json.loads(l[6:]) for l in text.splitlines() if l.startswith("data: {")]
+
+
+@pytest.mark.parametrize("body", [{"task": "x", "max_steps": 50}, {"task": "x", "max_steps": 0},
+                                  {"task": ""}, {"task": "x" * 8001}])
+def test_budget_and_task_bounds_return_422(client, body):
+    assert client.post(URL, json=body).status_code == 422
+
+
+def test_scripted_run_still_answers(client):
+    r = client.post(URL, json={"task": "refund policy"})
+    assert lab.summary(r.text) == "tool_call tool_result tool_call tool_result final [DONE]"
+
+
+def test_injected_planner_hits_the_budget(client):
+    lab.app.dependency_overrides[lab.get_planner] = lab.LoopingPlanner
+    r = client.post(URL, json={"task": "refund policy", "max_steps": 3})
+    assert lab.summary(r.text) == ("tool_call tool_result " * 3 + "final(budget_exhausted) [DONE]")
+
+
+def test_tool_failures_are_reported_and_the_run_continues(client):
+    lab.app.dependency_overrides[lab.get_planner] = FailingToolPlanner
+    ev = events(client.post(URL, json={"task": "where is my order"}).text)
+    results = [e for e in ev if e["type"] == "tool_result"]
+    assert [e.get("error") for e in results] == ["unknown tool get_weather",
+                                                 "TimeoutError: order service timed out"]
+    assert ev[-1] == {"type": "final", "text": "Sorry, I could not check that."}
+```
+
+On the starter, six of seven fail: the four bound cases get 200, the looping run ends with a plain
+`final`, and the failing-tool run never reaches `FailingToolPlanner` (once you inject the planner, it
+raises `KeyError` until LAB 3 is done). The scripted test passes and guards the happy path.
+
+### Failure scenarios
+- **Inject: override `lab.ScriptedPlanner` instead of `lab.get_planner`.** Observe: the looping test
+  sees the scripted run again. Debug: `dependency_overrides` is keyed by the exact callable passed to
+  `Depends`; print the keys and compare them with the handler signature.
+- **Inject: build the client as `TestClient(lab.app)` without the `with` block.** Observe:
+  `AttributeError: 'State' object has no attribute 'planner'`. Debug: lifespan only runs inside the
+  context manager, so anything built in `lifespan` is missing.
+- **Inject: drop `dependency_overrides.clear()` from the fixture.** Observe: tests pass alone and fail
+  in a different order, because an override leaks into the next test. Debug: run the failing test by
+  itself with `pytest -k`, then dump `app.dependency_overrides` at the start of each test.
+- **Inject: let a tool exception propagate.** Observe: the client gets a 200 with a truncated stream
+  and no `[DONE]`; the status was sent with the first event. Debug: errors after streaming starts must
+  travel as events, not as HTTP status codes.
+
+### Submission
+- **Code:** your `lab_agent_api.py` with LAB 1-4 done and the planner reaching the handler only through
+  `Depends(get_planner)`.
+- **Test run:** `pytest -q` showing 7 passed, plus the script output matching Expected output.
+- **A captured stream:** the raw SSE text of the looping run, showing three step pairs and the
+  `budget_exhausted` final event.
+- **A short note (3-5 sentences):** why a tool error goes back as an event the model can read, and
+  when this run would move from an inline stream to a durable job queue.
+- **Evaluation:** tests pass, bounds live in the Pydantic model rather than in `if` checks, and no
+  exception can end a stream without a final event.
 
 ## Why it exists
 - **An agent endpoint is unusual HTTP.** A request may hold its connection open for ten seconds or far

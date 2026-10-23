@@ -5,7 +5,8 @@ name: GRPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/rlhf
@@ -161,6 +162,25 @@ flowchart TD
     NEW -.->|"every few dozen steps"| HO{"Held-out accuracy rising too?"}
     HO -.->|"no: reward hacking"| RW["Fix reward, roll back"]
 ```
+
+## Misconceptions
+- **"GRPO is a new kind of RL objective."** It is PPO's clipped surrogate with the value model replaced
+  by the group's reward mean and spread. With one gradient step per batch every ratio is 1 and it reduces
+  to REINFORCE with a group-mean baseline plus the KL term.
+- **"A verifiable reward cannot be hacked."** It cannot be flattered, but it can be gamed: hard-coded
+  visible test outputs, empty reasoning tags, or a "done" tool call that leaves the state the checker does
+  not inspect unchanged. Test the reward against known hacks and track an independent held-out verifier.
+- **"Every rollout teaches the model something."** A group where all G attempts score the same has zero
+  advantage and no gradient, yet costs G full rollouts. Curate tasks the model solves sometimes, and
+  re-curate as solved tasks pile up.
+- **"Dividing by the group std is a harmless normalisation."** For a 0/1 reward it up-weights extreme
+  groups: a lone success at 1/8 gets +2.47 versus +0.94 at 4/8. Dr. GRPO drops it; runs that differ here
+  are different algorithms.
+- **"Longer reasoning or more tool calls means it is learning."** Outcome rewards favour extra steps only
+  when they buy accuracy, and per-response length averaging biases toward verbosity on failures. Length
+  rising with flat held-out success is cost, not progress.
+- **"GRPO can bootstrap a skill from nothing."** If the starting policy almost never succeeds, every group
+  is all-zero; SFT on traces or an easier curriculum has to come first.
 
 ## Examples
 ### A verifiable reward for an agent rollout

@@ -5,7 +5,8 @@ name: safetensors
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/pytorch
@@ -36,6 +37,207 @@ uploaded adapters cannot execute on load.
   for fast autoscaling.
 - **What you can skip.** The byte layout details and writing loaders yourself. Remember three facts: no
   code on load, lazy memory-mapped reads, and "safe to load" is not "safe to run".
+
+## Lab
+### Task
+Harden the tenant-adapter intake check from the Examples section until hand-made malicious files cannot
+pass it. Read the file only with `json` and `struct`; never import torch and never unpickle. Time box:
+45-75 minutes.
+- **Prerequisites:** PyTorch, PEFT (LoRA shapes), and this lesson's file layout section.
+- **What must be rejected:** anything not named `*.safetensors`, a module the base model does not have,
+  shapes other than A = `[rank, in]` and B = `[out, rank]`, offsets that disagree with dtype × shape,
+  run past the file or overlap, and a missing provenance key.
+- **Checked against:** Python 3.12, NumPy 2.5 and `safetensors` 0.8 (`safetensors.numpy.save_file`, so no
+  torch is needed); the header layout has been stable since the format's first release.
+
+### Starter code
+Save as `lab.py`. Extend `audit_adapter` where the `LAB` comments are; the helpers build test files.
+
+```python
+"""Lab: intake check for tenant-uploaded LoRA adapters, using only json and struct to read them."""
+import json
+import os
+import pickle
+import struct
+import tempfile
+
+import numpy as np
+from safetensors.numpy import save_file
+
+DTYPE_BYTES = {"F16": 2, "BF16": 2, "F32": 4}
+BASE = {"layers.0.q_proj": (64, 64), "layers.0.v_proj": (64, 64)}   # module -> (out, in) of the base
+RANK = 8
+REQUIRED_META = ("source", "base_revision")
+
+
+def audit_adapter(path: str, base: dict = BASE, rank: int = RANK, max_bytes: int = 50_000_000) -> dict:
+    """Return {"tensors", "bytes", "metadata"} or raise ValueError. Never imports torch, never unpickles."""
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        if n > 10_000_000:
+            raise ValueError("header too large")
+        header = json.loads(f.read(n))
+    meta = header.pop("__metadata__", {})
+    total = 0
+    for name, t in header.items():
+        if "lora_" not in name:
+            raise ValueError(f"unexpected tensor {name}")
+        if t["dtype"] not in DTYPE_BYTES:
+            raise ValueError(f"bad dtype {t['dtype']} for {name}")
+        if rank not in t["shape"]:
+            raise ValueError(f"rank mismatch in {name}: {t['shape']}")
+        begin, end = t["data_offsets"]
+        total += end - begin
+    # LAB 1: accept only *.safetensors files.
+    # LAB 2: names must be <module>.lora_A.weight / <module>.lora_B.weight for a module in `base`, and
+    #        shapes exactly A = [rank, in], B = [out, rank].
+    # LAB 3: offsets must match dtype x shape, stay inside the data buffer, and not overlap.
+    # LAB 4: require every REQUIRED_META key in __metadata__ (provenance).
+    if total > max_bytes:
+        raise ValueError("adapter larger than policy allows")
+    return {"tensors": len(header), "bytes": total, "metadata": meta}
+
+
+def lora(out_dim=64, in_dim=64, r=RANK):
+    return np.zeros((r, in_dim), np.float16), np.zeros((out_dim, r), np.float16)
+
+
+def make_good(path):
+    t = {}
+    for m in BASE:
+        t[f"{m}.lora_A.weight"], t[f"{m}.lora_B.weight"] = lora()
+    save_file(t, path, metadata={"source": "tenant-acme/run-17", "base_revision": "3f2a9c1"})
+
+
+def write_raw(path, header: dict, data: bytes):
+    """Write a hand-made (possibly malicious) safetensors file."""
+    h = json.dumps(header).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(h)) + h + data)
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory() as d:
+        p = lambda name: os.path.join(d, name)
+        make_good(p("good.safetensors"))
+        a, b = lora(in_dim=32)                                  # A is [8, 32]; the base expects [8, 64]
+        save_file({"layers.0.q_proj.lora_A.weight": a, "layers.0.q_proj.lora_B.weight": b},
+                  p("shape.safetensors"), metadata={"source": "x", "base_revision": "y"})
+        write_raw(p("oob.safetensors"), {"__metadata__": {"source": "x", "base_revision": "y"},
+                  "layers.0.q_proj.lora_A.weight": {"dtype": "F16", "shape": [8, 64],
+                                                    "data_offsets": [0, 1024]}}, b"\0" * 16)
+        save_file(dict(zip(["layers.0.q_proj.lora_A.weight", "layers.0.q_proj.lora_B.weight"], lora())),
+                  p("nometa.safetensors"))
+        with open(p("adapter.bin"), "wb") as f:
+            pickle.dump({"note": "pickles are programs"}, f)
+        for name in ["good.safetensors", "shape.safetensors", "oob.safetensors", "nometa.safetensors",
+                     "adapter.bin"]:
+            try:
+                m = audit_adapter(p(name))
+                print(f"{name}: ACCEPTED {m['tensors']} tensors, {m['bytes']} bytes, from {m['metadata'].get('source')}")
+            except ValueError:
+                print(f"{name}: REJECTED")
+```
+
+### Expected output
+The starter accepts the first four files. It rejects `adapter.bin` only by luck, because the pickle's
+first 8 bytes decode to an absurd header size. A correct audit prints:
+
+```
+good.safetensors: ACCEPTED 4 tensors, 4096 bytes, from tenant-acme/run-17
+shape.safetensors: REJECTED
+oob.safetensors: REJECTED
+nometa.safetensors: REJECTED
+adapter.bin: REJECTED
+```
+
+- **Check the bytes:** each of the 4 tensors is 8 × 64 values × 2 bytes (F16) = 1,024 bytes, so 4,096.
+
+### Tests
+Save as `test_lab.py` and run `pytest -q`. Six cases fail on the starter with "DID NOT RAISE"; the good
+adapter and the pickle case pass.
+
+```python
+import pickle
+
+import pytest
+from lab import audit_adapter, lora, make_good, write_raw
+from safetensors.numpy import save_file
+
+META = {"source": "tenant-acme/run-17", "base_revision": "3f2a9c1"}
+A = "layers.0.q_proj.lora_A.weight"
+
+
+def test_good_adapter_passes_with_manifest(tmp_path):
+    make_good(tmp_path / "a.safetensors")
+    out = audit_adapter(str(tmp_path / "a.safetensors"))
+    assert out == {"tensors": 4, "bytes": 4 * 8 * 64 * 2, "metadata": META}
+
+
+def test_pickle_upload_is_rejected(tmp_path):
+    with open(tmp_path / "adapter.bin", "wb") as f:
+        pickle.dump({"x": 1}, f)
+    with pytest.raises(ValueError):
+        audit_adapter(str(tmp_path / "adapter.bin"))
+
+
+def test_wrong_shape_is_rejected_even_if_rank_appears(tmp_path):
+    a, b = lora(in_dim=32)
+    save_file({A: a, A.replace("lora_A", "lora_B"): b}, tmp_path / "s.safetensors", metadata=META)
+    with pytest.raises(ValueError):
+        audit_adapter(str(tmp_path / "s.safetensors"))
+
+
+def test_module_not_in_base_is_rejected(tmp_path):
+    a, b = lora()
+    save_file({"layers.0.k_proj.lora_A.weight": a, "layers.0.k_proj.lora_B.weight": b},
+              tmp_path / "k.safetensors", metadata=META)
+    with pytest.raises(ValueError):
+        audit_adapter(str(tmp_path / "k.safetensors"))
+
+
+@pytest.mark.parametrize("offsets, data", [([0, 1024], b"\0" * 16),       # past the end of the file
+                                           ([0, 10], b"\0" * 1024)],     # size != dtype x shape
+                         ids=["past-end", "size-mismatch"])
+def test_bad_offsets_are_rejected(tmp_path, offsets, data):
+    write_raw(tmp_path / "o.safetensors", {"__metadata__": META, A: {
+        "dtype": "F16", "shape": [8, 64], "data_offsets": offsets}}, data)
+    with pytest.raises(ValueError):
+        audit_adapter(str(tmp_path / "o.safetensors"))
+
+
+def test_overlapping_tensors_are_rejected(tmp_path):
+    t = {"dtype": "F16", "shape": [8, 64], "data_offsets": [0, 1024]}
+    write_raw(tmp_path / "v.safetensors", {"__metadata__": META, A: t,
+              "layers.0.v_proj.lora_A.weight": dict(t)}, b"\0" * 2048)
+    with pytest.raises(ValueError):
+        audit_adapter(str(tmp_path / "v.safetensors"))
+
+
+def test_missing_provenance_is_rejected(tmp_path):
+    save_file(dict(zip([A, A.replace("lora_A", "lora_B")], lora())), tmp_path / "m.safetensors")
+    with pytest.raises(ValueError):
+        audit_adapter(str(tmp_path / "m.safetensors"))
+```
+
+### Failure scenarios
+- **Bound offsets by the header size instead of the data buffer.** The past-end case still passes your
+  check. Debug: print `os.path.getsize(path) - 8 - n` next to each `end`; offsets are relative to the
+  buffer, which starts after the header.
+- **Check overlap without sorting spans.** Two tensors listed out of order slip through. Debug: print the
+  sorted `(begin, end)` list and compare neighbours.
+- **Match names with `"q_proj" in name`.** A tensor named `evil.q_proj_extra.lora_A.weight` is accepted.
+  Debug: split the name at `.lora_` and look the module up in `base` exactly.
+- **"Fix" a rejected `.bin` with `torch.load(..., weights_only=False)`.** Nothing fails in the lab, which is
+  the danger. Debug: grep the intake path for `torch.load`; conversion belongs in a sandbox job.
+
+### Submission
+- **`lab.py` passing all eight tests**, with output matching Expected output.
+- **A manifest** printed for a real PEFT `adapter_model.safetensors` (any small public adapter), with the
+  `base` shapes you derived from its base model's config.
+- **A note** listing which checks still do not prove the adapter is safe to run, and the eval gate that
+  covers them.
+- **Evaluation:** tests pass, and the audit never imports torch or calls `pickle.load`.
 
 ## Why it exists
 - **Pickle checkpoints are programs.** `torch.save` uses Python's `pickle`, which is not a data format: it

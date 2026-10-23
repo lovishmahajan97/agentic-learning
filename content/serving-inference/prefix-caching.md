@@ -5,7 +5,8 @@ name: Prefix caching
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/prompt-caching
@@ -150,6 +151,27 @@ flowchart TD
     C -->|"memory pressure during tool wait"| E["LRU eviction"]
     C -.->|"next step of the run"| L
 ```
+
+## Misconceptions
+- **"Prefix caching is a semantic cache that reuses answers to similar prompts."** It reuses K and V for
+  a byte-identical token prefix and still runs the model on the rest. Similar wording, a reordered tool
+  list or a different chat template is a miss.
+- **"Serving from the cache changes what the model samples."** The cache holds K and V, which causal
+  attention makes a pure function of the prefix and the weights, so reuse is exact and independent of
+  temperature or seed. Batched kernels can still differ in the last bits, so do not demand bit-identical
+  trajectories.
+- **"One volatile token costs only that token."** Block keys chain the previous key, so the first changed
+  token invalidates every later block. A step id placed before the system prompt turns 19,548 prefill
+  tokens into 127,510 over a 10-step run, about 6.5x.
+- **"Enabling `--enable-prefix-caching` is enough on a fleet."** The cache lives on one GPU. Behind
+  round-robin routing an agent's next step usually lands on a replica that never saw its trajectory, so
+  route by run or conversation id.
+- **"Once cached, my agent's prefix stays cached."** Between steps its blocks have zero references and
+  are LRU-evictable under load, and hosted caches expire after minutes, so a slow tool call can outlive
+  the entry.
+- **"The payoff is only lower TTFT."** Requests sharing a prefix share physical blocks. 100 concurrent
+  requests on a 3,000-token prefix hold one copy instead of 100, roughly 39 GB returned to live
+  sequences, which raises the batch size.
 
 ## Examples
 ### Agent scenario: prefill tokens for a 10-step run, simulated

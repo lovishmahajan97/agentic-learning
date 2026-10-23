@@ -5,7 +5,8 @@ name: Async database access & connection pooling
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/sqlalchemy-sqlmodel
@@ -38,6 +39,150 @@ must fit Postgres's cap. Agent rule: never hold a connection across a model call
   law, the fleet-wide connection budget, and how each tool gets its own short session.
 - **What you can skip.** Greenlet internals and Postgres backend-process details. Know `MissingGreenlet`,
   the pool settings table and the budget arithmetic.
+
+## Lab
+### Task
+Reproduce pool exhaustion caused by an agent turn that holds its session across a model call, then fix
+it structurally. A file-backed SQLite database and a one-connection pool make the bug show up with four
+concurrent turns, offline. Time box: 30-45 minutes. Prerequisites: Async endpoints and SQLAlchemy / SQLModel.
+- **Reproduce:** run the starter and see `QueuePool limit of size 1 overflow 0 reached`.
+- **Fix:** read in a short session, release it, call the model holding nothing, write in a second
+  short session.
+- **Prove:** no connection is checked out while the model runs, and the four turns overlap.
+
+### Starter code
+Save as `lab_pool.py`. Needs `pip install "sqlalchemy[asyncio]" aiosqlite pytest` (the extra pulls in
+`greenlet`; checked with SQLAlchemy 2.1.6, aiosqlite 0.22.1, greenlet 3.5.6, Python 3.12).
+
+```python
+import asyncio, os, tempfile
+from sqlalchemy import String, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.pool import AsyncAdaptedQueuePool
+
+class Base(DeclarativeBase):
+    pass
+
+class Message(Base):
+    __tablename__ = "message"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    conv_id: Mapped[int] = mapped_column(index=True)
+    role: Mapped[str] = mapped_column(String(16))
+    content: Mapped[str]
+
+MODEL_SECONDS = 0.3                    # a slow model call (seconds in production)
+SEEN_CHECKED_OUT: list[int] = []       # pool connections checked out while the model ran
+
+def make_engine(path: str):
+    # A deliberately tiny pool: 1 connection, no overflow, give up after 0.5 s.
+    return create_async_engine(f"sqlite+aiosqlite:///{path}", poolclass=AsyncAdaptedQueuePool,
+                               pool_size=1, max_overflow=0, pool_timeout=0.5)
+
+async def call_model(engine, transcript: list[str]) -> str:   # fake model: no DB access
+    SEEN_CHECKED_OUT.append(engine.pool.checkedout())
+    await asyncio.sleep(MODEL_SECONDS)
+    return f"answer after {len(transcript)} messages"
+
+async def agent_turn(engine, sessions: async_sessionmaker[AsyncSession], conv_id: int, prompt: str) -> str:
+    # BUG: one session for the whole turn holds the pool's only connection across the model call.
+    # YOUR CODE: read history in a short session and release it, call the model holding nothing,
+    #            then write prompt and answer in a second short session.
+    async with sessions() as s:
+        history = (await s.scalars(select(Message.content).where(Message.conv_id == conv_id)
+                                   .order_by(Message.id))).all()
+        answer = await call_model(engine, [*history, prompt])
+        s.add_all([Message(conv_id=conv_id, role="user", content=prompt),
+                   Message(conv_id=conv_id, role="assistant", content=answer)])
+        await s.commit()
+    return answer
+
+async def main(turns: int = 4) -> list[str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = make_engine(os.path.join(tmp, "agent.db"))
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            return await asyncio.gather(*(agent_turn(engine, sessions, c, "hi") for c in range(turns)))
+        finally:
+            await engine.dispose()
+
+if __name__ == "__main__":
+    try:
+        print(asyncio.run(main(turns=4)))
+    except Exception as exc:
+        print(type(exc).__name__, str(exc).split(",")[0])
+    SEEN_CHECKED_OUT.clear(); asyncio.run(main(turns=1))
+    print("connections held during a lone model call:", SEEN_CHECKED_OUT)
+```
+
+The starter prints `TimeoutError QueuePool limit of size 1 overflow 0 reached`, then
+`connections held during a lone model call: [1]`.
+
+### Expected output
+With a correct solution, `python lab_pool.py` prints:
+
+```
+['answer after 1 messages', 'answer after 1 messages', 'answer after 1 messages', 'answer after 1 messages']
+connections held during a lone model call: [0]
+```
+
+### Tests
+Save as `test_lab_pool.py` and run `pytest -q`. On the starter the first test fails with
+`sqlalchemy.exc.TimeoutError` and the second sees `[1]`; the third passes and guards that history and
+both messages still persist.
+
+```python
+import asyncio, os, tempfile, time
+import lab_pool
+
+def test_concurrent_turns_fit_a_one_connection_pool():
+    lab_pool.SEEN_CHECKED_OUT.clear()
+    t0 = time.perf_counter()
+    answers = asyncio.run(lab_pool.main(turns=4))          # starter: pool TimeoutError
+    assert answers == ["answer after 1 messages"] * 4
+    assert time.perf_counter() - t0 < 4 * lab_pool.MODEL_SECONDS   # model calls overlapped
+
+def test_no_connection_is_held_while_the_model_runs():
+    lab_pool.SEEN_CHECKED_OUT.clear()
+    asyncio.run(lab_pool.main(turns=1))
+    assert lab_pool.SEEN_CHECKED_OUT == [0]
+
+def test_history_is_read_and_both_messages_written():
+    async def two_turns(path):
+        engine = lab_pool.make_engine(path)
+        async with engine.begin() as conn:
+            await conn.run_sync(lab_pool.Base.metadata.create_all)
+        sessions = lab_pool.async_sessionmaker(engine, expire_on_commit=False)
+        first = await lab_pool.agent_turn(engine, sessions, 7, "hi")
+        second = await lab_pool.agent_turn(engine, sessions, 7, "again")
+        await engine.dispose()
+        return first, second
+    with tempfile.TemporaryDirectory() as tmp:
+        result = asyncio.run(two_turns(os.path.join(tmp, "t.db")))
+    assert result == ("answer after 1 messages", "answer after 3 messages")
+```
+
+### Failure scenarios
+- **Raise `pool_size` to 4 instead of restructuring.** The first test now passes, but the second still
+  sees `[1]`: hold time is unchanged, so at 20 turns per second with an 8 s model call you still need
+  about 160 connections. Debug: measure hold time per checkout, not pool size.
+- **Keep one session but call `commit()` before the model.** It works (commit returns the connection),
+  but the second write autobegins a new transaction on the same session. Debug: log
+  `engine.pool.checkedout()` at each step to see when the connection comes back.
+- **Use `expire_on_commit=True` and read an attribute after commit.** The implicit reload raises
+  `MissingGreenlet`. Debug: the traceback names the attribute access; keep the factory's setting.
+- **Share one session across the four `gather`ed turns.** It fails with an `IllegalStateChangeError`
+  (or a concurrent-operations error, depending on timing). Debug: one session per task, always.
+
+### Submission
+- **Code:** `lab_pool.py` with only `agent_turn` changed.
+- **Test run:** `pytest -q` showing 3 passed, plus the starter's `TimeoutError` line for comparison.
+- **Trace:** the output of `python lab_pool.py`, matching the expected output.
+- **Note (3-5 sentences):** your hold time before and after, and the pool size Little's law gives for
+  200 turns per second in each case.
+- **Evaluated on:** passing tests, no session open across `call_model`, and correct arithmetic in the note.
 
 ## Why it exists
 - **Problem 1: blocking.** A sync driver call such as psycopg2's `cursor.execute()` inside an `async def`

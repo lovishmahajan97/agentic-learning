@@ -5,7 +5,8 @@ name: FlashAttention
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - model-internals/self-attention
@@ -170,7 +171,53 @@ flowchart TD
     OUT --> LSE["Save one log-sum-exp per row"]
 ```
 
+## Misconceptions
+- **"FlashAttention is an approximation, like sparse or low-rank attention."** It is exact: online softmax
+  rescales earlier partial sums by `exp(m − m_new)`, so outputs differ from eager only by fp16 or bf16
+  rounding.
+- **"It makes long context cheap."** FLOPs stay quadratic; it removes the n² memory and traffic, so long
+  transcripts fit, but beyond roughly 100k tokens you still need windowing, sparsity or retrieval.
+- **"Attention is a small share of FLOPs, so a faster kernel cannot matter much."** Naive attention is
+  memory-bound: softmax and masking do about one FLOP per byte, so HBM round-trips of the scores set the
+  time, not the arithmetic.
+- **"Calling SDPA or setting `attn_implementation` means flash is running."** fp32 inputs, an unsupported
+  head dimension, a dense mask tensor or a pre-Ampere GPU silently fall back; force the backend in a test
+  to make it fail loudly.
+- **"The same kernel speeds up decode."** Decode has one query row per sequence, so engines use
+  Flash-Decoding, which splits the cached key/value length across thread blocks instead.
+
 ## Examples
+### Online softmax in NumPy: tiles give the exact answer
+No GPU needed. One query block streams over K/V tiles of 16 rows with the running max and sum, and
+matches the naive result exactly (up to float rounding).
+
+```python
+import numpy as np
+
+def naive(Q, K, V):
+    S = Q @ K.T / np.sqrt(Q.shape[1])
+    P = np.exp(S - S.max(1, keepdims=True)); P /= P.sum(1, keepdims=True)
+    return P @ V
+
+def tiled(Q, K, V, Bc=16):
+    """One query block, streaming K/V blocks with an online softmax (no n x n matrix)."""
+    n, d = Q.shape
+    m = np.full(n, -np.inf); l = np.zeros(n); O = np.zeros((n, V.shape[1]))
+    for j in range(0, K.shape[0], Bc):
+        S = Q @ K[j:j + Bc].T / np.sqrt(d)             # a small n x Bc tile
+        m_new = np.maximum(m, S.max(1))
+        scale = np.exp(m - m_new)                      # rescale what was accumulated so far
+        p = np.exp(S - m_new[:, None])
+        l = scale * l + p.sum(1)
+        O = scale[:, None] * O + p @ V[j:j + Bc]
+        m = m_new
+    return O / l[:, None]                              # divide once at the end (FlashAttention-2)
+
+rng = np.random.default_rng(0)
+Q, K, V = (rng.normal(size=(64, 32)) for _ in range(3))
+print(np.allclose(naive(Q, K, V), tiled(Q, K, V)))     # True: exact, just re-associated
+```
+
 ### Naive attention against the flash backend on one GPU
 Naive attention against the flash backend on one GPU, comparing peak memory, time and the outputs, at
 8,192 tokens, a modest agent transcript.
@@ -209,37 +256,6 @@ for name, fn in (("naive", naive), ("flash", flash)):
 print(torch.allclose(naive(), flash(), atol=2e-3, rtol=2e-3))   # True: same result up to fp16 rounding
 # Expect roughly 12 GiB peak for naive (3 x 4 GiB plus inputs) versus well under 1 GiB for flash, and flash several times faster;
 # the exact numbers depend on the GPU. Passing an explicit attn_mask instead of is_causal would disable flash.
-```
-
-### Online softmax in NumPy: tiles give the exact answer
-No GPU needed. One query block streams over K/V tiles of 16 rows with the running max and sum, and
-matches the naive result exactly (up to float rounding).
-
-```python
-import numpy as np
-
-def naive(Q, K, V):
-    S = Q @ K.T / np.sqrt(Q.shape[1])
-    P = np.exp(S - S.max(1, keepdims=True)); P /= P.sum(1, keepdims=True)
-    return P @ V
-
-def tiled(Q, K, V, Bc=16):
-    """One query block, streaming K/V blocks with an online softmax (no n x n matrix)."""
-    n, d = Q.shape
-    m = np.full(n, -np.inf); l = np.zeros(n); O = np.zeros((n, V.shape[1]))
-    for j in range(0, K.shape[0], Bc):
-        S = Q @ K[j:j + Bc].T / np.sqrt(d)             # a small n x Bc tile
-        m_new = np.maximum(m, S.max(1))
-        scale = np.exp(m - m_new)                      # rescale what was accumulated so far
-        p = np.exp(S - m_new[:, None])
-        l = scale * l + p.sum(1)
-        O = scale[:, None] * O + p @ V[j:j + Bc]
-        m = m_new
-    return O / l[:, None]                              # divide once at the end (FlashAttention-2)
-
-rng = np.random.default_rng(0)
-Q, K, V = (rng.normal(size=(64, 32)) for _ in range(3))
-print(np.allclose(naive(Q, K, V), tiled(Q, K, V)))     # True: exact, just re-associated
 ```
 
 ### Agent scenario: fine-tuning on agent trajectories, padded versus packed

@@ -5,7 +5,8 @@ name: LlamaIndex (indexes, query engines, agents, workflows)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/frameworks
@@ -38,6 +39,157 @@ that run on its event-driven Workflows engine.
   reranking, the vector store behind the index, and the tool descriptions the agent reads.
 - **What you can skip.** The long tail of legacy query-engine variants and older agent classes. Learn
   indexes, retrievers, query engines, tools, `FunctionAgent` and `Workflow`; the rest is built from them.
+
+## Lab
+### Task
+Fix a policy-retrieval workflow that leaks another tenant's documents and answers off-topic questions
+from irrelevant chunks. You enforce tenant isolation with a metadata filter set from the caller's
+identity, fail closed when no tenant is given, and add the refusal branch from the corrective-RAG
+example.
+
+This is the retrieval step your agent's `policy_search` tool will run.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** this lesson's Workflows section and the guarded-RAG example; agentic RAG basics.
+- **Runs offline:** a deterministic keyword embedder replaces a real embedding model, and an
+  extractive answer step replaces LLM synthesis, so no API key is needed.
+- **Needs:** `llama-index-core` and `pytest`; checked with llama-index-core 0.14.25 on Python 3.12.
+
+### Starter code
+```python
+# policy_rag.py: a tenant-safe retrieval workflow that refuses on weak evidence (LlamaIndex, offline)
+import asyncio, re
+from llama_index.core import VectorStoreIndex
+from llama_index.core.embeddings import BaseEmbedding
+from llama_index.core.schema import NodeWithScore, TextNode
+from llama_index.core.vector_stores import ExactMatchFilter, MetadataFilters
+from llama_index.core.workflow import Event, StartEvent, StopEvent, Workflow, step
+
+VOCAB = ["refund", "day", "purchase", "allowed", "within", "travel", "economy", "class", "book"]
+REFUSAL = "I could not find a supporting policy."
+
+class KeywordEmbedding(BaseEmbedding):
+    """Deterministic stand-in for a real embedder: one dimension per vocabulary word,
+    plus an 'unknown' dimension so off-topic text is orthogonal to every policy."""
+    def _vec(self, text: str) -> list[float]:
+        words = {w.rstrip("s") for w in re.findall(r"[a-z]+", text.lower())}
+        v = [1.0 if w in words else 0.0 for w in VOCAB]
+        return v + [0.0 if any(v) else 1.0]
+    def _get_text_embedding(self, text): return self._vec(text)
+    def _get_query_embedding(self, query): return self._vec(query)
+    async def _aget_query_embedding(self, query): return self._vec(query)
+
+NODES = [
+    TextNode(id_="acme-refund", text="Acme refunds are allowed within 30 days of purchase.",
+             metadata={"tenant": "acme"}),
+    TextNode(id_="acme-travel", text="Acme staff book travel in economy class.",
+             metadata={"tenant": "acme"}),
+    TextNode(id_="globex-refund", text="Globex refunds are allowed within 90 days of purchase.",
+             metadata={"tenant": "globex"}),
+]
+index = VectorStoreIndex(NODES, embed_model=KeywordEmbedding())
+
+class Retrieved(Event):
+    question: str
+    nodes: list[NodeWithScore]
+
+class PolicyRAG(Workflow):
+    def __init__(self, index, min_score: float = 0.5, top_k: int = 2, **kw):
+        super().__init__(**kw)
+        self.index, self.min_score, self.top_k = index, min_score, top_k
+
+    @step
+    async def retrieve(self, ev: StartEvent) -> Retrieved | StopEvent:
+        tenant = ev.get("tenant")  # set by your auth layer, never by the model or the question
+        # YOUR CODE 1: fail closed (raise ValueError) when tenant is missing, and build the
+        # retriever with a metadata filter on "tenant" so other tenants' nodes are never candidates
+        retriever = self.index.as_retriever(similarity_top_k=self.top_k)
+        nodes = await retriever.aretrieve(ev.question)
+        # YOUR CODE 2: keep only nodes scoring >= self.min_score; if none are left, stop with
+        # {"answer": REFUSAL, "sources": []} instead of answering from weak evidence
+        return Retrieved(question=ev.question, nodes=nodes)
+
+    @step
+    async def answer(self, ev: Retrieved) -> StopEvent:
+        # Extractive stand-in for LLM synthesis: quote the best node and cite every node used
+        return StopEvent(result={"answer": ev.nodes[0].get_content(),
+                                 "sources": [n.node.node_id for n in ev.nodes]})
+
+async def main():
+    wf = PolicyRAG(index=index, timeout=10)
+    for tenant, q in [("acme", "How many days do I have to get a refund after purchase?"),
+                      ("globex", "How many days do I have to get a refund after purchase?"),
+                      ("acme", "What is the parental leave policy?")]:
+        print(tenant, "->", await wf.run(question=q, tenant=tenant))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+As given, both refund questions cite `acme-refund` and `globex-refund` (the two score the same, about
+0.77), and the leave question is answered from `acme-travel` with a score of 0.
+
+### Expected output
+```
+acme -> {'answer': 'Acme refunds are allowed within 30 days of purchase.', 'sources': ['acme-refund']}
+globex -> {'answer': 'Globex refunds are allowed within 90 days of purchase.', 'sources': ['globex-refund']}
+acme -> {'answer': 'I could not find a supporting policy.', 'sources': []}
+```
+
+### Tests
+```python
+# test_policy_rag.py: run with `pytest -q`
+import asyncio
+import pytest
+import policy_rag as m
+
+Q = "How many days do I have to get a refund after purchase?"
+
+def run(**kw):
+    async def go():  # a workflow run needs a running event loop
+        return await m.PolicyRAG(index=m.index, timeout=10).run(**kw)
+    return asyncio.run(go())
+
+def test_acme_sees_only_acme():
+    r = run(question=Q, tenant="acme")
+    assert r["sources"] == ["acme-refund"]
+    assert "30 days" in r["answer"]
+
+def test_question_cannot_pick_the_tenant():
+    r = run(question="What is the Globex refund window in days after purchase?", tenant="acme")
+    assert "globex-refund" not in r["sources"]
+
+def test_globex_sees_only_globex():
+    assert run(question=Q, tenant="globex")["sources"] == ["globex-refund"]
+
+def test_off_topic_question_is_refused():
+    assert run(question="What is the parental leave policy?", tenant="acme") == {
+        "answer": m.REFUSAL, "sources": []}
+
+def test_missing_tenant_fails_closed():
+    with pytest.raises(Exception, match="tenant"):
+        run(question=Q)
+```
+
+All five fail on the starter: four on a cross-tenant source or a non-refusal, one because no error is
+raised without a tenant.
+
+### Failure scenarios
+- **Inject a prompt-only filter:** drop the `MetadataFilters` and add "only use acme documents" to the
+  question. `test_question_cannot_pick_the_tenant` still fails. Log the retrieved node IDs per run;
+  `globex-refund` among the candidates proves the prompt cannot enforce tenancy.
+- **Inject an embedder mismatch:** index with `KeywordEmbedding` but query with a different `VOCAB`
+  order. Every score drops and the refusal fires for valid questions. Print `n.score` for the top nodes
+  and compare the embed model used at ingestion and at query time, as in this lesson's Check yourself.
+- **Inject a threshold of 0:** set `min_score=0.0`. The leave question cites `acme-travel` again.
+  Count refusals on a set of unanswerable questions; a refusal rate of zero means the guard is off.
+
+### Submission
+- **Your `policy_rag.py`** with both `YOUR CODE` steps done and nothing else changed.
+- **A `pytest -q` run** showing 5 passed, plus the script output matching the expected lines.
+- **A trace or log** for one run listing node IDs, scores and the tenant filter applied.
+- **A short note** on how you would calibrate `min_score` for a real embedding model on a labelled set.
+- **Evaluated on:** green tests, the filter built from the `tenant` argument only, and no answer
+  without a source above the threshold.
 
 ## Why it exists
 - **Retrieval is where RAG agents fail.** In practice wrong answers trace back to bad parsing, bad

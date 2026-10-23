@@ -5,7 +5,8 @@ name: A100 / H100 / L4 selection
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/gpu-sizing
@@ -35,6 +36,62 @@ Pick each agent-stack card by its first binding constraint: fit (long contexts),
   whether small models share a card through MIG.
 - **What you can skip.** SM counts and architecture marketing. Memory, bandwidth, price and expected load
   decide it.
+
+## Decision case
+### Scenario
+A travel company self-hosts an 8B bf16 tool-calling model for a booking agent and must sign a one-year
+reservation for its serving cards in one EU region.
+- **Demand:** 1,500 tokens/s of agent decode at peak today; the product forecast doubles it to 3,000
+  within the year.
+- **Step SLO:** a 150-token tool call must decode in 1.5 s, so the step time floor must be at most
+  10 ms at the batch you run. Contexts average 4k tokens (about 0.54 GB of KV per sequence).
+- **Reliability:** at least two replicas.
+- **Region:** H100 quota of 4 cards granted; A100 and L4 freely available.
+- **Prices (illustrative, per card-hour):** L4 $0.80, A100 80 GB $2.00, H100 $4.00. Replace with your
+  quotes.
+
+Batch per card is the largest batch whose floor, `(16 GB + B × 0.54 GB) ÷ bandwidth`, stays under 10 ms.
+
+### Options
+| Option | Batch under 10 ms | Ceiling per card | Cards today (1,500 tok/s) | Cost today | Cards at forecast (3,000) | Cost at forecast |
+|---|---|---|---|---|---|---|
+| A. L4 | None: ≈ 55 ms at batch 1 | n/a | Fails the step SLO | n/a | n/a | n/a |
+| B. A100 80 GB | 7 (9.9 ms) | ≈ 710 tok/s | 3 (71% busy) | $6.00/h | 5 | $10.00/h |
+| C. H100 SXM | 32 (9.9 ms) | ≈ 3,230 tok/s | 2, the replica minimum (23% busy) | $8.00/h | 2 | $8.00/h |
+
+### Decision
+Choose **C**.
+- **Latency gate:** the L4 is out at any price, because bandwidth, not memory, fails it.
+- **Cost over the reservation:** B is $2/h cheaper today but $2/h dearer at forecast. The crossover sits
+  where the A100 fleet reaches five cards, above about 2,830 tokens/s (4 × 710); the forecast passes it.
+- **Headroom:** two H100s carry up to ≈ 6,460 tokens/s, so a forecast miss upward needs no new
+  procurement. The A100 fleet already runs at 71% of a bandwidth ceiling real engines do not reach.
+- **Future levers:** fp8 on H100 halves weight bytes per step; the A100 has no fp8 tensor cores.
+- **Quota:** two cards fit the 4-card grant, leaving two for a failover or canary replica.
+
+**What would change it:**
+- **Flat forecast:** B saves about $17,500 a year at these illustrative prices ($2/h × 8,760 h), so
+  take B and revisit at renewal.
+- **H100 quota withdrawn:** take B.
+- **Step SLO loosened to 3 s per tool call:** rerun the batch column, since both cards then hold larger
+  batches.
+
+### Trade-offs accepted
+- **Paying for idle capacity in year one.** C runs near 23% of its ceiling today; track utilisation
+  against the plan monthly.
+- **A forecast-dependent choice.** Record the 2,830 tokens/s crossover in the capacity plan and compare
+  real peak demand with it each quarter.
+- **Concentrated hardware.** Two big cards mean one failure halves capacity; keep the spare quota ready
+  and watch per-replica error rates.
+- **Benchmarks still owed.** Floors are upper bounds; replay real agent traces at batch 32 before the
+  reservation is signed.
+
+### Review rubric
+- Applies the gates in order: fit, per-step latency at the batch used, then cost at expected load.
+- Derives the batch each card can run under the step SLO instead of assuming one batch for all cards.
+- Prices both today's demand and the forecast over the commitment term, and states the crossover.
+- Applies the replica minimum and checks regional quota before recommending.
+- Labels prices as quotes or illustrative and names the measured value that would flip the choice.
 
 ## Why it exists
 - **Price and speed differ by an order of magnitude.** Three cards from the same vendor can differ that

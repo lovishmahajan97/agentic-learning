@@ -5,7 +5,8 @@ name: GPU sizing (VRAM math)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -37,6 +38,61 @@ per parameter with mixed-precision Adam.
   system prompt and tool schemas), and adapter versus full fine-tune.
 - **What you can skip.** Exact activation formulas and ZeRO internals. Keep the weights, KV-per-token and
   16-bytes-per-parameter rules.
+
+## Decision case
+### Scenario
+An insurer's claims team runs a self-hosted Llama-3-70B agent (80 layers, 8 KV heads, head_dim 128, so
+320 KB of bf16 KV per token). It must serve 30 concurrent sessions at peak. Here k = 1,024 tokens.
+- **Session profile from traces:** a 6k shared prefix (system prompt plus tool schemas, byte-identical so
+  prefix caching shares it) and compaction capping each run at 16k, so 10k unique tokens per session.
+- **Demand:** 30 × 10k + 6k = 313,344 tokens of KV, about 103 GB in bf16.
+- **Hardware:** four 80 GB H100s in one NVLink node, no more this quarter. Budget per card is 72 GB at
+  `gpu_memory_utilization` 0.9, with about 1 GB overhead per card.
+- **Quality:** the claims eval shows fp8 weights within 1 point of bf16; int4 drops task success by 4
+  points (the team's own illustrative numbers). An fp8 KV cache has not been evaluated yet.
+- **Reliability:** losing one card must not take the agent fully offline. `--max-model-len` is 32k.
+
+### Options
+| Option | Layout | KV room per replica | Sessions (prefix shared) | Survives one bad card? | Quality |
+|---|---|---|---|---|---|
+| A. bf16, one replica | TP=4 on all four cards | 288 − 141.2 − 4 = 142.8 GB | ≈ 41 | No: one replica | Baseline |
+| B. fp8 weights, two replicas | TP=2 per replica, two replicas | 144 − 70.6 − 2 = 71.4 GB | ≈ 20 per replica, 40 total | Yes, at 20 sessions | Within 1 point |
+| C. int4, four replicas | One card per replica | 72 − 38.8 − 1 ≈ 32.2 GB | ≈ 8 per replica, 32 total | Yes, at 24 sessions | Fails: −4 points |
+| D. fp8 weights and fp8 KV, two replicas | As B, KV at 1 byte | 71.4 GB at 160 KB per token | ≈ 41 per replica | Yes, at full load | KV untested |
+
+### Decision
+Choose **B** now, and run the fp8 KV eval to unlock D.
+- **Capacity:** 40 sessions cover the 30-session peak with a third of headroom, and each replica's
+  ≈ 218k tokens holds a 32k `max-model-len` request.
+- **Reliability:** two replicas mean a bad card halves capacity to 20 sessions and queues the rest; with
+  A it takes the agent offline.
+- **Quality:** fp8 weights pass the eval; int4 does not, so C is out despite fitting on paper.
+- **Why not A:** it holds one more session than B but puts every agent on one fault domain.
+- **Why not D yet:** an fp8 KV cache doubles resident tokens but has no eval result; capacity from an
+  untested change is a guess.
+
+**What would change it:**
+- **fp8 KV eval passes:** move to D, where either replica alone carries the full peak.
+- **fp8 weights regress on a new eval set:** fall back to A and buy redundancy next quarter.
+- **Compaction removed:** runs peaking at 32k unique tokens leave B about 6 sessions per replica, so redo
+  the case.
+
+### Trade-offs accepted
+- **A small quality gap.** Accept up to 1 point from fp8; rerun the claims eval on every model or engine
+  upgrade.
+- **Dependence on prefix stability.** Sessions fit only because the 6k prefix is shared; alert when the
+  prefix-cache hit rate drops, which signals a prompt or tool-schema edit that broke byte identity.
+- **Dependence on compaction.** Track p95 tokens per session at the last step; past 16k, preemptions rise.
+- **Degraded mode at 20 sessions.** During a card failure, ten sessions queue; watch queue time and
+  preemption counts per replica.
+
+### Review rubric
+- Derives KV bytes per token from the model config and states the per-session peak from real traces.
+- Computes KV room per card from utilisation, weights and overhead, per replica rather than in total.
+- Counts the shared prefix once and states which lever (prefix caching, compaction) the fit depends on.
+- Rejects any precision that fails the task eval, even when it fits.
+- Weighs fault domains (replica count) alongside session capacity.
+- Names the measured thresholds (eval result, peak tokens) that flip the choice.
 
 ## Why it exists
 - **A GPU cannot page to disk.** When the device runs out of memory the engine does not slow down

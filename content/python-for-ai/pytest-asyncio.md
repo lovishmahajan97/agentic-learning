@@ -5,7 +5,8 @@ name: pytest-asyncio
 kind: tool
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/pytest
@@ -35,6 +36,168 @@ edges come from loop lifetime.
   and backoff tests stay fast, and a guard that fails any test leaving a tool task pending.
 - **What you can skip.** Custom loop policies and the old `event_loop` override. Pin the plugin, set the
   config keys explicitly and use the defaults.
+
+## Lab
+### Task
+An agent step runs every tool call the model requested, but today it runs them one after another with
+no timeout, so one hung page load stalls the whole step.
+
+You will make the step concurrent behind a cap,
+give each call a timeout that turns into an error result, and prove with async tests that cancellation
+really stops the tools. Time box: 45-75 minutes.
+- **Prerequisites:** asyncio, Async cancellation and exception propagation, and this lesson's Strict vs
+  auto mode and Loop scope sections.
+- **Setup:** Python 3.11+ (for `asyncio.timeout`), `pip install pytest pytest-asyncio` (checked against
+  pytest 9.1.1 and pytest-asyncio 1.4.0, default strict mode). Save the starter as `async_step.py` and
+  the tests as `test_async_step.py`.
+- **Goal:** results in call order, peak concurrency equal to `limit`, a hung tool reported within its
+  timeout, and no tool left running after a timeout or a cancelled step.
+
+### Starter code
+```python
+"""async_step.py: run every tool call the model requested in one agent step."""
+import asyncio
+
+
+async def run_tool_calls(calls, tools, *, timeout_s, limit):
+    # EXERCISE: run the calls concurrently, at most `limit` in flight, each under `timeout_s`.
+    # A call that times out returns {"id": ..., "error": "<name> timed out after <timeout_s>s"}.
+    # Results keep the order of `calls`.
+    out = []
+    for call in calls:                                   # sequential, no timeout, no cap
+        content = await tools[call["name"]](**call["args"])
+        out.append({"id": call["id"], "content": content})
+    return out
+
+
+def make_tools(state, slow_s=10.0):
+    state.setdefault("in_flight", 0)
+    state.setdefault("peak", 0)
+    state.setdefault("open", 0)
+
+    async def search(q):
+        state["in_flight"] += 1
+        state["peak"] = max(state["peak"], state["in_flight"])
+        try:
+            await asyncio.sleep(0.05)
+            return f"results for {q}"
+        finally:
+            state["in_flight"] -= 1
+
+    async def browse(url):
+        state["open"] += 1
+        try:
+            await asyncio.sleep(slow_s)                  # a hung page load
+            return f"page {url}"
+        finally:
+            state["open"] -= 1                           # runs on cancellation
+
+    return {"search": search, "browse": browse}
+
+
+if __name__ == "__main__":
+    state = {}
+    calls = [{"id": f"c{i}", "name": "search", "args": {"q": f"q{i}"}} for i in range(4)]
+    calls.append({"id": "c4", "name": "browse", "args": {"url": "https://example.com"}})
+    results = asyncio.run(run_tool_calls(calls, make_tools(state, slow_s=0.3), timeout_s=0.2, limit=2))
+    for r in results:
+        print(r)
+    print("peak in flight:", state["peak"], "| open pages:", state["open"])
+```
+
+### Expected output
+`python async_step.py` after the fix. The starter instead prints the page for `c4` and
+`peak in flight: 1`.
+
+```text
+{'id': 'c0', 'content': 'results for q0'}
+{'id': 'c1', 'content': 'results for q1'}
+{'id': 'c2', 'content': 'results for q2'}
+{'id': 'c3', 'content': 'results for q3'}
+{'id': 'c4', 'error': 'browse timed out after 0.2s'}
+peak in flight: 2 | open pages: 0
+```
+
+`pytest -v` then reports `4 passed` in about a second.
+
+### Tests
+On the starter, 3 of 4 fail: the cap test with `assert 1 == 3`, the hung-tool test with `TimeoutError`
+from its 2 s guard, and the cancel test with `assert 1 == 3`.
+
+```python
+import asyncio
+import time
+
+import pytest
+
+from async_step import make_tools, run_tool_calls
+
+
+def searches(n):
+    return [{"id": f"c{i}", "name": "search", "args": {"q": f"q{i}"}} for i in range(n)]
+
+
+@pytest.mark.asyncio
+async def test_results_keep_call_order():
+    out = await run_tool_calls(searches(5), make_tools({}), timeout_s=1, limit=5)
+    assert [r["id"] for r in out] == ["c0", "c1", "c2", "c3", "c4"]
+    assert out[3] == {"id": "c3", "content": "results for q3"}
+
+
+@pytest.mark.asyncio
+async def test_concurrency_is_capped_and_used():
+    state = {}
+    await run_tool_calls(searches(12), make_tools(state), timeout_s=1, limit=3)
+    assert state["peak"] == 3                  # 1 means sequential, 12 means no cap
+
+
+@pytest.mark.asyncio
+async def test_hung_tool_becomes_error_result_and_is_cancelled():
+    state = {}
+    calls = searches(1) + [{"id": "b", "name": "browse", "args": {"url": "https://x.test"}}]
+    start = time.monotonic()
+    async with asyncio.timeout(2):             # guard: a missing timeout fails here, not after 10 s
+        out = await run_tool_calls(calls, make_tools(state), timeout_s=0.1, limit=2)
+    assert time.monotonic() - start < 1
+    assert out[0]["content"] == "results for q0"
+    assert out[1] == {"id": "b", "error": "browse timed out after 0.1s"}
+    assert state["open"] == 0                  # the hung page load was really cancelled
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_step_cancels_every_tool():
+    state = {}
+    calls = [{"id": f"b{i}", "name": "browse", "args": {"url": "u"}} for i in range(3)]
+    task = asyncio.create_task(run_tool_calls(calls, make_tools(state), timeout_s=5, limit=3))
+    await asyncio.sleep(0.05)
+    assert state["open"] == 3                  # all three started concurrently
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert state["open"] == 0
+```
+
+### Failure scenarios
+- **Inject: `time.sleep(0.05)` in `search`.** The cap test reports `peak == 1` even with a correct
+  semaphore, because the blocking call stops task switching. Debug: run with `python -X dev` and look for
+  the slow-callback warning; restore `await asyncio.sleep`.
+- **Inject: remove `@pytest.mark.asyncio` from one test.** Recent pytest fails it with "async def
+  functions are not natively supported" instead of running it. Debug: read the failure text, then decide whether the suite
+  should set `asyncio_mode` explicitly in config.
+- **Inject: one `asyncio.timeout(timeout_s)` around the whole `gather`.** The hung-tool test fails with
+  `TimeoutError`, and the finished search result is lost with it. Debug: the traceback ends in the
+  step, not in one call; move the timeout inside the per-call wrapper.
+- **Inject: start the timeout before acquiring the semaphore.** With a tight cap, queued calls time out
+  while waiting for a slot. Debug: add a test with `limit=1` and two fast calls under a short timeout.
+
+### Submission
+- **Your `async_step.py`**, with the four given tests unchanged and passing in under 2 seconds.
+- **A starter-versus-fixed test log** showing the three failures turning green.
+- **One extra test of your own**: a tool that raises, asserting the other results still arrive (decide
+  and document whether it becomes an error result).
+- **A short note** explaining why `state["open"] == 0` proves cancellation rather than just a timeout.
+- **Evaluated by:** order, cap, timeout and cancellation behaviour, and that no test needs a real
+  multi-second sleep.
 
 ## Why it exists
 - **pytest calls tests synchronously.** An `async def` test is just a coroutine object nobody awaits.

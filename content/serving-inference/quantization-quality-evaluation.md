@@ -5,7 +5,8 @@ name: Quantization quality evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/quantization
@@ -159,41 +160,28 @@ flowchart TD
     S5 --> V[("Registered model version")]
 ```
 
+## Misconceptions
+- **"A tiny perplexity delta on the model card means the build is nearly lossless."** Perplexity averages
+  log-loss over mostly easy tokens, so the digit, function name or closing brace a task hinges on can
+  shift a lot while the average barely moves. Check mean and tail KL on your own domain text, then task
+  evals.
+- **"Comparing against the published fp16 score is good enough."** Prompts, templates and harness
+  settings differ, so the "regression" may be a harness difference. Re-run fp16 yourself in the same job
+  with identical settings.
+- **"Two accuracy numbers on 300 items show whether a 2-point drop is real."** Independent runs at 80%
+  carry about ±6.4 points of 95% interval. Pairing per item, with 15 disagreements, narrows it to near
+  ±2.5, so analyse per-item differences, not two means.
+- **"Unchanged net accuracy means nothing regressed."** Ten broken and ten fixed answers cancel in the
+  mean, and the users who owned the broken ten see a regression. Count correct → wrong flips and read
+  every one.
+- **"A one-point drop per call is a one-point drop for the agent."** Per-step errors compound: at 15 steps,
+  99% per step gives 86.0% run success and 98% gives 73.9%. Gate on replayed agent runs, not single-turn
+  scores.
+- **"A 4-bit build of a model is a known quantity."** Group size, scale granularity and the calibration set
+  all move the result; two 4-bit files of one model can differ more from each other than from fp16.
+  Evaluate the exact artifact you will ship.
+
 ## Examples
-### Teacher-forced comparison: KL, top-1 agreement, perplexity
-Compares a full-precision model and its 4-bit counterpart on domain text. Run it on your own text, not
-only WikiText, and gate on the deltas before investing in slower task evals.
-
-```python
-import math, torch, torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-name = "Qwen/Qwen2.5-0.5B"                        # swap in the checkpoint you plan to ship
-tok = AutoTokenizer.from_pretrained(name)
-fp16 = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16, device_map="cuda").eval()
-q4 = AutoModelForCausalLM.from_pretrained(
-    name, device_map="cuda",
-    quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                                           bnb_4bit_compute_dtype=torch.float16)).eval()
-
-texts = open("domain_sample.txt").read().split("\n\n")[:200]   # YOUR domain, same text for both
-kl = agree = nll16 = nll4 = n = 0
-with torch.no_grad():
-    for t in texts:
-        ids = tok(t, return_tensors="pt", truncation=True, max_length=1024).input_ids.cuda()
-        lp = F.log_softmax(fp16(ids).logits[0, :-1].float(), -1)   # predictions for positions 1..T
-        lq = F.log_softmax(q4(ids).logits[0, :-1].float(), -1)     # identical context: teacher forced
-        tgt = ids[0, 1:]
-        kl += (lp.exp() * (lp - lq)).sum(-1).sum().item()           # KL(P_fp16 || P_q4), summed
-        agree += (lp.argmax(-1) == lq.argmax(-1)).sum().item()
-        nll16 += -lp.gather(1, tgt[:, None]).sum().item()
-        nll4 += -lq.gather(1, tgt[:, None]).sum().item()
-        n += tgt.numel()
-print(f"tokens={n}  mean KL/token={kl/n:.4f}  top-1 agreement={agree/n:.2%}")
-print(f"ppl fp16={math.exp(nll16/n):.3f}  ppl 4bit={math.exp(nll4/n):.3f}")
-# Next: run the golden set under both models with identical decoding and compare with paired bootstrap.
-```
-
 ### Paired bootstrap with flip counts on a golden set
 Pure Python, runnable as is. Feed it per-item correctness for both models on the same prompts; it
 reports the delta, a 95% interval and the list of broken items someone must read.
@@ -227,6 +215,40 @@ print("read these:", paired_report(fp16, quant))
 
 The interval straddles zero, so the net number alone is inconclusive, yet ten specific answers broke.
 Read them: if they share a pattern (dates, long inputs, JSON), that slice is the real finding.
+
+### Teacher-forced comparison: KL, top-1 agreement, perplexity
+Compares a full-precision model and its 4-bit counterpart on domain text. Run it on your own text, not
+only WikiText, and gate on the deltas before investing in slower task evals.
+
+```python
+import math, torch, torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+name = "Qwen/Qwen2.5-0.5B"                        # swap in the checkpoint you plan to ship
+tok = AutoTokenizer.from_pretrained(name)
+fp16 = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16, device_map="cuda").eval()
+q4 = AutoModelForCausalLM.from_pretrained(
+    name, device_map="cuda",
+    quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                                           bnb_4bit_compute_dtype=torch.float16)).eval()
+
+texts = open("domain_sample.txt").read().split("\n\n")[:200]   # YOUR domain, same text for both
+kl = agree = nll16 = nll4 = n = 0
+with torch.no_grad():
+    for t in texts:
+        ids = tok(t, return_tensors="pt", truncation=True, max_length=1024).input_ids.cuda()
+        lp = F.log_softmax(fp16(ids).logits[0, :-1].float(), -1)   # predictions for positions 1..T
+        lq = F.log_softmax(q4(ids).logits[0, :-1].float(), -1)     # identical context: teacher forced
+        tgt = ids[0, 1:]
+        kl += (lp.exp() * (lp - lq)).sum(-1).sum().item()           # KL(P_fp16 || P_q4), summed
+        agree += (lp.argmax(-1) == lq.argmax(-1)).sum().item()
+        nll16 += -lp.gather(1, tgt[:, None]).sum().item()
+        nll4 += -lq.gather(1, tgt[:, None]).sum().item()
+        n += tgt.numel()
+print(f"tokens={n}  mean KL/token={kl/n:.4f}  top-1 agreement={agree/n:.2%}")
+print(f"ppl fp16={math.exp(nll16/n):.3f}  ppl 4bit={math.exp(nll4/n):.3f}")
+# Next: run the golden set under both models with identical decoding and compare with paired bootstrap.
+```
 
 ### Worked scenario: per-step losses compound over an agent run
 Assume each step's tool call must be correct for the run to succeed and errors are independent (a

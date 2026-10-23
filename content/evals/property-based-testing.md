@@ -5,7 +5,8 @@ name: Property-based testing
 kind: practice
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -143,6 +144,24 @@ flowchart TD
     MIN --> PIN["Pin with an example decorator"]
     DB -.->|"replayed first next run"| G
 ```
+
+## Misconceptions
+- **"Property-based testing is fuzzing with a nicer API."** Fuzzing finds crashes; a property asserts
+  what must be true for every input, so it catches wrong answers, and shrinking turns a 2 KB failure into
+  a case readable in seconds.
+- **"A property that passed 100 examples proves the code correct."** It explored a sample, biased toward
+  edges. A strategy too broad can miss a bug on some runs, as the trimmer's tool-result range did, so
+  shape strategies toward realistic sizes.
+- **"The property can just compute the expected output."** Re-implementing the function copies its bug
+  into the test. State independent facts: round trip, size bounds, coverage, typed errors only.
+- **"It does not apply to LLM agents because the model is nondeterministic."** The highest-value targets
+  are deterministic: tool-argument parsers, history trimmers, chunkers, budget counters. Model-output
+  properties are the exception, run nightly as a rate with a low count and no deadline.
+- **"Random inputs make CI flaky."** Hypothesis replays stored failures first from its example database,
+  and pinned `@example(...)` cases keep known bugs fixed. A property that fails randomly is usually a
+  strategy that reaches the bug only sometimes.
+- **"The shrunk input is unrealistic, so debug the original."** The minimal case is the diagnosis;
+  patching for the long input lets the same bug return with a different one.
 
 ## Examples
 ### Three properties over an overlapping chunker

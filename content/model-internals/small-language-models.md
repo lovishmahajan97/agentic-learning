@@ -5,7 +5,8 @@ name: Small language models (SLMs)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - model-internals/scaling-laws
@@ -145,6 +146,22 @@ flowchart TD
     L --> OUT
     OUT -.->|"sampled for evals"| G[("Golden set and audit log")]
 ```
+
+## Misconceptions
+- **"An SLM is just a frontier model that is a bit worse at everything."** Losses are uneven: long-tail
+  factual recall and multi-step composition shrink first, while narrow, well-defined skills such as
+  classification or extraction can match a zero-shot frontier model after fine-tuning.
+- **"Quantising a 70B model gets you the same savings."** 4-bit buys roughly 4× in memory, not the
+  20× that separates a 70B from a 3B, and the quantised 70B still needs a server GPU.
+- **"Fine-tuning an SLM on our documents teaches it our facts."** Few parameters means few facts stored
+  reliably, so memorised answers come out confidently wrong. Feed facts through retrieval or tool results
+  and fine-tune for the form of the output.
+- **"Moving most agent calls to an SLM cuts the bill by about that share."** Cost follows tokens times
+  price, not call count: in the research-agent example seven of ten calls moved but the bill fell only 41%,
+  because the planner calls carry most of the frontier spend.
+- **"Small models are trained compute-optimally, so more data would not help them."** Modern SLMs are
+  deliberately over-trained (Llama 3 8B at close to 2,000 tokens per parameter versus about 20) because
+  inference, not training, dominates lifetime cost.
 
 ## Examples
 ### Agent scenario: which steps of a research agent move to an SLM

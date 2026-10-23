@@ -5,7 +5,8 @@ name: Knowledge distillation
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/supervised-fine-tuning
@@ -178,7 +179,40 @@ flowchart TD
     SFT --> E
 ```
 
+## Misconceptions
+- **"Distillation needs the teacher's logits."** Most LLM distillation is black-box: SFT on filtered
+  teacher trajectories, which works across tokenizers and API-only teachers. Logits are needed only for
+  token-level distillation with a shared tokenizer.
+- **"Raising the temperature reveals new information."** It only rescales what is already in the logits:
+  ratios between wrong answers shrink toward 1 but never invert, and too high a *T* washes the ranking
+  out toward uniform.
+- **"A student that matches the teacher per step matches it per task."** Small per-step error rates
+  compound over a long trajectory, and a student trained on teacher prefixes never learned to recover from
+  its own mistakes (exposure bias), so judge it on end-to-end task success.
+- **"The biggest available teacher gives the best student."** A student far smaller than its teacher can
+  learn less from it than from a mid-sized intermediate, and the teacher is always the ceiling on the
+  covered distribution, so its mistakes copy over unless a verifier filters them.
+- **"A distilled student is a small copy of the teacher."** It reproduces the teacher on the prompt
+  distribution you covered and degrades faster outside it, which is why you distil narrow agent steps and
+  keep a teacher fallback.
+
 ## Examples
+### Worked scenario: distilling the cheap steps of a research agent
+A research agent makes 12 LLM calls per task. Costs are in illustrative units, with the student at
+roughly one tenth of the teacher per call, as for a 7B versus a 70B-class model.
+
+| Call type | Calls per task | All on teacher | Router, rewrites and summaries on student |
+|---|---|---|---|
+| Route the request | 1 | 10 | 1 |
+| Rewrite search queries | 3 | 30 | 3 |
+| Summarise tool results | 6 | 60 | 6 |
+| Plan next step | 1 | 10 | 10 (teacher) |
+| Final answer | 1 | 10 | 10 (teacher) |
+| Total per task | 12 | 120 | 30 |
+
+A 4× cheaper task, provided the end-to-end success rate on held-out tasks stays within your tolerance
+and the fallback rate (student output fails validation, teacher retries) stays low.
+
 ### Token-level distillation loss in PyTorch
 Both models must use the same tokenizer so vocabulary positions line up; the teacher is frozen. The `T²`
 scaling and mixed hard/soft objective follow Hinton; padded positions are masked out of the soft term.
@@ -234,22 +268,6 @@ for T in (1, 2, 4, 20):
 # T= 4: p=[0.604, 0.222, 0.173]  tail mass=39.6%  p2/p3=1.28   (0.6045 before rounding)
 # T=20: p=[0.385, 0.315, 0.3]  tail mass=61.5%  p2/p3=1.05    <- near uniform, ranking washes out
 ```
-
-### Worked scenario: distilling the cheap steps of a research agent
-A research agent makes 12 LLM calls per task. Costs are in illustrative units, with the student at
-roughly one tenth of the teacher per call, as for a 7B versus a 70B-class model.
-
-| Call type | Calls per task | All on teacher | Router, rewrites and summaries on student |
-|---|---|---|---|
-| Route the request | 1 | 10 | 1 |
-| Rewrite search queries | 3 | 30 | 3 |
-| Summarise tool results | 6 | 60 | 6 |
-| Plan next step | 1 | 10 | 10 (teacher) |
-| Final answer | 1 | 10 | 10 (teacher) |
-| Total per task | 12 | 120 | 30 |
-
-A 4× cheaper task, provided the end-to-end success rate on held-out tasks stays within your tolerance
-and the fallback rate (student output fails validation, teacher retries) stays low.
 
 ### Building per-step SFT data from verified teacher trajectories
 Pure Python. Only trajectories whose task passed survive, and each teacher action becomes one example.

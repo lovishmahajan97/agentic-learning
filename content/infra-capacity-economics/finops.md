@@ -5,7 +5,8 @@ name: FinOps
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - observability/token-cost-tracking
@@ -37,6 +38,62 @@ token budgets, and review the loop weekly.
   before a new agent ships.
 - **What you can skip.** Procurement work (committed-use contracts, reservations) and FOCUS billing
   normalization unless you own the platform budget; know they exist and who owns them.
+
+## Decision case
+### Scenario
+A B2B company has six product teams running four agents on two LLM providers. All figures are
+illustrative; the stuck-run costs reuse the per-run meter example below.
+- **Spend:** the invoice is $62,000 a month, but metered events explain only $48,360, so $13,640 (22%) is
+  unallocated.
+- **Incident:** over one weekend about 385 support-agent runs looped on a failing tool to the 100-step
+  ceiling, at about $23.36 each, roughly $9,000.
+- **The CFO's constraints:** no single incident above $2,000; unallocated spend at or below 5% (about
+  $3,100 at this bill) within one quarter; no customer-facing outage caused by a cost control.
+- **Team:** one platform engineer for six weeks.
+- **Latency:** any new hop must add at most 20 ms of p95 per call, the agents' own budget rule.
+
+### Options
+| Option | How it works | Bounds a runaway loop? | Customer outage risk | Attribution | Effort |
+|---|---|---|---|---|---|
+| A. Hard monthly caps per key | spend limits in each provider console | bounds the month, not the run: a loop burns until the cap | high: a tripped cap takes the agent down | unchanged, 22% unallocated | days |
+| B. Gateway, tags, run limits, forecasts | sole egress with mandatory tags; per-run step and spend limits in each agent loop; two-window forecast alerts; showback; hard caps only on non-production keys | yes: 385 stuck runs × $0.56 ≈ $216 | low: a stopped run returns "could not finish" | per tenant, feature, run; target 5% or less | about six weeks |
+| C. B plus chargeback now | as B, debiting team budgets from month one | yes | low | as B, but disputed while 22% is unallocated | six weeks plus finance work |
+| D. Per-team keys, monthly review | one provider key per team, invoice read monthly | no, found a month later | none | per team only, no tenant, feature or run | days |
+
+### Decision
+Choose **B**, and start chargeback only after unallocated spend stays at or below 5% for two consecutive
+months.
+- **It is the only option that bounds a single run:** the gateway sees calls, so the step and spend limit
+  must live in the loop; at `max_usd=0.50` the weekend incident costs about $216, under $2,000.
+- **It meets the outage constraint:** production keys get forecast alerts and rate limits, not hard caps.
+- **It meets the attribution target:** mandatory tags plus monthly reconciliation make the 22% gap a
+  tracked KPI and expose the bypass paths, typically eval jobs and scripts with personal keys.
+- **A and D are fast but fail the constraints:** A trades a runaway bill for an outage; D sees the
+  incident a month late.
+- **C is premature:** chargeback on numbers with a 22% hole produces arguments, not decisions.
+
+**What would change it:**
+- **The gateway adds more than 20 ms of p95 in a load test:** use an in-process SDK wrapper with the same
+  tags and limits.
+- **A team needs a provider feature the gateway cannot pass through:** allow a direct key with its own
+  tags, a hard cap and an owner.
+- **A bill of a few hundred dollars:** tagged events and a daily report are enough; skip the gateway.
+
+### Trade-offs accepted
+- **One more hop and a single point of failure:** monitor gateway p95 and error rate, and keep a tested
+  fail-open path for production traffic.
+- **Legitimate long runs may be stopped:** set `max_usd` above a high percentile of successful-run cost,
+  and track the share of runs stopped by budget against run success.
+- **Call-site discipline:** quarantine untagged calls and report the unallocated share weekly.
+- **Delayed chargeback accountability:** showback carries the first quarter.
+
+### Review rubric
+- Quantifies the incident and shows the chosen control bounds it per run, with the arithmetic.
+- Separates production from non-production controls and explains why hard caps sit only on the latter.
+- Sets a measurable attribution target and the reconciliation that tracks it.
+- Sequences showback before chargeback with an explicit entry condition.
+- Derives run limits from the cost distribution of successful runs, not a guess.
+- States the latency or capability threshold that would change the enforcement point.
 
 ## Why it exists
 - **Cloud broke purchase-order budgeting.** Traditional budgets assume finance approves spend in advance;

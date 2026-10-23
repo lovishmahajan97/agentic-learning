@@ -5,7 +5,8 @@ name: Instructor
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/pydantic
@@ -38,6 +39,162 @@ so every structured agent step returns a checked object.
   step still fails.
 - **What you can skip.** The provider adapter internals and every `Mode` you do not use. Know that a
   reask is a full, longer LLM call that counts against your agent's latency and token budget.
+
+## Lab
+### Task
+Build the planner step of a support agent: a `NextAction` model whose validator checks the live tool
+registry, and a `plan_step` that reasks on bad output and escalates instead of crashing. The model is a
+recorded fake behind `httpx.MockTransport`, so no API key or network is needed. Time box: 60 minutes.
+- **Prerequisites:** the Pydantic lesson (validators, `ValidationInfo`) and the httpx lesson
+  (`MockTransport`).
+- **Setup:** Python 3.11+, `pip install "instructor==1.17.0" openai pytest` (checked against instructor
+  1.17.0 and openai 3.3.0). Save the starter as `planner.py` and the tests as `test_planner.py`.
+- **Version trap:** find out what `max_retries` counts in the release you pinned before you set it;
+  `plan_step` takes total attempts.
+
+### Starter code
+```python
+"""Lab: a validated next-action step, run against a recorded model (no network, no API key)."""
+import json
+from typing import Literal
+
+import httpx
+import instructor
+from instructor.core import InstructorRetryException
+from openai import OpenAI
+from pydantic import BaseModel, Field, ValidationInfo, model_validator
+
+TOOLS = {"search_docs": "Search the help centre", "get_ticket": "Fetch a ticket by numeric id"}
+
+
+def tool_call_reply(args: dict) -> dict:
+    """A recorded chat-completions response whose forced tool call carries `args`."""
+    call = {"id": "call_1", "type": "function",
+            "function": {"name": "NextAction", "arguments": json.dumps(args)}}
+    return {"id": "chatcmpl-1", "object": "chat.completion", "created": 0, "model": "fake",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": None, "tool_calls": [call]}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}
+
+
+class FakeLLM:
+    """Replays recorded replies in order and keeps every request body it received."""
+    def __init__(self, replies: list[dict]):
+        self.replies, self.requests = list(replies), []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(json.loads(request.content))
+        return httpx.Response(200, json=tool_call_reply(self.replies.pop(0)))
+
+
+def make_client(fake: FakeLLM):
+    http = httpx.Client(transport=httpx.MockTransport(fake))
+    sdk = OpenAI(api_key="test", base_url="http://fake.local/v1", http_client=http, max_retries=0)
+    return instructor.from_openai(sdk)
+
+
+class NextAction(BaseModel):
+    reasoning: str = Field(description="One or two sentences: why this action now")
+    action: Literal["call_tool", "finish"]
+    tool: str | None = Field(None, description="Tool name when action is call_tool")
+    args: dict = Field(default_factory=dict)
+    answer: str | None = Field(None, description="Final answer when action is finish")
+
+    # YOUR CODE: add a model_validator(mode="after") that reads the registry from
+    # info.context["tools"] and raises ValueError with an actionable message when
+    #   (a) action is call_tool and tool is not in the registry ("unknown tool ...; choose one of ..."),
+    #   (b) action is finish and answer is empty.
+
+
+def plan_step(client, messages: list[dict], max_attempts: int = 2) -> NextAction:
+    """Return a validated NextAction using at most `max_attempts` LLM calls in total.
+    If every attempt fails validation, return NextAction(reasoning=..., action="finish",
+    answer="ESCALATE: <reason>") instead of raising, so the agent loop never crashes."""
+    raise NotImplementedError("YOUR CODE: create(..., response_model=, context=, max_retries=)")
+
+
+if __name__ == "__main__":
+    fake = FakeLLM([
+        {"reasoning": "need the ticket", "action": "call_tool", "tool": "lookup_ticket", "args": {"id": 42}},
+        {"reasoning": "need the ticket", "action": "call_tool", "tool": "get_ticket",
+         "args": {"ticket_id": 42}},
+    ])
+    act = plan_step(make_client(fake), [{"role": "user", "content": "Is ticket 42 still open?"}])
+    print("action:", act.action, act.tool, act.args)
+    print("llm calls:", len(fake.requests))
+    print("reask carried the error:", "unknown tool" in json.dumps(fake.requests[-1]))
+```
+
+### Expected output
+```
+action: call_tool get_ticket {'ticket_id': 42}
+llm calls: 2
+reask carried the error: True
+```
+`pytest -q test_planner.py` then reports `4 passed`. On the starter all four fail with
+`NotImplementedError`.
+
+### Tests
+```python
+import json
+from planner import FakeLLM, make_client, plan_step
+
+ASK = [{"role": "user", "content": "Is ticket 42 still open?"}]
+BAD = {"reasoning": "guess", "action": "call_tool", "tool": "lookup_ticket", "args": {"id": 42}}
+GOOD = {"reasoning": "need it", "action": "call_tool", "tool": "get_ticket", "args": {"ticket_id": 42}}
+
+
+def run(replies, **kw):
+    fake = FakeLLM(replies)
+    return plan_step(make_client(fake), ASK, **kw), fake
+
+
+def test_valid_first_reply_needs_one_call():
+    act, fake = run([GOOD])
+    assert (act.tool, act.args, len(fake.requests)) == ("get_ticket", {"ticket_id": 42}, 1)
+
+
+def test_unknown_tool_is_reasked_with_the_error():
+    act, fake = run([BAD, GOOD])
+    assert act.tool == "get_ticket" and len(fake.requests) == 2
+    assert "unknown tool" in json.dumps(fake.requests[1])          # the model was told what was wrong
+
+
+def test_finish_without_answer_is_rejected():
+    act, fake = run([{"reasoning": "done", "action": "finish"},
+                     {"reasoning": "done", "action": "finish", "answer": "Yes, it is open."}])
+    assert act.answer == "Yes, it is open." and len(fake.requests) == 2
+
+
+def test_escalates_after_max_attempts_instead_of_raising():
+    act, fake = run([BAD, BAD, BAD], max_attempts=2)
+    assert act.action == "finish" and act.answer.startswith("ESCALATE")
+    assert len(fake.requests) == 2                                   # max_attempts counts every call
+```
+
+### Failure scenarios
+- **Pass `max_retries=max_attempts` straight through.** On instructor 1.17.0 the escalation test sees 3
+  requests, not 2: this release stops after `max_retries + 1` attempts. Debug by counting
+  `fake.requests` and reading the "Total attempts" line Instructor logs; older releases counted
+  differently, which is why you pin and test.
+- **Drop `context={"tools": TOOLS}` from the call.** Every `call_tool` reply now fails with an empty
+  registry, so even the valid first reply is reasked until escalation. Debug by printing
+  `info.context` inside the validator.
+- **Write the validator message as just "invalid".** Tests still pass, but print the second request's
+  last message: the model gets no hint of the legal tool names, which is what makes real reasks
+  converge.
+- **Let `InstructorRetryException` escape.** The escalation test errors instead of failing an
+  assertion, the same crash an agent run would suffer on one stubborn step.
+
+### Submission
+- **`planner.py`** with your validator and `plan_step`; no edits to `FakeLLM`, `make_client` or the tests.
+- **A `pytest -q` run** showing `4 passed`, plus the `python planner.py` output matching Expected output.
+- **The second request body** from `test_unknown_tool_is_reasked_with_the_error` (pretty-printed), with
+  the message that carried your validator error highlighted.
+- **A three-line note:** what `max_retries` counts on your pinned version, and how you would cap cost per
+  agent step.
+- **Evaluated on:** tests passing unmodified, an actionable error message that names the legal tools, and
+  no exception escaping `plan_step`.
 
 ## Why it exists
 - **Most LLM features, and most agent sub-steps, are extraction or classification.** Pull an invoice's

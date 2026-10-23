@@ -5,7 +5,8 @@ name: Pruning
 kind: concept
 difficulty: advanced
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 related:
   - training-adaptation/quantization
@@ -153,6 +154,24 @@ flowchart TD
     QZ --> E["Agent task, safety, latency evals"]
     P -.->|"teacher"| D
 ```
+
+## Misconceptions
+- **"A 50% sparse model is twice as fast."** Unstructured zeros are still multiplied by dense GPU kernels,
+  so tokens per second do not change. Only 2:4 with a sparse kernel path, or structured cuts that leave a
+  smaller dense model, turn sparsity into latency.
+- **"Small weights are the unimportant ones."** A small weight on an input channel with huge activations
+  can carry much of the output; that is why one-shot magnitude pruning at 50% wrecks large LLMs and Wanda
+  scores |W_ij| · ‖X_j‖₂ instead.
+- **"2:4 sparsity halves the weight memory."** Survivors plus 2-bit position indices are about 56% of
+  dense, and the gain reaches decode only if the engine reads the compressed form.
+- **"If perplexity holds, the pruned model is safe to swap in."** Instruction following, strict tool-call
+  formats and refusals can collapse while next-token loss looks intact, so gate on the agent task suite
+  and the safety suite.
+- **"Pruning is the way to make a model smaller."** For most agent teams quantization comes first: INT4
+  weights are about 26% of bf16 with no training run, while pruning needs a strong parent and a
+  distillation phase to recover.
+- **"Removing attention heads shrinks the KV cache."** Pruning query heads leaves the cache unchanged;
+  only removing KV heads or whole layers reduces it.
 
 ## Examples
 ### Wanda vs magnitude pruning on one layer

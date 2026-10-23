@@ -5,7 +5,8 @@ name: python-dotenv
 kind: tool
 difficulty: intro
 est_minutes: 9
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/pydantic-settings
@@ -35,6 +36,156 @@ never overrides variables already set.
   wins under the default `override=False`, so the platform's injected secret beats any stray file.
 - **What you can skip.** Parser edge cases beyond quoting and `${VAR}` expansion. Know the override
   default, the one-time copy, and that every value is a string.
+
+## Lab
+### Task
+Build the config loader for a two-tool agent: read a `.env` with `dotenv_values`, let the real
+environment win (the `override=False` rule), fail fast listing every missing key, convert strings to
+real types, and hand a code-execution tool a minimal environment with no secrets. Time box: 45 minutes.
+- **Prerequisites:** this lesson's How it works, plus pytest and exceptions-and-custom-exception-hierarchies.
+- **Why `dotenv_values`:** it returns a dict and leaves `os.environ` alone, so the merge is explicit and
+  tests stay isolated.
+
+### Starter code
+```python
+# agent_config.py  (checked with python-dotenv 1.2.1, Python 3.9+)
+import os
+import tempfile
+from pathlib import Path
+
+from dotenv import dotenv_values
+
+REQUIRED = ["OPENAI_API_KEY", "MODEL", "SEARCH_API_KEY"]   # model + every tool's key
+
+
+class ConfigError(Exception):
+    pass
+
+
+def parse_bool(raw: str) -> bool:
+    # FILL IN 1: "1", "true", "yes", "on" (any case) -> True; "0", "false", "no", "off", "" -> False.
+    # Anything else raises ConfigError with the bad value in the message.
+    raise NotImplementedError
+
+
+def load_agent_config(env_file, environ=None) -> dict:
+    """Typed agent config from a .env file, with the real environment winning (override=False)."""
+    environ = dict(os.environ if environ is None else environ)
+    file_vals = dotenv_values(env_file) if Path(env_file).exists() else {}
+    # FILL IN 2: merge so environ beats the file; treat empty or None values as unset.
+    # FILL IN 3: raise ConfigError("missing config: [...]") listing ALL missing REQUIRED keys, sorted.
+    # FILL IN 4: return {"model": str, "max_steps": int (default 8), "debug": bool (default False),
+    #                    "keys": {k: value for k in REQUIRED}}
+    raise NotImplementedError
+
+
+def tool_env(config: dict) -> dict:
+    # FILL IN 5: env for a code-execution tool subprocess: only PATH (from os.environ,
+    # default "/usr/bin:/bin") and AGENT_MAX_STEPS as a string. No secrets.
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory() as d:
+        env = Path(d) / ".env"
+        env.write_text("OPENAI_API_KEY=sk-file\nMODEL=gpt-4o-mini\nSEARCH_API_KEY=srch-file\n"
+                       "MAX_STEPS=5\nDEBUG=false\n")
+        cfg = load_agent_config(env, environ={"MODEL": "gpt-4o"})   # a stale shell export
+        print("model:", cfg["model"])
+        print("max_steps:", cfg["max_steps"], type(cfg["max_steps"]).__name__)
+        print("debug:", cfg["debug"])
+        print("tool env keys:", sorted(tool_env(cfg)))
+        try:
+            load_agent_config(Path(d) / "missing.env", environ={"MODEL": "x"})
+        except ConfigError as e:
+            print("error:", e)
+```
+
+### Expected output
+```text
+model: gpt-4o
+max_steps: 5 int
+debug: False
+tool env keys: ['AGENT_MAX_STEPS', 'PATH']
+error: missing config: ['OPENAI_API_KEY', 'SEARCH_API_KEY']
+```
+
+### Tests
+```python
+# test_agent_config.py  (run: pytest -q)
+import pytest
+
+from agent_config import ConfigError, load_agent_config, parse_bool, tool_env
+
+BASE = "OPENAI_API_KEY=sk-file\nMODEL=gpt-4o-mini\nSEARCH_API_KEY=srch\n"
+
+
+def write(tmp_path, text):
+    p = tmp_path / ".env"
+    p.write_text(text)
+    return p
+
+
+def test_environment_beats_file(tmp_path):
+    cfg = load_agent_config(write(tmp_path, BASE), environ={"MODEL": "gpt-4o"})
+    assert cfg["model"] == "gpt-4o"
+    assert cfg["keys"]["OPENAI_API_KEY"] == "sk-file"
+
+
+@pytest.mark.parametrize("raw,want", [("false", False), ("FALSE", False), ("0", False),
+                                      ("", False), ("true", True), ("Yes", True)])
+def test_parse_bool(raw, want):
+    assert parse_bool(raw) is want
+
+
+def test_parse_bool_rejects_garbage():
+    with pytest.raises(ConfigError, match="maybe"):
+        parse_bool("maybe")
+
+
+def test_types_and_defaults(tmp_path):
+    cfg = load_agent_config(write(tmp_path, BASE + "DEBUG=false\n"), environ={})
+    assert cfg["max_steps"] == 8 and cfg["debug"] is False
+    cfg = load_agent_config(write(tmp_path, BASE + "MAX_STEPS=3\n"), environ={})
+    assert cfg["max_steps"] == 3
+
+
+def test_missing_keys_listed_together(tmp_path):
+    with pytest.raises(ConfigError) as e:
+        load_agent_config(tmp_path / "nope.env", environ={"MODEL": "m", "OPENAI_API_KEY": ""})
+    assert "OPENAI_API_KEY" in str(e.value) and "SEARCH_API_KEY" in str(e.value)
+
+
+def test_no_file_is_fine_when_environment_is_complete(tmp_path):
+    env = {"OPENAI_API_KEY": "k", "MODEL": "m", "SEARCH_API_KEY": "s"}
+    assert load_agent_config(tmp_path / "nope.env", environ=env)["model"] == "m"
+
+
+def test_tool_env_has_no_secrets(tmp_path):
+    env = tool_env(load_agent_config(write(tmp_path, BASE), environ={}))
+    assert set(env) == {"PATH", "AGENT_MAX_STEPS"}
+    assert env["AGENT_MAX_STEPS"] == "8"
+    assert "sk-file" not in env.values() and "srch" not in env.values()
+```
+On the starter all 12 tests fail with `NotImplementedError`; a correct solution passes all 12.
+
+### Failure scenarios
+- **Inject `{**environ, **file_vals}` (file wins).** `test_environment_beats_file` fails with
+  `gpt-4o-mini`. Debug by printing both dicts for `MODEL`; the merge order is the precedence rule.
+- **Inject `bool(merged.get("DEBUG"))`.** `"false"` becomes `True` and the debug test fails. Find it by
+  asserting `type(...)` and value on every converted field, not just truthiness.
+- **Inject raising on the first missing key.** The error names only `OPENAI_API_KEY`, so an operator
+  fixes one key per deploy. Collect all missing names before raising.
+- **Inject `tool_env` returning `dict(os.environ)`.** After a real `load_dotenv()` the tool sees every
+  key. The secrets test catches it; in a real run, spawn `env` in the tool and diff the keys.
+
+### Submission
+- **Code:** `agent_config.py` and the unchanged `test_agent_config.py` in a repo or gist.
+- **Test run:** `pytest -q` output showing 12 passed, with the python-dotenv version (`pip show python-dotenv`).
+- **Output:** the five lines from `python agent_config.py`, matching Expected output exactly.
+- **Precedence note:** two or three sentences on why the stale `MODEL` export wins and how you would spot it.
+- **Evaluation:** tests pass unmodified, no secret reaches `tool_env`, and no `os.environ` mutation appears
+  in `load_agent_config`.
 
 ## Why it exists
 - **Config belongs in the environment.** An agent service needs values that differ per environment and

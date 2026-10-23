@@ -5,7 +5,8 @@ name: Embeddings
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - model-internals/tokenization
@@ -176,6 +177,21 @@ flowchart TD
     I -->|"cosine top-k"| R["Retrieved passages"]
     R -->|"tool result"| AC["Agent context"]
 ```
+
+## Misconceptions
+- **"An LLM already has embeddings, so pooling its hidden states gives good search vectors."** Next-token
+  training never asks two paraphrases to land together, so pooled states cluster in a narrow band. Search
+  needs a contrastively trained embedding model whose loss optimizes exactly the cosine you query with.
+- **"After an embedder upgrade, re-embedding new documents is enough."** Each model has its own space;
+  a new-model query sits at a meaningless distance from old-model vectors. Re-embed the whole corpus into
+  a fresh index and cut over once recall@k holds.
+- **"Cosine above 0.8 means relevant."** Score distributions differ by model, and some score unrelated
+  pairs well above zero. A threshold is calibrated per model on labelled pairs, never copied.
+- **"More dimensions means better retrieval."** Memory grows linearly (10M chunks: about 61 GB at 1,536
+  versus 123 GB at 3,072 in float32) while recall gains shrink quickly. Pick the size with recall@k on
+  your own queries.
+- **"A good embedder will find exact codes like AX-4471."** Dense vectors encode meaning, not spelling,
+  so rare identifiers blur. Run BM25 alongside vector search and fuse by rank.
 
 ## Examples
 ### Lookup, weight tying and paraphrase geometry

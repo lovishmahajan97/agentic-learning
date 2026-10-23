@@ -5,7 +5,8 @@ name: Pre-training
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 related:
   - training-adaptation/post-training
@@ -176,33 +177,25 @@ flowchart TD
     PT --> AG["Your agent"]
 ```
 
+## Misconceptions
+- **"A base model is just a weaker chat model."** It has the knowledge but no behaviour: nothing in the
+  objective rewards answering, stopping or calling tools, so it continues text. Judge it with few-shot or
+  log-likelihood tasks, never by chatting.
+- **"Tool calling is learned in post-training."** Post-training teaches the format and when to call; the
+  ability to read schemas and emit valid JSON comes from the code and structured text in the pre-training
+  mix. A base that saw little of either stays a weak tool caller.
+- **"Lower loss means the better base."** Loss is per token, so a coarser tokenizer looks worse while
+  predicting the same text better. Compare candidates on bits per byte over the same corpus.
+- **"Chinchilla's ~20 tokens per parameter is the right amount of training."** It minimises training
+  compute only. Agents spend far more on inference, so a smaller base trained well past the ratio (143
+  tokens per parameter in the 7B example) is the cheaper total.
+- **"Pre-training on our documents will teach it our products."** 200M tokens is orders of magnitude
+  short of a corpus; facts belong in retrieval, style in a fine-tune, and continued pre-training only fits
+  a large corpus mixed with general data.
+- **"The tokenizer is a detail you can swap later."** It is frozen before the main run and the embedding
+  table is built on it, so its cost per tool schema and tool result is permanent for that model family.
+
 ## Examples
-### Measure what a tokenizer costs your agent
-Before shortlisting open-weight bases, tokenise a real agent prefix (system prompt plus tool schemas) and
-a typical tool result with each candidate. The tokenizer was frozen at pre-training, so this cost is
-permanent for that model family.
-
-```python
-import json
-from transformers import AutoTokenizer
-
-tools = [{"name": "search_orders", "description": "Find orders by customer email",
-          "parameters": {"type": "object", "properties": {"email": {"type": "string"},
-                         "status": {"type": "string", "enum": ["open", "shipped", "refunded"]}},
-                         "required": ["email"]}}]
-system = "You are a support agent. Call tools to look up orders before answering."
-tool_result = json.dumps({"orders": [{"id": "A-1042", "status": "shipped", "eta": "2026-10-25"}] * 20})
-prefix = system + "\n" + json.dumps(tools)
-
-for name in ["Qwen/Qwen2.5-0.5B", "gpt2"]:            # swap in the bases you are comparing
-    tok = AutoTokenizer.from_pretrained(name)
-    n_prefix = len(tok(prefix).input_ids)
-    n_result = len(tok(tool_result).input_ids)
-    words = len((prefix + tool_result).split())
-    print(f"{name}: prefix={n_prefix} result={n_result} tokens/word={(n_prefix + n_result) / words:.2f}")
-# Multiply the per-step tokens by steps per task and tasks per day to see the bill difference.
-```
-
 ### Worked budget: why nobody on an agent team pre-trains
 Back-of-envelope for a 7B base, as an illustrative order of magnitude:
 
@@ -238,6 +231,32 @@ def pretrain_budget(params, tokens, flops_per_gpu=4e14, gpus=1024, vocab=152_000
 print(pretrain_budget(7e9, 1e12))
 # gpu_days ~1215, wall_clock ~1.2 days on 1,024 GPUs, chinchilla_tokens 1.4e+11,
 # tokens_per_param 143 (well past compute-optimal, as inference-minded models are), initial loss 11.9
+```
+
+### Measure what a tokenizer costs your agent
+Before shortlisting open-weight bases, tokenise a real agent prefix (system prompt plus tool schemas) and
+a typical tool result with each candidate. The tokenizer was frozen at pre-training, so this cost is
+permanent for that model family.
+
+```python
+import json
+from transformers import AutoTokenizer
+
+tools = [{"name": "search_orders", "description": "Find orders by customer email",
+          "parameters": {"type": "object", "properties": {"email": {"type": "string"},
+                         "status": {"type": "string", "enum": ["open", "shipped", "refunded"]}},
+                         "required": ["email"]}}]
+system = "You are a support agent. Call tools to look up orders before answering."
+tool_result = json.dumps({"orders": [{"id": "A-1042", "status": "shipped", "eta": "2026-10-25"}] * 20})
+prefix = system + "\n" + json.dumps(tools)
+
+for name in ["Qwen/Qwen2.5-0.5B", "gpt2"]:            # swap in the bases you are comparing
+    tok = AutoTokenizer.from_pretrained(name)
+    n_prefix = len(tok(prefix).input_ids)
+    n_result = len(tok(tool_result).input_ids)
+    words = len((prefix + tool_result).split())
+    print(f"{name}: prefix={n_prefix} result={n_result} tokens/word={(n_prefix + n_result) / words:.2f}")
+# Multiply the per-step tokens by steps per task and tasks per day to see the bill difference.
 ```
 
 ### Worked scenario: a tokenizer choice on a 20-step agent

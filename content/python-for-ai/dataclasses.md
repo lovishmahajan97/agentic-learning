@@ -5,7 +5,8 @@ name: dataclasses
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/type-hints
@@ -35,6 +36,175 @@ configs, retrieved chunks. It generates `__init__`, `__repr__`, `__eq__` and opt
   per-run lists, `repr=False` on huge tool outputs and prompts, `slots=True` on high-volume records.
 - **What you can skip.** `order=True`, `InitVar` and `match_args` details; you rarely need them in agent
   code.
+
+## Lab
+### Task
+Build the trace records of an agent run: a frozen, slotted, keyword-only `ToolStep` whose canonical
+arguments make repeated calls hashable and countable, a `Run` that enforces a step budget, and a
+`replace`-based retry that never edits history.
+
+Time box: 45-60 minutes. Do "How it works" here and the `type-hints` lesson first.
+- **Change** the `ToolStep` decorator and the `output` field; keep the field names.
+- **Implement** `make_step`, `retry_of`, `Run.record`, `Run.tokens` and `Run.repeats` in `lab.py`.
+- **Run** on Python 3.10+ (for `slots` and `kw_only`), standard library plus pytest (checked on
+  Python 3.12.14, pytest 9.1.1).
+
+### Starter code
+Save as `lab.py`. It runs and stops at the first unimplemented function.
+
+```python
+"""lab.py: immutable trace records, a step budget and loop detection for an agent run."""
+from __future__ import annotations
+
+import json
+from collections import Counter
+from dataclasses import asdict, dataclass, field, replace
+
+class BudgetExceeded(RuntimeError): ...
+
+@dataclass        # LAB: make it immutable and hashable, slotted, keyword-only; keep `output` out of repr
+class ToolStep:
+    index: int
+    tool: str
+    args_json: str                 # canonical JSON text of the arguments
+    output: str                    # can be 40 KB of HTML
+    input_tokens: int
+    output_tokens: int
+
+def make_step(index: int, tool: str, args: dict[str, object], output: str,
+              input_tokens: int, output_tokens: int) -> ToolStep:
+    """Build a step whose args_json is canonical, so equal calls compare and hash equal."""
+    raise NotImplementedError("LAB: make_step")
+
+def retry_of(step: ToolStep, *, input_tokens: int) -> ToolStep:
+    """The next attempt of the same call: index + 1, new input_tokens, the original left untouched."""
+    raise NotImplementedError("LAB: retry_of")
+
+@dataclass
+class Run:
+    task: str
+    max_steps: int = 4
+    steps: list[ToolStep] = field(default_factory=list)
+
+    def record(self, step: ToolStep) -> None:
+        """Append, or raise BudgetExceeded(f"step budget of {self.max_steps} exhausted") when full."""
+        raise NotImplementedError("LAB: Run.record")
+
+    @property
+    def tokens(self) -> int:
+        """Input plus output tokens over all steps."""
+        raise NotImplementedError("LAB: Run.tokens")
+
+    def repeats(self) -> dict[tuple[str, str], int]:
+        """(tool, args_json) -> count, only for calls made more than once: the loop signal."""
+        raise NotImplementedError("LAB: Run.repeats")
+
+def to_trace(run: Run) -> str:
+    """JSON text of the whole run (outputs included) for the trace store."""
+    return json.dumps(asdict(run))
+
+def main() -> None:
+    run = Run("Find the refund policy")
+    s = make_step(0, "search", {"q": "refund", "k": 3}, "...40 KB of HTML...", 1800, 60)
+    run.record(s)
+    run.record(retry_of(s, input_tokens=2400))
+    run.record(make_step(2, "search", {"k": 3, "q": "refund"}, "...40 KB of HTML...", 2500, 40))
+    print(run.steps[0])
+    print("tokens:", run.tokens)
+    print("repeats:", run.repeats())
+    try:
+        run.record(make_step(3, "fetch", {"url": "/refunds"}, "<html>", 900, 20))
+        run.record(make_step(4, "fetch", {"url": "/terms"}, "<html>", 900, 20))
+    except BudgetExceeded as e:
+        print("budget:", e)
+    print("trace keys:", sorted(json.loads(to_trace(run))))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except NotImplementedError as e:
+        print("not implemented:", e)
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly (tokens: 1,860 + 2,460 + 2,540 = 6,860):
+
+```
+ToolStep(index=0, tool='search', args_json='{"k": 3, "q": "refund"}', input_tokens=1800, output_tokens=60)
+tokens: 6860
+repeats: {('search', '{"k": 3, "q": "refund"}'): 3}
+budget: step budget of 4 exhausted
+trace keys: ['max_steps', 'steps', 'task']
+```
+
+### Tests
+Save as `test_lab.py` and run `python -m pytest -q`. On the starter all five fail with
+`NotImplementedError`; once `make_step` works, the immutability, slots and repr checks still fail until
+the decorator is changed.
+
+```python
+import json
+from dataclasses import FrozenInstanceError
+import pytest
+from lab import BudgetExceeded, Run, ToolStep, make_step, retry_of, to_trace
+
+def step(i=0, args=None, tokens=100):
+    return make_step(i, "search", args or {"q": "refund", "k": 3}, "x" * 40_000, tokens, 10)
+
+def test_step_is_immutable_hashable_and_canonical():
+    a, b = step(args={"q": "refund", "k": 3}), step(args={"k": 3, "q": "refund"})
+    with pytest.raises(FrozenInstanceError):
+        a.tool = "fetch"
+    assert a == b and len({a, b}) == 1
+    assert json.loads(a.args_json) == {"q": "refund", "k": 3}
+
+def test_step_is_slotted_keyword_only_and_quiet_in_logs():
+    s = step()
+    assert not hasattr(s, "__dict__")
+    assert "xxxx" not in repr(s) and "output=" not in repr(s)
+    with pytest.raises(TypeError):
+        ToolStep(0, "search", "{}", "out", 1, 1)
+
+def test_retry_is_a_new_record():
+    s = step(tokens=1800)
+    r = retry_of(s, input_tokens=2400)
+    assert (r.index, r.input_tokens, s.index, s.input_tokens) == (1, 2400, 0, 1800)
+
+def test_budget_tokens_and_repeats():
+    run = Run("t", max_steps=3)
+    for i in range(3):
+        run.record(step(i, tokens=100))
+    with pytest.raises(BudgetExceeded, match="step budget of 3 exhausted"):
+        run.record(step(3))
+    assert run.tokens == 330
+    assert run.repeats() == {("search", '{"k": 3, "q": "refund"}'): 3}
+    assert Run("a").steps is not Run("b").steps
+
+def test_trace_keeps_outputs():
+    run = Run("t"); run.record(step())
+    assert len(json.loads(to_trace(run))["steps"][0]["output"]) == 40_000
+```
+
+### Failure scenarios
+- **Dump args without `sort_keys=True`.** the same arguments in key order `q, k` and `k, q` give different text, so the
+  two steps compare unequal and the loop goes unnoticed. Print both `args_json` values side by side.
+- **Store `args: dict[str, object]` on the frozen step.** Construction works, but `{a, b}` raises
+  `TypeError: unhashable type: 'dict'`, because the generated hash covers every field. The traceback
+  points at the set or `Counter`, not the class.
+- **Write `step.index += 1` in `retry_of`.** It raises `FrozenInstanceError`; on a non-frozen class it
+  would silently rewrite history. Use `dataclasses.replace`.
+- **Forget `repr=False` on `output`.** Every log line carries 40 KB; `repr(step)` in the test contains
+  the payload. Check the length of `repr(step)` in a log.
+
+### Submission
+- **`lab.py` and `test_lab.py`,** with the `python -m pytest -q` output showing 5 passed.
+- **The output of `python lab.py`,** matching the expected block, and a hand check of the token total.
+- **One extension:** an `alert_on` threshold so `Run.record` raises when the same `(tool, args_json)`
+  appears three times, with a test.
+- **A note of 2-3 sentences:** which inputs to this run you would validate with Pydantic before they
+  become `ToolStep`s, and why the dataclass itself does not check them.
+- **Evaluation:** tests pass unmodified, no step is ever mutated after creation, and the repeat count
+  survives key reordering.
 
 ## Why it exists
 - **Systems fill up with mostly-data classes.** A `GenerationConfig` with a model name and temperature, a

@@ -5,7 +5,8 @@ name: MCP Python SDK
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/model-context-protocol
@@ -36,6 +37,144 @@ and transports. The agents module teaches the protocol.
   model recovers from, the transport, auth, and how many tools you expose per agent.
 - **What you can skip.** Hand-writing JSON-RPC, capability negotiation and transport framing; the SDK
   owns those. Know the lifecycle, the two failure channels and why stdout is sacred on stdio.
+
+## Lab
+### Task
+Finish a FastMCP ticket server that an agent can recover from: tools whose descriptions are written for
+the model, failures returned as actionable `isError` results, and logs that never touch stdout. The
+tests drive it as a host would, over stdio with a real `ClientSession`, plus one raw JSON-RPC exchange.
+Time box: 60 minutes.
+- **Prerequisites:** the async/await lesson and the Pydantic lesson; the agents module's MCP lesson for
+  the protocol.
+- **Setup:** Python 3.10+, `pip install "mcp>=1.30,<2" pytest` (checked against mcp 1.30.0). The 2.x
+  line renamed `FastMCP` to `MCPServer`, so pin below 2 for this lesson's code. Save the starter as
+  `server.py` and the tests as `test_server.py` in the same folder.
+
+### Starter code
+```python
+"""Lab: a ticket MCP server an agent can recover from. Run over stdio: python server.py"""
+import logging
+import sys
+from typing import Literal
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("tickets")
+TICKETS: dict[int, dict] = {42: {"id": 42, "title": "VPN down in Berlin", "status": "open",
+                                 "priority": "high"}}
+log = logging.getLogger("tickets")
+
+# YOUR CODE: configure logging so log lines go to stderr; stdout carries only JSON-RPC.
+
+
+@mcp.tool()
+def get_ticket(ticket_id: int) -> dict:
+    """Write the model-facing description: what it returns and what to do when you only have a title."""
+    raise NotImplementedError("YOUR CODE: return the ticket, or raise an actionable ValueError")
+
+
+# YOUR CODE: a create_ticket(title: str, priority: Literal["low", "high"]) tool that stores a new
+# ticket with status "open", logs "created ticket <id>" through `log`, and returns the ticket.
+
+
+if __name__ == "__main__":
+    mcp.run()                              # stdio transport
+```
+
+### Expected output
+Key lines a correct solution produces (your wording of the error may differ, but it must name the id
+and `create_ticket`):
+```
+$ pytest -q test_server.py
+....                                                                     [100%]
+4 passed
+
+get_ticket(7)  -> isError=True  "Error executing tool get_ticket: ticket 7 does not exist; known ids: [42]. To report a new issue call create_ticket."
+create_ticket(priority="urgent") -> isError=True  "... priority  Input should be 'low' or 'high' ..."
+```
+On the starter all four tests fail: the tool list lacks `create_ticket` and `get_ticket` raises
+`NotImplementedError`.
+
+### Tests
+```python
+import asyncio, json, subprocess, sys
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+PARAMS = StdioServerParameters(command=sys.executable, args=["server.py"])
+
+
+async def session_calls(*calls):
+    async with stdio_client(PARAMS) as (read, write), ClientSession(read, write) as s:
+        await s.initialize()
+        tools = {t.name: t for t in (await s.list_tools()).tools}
+        results = [await asyncio.wait_for(s.call_tool(n, a), 10) for n, a in calls]
+        return tools, results
+
+
+def text(res):
+    return "".join(c.text for c in res.content if c.type == "text")
+
+
+def test_tool_list_and_schema():
+    tools, _ = asyncio.run(session_calls())
+    assert set(tools) == {"get_ticket", "create_ticket"}
+    assert tools["create_ticket"].inputSchema["properties"]["priority"]["enum"] == ["low", "high"]
+    assert all(len(t.description or "") > 30 for t in tools.values())     # written for the model
+
+
+def test_found_missing_and_created():
+    _, (found, missing, created, again) = asyncio.run(session_calls(
+        ("get_ticket", {"ticket_id": 42}), ("get_ticket", {"ticket_id": 7}),
+        ("create_ticket", {"title": "Printer jam", "priority": "low"}),
+        ("get_ticket", {"ticket_id": 43})))
+    assert not found.isError and json.loads(text(found))["status"] == "open"
+    assert missing.isError and "7" in text(missing) and "create_ticket" in text(missing)
+    assert not created.isError and json.loads(text(created))["id"] == 43
+    assert json.loads(text(again))["title"] == "Printer jam"
+
+
+def test_bad_argument_comes_back_as_tool_error():
+    _, (res,) = asyncio.run(session_calls(("create_ticket", {"title": "x", "priority": "urgent"})))
+    assert res.isError and "'low' or 'high'" in text(res)     # the model learns the legal values
+
+
+def test_stdout_is_only_json_rpc_and_logs_go_to_stderr():
+    lines = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "t", "version": "0"}}},
+             {"jsonrpc": "2.0", "method": "notifications/initialized"},
+             {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                "name": "create_ticket", "arguments": {"title": "VPN", "priority": "high"}}}]
+    p = subprocess.run([sys.executable, "server.py"], capture_output=True, text=True, timeout=20,
+                       input="".join(json.dumps(m) + "\n" for m in lines))
+    out = [json.loads(line) for line in p.stdout.splitlines()]   # any stray print fails here
+    assert out[-1]["id"] == 2 and "created ticket 43" in p.stderr
+```
+
+### Failure scenarios
+- **Add `print("debug", tid, flush=True)` inside `create_ticket`.** The three `ClientSession` tests still
+  pass, because this SDK client skips the unparseable line, but the raw stdout test fails with
+  `JSONDecodeError`; stricter hosts drop the connection. Debug by running the raw exchange and reading
+  stdout line by line.
+- **Raise `Exception("failed")` for a missing ticket.** The call is still `isError`, but the
+  assertion on `create_ticket` in the message fails; in a live agent the model retries the same id. Debug
+  by printing `text(missing)` exactly as the model would see it.
+- **Type `priority` as plain `str`.** The schema loses its `enum` and `"urgent"` is accepted. Debug by
+  printing `inputSchema`, or open it in `mcp dev server.py`.
+- **Call `sys.exit(1)` for a missing ticket.** `SystemExit` is not an `Exception`, so FastMCP does not
+  turn it into `isError`: no result ever arrives and the test fails at its 10 s `asyncio.wait_for`.
+  Debug from the server's stderr traceback; this is why tests need a timeout per call.
+
+### Submission
+- **`server.py`** passing the four tests unmodified, with model-facing docstrings on both tools.
+- **The `pytest -q` output** and the stderr captured from the raw test showing `created ticket 43`.
+- **The `list_tools()` snapshot** (names, descriptions, `inputSchema`) saved as JSON, ready to become the
+  CI contract test from Production patterns.
+- **One paragraph** on which failures go back to the model as `isError` and which your agent loop must
+  handle in code.
+- **Evaluated on:** an error message an agent can act on, a schema whose enum matches the hint, and zero
+  non-JSON bytes on stdout.
 
 ## Why it exists
 - **Every host defined tools its own way.** An OpenAI function schema here, a LangChain tool class there,

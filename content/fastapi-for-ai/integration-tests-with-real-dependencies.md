@@ -5,7 +5,8 @@ name: Integration tests with real dependencies
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/testclient-plus-pytest-asyncio
@@ -39,6 +40,201 @@ dimensions or TTLs. The LLM is the exception: use recordings.
   real-dependency tests, and how often the live-model contract suite runs.
 - **What you can skip.** Container orchestration details. Know session-scoped containers, readiness,
   migrations-not-`create_all`, and the rollback-vs-truncate rule.
+
+## Lab
+### Task
+Build the integration-test harness for an agent's RAG tool: a migrated database created once per
+session, a per-test session bound to an outer transaction that is always rolled back (even when the
+handler commits), a fix for a tenant leak in the retrieval query, and a model call replayed from a
+recording. Time box: 60-90 minutes.
+- **Prerequisites:** the TestClient + pytest-asyncio lesson and the rollback isolation section below.
+- **Setup:** `pip install fastapi httpx sqlalchemy pytest`; checked with SQLAlchemy 2.1, FastAPI 0.161,
+  httpx 0.28 and Python 3.12.
+- **Why SQLite here:** a SQLite file stands in for the pgvector container so the lab runs without
+  Docker. Rollback isolation, tenant scoping and recordings behave the same; dialect bugs and the
+  `atttypmod` dimension check need the real container from the first example, which you swap into the
+  `engine` fixture afterwards.
+- **Save** the starter as `lab.py` and the tests as `test_lab.py`, then run `pytest -q`.
+
+### Starter code
+```python
+"""Lab: integration-test an agent's retrieval tool with per-test rollback and a recorded LLM.
+Needs fastapi, httpx and sqlalchemy>=2.0. A SQLite file stands in for the Postgres container so
+the lab runs without Docker; the isolation pattern and the SQL are the same on Postgres."""
+from contextlib import contextmanager
+import httpx
+from fastapi import Depends, FastAPI
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.orm import Session
+
+MIGRATIONS = [   # stands in for `alembic upgrade head`: the schema comes from migrations
+    "CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT NOT NULL)",
+    "CREATE TABLE chunks (id INTEGER PRIMARY KEY, tenant_id TEXT NOT NULL, body TEXT NOT NULL,"
+    " e0 REAL, e1 REAL, e2 REAL)",   # a 3-dim embedding; pgvector would use vector(1024)
+]
+
+def make_engine(url: str):
+    eng = create_engine(url)
+    if url.startswith("sqlite"):          # SQLAlchemy's documented recipe for SAVEPOINT on pysqlite
+        @event.listens_for(eng, "connect")
+        def _connect(dbapi_conn, _):
+            dbapi_conn.isolation_level = None
+        @event.listens_for(eng, "begin")
+        def _begin(conn):
+            conn.exec_driver_sql("BEGIN")
+    return eng
+
+def migrate(eng) -> None:
+    with eng.begin() as conn:
+        for ddl in MIGRATIONS:
+            conn.exec_driver_sql(ddl)
+
+@contextmanager
+def isolated_session(eng):
+    # LAB 1: connect, begin an outer transaction that is never committed, bind a
+    # Session(bind=conn, join_transaction_mode="create_savepoint") to it, yield the session,
+    # then close the session and roll the outer transaction back.
+    raise NotImplementedError("lab step 1: isolated_session")
+    yield
+
+def get_session():                         # the app's real dependency; tests override it
+    raise RuntimeError("no database configured")
+
+app = FastAPI()
+
+@app.post("/docs", status_code=201)
+def create_doc(body: dict, s: Session = Depends(get_session)):
+    s.execute(text("INSERT INTO docs (title) VALUES (:t)"), {"t": body["title"]})
+    s.commit()                             # real handlers commit; the test must still roll back
+    return {"ok": True}
+
+def search_chunks(s: Session, tenant: str, qvec: list[float], k: int = 2) -> list[dict]:
+    """The agent's retrieval tool: nearest chunks by dot product, for this tenant only."""
+    # LAB 2: this query has the bug a fake vector store never catches. Fix it.
+    rows = s.execute(text(
+        "SELECT body, tenant_id FROM chunks "
+        "ORDER BY (e0*:q0 + e1*:q1 + e2*:q2) DESC LIMIT :k"),
+        {"q0": qvec[0], "q1": qvec[1], "q2": qvec[2], "k": k}).all()
+    return [{"body": b, "tenant": t} for b, t in rows]
+
+def answer(s: Session, http: httpx.Client, tenant: str, q: str, qvec: list[float]) -> str:
+    """RAG step: retrieve, then one model call. In tests the model is a recorded response."""
+    context = "\n".join(h["body"] for h in search_chunks(s, tenant, qvec))
+    r = http.post("/v1/complete", json={"prompt": f"Context:\n{context}\n\nQuestion: {q}"})
+    r.raise_for_status()
+    return r.json()["text"]
+
+if __name__ == "__main__":
+    import os, tempfile
+    path = os.path.join(tempfile.mkdtemp(), "lab.db")
+    eng = make_engine(f"sqlite:///{path}")
+    migrate(eng)
+    try:
+        for run in (1, 2):
+            with isolated_session(eng) as s:
+                s.execute(text("INSERT INTO docs (title) VALUES ('Refund policy')"))
+                s.commit()
+                n = s.execute(text("SELECT count(*) FROM docs")).scalar_one()
+                print(f"run {run}: docs inside test={n}")
+        with eng.connect() as c:
+            print(f"docs after both runs: {c.execute(text('SELECT count(*) FROM docs')).scalar_one()}")
+    except NotImplementedError as e:
+        print(f"not done yet: {e}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints:
+
+```
+run 1: docs inside test=1
+run 2: docs inside test=1
+docs after both runs: 0
+```
+
+### Tests
+```python
+import json
+import httpx, pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import text
+import lab
+
+CASSETTE = {   # recorded once from the real provider, replayed on every run
+    "/v1/complete": {"status": 200, "json": {"text": "Refunds take 5 days."}},
+}
+
+@pytest.fixture(scope="session")
+def engine(tmp_path_factory):
+    # Real run: PostgresContainer("pgvector/pgvector:pg16") plus alembic upgrade head.
+    eng = lab.make_engine(f"sqlite:///{tmp_path_factory.mktemp('db') / 'test.db'}")
+    lab.migrate(eng)
+    yield eng
+    eng.dispose()
+
+@pytest.fixture
+def session(engine):
+    with lab.isolated_session(engine) as s:
+        lab.app.dependency_overrides[lab.get_session] = lambda: s
+        yield s
+        lab.app.dependency_overrides.clear()
+
+def seed(s):
+    for tenant, body, vec in [("t1", "refunds take 5 days", (1, 0, 0)),
+                              ("t1", "shipping is free", (0, 1, 0)),
+                              ("t2", "t2 secret refund rule", (1, 0, 0))]:
+        s.execute(text("INSERT INTO chunks (tenant_id, body, e0, e1, e2) VALUES (:t, :b, :x, :y, :z)"),
+                  {"t": tenant, "b": body, "x": vec[0], "y": vec[1], "z": vec[2]})
+
+@pytest.mark.parametrize("run", [1, 2])     # the second run fails if the first one leaked
+def test_handler_commit_is_rolled_back(session, run):
+    with TestClient(lab.app) as client:
+        assert client.post("/docs", json={"title": "Refund policy"}).status_code == 201
+    assert session.execute(text("SELECT count(*) FROM docs")).scalar_one() == 1
+
+def test_search_is_nearest_and_tenant_scoped(session):
+    seed(session)
+    hits = lab.search_chunks(session, "t1", [1.0, 0.0, 0.0], k=2)
+    assert hits[0]["body"] == "refunds take 5 days"
+    assert {h["tenant"] for h in hits} == {"t1"}
+
+def test_answer_replays_recording_and_sends_only_tenant_context(session):
+    seed(session)
+    sent = []
+    def replay(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content))
+        rec = CASSETTE[request.url.path]
+        return httpx.Response(rec["status"], json=rec["json"])
+    with httpx.Client(base_url="http://llm.test", transport=httpx.MockTransport(replay)) as http:
+        out = lab.answer(session, http, "t1", "How long do refunds take?", [1.0, 0.0, 0.0])
+    assert out == "Refunds take 5 days."
+    assert "t2 secret" not in sent[0]["prompt"]          # no cross-tenant leak into the model
+```
+
+On the starter all four error in the `session` fixture with `NotImplementedError`. With only LAB 1
+done, the two retrieval tests fail on the `t2` chunk; a correct solution passes all four.
+
+### Failure scenarios
+- **Bind the session without an outer transaction.** `test_handler_commit_is_rolled_back[2]` fails with
+  a count of 2: the handler's `commit()` persisted, so test order now matters. Debug by counting rows
+  directly on a fresh `engine.connect()` after a test.
+- **Leave the tenant filter out.** The `t2` chunk scores as high as the `t1` one, so it lands in the
+  hits and in the prompt sent to the model; this is the leak a fake store hides. Debug by printing the
+  `tenant` of every hit.
+- **Replace the recording with a real provider call.** The suite becomes slow, billed and
+  non-deterministic; block outbound network in CI so such a test fails at once.
+- **Read the seeded rows from a second connection,** as a background worker would, with its own
+  `engine.connect()`. It sees none of them, because they are uncommitted: the case where rollback
+  isolation stops working and you switch to truncation.
+
+### Submission
+- `lab.py` with both lab steps done, and `test_lab.py` unchanged.
+- A `pytest -q` run showing 4 passed, plus `python lab.py` matching the expected output.
+- The same suite run against a pgvector container (swap the `engine` fixture as in the first example),
+  or a note on what blocked it.
+- A one-paragraph note: which of your agent's tools need a real-dependency test, and which isolation
+  strategy each needs.
+- Evaluation: every test leaves the database empty, no hit or prompt contains another tenant's data, and
+  no test calls a live model.
 
 ## Why it exists
 - **AI services lean on infrastructure with real semantics.** Postgres with JSONB queries and row locks,

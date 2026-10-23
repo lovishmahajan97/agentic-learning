@@ -5,7 +5,8 @@ name: Tenant isolation
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/multi-tenancy
@@ -39,6 +40,60 @@ indexes and memory, run-scoped credentials, sandboxes, quotas.
   retrieval or prompt change.
 - **What you can skip.** Writing your own crypto or policy engine. Use the database's row security, your
   vector store's namespaces and your secrets manager; spend the effort on tests that prove they hold.
+
+## Decision case
+### Scenario
+A support-agent platform keeps documents, embeddings and agent memory for all tenants in one PostgreSQL
+database with pgvector, behind a transaction-mode pooler. A bank in the sales pipeline sends a security
+questionnaire. All figures are illustrative.
+- **Tenants:** 1,200 pooled tenants; 1,150 have under 5,000 chunks each, 50 have over a million.
+- **Schema:** 6 tenant-scoped tables (documents, chunks, memory, checkpoints, tool results, files).
+- **Database:** configured for 500 connections.
+- **Constraints:** the questionnaire requires at least two independent controls between tenants, with
+  evidence; agents read untrusted documents, so prompt injection is in scope; 5 engineers; 8 weeks to
+  the bank's review; retrieval recall must not drop for small tenants.
+
+### Options
+| Option | How it works | Independent data layers | Operational load | Fit with pooler and recall |
+|---|---|---|---|---|
+| A. App filter plus tests | Every query adds `WHERE tenant_id = ...`; unit tests check it | 1: fails the questionnaire | Lowest | Fine |
+| B. Run-bound tools, mandatory client filter, RLS | Tenant from the run, never a tool argument; required tenant parameter in the retrieval client; `FORCE ROW LEVEL SECURITY` with `SET LOCAL`; canary probe | 2 (client filter and RLS), plus run binding | One policy per table, 6 in total | Works with transaction pooling; small tenants may get fewer than k rows from HNSW |
+| C. Schema per tenant with per-tenant roles | 1,200 schemas, each with its own database role | 2, and survives a compromised app | 1,200 × 6 = 7,200 tables, 1,200 migrations per release, 1,200 roles | Pools are per role: even 1 server connection each needs 1,200, over the 500 limit |
+
+### Decision
+Choose **B, with dedicated partitions for the 50 large tenants**, because:
+- **It meets the two-layer requirement with evidence:** the client filter and RLS fail independently, and
+  the canary probe plus negative CI tests are the artefacts the bank asked for.
+- **It survives the pooler:** `SET LOCAL` scopes the tenant to one transaction, and a missing setting
+  returns zero rows, so the failure is empty, not a leak.
+- **C does not fit the constraints:** 1,200 per-tenant roles need more pooled connections than the
+  database allows, and 1,200 migrations per release is too much for 5 engineers.
+- **Recall is solved structurally:** partitioning the 50 large tenants keeps HNSW search inside their
+  own data, while the 1,150 small tenants use iterative index scans (pgvector 0.8 and later).
+
+**What would change it:** a contract that must withstand SQL injection or full application compromise
+would justify C or a silo for that tenant only, with its own credentials. An agent tool that runs
+free-form SQL would also force per-tenant credentials.
+
+### Trade-offs accepted
+- **RLS trusts the setting.** A compromised app can name another tenant. Watch: roles holding
+  `BYPASSRLS` (should be tiny) and SQL-injection findings from scans.
+- **Policies add a predicate to every query.** Watch: p95 query latency per table after rollout, and
+  that composite indexes lead with `tenant_id`.
+- **Filtered HNSW can return fewer than k rows.** Watch: share of searches returning fewer than k rows
+  for small tenants, from the retrieval client.
+- **Cross-tenant analytics becomes a privileged path.** Watch: queries run on the replica's analytics
+  role, reviewed monthly.
+
+### Review rubric
+- **Every isolation dimension gets a named control**, including memory, caches, tool credentials and
+  telemetry, not only the documents table.
+- **Two independent layers are shown for each data path**, with the failure each catches that the other
+  misses.
+- **The model never chooses the tenant:** tool schemas carry no tenant or credential field.
+- **The pooler and connection limits are checked** against the option, with the arithmetic shown.
+- **Evidence is planned:** a canary probe and negative tests, with what they would output.
+- **Reversal triggers are concrete**, naming the threat that would justify per-tenant credentials.
 
 ## Why it exists
 - **Some layer, some day, will not respect the tenant.** Multi-tenancy tells every layer to; isolation is

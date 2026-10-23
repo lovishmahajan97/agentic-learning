@@ -5,7 +5,8 @@ name: Async cancellation & exception propagation
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/asyncio
@@ -38,6 +39,144 @@ depend on it, so swallowing it breaks deadlines and leaves tools running.
   step, and shielding only short critical writes such as an audit record.
 - **What you can skip.** The internals of `Task.uncancel()` bookkeeping and the pre-3.12 `wait_for`
   implementation. Know the contract, the TaskGroup versus gather table and how to test it.
+
+## Lab
+### Task
+Repair an agent turn that cannot be stopped. The starter's tool wrapper swallows every exception
+(including `CancelledError`), and the turn uses `gather` with no deadline, so Stop, the turn budget and
+fatal tool errors are all ignored. Time box: 60 minutes. Do **asyncio** and **async / await** first.
+- **Goal:** a cancelled tool reports cancelled, the turn raises `TimeoutError` at its deadline, a
+  `FatalToolError` cancels the siblings, and ordinary tool errors still come back as strings.
+- **Check after every scenario:** `in_flight` is empty, meaning no connection was left open.
+- **Constraints:** standard library only; Python 3.11+. Checked on Python 3.12.14 with pytest 9.1.
+
+### Starter code
+Save as `lab_cancel.py`. It runs as given: the deadline turn takes 3.0 s and the fatal turn 1.0 s.
+
+```python
+import asyncio, time
+
+in_flight: set[str] = set()                 # open upstream connections, by tool name
+
+class FatalToolError(Exception):
+    """The tool result makes the rest of the turn pointless (bad schema, auth revoked)."""
+
+async def fake_tool(name, delay, fail=None):
+    in_flight.add(name)
+    try:
+        await asyncio.sleep(delay)          # stands in for an HTTP call or model stream
+        if fail is not None:
+            raise fail
+        return f"{name}: ok"
+    finally:
+        in_flight.discard(name)             # connection back to the pool
+
+async def call_tool(name, delay, fail=None):
+    """Every tool goes through this wrapper: ordinary errors become a string for the model."""
+    try:
+        return await fake_tool(name, delay, fail)
+    except BaseException as e:              # LAB 1: swallows CancelledError and FatalToolError too
+        return f"error: {e!r}"
+
+async def run_turn(specs, deadline):
+    """Run (name, delay[, fail]) tools concurrently and return their results in order.
+    LAB 2: the whole turn must raise TimeoutError after `deadline` seconds.
+    LAB 3: a FatalToolError must cancel the sibling tools and propagate (as an ExceptionGroup)."""
+    return await asyncio.gather(*(call_tool(*s) for s in specs))
+
+async def main():
+    print(await run_turn([("retriever", 0.1), ("calc", 0.05, ValueError("bad input"))], deadline=1.0))
+    for specs in ([("llm", 3.0)], [("calc", 0.1, FatalToolError("schema mismatch")), ("search", 1.0)]):
+        t0 = time.perf_counter()
+        try:
+            outcome = f"results {await run_turn(specs, deadline=0.3)}"
+        except TimeoutError:
+            outcome = "deadline exceeded"
+        except ExceptionGroup as eg:
+            outcome = f"fatal: {eg.exceptions[0]!r}"
+        print(f"{outcome} after {time.perf_counter() - t0:.1f}s, open connections: {sorted(in_flight)}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Expected output
+```
+['retriever: ok', "error: ValueError('bad input')"]
+deadline exceeded after 0.3s, open connections: []
+fatal: FatalToolError('schema mismatch') after 0.1s, open connections: []
+```
+
+### Tests
+Save as `test_lab_cancel.py` and run `pytest -q`. On the starter three fail: the cancelled task
+returns `'error: CancelledError()'`, and the deadline and fatal turns raise nothing. The other two guard
+the partial-results behaviour you must keep.
+
+```python
+import asyncio, time
+import pytest
+import lab_cancel as lab
+
+def test_wrapper_lets_cancellation_through():
+    async def scenario():
+        t = asyncio.create_task(lab.call_tool("llm", 5.0))
+        await asyncio.sleep(0.05)
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        return t
+    t = asyncio.run(scenario())
+    assert t.cancelled(), f"cancelled tool reported a result: {t.result()!r}"
+    assert lab.in_flight == set()
+
+def test_ordinary_error_is_returned_to_the_model():
+    out = asyncio.run(lab.call_tool("calc", 0.01, ValueError("bad input")))
+    assert out == "error: ValueError('bad input')"
+
+def test_turn_deadline_fires():
+    t0 = time.perf_counter()
+    with pytest.raises(TimeoutError):
+        asyncio.run(lab.run_turn([("retriever", 0.05), ("llm", 2.0)], deadline=0.2))
+    assert time.perf_counter() - t0 < 0.6
+    assert lab.in_flight == set(), "a tool was left running after the deadline"
+
+def test_fatal_error_cancels_siblings():
+    t0 = time.perf_counter()
+    with pytest.raises(ExceptionGroup) as info:
+        asyncio.run(lab.run_turn([("calc", 0.05, lab.FatalToolError("schema mismatch")),
+                                  ("search", 1.0)], deadline=2.0))
+    assert info.value.subgroup(lab.FatalToolError) is not None
+    assert time.perf_counter() - t0 < 0.5, "siblings ran to completion instead of being cancelled"
+    assert lab.in_flight == set()
+
+def test_partial_results_still_work():
+    out = asyncio.run(lab.run_turn([("retriever", 0.05), ("calc", 0.01, ValueError("x"))], deadline=1.0))
+    assert out == ["retriever: ok", "error: ValueError('x')"]
+```
+
+### Failure scenarios
+- **Inject a swallow inside the timeout's own task:** `try: await asyncio.sleep(5) except
+  asyncio.CancelledError: return None` directly in `run_turn`. The deadline test fails with "DID NOT
+  RAISE". Debug: the timeout converts only a `CancelledError` that reaches its exit; grep for handlers
+  that catch it without `raise`.
+- **Inject `gather(..., return_exceptions=True)` in place of the TaskGroup.** The fatal test fails with
+  "DID NOT RAISE": the error comes back as a list item and the turn takes about 1.0 s, because siblings
+  are never cancelled. Debug: time the turn and log which tools finished after the fatal one.
+- **Remove the `finally` from `fake_tool`.** Every cancel test fails on `in_flight`. Debug: cancellation
+  unwinds only through `finally` and `async with`, so cleanup placed after the `await` never runs.
+- **Re-raise `FatalToolError` but catch it again in `main` with `except FatalToolError`.** Nothing matches,
+  because the TaskGroup wraps it. Debug: print `type(e)`, then use `except*` or `ExceptionGroup.subgroup`.
+
+### Submission
+- **Your `lab_cancel.py`** with the three LAB markers resolved.
+- **A `pytest -q` run** showing 5 passed, plus the starter run's failing output, in `NOTES.md`.
+- **The printed output of the fixed script**, matching the expected block.
+- **One paragraph:** why `except Exception` is safe here on Python 3.8+ but `except BaseException` is
+  not, and why the TaskGroup reports an `ExceptionGroup` rather than the bare error.
+- **Evaluation:** tests pass, `CancelledError` is never caught without re-raise, and the turn owns its
+  deadline with `asyncio.timeout` around a `TaskGroup`.
 
 ## Why it exists
 - **Concurrent work must stop cleanly.** An agent turn runs three tool calls and a retrieval query; then

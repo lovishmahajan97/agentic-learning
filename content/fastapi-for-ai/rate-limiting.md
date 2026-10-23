@@ -5,7 +5,8 @@ name: Rate limiting (slowapi)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/api-keys-oauth2-jwt
@@ -39,6 +40,159 @@ Redis, returning 429; build token budgets beside it.
   run budget, or stop and report.
 - **What you can skip.** Choosing between fine-grained window algorithms on day one; a fixed window for
   run admission plus a token budget covers most agent products.
+
+## Lab
+### Task
+Cap both how many agent runs a customer starts and how many tokens those runs burn. You key slowapi's
+admission limit by API key instead of IP, make its 429 carry `Retry-After`, and build the per-step
+reserve-and-reconcile token budget so a long run pauses at the step that would overspend.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** API keys / OAuth2 / JWT, concurrency limits, and this lesson's "Limits for agent
+  runs".
+- **Runs offline:** in-memory storage (`memory://`) and a fake model whose prompt grows 2k tokens per
+  step; an injectable clock replaces waiting a real minute.
+- **Needs:** `fastapi`, `httpx`, `slowapi`, `pytest`; checked with slowapi 0.1.10 (limits 5.8.0) on
+  FastAPI 0.115.6 and 0.161.1, Python 3.12.
+
+### Starter code
+```python
+# limits_lab.py: run admission per API key (slowapi) plus a per-step token budget for an agent
+import hashlib, time
+from fastapi import FastAPI, Request, Response
+from fastapi.testclient import TestClient
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+
+TENANT_TPM = 40_000           # tokens per minute per tenant
+MAX_TOKENS = 1_024            # max_tokens per model step
+MAX_STEPS = 12
+
+def caller(request: Request) -> str:
+    """Limiter key for this request."""
+    # YOUR CODE: key by a hash of the X-API-Key header (fall back to the IP when it is absent)
+    return get_remote_address(request)
+
+class TokenBudget:
+    """Fixed one-minute windows of reserved tokens per tenant (Redis INCRBY in production)."""
+    def __init__(self, tpm: int, clock=time.time):
+        self.tpm, self.clock, self.used = tpm, clock, {}
+    def _key(self, tenant: str):
+        return (tenant, int(self.clock() // 60))
+    def reserve(self, tenant: str, est: int) -> bool:
+        # YOUR CODE: add est to this window; if that exceeds tpm, release it and return False
+        return True
+    def reconcile(self, tenant: str, est: int, actual: int) -> None:
+        # YOUR CODE: correct this window by (actual - est) once the provider reports usage
+        pass
+
+def fake_llm(step: int) -> dict:
+    """A model step: the transcript grows ~2k tokens per step; replies use 500 fewer than reserved."""
+    prompt = 6_000 + 2_000 * step
+    return {"prompt_tokens": prompt, "usage": prompt + MAX_TOKENS - 500, "tool_calls": [{"name": "search"}]}
+
+def run_agent(budget: TokenBudget, tenant: str) -> dict:
+    for step in range(MAX_STEPS):
+        est = 6_000 + 2_000 * step + MAX_TOKENS       # prompt so far plus max_tokens
+        # YOUR CODE: reserve est before the call; return {"status": "paused", "step": step} if refused
+        reply = fake_llm(step)
+        # YOUR CODE: reconcile with reply["usage"]
+    return {"status": "stopped", "reason": "step cap"}
+
+def build_app(budget: TokenBudget | None = None) -> FastAPI:
+    # YOUR CODE: make 429s carry Retry-After (slowapi only sends it when asked to)
+    limiter = Limiter(key_func=caller, storage_uri="memory://")
+    app = FastAPI()
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    budget = budget or TokenBudget(TENANT_TPM)
+
+    @app.post("/v1/agent/runs")
+    @limiter.limit("3/minute")                        # runs, not model calls
+    async def start_run(request: Request, response: Response):
+        return run_agent(budget, caller(request))
+    return app
+
+if __name__ == "__main__":
+    c = TestClient(build_app())
+    codes = [c.post("/v1/agent/runs", headers={"X-API-Key": "sk_a"}).status_code for _ in range(4)]
+    other = c.post("/v1/agent/runs", headers={"X-API-Key": "sk_b"})
+    last = c.post("/v1/agent/runs", headers={"X-API-Key": "sk_a"})
+    print("key A:", codes, "| key B:", other.status_code, "| Retry-After:", last.headers.get("retry-after"))
+    print("run:", run_agent(TokenBudget(TENANT_TPM), "t_1"))
+```
+
+As given it prints `key B: 429 | Retry-After: None` (every test client shares one IP bucket) and
+`run: {'status': 'stopped', 'reason': 'step cap'}`, because nothing counts tokens.
+
+### Expected output
+```
+key A: [200, 200, 200, 429] | key B: 200 | Retry-After: 60
+run: {'status': 'paused', 'step': 4}
+```
+
+`Retry-After` is the seconds until the window resets, so it can read 59 on a slow machine.
+
+### Tests
+```python
+# test_limits_lab.py: run with `pytest -q`
+from fastapi.testclient import TestClient
+from limits_lab import TENANT_TPM, TokenBudget, build_app, run_agent
+
+def post(c, key):
+    return c.post("/v1/agent/runs", headers={"X-API-Key": key})
+
+def test_admission_is_per_api_key():
+    c = TestClient(build_app())
+    assert [post(c, "sk_a").status_code for _ in range(4)] == [200, 200, 200, 429]
+    assert post(c, "sk_b").status_code == 200          # another customer is unaffected
+
+def test_429_tells_the_client_when_to_come_back():
+    c = TestClient(build_app())
+    for _ in range(3):
+        post(c, "sk_a")
+    r = post(c, "sk_a")
+    assert r.status_code == 429 and int(r.headers["retry-after"]) > 0
+
+def test_rejected_reservation_is_released():
+    b = TokenBudget(40_000, clock=lambda: 0)
+    assert b.reserve("t", 30_000) is True
+    assert b.reserve("t", 15_000) is False
+    assert b.reserve("t", 10_000) is True               # the 15k was not left behind
+
+def test_window_resets_each_minute():
+    now = [0.0]
+    b = TokenBudget(40_000, clock=lambda: now[0])
+    assert b.reserve("t", 40_000) and not b.reserve("t", 1)
+    now[0] = 60.0
+    assert b.reserve("t", 1)
+
+def test_run_pauses_at_the_step_that_would_overspend():
+    # reserved 7,024 + 9,024 + 11,024 + 13,024 = 40,096 > 40,000 without reconciling;
+    # reconciling 500 tokens back per step lets step 3 fit, so the run pauses at step 4
+    assert run_agent(TokenBudget(TENANT_TPM, clock=lambda: 0), "t_1") == {"status": "paused", "step": 4}
+```
+
+All five fail on the starter: shared IP bucket, no `Retry-After` header, and a budget that never says no.
+
+### Failure scenarios
+- **Inject a missing reconcile.** The run pauses at step 3 instead of 4: reservations of 7,024 +
+  9,024 + 11,024 + 13,024 reach 40,096. Debug by logging reserved minus actual per step; a constant
+  positive gap means estimates are never corrected.
+- **Inject a missing release:** keep the rejected `est` in the window. `test_rejected_reservation` fails
+  and later small steps are refused too. Print the window's total after each refusal.
+- **Inject `headers_enabled=True` but drop `response: Response`** from the endpoint. Every call becomes
+  a 500 with slowapi's "parameter `response` must be an instance of starlette.responses.Response".
+- **Key on any header value:** send ten random `X-API-Key` values. All get 200, because each mints a
+  fresh bucket. Count distinct limiter keys per minute; production keys on the validated principal.
+
+### Submission
+- **Your `limits_lab.py`** with `caller`, `TokenBudget` and the budgeted `run_agent` done.
+- **A `pytest -q` run** showing 5 passed.
+- **The script's printed output**, matching the expected lines.
+- **A short note** on what changes with 4 uvicorn workers (move both counters to Redis, make
+  reserve atomic) and how you would set tenant TPM so the sum fits the provider quota.
+- **Evaluated on:** green tests, released rejections, reconciled usage, and admission keyed by credential.
 
 ## Why it exists
 - **Upstream capacity is fixed.** The provider grants your organisation a requests-per-minute and

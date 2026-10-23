@@ -5,7 +5,8 @@ name: Serverless GPUs
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/keda-autoscaling
@@ -36,6 +37,64 @@ Decide on break-even, gated by the SLO.
   cached volume, and a hybrid base for interactive agents.
 - **What you can skip.** How the provider pools its fleet. Measure cold start by stage and run the
   break-even arithmetic.
+
+## Decision case
+### Scenario
+A 400-person company runs an internal IT-helpdesk agent on a self-hosted 8B model. Rates are the
+illustrative ones from the examples: dedicated L4 $0.80/h ($584 a month), serverless $1.60/h, 45 s
+measured cold start, 5-minute scale-down window.
+- **Traffic:** office hours only, 10 h × 22 workdays. The base container is about 40% busy then (88 busy
+  hours a month). A 2-hour daily peak needs two more containers fully busy (88 container-hours).
+- **Agent shape:** about 6,000 model steps per workday; p95 tool gap 90 s, inside the 5-minute window.
+- **Measured on a scale-to-zero pilot:** 40 cold starts per workday on the base container, each stalling
+  about 3 in-flight steps.
+- **Constraints:** at most 1% of steps may meet a cold start (a 45 s stall breaks the 5 s step p95);
+  GPU budget $800 a month; one engineer, no Kubernetes cluster.
+
+### Options
+| Option | How it works | Monthly cost (illustrative) | Steps meeting a cold start | Ops load |
+|---|---|---|---|---|
+| A. Scale to zero everywhere | All containers serverless, `min_containers=0` | 176 busy + 11 cold + 73 idle h = 260 h ≈ $417 | 120 of 6,000 = 2% | Lowest |
+| B. Serverless with one warm minimum | One container always warm, bursts serverless | 730 × $1.60 + $141 burst + $7 tails ≈ $1,316 | About 0.1% | Low |
+| C. Dedicated base, serverless burst | One L4 VM 24/7 for the base, overflow to serverless | $584 + $141 + $7 ≈ $732 | 2 burst scale-outs × 3 steps = 6 of 6,000, 0.1% | One VM to patch |
+| D. All dedicated | Three L4 VMs sized for the peak | 3 × $584 = $1,752 | None | Three VMs |
+
+The burst line is 88 h × $1.60 ≈ $141; its tails are two containers a day, each paying 45 s start plus a
+5-minute idle window: 44 × 345 s ≈ 4.2 h ≈ $7.
+
+### Decision
+Choose **C**.
+- **SLO:** cold starts touch only the two daily scale-outs, about 0.1% of steps, ten times inside the 1%
+  limit. A fails at 2%.
+- **Budget:** $732 fits under $800; B and D do not.
+- **Why a dedicated base rather than a warm minimum:** both remove base cold starts, but a warm serverless
+  container bills at twice the dedicated rate for the same 730 hours.
+- **Agent fit:** the 90 s p95 tool gap stays inside the window, so burst containers do not go cold
+  mid-run; the base VM also keeps prefix caches warm for long sessions.
+- **Team:** one VM and one serverless function are within one engineer's reach; no cluster is needed.
+
+**What would change it:**
+- **Reliable scheduled start of the base VM:** office hours plus a 1-hour lead is 242 h × $0.80 ≈ $194
+  instead of $584, if morning capacity is guaranteed.
+- **Cold starts tuned well below 45 s:** re-measure A's exposure, since the stall becomes tolerable.
+- **Agents at steady 24/7 volume above 50% busy:** move bursts to dedicated as well.
+
+### Trade-offs accepted
+- **An idle base card at night.** About 510 of 730 hours serve nobody; report base utilisation monthly and
+  revisit scheduled start once it is proven.
+- **Two serving paths.** Base and burst must run the same model, engine and tool-call parser; deploy both
+  from one config and diff them in CI.
+- **Burst capacity is not guaranteed.** Alert on capacity errors from the platform and let the agent
+  retry a capacity error on the base.
+- **Tool gaps can grow.** Track p95 tool gap per agent; past the 5-minute window, cold starts return
+  mid-run.
+
+### Review rubric
+- Measures cold starts per day and steps stalled per cold start, and turns them into a fraction of steps.
+- Includes billed cold-start seconds and idle tails, not only busy hours, in every serverless line.
+- Compares a warm serverless minimum with a dedicated base at their real hourly rates.
+- Checks the scale-down window against the agent's p95 tool gap.
+- States the measured values (cold-start time, utilisation, tool gap) that would flip the choice.
 
 ## Why it exists
 - **A dedicated GPU costs the same idle or busy.** It costs the same per hour whether it serves ten

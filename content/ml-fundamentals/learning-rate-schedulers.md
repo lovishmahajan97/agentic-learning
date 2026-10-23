@@ -5,7 +5,8 @@ name: Learning-rate schedulers
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/warmup
@@ -147,6 +148,21 @@ flowchart TD
     F -->|"t reaches T"| G["Floor: clamp or re-plan"]
     G -.->|"more traces arrive"| H["New schedule, not resume"]
 ```
+
+## Misconceptions
+- **"The scheduler counts what the dataloader yields."** It counts optimizer steps. With gradient
+  accumulation of 8, a horizon sized in micro-batches leaves the run near the peak at the end, and stepping
+  per micro-batch finishes the decay 8× too early.
+- **"The shape (linear vs cosine) is the big decision."** Among reasonable decaying shapes, the peak rate
+  matters more. Sweep the peak by a factor of 2–3 first; compare shapes only after.
+- **"Resuming a finished cosine run with more traces just keeps training."** Past `T` a clamped schedule
+  sits at the floor and barely learns, while an unclamped cosine climbs back towards the peak with no
+  warmup. Extending a run means re-planning the schedule.
+- **"The sharp loss drop late in the run means the model finally understood the task."** It is the noise
+  floor shrinking as η falls. It shows up in every well-scheduled run, so judge the checkpoint on agent
+  evals, not on that drop.
+- **"Adam adapts the step size, so a schedule is unnecessary."** Adam rescales per parameter, but the
+  global scale is still η, and the same noise-floor argument says η must end small.
 
 ## Examples
 ### Sizing the schedule for a tool-calling SFT run

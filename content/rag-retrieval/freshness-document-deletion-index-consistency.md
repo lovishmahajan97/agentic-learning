@@ -5,7 +5,8 @@ name: Freshness, document deletion and index consistency
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -188,7 +189,53 @@ flowchart TD
     I --> A["Agent search tool with version guard"]
 ```
 
+## Misconceptions
+- **"Upserting the new version under the same ids replaces the document."** Only if it has as many
+  chunks as before. A document that shrinks from nine chunks to seven keeps old chunks seven and eight;
+  versioned ids plus a delete of the old version by filter are what remove them.
+- **"A nightly re-crawl keeps the index in sync."** A crawler lists only what exists now, so a deleted
+  document never shows up again and its chunks stay forever. Deletes are found only by diffing a
+  manifest of indexed `doc_id`s against a complete listing.
+- **"The delete call succeeded, so the text is gone."** Many ANN engines delete lazily, and the vector
+  index is one of several derived stores (BM25, parent store, answer caches, agent memory, traces).
+  Only a probe for distinctive text, run against every retrieval leg, proves removal.
+- **"The model will prefer the current passage if both are retrieved."** Two near-identical policy
+  paragraphs look equally authoritative. Enforce the version guard and archive filter in the tool code;
+  `modified_at` in the result is supporting evidence, not the control.
+- **"A content hash catches every change."** It covers text, not metadata: a permission edit leaves the
+  hash unchanged, so ACL refresh needs its own path or must be part of the hash.
+- **"Reconciliation deletes are safe because they mirror the source."** A timed-out or empty listing
+  makes every document look deleted. Require a complete listing and cap the deletion fraction.
+
 ## Examples
+### The shrinking-document orphan, reproduced
+Runnable with plain Python: a dict stands in for the index. A nine-chunk document is edited down to seven.
+
+```python
+index = {}
+
+def upsert_positional(doc_id, chunks):
+    for i, c in enumerate(chunks):
+        index[f"{doc_id}:{i}"] = c                       # overwrite by position
+
+def upsert_versioned(doc_id, version, chunks):
+    for i, c in enumerate(chunks):
+        index[f"{doc_id}:{version}:{i}"] = c             # 1. write new alongside old
+    stale = [k for k in index if k.startswith(f"{doc_id}:") and k.split(":")[1] != version]
+    for k in stale:
+        del index[k]                                     # 3. delete old by filter, not by count
+
+v1 = [f"old para {i}" for i in range(9)]                 # 9 chunks
+v2 = [f"new para {i}" for i in range(7)]                 # edited down to 7 chunks
+
+upsert_positional("policy", v1); upsert_positional("policy", v2)
+print(sorted(v for v in index.values() if v.startswith("old")))  # ['old para 7', 'old para 8']
+
+index.clear()
+upsert_versioned("policy", "v1", v1); upsert_versioned("policy", "v2", v2)
+print(len(index), all(v.startswith("new") for v in index.values()))  # 7 True
+```
+
 ### Agent scenario: a search tool that guards versions and reports freshness
 The agent never sees raw index hits. The tool drops tombstoned and superseded chunks, then returns
 `version` and `modified_at` with each passage so the agent can cite them and your evals can check them.
@@ -266,34 +313,6 @@ def reconcile(source_listing, manifest, tombstones, store, bm25, caches, max_fra
     for doc_id in gone:
         delete_document(store, bm25, caches, doc_id, manifest, tombstones)
     return [d for d in source_listing if d not in manifest]  # never indexed: feed back to index_document
-```
-
-### The shrinking-document orphan, reproduced
-Runnable with plain Python: a dict stands in for the index. A nine-chunk document is edited down to seven.
-
-```python
-index = {}
-
-def upsert_positional(doc_id, chunks):
-    for i, c in enumerate(chunks):
-        index[f"{doc_id}:{i}"] = c                       # overwrite by position
-
-def upsert_versioned(doc_id, version, chunks):
-    for i, c in enumerate(chunks):
-        index[f"{doc_id}:{version}:{i}"] = c             # 1. write new alongside old
-    stale = [k for k in index if k.startswith(f"{doc_id}:") and k.split(":")[1] != version]
-    for k in stale:
-        del index[k]                                     # 3. delete old by filter, not by count
-
-v1 = [f"old para {i}" for i in range(9)]                 # 9 chunks
-v2 = [f"new para {i}" for i in range(7)]                 # edited down to 7 chunks
-
-upsert_positional("policy", v1); upsert_positional("policy", v2)
-print(sorted(v for v in index.values() if v.startswith("old")))  # ['old para 7', 'old para 8']
-
-index.clear()
-upsert_versioned("policy", "v1", v1); upsert_versioned("policy", "v2", v2)
-print(len(index), all(v.startswith("new") for v in index.values()))  # 7 True
 ```
 
 ### Worked scenario: a freshness lag budget for a support agent

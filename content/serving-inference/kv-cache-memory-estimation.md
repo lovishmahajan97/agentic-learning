@@ -5,7 +5,8 @@ name: KV-cache memory estimation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -162,6 +163,26 @@ flowchart TD
     TOK -->|"divide by max_model_len"| GUA["Guaranteed concurrency"]
     TOK -.->|"compare"| LOG["Engine startup log block count"]
 ```
+
+## Misconceptions
+- **"Weights are the memory budget; the rest of the card is headroom."** The rest is the cache pool, and
+  every running request pins a slice of it that grows with its context. On an 80 GB card an 8B fp16
+  model leaves ~52 GB after workspace, about 400k tokens, not unlimited concurrency.
+- **"More attention heads means a bigger cache."** Only KV heads count. Two 7-8B-class models with 32
+  attention heads differ 4x in cache (512 KB vs 128 KB per token) because one has 32 KV heads and the
+  other 8.
+- **"Every request reserves `max_model_len` of cache."** With paged allocation a request holds only what
+  it has generated so far. `max_model_len` bounds the guaranteed concurrency; the p50 length sets the
+  expected one, and the gap between them is where preemption lives.
+- **"Size an agent fleet from chat traffic or step 1."** Transcripts grow every step. The GPU that holds
+  ~132 requests at a 3k p50 holds about 20 agents at the end of a 10-step run and about 9 at a 25-step
+  p95 run.
+- **"Adding tensor parallelism always shrinks per-GPU cache."** It divides KV heads across GPUs only until
+  *T* reaches `n_kv_heads`. With 8 KV heads, TP 16 replicates heads and per-GPU cache stays at 40 KB per
+  token.
+- **"One formula fits every model."** MLA models store one compressed latent per layer (~70 KB per token
+  for DeepSeek-V3), and sliding-window layers cap at *W* tokens. Read the architecture and trust the
+  engine's startup log.
 
 ## Examples
 ### A capacity helper for any Hugging Face config

@@ -5,7 +5,8 @@ name: Error analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -183,6 +184,23 @@ flowchart TD
     P --> G[("Golden items and graders")]
     N -->|"next round, new traffic"| S
 ```
+
+## Misconceptions
+- **"An LLM judge over every trace replaces reading them."** A judge grades only the criteria you wrote,
+  so it cannot report a failure mode nobody has named yet. Humans write the notes first; a judge is built
+  afterwards for each stable category and calibrated against those human labels.
+- **"Count every error in the trace."** Later errors are usually consequences of the first one: a wrong
+  argument at step 2 explains the confused steps after it. Count the first wrong step for attribution and
+  keep secondary failures in their own field.
+- **"Fixing the biggest category gets you to the target."** A category's ceiling is its share of all
+  traces, not of failures. With 13 of 100 traces, a perfect fix buys at most 13 points, so a +20 target
+  needs several fixes, and you know that before writing code.
+- **"The ranking of my categories is the ranking of my problems."** One round's counts are noisy: 7 and 9
+  out of 100 have overlapping intervals, so they are tied. Let severity and fixability break the tie; a
+  single unconfirmed refund outranks ten bad lookups.
+- **"Thumbs-down feedback is a ready-made error sample."** It over-counts what users notice (tone,
+  format) and misses plausible wrong answers they accept. Use a random sample for prevalence and flagged
+  or stratified traces for discovery only.
 
 ## Examples
 ### Worked round on a tool-calling support agent

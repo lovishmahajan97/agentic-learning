@@ -174,6 +174,40 @@ flowchart TD
 ```
 
 ## Examples
+### A two-layer network by hand, checked numerically
+A two-layer network with ReLU and softmax cross-entropy, differentiated by hand and checked against a
+finite difference. Each backward line is one local derivative multiplied by the upstream adjoint; the
+numeric check should agree to around 1e-10.
+
+```python
+import numpy as np
+rng = np.random.default_rng(0)
+X = rng.normal(size=(8, 4)); y = rng.integers(0, 3, size=8)            # 8 examples, 4 features, 3 classes
+W1 = rng.normal(scale=0.5, size=(4, 5)); W2 = rng.normal(scale=0.5, size=(5, 3))
+
+def forward(W1, W2):
+    h_pre = X @ W1; h = np.maximum(h_pre, 0)                          # linear, ReLU
+    logits = h @ W2
+    p = np.exp(logits - logits.max(1, keepdims=True)); p /= p.sum(1, keepdims=True)
+    loss = -np.log(p[np.arange(8), y]).mean()                         # cross-entropy
+    return loss, (h_pre, h, p)
+
+loss, (h_pre, h, p) = forward(W1, W2)
+
+# backward: reverse order, each step = local derivative x upstream adjoint
+d_logits = p.copy(); d_logits[np.arange(8), y] -= 1; d_logits /= 8     # dL/dlogits = (p - onehot) / N
+dW2 = h.T @ d_logits                                                   # logits = h @ W2  -> needs h
+d_h = d_logits @ W2.T
+d_hpre = d_h * (h_pre > 0)                                             # ReLU gate     -> needs h_pre
+dW1 = X.T @ d_hpre                                                     # h_pre = X @ W1 -> needs X
+
+# finite-difference check on one weight
+i, j, eps = 1, 2, 1e-5
+W1p, W1m = W1.copy(), W1.copy(); W1p[i, j] += eps; W1m[i, j] -= eps
+numeric = (forward(W1p, W2)[0] - forward(W1m, W2)[0]) / (2 * eps)
+print(dW1[i, j], numeric)        # agree to ~1e-10; the saved h, h_pre, X are the "activation memory"
+```
+
 ### No gradient through a tool call, and the REINFORCE workaround
 A toy router samples one of four tools; the tool runs and the outcome is scored outside the graph. The
 reward has no gradient, so the update weights the log-probability of the chosen tool by the reward.
@@ -209,40 +243,6 @@ Activation memory is shown relative to the 4k setting; it is a scaling sketch, n
 - **Order of levers:** checkpointing, a fused attention kernel, micro-batch 1 with gradient accumulation,
   then truncating or summarising long tool results in the training data.
 - **Measure** peak memory at two lengths before buying hardware, to confirm the linear scaling.
-
-### A two-layer network by hand, checked numerically
-A two-layer network with ReLU and softmax cross-entropy, differentiated by hand and checked against a
-finite difference. Each backward line is one local derivative multiplied by the upstream adjoint; the
-numeric check should agree to around 1e-10.
-
-```python
-import numpy as np
-rng = np.random.default_rng(0)
-X = rng.normal(size=(8, 4)); y = rng.integers(0, 3, size=8)            # 8 examples, 4 features, 3 classes
-W1 = rng.normal(scale=0.5, size=(4, 5)); W2 = rng.normal(scale=0.5, size=(5, 3))
-
-def forward(W1, W2):
-    h_pre = X @ W1; h = np.maximum(h_pre, 0)                          # linear, ReLU
-    logits = h @ W2
-    p = np.exp(logits - logits.max(1, keepdims=True)); p /= p.sum(1, keepdims=True)
-    loss = -np.log(p[np.arange(8), y]).mean()                         # cross-entropy
-    return loss, (h_pre, h, p)
-
-loss, (h_pre, h, p) = forward(W1, W2)
-
-# backward: reverse order, each step = local derivative x upstream adjoint
-d_logits = p.copy(); d_logits[np.arange(8), y] -= 1; d_logits /= 8     # dL/dlogits = (p - onehot) / N
-dW2 = h.T @ d_logits                                                   # logits = h @ W2  -> needs h
-d_h = d_logits @ W2.T
-d_hpre = d_h * (h_pre > 0)                                             # ReLU gate     -> needs h_pre
-dW1 = X.T @ d_hpre                                                     # h_pre = X @ W1 -> needs X
-
-# finite-difference check on one weight
-i, j, eps = 1, 2, 1e-5
-W1p, W1m = W1.copy(), W1.copy(); W1p[i, j] += eps; W1m[i, j] -= eps
-numeric = (forward(W1p, W2)[0] - forward(W1m, W2)[0]) / (2 * eps)
-print(dW1[i, j], numeric)        # agree to ~1e-10; the saved h, h_pre, X are the "activation memory"
-```
 
 ### The fan-out rule in code, then in autograd
 The three-line graph from How it works, first by hand in plain Python, then confirmed by PyTorch.

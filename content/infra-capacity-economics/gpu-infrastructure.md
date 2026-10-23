@@ -5,7 +5,8 @@ name: GPU infrastructure
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/gpu-sizing
@@ -37,6 +38,60 @@ slow" tickets turn out to be host, driver or scheduling problems.
   the driver/image pairing, and the health loop that removes bad cards before agent sessions land on them.
 - **What you can skip.** SM microarchitecture and NCCL tuning. Know the seven layers, their failure
   signatures, and that ready-time is a storage number.
+
+## Decision case
+### Scenario
+A legal-tech startup sells a contract-review agent to EU law firms. Each run makes about 20 model calls
+to a self-hosted 70B model (140 GB fp16 checkpoint, tensor-parallel across 4 H100 80 GB cards), plus
+retrieval calls to an L4 embedder and reranker. The question is how many layers of the GPU stack to own.
+- **Load:** 4 model replicas (2 eight-GPU SXM nodes) overnight, 8 replicas (4 nodes) in office hours.
+  The morning ramp takes about 10 minutes.
+- **Residency:** contracts may not leave one EU region and may not go to a hosted model API.
+- **Ready-time:** a new replica must serve within 5 minutes of scale-up, or the morning queue times out
+  agent sessions at step one.
+- **Reliability:** at least 99% of 20-step runs must finish without an infra-caused failure.
+- **Team and deadline:** two platform engineers with Kubernetes but no GPU-ops experience; production in
+  8 weeks. Costs below are relative and illustrative, not vendor quotes.
+
+### Options
+| Option | How it works | Residency | Ready-time (140 GB) | Health loop | Team fit, 8 weeks |
+|---|---|---|---|---|---|
+| A. Managed GPU node pools + GPU Operator | Cloud owns hardware and node images; you own pod spec, weight staging, cordon-on-XID | Pin the cluster to the EU region | Pre-staged NVMe: about 0.8 min at 3,000 MB/s | Yours: DCGM XID alerts, auto-cordon | Good: Kubernetes skills transfer |
+| B. Serverless GPU platform | Platform owns everything below your container; per-second billing | Only if the platform can pin an EU region | Depends on the platform's weight cache; a 100 MB/s pull is 23.3 min | The platform's, not visible to you | Fastest to start, but 4-GPU replicas may be unsupported |
+| C. Leased bare metal, own driver stack | You install drivers, toolkit, device plugin, metrics | Full control | Your NVMe, same as A | Yours, plus hardware tickets | Poor: quota and lease lead time of weeks, no GPU-ops skills |
+
+### Decision
+Choose **A**.
+- **Residency:** a regional managed cluster meets it without trusting a platform's placement promises.
+- **Ready-time:** loading 140 GB inside a 3-minute window (leaving 2 minutes for scheduling and warm-up)
+  needs about 780 MB/s sustained. Only pre-staged local NVMe clears that; A lets you choose that storage.
+- **Reliability:** the target allows a per-call infra failure rate of about 1 − 0.99^(1/20) ≈ 0.05%, one
+  call in 2,000. One bad replica out of 8 touches 1 − (7/8)^20 ≈ 93% of runs. That demands a health loop
+  you control (cordon-on-XID) plus a one-shot retry on another replica.
+- **Why not B:** residency and 4-GPU tensor parallelism are uncertain, and you cannot cordon a bad card
+  you cannot see.
+- **Why not C:** the team cannot build and run a driver stack and hardware process in 8 weeks.
+
+**What would change it:** a model small enough for one card (an 8B model at 16 GB loads in 160 s even at
+100 MB/s) plus an EU-pinned platform makes B the right burst layer. Steady 24/7 load near full
+utilisation and a dedicated GPU-ops hire make C worth its cost per GPU hour.
+
+### Trade-offs accepted
+- **The provider's driver cadence.** Watch driver version per node from feature-discovery labels; block
+  base-image bumps until every pool runs the new driver.
+- **Fixed eight-card blocks.** Two 4-GPU replicas fill a node exactly, but any 3-GPU or 5-GPU change
+  strands cards. Watch GPU hours used versus purchased.
+- **Quota for burst nodes.** Hold quota or reservations for the two extra nodes; alert on
+  "insufficient capacity" during the morning ramp.
+- **Owning the health loop.** Alert on `DCGM_FI_DEV_XID_ERRORS`, track cordoned nodes, and tag every agent
+  trace span with the node that served it.
+
+### Review rubric
+- States residency, ready-time, reliability and team constraints with numbers before comparing options.
+- Converts ready-time into a required read throughput (size divided by time) and picks storage from it.
+- Converts a per-run success target into a per-call failure budget and checks one-bad-replica exposure.
+- Names who owns each layer (driver, runtime, scheduling, health) in every option, not just price.
+- Gives concrete conditions (model size, utilisation, team) under which the choice flips.
 
 ## Why it exists
 - **GPUs break CPU-server assumptions.** CPU nodes are interchangeable: any node runs any container, the

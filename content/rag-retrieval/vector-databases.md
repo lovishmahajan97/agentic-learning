@@ -5,7 +5,8 @@ name: Vector databases (pgvector, Qdrant, Pinecone, Weaviate, Milvus, Chroma)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -44,6 +45,179 @@ Chroma differ on operations, filtering and scale, not retrieval quality.
   filter indexes, `ef_search`, consistency on writes, and the token budget of what the tool returns.
 - **What you can skip.** HNSW internals and vendor feature matrices; know filtered search,
   read-your-writes and the memory sum.
+
+## Lab
+### Task
+Build the three memory tools an agent needs on a real vector-store API: `save_memory`, `recall_memory`
+and `forget_user`. Time box: 45-75 minutes. Do ANN indexes, Similarity search and Embedding pipelines
+first.
+- **Runs locally:** qdrant-client's in-process mode (`QdrantClient(":memory:")`) needs no server, and a
+  hashed bag-of-words `embed` stands in for the embedding model, so no download or API key.
+- **Done means:** saves are idempotent and wait for the write, recall never leaks another user's
+  memories and still returns k hits for a user who owns 8 of 508 points, and forgetting a user deletes
+  every one of their points and nobody else's.
+- **Carry-over:** the same calls work against a Qdrant server; only the client constructor changes.
+
+### Starter code
+Save as `memory_store.py`; `pip install qdrant-client` (checked with qdrant-client 1.20.0 on Python
+3.12.14).
+
+```python
+# memory_store.py  (Python 3.10+, pip install qdrant-client; runs in-process, no server)
+import hashlib, math, re, uuid, warnings
+from qdrant_client import QdrantClient, models
+
+DIM, COLLECTION = 64, "memories"
+
+
+def embed(text: str) -> list[float]:
+    """Deterministic stand-in for the shared embedding function: hashed bag of words, unit length."""
+    v = [0.0] * DIM
+    for w in re.findall(r"[a-z0-9]+", text.lower()):
+        v[int(hashlib.md5(w.encode()).hexdigest(), 16) % DIM] += 1.0
+    n = math.sqrt(sum(x * x for x in v)) or 1.0
+    return [x / n for x in v]
+
+
+def make_client() -> QdrantClient:
+    client = QdrantClient(":memory:")          # local mode; swap for QdrantClient(url=...) in production
+    client.create_collection(COLLECTION, vectors_config=models.VectorParams(
+        size=DIM, distance=models.Distance.COSINE))
+    with warnings.catch_warnings():          # local mode ignores payload indexes; a server uses them
+        warnings.simplefilter("ignore")
+        client.create_payload_index(COLLECTION, field_name="user_id",
+                                    field_schema=models.PayloadSchemaType.KEYWORD)
+    return client
+
+
+def save_memory(client: QdrantClient, user_id: str, text: str) -> str:
+    """YOUR CODE: upsert one point whose id is derived from (user_id, text), so saving the same fact
+    twice keeps one point. Payload: user_id and text. Wait for the write so the next step can recall it.
+    Return "Saved."."""
+    raise NotImplementedError("save_memory")
+
+
+def recall_memory(client: QdrantClient, user_id: str, query: str, k: int = 5) -> list[str]:
+    """YOUR CODE: return up to k memory texts of this user only, nearest first. The filter must run
+    inside the search, so a user with few memories still gets k hits."""
+    raise NotImplementedError("recall_memory")
+
+
+def forget_user(client: QdrantClient, user_id: str) -> int:
+    """YOUR CODE: delete every memory of this user (and nobody else's); return how many were deleted."""
+    raise NotImplementedError("forget_user")
+
+
+if __name__ == "__main__":
+    client = make_client()
+    try:
+        for i in range(300):
+            save_memory(client, "big-co", f"meeting note {i} about quarterly planning")
+        for fact in ["prefers invoices in EUR", "billing contact is Dana",
+                     "timezone is Europe/Berlin", "prefers invoices in EUR"]:
+            save_memory(client, "u42", fact)
+        print("points:", client.count(COLLECTION, exact=True).count)
+        print("recall:", recall_memory(client, "u42", "which currency for invoices", k=3))
+        print("forgot:", forget_user(client, "u42"))
+        print("after: ", recall_memory(client, "u42", "invoices"),
+              client.count(COLLECTION, exact=True).count)
+    except NotImplementedError as e:
+        print("not implemented yet:", e)
+```
+
+### Expected output
+The starter prints `not implemented yet: save_memory`. A correct solution prints (the duplicate save
+leaves 303 points, not 304):
+
+```
+points: 303
+recall: ['prefers invoices in EUR', 'timezone is Europe/Berlin', 'billing contact is Dana']
+forgot: 3
+after:  [] 300
+```
+
+### Tests
+Save next to `memory_store.py` and run `pytest -q` (checked with pytest 9.1.1). On the starter all five
+fail with `NotImplementedError`; a correct solution passes all five in about a second.
+
+```python
+# test_memory_store.py  (run: pytest -q)
+from qdrant_client import models
+from memory_store import COLLECTION, forget_user, make_client, recall_memory, save_memory
+
+
+def count(client, user_id=None):
+    flt = None
+    if user_id:
+        flt = models.Filter(must=[models.FieldCondition(
+            key="user_id", match=models.MatchValue(value=user_id))])
+    return client.count(COLLECTION, count_filter=flt, exact=True).count
+
+
+def seeded():
+    client = make_client()
+    for i in range(500):
+        save_memory(client, "big-co", f"note {i} about invoices and quarterly planning")
+    for i in range(8):
+        save_memory(client, "u42", f"fact {i}: prefers invoices in EUR")
+    return client
+
+
+def test_saving_the_same_fact_twice_keeps_one_point():
+    client = make_client()
+    assert save_memory(client, "u1", "prefers invoices in EUR") == "Saved."
+    save_memory(client, "u1", "prefers invoices in EUR")
+    save_memory(client, "u2", "prefers invoices in EUR")      # same text, other user: separate point
+    assert count(client, "u1") == 1 and count(client) == 2
+
+
+def test_recall_is_scoped_to_the_user():
+    client = seeded()
+    hits = recall_memory(client, "u42", "invoices", k=5)
+    assert hits and all(h.startswith("fact ") for h in hits), "another user's memories leaked"
+
+
+def test_small_user_still_gets_k_hits():
+    client = seeded()                                          # u42 owns 8 of 508 points
+    assert len(recall_memory(client, "u42", "quarterly planning invoices", k=5)) == 5
+
+
+def test_nearest_memory_comes_first():
+    client = make_client()
+    for fact in ["timezone is Europe/Berlin", "prefers invoices in EUR", "billing contact is Dana"]:
+        save_memory(client, "u7", fact)
+    assert recall_memory(client, "u7", "invoices currency", k=3)[0] == "prefers invoices in EUR"
+
+
+def test_forget_user_removes_all_and_only_that_user():
+    client = make_client()
+    for i in range(25):
+        save_memory(client, "u9", f"memory {i}")
+    save_memory(client, "u10", "keep me")
+    assert forget_user(client, "u9") == 25
+    assert count(client, "u9") == 0 and count(client, "u10") == 1
+    assert recall_memory(client, "u9", "memory") == []
+```
+
+### Failure scenarios
+- **Post-filter in Python:** query with `limit=k` and no `query_filter`, then drop other users' hits.
+  `test_small_user_still_gets_k_hits` gets 0 instead of 5, because big-co's 500 notes fill the top 5.
+  Debug: log hit count against k per recall, then rerun with the filter inside `query_points`.
+- **Random point ids (`uuid.uuid4()`).** The duplicate test counts 2 points for one fact; in production
+  recall returns the same preference several times. Debug: count points per `(user_id, text)`; use a
+  `uuid5` of both.
+- **Forget by `scroll` then delete by ids.** `scroll` returns one page (10 points by default), so 10 of 25
+  memories are deleted and the rest survive an erasure request. Debug: count the user's points after
+  deleting; delete with `models.FilterSelector` and the same user filter instead.
+
+### Submission
+- **`memory_store.py` and the unchanged `test_memory_store.py`** in a repo or gist.
+- **A `pytest -q` run** showing 5 passed, and `python memory_store.py` output matching the expected block.
+- **One injected fault** from the list above, with the failing assertion and how you traced it.
+- **A short note (under 150 words):** what changes against a Qdrant server (payload index now used,
+  `wait=True` latency) and how you would check filtered recall there with a brute-force comparison.
+- **Evaluated on:** all tests green, no cross-user hit in any test, and a note that names the store
+  behaviour each guard depends on.
 
 ## Why it exists
 - **Exact search is O(N·d) per query.** Ten million 1536-dimensional vectors is roughly 15 billion

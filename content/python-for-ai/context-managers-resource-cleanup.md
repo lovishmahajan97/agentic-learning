@@ -5,7 +5,8 @@ name: Context managers / resource cleanup
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/generators
@@ -40,6 +41,160 @@ A context manager pairs setup with guaranteed teardown: `with` runs `__enter__`,
   non-masking cleanup.
 - **What you can skip.** The exact PEP 343 expansion beyond its three consequences, and writing class-based
   managers when `@asynccontextmanager` will do.
+
+## Lab
+### Task
+Make an agent run leak-proof. The starter's resource helper puts teardown after `yield` without
+`finally`, and the run enters its MCP sessions by hand, so a tool error, a failed connect or the Stop
+button leaves the span, sandbox and sessions open. Time box: 45 minutes. Do **async cancellation &
+exception propagation** first.
+- **Goal:** all four scenarios end with nothing open, closes run newest first, and errors still
+  propagate.
+- **The resources are fakes** that record open and close, so the lab runs offline; in production they
+  would be a tracing span, a container and MCP client sessions.
+- **Constraints:** standard library only; checked on Python 3.12.14 with pytest 9.1.
+
+### Starter code
+Save as `lab_run.py`. It runs as given and prints what each failure path leaks.
+
+```python
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
+
+OPEN: set[str] = set()                      # resources currently held: should be empty after any run
+LOG: list[str] = []
+
+@asynccontextmanager
+async def resource(kind, name):
+    """Stands in for a trace span, a code sandbox or an MCP client session."""
+    key = f"{kind}:{name}"
+    if name == "broken":
+        raise ConnectionError(f"{key}: connect failed")
+    OPEN.add(key)
+    LOG.append(f"open {key}")
+    yield key
+    # LAB 1: this teardown is skipped when the block raises or is cancelled
+    await asyncio.sleep(0)                  # async teardown: stop the container, close the session
+    OPEN.discard(key)
+    LOG.append(f"close {key}")
+
+async def agent_run(task, servers, fail=False):
+    """LAB 2: open the span, the sandbox and one MCP session per server through one AsyncExitStack,
+    so success, a tool error, a failed connect and cancellation all close everything, newest first."""
+    async with resource("span", task), resource("sandbox", "py") as sandbox:
+        sessions = [resource("mcp", s) for s in servers]
+        opened = [await cm.__aenter__() for cm in sessions]
+        await asyncio.sleep(0.05)           # model and tool steps would run here
+        if fail:
+            raise RuntimeError("tool returned malformed output")
+        for cm in reversed(sessions):
+            await cm.__aexit__(None, None, None)
+        return f"done with {sandbox} and {len(opened)} servers"
+
+async def scenario(name):
+    OPEN.clear()
+    try:
+        if name == "cancel":
+            t = asyncio.create_task(agent_run("long", ["github", "jira"]))
+            await asyncio.sleep(0.01)
+            t.cancel()                      # the user pressed Stop
+            await t
+            outcome = "not cancelled"
+        else:
+            servers = ["github", "broken"] if name == "bad connect" else ["github", "jira"]
+            outcome = await agent_run("triage", servers, fail=(name == "tool error"))
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+    except Exception as e:
+        outcome = f"{type(e).__name__}"
+    return f"{name}: {outcome}; still open {sorted(OPEN)}"
+
+async def main():
+    for name in ("success", "tool error", "bad connect", "cancel"):
+        print(await scenario(name))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Expected output
+The starter leaks on three of the four lines (for example
+`bad connect: ConnectionError; still open ['mcp:github', 'sandbox:py', 'span:triage']`). A correct
+solution prints:
+
+```
+success: done with sandbox:py and 2 servers; still open []
+tool error: RuntimeError; still open []
+bad connect: ConnectionError; still open []
+cancel: cancelled; still open []
+```
+
+### Tests
+Save as `test_lab_run.py` and run `pytest -q`. On the starter the three failure-path tests fail with
+the leaked resources listed; the success test guards the close order.
+
+```python
+import asyncio
+import pytest
+import lab_run as lab
+
+@pytest.fixture(autouse=True)
+def reset():
+    lab.OPEN.clear()
+    lab.LOG.clear()
+
+def closes():
+    return [line for line in lab.LOG if line.startswith("close")]
+
+def test_success_closes_newest_first():
+    asyncio.run(lab.agent_run("triage", ["github", "jira"]))
+    assert lab.OPEN == set()
+    assert closes() == ["close mcp:jira", "close mcp:github", "close sandbox:py", "close span:triage"]
+
+def test_tool_error_closes_everything_and_propagates():
+    with pytest.raises(RuntimeError, match="malformed"):
+        asyncio.run(lab.agent_run("triage", ["github", "jira"], fail=True))
+    assert lab.OPEN == set(), f"leaked: {sorted(lab.OPEN)}"
+    assert closes() == ["close mcp:jira", "close mcp:github", "close sandbox:py", "close span:triage"]
+
+def test_failed_connect_closes_what_was_opened():
+    with pytest.raises(ConnectionError):
+        asyncio.run(lab.agent_run("triage", ["github", "broken"]))
+    assert lab.OPEN == set(), f"leaked: {sorted(lab.OPEN)}"
+
+def test_stop_button_closes_everything():
+    async def scenario():
+        t = asyncio.create_task(lab.agent_run("long", ["github", "jira"]))
+        await asyncio.sleep(0.01)
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+    asyncio.run(scenario())
+    assert lab.OPEN == set(), f"leaked: {sorted(lab.OPEN)}"
+```
+
+### Failure scenarios
+- **Fix only `agent_run` and leave the teardown outside `finally`.** All three failure-path tests still
+  leak every resource: the exception is thrown in at the `yield` and skips the close, even though the
+  stack calls each exit. Debug: raise inside a bare `async with resource(...)` block and check `OPEN`.
+- **Fix only `resource` and keep the manual `__aenter__` loop.** The span and sandbox now close, but MCP
+  sessions still leak on a tool error, a failed connect and Stop, because nothing calls their
+  `__aexit__`. Debug: compare the `LOG` opens and closes per key.
+- **Inject `stack.pop_all()` before returning** (to keep sessions for the next turn). Even the success
+  test fails with all four resources open. Debug: a lifetime longer than the block needs an owner, such
+  as a session manager with an idle timeout, that closes it later.
+- **Inject `return True` from a custom `__aexit__`.** The tool error vanishes and `agent_run` returns
+  `None`. Debug: the `pytest.raises(RuntimeError)` test fails; return `None` unless suppression is the
+  manager's purpose.
+
+### Submission
+- **Your `lab_run.py`** with both LAB markers resolved and no manual `__aenter__` or `__aexit__` calls.
+- **A `pytest -q` run** showing 4 passed, plus the starter's leaking output, in `NOTES.md`.
+- **The fixed script's output**, matching the expected block exactly.
+- **Two sentences** on why the failed connect needs nothing extra once the stack owns every resource
+  (a manager whose enter raised was never pushed, and everything entered before it unwinds).
+- **Evaluation:** tests pass, teardown sits in `finally`, one `AsyncExitStack` owns the run's
+  resources, and errors are not suppressed.
 
 ## Why it exists
 - **Resources leak on the unhappy path.** A streaming LLM call opens a connection; the client

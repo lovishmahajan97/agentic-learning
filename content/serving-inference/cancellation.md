@@ -5,7 +5,8 @@ name: Cancellation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - serving-inference/timeouts
@@ -150,7 +151,66 @@ sequenceDiagram
     Note over E: queued requests take the freed slot
 ```
 
+## Misconceptions
+- **"Closing the tab or hitting stop stops the model."** The engine has no idea whether anyone is
+  reading. The stop must cross every hop, and each hop must close its own upstream connection, or
+  decoding runs to `max_tokens`.
+- **"`task.cancel()` kills the task."** It schedules a `CancelledError` at the next `await`. `finally`
+  blocks run, and one that logs and returns swallows the cancel, so the upstream is never closed.
+- **"My server knows when the client leaves."** It learns only when it next touches the socket. A
+  streaming handler notices within a token; a non-streaming handler awaiting the model never does unless
+  you race it against a disconnect watcher.
+- **"Cancelling the HTTP response cancels the agent run."** The run is a tree: model stream, parallel
+  tools and sub-agents. Only structured concurrency such as `asyncio.TaskGroup` and a cancel check
+  between steps reaches every leaf.
+- **"A cancelled tool call did nothing."** Cancellation lands at an `await`, after the email or charge
+  may already have gone out; write tools need idempotency keys, and the run is recorded as cancelled,
+  not failed.
+- **"I am billed only for the tokens I received."** A cancelled stream never sends its usage event, and
+  the provider charges until its gateway sees the abort. Treat received text as a lower bound and
+  reconcile against usage reports.
+
 ## Examples
+### Agent scenario: stop pressed while parallel tools run
+Runnable on Python 3.11+: the run's parallel tools live in a `TaskGroup`, so cancelling the run cancels
+the slow tool too, while a tool that already finished keeps its result.
+
+```python
+import asyncio
+
+log = []
+
+async def tool(name, secs):
+    try:
+        await asyncio.sleep(secs)                    # stand-in for an HTTP tool call
+        log.append(f"{name}: done")
+    finally:
+        if asyncio.current_task().cancelling():
+            log.append(f"{name}: cancelled, connection closed")
+
+async def agent_run(steps=5):
+    for step in range(steps):
+        log.append(f"step {step}: model call")
+        await asyncio.sleep(0.1)                     # stand-in for a streamed model call
+        async with asyncio.TaskGroup() as tg:        # parallel tool calls share the run's fate
+            tg.create_task(tool(f"search-{step}", 0.3))
+            tg.create_task(tool(f"fetch-{step}", 1.0))
+
+async def main():
+    run = asyncio.create_task(agent_run())
+    await asyncio.sleep(0.6)                         # user presses stop during step 0's tools
+    run.cancel()
+    await asyncio.wait([run])
+    print(*log, sep="\n")
+    print("run cancelled:", run.cancelled())
+
+asyncio.run(main())
+# step 0: model call
+# search-0: done
+# fetch-0: cancelled, connection closed
+# run cancelled: True
+```
+
 ### Supersede pattern for a chat session
 The newest request cancels the previous generation, and the cancelled task's `finally` closes the
 provider stream, which is the only way the provider learns to stop decoding. The `asyncio.wait` keeps
@@ -244,46 +304,6 @@ async def handle(disconnect_after):
 
 asyncio.run(handle(0.5))
 # cancelled: upstream closed=True, tokens decoded=45   (roughly 45-50, timing dependent)
-```
-
-### Agent scenario: stop pressed while parallel tools run
-Runnable on Python 3.11+: the run's parallel tools live in a `TaskGroup`, so cancelling the run cancels
-the slow tool too, while a tool that already finished keeps its result.
-
-```python
-import asyncio
-
-log = []
-
-async def tool(name, secs):
-    try:
-        await asyncio.sleep(secs)                    # stand-in for an HTTP tool call
-        log.append(f"{name}: done")
-    finally:
-        if asyncio.current_task().cancelling():
-            log.append(f"{name}: cancelled, connection closed")
-
-async def agent_run(steps=5):
-    for step in range(steps):
-        log.append(f"step {step}: model call")
-        await asyncio.sleep(0.1)                     # stand-in for a streamed model call
-        async with asyncio.TaskGroup() as tg:        # parallel tool calls share the run's fate
-            tg.create_task(tool(f"search-{step}", 0.3))
-            tg.create_task(tool(f"fetch-{step}", 1.0))
-
-async def main():
-    run = asyncio.create_task(agent_run())
-    await asyncio.sleep(0.6)                         # user presses stop during step 0's tools
-    run.cancel()
-    await asyncio.wait([run])
-    print(*log, sep="\n")
-    print("run cancelled:", run.cancelled())
-
-asyncio.run(main())
-# step 0: model call
-# search-0: done
-# fetch-0: cancelled, connection closed
-# run cancelled: True
 ```
 
 ### Worked scenario: what abandonment costs without cancellation

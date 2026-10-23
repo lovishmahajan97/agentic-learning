@@ -5,7 +5,8 @@ name: Self-attention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 related:
   - model-internals/attention-mechanism
@@ -149,6 +150,22 @@ flowchart TD
     V --> AV
     AV --> O["Output projection W_O"]
 ```
+
+## Misconceptions
+- **"Attention is always the expensive part of a layer."** The core-to-projection ratio is n/(2d): at
+  d = 4096 it is 0.5 at 4k tokens, so linear layers dominate, and only around 32k (ratio 4) does the
+  quadratic core take over.
+- **"Every generated token pays the n² cost again."** Decode has one query row against cached keys and
+  values, O(n·d) per head and bandwidth-bound; the n² case is prefill, which a big new tool result
+  triggers.
+- **"Self-attention knows the order of the tokens."** Without positions it is permutation equivariant;
+  the causal mask leaks only a rough count of preceding tokens, so models add an explicit scheme.
+- **"Masking is just zeroing the future weights."** Zeroing after softmax leaves rows that no longer sum to
+  one; the mask must put −∞ on the logits before softmax.
+- **"An attention mask makes padding side irrelevant."** In decoder-only generation, right padding puts
+  pad tokens between the prompt and its new tokens; use left padding plus the mask.
+- **"The first tokens of a long session are safe to evict."** Many heads park their weight on the first
+  token as an attention sink, so window caches keep those tokens.
 
 ## Examples
 ### Causal self-attention by hand, checked against the fused kernel

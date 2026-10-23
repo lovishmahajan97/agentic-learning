@@ -5,7 +5,8 @@ name: Data curation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/data-labeling
@@ -200,6 +201,21 @@ flowchart TD
     C -.->|"rejects with reason"| J
     V -->|"eval error analysis"| P
 ```
+
+## Misconceptions
+- **"More logged runs make a better fine-tune."** The model learns whatever is in the batch, loops and
+  failed runs included; LIMA got competitive results from about a thousand curated pairs. In the
+  coding-agent funnel only 16,200 of 50,000 runs deserve imitation.
+- **"Exact-hash dedup is enough."** Support macros with a name swapped, templated bot prompts and
+  paraphrases survive hashing; MinHash with LSH (and an embedding pass for paraphrases) removes far more.
+- **"Clean the data, then split it however you like."** Split before dedup, or by run, and near-copies of
+  the same task sit on both sides, inflating eval scores. Dedup first, then split by tenant, repository or
+  task cluster.
+- **"Decontaminating against public benchmarks protects my evals."** The leak that hurts is usually your
+  own golden set sampled from the same export, and 13-gram matching misses paraphrases, so register
+  internal evals and add an embedding check.
+- **"Scrubbing PII from user turns is enough."** Tool results carry customer records and secrets, and a
+  model trained on them recites them, so the PII and secrets pass must cover tool turns too.
 
 ## Examples
 ### Compact curation pass

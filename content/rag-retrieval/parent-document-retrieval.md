@@ -5,7 +5,8 @@ name: Parent-document retrieval
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -146,6 +147,22 @@ flowchart TD
     KV --> GEN["Tool result: parent text"]
     G -.->|"matched child spans"| CIT["Citations and highlights"]
 ```
+
+## Misconceptions
+- **"Parent-document retrieval improves what the index can match."** It changes what the generator sees,
+  not what gets found. The child is still embedded alone, so "The limit is 50 requests per minute." can
+  miss a query naming the endpoint and plan, and its parent is never fetched. Prepend the heading path or
+  use contextual retrieval for matching.
+- **"Overlap gives you the same context."** Overlap smears a few sentences across a boundary. It cannot
+  carry a table header 1,000 tokens back to the row that needs it; a pointer to the parent can.
+- **"Embed the parents too, for good measure."** Parents are never searched, so their vectors waste space,
+  and their averaged topics blur the key. Embed children only and keep parents in a key-value store.
+- **"Rank parents by how many children hit."** Count favours big sections: a parent with 30 children has
+  more chances to land hits than one with 4. Max child suits pinpoint questions, fraction removes the
+  size bias but rewards one lucky hit on a tiny parent; pick by question type and measure.
+- **"Bigger parents are always safer, up to the whole document."** Each parent stays in the agent's
+  transcript (19,200 tokens for 4 searches of 4 parents above), and a 25k-token manual as parent does not
+  fit a 6,000-token budget at all. Size parents to sections, or return snippets plus `read_section`.
 
 ## Examples
 ### Two stores and the query-side join

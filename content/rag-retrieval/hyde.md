@@ -5,7 +5,8 @@ name: HyDE (Hypothetical Document Embeddings)
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -131,6 +132,22 @@ flowchart TD
     RR --> A["Tool result to agent: real passages only"]
     G -.->|"logged, never sent to the generator"| L[("Debug log")]
 ```
+
+## Misconceptions
+- **"A hallucinated passage will retrieve hallucinated results."** The search runs over the real corpus,
+  and the embedding keeps the gist (topic, entities, structure) while giving little weight to one number.
+  A wrong "48 hours" still lands next to the real 24-hour passage. Only entity-level errors, such as the
+  wrong product, send it elsewhere.
+- **"The hypothetical is useful context for the answer."** It is a search key, not evidence. Passing it to
+  the generator, or letting an agent's draft sit in the transcript as if it were fact, is how invented
+  numbers get cited.
+- **"HyDE always improves recall."** Instruction-tuned embedders trained on query-passage pairs have
+  largely closed the shape gap, so the gain can be zero or negative while every search pays a generation.
+  Try query and passage prefixes first, and measure recall@k with and without HyDE.
+- **"Any embedder will do for the hypothetical."** It must be embedded with the corpus encoder in passage
+  mode, because the comparison is passage-to-passage in one space. A different encoder defeats the method.
+- **"Rerank against the hypothetical, since it matched best."** Score real candidates against the original
+  question. The user's words, not the model's guess, define relevance.
 
 ## Examples
 ### HyDE with multiple samples and a query anchor

@@ -5,7 +5,8 @@ name: GPU utilization & memory bandwidth
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - serving-inference/prefill-vs-decode
@@ -37,6 +38,61 @@ that the chip was busy.
   caching to keep prefill small, and quantisation to cut bytes per step.
 - **What you can skip.** Deriving roofline curves for custom kernels. Keep "decode step ≈ bytes ÷
   bandwidth" and "intensity ≈ batch size".
+
+## Decision case
+### Scenario
+A developer-tools company self-hosts Llama-3-8B in bf16 on H100 SXM cards (3.35 TB/s) for a code-review
+agent. Finance asks for "fewer GPUs"; product owns the run-latency SLO.
+- **Load:** 400 concurrent agent runs at peak, 20 steps each, average context about 4k tokens (128 KB of
+  KV per token).
+- **Output per step:** about 150 tokens of tool-call JSON today. A trial prompt that asks for compact
+  arguments brings that to 100 tokens with no change on the team's review eval.
+- **SLO:** a run must finish in 60 s at p95. Prefill and tool execution use 38 s, so decode gets 22 s
+  per run.
+- **Constraint:** the per-card batch cap (`--max-num-seqs`) sets the card count, ⌈400 ÷ batch⌉. Step
+  times below are bandwidth floors from the estimator, `(16 GB + B × 4096 × 128 KB) ÷ 3.35 TB/s`; real
+  engines run slower, so floors are lower bounds.
+
+### Options
+| Option | Batch per card | Output tokens per step | Step floor | Decode per run (floor) | Cards |
+|---|---|---|---|---|---|
+| A. Small batches | 8 | 150 | 6.1 ms | 18.2 s | 50 |
+| B. Medium batches | 16 | 150 | 7.3 ms | 22.0 s, no margin | 25 |
+| C. Big batches, compact tool calls | 32 | 100 | 9.9 ms | 19.8 s | 13 |
+| D. Big batches, int4 weights | 32 | 150 | 6.4 ms | 19.3 s | 13 |
+
+### Decision
+Choose **C**, gated on a load test.
+- **Cost:** 13 cards against 50 for A, a quarter of the fleet, while still memory-bound.
+- **Latency:** the 19.8 s floor leaves 2.2 s (10%) of the decode budget for engine overhead above the
+  floor.
+- **Quality:** compact tool arguments already pass the review eval; nothing about the model changes.
+- **Capacity:** 32 sequences at 4k hold about 131k tokens of KV, well inside the ≈ 420k an H100 holds
+  for this model.
+- **Why not B:** it lands exactly on the 22 s budget at the floor, so any real overhead breaks the SLO.
+- **Why not D:** int4 needs its own quality eval, and dequantisation kernels can erase the byte savings
+  at batch 32; it is the next lever, not the first.
+- **Why not A:** it buys 1.6 s per run (18.2 s against 19.8 s) that the SLO does not need, for 37 extra cards.
+
+**What would change it:** replay real agent traces at batch 32. If measured step time exceeds 11 ms,
+decode passes 22 s, so drop to batch 24 (8.6 ms floor, 17.2 s, 17 cards). If transcripts grow past an
+average of 4k, KV reads rise and the floor moves, so redo the table.
+
+### Trade-offs accepted
+- **Thinner per-run margin.** Watch run p95 split into prefill, decode and tools in agent traces, not
+  only time-per-output-token.
+- **A prompt constraint on tool output.** Alert when output tokens per step drift above 100, which
+  silently raises decode time.
+- **Less spare capacity per card.** Autoscale on `vllm:num_requests_waiting`, not GPU-Util, which reads
+  near 100% at any batch.
+- **Dependence on the eval.** Rerun the review eval when the tool schema or prompt changes.
+
+### Review rubric
+- Converts the run SLO into a per-step decode budget after subtracting prefill and tool time.
+- Computes step floors from bytes read divided by bandwidth, including KV bytes, at each candidate batch.
+- Treats floors as lower bounds and plans a load test with replayed agent traces before committing.
+- Considers output length and precision as levers alongside batch size, and gates each on an eval.
+- Ties card count to the chosen batch and names the measured value that would flip the choice.
 
 ## Why it exists
 - **The spec sheet and the dashboard disagree.** Teams buy GPUs for their FLOPs, then an H100 serving a

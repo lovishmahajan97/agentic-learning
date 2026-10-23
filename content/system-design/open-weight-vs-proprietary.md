@@ -5,7 +5,8 @@ name: Open-weight vs proprietary
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/self-host-vs-api
@@ -38,6 +39,65 @@ lifecycle control and cost shape, separately from self-host versus API.
   pass.
 - **What you can skip.** Licence law details (legal reviews them) and training-data provenance debates.
   Know the eight dimensions, the deployment combinations and the supply-chain gate.
+
+## Decision case
+### Scenario
+A European machinery manufacturer builds a maintenance agent for its engineers: it searches machine
+logs, service history and design documents, proposes a diagnosis and opens a work order. All figures
+are illustrative.
+- **Load:** 2,000 runs a day, 6 model calls each: 12,000 calls a day.
+- **Isolation:** about 30% of runs touch design documents covered by defence-customer contracts that
+  allow processing only on hosts the company operates. That is architectural isolation. The rest
+  needs EU residency, which a contract and a private network path satisfy.
+- **Quality:** run success of at least 0.80 overall on a 200-task agent eval.
+- **Team:** two ML engineers with GPU serving experience.
+- **Licence:** the open-weight model must allow commercial internal use, with acceptable-use terms
+  cleared by legal for defence-related work.
+
+Measured on the eval: the proprietary model succeeds on 0.90 of runs via its public API and 0.89 via
+the cloud provider's managed service. The best permissively licensed open-weight model succeeds on
+0.78, since long multi-step tool use is where it trails.
+
+Costs: an API call is about 0.03 units (0.036 on the managed service), and a GPU node 250 units a day.
+
+### Options
+| Option | How it works | Run success | Cost per day | Isolation |
+|---|---|---|---|---|
+| **A. Proprietary, public API, everything** | one pinned model for all runs | 0.90 | 12,000 × 0.03 = 360 | restricted runs leave company hosts: fails |
+| **B. Open weights, self-hosted, everything** | three GPU nodes serve all calls | 0.78: fails | 3 × 250 = 750 | passes |
+| **C. Split by data class** | restricted runs entirely on self-hosted open weights (two nodes for availability); the rest on the managed proprietary service over a private endpoint | 0.3 × 0.78 + 0.7 × 0.89 ≈ 0.857 | 500 + 8,400 × 0.036 ≈ 802 | passes |
+| **D. Proprietary via managed service, everything** | private endpoint in the EU region | 0.89 | 12,000 × 0.036 = 432 | inference still on the provider's hosts: fails for restricted runs |
+
+### Decision
+**Choose C.** Constraints come first. The restricted runs need architectural isolation, which only
+hosts the company operates provide, so A and D are out for them. Every step of a restricted run stays
+on open weights, because its tool results enter the planner's context.
+
+B passes isolation but misses the quality bar. C passes both, and the two engineers can run two nodes.
+It costs about twice A, which is the price of the isolation rule, not a choice to optimise away.
+
+**What would change it.**
+- If the restricted share grows past about 82% (0.89 − 0.11s ≥ 0.80 gives s ≤ 0.818), C's blended run
+  success falls below the bar.
+- An open-weight planner fine-tuned on restricted-run traces that clears the bar would allow B.
+- A contract change to legal isolation would move everything to D at 432 a day.
+
+### Trade-offs accepted
+- **Lower success on restricted runs.** 0.78 on only 60 restricted tasks has an interval of about ±10
+  points; the restricted eval is grown to 200 tasks, and engineer overrides on those runs are tracked.
+- **Two weight types, one agent.** Prompts and tool-call parsing differ per backend; parse failures per
+  backend are monitored and both run the same eval.
+- **Owning safety and supply chain.** The open-weight path needs its own guardrails, revision pin and
+  hash manifest; jailbreak and policy-violation rates are compared with the API baseline.
+- **Higher cost than A.** About 442 a day more; reviewed whenever the restricted share or the
+  contracts change.
+
+### Review rubric
+- Classifies each isolation requirement as legal or architectural before comparing capability.
+- Separates the weight-type choice from the deployment choice and names the combination per data class.
+- Measures every candidate on whole agent runs and reports the segment that the split depends on.
+- Computes blended success and daily cost reproducibly, and the share at which the decision flips.
+- Includes the licence check and supply-chain gate for the open-weight path.
 
 ## Why it exists
 - **The real question is why anyone runs open weights.** The proprietary frontier usually leads on raw

@@ -5,7 +5,8 @@ name: OpenAI SDK
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/anthropic-sdk
@@ -38,6 +39,208 @@ code often reaches vLLM, Ollama or gateways by changing `base_url`.
   log per step (request ID, usage, tool calls).
 - **What you can skip.** Raw HTTP and SSE parsing, and most Responses-only features if you need
   portability. Learn the tool-call round trip and retry semantics before any framework hides them.
+
+## Lab
+### Task
+Fix a tool-calling loop so it survives what real agent traffic sends: parallel tool calls in one turn,
+truncated argument JSON, a tool name the model invented, and a transient 429. You run the real `openai`
+client against a recorded fake server plugged in through `httpx.MockTransport`, so no key or money is
+needed. Time box: 45-60 minutes.
+- **Prerequisites:** httpx, Pydantic, Function and tool calling, and this lesson's Tools and Errors
+  sections.
+- **The fake server behaves like the API on one rule:** every `tool_call_id` in an assistant turn needs
+  exactly one tool message, or it returns a 400.
+- **Checked against:** Python 3.12, `openai` 2.54 and `httpx` 0.28. `http_client=`, `max_retries`,
+  `_request_id` and the `retry-after-ms` header have been stable since `openai` 1.x.
+
+### Starter code
+Save as `lab.py`. Change only the three `LAB` lines inside `run_agent`.
+
+```python
+"""Lab: a bounded tool-calling loop on the real OpenAI SDK, against a recorded fake server (no API key)."""
+import json
+
+import httpx
+from openai import OpenAI
+
+
+def tool_call(cid, name, arguments):        # one recorded assistant tool call
+    return {"id": cid, "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
+class FakeChatServer:
+    """Replays recorded Chat Completions replies in order and validates history like the real API."""
+
+    def __init__(self, replies):
+        self.replies, self.requests = list(replies), []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        self.requests.append(body)
+        msgs = body["messages"]
+        open_ids = set()                                            # calls still waiting for a result
+        for m in msgs + [{"role": "end"}]:
+            if m["role"] == "tool" and m.get("tool_call_id") in open_ids:
+                open_ids.discard(m["tool_call_id"])
+                continue
+            if open_ids or m["role"] == "tool":
+                return httpx.Response(400, json={"error": {"message": "each tool_call_id needs exactly one "
+                                      "tool message right after its assistant turn", "type": "invalid_request_error"}})
+            open_ids = {c["id"] for c in m.get("tool_calls") or []}
+        reply = self.replies.pop(0)
+        if isinstance(reply, int):                                  # a recorded HTTP error
+            return httpx.Response(reply, headers={"retry-after-ms": "10"},
+                                  json={"error": {"message": f"status {reply}", "type": "error"}})
+        n = len(self.requests)
+        msg = {"role": "assistant", "content": None if isinstance(reply, list) else reply}
+        if isinstance(reply, list):
+            msg["tool_calls"] = reply
+        return httpx.Response(200, headers={"x-request-id": f"req_{n}"}, json={
+            "id": f"chatcmpl-{n}", "object": "chat.completion", "created": 0, "model": "fake-model",
+            "choices": [{"index": 0, "message": msg, "finish_reason": "tool_calls" if msg.get("tool_calls") else "stop"}],
+            "usage": {"prompt_tokens": 20 * len(msgs), "completion_tokens": 7, "total_tokens": 20 * len(msgs) + 7}})
+
+
+def make_client(server, max_retries=1):
+    return OpenAI(api_key="test", base_url="http://fake.local/v1", max_retries=max_retries, timeout=5.0,
+                  http_client=httpx.Client(transport=httpx.MockTransport(server)))
+
+
+TOOLS = [{"type": "function", "function": {
+    "name": "get_order", "description": "Look up an order by id", "strict": True,
+    "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                   "required": ["order_id"], "additionalProperties": False}}}]
+
+
+def get_order(order_id: str) -> dict:
+    return {"order_id": order_id, "status": "shipped"}
+
+
+REGISTRY = {"get_order": get_order}
+
+
+def run_agent(client, question: str, max_steps: int = 4) -> tuple[str, list[dict]]:
+    """Return (answer, per-step log of request_id, prompt_tokens and tool names)."""
+    messages, log = [{"role": "user", "content": question}], []
+    for step in range(max_steps):
+        resp = client.chat.completions.create(model="fake-model", messages=messages, tools=TOOLS)
+        msg = resp.choices[0].message
+        log.append({"step": step, "request_id": resp._request_id, "prompt_tokens": resp.usage.prompt_tokens,
+                    "tools": [c.function.name for c in msg.tool_calls or []]})
+        if not msg.tool_calls:
+            return msg.content, log
+        messages.append(msg.model_dump(exclude_none=True))
+        call = msg.tool_calls[0]                    # LAB 1: answer EVERY tool call in this turn
+        args = json.loads(call.function.arguments)  # LAB 2: bad JSON -> error result, not a crash
+        result = REGISTRY[call.function.name](**args)   # LAB 3: unknown tool -> error result
+        messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
+    return "Step limit reached.", log
+
+
+if __name__ == "__main__":
+    server = FakeChatServer([
+        429,                                                         # transient: the SDK retries it
+        [tool_call("call_1", "get_order", '{"order_id": "A1"}'),
+         tool_call("call_2", "get_order", '{"order_id": "B2"}')],    # two parallel calls in one turn
+        [tool_call("call_3", "get_order", '{"order_id": ')],         # truncated, invalid JSON
+        "A1 and B2 have both shipped.",
+    ])
+    try:
+        answer, log = run_agent(make_client(server), "Where are orders A1 and B2?")
+        for row in log:
+            print(row)
+        print("answer:", answer, "| HTTP requests:", len(server.requests))
+    except Exception as e:
+        print(f"{type(e).__name__}: {e}")
+```
+
+### Expected output
+The starter prints `BadRequestError: Error code: 400 - ...each tool_call_id needs exactly one tool
+message...`, because `call_2` was never answered. A correct loop prints:
+
+```
+{'step': 0, 'request_id': 'req_2', 'prompt_tokens': 20, 'tools': ['get_order', 'get_order']}
+{'step': 1, 'request_id': 'req_3', 'prompt_tokens': 80, 'tools': ['get_order']}
+{'step': 2, 'request_id': 'req_4', 'prompt_tokens': 120, 'tools': []}
+answer: A1 and B2 have both shipped. | HTTP requests: 4
+```
+
+- **Read the numbers:** step 0 is `req_2` because the SDK retried the 429 once. Prompt tokens are 20 per
+  message in the fake: 1 message, then 4 (question, assistant, two results), then 6.
+
+### Tests
+Save as `test_lab.py` and run `pytest -q`. Three fail on the starter: `BadRequestError` (unanswered
+parallel call), `JSONDecodeError` and `KeyError`. The step-limit and retry tests pass already; they pin
+down the SDK behaviour you rely on.
+
+```python
+import json
+
+import openai
+import pytest
+from lab import FakeChatServer, make_client, run_agent, tool_call
+
+
+def tool_messages(request):
+    return [m for m in request["messages"] if m["role"] == "tool"]
+
+
+def test_every_parallel_call_gets_a_result():
+    server = FakeChatServer([[tool_call("c1", "get_order", '{"order_id": "A1"}'),
+                              tool_call("c2", "get_order", '{"order_id": "B2"}')], "done"])
+    answer, _ = run_agent(make_client(server), "q")
+    assert answer == "done"
+    assert [m["tool_call_id"] for m in tool_messages(server.requests[1])] == ["c1", "c2"]
+
+
+def test_invalid_arguments_go_back_to_the_model_as_an_error():
+    server = FakeChatServer([[tool_call("c1", "get_order", '{"order_id": ')], "fixed"])
+    answer, _ = run_agent(make_client(server), "q")
+    assert answer == "fixed"
+    assert "error" in json.loads(tool_messages(server.requests[1])[0]["content"])
+
+
+def test_unknown_tool_is_not_run_and_reported():
+    server = FakeChatServer([[tool_call("c1", "delete_all_orders", "{}")], "ok"])
+    answer, _ = run_agent(make_client(server), "q")
+    assert answer == "ok"
+    assert "error" in json.loads(tool_messages(server.requests[1])[0]["content"])
+
+
+def test_step_limit_stops_a_runaway_loop():
+    server = FakeChatServer([[tool_call(f"c{i}", "get_order", '{"order_id": "A1"}')] for i in range(10)])
+    answer, log = run_agent(make_client(server), "q", max_steps=4)
+    assert answer == "Step limit reached." and len(server.requests) == 4 and len(log) == 4
+
+
+def test_sdk_retries_429_but_not_400():
+    server = FakeChatServer([429, "ok"])
+    answer, log = run_agent(make_client(server, max_retries=1), "q")
+    assert answer == "ok" and len(server.requests) == 2 and log[0]["request_id"] == "req_2"
+    server = FakeChatServer([400])
+    with pytest.raises(openai.BadRequestError):
+        run_agent(make_client(server, max_retries=3), "q")
+    assert len(server.requests) == 1
+```
+
+### Failure scenarios
+- **Append results only for calls that succeeded.** The bad-arguments turn now gets no tool message and
+  the next request is a 400. Debug: print the ids in the assistant turn next to the ids of the tool
+  messages that follow it in `server.requests[-1]`.
+- **Set `max_retries=0` and replay the 429 script.** `RateLimitError` reaches your loop. Debug: count
+  `server.requests`; decide whether the client or an outer queue owns the retry, never both.
+- **Forget to append the assistant turn before its tool results.** The tool messages now answer a call
+  the server never saw, and it returns a 400, as the real API does. Debug: print the roles of the last
+  request body; every `tool` message must follow an assistant message whose `tool_calls` hold its id.
+
+### Submission
+- **`lab.py` passing all five tests**, and the script output matching Expected output.
+- **A recorded transcript of your own:** capture one real or local (vLLM via `base_url`) multi-tool run as
+  a `FakeChatServer` script, and add a test that replays it.
+- **A note** on how the per-step log (request ID, prompt tokens, tool names) would let you explain one
+  costly run to a teammate.
+- **Evaluation:** tests pass, every tool call gets exactly one result, and the loop never runs a tool
+  that is not in `REGISTRY`.
 
 ## Why it exists
 - **Raw HTTP breaks on the details.** 429 rate limits and transient 5xx errors are routine at volume and

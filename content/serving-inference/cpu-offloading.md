@@ -5,7 +5,8 @@ name: CPU offloading
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - serving-inference/gpu-memory-optimization
@@ -167,6 +168,23 @@ flowchart TD
     L --> M
     K["Idle or preempted KV"] -.->|"swap to pinned host RAM"| H[("Host memory")]
 ```
+
+## Misconceptions
+- **"Offloading 10% of the weights costs about 10% of the speed."** Every token re-reads the offloaded
+  bytes over PCIe. On the 24 GB example, 4 GB offloaded adds 160 ms per token against 36 ms resident, a
+  4× slowdown, not 10%.
+- **"Prefetching on a side stream hides the transfer."** Overlap needs compute to hide behind. One decode
+  token spends microseconds per layer, so step time is offloaded bytes ÷ PCIe bandwidth. Overlap works for
+  long prefills and huge offline batches, FlexGen's regime.
+- **"Offloading and quantization are two ways to do the same thing."** Quantizing fp16 to 4-bit removes
+  75% of the bytes for a modest quality cost; offloading 75% moves them over the bus on every token and
+  multiplies latency by tens. Quantize first.
+- **"Offloading KV cache is as bad as offloading weights."** A paused agent's KV is read back once on
+  resume, about 40 ms for an 8k-token Llama-3-8B-class context over Gen4, not on every step. That is the
+  case where offloading pays.
+- **"`device_map="auto"` will fail if the model does not fit."** It falls back to CPU or disk silently,
+  so the model "works" at a token or two per second. Cap `max_memory` and fail the load when any module is
+  off the GPU.
 
 ## Examples
 ### Worked scenario: 4-bit 70B on a 24 GB GPU

@@ -5,7 +5,8 @@ name: Reference architectures
 kind: pattern
 difficulty: intro
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/ai-solution-architecture
@@ -38,6 +39,65 @@ problem to a shape, often a workflow, and deviate deliberately instead of redisc
   as ADRs.
 - **What you can skip.** Vendor reference diagrams with their product in every box, and enterprise
   catalogue tooling. One page per shape in the repo, next to the ADRs, is enough.
+
+## Decision case
+### Scenario
+An HR shared-services team for 8,000 employees asks for "an HR agent". Discovery finds three jobs; all
+figures are illustrative.
+- **Policy questions:** about 1,200 a day, answered from the handbook and local policies; p95 answer
+  within 5 s.
+- **Leave requests:** about 150 a day, written into the HR system; an invalid write (wrong balance,
+  overlapping dates) is a payroll incident.
+- **Payslip anomaly checks:** 8,000 payslips once a month, flagged for an HR specialist.
+- **Constraints:** two engineers, eight weeks; the company gateway and tracing stack must be reused;
+  employees may only see their own records and the policies of their country.
+
+### Options
+| Option | Shapes | Calls a day (Q&A + leave) | Write safety | Latency | Fits team and deadline |
+|---|---|---|---|---|---|
+| **A. One tool-using agent for all three jobs** | 3 | about 4 steps per task: (1,200 + 150) × 4 = 5,400 | depends on the agent calling validation; approval gate needed on every write | variable, several sequential calls per answer | one codebase, but the eval must cover every path the agent might take |
+| **B. Composition** | 1 for Q&A, 4 for leave, 2 for payslips, all on 6 | 1,200 × 1 + 150 × 2 = 1,500 | the leave workflow validates balance and dates in code before any write | Q&A is one retrieval plus one call | three small pipelines with three small golden sets |
+| **C. B plus memory** | B plus 5 | as B, plus memory writes and reads | as B | as B | adds memory policies and a poisoning risk |
+
+### Decision
+**Choose B.** Walking the six questions gives it directly:
+- Leave requests act on a system of record, so they get a validation contract and a fixed workflow;
+  the steps are known (check balance, check overlaps, write, notify), so nothing calls for an agent.
+- Payslips are a stream of items, not a person waiting, so they are a monthly batch extraction with a
+  review queue.
+- Policy questions need an unseen corpus, so they are retrieval with country and identity filters.
+- Several teams already call models, so all three sit behind the existing gateway.
+
+Option A pays about 3.6 times as many model calls (5,400 versus 1,500) for flexibility nobody needs,
+and its write safety rests on the agent choosing to validate. C adds memory although no requirement
+needs state across sessions.
+
+**What would change it.** If traces of policy questions show many multi-step cases (look up a
+balance, then apply a country rule, then propose dates), add one bounded agent node behind the Q&A
+route, with read-only tools.
+
+If employees ask for preferences remembered across sessions, add memory
+with an ADR covering what is stored and for how long.
+
+### Trade-offs accepted
+- **Three pipelines instead of one.** More components to own; mitigated by shared gateway, tracing and
+  one review checklist, and watched as on-call load per pipeline.
+- **No free-form questions that cross jobs.** "Can I take Friday off and what does policy say about
+  carry-over?" needs two routes; the share of such questions is counted from traces as the signal for a
+  bounded agent node.
+- **Review queue cost for payslips.** Every flagged payslip goes to a person at first; the review rate
+  is lowered only while sampled precision stays above the bar.
+
+### Review rubric
+- Splits the request into jobs and names the reference shape for each, with the question that decided
+  it.
+- Justifies any agent shape by steps that cannot be enumerated, and puts writes behind a validation
+  contract.
+- Includes the cross-cutting boxes (golden set, tracing, gateway, control layer) for every job.
+- Quantifies at least one consequence of the shape choice, such as calls per day or latency, with
+  reproducible arithmetic.
+- Records each deviation from the reference as an ADR line and names the trace signal that would
+  revisit it.
 
 ## Why it exists
 - **Every first team leaves out the same boxes.** The first document assistant or agent omits

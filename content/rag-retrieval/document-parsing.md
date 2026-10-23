@@ -5,7 +5,8 @@ name: Document parsing (OCR, layout, tables)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -176,6 +177,23 @@ flowchart TD
     L --> T["Tables: Markdown or HTML, rows with headers, stitched"]
     T --> K[("Structured text and metadata to chunking")]
 ```
+
+## Misconceptions
+- **"A PDF contains text; extracting it is a solved problem."** A PDF is glyphs at coordinates, and a
+  scan is a picture with no text layer. Reading order, columns, headers and table cells all have to be
+  reconstructed, and scanned pages silently come back as empty strings.
+- **"A non-empty text layer is a good text layer."** Fonts without a Unicode mapping extract as
+  `(cid:42)` placeholders or mojibake, and old scanner OCR layers are riddled with errors. Gate each page
+  on quality (dictionary-word share, placeholder counts), not length.
+- **"Low CER means the numbers are right."** One wrong character in a 64-character sentence is a CER of
+  0.016, yet "3O days" makes the digit CER 0.50 and the answer wrong. Measure digits separately.
+- **"Extracting the cell values is enough for tables."** "30 days" detached from "Refund window" and
+  "Enterprise plan" matches no query and is misread when retrieved. Keep structure and serialise each row
+  with its headers.
+- **"A vision-language model is just a better OCR."** It generates rather than transcribes, so it can
+  normalise a value or fill a smudged digit fluently. Use it for hard layouts and cross-check numbers.
+- **"The framework's PDF loader handles this."** Default loaders are often plain text-layer extraction,
+  so an agent reading a scanned upload says the document "does not mention" what is on the page.
 
 ## Examples
 ### Agent scenario: a read tool that flags shaky digits

@@ -5,7 +5,8 @@ name: Structured / constrained generation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/structured-outputs-json-mode
@@ -174,7 +175,74 @@ flowchart TD
     E -->|"yes"| V["Parse, semantic check, run tool"]
 ```
 
+## Misconceptions
+- **"Constrained decoding means putting the schema in the prompt."** Prompting asks; constraining forbids.
+  The engine adds −∞ to every illegal token's logit before sampling, so invalid output is impossible
+  rather than unlikely, whatever the prompt says.
+- **"A schema-valid tool call is a correct tool call."** The grammar guarantees shape, not truth: a
+  hallucinated order id or wrong amount passes every type check. Semantic validators and lookups still run
+  after parsing, before the tool executes.
+- **"The constrained output is what the model would have said, just tidied up."** The mask is greedy and
+  local, not sampling conditioned on valid output, so it can steer the model down unlikely paths, and an
+  answer field placed before reasoning commits it early. Put `reasoning` first or think, then extract.
+- **"With a strict schema the call can never fail to parse."** Output cut at `max_tokens` is still
+  truncated JSON (check `finish_reason`), and some backends ignore keywords such as `minimum`, `pattern` or
+  `format: date`. Re-validate with Pydantic.
+- **"JSON mode already enforces my schema."** JSON mode guarantees syntactically valid JSON of any shape;
+  structured-output modes enforce your fields, types and enums.
+- **"Masking is expensive because every step checks the whole vocabulary."** The state-to-token table is
+  compiled once per schema and tokenizer, so a step is a lookup. The real cost is compilation, paid again
+  whenever a request brings a new schema, visible as higher TTFT.
+
 ## Examples
+### The token index for "exactly three digits", in pure Python
+Runnable as is. It builds the state-to-token table from the tiny index above at compile time, then
+decodes greedily with a fake model that prefers illegal tokens.
+
+```python
+VOCAB = ["7", "42", "123", "1234", "a", " 5", "<eos>"]
+ACCEPT = 3                                      # DFA for "exactly three digits": state = digits seen
+
+def step(state, ch):
+    return state + 1 if ch.isdigit() and state < ACCEPT else None   # None = dead state
+
+def build_index(vocab):
+    """Compile time: for every DFA state, which tokens are legal and where they lead."""
+    index = {}
+    for s in range(ACCEPT + 1):
+        index[s] = {}
+        for tok in vocab:
+            if tok == "<eos>":
+                if s == ACCEPT:
+                    index[s][tok] = "done"      # EOS only in the accepting state
+                continue
+            cur = s
+            for ch in tok:                      # walk every character of the token
+                cur = step(cur, ch)
+                if cur is None:
+                    break
+            if cur is not None:
+                index[s][tok] = cur
+    return index
+
+def constrained_greedy(scores, index):
+    """Run time: a lookup per step, then argmax among allowed tokens only."""
+    state, out = 0, []
+    while state != "done":
+        allowed = index[state]
+        tok = max(allowed, key=lambda t: scores.get(t, float("-inf")))
+        out.append(tok)
+        state = allowed[tok]
+    return "".join(t for t in out if t != "<eos>")
+
+index = build_index(VOCAB)
+for s, allowed in index.items():
+    print(s, allowed)       # 0 {'7': 1, '42': 2, '123': 3} ... 3 {'<eos>': 'done'}
+# The "model" prefers 1234 and a, both illegal from the start state.
+fake_logits = {"1234": 5.0, "a": 4.0, "<eos>": 3.0, "42": 1.0, "7": 0.5}
+print(constrained_greedy(fake_logits, index))   # -> 427
+```
+
 ### Worked scenario: parse failures across an agent run
 A 10-step agent makes one tool call per step. Illustrative rates; the point is how per-call rates
 compound per run (run failure = 1 − (1 − p)^10).
@@ -265,54 +333,6 @@ ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="
 proc = LogitsProcessorList([ChoiceConstraint(["yes", "no", "unknown"], ids.shape[1])])
 out = model.generate(ids, max_new_tokens=5, do_sample=False, logits_processor=proc)
 print(repr(tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True)))   # -> 'no'
-```
-
-### The token index for "exactly three digits", in pure Python
-Runnable as is. It builds the state-to-token table from the tiny index above at compile time, then
-decodes greedily with a fake model that prefers illegal tokens.
-
-```python
-VOCAB = ["7", "42", "123", "1234", "a", " 5", "<eos>"]
-ACCEPT = 3                                      # DFA for "exactly three digits": state = digits seen
-
-def step(state, ch):
-    return state + 1 if ch.isdigit() and state < ACCEPT else None   # None = dead state
-
-def build_index(vocab):
-    """Compile time: for every DFA state, which tokens are legal and where they lead."""
-    index = {}
-    for s in range(ACCEPT + 1):
-        index[s] = {}
-        for tok in vocab:
-            if tok == "<eos>":
-                if s == ACCEPT:
-                    index[s][tok] = "done"      # EOS only in the accepting state
-                continue
-            cur = s
-            for ch in tok:                      # walk every character of the token
-                cur = step(cur, ch)
-                if cur is None:
-                    break
-            if cur is not None:
-                index[s][tok] = cur
-    return index
-
-def constrained_greedy(scores, index):
-    """Run time: a lookup per step, then argmax among allowed tokens only."""
-    state, out = 0, []
-    while state != "done":
-        allowed = index[state]
-        tok = max(allowed, key=lambda t: scores.get(t, float("-inf")))
-        out.append(tok)
-        state = allowed[tok]
-    return "".join(t for t in out if t != "<eos>")
-
-index = build_index(VOCAB)
-for s, allowed in index.items():
-    print(s, allowed)       # 0 {'7': 1, '42': 2, '123': 3} ... 3 {'<eos>': 'done'}
-# The "model" prefers 1234 and a, both illegal from the start state.
-fake_logits = {"1234": 5.0, "a": 4.0, "<eos>": 3.0, "42": 1.0, "7": 0.5}
-print(constrained_greedy(fake_logits, index))   # -> 427
 ```
 
 ### Production call: schema-constrained output plus semantic validation

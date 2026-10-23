@@ -5,7 +5,8 @@ name: Offline vs online evaluation
 kind: decision
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -44,6 +45,76 @@ slow and noisy. Offline gates, online validates, traces refill it.
   launch log that tracks offline-online agreement.
 - **What you can skip.** A full experimentation platform up front; a launch log, a trace sampler and one
   outcome event get most of the value.
+
+## Decision case
+### Scenario
+A B2B software company runs a support agent with read tools (`lookup_order`, search over the help
+centre) and write tools (`issue_refund`, `send_email`, `update_address`). It handles about 2,000
+conversations a week; the primary outcome is resolution without human escalation, currently 60%.
+
+Two kinds of change are queued:
+- **About three prompt or tool-description edits a week** from a team of three engineers.
+- **A model swap** to a smaller model, illustratively about 40% cheaper per conversation. Finance wants
+  a go or no-go within 3 weeks.
+
+Constraints:
+- **No duplicate side effects.** No customer may receive a refund or email that production did not send.
+- **Latency.** p95 reply latency must stay under 8 seconds (the team's own SLO).
+- **Traffic.** 2,000 conversations a week is all there is; nothing else can be split.
+- **People.** No dedicated data scientist; whatever the team builds, three engineers must run it weekly.
+
+### Options
+| Option | How it works | Fit to the 3-week deadline | Side-effect safety | Can it see a resolution change? |
+|---|---|---|---|---|
+| **A. Offline gate only** | Regression suite plus golden set per change, ship on a pass | Minutes per change | Safe, no live traffic | No: proxy scores only, as in the "offline win, online flat" example |
+| **B. A/B every change** | Randomise each edit and the swap 50/50 on resolution | Fails: a 3-point effect needs 4,126 to 4,231 per arm, over 4 weeks of all traffic per change | Real writes to real users in both arms | Yes, but for one change a month, not three a week |
+| **C. Offline plus shadow plus canary** | Offline gate, then the candidate shadows live traffic with dry-run write tools, then a canary | Fits in about 2 weeks | Safe if the dry-run wrapper is tested | No: shadow and canary measure distribution and guardrails, not user outcomes |
+| **D. Tiered ladder by change type** | Edits: offline gate, then canary. Model swap: offline, 1 week shadow, then a 2-week 50/50 A/B as a loss guard | Edits same day; swap decided in week 3 | Shadow dry-runs every write tool | Only large losses: about 4.4 points at 2,000 per arm |
+
+### Decision
+Choose **D**, because traffic is the binding constraint:
+- **Edits stay offline-gated.** At three a week, no online test can be powered for them, so the regression
+  suite, golden set and canary guardrails carry them. The team accepts proxy risk on small edits.
+- **The model swap earns the full ladder.** It changes every reply, it is the change most likely to move
+  resolution, and it is the one with a deadline.
+- **Shadow catches unsafe intended writes.** Week 1 shadows all 2,000 conversations with dry-run write
+  tools, so the intended-write diff surfaces any extra refunds before a user is exposed.
+- **Weeks 2 and 3 are a loss guard, not a proof of no change.** A 50/50 split gives about 2,000 per arm,
+  enough to detect a drop of roughly 4.4 points at 80% power and α = 0.05. Ship the swap if the interval
+  rules that out and guardrails hold.
+
+What would change it:
+- **Traffic.** Above about 8,500 conversations a week, a 3-point A/B fits into a single week, and option B
+  becomes viable for model swaps.
+- **Agreement.** If the launch log's directional agreement falls toward a coin flip, stop shipping edits
+  on the offline gate alone until the grader is repaired.
+- **Dry-run.** If the write tools cannot be wrapped (a vendor SDK that writes on read), shadow is unsafe,
+  and the swap goes straight from offline to a small A/B with human approval on every write.
+
+### Trade-offs accepted
+- **Small resolution losses go unseen.** A 2-point drop from the swap is below what 2,000 per arm can
+  detect. Watch it with sampled online judging and the weekly escalation rate, and keep the old model
+  behind a flag for a month.
+- **Edits ship on a proxy.** Watch it with the launch log: every A/B the team does run adds a row, and
+  directional agreement is reviewed monthly.
+- **Shadow doubles model spend for a week.** It is cheap next to a wrong swap. Watch shadow cost per
+  request and stop at 2,000 conversations.
+- **Users see the candidate during the A/B.** Half of a fortnight's traffic is exposed to a possibly
+  worse agent. Canary guardrails (error rate, p95 latency, refusals) roll back automatically.
+
+### Review rubric
+- **Constraints first.** The write-up names traffic, deadline, side-effect and team constraints with
+  numbers before comparing options.
+- **Power is computed, not assumed.** It states the per-arm sample for the smallest meaningful effect
+  and how many weeks of traffic that takes.
+- **Side effects are handled explicitly.** Shadow uses dry-run write tools, compares intended writes,
+  and says how the wrapper is tested.
+- **Different changes get different rungs.** The ladder for a prompt edit differs from that for a model
+  swap, with a reason tied to cost of error and traffic.
+- **The blind spot is named and monitored.** It says what effect size goes undetected and which signal
+  (escalation trend, sampled judging, launch log) watches it.
+- **Reversal conditions are concrete.** It names the traffic level, agreement rate or tooling fact that
+  would flip the decision.
 
 ## Why it exists
 Offline scores and real outcomes drift apart for four structural reasons:

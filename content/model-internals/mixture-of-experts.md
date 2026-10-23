@@ -5,7 +5,8 @@ name: Mixture of experts (MoE)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - model-internals/transformer
@@ -170,6 +171,22 @@ flowchart TD
     M --> Y["Residual add, next layer"]
     R -.->|"balance loss or bias"| B["Even expert load"]
 ```
+
+## Misconceptions
+- **"An MoE needs only as much GPU memory as its active parameters."** Any token can be routed to any
+  expert, so all experts must be resident: Mixtral 8x7B needs about 94 GB of fp16 weights even though
+  it computes like a roughly 13B model.
+- **"8x7B means a 56B model."** Attention, embeddings and norms are shared, so the total is about 47B.
+  Total governs memory; active (about 13B) governs per-token compute and batch-1 decode speed.
+- **"An MoE decodes at small-model speed however many agent loops share it."** That holds near batch 1.
+  As concurrent loops grow, the batch touches nearly every expert per step, so weight traffic approaches
+  the dense total and the bandwidth edge mostly disappears.
+- **"Each expert is a topic specialist you could prune."** Routing is per token and per layer and tracks
+  token type and syntax far more than domain, so there is no "legal expert" to keep and no "code expert"
+  to drop.
+- **"The router just picks experts; their outputs are summed."** Outputs are weighted by router
+  probabilities because top-k selection is not differentiable; those weights are the router's only
+  gradient path, and without balancing it collapses onto a few experts.
 
 ## Examples
 ### A minimal top-k MoE layer with a Switch-style balancing loss

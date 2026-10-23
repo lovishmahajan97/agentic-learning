@@ -5,7 +5,8 @@ name: RLHF
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 related:
   - training-adaptation/dpo
@@ -173,6 +174,25 @@ flowchart TD
     PPO -.->|"proxy up, win rate down"| CHK{"Overoptimised?"}
     CHK -.->|"raise beta, recollect pairs"| RAT
 ```
+
+## Misconceptions
+- **"The reward model measures quality."** It is a proxy fitted to comparisons near the policy that
+  produced them, and wrong further away. Gao et al. showed proxy reward keeps rising while true reward
+  peaks and falls, so select checkpoints by held-out human win rate.
+- **"Human feedback trains the policy directly."** PPO scores far more samples than raters could label;
+  the human comparisons train the reward model, and only the reward model scores the policy's samples.
+  Its errors, not the raters' intent, are what the policy optimises.
+- **"The KL penalty is an optional regulariser."** It is what keeps the policy where the reward model is
+  trustworthy. With β at zero the policy finds length, flattery and degenerate text that score well.
+- **"A higher reward-model accuracy means a better reward model."** Accuracy cannot meaningfully beat
+  inter-annotator agreement on the same pairs, and in-distribution accuracy says little about the new
+  policy's outputs. Measure both before starting RL.
+- **"Reward hacking only happens inside RL training."** Tuning an agent's prompt or best-of-n against one
+  LLM judge is the same loop: the judge score went from 6.8 to 8.7 while human-audited success fell from
+  a 76% peak to 69%. Keep a human audit slice on any judge you optimise against.
+- **"Verbose, agreeable answers are a prompting problem."** They are partly trained in: raters and reward
+  models preferred them. Prompts can trim them; a length-guarded reranker or a preference fine-tune
+  removes them more reliably.
 
 ## Examples
 ### Reward-model loss and PPO reward shaping

@@ -5,7 +5,8 @@ name: DPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/rlhf
@@ -148,43 +149,26 @@ flowchart TD
     W -.->|"yes: likelihood displacement"| FX["Raise beta or add SFT term"]
 ```
 
+## Misconceptions
+- **"DPO is just SFT on the chosen responses."** It also pushes probability away from the rejected one,
+  and weights each pair by how wrong the current ranking is, so well-separated pairs contribute almost
+  nothing. SFT on chosen alone learns nothing about the wrong tool choice.
+- **"No reward model means no KL leash."** The leash is inside the loss: reference log-probs appear in
+  every pair, and β sets how far the policy may move. At β = 0.1 reaching a 0.9 preference needs about 22
+  nats of drift; at β = 0.5, about 4.4.
+- **"A growing margin means good responses are getting more likely."** The margin can grow while both
+  log-probs fall, as long as rejected falls faster. Plot chosen log-prob beside the margin to catch
+  likelihood displacement.
+- **"Any good preference dataset will do."** DPO is offline: pairs from a different, stronger model
+  compare sequences your policy rarely writes, so the loss moves while outputs barely change. Build pairs
+  from your own agent's runs and iterate in rounds.
+- **"Pair the whole good run against the whole bad run."** Whole trajectories blur which step mattered,
+  and runs that differ because a tool returned different data teach nothing about the agent. Pair at the
+  first diverging assistant turn.
+- **"Training accuracy near 100% means it worked."** On a small pair set it usually means memorised
+  surface features such as length. Train one epoch and stop on held-out reward accuracy and win rate.
+
 ## Examples
-### Turning agent runs into DPO pairs
-Two runs of the same task that share a history and then diverge make a natural pair: the shared prefix
-is the prompt, and each run's first diverging assistant turn is chosen or rejected. The output is the conversational
-prompt / chosen / rejected format TRL's DPO trainer accepts.
-
-```python
-def shared_prefix(a, b):
-    n = 0
-    while n < min(len(a), len(b)) and a[n] == b[n]:
-        n += 1
-    return n
-
-def runs_to_pair(run_good, run_bad):
-    """Each run is a list of chat messages. Pair only the first diverging step, and only if both
-    sides of it are assistant turns (a tool result that differed is not the agent's decision)."""
-    n = shared_prefix(run_good, run_bad)
-    if n == min(len(run_good), len(run_bad)):
-        return None                                   # the runs never diverge
-    if run_good[n]["role"] != "assistant" or run_bad[n]["role"] != "assistant":
-        return None
-    return {"prompt": run_good[:n], "chosen": [run_good[n]], "rejected": [run_bad[n]]}
-
-history = [{"role": "system", "content": "Support agent. Tools: get_order, refund."},
-           {"role": "user", "content": "Refund order A-1042, it arrived broken."}]
-good = history + [{"role": "assistant", "content": "", "tool_calls": [{"type": "function",
-                   "function": {"name": "refund", "arguments": {"order_id": "A-1042"}}}]}]
-bad = history + [{"role": "assistant", "content": "Could you confirm your order number?"}]  # needless ask
-
-pair = runs_to_pair(good, bad)
-call = pair["chosen"][0]["tool_calls"][0]["function"]["name"]
-print(len(pair["prompt"]), "shared messages; chosen calls", call, "| rejected:", pair["rejected"][0]["content"])
-# 2 shared messages; chosen calls refund | rejected: Could you confirm your order number?
-# Label which run is better with users, experts or a calibrated judge. Only the step where they diverge
-# is kept, so the pair isolates one decision and contains no tool-result tokens to score.
-```
-
 ### The DPO loss from sequence log-probs
 Reference log-probs are precomputed. Shapes are `[batch]` after summing per-token log-probs over
 response tokens; the helper shows the masked sum.
@@ -234,6 +218,42 @@ Preference probability is σ(β × log-ratio margin). Computed for the 4-nat swi
   each pair: big behaviour change, more drift risk.
 - **Large β is satisfied after small moves:** the policy stays close to the reference, which is what you
   want when pairs are noisy or off-policy, as user thumbs often are.
+
+### Turning agent runs into DPO pairs
+Two runs of the same task that share a history and then diverge make a natural pair: the shared prefix
+is the prompt, and each run's first diverging assistant turn is chosen or rejected. The output is the conversational
+prompt / chosen / rejected format TRL's DPO trainer accepts.
+
+```python
+def shared_prefix(a, b):
+    n = 0
+    while n < min(len(a), len(b)) and a[n] == b[n]:
+        n += 1
+    return n
+
+def runs_to_pair(run_good, run_bad):
+    """Each run is a list of chat messages. Pair only the first diverging step, and only if both
+    sides of it are assistant turns (a tool result that differed is not the agent's decision)."""
+    n = shared_prefix(run_good, run_bad)
+    if n == min(len(run_good), len(run_bad)):
+        return None                                   # the runs never diverge
+    if run_good[n]["role"] != "assistant" or run_bad[n]["role"] != "assistant":
+        return None
+    return {"prompt": run_good[:n], "chosen": [run_good[n]], "rejected": [run_bad[n]]}
+
+history = [{"role": "system", "content": "Support agent. Tools: get_order, refund."},
+           {"role": "user", "content": "Refund order A-1042, it arrived broken."}]
+good = history + [{"role": "assistant", "content": "", "tool_calls": [{"type": "function",
+                   "function": {"name": "refund", "arguments": {"order_id": "A-1042"}}}]}]
+bad = history + [{"role": "assistant", "content": "Could you confirm your order number?"}]  # needless ask
+
+pair = runs_to_pair(good, bad)
+call = pair["chosen"][0]["tool_calls"][0]["function"]["name"]
+print(len(pair["prompt"]), "shared messages; chosen calls", call, "| rejected:", pair["rejected"][0]["content"])
+# 2 shared messages; chosen calls refund | rejected: Could you confirm your order number?
+# Label which run is better with users, experts or a calibrated judge. Only the step where they diverge
+# is kept, so the pair isolates one decision and contains no tool-result tokens to score.
+```
 
 ### Production run with TRL
 A typical first round on the SFT checkpoint. Argument names follow recent TRL releases; check your

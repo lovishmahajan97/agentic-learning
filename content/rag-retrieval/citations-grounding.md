@@ -5,7 +5,8 @@ name: Citations / grounding
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -141,6 +142,23 @@ flowchart TD
     F --> G
     U -.->|"sampled"| E["Entailment audit with NLI or LLM judge"]
 ```
+
+## Misconceptions
+- **"Retrieval plus 'only use the context' grounds the answer."** The model follows that instruction
+  probabilistically and still fills gaps from parametric memory, leaving no trail to check. Grounding
+  needs an abstention path, per-claim citations and a verifier in code.
+- **"A sources list under the answer counts as citations."** It says what was retrieved, not which
+  sentence each source supports, so nothing can be verified. Cite per claim, with a quote.
+- **"Document-level citations are safer because they are almost never wrong."** A 40-page PDF supports
+  almost any claim on its topic, so the score looks perfect while users and verifiers can check nothing.
+  Cite chunks plus a short verbatim quote.
+- **"Ask the model for character offsets to get precise spans."** Models cannot count offsets reliably.
+  Have it emit a quote and resolve the quote to offsets server-side, in the chunk version it saw.
+- **"A quote that passes the substring check proves the claim."** It proves only that the text exists in
+  the cited chunk; that text may still not entail the claim. Keep the cheap quote check and add a
+  sampled NLI or LLM-judge entailment audit.
+- **"Source IDs only need to be unique per tool call."** In a multi-step agent each search would restart
+  at S1, so "S2" means different chunks at different steps. Keep one registry for the whole run.
 
 ## Examples
 ### Agent loop: run-level source registry and a verified final answer

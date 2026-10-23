@@ -5,7 +5,8 @@ name: LLM-as-a-judge
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -161,6 +162,25 @@ flowchart TD
     G --> O["Sampled online judging plus human spot checks"]
     O -.->|"generator, task or judge model changes"| H
 ```
+
+## Misconceptions
+- **"A judge that agrees with humans 90% of the time is ready to gate releases."** When most items
+  pass, agreement is dominated by easy passes. In the worked example 90% agreement comes with 75%
+  recall on failures, so one real failure in four gets through; gate on failure recall.
+- **"A 1-10 score carries more information than pass or fail."** Undefined scales compress toward 7
+  or 8 and shift with phrasing, so a 0.3 move cannot be acted on. One binary criterion per call is
+  easier to calibrate and tells you what failed.
+- **"The judge's pass rate is the agent's pass rate."** It is an estimate of the judge. A judge that
+  misses failures inflates the headline (observed 0.75 against a true 0.70 in the example); correct
+  it with the calibrated recalls or quote it as biased.
+- **"The strongest model, the one behind my agent, makes the best judge."** Judges prefer their own
+  family's style. Use a judge from another family, or at least split agreement with humans by
+  generator.
+- **"One pairwise run shows which prompt is better."** Position bias can flip the verdict: B wins 68 of
+  100 when shown first and 44 when shown second. Run both orders and count flips as ties.
+- **"A judge can verify code and arithmetic by reading them."** Judges misgrade both with full
+  confidence. Execute code, assert on sandbox state, and keep the judge for criteria that cannot be
+  checked.
 
 ## Examples
 ### Reference-guided binary judge and its calibration

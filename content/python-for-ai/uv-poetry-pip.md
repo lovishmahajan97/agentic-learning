@@ -5,7 +5,8 @@ name: uv / poetry / pip
 kind: tool
 difficulty: intro
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/lockfiles-and-dependency-pinning
@@ -40,6 +41,149 @@ machine. uv covers pip, pip-tools, virtualenv, pyenv and pipx, much faster.
   happen: in their own pull request, gated on the eval suite.
 - **What you can skip.** Resolver internals beyond "constraints, markers, wheel tags". Poetry versus uv
   arguments; pick one and lock.
+
+## Lab
+### Task
+A code-executing agent writes one-file scripts with PEP 723 metadata and asks to run them with `uv run`.
+Build the gate in front of that.
+- **The gate:** parse the `# /// script` block, refuse packages outside the sandbox allowlist (including
+  hallucinated names), and require exact pins and a satisfiable `requires-python`.
+- **The output:** the `uv run` argv that points only at the audited sandbox index.
+- **Time box:** 45-60 min.
+- **Prerequisites:** Lockfiles & dependency pinning; Security scanning & dependency auditing.
+- **Setup:** Python 3.11+ (for `tomllib`), `pip install packaging pytest` (checked with packaging 26.3 and
+  uv 0.12.6). Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **Offline:** nothing is installed or downloaded; the lab plans the command. The planned flags were
+  smoke-tested with a dependency-free script.
+
+### Starter code
+```python
+"""Lab: vet an agent-written PEP 723 script and plan its `uv run`. Run: python lab.py"""
+from __future__ import annotations
+import re, tomllib
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
+
+# The block format from PEP 723 (the regex is the one the PEP gives)
+REGEX = r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$"
+SANDBOX_INDEX = "https://pypi.internal.example/simple"     # audited mirror inside the sandbox
+ALLOWED = {"httpx", "pandas", "numpy"}                      # packages the mirror serves
+
+def read_metadata(script: str) -> dict | None:
+    # YOUR CODE HERE: find `# /// script` blocks with REGEX (match group "type" == "script")
+    # - none -> None; more than one -> ValueError
+    # - strip the leading "# " (or "#" on empty lines) from each content line, parse with tomllib
+    raise NotImplementedError
+
+def plan_run(script: str, path: str, python: str = "3.12") -> list[str]:
+    # YOUR CODE HERE: return the argv that runs the script in the sandbox, or raise
+    # - no metadata -> ValueError("no script metadata")
+    # - requires-python missing, or not satisfied by `python` -> ValueError mentioning requires-python
+    # - a dependency whose canonical name is not in ALLOWED -> PermissionError naming it
+    # - a dependency not pinned with exactly one "==" specifier -> ValueError mentioning "pin"
+    # - otherwise: ["uv", "run", "--no-config", "--python", python,
+    #               "--default-index", SANDBOX_INDEX, path]
+    raise NotImplementedError
+
+GOOD = '''\
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "Pandas==2.2.3",
+#   "httpx==0.28.1",
+# ]
+# ///
+import pandas, httpx
+'''
+
+if __name__ == "__main__":
+    print(read_metadata(GOOD))
+    print(" ".join(plan_run(GOOD, "analysis.py")))
+    hallucinated = GOOD.replace("httpx==0.28.1", "pandas-profiler-pro==1.0")
+    try:
+        plan_run(hallucinated, "analysis.py")
+    except PermissionError as e:
+        print("refused:", e)
+```
+
+### Expected output
+`python lab.py` with a correct solution prints (the refusal wording is yours; it must name the package):
+
+```
+{'requires-python': '>=3.11', 'dependencies': ['Pandas==2.2.3', 'httpx==0.28.1']}
+uv run --no-config --python 3.12 --default-index https://pypi.internal.example/simple analysis.py
+refused: pandas-profiler-pro is not in the sandbox allowlist
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (Python 3.12, packaging 26.3, pytest 9.1).
+
+```python
+import pytest
+from lab import GOOD, SANDBOX_INDEX, plan_run, read_metadata
+
+def script(requires='">=3.11"', deps='"httpx==0.28.1"'):
+    lines = ["# /// script"]
+    if requires:
+        lines.append(f"# requires-python = {requires}")
+    lines += [f"# dependencies = [{deps}]", "# ///", "print('hi')", ""]
+    return "\n".join(lines)
+
+def test_reads_the_block_and_handles_absent_or_duplicate():
+    assert read_metadata(GOOD) == {"requires-python": ">=3.11",
+                                   "dependencies": ["Pandas==2.2.3", "httpx==0.28.1"]}
+    assert read_metadata("print('no metadata')\n") is None
+    with pytest.raises(ValueError):
+        read_metadata(script() + script())
+
+def test_plans_a_locked_down_uv_run():
+    assert plan_run(GOOD, "analysis.py") == [
+        "uv", "run", "--no-config", "--python", "3.12", "--default-index", SANDBOX_INDEX, "analysis.py"]
+
+def test_refuses_packages_outside_the_allowlist():
+    with pytest.raises(PermissionError, match="pandas-profiler-pro"):
+        plan_run(script(deps='"pandas-profiler-pro==1.0"'), "a.py")
+
+def test_requires_exact_pins():
+    for dep in ('"httpx>=0.27"', '"httpx"', '"httpx==0.28.1,!=0.28.0"'):
+        with pytest.raises(ValueError, match="pin"):
+            plan_run(script(deps=dep), "a.py")
+
+def test_requires_python_must_be_declared_and_satisfied():
+    with pytest.raises(ValueError, match="requires-python"):
+        plan_run(script(requires=None), "a.py")
+    with pytest.raises(ValueError, match="requires-python"):
+        plan_run(script(requires='">=3.13"'), "a.py", python="3.12")
+
+def test_no_metadata_is_refused():
+    with pytest.raises(ValueError, match="no script metadata"):
+        plan_run("import os\n", "a.py")
+```
+
+### Failure scenarios
+- **Compare raw names with the allowlist.** `Pandas==2.2.3` is refused although `pandas` is allowed,
+  because PEP 503 normalization lowercases and folds `-`, `_` and `.`. Print `canonicalize_name(req.name)`
+  next to `req.name` for each dependency.
+- **Take the first match with `re.search`.** A script with two `script` blocks is accepted and the
+  duplicate test fails; an agent (or an injected prompt) could hide extra dependencies in the second block.
+  Print `len(list(re.finditer(REGEX, script)))` for the failing input.
+- **Check pins with `"==" in dep`.** `httpx==0.28.1,!=0.28.0` passes as "pinned" and `httpx===0.28.1`
+  gets misread. Iterate `Requirement(dep).specifier` and inspect each `operator`.
+- **Drop `--default-index`.** The plan test fails; in a real sandbox `uv run` would fall back to public
+  PyPI, where an attacker can register the name a model hallucinated. Print the argv and check it names
+  only the sandbox index.
+
+### Submission
+- **`lab.py`** with `read_metadata` and `plan_run` implemented.
+- **A green test run** (6 passed) and the output of `python lab.py`.
+- **One extra test** for a dependency with an environment marker (`numpy==2.1.3; sys_platform == 'linux'`),
+  stating whether your gate should accept it and why.
+- **A note:** why this gate is a dependency boundary but not a security sandbox, and what still has to
+  isolate the process (container, no network except the mirror, CPU and time limits).
+- **Evaluated on:** tests passing, normalized allowlist matching, strict pins, and an argv that can only
+  reach the audited index.
 
 ## Why it exists
 - **A project needs four things.** A list of what it depends on, an exact resolved set of versions satisfying

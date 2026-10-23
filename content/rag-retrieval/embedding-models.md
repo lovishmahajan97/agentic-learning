@@ -5,7 +5,8 @@ name: Embedding models
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -156,6 +157,22 @@ flowchart TD
     IDX -->|"top 50"| CE["Cross-encoder reranker"]
     CE -->|"top few"| OUT["Tool result to agent"]
 ```
+
+## Misconceptions
+- **"Two models with the same dimension produce compatible vectors."** The dimension is only the array
+  length; each axis means something specific to the model that produced it. Mixing models or versions in
+  one index gives meaningless similarities, so re-embed everything on a switch.
+- **"An embedding is a neutral fingerprint of the text; how you call the model does not matter."**
+  Prefixes, pooling and normalization are part of the trained contract. Dropping `query: ` on E5 or
+  mean-pooling a [CLS]-trained model still returns vectors, just worse ones, with no error.
+- **"The top MTEB model is the best model for my agent."** MTEB averages tasks that may not resemble
+  yours, and agent-written queries are terse and keyword-like. Only recall@k on your own labelled
+  queries, including ones from traces, decides.
+- **"A cosine of 0.8 means the hit is relevant."** Score scales differ by model, so a threshold copied
+  across models lets everything or nothing through. Calibrate it per model on labelled relevant and
+  irrelevant pairs.
+- **"Embeddings replace keyword search."** They capture paraphrase but handle exact identifiers, error
+  codes and rare names poorly. Pair them with BM25 or give the agent an exact-match tool.
 
 ## Examples
 ### Synonym matching with an asymmetric model

@@ -5,7 +5,8 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/redis-caching
@@ -38,6 +39,173 @@ state and job queues, never as the system of record.
   lock guarding a side effect.
 - **What you can skip.** Cluster internals and Redlock debates beyond "unsafe without fencing". Know the
   data types, eviction policies, persistence modes and the four patterns below.
+
+## Lab
+### Task
+Agent workers share a Redis tool cache and a reindex lock, and three bugs reached production: identical
+searches with arguments in a different order never hit the cache, the second `send_email` of a run
+was answered from cache so nothing went out, and a slow worker's release deleted the lock another
+worker had just acquired.
+
+You will fix all three in `agent_redis.py` against `fakeredis`, an in-process fake, so no server is
+needed. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's Patterns, Locks and agent-loop sections, and the redis-py primitives
+  under Examples.
+- **Setup:** Python 3.11+, `pip install pytest "fakeredis[lua]"` (checked against pytest 9.1.1,
+  fakeredis 2.40.0 with lupa 2.8, redis-py 8.1.0). Save the starter as `agent_redis.py` and the tests as
+  `test_agent_redis.py` in one directory. The `lua` extra makes `EVAL` and `register_script` work.
+- **Goal:** cache keys are canonical, hashed and expiring; only read-only tools are cached; a release
+  never deletes a lock someone else holds.
+
+### Starter code
+```python
+"""agent_redis.py: a shared tool cache and lock for agent workers. Runs against fakeredis, an
+in-process fake; point make_client at redis.Redis(...) for a real server, the calls are the same."""
+import json
+import time
+import uuid
+
+import fakeredis
+
+TOOLS = {
+    "search": {"read_only": True, "ttl_s": 300},
+    "send_email": {"read_only": False},
+}
+
+
+def make_client():
+    return fakeredis.FakeRedis(decode_responses=True)
+
+
+def cache_key(tool, args):
+    return f"tool:{tool}:{args}"                 # EXERCISE 1: canonical and hashed, any arg order
+
+
+def call_tool(r, tool, args, impl):
+    """Cache-aside around one tool call. Returns (result, "hit" | "miss" | "uncached")."""
+    key = cache_key(tool, args)
+    hit = r.get(key)
+    if hit is not None:
+        return json.loads(hit), "hit"
+    out = impl(**args)
+    r.set(key, json.dumps(out))                  # EXERCISE 1: TTL; EXERCISE 2: read-only tools only
+    return out, "miss"
+
+
+def acquire(r, name, ttl_ms):
+    token = str(uuid.uuid4())
+    return token if r.set(f"lock:{name}", token, nx=True, px=ttl_ms) else None
+
+
+def release(r, name, token):
+    r.delete(f"lock:{name}")                     # EXERCISE 3: delete only if the lock is still ours
+
+
+if __name__ == "__main__":
+    r = make_client()
+    search = lambda q, k: {"q": q, "hits": k}
+    print("search:", call_tool(r, "search", {"q": "refund policy", "k": 3}, search)[1],
+          call_tool(r, "search", {"k": 3, "q": "refund policy"}, search)[1])
+    outbox = []
+    send = lambda to: outbox.append(to) or {"sent": to}
+    call_tool(r, "send_email", {"to": "a@example.com"}, send)
+    call_tool(r, "send_email", {"to": "a@example.com"}, send)
+    print("emails actually sent:", len(outbox))
+    slow = acquire(r, "reindex", ttl_ms=50)
+    time.sleep(0.1)                              # a slow model call outlives the lease
+    fast = acquire(r, "reindex", ttl_ms=5000)
+    release(r, "reindex", slow)                  # the slow worker finishes and releases
+    print("second holder still has the lock:", r.get("lock:reindex") == fast)
+```
+
+### Expected output
+The starter prints `search: miss miss`, `emails actually sent: 1` and
+`second holder still has the lock: False`. After the fix, `python agent_redis.py` prints:
+
+```text
+search: miss hit
+emails actually sent: 2
+second holder still has the lock: True
+```
+
+### Tests
+On the starter all 4 fail: `assert 'miss' == 'hit'`, `assert 5029 < 100` (the raw arguments are the
+key), `assert ['miss', 'hit'] == ['uncached', 'uncached']`, and `assert None == '<token>'` for the lock.
+
+```python
+import time
+
+import pytest
+
+from agent_redis import acquire, cache_key, call_tool, make_client, release
+
+
+@pytest.fixture
+def r():
+    return make_client()
+
+
+def counting(result):
+    calls = []
+    def impl(**args):
+        calls.append(args)
+        return result
+    return impl, calls
+
+
+def test_same_args_in_any_order_hit_the_cache(r):
+    impl, calls = counting({"hits": 3})
+    assert call_tool(r, "search", {"q": "refunds", "k": 3}, impl)[1] == "miss"
+    assert call_tool(r, "search", {"k": 3, "q": "refunds"}, impl)[1] == "hit"
+    assert len(calls) == 1
+
+
+def test_cache_key_is_bounded_and_expires(r):
+    impl, _ = counting({"hits": 1})
+    args = {"q": "x" * 5000, "k": 1}
+    call_tool(r, "search", args, impl)
+    key = cache_key("search", args)
+    assert len(key) < 100
+    assert 0 < r.ttl(key) <= 300
+
+
+def test_side_effecting_tool_is_never_cached(r):
+    impl, calls = counting({"sent": True})
+    statuses = [call_tool(r, "send_email", {"to": "a@example.com"}, impl)[1] for _ in range(2)]
+    assert statuses == ["uncached", "uncached"]
+    assert len(calls) == 2
+    assert r.keys("tool:send_email:*") == []
+
+
+def test_stale_release_keeps_next_holders_lock(r):
+    slow = acquire(r, "reindex", ttl_ms=50)
+    time.sleep(0.1)
+    fast = acquire(r, "reindex", ttl_ms=5000)
+    assert fast is not None
+    release(r, "reindex", slow)
+    assert r.get("lock:reindex") == fast
+```
+
+### Failure scenarios
+- **Inject: release with `GET`, compare in Python, then `DEL`.** Tests pass, but between the two
+  commands the lease can expire and another worker acquire it, so you delete their lock anyway. Debug:
+  put a `time.sleep` between the calls in a test; the check and the delete must be one Lua script.
+- **Inject: hash `json.dumps(args)` without `sort_keys=True`.** The any-order test fails again. Debug:
+  print both serialized specs; dict order follows insertion, so canonicalize before hashing.
+- **Inject: `ex=` set in a second call after `set`.** It passes here; a crash between the two leaves a
+  key with no TTL. Debug: `r.ttl(key)` returns -1; pass `ex` on the same `SET`.
+- **Inject: leave out the model name or a tool version in the key.** After a tool upgrade, workers serve
+  results in the old shape. Debug: compare a cached value with a fresh call; version the key prefix.
+
+### Submission
+- **Your fixed `agent_redis.py`**, with the given tests unchanged.
+- **A `pytest -v` log** with all 4 passing, plus the starter's failing run for comparison.
+- **The `python agent_redis.py` output** after the fix.
+- **One extra test** of your own, for example that two different argument values never share a key.
+- **A short note** on what the lock still does not guarantee without a fencing token, and where in your
+  agent you would check one.
+- **Evaluated by:** the given tests pass unmodified, your test fails on the starter, and no side-effecting
+  tool result is ever stored in Redis.
 
 ## Why it exists
 - **Backends need shared, hot state.** The cached answer to an expensive call, requests a client made this

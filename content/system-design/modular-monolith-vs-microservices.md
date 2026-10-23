@@ -5,7 +5,8 @@ name: Modular monolith vs microservices
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/domain-driven-design-and-bounded-contexts
@@ -40,6 +41,64 @@ team, security), because hops multiply across agent steps.
   choice reversible.
 - **What you can skip.** Service-mesh and platform-team theory. Know the hop arithmetic, the four
   properties of a module boundary, and the short list of reasons that justify a split.
+
+## Decision case
+### Scenario
+A B2B analytics startup is shipping a data-analysis agent: it reads a customer's files, retrieves
+context, and writes and runs Python to answer questions. It must choose its runtime layout. All figures
+are illustrative.
+- **Volume:** 40,000 agent runs a day, about 15 steps each; each step makes one hosted-model call, and
+  about 3 steps per run execute generated code.
+- **Run length:** runs take up to 10 minutes, so they cannot live in the request handler.
+- **Constraints:** one team of 8 Python engineers; 12 weeks to launch; generated code is untrusted and
+  must not reach the database credentials; a pilot customer wants a VPC install with no platform team on
+  their side; at most one on-call rotation.
+
+### Options
+| Option | How it works | Links per run, runs with no failed link (99.9% per link) | Security of code execution | Team, deadline and VPC install |
+|---|---|---|---|---|
+| A. Single deployable | Loop, tools, retrieval, memory and code execution in one API process | 15, 0.999¹⁵ ≈ 98.5% | Fails: generated code runs beside the credentials | Simplest, but a 10-minute run blocks an API worker |
+| B. One image, `api` and `worker` entrypoints, plus a sandbox service | Enforced modules in one codebase; runs execute in `worker`; code runs in a separate sandbox over HTTP | 15 + 3 = 18, 0.999¹⁸ ≈ 98.2% | Passes: own network segment and no database credentials | One build, three runtime units, one rotation |
+| C. Microservices per capability | Orchestrator, memory, retrieval, tools and sandbox as services; each step crosses orchestrator to memory and to a tool | 3 per step, 45, 0.999⁴⁵ ≈ 95.6% | Passes | Seven pipelines and contracts for 8 engineers; heavy for a VPC install |
+
+At 40,000 runs a day, that is roughly 600 runs (A), 710 runs (B) and 1,760 runs (C) a day that hit at
+least one failed link and must retry or abort.
+
+### Decision
+Choose **B, one image with `api` and `worker` roles plus a sandbox service**, because:
+- **Security forces exactly one split:** untrusted code is a named reason (a different security
+  envelope), so the sandbox is a service from day one; A fails this constraint outright.
+- **Run length forces a separate process, not a service:** a `worker` role from the same image keeps
+  10-minute runs off the API without a second codebase or versioned contract.
+- **Hop math rules out C:** C turns about 710 failing runs a day into about 1,760, and each extra hop
+  is a retry path that needs an idempotency key.
+- **Team and deadline:** one team gains no release independence from seven services, and a customer
+  VPC install with no platform team is three units, not seven.
+
+**What would change it:** a second team owning retrieval on its own release cadence, retrieval moving to
+a different data store, or self-hosting the model on GPUs would each justify extracting that one module
+through its existing facade.
+
+### Trade-offs accepted
+- **Shared release train for `api` and `worker`.** A worker bug ships with an API change. Watch: change
+  failure rate per role and rollbacks caused by the other role.
+- **Boundaries rely on CI, not the network.** Watch: `import-linter` contract exceptions; a growing
+  ignore list means a boundary is eroding.
+- **The sandbox hop can fail mid-run.** Watch: sandbox timeout and retry rate per run, and duplicate
+  executions per idempotency key, which must stay at zero.
+- **No independent scaling of retrieval.** Watch: retrieval p99 latency inside `worker` as tenants grow.
+
+### Review rubric
+- **Each split names its reason:** every service or deployable is tied to hardware, failure domain,
+  team, security or runtime, and every module that stays in-process says why.
+- **Hop arithmetic is shown per run:** links per run and the resulting failure rate are computed, not
+  asserted, and converted into failing runs per day.
+- **Separate deployable is considered** as the middle option before any new service.
+- **Retries are safe:** every remote mutating call has an idempotency key derived from run, step and
+  call.
+- **Reversal triggers are concrete:** at least one named change that would justify the next extraction,
+  and the facade that keeps it cheap.
+- **Each accepted trade-off names a metric** someone can alert on.
 
 ## Why it exists
 - **Failure mode 1: the big ball of mud.** A monolith with no internal structure: any table joined from

@@ -5,7 +5,8 @@ name: GPU memory optimization (VRAM math)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -158,6 +159,22 @@ flowchart TD
     Q["Quantize, fp8 KV, caps, TP"] -.->|"shrink weights"| W
     Q -.->|"fewer bytes or tokens"| T
 ```
+
+## Misconceptions
+- **"`nvidia-smi` shows how much memory the model needs."** It includes the allocator's reserve and the
+  KV pool the engine pre-allocates, so a serving engine looks nearly full even at idle. Attribute memory
+  with the PyTorch counters and the KV size the engine logs at startup.
+- **"If the model loads, the deployment fits."** Fitting at idle says nothing about peak: a model that
+  "uses 18 GB" at idle can need 60 GB under load. Tokens in flight and the largest prefill step are
+  properties of traffic, so size from capped p99 traffic, not from a successful start.
+- **"The weights decide how many agents a GPU serves."** Weights are fixed; the KV line scales with
+  traffic. On the same int8 70B pool of about 227,000 tokens per GPU pair, 8k conversations give about 27
+  concurrent, and an fp8 cache plus a 4k cap gives about 111.
+- **"An MoE model needs memory for its active parameters."** Every expert must be resident even though
+  only a few run per token. A 47B-total, 13B-active model needs 94 GB of bf16 weights, not 26 GB.
+- **"Activation memory adds up across layers and grows with the prompt."** It is one layer's transient,
+  reused layer after layer: about 0.94 GB for the 70B-class gate and up projections at T = 8,192. Chunked
+  prefill caps T per step, so a huge tool result does not raise the peak.
 
 ## Examples
 ### Worked plan: Llama-3-70B-class on two 80 GB GPUs

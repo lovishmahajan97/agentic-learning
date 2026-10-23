@@ -5,7 +5,8 @@ name: Lost-in-the-middle
 kind: concept
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -148,6 +149,23 @@ flowchart TD
     T -->|"yes, present but unused"| L["Fix layout: smaller k, compaction"]
     T -->|"no, missing"| R["Fix retrieval: decomposition, recall"]
 ```
+
+## Misconceptions
+- **"If a fact is in the context, the model will use it."** The context window is not a database:
+  attention is a fixed budget split among similar chunks, and a fact in the middle of a long prompt is
+  used least reliably. Agents show this as repeat searches for results they already hold.
+- **"Higher recall@k means better answers, so raise k."** Every extra chunk is a lookalike distractor that
+  pushes the evidence deeper into the trough. Recall rises while end-to-end accuracy falls; rerank and cut
+  to a small k instead.
+- **"Accuracy fades steadily with distance from the question."** The curve is U-shaped, not a linear
+  decay: the start was strongest in the original study, then the end, with the trough between. Rank order
+  therefore wastes the strong last slot on the weakest chunk; edge reordering uses both ends.
+- **"Near-perfect needle-in-a-haystack scores mean the effect is solved."** Newer models have a shallower
+  trough on single-fact lookups, but multi-fact questions, multi-passage reasoning and very long
+  contexts still show it, and a long agent run is all three. Measure with a position sweep on your model.
+- **"A wrong answer with high recall means retrieval needs work."** If the gold chunk was in context, the
+  failure is layout and distractors (evidence present but unused). Split failures by that flag before
+  changing the retriever or the embedding model.
 
 ## Examples
 ### Agent context builder: trimmed results, edge order, goal restated last

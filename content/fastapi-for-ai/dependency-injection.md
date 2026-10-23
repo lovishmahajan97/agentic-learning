@@ -5,7 +5,8 @@ name: Dependency injection (Depends)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/dependency-injection-and-interface-boundaries
@@ -37,6 +38,174 @@ LLM with `dependency_overrides`.
   spend, close the session), and what tests replace.
 - **What you can skip.** DI container libraries and the dependency-graph internals. Know caching, `yield`
   teardown, sibling ordering and overrides.
+
+## Lab
+### Task
+Make an agent endpoint testable and accountable through its dependencies. The starter hard-wires the
+paid LLM client inside a dependency, so tests cannot swap it, and it never records what a run spent.
+You will fix the seam and add a teardown that logs spend for every run, including failed ones.
+
+Time box: 45 minutes. Prerequisites: Python generators and context managers, and this lesson's How it
+works. The code marks two tasks:
+- **Task 1:** turn `get_budget` into a `yield` dependency whose teardown appends `(user id, tokens)` to
+  `SPEND_LOG`, even when the run ends in a 402.
+- **Task 2:** make `metered_llm` take its client from `Depends(get_llm)` so `dependency_overrides`
+  reaches it.
+
+### Starter code
+Save as `lab_di.py`. `ScriptedLLM` is the fake model the tests use; no API key or network is needed. It
+runs as given and prints two 500s from the hard-wired client. Checked with FastAPI 0.161.1, httpx
+0.28.1, pytest 9.1 and Python 3.13.
+
+```python
+from typing import Annotated
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.testclient import TestClient
+
+SPEND_LOG: list[tuple[str, int]] = []            # (user id, tokens used), written after every run
+USERS = {"key-viewer": {"id": "u1", "scopes": {"orders:read"}, "token_limit": 10_000},
+         "key-admin": {"id": "u2", "scopes": {"orders:read", "orders:refund"}, "token_limit": 10_000},
+         "key-trial": {"id": "u3", "scopes": {"orders:read"}, "token_limit": 400}}
+ALL_TOOLS = {"lookup_order": "orders:read", "refund_order": "orders:refund"}
+
+class RealLLM:                                   # the paid provider client
+    async def next(self, history: list[str], tools: list[str]) -> dict:
+        raise RuntimeError("network call to a paid LLM provider")
+
+class Budget:                                    # per-run token budget
+    def __init__(self, limit: int): self.limit, self.used = limit, 0
+    def charge(self, tokens: int):
+        self.used += tokens
+        if self.used > self.limit:
+            raise HTTPException(402, "token budget exceeded")
+
+def get_principal(x_api_key: Annotated[str, Header()]) -> dict:
+    if x_api_key not in USERS:
+        raise HTTPException(401, "invalid api key")
+    return USERS[x_api_key]
+
+def get_tools(p: Annotated[dict, Depends(get_principal)]) -> list[str]:
+    return [t for t, scope in ALL_TOOLS.items() if scope in p["scopes"]]
+
+def get_llm() -> RealLLM:                        # production: request.app.state.llm from lifespan
+    return RealLLM()
+
+def get_budget(p: Annotated[dict, Depends(get_principal)]):
+    # TASK 1: turn this into a yield dependency: yield the Budget, then in teardown append
+    #         (user id, budget.used) to SPEND_LOG, also when the run fails with a 402.
+    return Budget(p["token_limit"])
+
+def metered_llm(budget: Annotated[Budget, Depends(get_budget)]):
+    # TASK 2: the client is hard-wired, so tests cannot swap it. Take it from Depends(get_llm).
+    llm = RealLLM()
+    class Metered:
+        async def next(self, history, tools):
+            reply = await llm.next(history, tools)
+            budget.charge(reply["tokens"])       # same Budget instance as the route's: cached per request
+            return reply
+    return Metered()
+
+app = FastAPI()
+
+@app.post("/agent/run")
+async def run(task: str, tools: Annotated[list[str], Depends(get_tools)],
+              llm: Annotated[object, Depends(metered_llm)], budget: Annotated[Budget, Depends(get_budget)]):
+    history, steps = [task], []
+    for _ in range(5):                           # step cap
+        reply = await llm.next(history, tools)
+        if reply["type"] == "answer":
+            return {"answer": reply["text"], "steps": steps, "tokens": budget.used}
+        steps.append(reply["tool"])
+        history.append(f"{reply['tool']} -> ok")
+    return {"answer": None, "steps": steps, "tokens": budget.used}
+
+class ScriptedLLM:                               # deterministic fake: one tool call, then an answer
+    def __init__(self): self.calls, self.seen_tools = 0, None
+    async def next(self, history, tools):
+        self.calls += 1
+        self.seen_tools = tools
+        if self.calls == 1:
+            return {"type": "tool", "tool": "lookup_order", "tokens": 300}
+        return {"type": "answer", "text": "shipped", "tokens": 200}
+
+if __name__ == "__main__":
+    app.dependency_overrides[get_llm] = ScriptedLLM
+    with TestClient(app, raise_server_exceptions=False) as c:
+        for key in ("key-viewer", "key-trial"):
+            r = c.post("/agent/run", params={"task": "where is order 7?"}, headers={"x-api-key": key})
+            print(key, r.status_code, r.text)
+    print("spend log:", SPEND_LOG)
+```
+
+### Expected output
+`python lab_di.py` after both tasks. The trial user's 400-token budget is exceeded on the second step
+(300 + 200 = 500 tokens), and the spend is still logged.
+
+```
+key-viewer 200 {"answer":"shipped","steps":["lookup_order"],"tokens":500}
+key-trial 402 {"detail":"token budget exceeded"}
+spend log: [('u1', 500), ('u3', 500)]
+```
+
+### Tests
+Save as `test_lab_di.py` and run `pytest -q`. On the starter all 4 fail: two 500s from the real client,
+a fake that was never called (`seen_tools` is `None`), and an empty spend log.
+
+```python
+import pytest
+from fastapi.testclient import TestClient
+import lab_di as lab
+
+@pytest.fixture
+def fake():
+    llm = lab.ScriptedLLM()
+    lab.app.dependency_overrides[lab.get_llm] = lambda: llm    # the same fake for this test
+    lab.SPEND_LOG.clear()
+    yield llm
+    lab.app.dependency_overrides.clear()
+
+def post(key):
+    c = TestClient(lab.app, raise_server_exceptions=False)
+    return c.post("/agent/run", params={"task": "where is order 7?"}, headers={"x-api-key": key})
+
+def test_agent_runs_against_the_fake_not_the_provider(fake):
+    r = post("key-viewer")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"answer": "shipped", "steps": ["lookup_order"], "tokens": 500}
+
+def test_viewer_agent_never_sees_the_refund_tool(fake):
+    post("key-viewer")
+    assert fake.seen_tools == ["lookup_order"]
+
+def test_spend_is_recorded_after_the_run(fake):
+    post("key-viewer")
+    assert lab.SPEND_LOG == [("u1", 500)]
+
+def test_spend_is_recorded_even_when_the_budget_is_exceeded(fake):
+    r = post("key-trial")
+    assert r.status_code == 402
+    assert lab.SPEND_LOG == [("u3", 500)]
+```
+
+### Failure scenarios
+- **Teardown without `try/finally`.** Put the log line after a bare `yield`. Observe: the 402 test
+  fails with an empty log while the happy path passes, because the exception is thrown into the
+  generator at `yield` and the line after it never runs. Debug: print inside the teardown; wrap the
+  `yield` in `try/finally`.
+- **Turn off the per-request cache.** Use `Depends(get_budget, use_cache=False)` on the route. Observe:
+  the route reports `"tokens": 0`, because it gets a second `Budget` while `metered_llm` charges the
+  first. Debug: print `id(budget)` in both places; one request should see one instance.
+- **Override the wrong callable.** Override `RealLLM` or `metered_llm` instead of `get_llm`. Observe:
+  the real client still runs, or the budget wrapper disappears. Debug: overrides are keyed by the exact
+  function passed to `Depends`; grep for it.
+
+### Submission
+- **Code:** `lab_di.py` with both tasks done.
+- **Test run:** `pytest -q` showing 4 passed with no network access.
+- **Trace:** the demo output, matching Expected output.
+- **Short note (5-8 lines):** why spend is logged in a dependency teardown rather than at the end of the
+  route, and what the per-request cache guarantees here.
+- **Evaluation:** tests pass, no client is constructed outside `get_llm`, and teardown runs on failure.
 
 ## Why it exists
 - **Every endpoint needs the same things.** Who is calling, which tenant, a provider client, a retrieval

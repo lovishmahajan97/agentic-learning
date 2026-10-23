@@ -5,7 +5,8 @@ name: Object model and mutability
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/dataclasses
@@ -36,6 +37,145 @@ can corrupt another branch, run or tenant.
   return new messages instead of editing old ones, and lint mutable defaults and class attributes.
 - **What you can skip.** CPython's small-int cache and interning rules beyond "never use `is` on values";
   descriptor internals beyond the lookup order below.
+
+## Lab
+### Task
+Debug an agent session module that leaks state between tenants, sessions and forked branches. It has
+four aliasing bugs, each a pattern from the examples below: a class-level history, a shallow-copied
+config extended with `+=`, an in-place `compact`, and a mutable default.
+
+Time box: 45-60 minutes. Do "How it works" here first; the `dataclasses` lesson helps.
+- **Fix** all four bugs and make `BASE_CONFIG` read-only, so the tenant leak becomes impossible rather
+  than merely avoided.
+- **Keep** every function signature and docstring contract; `with_question` may change its default.
+- **Run** on Python 3.10+, standard library plus pytest (checked on Python 3.12.14, pytest 9.1.1).
+
+### Starter code
+Save as `lab.py`. It runs and prints the leaks.
+
+```python
+"""lab.py: an agent session module with four aliasing bugs. Fix them and keep every signature."""
+from __future__ import annotations
+
+from types import MappingProxyType   # LAB: use it to make BASE_CONFIG read-only
+
+Message = dict[str, str]
+
+BASE_CONFIG = {"model": "gpt-4o-mini", "system": "You are a support bot.", "tools": ["search"]}
+
+def tenant_config(tenant: str, extra_tools: list[str]) -> dict[str, object]:
+    """A per-tenant config: BASE_CONFIG plus this tenant's tools. Must never change BASE_CONFIG."""
+    cfg = dict(BASE_CONFIG)                      # LAB bug: shallow copy, cfg["tools"] IS the base list
+    cfg["tools"] += extra_tools                  # list += extends that shared list in place
+    return cfg
+
+class Session:
+    history: list[Message] = []                  # LAB bug: one list on the class, shared by all sessions
+
+    def __init__(self, tenant: str) -> None:
+        self.tenant = tenant
+        self.config = tenant_config(tenant, [f"{tenant}_crm"])
+
+    def add(self, role: str, content: str) -> None:
+        self.history.append({"role": role, "content": content})
+
+def compact(messages: list[Message], limit: int = 20) -> list[Message]:
+    """Truncate long tool outputs for a cheaper model. Must not change `messages` or its dicts."""
+    for m in messages:                           # LAB bug: edits the caller's dicts in place
+        if m["role"] == "tool" and len(m["content"]) > limit:
+            m["content"] = m["content"][:limit] + "...[truncated]"
+    return messages
+
+def with_question(question: str, history: list[Message] = []) -> list[Message]:
+    """The history plus one user turn, as a new list. Must not change the history passed in."""
+    history.append({"role": "user", "content": question})   # LAB bug: shared default, mutated
+    return history
+
+if __name__ == "__main__":
+    a, b = Session("acme"), Session("beta")
+    a.add("user", "hi from acme")
+    print("beta history:", b.history)
+    print("base tools:", list(BASE_CONFIG["tools"]), "beta tools:", b.config["tools"])
+    msgs = [{"role": "user", "content": "Summarise ticket 4521"},
+            {"role": "tool", "content": "full ticket text " * 10}]      # 170 characters
+    short = compact(msgs)
+    print("original:", len(msgs[1]["content"]), "compacted:", len(short[1]["content"]))
+    print("turns:", len(with_question("a")), len(with_question("b")))
+```
+
+### Expected output
+The starter prints `beta history: [{'role': 'user', 'content': 'hi from acme'}]`, base tools
+`['search', 'acme_crm', 'beta_crm']`, `original: 34` and `turns: 1 2`. A correct solution prints exactly:
+
+```
+beta history: []
+base tools: ['search'] beta tools: ['search', 'beta_crm']
+original: 170 compacted: 34
+turns: 1 1
+```
+
+### Tests
+Save as `test_lab.py` and run `python -m pytest -q`. On the starter all five fail on assertions that
+name the leak; none fails on an import or `NotImplementedError`.
+
+```python
+import pytest
+import lab
+from lab import BASE_CONFIG, Session, compact, tenant_config, with_question
+
+def test_sessions_do_not_share_history():
+    a, b = Session("acme"), Session("beta")
+    a.add("user", "hi")
+    assert b.history == [] and a.history == [{"role": "user", "content": "hi"}]
+
+def test_tenant_configs_do_not_leak():
+    tenant_config("acme", ["acme_crm"])
+    beta = tenant_config("beta", ["beta_kb"])
+    assert beta["tools"] == ["search", "beta_kb"]
+    assert list(BASE_CONFIG["tools"]) == ["search"]
+    beta["tools"].append("scratch")              # a tenant may edit its own copy
+    assert list(BASE_CONFIG["tools"]) == ["search"]
+
+def test_base_config_is_read_only():
+    with pytest.raises(TypeError):
+        BASE_CONFIG["model"] = "gpt-5"           # type: ignore[index]
+    with pytest.raises((TypeError, AttributeError)):
+        BASE_CONFIG["tools"].append("x")         # type: ignore[union-attr]
+
+def test_compact_returns_new_dicts_only_where_changed():
+    msgs = [{"role": "user", "content": "Summarise ticket 4521"},
+            {"role": "tool", "content": "full ticket text " * 10}]
+    out = compact(msgs)
+    assert len(msgs[1]["content"]) == 170 and len(out[1]["content"]) == 34
+    assert out is not msgs and out[0] is msgs[0] and out[1] is not msgs[1]
+
+def test_with_question_never_mutates():
+    assert len(with_question("a")) == 1 and len(with_question("b")) == 1
+    h = [{"role": "user", "content": "first"}]
+    assert len(with_question("second", h)) == 2 and len(h) == 1
+```
+
+### Failure scenarios
+- **Fix `compact` with `list(messages)` first.** The outer list is new but the dicts are shared, so
+  `original` still prints 34. Print `msgs[1] is short[1]`; `True` means the copy was too shallow.
+- **Make `BASE_CONFIG` a `MappingProxyType` but leave `tools` a list.** The top level is read-only,
+  yet `BASE_CONFIG["tools"].append("x")` still works, so the read-only test fails. Freeze inner
+  values too: a tuple of tools.
+- **Then call `copy.deepcopy(BASE_CONFIG)` in `tenant_config`.** It raises `TypeError: cannot pickle
+  'mappingproxy' object`. Build the new dict instead: spread the base and give `tools` a fresh list.
+- **Default to `None`, then `history = history or []` and `history.append(...)`.** The shared default
+  is gone, but a caller's list is still mutated, so `len(h) == 1` fails. Return `[*history, turn]`
+  instead of appending.
+
+### Submission
+- **`lab.py` and `test_lab.py`,** with the `python -m pytest -q` output showing 5 passed.
+- **Starter and fixed output side by side,** one line per bug saying which name aliased which object.
+- **A fifth bug of your own** from your agent code (or a plausible one, such as a module-level tool
+  registry mutated per request), with a failing test and its fix.
+- **A short note:** for each fix, whether you chose copy, rebuild or immutability, and the cost of
+  that choice for a 200-message transcript.
+- **Evaluation:** tests pass unmodified, no `copy.deepcopy` on the hot path, and `BASE_CONFIG` cannot
+  be changed through any reference.
 
 ## Why it exists
 - **Four bugs, one fact.** `def ask(question, history=[])` passes its unit test, then every production

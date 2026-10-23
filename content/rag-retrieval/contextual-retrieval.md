@@ -5,7 +5,8 @@ name: Contextual retrieval
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -171,6 +172,24 @@ flowchart TD
     BM --> H
     H --> RR["Reranker, top-n to generator"]
 ```
+
+## Misconceptions
+- **"Parent-document retrieval already solves missing context."** It gives the generator the section but
+  still embeds the bare child, so "The company's revenue grew by 3%" stays unfindable for "ACME Q2 2023
+  revenue growth". Contextual retrieval fixes matching, parents fix reading, and they compose.
+- **"Contextual embeddings are enough; BM25 can stay as it was."** Both legs miss on the same absent terms
+  (ACME, Q2, 2023). The reported failure-rate reduction grew from around 35% to around 49% when the
+  context was also indexed in BM25.
+- **"A richer, longer context is better."** A long context dominates the vector and makes every chunk of a
+  document look alike, so the specific passage ranks no higher than its neighbours. Keep it to a sentence
+  or two (about 50–100 tokens).
+- **"Prompt caching makes the job nearly free."** It cuts the constant (about 7× for a 20,000-token, 50-chunk
+  document), but cost still grows with chunks × document length, and caches expire after minutes. Process
+  one document's chunks back to back and split very long documents into sections.
+- **"The generated context is part of the source."** It is model-written and can be wrong. Store the
+  original chunk separately and cite only that, never the context sentence.
+- **"This is a query-time technique like HyDE."** All its cost is paid once at ingestion; an agent's
+  search calls add zero latency, which is why it suits agents that search several times per task.
 
 ## Examples
 ### A contextualisation step for both index legs

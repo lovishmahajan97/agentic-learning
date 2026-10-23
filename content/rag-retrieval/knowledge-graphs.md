@@ -5,7 +5,8 @@ name: Knowledge graphs
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -136,6 +137,26 @@ flowchart TD
     TC --> KG
     KG --> A["Rows plus sources back to the agent"]
 ```
+
+## Misconceptions
+- **"A knowledge graph is what GraphRAG builds."** GraphRAG extracts a schema-free entity graph to write
+  community summaries for themes. A knowledge graph has typed entities and relationships under a schema,
+  resolved identities and provenance, so it can answer exact joins and counts.
+- **"Relational questions need a graph database."** A fixed three-hop question is three SQL joins, and
+  recursive CTEs cover bounded variable-length paths. A graph database pays off when deep variable-length
+  traversal, such as `[:USES|DEPENDS_ON*1..6]`, is the core workload.
+- **"A generic `RELATED_TO` edge keeps the schema flexible."** It turns the graph back into a
+  co-occurrence network whose traversals return everything or nothing. Derive specific, directed
+  relationship types from the questions the tools must answer.
+- **"You build the graph by having an LLM extract triples from documents."** Text extraction is noisy and
+  needs entity resolution. Load systems of record (CMDB, HR, CRM) by stable IDs first, then add extracted
+  edges with provenance.
+- **"Keeping the graph current means overwriting changed edges."** Overwriting loses history, and missed
+  deletes leave two current owners. Put `valid_from` and `valid_to` on the relationship, close old
+  edges, and default queries to currently valid.
+- **"Letting the model write Cypher gives the agent the most capable tool."** It also invents labels and
+  writes unbounded traversals. For known question types, parametrised read-only tools with hop limits,
+  `LIMIT` and a timeout are more reliable.
 
 ## Examples
 ### A join beats similarity (runnable, in memory)

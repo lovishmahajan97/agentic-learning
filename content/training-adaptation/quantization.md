@@ -5,7 +5,8 @@ name: Quantization (INT8/INT4, GPTQ, AWQ, GGUF)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/peft
@@ -185,6 +186,21 @@ flowchart TD
     I4 --> E
     U --> E
 ```
+
+## Misconceptions
+- **"Quantization makes every agent step faster."** Weight-only INT4 cuts bytes read per decoded token,
+  but prefill stays compute-bound in 16-bit. Agent steps re-send long prompts and decode short tool calls,
+  so the bigger win is often memory freed for KV cache and more concurrent agents.
+- **"A 4-bit model is a quarter of the bf16 size."** Group scales and zero-points add overhead: about 4.16
+  bits per weight at group 128, so a 70B model is about 36.4 GB, not 35, before the KV cache.
+- **"If perplexity barely moves, the agent is fine."** Perplexity can shift by 0.1 while JSON tool calls,
+  maths or a minority language regress sharply, and small per-call drops compound over a 20-step task.
+  Gate on tool-call validity and full replayed tasks.
+- **"A smaller 16-bit model is safer than a bigger 4-bit one."** At a fixed memory budget, a 4-bit model
+  with roughly four times the parameters generally wins; that is why 4-bit is the local default.
+- **"GGUF is a quantization algorithm like GPTQ or AWQ."** It is llama.cpp's single-file container; the
+  quantization type (`Q4_K_M`, `Q8_0`) is chosen at conversion, and the file also carries the tokenizer
+  and chat template your tool-call format depends on.
 
 ## Examples
 ### Why the granularity ladder matters (NumPy)

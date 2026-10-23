@@ -5,7 +5,8 @@ name: Generators
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/async-await
@@ -39,6 +40,172 @@ corpus for RAG one batch at a time.
   long ingestion or eval jobs resume.
 - **What you can skip.** Hand-written iterator classes and generator-based coroutines (pre-`async`). Know
   laziness, single-pass behaviour, `yield from` and async-generator cleanup.
+
+## Lab
+### Task
+Turn an eager RAG ingestion job into a lazy, resumable generator pipeline. The starter reads the whole
+export into lists before the first embedding call and has no checkpoints, so a crash replays
+everything. Time box: 60 minutes. Do **JSON / JSONL** first.
+- **Goal:** the first batch goes out after reading two lines, malformed lines are counted and skipped,
+  and a crash mid-run resumes from a checkpoint that never loses a chunk.
+- **The embedding API is a local callback,** so the lab runs offline; swap in your provider's batch
+  call later.
+- **Constraints:** standard library only; Python 3.12+ (`itertools.batched`). Checked on Python 3.12.14
+  with pytest 9.1.
+
+### Starter code
+Save as `lab_ingest.py`. It runs as given and shows 100 lines read before the first batch.
+
+```python
+import itertools, json
+from collections.abc import Callable, Iterable, Iterator
+
+Chunk = tuple[int, str, str, bool]          # (line_no, chunk_id, text, is_last_chunk_of_its_doc)
+
+def read_jsonl(lines: Iterable[str], stats: dict) -> Iterator[tuple[int, dict]]:
+    """Yield (line_no, doc) per valid line; count malformed lines in stats["bad"].
+    LAB 1: make this lazy: read one line per document the consumer pulls."""
+    out = []
+    for line_no, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            out.append((line_no, json.loads(line)))
+        except json.JSONDecodeError:
+            stats["bad"] += 1
+    return iter(out)
+
+def chunks(docs: Iterable[tuple[int, dict]], size: int = 8) -> Iterator[Chunk]:
+    """Yield fixed-size chunks; chunk_id is "<doc id>:<offset>".
+    LAB 2: make this lazy as well."""
+    out = []
+    for line_no, doc in docs:
+        text = doc["text"]
+        for start in range(0, len(text), size):
+            out.append((line_no, f"{doc['id']}:{start}", text[start:start + size],
+                        start + size >= len(text)))
+    return iter(out)
+
+def embed_corpus(lines: Iterable[str], embed: Callable[[list], None], batch_size: int = 4,
+                 start_after: int = 0, checkpoint: Callable[[int], None] = lambda n: None) -> dict:
+    """Send (chunk_id, text) batches to embed() and return {"bad": ..., "sent": ...}.
+    LAB 3: skip documents on lines <= start_after (resume after a crash).
+    LAB 4: after each batch call checkpoint(n): n is the line of the batch's last chunk if that chunk
+    completes its document, else that line minus 1. Resuming after n must never lose a chunk."""
+    stats = {"bad": 0, "sent": 0}
+    for batch in itertools.batched(chunks(read_jsonl(lines, stats)), batch_size):
+        embed([(cid, text) for _, cid, text, _ in batch])
+        stats["sent"] += len(batch)
+    return stats
+
+def corpus(n_docs: int, reads: list | None = None) -> Iterator[str]:
+    """A fake JSONL export: every doc has 3 chunks of size 8; line 3 is malformed."""
+    for i in range(1, n_docs + 1):
+        if reads is not None:
+            reads.append(i)
+        yield "{not json" if i == 3 else json.dumps({"id": f"d{i}", "text": f"document {i:02d} body..."})
+
+if __name__ == "__main__":
+    reads, first = [], []
+    def embed(batch):
+        if not first:
+            first.append(len(reads))
+    print(embed_corpus(corpus(100, reads), embed), "| lines read before the first batch:", first[0])
+
+    sent, ckpts, calls = [], [], [0]
+    def crash_on_third(batch):
+        calls[0] += 1
+        if calls[0] == 3:
+            raise ConnectionError("embedding API down")
+        sent.extend(cid for cid, _ in batch)
+    try:
+        embed_corpus(corpus(10), crash_on_third, checkpoint=ckpts.append)
+    except ConnectionError as e:
+        print(f"crashed: {e}; checkpoints {ckpts}")
+    resume = ckpts[-1] if ckpts else 0
+    embed_corpus(corpus(10), lambda b: sent.extend(c for c, _ in b), start_after=resume)
+    print(f"resumed after line {resume}: {len(set(sent))} of 27 chunks, "
+          f"{len(sent) - len(set(sent))} sent twice")
+```
+
+### Expected output
+The starter prints 100 lines read, `checkpoints []` and `8 sent twice`. A correct solution prints:
+
+```
+{'bad': 1, 'sent': 297} | lines read before the first batch: 2
+crashed: embedding API down; checkpoints [1, 3]
+resumed after line 3: 27 of 27 chunks, 2 sent twice
+```
+
+**Read the numbers:** 99 valid documents × 3 chunks = 297. With 9 valid documents in the crash run (27
+chunks), the first batch ends inside document 2, so the checkpoint is 1, not 2.
+
+### Tests
+Save as `test_lab_ingest.py` and run `pytest -q`. On the starter four fail: building the pipeline reads
+all 50 lines, the first batch waits for 100, and no checkpoint is ever recorded.
+
+```python
+import lab_ingest as lab
+
+def test_building_the_pipeline_reads_nothing():
+    reads = []
+    lab.chunks(lab.read_jsonl(lab.corpus(50, reads), {"bad": 0}))
+    assert reads == [], f"{len(reads)} lines read before anyone asked for a chunk"
+
+def test_first_batch_needs_only_two_lines():
+    reads, first = [], []
+    def embed(batch):
+        if not first:
+            first.append(len(reads))
+    lab.embed_corpus(lab.corpus(100, reads), embed, batch_size=4)
+    assert first == [2], f"read {first[0]} lines before the first batch; 2 are enough"
+
+def test_malformed_lines_are_counted_and_skipped():
+    got = []
+    stats = lab.embed_corpus(lab.corpus(10), lambda b: got.extend(b))
+    assert stats == {"bad": 1, "sent": 27} and len(got) == 27
+
+def test_checkpoints_never_skip_a_partly_sent_doc():
+    ckpts = []
+    lab.embed_corpus(lab.corpus(10), lambda b: None, checkpoint=ckpts.append)
+    assert ckpts == [1, 3, 5, 6, 7, 9, 10]
+
+def test_crash_and_resume_loses_nothing_and_resends_little():
+    sent, ckpts, calls = [], [], [0]
+    def crash_on_third(batch):
+        calls[0] += 1
+        if calls[0] == 3:
+            raise ConnectionError("embedding API down")
+        sent.extend(cid for cid, _ in batch)
+    try:
+        lab.embed_corpus(lab.corpus(10), crash_on_third, checkpoint=ckpts.append)
+    except ConnectionError:
+        pass
+    assert ckpts, "no checkpoint was recorded before the crash"
+    lab.embed_corpus(lab.corpus(10), lambda b: sent.extend(c for c, _ in b), start_after=ckpts[-1])
+    assert len(set(sent)) == 27, "chunks were lost across the crash"
+    assert len(sent) - len(set(sent)) < 4, "resume replayed more than one partial batch"
+```
+
+### Failure scenarios
+- **Inject a naive checkpoint** (the line of the batch's last chunk). The resume test fails with 26
+  unique chunks: document 4 was split across batches and its last chunk is skipped. Debug: print each
+  batch's chunk ids next to the checkpoint and find the one that straddles a document.
+- **Inject `list(...)` around `read_jsonl(...)` for debugging.** The laziness tests fail again with 50
+  and 100 lines read. Debug: put the `reads` counter on the source and check it before the first batch.
+- **Inject a `try/except json.JSONDecodeError` around the `read_jsonl(...)` call** instead of inside the
+  loop. Line 3 now crashes the job, because the error is raised during iteration, outside the handler.
+  Debug: read the traceback; it points at the consuming loop, not at the call.
+- **Iterate one generator twice** (count the chunks, then embed them). The second pass sends nothing and
+  `sent` is 0. Debug: generators are single-pass; rebuild the pipeline per pass.
+
+### Submission
+- **Your `lab_ingest.py`** with the four LAB markers resolved, using `yield` rather than lists.
+- **A `pytest -q` run** showing 5 passed, plus the starter's run, in `NOTES.md`.
+- **The fixed script's output**, matching the expected block exactly.
+- **Two sentences** explaining why the checkpoint is "line minus 1" when a batch ends mid-document, and
+  why idempotent upserts by `chunk_id` make the 2 re-sent chunks harmless.
+- **Evaluation:** tests pass, no stage builds a list of the dataset, and the resume rule is justified.
 
 ## Why it exists
 - **Agent data is too big or too slow to materialise:** a corpus to chunk and embed, an eval set of 50,000

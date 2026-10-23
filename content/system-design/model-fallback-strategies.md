@@ -5,7 +5,8 @@ name: Model fallback strategies
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - serving-inference/fallbacks
@@ -38,6 +39,65 @@ incidents, and mid-run failover can replay tool side effects.
   tool calls against the same schemas.
 - **What you can skip.** Writing your own breaker if your gateway's cooldowns cover it. You cannot skip
   equivalence testing of the fallback model on your tools and prompts.
+
+## Decision case
+### Scenario
+A European travel company runs a booking agent: about 12 model steps per run. Step 5 holds a fare
+through a payment tool and step 9 emails the itinerary. Figures are illustrative.
+- **Availability target:** the model call behind each step must be available 99.9% of the time, at most
+  about 43 minutes a month. The primary model endpoint (vendor A, US region) has delivered about 99.5%,
+  roughly 216 minutes a month.
+- **Data rule:** passenger data may go only to vendor A, either directly or through one approved cloud
+  platform that serves the same weights. Vendor B is not approved for this data class.
+- **Latency:** a 10 s deadline per step and 90 s per run.
+- **Team and budget:** two engineers, launch in 8 weeks; secondary quota must be bought and paid for
+  before launch.
+- **Shared-cause estimates:** from incident history, about half of a second vendor A region's failures
+  are shared with the primary (one control plane). About 10% are shared for the cloud platform (only
+  bad model releases).
+
+### Options
+Each rung is assumed to be available 99.5% on its own; availability uses the shared-cause formula from
+the example below.
+
+| Option | How it works | Availability | Unavailable per 30 days | Data rule and behaviour |
+|---|---|---|---|---|
+| A. Retry-only | Two jittered retries on the primary | 99.5% (retries do not survive an outage) | About 216 min | Allowed; slowest failure |
+| B. Second vendor A region | US then EU, same model | 99.7494% (50% shared) | About 108 min | Allowed; identical behaviour |
+| C. Same weights via the cloud platform | Vendor A, then the platform's deployment of the same model | 99.9480% (10% shared) | About 22 min | Allowed; identical weights |
+| D. Comparable model from vendor B | Vendor A, then vendor B | 99.9975% if independent | About 1 min | Breaks the data rule; transcript translation and re-validation needed |
+
+### Decision
+Choose **C**, with the EU region as a cheap first rung in front of it, and hand off to degradation
+("we will finish your booking and email you") after the last rung.
+- **Availability:** C is the only allowed option that meets 99.9%, because its failures are the most
+  independent. B adds a rung but shares too much with the primary to help much.
+- **Ladder discipline:** per-target breakers (5 failures, 60 s cooldown) and per-rung timeouts of
+  `min(rung_timeout, remaining)` inside the 10 s step deadline.
+- **Side effects:** checkpoint after every step and use idempotency keys on the fare-hold and email
+  tools, so a failover at step 7 never repeats steps 5 or 9.
+
+**What would change it:** if vendor B is approved for passenger data, D adds independence, but only
+after its tool calls pass the same eval on recorded runs. If the cloud platform starts lagging vendor
+A's model versions, the "identical weights" premise fails and its rung needs its own validation.
+
+### Trade-offs accepted
+- **Idle secondary quota.** Pay for capacity to fail over 100% of traffic; load-test it before launch
+  and alert on its rate-limit headroom.
+- **Shared-cause risk remains.** A bad model release hits both rungs. Keep the degradation path live and
+  game-day it.
+- **Per-step deadline over completeness.** A slow ladder ends in degradation rather than a longer wait;
+  watch rungs skipped for lack of budget.
+- **Fallbacks may rot unused.** Send about 1% of traffic through each rung continuously and alert when
+  `fallback_depth` above zero rises.
+
+### Review rubric
+- Classifies errors into retry, fail over and neither, and keeps request errors out of the breaker.
+- Computes availability with an explicit shared-cause assumption, not as if rungs were independent.
+- Checks every rung against the data rule before counting its availability.
+- Fits every attempt inside one step deadline and one run deadline.
+- Protects side-effecting tools with checkpoints and idempotency keys so failover cannot replay them.
+- Names how each rung is exercised before an outage (live slice, game day, quota load test).
 
 ## Why it exists
 - **Model endpoints fail in several distinct ways:** outages and hard errors (5xx, connection resets),

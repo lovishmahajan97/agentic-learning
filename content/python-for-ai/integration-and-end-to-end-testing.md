@@ -5,7 +5,8 @@ name: Integration and end-to-end testing
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/pytest
@@ -39,6 +40,225 @@ going up, because some failures exist only there.
   never exact wording.
 - **What you can skip.** Judging answer quality here. That is the eval suite's job; these tests check the
   plumbing the model depends on.
+
+## Lab
+### Task
+A RAG agent ingests documents in a background job, so "upload, then immediately ask" races indexing.
+You will write the polling helper that every e2e journey uses, then run an upload-to-citation journey
+against a local stand-in for the deployed service over real HTTP. Assertions cover structure and tenant
+isolation, never wording.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** pytest (fixture scopes), Test doubles, mocks and fixtures, and this lesson's
+  End-to-end tests that are not flaky section.
+- **Setup:** Python 3.9+ standard library plus `pip install pytest` (checked on Python 3.12 with pytest
+  9.1.1). The service runs in a thread on `127.0.0.1`, so no Docker, network or API key is needed. Save
+  the starter as `e2e_lab.py` and the tests as `test_e2e_lab.py`.
+- **Goal:** `wait_for` returns as soon as the outcome is observable and fails with the last status seen;
+  the journey cites the uploaded document every run.
+
+### Starter code
+```python
+"""e2e_lab.py: a local stand-in for a deployed RAG agent with background ingestion, and an e2e client."""
+import json
+import random
+import threading
+import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+
+def start_service():
+    """Start the service on a free port. Returns (base_url, stop)."""
+    docs, started = {}, time.monotonic()            # doc_id -> {"tenant", "text", "status"}
+
+    def index_later(doc_id):
+        time.sleep(random.uniform(0.1, 0.6))        # ingestion is a background job
+        docs[doc_id]["status"] = "indexed"
+
+    class Handler(BaseHTTPRequestHandler):
+        def reply(self, status, body):
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("x-request-id", uuid.uuid4().hex[:12])
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            tenant = self.headers.get("X-Tenant")
+            if self.path == "/ready":
+                ok = time.monotonic() - started > 0.2   # dependencies take a moment to come up
+                return self.reply(200 if ok else 503, {"ready": ok})
+            doc = docs.get(self.path.removeprefix("/documents/"))
+            if doc is None or doc["tenant"] != tenant:
+                return self.reply(404, {"error": "not found"})
+            return self.reply(200, {"status": doc["status"]})
+
+        def do_POST(self):
+            tenant = self.headers.get("X-Tenant")
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if self.path == "/documents":
+                doc_id = f"doc-{uuid.uuid4().hex[:8]}"
+                docs[doc_id] = {"tenant": tenant, "text": body["text"], "status": "pending"}
+                threading.Thread(target=index_later, args=(doc_id,), daemon=True).start()
+                return self.reply(201, {"id": doc_id})
+            if self.path == "/ask":
+                words = set(body["question"].lower().split())
+                cited = [i for i, d in docs.items() if d["tenant"] == tenant and d["status"] == "indexed"
+                         and words & set(d["text"].lower().split())]
+                return self.reply(200, {"answer": "see citations", "citations": cited})
+            return self.reply(404, {"error": "not found"})
+
+        def log_message(self, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_port}", srv.shutdown
+
+
+def call(base, method, path, tenant, body=None):
+    """One HTTP call. Returns (status, json body, request id)."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = Request(base + path, data=data, method=method,
+                  headers={"X-Tenant": tenant, "Content-Type": "application/json"})
+    try:
+        with urlopen(req, timeout=5) as r:
+            return r.status, json.loads(r.read()), r.headers.get("x-request-id")
+    except HTTPError as e:
+        return e.code, json.loads(e.read()), e.headers.get("x-request-id")
+
+
+def wait_for(check, *, timeout, interval=0.05):
+    """Call check() until it returns (True, value) and return value.
+
+    On timeout raise AssertionError naming the timeout and the last value seen.
+    """
+    raise NotImplementedError("EXERCISE: poll with a deadline instead of sleeping a guessed time")
+
+
+def upload_and_ask(base, tenant, text, question):
+    """The journey: wait for readiness, upload, wait until indexed, ask. Returns (doc_id, citations, ids)."""
+    request_ids = []
+    wait_for(lambda: (call(base, "GET", "/ready", tenant)[0] == 200, "not ready"), timeout=5)
+    status, body, rid = call(base, "POST", "/documents", tenant, {"text": text})
+    request_ids.append(rid)
+    doc_id = body["id"]
+
+    def indexed():
+        s = call(base, "GET", f"/documents/{doc_id}", tenant)[1]["status"]
+        return s == "indexed", s
+
+    wait_for(indexed, timeout=5)
+    status, body, rid = call(base, "POST", "/ask", tenant, {"question": question})
+    request_ids.append(rid)
+    return doc_id, body["citations"], request_ids
+
+
+if __name__ == "__main__":
+    base, stop = start_service()
+    tenant = f"e2e-{uuid.uuid4().hex[:8]}"
+    try:
+        doc_id, citations, ids = upload_and_ask(base, tenant, "Refunds are issued within 14 days.",
+                                                "How long do refunds take?")
+        print("cited the uploaded document:", doc_id in citations, "| request ids logged:", len(ids))
+    except NotImplementedError as e:
+        print("journey not run:", e)
+    finally:
+        stop()
+```
+
+### Expected output
+`python e2e_lab.py` with `wait_for` implemented (the starter prints `journey not run: ...`):
+
+```text
+cited the uploaded document: True | request ids logged: 2
+```
+
+`pytest -v` then reports `5 passed` in about 2-3 seconds, on every run.
+
+### Tests
+On the starter, 4 of 5 fail with `NotImplementedError`. The race test passes on both versions: it
+documents why polling is needed.
+
+```python
+import time
+import uuid
+
+import pytest
+
+from e2e_lab import call, start_service, upload_and_ask, wait_for
+
+
+@pytest.fixture(scope="module")
+def base():
+    url, stop = start_service()
+    yield url
+    stop()
+
+
+@pytest.fixture
+def tenant():
+    return f"e2e-{uuid.uuid4().hex[:8]}"          # unique per test: no cleanup, no cross-talk
+
+
+def test_wait_for_returns_the_value_once_done():
+    seen = []
+    def check():
+        seen.append(1)
+        return len(seen) == 3, f"attempt {len(seen)}"
+    assert wait_for(check, timeout=2, interval=0.01) == "attempt 3"
+
+
+def test_wait_for_fails_fast_with_the_last_value_seen():
+    start = time.monotonic()
+    with pytest.raises(AssertionError, match="pending") as exc:
+        wait_for(lambda: (False, "pending"), timeout=0.3, interval=0.05)
+    assert "0.3" in str(exc.value)
+    assert time.monotonic() - start < 1
+
+
+def test_asking_before_indexing_finishes_cites_nothing(base, tenant):
+    _, body, _ = call(base, "POST", "/documents", tenant, {"text": "Refunds are issued within 14 days."})
+    assert call(base, "POST", "/ask", tenant, {"question": "how long do refunds take"})[1]["citations"] == []
+
+
+def test_upload_then_ask_cites_the_document(base, tenant):
+    doc_id, citations, ids = upload_and_ask(base, tenant, "Refunds are issued within 14 days.",
+                                            "How long do refunds take?")
+    assert doc_id in citations, f"request ids: {ids}"   # structure, not wording
+    assert len(ids) == 2 and all(ids)
+
+
+def test_tenants_never_see_each_other(base, tenant):
+    upload_and_ask(base, tenant, "Refunds are issued within 14 days.", "refunds")
+    other = tenant + "-other"
+    assert call(base, "POST", "/ask", other, {"question": "How long do refunds take?"})[1]["citations"] == []
+```
+
+### Failure scenarios
+- **Inject: `time.sleep(0.3)` in place of the indexing `wait_for`.** The citation test turns flaky:
+  indexing takes 0.1-0.6 s uniformly, so it fails on about 60% of runs in expectation (4 of 10 in one
+  trial). Debug: loop `pytest -k cites_the` ten times and count reds; restore polling.
+- **Inject: indexing deadline of 0.05 s.** The journey fails with `not done after 0.05s; last seen:
+  'pending'`. Debug: the last-seen value says the system was slow, not broken; set the deadline from
+  measured ingestion time with headroom.
+- **Inject: a fixed tenant name `e2e` in the fixture.** The race test sees documents an earlier test
+  indexed and fails depending on order. Debug: move the race test to the end of the file (or shuffle
+  with pytest-randomly) and it fails; restore the unique suffix.
+- **Inject: assert `body["answer"]` equals a sentence.** Any wording change breaks the suite while the
+  plumbing works. Debug: assert cited IDs and request IDs only; quality belongs to evals.
+
+### Submission
+- **Your `wait_for`**, with the given tests unchanged and 5 passing on ten consecutive runs.
+- **The log of those ten runs**, for example from a shell loop.
+- **One extra journey test** that uploads two documents for one tenant and asserts both are cited.
+- **A short note** comparing the sleep and polling variants in wall time and red runs over your ten runs.
+- **Evaluated by:** no fixed sleeps in the journey, failure messages that include the last status and
+  request IDs, and no state shared between tests.
 
 ## Why it exists
 - **Unit tests only prove logic given your assumptions.** Doubles check your code against your model of

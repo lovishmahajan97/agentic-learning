@@ -5,7 +5,8 @@ name: Request-size limits & upload security
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/uploadfile
@@ -38,6 +39,156 @@ parse in an isolated worker, and treat extracted text as untrusted.
   page and pixel caps, sandboxed parsing, and a cap on how much tool output enters the context.
 - **What you can skip.** Writing your own antivirus or format parsers; use hardened ones in a sandbox and
   spend effort on caps and injection handling.
+
+## Lab
+### Task
+Harden the ingestion API of a RAG agent so oversized and mislabelled inputs never reach a handler or
+parser. You write the byte-counting ASGI middleware (a `Content-Length` fast path plus a counter on
+`receive` for chunked bodies) and a magic-byte sniffer that ignores the filename and declared type.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** UploadFile, middleware ordering, HTTPException handling.
+- **Runs offline:** caps are shrunk to 64 KiB for documents and 8 KiB for chat so tests run in under a
+  second; `TestClient` sends a generator body as chunked, with no `Content-Length`.
+- **Needs:** `fastapi`, `httpx`, `python-multipart`, `pytest`; checked with FastAPI 0.115.6 and
+  0.161.1 on Python 3.12.
+
+### Starter code
+```python
+# size_lab.py: byte caps and content sniffing for a RAG agent's ingestion API (pure ASGI + FastAPI)
+from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.testclient import TestClient
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+LIMITS = {"/v1/documents": 64 * 1024}      # tiny caps so the lab runs fast: 64 KiB for documents
+DEFAULT = 8 * 1024                         # 8 KiB for everything else (chat JSON)
+ALLOWED = {b"%PDF-": "application/pdf", b"\x89PNG\r\n\x1a\n": "image/png"}
+HANDLED = {"n": 0}                         # how many requests reached a handler
+
+class BodyLimit:
+    def __init__(self, app: ASGIApp): self.app = app
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        cap = LIMITS.get(scope["path"], DEFAULT)
+        # YOUR CODE: (1) if Content-Length exceeds cap, send a 413 without calling the app;
+        # (2) otherwise wrap receive so it counts body bytes and raises HTTPException(413) past cap
+        await self.app(scope, receive, send)
+
+def sniff(head: bytes) -> str | None:
+    """Return the allowed type for these leading bytes, or None."""
+    # YOUR CODE: match against ALLOWED; never trust the filename or the declared content type
+    return "application/pdf"
+
+app = FastAPI()
+app.add_middleware(BodyLimit)
+
+@app.post("/v1/documents", status_code=202)
+async def upload(file: UploadFile):
+    HANDLED["n"] += 1
+    head = await file.read(8)
+    await file.seek(0)
+    kind = sniff(head)
+    if kind is None:
+        raise HTTPException(415, "only PDF and PNG are accepted")
+    return {"job_id": "job_123", "detected_type": kind}
+
+@app.post("/v1/chat")
+async def chat(body: dict):
+    HANDLED["n"] += 1
+    return {"reply": "ok"}
+
+def chunks(total: int, size: int = 4096):            # a chunked body with no Content-Length
+    for _ in range(total // size):
+        yield b"x" * size
+
+if __name__ == "__main__":
+    c = TestClient(app, raise_server_exceptions=False)
+    pdf = ("a.pdf", b"%PDF-1.7 hello", "application/pdf")
+    svg = ("report.pdf", b"<svg onload=alert(1)>", "application/pdf")
+    big = ("big.pdf", b"%PDF-" + b"0" * 100_000, "application/pdf")
+    print("pdf:", c.post("/v1/documents", files={"file": pdf}).json())
+    print("svg named .pdf:", c.post("/v1/documents", files={"file": svg}).status_code)
+    print("100 KB upload:", c.post("/v1/documents", files={"file": big}).status_code)
+    print("chunked 40 KiB chat:", c.post("/v1/chat", content=chunks(40 * 1024),
+                                         headers={"content-type": "application/json"}).status_code)
+    print("small chat:", c.post("/v1/chat", json={"m": "hi"}).status_code, "| handled:", HANDLED["n"])
+```
+
+As given, the SVG and the 100 KB upload both get 202, the chunked chat body is parsed (and fails as
+JSON with 422), and four requests reach a handler.
+
+### Expected output
+```
+pdf: {'job_id': 'job_123', 'detected_type': 'application/pdf'}
+svg named .pdf: 415
+100 KB upload: 413
+chunked 40 KiB chat: 413
+small chat: 200 | handled: 3
+```
+
+### Tests
+```python
+# test_size_lab.py: run with `pytest -q`
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+import size_lab as m
+
+c = TestClient(m.app, raise_server_exceptions=False)
+
+@pytest.fixture(autouse=True)
+def reset():
+    m.HANDLED["n"] = 0
+
+def multipart_chunks(name, data):              # the same upload, sent chunked with no length
+    req = httpx.Request("POST", "http://t/v1/documents", files={"file": (name, data, "application/pdf")})
+    body = req.read()
+    return (body[i:i + 4096] for i in range(0, len(body), 4096)), req.headers["content-type"]
+
+def test_declared_oversize_is_rejected_before_the_handler():
+    r = c.post("/v1/documents", files={"file": ("big.pdf", b"%PDF-" + b"0" * 100_000, "application/pdf")})
+    assert r.status_code == 413 and m.HANDLED["n"] == 0
+
+def test_chunked_json_without_length_is_counted():
+    r = c.post("/v1/chat", content=m.chunks(40 * 1024), headers={"content-type": "application/json"})
+    assert r.status_code == 413 and m.HANDLED["n"] == 0
+
+def test_chunked_upload_without_length_is_counted():
+    gen, ct = multipart_chunks("big.pdf", b"%PDF-" + b"0" * 100_000)
+    r = c.post("/v1/documents", content=gen, headers={"content-type": ct})
+    assert r.status_code == 413 and m.HANDLED["n"] == 0
+
+def test_content_beats_the_claimed_type():
+    r = c.post("/v1/documents", files={"file": ("report.pdf", b"<svg onload=alert(1)>", "application/pdf")})
+    assert r.status_code == 415
+
+def test_real_pdf_and_png_pass():
+    for data, kind in [(b"%PDF-1.7 hi", "application/pdf"), (b"\x89PNG\r\n\x1a\n....", "image/png")]:
+        r = c.post("/v1/documents", files={"file": ("f.bin", data, "application/octet-stream")})
+        assert r.status_code == 202 and r.json()["detected_type"] == kind
+```
+
+All five fail on the starter: no cap fires and the sniffer calls everything a PDF.
+
+### Failure scenarios
+- **Inject a header-only check:** keep the `Content-Length` test and drop the counter. Both chunked
+  tests fail (422 for the chat body, 202 for the upload). Log the `content-length` header in the
+  middleware; it is `None` for these requests, so only counting bytes can stop them.
+- **Inject an eager read:** have the middleware drain `receive` itself and raise `HTTPException(413)`
+  there. The chunked chat request now returns 500, because the raise happens outside FastAPI's
+  `ExceptionMiddleware`. Raise only from the wrapped `receive` that FastAPI's body parsing calls, or
+  send the 413 yourself.
+- **Inject trust in `file.content_type`:** let `upload` use it instead of `sniff`. The SVG passes as a
+  PDF, which is the stored-XSS and parser-confusion path. Compare the first 8 bytes with the declared
+  type in your logs.
+
+### Submission
+- **Your `size_lab.py`** with `BodyLimit` and `sniff` done.
+- **A `pytest -q` run** showing 5 passed.
+- **The script's printed output**, matching the expected lines.
+- **A note of 3-5 sentences** naming what this layer cannot see (decompressed archive size, page
+  counts, injected instructions) and where each of those checks runs instead.
+- **Evaluated on:** green tests, a 413 before any handler runs, and type decided by bytes, not claims.
 
 ## Why it exists
 - **The inputs are the largest and least trusted in your stack:** long prompts, PDFs, images, audio, zip

@@ -5,7 +5,8 @@ name: Build vs buy
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - strategy/vendor-evaluation
@@ -34,6 +35,65 @@ assembly and eval sets, and own a thin seam everywhere.
   retriever interface), and the golden set of agent tasks that every option is measured against.
 - **What you can skip.** Feature-by-feature framework comparisons. Ask the four questions per layer,
   keep the seam, and measure time-to-swap instead of debating.
+
+## Decision case
+### Scenario
+A customer-support software company wants to ship a ticket-resolving agent inside its product: it reads
+the ticket, looks up the order in the customer's systems through connectors, drafts a reply and, with
+approval, closes the ticket.
+
+The decision here is one layer: who runs the agent loop and its traces.
+All figures are illustrative abstract units over three years.
+- **Projected runs:** 0.5M in year one, 1.5M in year two, 3M in year three: 5M in total.
+- **Compliance:** tickets contain customer PII; EU customers contractually require tool results and
+  traces to stay in an EU region under the company's control.
+- **Team and deadline:** four engineers, launch in 12 weeks (about 2.8 months).
+- **Differentiation:** the resolution quality is the product; competitors rent the same models.
+
+Model tokens cost the same under every option, so they are left out.
+
+### Options
+| Option | How it works | Three-year cost | Compliance | Deadline |
+|---|---|---|---|---|
+| **A. Managed agent service from a model vendor** | hosted loop, built-in tools; per-run fee of 0.01 | 5M × 0.01 = 50,000 runs + 40,000 integration + 0.4 × 150,000 exit = 150,000 | tool results processed in the vendor's runtime outside the EU: fails | fastest |
+| **B. Open-source framework behind an `AgentRunner` seam, self-hosted tracing** | checkpointed state and approval pauses from the framework; tools, prompts and evals in own modules | 8 engineer-months × 15,000 = 120,000 + maintenance 90,000 + tracing infra 1,500 × 36 = 54,000 → 264,000 | runs and traces in own EU environment | about 2 months: fits |
+| **C. Hand-written loop and own tracing** | build state persistence, pauses, retries and spans | 12 engineer-months = 180,000 + maintenance 135,000 + infra 54,000 → 369,000 | as B | about 3 months: misses 12 weeks |
+
+Maintenance is 25% of build per year; A's exit term is a 40% chance of switching times an exit cost of
+re-implementing tools, prompts and traces elsewhere.
+
+### Decision
+**Choose B.** The four questions settle it:
+- **Differentiation:** the loop's plumbing does not differentiate, but tools, context assembly and the
+  eval set do, and B keeps them in the company's own modules.
+- **Speed of the layer:** agent frameworks change fast, so the seam and a contract test keep a swap
+  possible.
+- **Compliance:** it overrides cost. A is cheapest on paper (150,000) but fails the EU trace rule, so it
+  is out before the comparison.
+- **Total cost including exit:** between the compliant options, B is 105,000 cheaper than C and is the
+  only one that meets the 12-week deadline.
+
+**What would change it.** A vendor offering an EU-region runtime with exportable traces and a
+data-processing agreement puts A back on the table at the next review. A framework upgrade that costs
+more than a few weeks a year, or an agent simple enough to be a fixed workflow, favours C's plain loop
+behind the same seam.
+
+### Trade-offs accepted
+- **Framework churn.** Upgrades and abstractions become the team's problem; time spent on upgrades per
+  quarter is logged, and the contract test runs on every upgrade.
+- **Running tracing ourselves.** Self-hosted tracing needs operations; trace export completeness and
+  storage cost are monitored.
+- **Slower start than A.** Two months instead of weeks; the golden set of 100 real tickets with expected
+  end states is built in the first two weeks so progress is measured from the start.
+- **Maintenance forever.** 30,000 a year at the stated rate; it is reviewed against the layer map at
+  each renewal.
+
+### Review rubric
+- Decides one stack layer at a time and says which parts stay built whatever runs the loop.
+- Applies compliance as a filter before comparing cost.
+- Writes out three-year TCO with maintenance, integration and exit terms, and the totals reproduce.
+- Checks each option against the deadline in calendar time, not only cost.
+- Names the seam (interface plus contract test) and the trigger that would reopen the decision.
 
 ## Why it exists
 - **The boundaries are not settled yet.** In mature domains nobody writes their own database. The AI

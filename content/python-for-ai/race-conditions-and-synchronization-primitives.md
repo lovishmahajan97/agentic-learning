@@ -5,7 +5,8 @@ name: Race conditions & synchronization primitives (asyncio.Lock, Semaphore)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/asyncio
@@ -37,6 +38,161 @@ Parallel tool calls and sub-agents share state (budgets, memory, tokens), and as
   rate limiter once you run more than one worker.
 - **What you can skip.** `asyncio.Condition` details and building your own primitives. Know the three
   ingredients of a race, double-checked locking, single-flight and Little's law for sizing.
+
+## Lab
+### Task
+Fix a per-run budget that parallel tool calls overspend, then cap how many model calls run at once.
+The starter checks the budget, awaits the sub-call, then deducts, so ten parallel calls on a 100-cent
+budget all pass the check. Time box: 45 minutes. Do **asyncio** first.
+- **Goal:** never approve more than the budget covers, refund a reservation when the call fails or is
+  cancelled, keep the lock off the slow await, and hold calls in flight to `limit`.
+- **Why cents:** integer cents keep the arithmetic exact, as a real ledger would.
+- **Constraints:** standard library only; checked on Python 3.12.14 with pytest 9.1.
+
+### Starter code
+Save as `lab_budget.py`. It runs as given and prints the overspend.
+
+```python
+import asyncio
+
+stats = {"in_flight": 0, "peak": 0}           # model calls currently running, and the maximum seen
+
+async def model_call(cost, fail=False):
+    stats["in_flight"] += 1
+    stats["peak"] = max(stats["peak"], stats["in_flight"])
+    try:
+        await asyncio.sleep(0.1)                # the sub-call: other tools run here
+        if fail:
+            raise ConnectionError("upstream reset")
+        return f"answer ({cost} cents)"
+    finally:
+        stats["in_flight"] -= 1
+
+class RunBudget:
+    """A per-run budget in integer cents, shared by parallel tool calls and sub-agents."""
+    def __init__(self, cents):
+        self.left = cents
+        self._lock = asyncio.Lock()
+
+    async def spend(self, cost, fail=False):
+        """Return the model answer, or None when the budget cannot cover `cost`.
+        LAB 1: decide and deduct under the lock BEFORE awaiting, with no await inside the lock.
+        LAB 2: refund the reservation if the call raises or is cancelled, then re-raise."""
+        if self.left < cost:
+            return None
+        answer = await model_call(cost, fail)
+        self.left -= cost
+        return answer
+
+async def fan_out(budget, n, cost, limit):
+    """Run n parallel sub-calls against one budget.
+    LAB 3: never more than `limit` model calls in flight (asyncio.Semaphore)."""
+    return await asyncio.gather(*(budget.spend(cost) for _ in range(n)))
+
+async def main():
+    b = RunBudget(100)
+    out = await fan_out(b, n=10, cost=20, limit=3)
+    approved = [a for a in out if a is not None]
+    print(f"approved={len(approved)} left={b.left} cents peak_in_flight={stats['peak']}")
+    b2 = RunBudget(100)
+    try:
+        await b2.spend(20, fail=True)
+    except ConnectionError as e:
+        print(f"failed call: {e}; left={b2.left} cents")
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Expected output
+The starter prints `approved=10 left=-100 cents peak_in_flight=10`. A correct solution prints:
+
+```
+approved=5 left=0 cents peak_in_flight=3
+failed call: upstream reset; left=100 cents
+```
+
+### Tests
+Save as `test_lab_budget.py` and run `pytest -q`. On the starter the overspend and in-flight tests
+fail (10 approved instead of 5, peak 10 instead of 3). The refund and lock-duration tests pass on the
+starter on purpose: they fail on the two tempting half-fixes (reserving without a refund, and awaiting
+the model inside the lock).
+
+```python
+import asyncio
+import pytest
+import lab_budget as lab
+
+@pytest.fixture(autouse=True)
+def reset_stats():
+    lab.stats.update(in_flight=0, peak=0)
+
+def test_parallel_calls_never_overspend():
+    async def scenario():
+        b = lab.RunBudget(100)
+        out = await asyncio.gather(*(b.spend(20) for _ in range(10)))
+        return b, out
+    b, out = asyncio.run(scenario())
+    assert sum(a is not None for a in out) == 5, "more calls approved than the budget covers"
+    assert b.left == 0
+
+def test_failed_call_is_refunded():
+    async def scenario():
+        b = lab.RunBudget(100)
+        with pytest.raises(ConnectionError):
+            await b.spend(20, fail=True)
+        return b.left
+    assert asyncio.run(scenario()) == 100
+
+def test_cancelled_call_is_refunded():
+    async def scenario():
+        b = lab.RunBudget(100)
+        t = asyncio.create_task(b.spend(20))
+        await asyncio.sleep(0.05)
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        return b.left
+    assert asyncio.run(scenario()) == 100
+
+def test_lock_is_not_held_across_the_model_call():
+    async def scenario():
+        b = lab.RunBudget(1000)
+        t0 = asyncio.get_running_loop().time()
+        await asyncio.gather(*(b.spend(10) for _ in range(5)))
+        return asyncio.get_running_loop().time() - t0
+    assert asyncio.run(scenario()) < 0.3, "calls ran one at a time: the await is inside the lock"
+
+def test_fan_out_caps_calls_in_flight():
+    async def scenario():
+        b = lab.RunBudget(1000)
+        return await lab.fan_out(b, n=10, cost=20, limit=3)
+    out = asyncio.run(scenario())
+    assert all(a is not None for a in out)
+    assert lab.stats["peak"] == 3, f"peak in flight was {lab.stats['peak']}, limit is 3"
+```
+
+### Failure scenarios
+- **Inject the await inside the lock** (`async with self._lock:` around the whole method). Budgets are
+  correct but the lock-duration test fails at about 0.5 s for five calls. Debug: time five parallel
+  calls; serialised critical sections show as latency equal to the sum.
+- **Inject `except Exception` for the refund.** The cancellation test fails with `left == 80`, because
+  `CancelledError` is a `BaseException`. Debug: cancel mid-call in a test and print the balance.
+- **Create the `Semaphore` at module import and reuse it across `asyncio.run` calls.** It can raise
+  "bound to a different event loop" once it has to wait. Debug: create primitives inside the running
+  loop (per call or in app startup).
+- **Run two worker processes with the in-process lock.** Each enforces its own budget, so the run can
+  spend twice. Debug: compare the ledger total across workers; move the reservation to an atomic decrement
+  in a shared store.
+
+### Submission
+- **Your `lab_budget.py`** with the three LAB markers resolved.
+- **A `pytest -q` run** showing 5 passed, plus the starter's failing run, in `NOTES.md`.
+- **The fixed script's output**, matching the expected block exactly.
+- **One paragraph naming the `await` that opened the race**, and why reserve-then-await holds the lock
+  for microseconds instead of the 0.1 s call.
+- **Evaluation:** tests pass, no `await` sits inside the lock, refunds catch `BaseException` and
+  re-raise, and the semaphore wraps only the model call path.
 
 ## Why it exists
 - **"Async cannot race" is half true.** Between two awaits a coroutine runs uninterrupted, so

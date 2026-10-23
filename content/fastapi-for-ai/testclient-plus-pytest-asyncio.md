@@ -5,7 +5,8 @@ name: TestClient + pytest-asyncio
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/pytest
@@ -38,6 +39,189 @@ streaming without paying for or waiting on a model.
   which loop each test runs on, and when to clear overrides.
 - **What you can skip.** anyio portal internals. Know the lifespan-under-`with` rule, the one-loop rule
   and the exact-callable override rule; that prevents almost every agent-test flake.
+
+## Lab
+### Task
+Make an agent endpoint testable without a model, then make a given suite pass: fix a factory-built
+dependency that overrides cannot reach, map provider errors to 502, and write the scripted fake LLM
+the tests drive. Time box: 45-75 minutes.
+- **The async part:** one test runs on the test's own loop through `ASGITransport` and reads the
+  agent's async memory store.
+- **Prerequisites:** the dependency injection and lifespan lessons, and pytest fixtures.
+- **Setup:** `pip install fastapi httpx pytest pytest-asyncio`; checked with FastAPI 0.161, httpx 0.28,
+  pytest 9.1, pytest-asyncio 1.4 (strict mode) and Python 3.12. No model or network is used.
+- **Save** the starter as `lab.py` and the tests as `test_lab.py`, then run `pytest -q`.
+
+### Starter code
+```python
+"""Lab: make an agent endpoint testable without a real model. Needs fastapi and httpx."""
+from contextlib import asynccontextmanager
+from fastapi import Depends, FastAPI, Request
+from fastapi.responses import JSONResponse
+
+class ProviderError(Exception):
+    """Raised by the model client on a provider failure (429, 5xx, timeout)."""
+
+class RealLLM:
+    def __init__(self, model: str): self.model = model
+    async def step(self, messages: list[dict]) -> dict:
+        raise RuntimeError("RealLLM called: a test reached the paid provider")
+
+def make_llm(model: str):
+    def dep() -> RealLLM:                      # a new closure: tests cannot reference it
+        return RealLLM(model)
+    return dep
+
+def get_llm() -> RealLLM:                      # the named dependency tests override
+    return RealLLM("model-x")
+
+async def weather(city: str) -> str:
+    return "18C"
+
+def get_tools() -> dict:
+    return {"weather": weather}
+
+class MemoryStore:
+    """Async store the agent writes final answers to (stands in for Redis or Postgres)."""
+    def __init__(self): self.items: list[tuple[str, str]] = []
+    async def save(self, q: str, answer: str): self.items.append((q, answer))
+    async def all(self): return list(self.items)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.memory = MemoryStore()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+# LAB 2: register an exception handler that turns ProviderError into
+# JSONResponse({"error": "upstream_failed"}, status_code=502).
+
+@app.post("/agent")
+async def run_agent(body: dict, request: Request,
+                    llm=Depends(make_llm("model-x")),      # LAB 1: fix the seam: Depends(get_llm)
+                    tools=Depends(get_tools)):
+    messages = [{"role": "user", "content": body["q"]}]
+    for _ in range(5):                                    # hard step cap
+        out = await llm.step(messages)
+        if out["type"] == "final":
+            await request.app.state.memory.save(body["q"], out["text"])
+            return {"answer": out["text"], "steps": len(messages)}
+        result = await tools[out["name"]](**out["args"])
+        messages += [{"role": "assistant", "tool": out["name"]},
+                     {"role": "tool", "content": result}]
+    return {"answer": None, "error": "step_limit"}
+
+class ScriptedLLM:
+    """LAB 3: a fake model. Pops the next scripted response on each step() call and records a
+    copy of the messages it was given in self.seen. If the script runs out, repeat the last item.
+    If an item is an Exception instance, raise it instead of returning it."""
+    def __init__(self, script: list):
+        raise NotImplementedError("lab step 3: ScriptedLLM")
+    async def step(self, messages: list[dict]) -> dict:
+        raise NotImplementedError("lab step 3: ScriptedLLM.step")
+
+if __name__ == "__main__":
+    from fastapi.testclient import TestClient
+    try:
+        llm = ScriptedLLM([{"type": "tool", "name": "weather", "args": {"city": "Oslo"}},
+                           {"type": "final", "text": "It is 18C in Oslo."}])
+        app.dependency_overrides[get_llm] = lambda: llm
+        with TestClient(app) as client:
+            print(client.post("/agent", json={"q": "Weather in Oslo?"}).json())
+            print(f"model saw the tool result: {llm.seen[1][-1]}")
+    except (NotImplementedError, RuntimeError) as e:
+        print(f"not done yet: {e}")
+    finally:
+        app.dependency_overrides.clear()
+```
+
+### Expected output
+`python lab.py` with a correct solution prints:
+
+```
+{'answer': 'It is 18C in Oslo.', 'steps': 3}
+model saw the tool result: {'role': 'tool', 'content': '18C'}
+```
+
+### Tests
+```python
+import httpx, pytest
+from fastapi.testclient import TestClient
+import lab
+from lab import ProviderError, ScriptedLLM, app, get_llm
+
+TOOL = {"type": "tool", "name": "weather", "args": {"city": "Oslo"}}
+FINAL = {"type": "final", "text": "It is 18C in Oslo."}
+
+@pytest.fixture(autouse=True)
+def clear_overrides():
+    yield
+    app.dependency_overrides.clear()               # never leak a fake into the next test
+
+def use(llm):
+    app.dependency_overrides[get_llm] = lambda: llm
+    return llm
+
+def test_tool_result_reaches_model_and_loop_stops():
+    llm = use(ScriptedLLM([TOOL, FINAL]))
+    with TestClient(app) as client:                 # with: lifespan creates app.state.memory
+        r = client.post("/agent", json={"q": "Weather in Oslo?"})
+    assert r.json() == {"answer": "It is 18C in Oslo.", "steps": 3}
+    assert llm.seen[1][-1] == {"role": "tool", "content": "18C"}   # appended before turn 2
+    assert len(llm.seen) == 2
+
+def test_runaway_tool_loop_hits_step_limit():
+    llm = use(ScriptedLLM([TOOL]))                  # only ever asks for tools
+    with TestClient(app) as client:
+        r = client.post("/agent", json={"q": "loop"})
+    assert r.json() == {"answer": None, "error": "step_limit"} and len(llm.seen) == 5
+
+def test_provider_error_maps_to_502():
+    use(ScriptedLLM([ProviderError("rate limited")]))
+    with TestClient(app) as client:
+        r = client.post("/agent", json={"q": "x"})
+    assert r.status_code == 502 and r.json() == {"error": "upstream_failed"}
+
+def test_unhandled_bug_is_500_for_clients():
+    use(ScriptedLLM([KeyError("bug")]))
+    with TestClient(app, raise_server_exceptions=False) as client:
+        r = client.post("/agent", json={"q": "x"})
+    assert r.status_code == 500
+
+@pytest.mark.asyncio
+async def test_async_answer_is_saved_to_memory():
+    use(ScriptedLLM([FINAL]))
+    async with app.router.lifespan_context(app):    # ASGITransport does not run lifespan
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+            r = await c.post("/agent", json={"q": "Oslo?"})
+        assert r.status_code == 200
+        assert await app.state.memory.all() == [("Oslo?", "It is 18C in Oslo.")]   # same loop
+```
+
+On the starter all five fail with `NotImplementedError` from `ScriptedLLM`. With only the fake written,
+four fail with `RuntimeError: RealLLM called`, which is the override-missed bug; a correct solution
+passes all five.
+
+### Failure scenarios
+- **Leave `Depends(make_llm("model-x"))` in place.** The override on `get_llm` is silently ignored and
+  `RealLLM` raises. In a real suite this is a slow test or a provider auth error. Debug by printing
+  `run_agent`'s dependency callables, or by blocking network in CI so the miss fails fast.
+- **Drop the `with` around `TestClient`.** The endpoint fails with `AttributeError` on
+  `app.state.memory`, because lifespan never ran.
+- **Remove the `autouse` cleanup fixture and reorder tests.** A later test inherits an earlier fake,
+  so results depend on order. Detect it by running the suite in random order with the
+  pytest-randomly plugin.
+- **Drop `@pytest.mark.asyncio` from the async test.** In strict mode the coroutine never runs and
+  pytest reports it as failed or skipped, depending on version, with no assertion executed.
+
+### Submission
+- `lab.py` with the three lab steps done, and `test_lab.py` unchanged.
+- A `pytest -q` run showing 5 passed, run at least three times with no event-loop errors.
+- One extra test of your own: a script whose tool raises, asserting what the agent returns.
+- A short note on which of your own agent's dependencies are injected through `Depends` and which are
+  still module globals a test cannot override.
+- Evaluation: tests pass unchanged, no test can reach `RealLLM`, and the fake records every prompt.
 
 ## Why it exists
 - **The behaviour worth testing is mostly not the model.** Request validation, auth, how a provider error

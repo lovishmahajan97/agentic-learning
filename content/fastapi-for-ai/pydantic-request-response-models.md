@@ -5,7 +5,8 @@ name: Pydantic request / response models
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/pydantic
@@ -39,6 +40,166 @@ output is filtered so scratchpads never leak.
   public and internal models so the agent's scratchpad and system prompt stay private.
 - **What you can skip.** Pydantic-core internals and custom serializer plumbing. Know lax versus strict
   coercion, `exclude_unset`, discriminators and the 422 `loc` path.
+
+## Lab
+### Task
+Write the two contracts of an agent endpoint: the client's run request and the tool calls the model
+generates. A bad request must become a 422 before any step runs; a bad tool call must become one precise
+hint the model can fix on its next step, not a crash.
+
+Time box: 60 minutes. Prerequisites: Pydantic v2 basics (`Field`, `ConfigDict`) and this lesson's How
+it works. The code marks three tasks:
+- **Task 1:** bound `RunRequest`: forbid extras, cap `task` and `max_steps`, allow-list `tools`.
+- **Task 2:** make `ToolCall` a discriminated union on `name`.
+- **Task 3:** implement `parse_tool_call`, returning a typed model or a retry hint.
+
+### Starter code
+Save as `lab_contracts.py`. A scripted fake model stands in for the LLM, so no API key is needed. It runs
+as given and stops with `NotImplementedError` at Task 3. Checked with FastAPI 0.161.1, Pydantic 2.14.1,
+httpx 0.28.1 and Python 3.13.
+
+```python
+from typing import Annotated, Literal, Union
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+
+class RunRequest(BaseModel):
+    # TASK 1: forbid unknown fields; task is 1-4000 characters; max_steps is 1-20 (default 8);
+    #         tools may only contain "search_docs" and "create_ticket" (default ["search_docs"]).
+    task: str
+    max_steps: int = 8
+    tools: list[str] = ["search_docs"]
+
+class SearchDocs(BaseModel):                      # tool argument models: schema AND validator
+    name: Literal["search_docs"]
+    query: str = Field(min_length=3)
+    top_k: int = Field(default=5, ge=1, le=10)
+
+class CreateTicket(BaseModel):
+    name: Literal["create_ticket"]
+    title: str = Field(min_length=5)
+    priority: Literal["low", "high"] = "low"
+
+# TASK 2: a discriminated union of SearchDocs and CreateTicket, discriminated on "name".
+ToolCall = Union[SearchDocs, CreateTicket]
+
+def parse_tool_call(raw: str) -> SearchDocs | CreateTicket | str:
+    # TASK 3: validate the model's raw JSON against ToolCall (TypeAdapter.validate_json). On failure
+    # return "invalid tool call: " + "; ".join(f"{loc}: {msg}") where loc is the error's loc joined
+    # by "." (or "arguments" when empty): a message the model can act on, instead of an exception.
+    raise NotImplementedError("parse_tool_call")
+
+SCRIPTED_LLM = [                                  # what a fake model emits, one tool call per step
+    '{"name": "search_docs", "query": "refund policy", "top_k": 50}',
+    '{"name": "search_docs", "query": "refund policy", "top_k": 5}',
+    '{"name": "create_ticket", "title": "Refund for order 1182", "priority": "high"}',
+]
+
+app = FastAPI()
+
+@app.post("/agent/run")
+def run(req: RunRequest):
+    observations = []
+    for raw in SCRIPTED_LLM[: req.max_steps]:
+        call = parse_tool_call(raw)
+        if isinstance(call, str):
+            observations.append(call)             # fed back to the model as the tool result
+        elif call.name not in req.tools:
+            observations.append(f"tool {call.name} is not enabled for this run")
+        else:
+            observations.append(f"ran {call.name}")
+    return {"observations": observations}
+
+if __name__ == "__main__":
+    c = TestClient(app)
+    r = c.post("/agent/run", json={"task": "refund order 1182", "max_steps": 3})
+    print(r.status_code, *r.json()["observations"], sep="\n")
+    for bad in ({"task": "x", "max_step": 3}, {"task": "x", "max_steps": 500}, {"task": "x", "tools": ["shell"]}):
+        r = c.post("/agent/run", json=bad)
+        print(r.status_code, [(e["loc"], e["type"]) for e in r.json().get("detail", [])])
+```
+
+### Expected output
+`python lab_contracts.py` after all three tasks. The default toolset is `["search_docs"]`, so the
+ticket call is refused by the allow-list, not by validation.
+
+```
+200
+invalid tool call: search_docs.top_k: Input should be less than or equal to 10
+ran search_docs
+tool create_ticket is not enabled for this run
+422 [(['body', 'max_step'], 'extra_forbidden')]
+422 [(['body', 'max_steps'], 'less_than_equal')]
+422 [(['body', 'tools', 0], 'literal_error')]
+```
+
+### Tests
+Save as `test_lab_contracts.py` and run `pytest -q`. On the starter all 8 fail: the request tests get a
+500 from inside the agent loop where a 422 belongs, and the tool tests hit `NotImplementedError`.
+
+```python
+from fastapi.testclient import TestClient
+import lab_contracts as lab
+
+c = TestClient(lab.app, raise_server_exceptions=False)
+HINT = "invalid tool call: search_docs.top_k: Input should be less than or equal to 10"
+
+def errors(body):
+    r = c.post("/agent/run", json=body)
+    assert r.status_code == 422, f"expected 422 before the agent loop ran, got {r.status_code}"
+    return [(e["loc"], e["type"]) for e in r.json()["detail"]]
+
+def test_typo_is_rejected_not_silently_ignored():
+    assert errors({"task": "x", "max_step": 3}) == [(["body", "max_step"], "extra_forbidden")]
+
+def test_step_budget_is_bounded():
+    assert errors({"task": "x", "max_steps": 500}) == [(["body", "max_steps"], "less_than_equal")]
+
+def test_empty_task_is_rejected():
+    assert errors({"task": ""}) == [(["body", "task"], "string_too_short")]
+
+def test_tools_come_from_an_allow_list():
+    assert errors({"task": "x", "tools": ["shell"]}) == [(["body", "tools", 0], "literal_error")]
+
+def test_bad_tool_args_become_one_precise_hint():
+    assert lab.parse_tool_call(lab.SCRIPTED_LLM[0]) == HINT
+
+def test_unknown_tool_names_the_expected_tags():
+    hint = lab.parse_tool_call('{"name": "delete_db"}')
+    assert hint.startswith("invalid tool call: arguments: Input tag 'delete_db'"), hint
+
+def test_valid_call_is_a_typed_model():
+    call = lab.parse_tool_call(lab.SCRIPTED_LLM[2])
+    assert isinstance(call, lab.CreateTicket) and call.priority == "high"
+
+def test_run_feeds_errors_back_instead_of_crashing():
+    r = c.post("/agent/run", json={"task": "refund order 1182", "max_steps": 3,
+                                   "tools": ["search_docs", "create_ticket"]})
+    assert r.status_code == 200
+    assert r.json()["observations"] == [HINT, "ran search_docs", "ran create_ticket"]
+```
+
+### Failure scenarios
+- **Skip the discriminator.** Do Task 3 on the plain `Union`. Observe: the hint for `top_k: 50` lists
+  three errors, including `CreateTicket.name` and `CreateTicket.title`, so the model is told to fix
+  fields of a tool it never called. Debug: print `e.errors()`; the `loc` starts with the class name
+  when every member was tried.
+- **Raise instead of returning a hint.** Let `ValidationError` escape `parse_tool_call`. Observe: the
+  run test gets a 500 and the whole run is lost to one bad argument. Debug: the traceback ends in the
+  route, not in a tool; catch per call and append the hint as the observation.
+- **Allow-list by `str` plus a manual check.** Keep `tools: list[str]` and reject unknown names in the
+  handler. Observe: the tools test fails unless you hand-build a matching 422, and
+  `model_json_schema()` shows `tools` as plain strings, so clients cannot see the allowed values.
+  Debug: compare the schema for `tools` before and after `Literal` (an `enum` appears).
+
+### Submission
+- **Code:** `lab_contracts.py` with the three tasks done.
+- **Test run:** `pytest -q` showing 8 passed.
+- **Trace:** the demo output, matching Expected output.
+- **Short note (5-8 lines):** which bound saves money (steps), which prevents a security problem
+  (tools), and why the hint format helps the model self-correct.
+- **Evaluation:** tests pass, every limit lives in the model rather than in handler `if`s.
 
 ## Why it exists
 - **AI payloads are rich and nested.** Messages with roles, optional tool definitions, sampling

@@ -5,7 +5,8 @@ name: Middleware ordering
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/asgi-lifecycle
@@ -36,6 +37,166 @@ decides whether runs are traced and errors are readable.
   token events are not buffered), and which concerns are middleware versus route dependencies.
 - **What you can skip.** Starlette's internals beyond the two fixed layers. Know "last added is
   outermost" and where `ServerErrorMiddleware` and `ExceptionMiddleware` sit; that answers most bugs.
+
+## Lab
+### Task
+Fix the middleware stack of an agent API so a browser chat UI can read every failure and every log
+line of a run carries its run ID. The starter works for a happy-path request, which is exactly why the
+bug ships: a missing key and a crashing tool both look like "CORS error" in the browser.
+
+Time box: 45 minutes. Prerequisites: the ASGI lifecycle lesson and this lesson's How it works.
+- **Task 1:** reorder the layers to RunID, CORS, ErrorEnvelope, Auth (outermost first).
+- **Task 2:** make `ErrorEnvelope` turn an unhandled exception into a JSON 500 that carries the run ID,
+  but only if the response has not started.
+
+### Starter code
+Save as `lab_mw.py`. It runs as given and prints the broken behaviour. Checked with FastAPI 0.161.1,
+Starlette 1.9.0, httpx 0.28.1 and Python 3.13 (Starlette 1.9 prints a deprecation warning about the
+test client's httpx transport; it is harmless here).
+
+```python
+import contextvars, uuid
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from starlette.middleware.cors import CORSMiddleware
+
+run_id_var = contextvars.ContextVar("run_id", default="-")
+LOG: list[str] = []                                   # what your log pipeline would receive
+ORIGIN = "https://chat.example.com"
+
+class RunID:                                          # pure ASGI: tags the run, streaming-safe
+    def __init__(self, app): self.app = app
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        rid = uuid.uuid4().hex[:12]
+        token = run_id_var.set(rid)
+        async def send_with_id(msg):
+            if msg["type"] == "http.response.start":
+                msg = {**msg, "headers": [*msg.get("headers", []), (b"x-run-id", rid.encode())]}
+            await send(msg)
+        try:
+            await self.app(scope, receive, send_with_id)
+        finally:
+            run_id_var.reset(token)
+
+class Auth:                                           # pure ASGI: rejects runs without a key
+    def __init__(self, app): self.app = app
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] != "OPTIONS":
+            if b"x-api-key" not in dict(scope["headers"]):
+                LOG.append(f"auth rejected run_id={run_id_var.get()}")
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json")]})
+                await send({"type": "http.response.body", "body": b'{"detail":"missing key"}'})
+                return
+        await self.app(scope, receive, send)
+
+class ErrorEnvelope:                                  # pure ASGI: crashes become JSON the UI can read
+    def __init__(self, app): self.app = app
+    async def __call__(self, scope, receive, send):
+        # TASK 2: catch exceptions from the inner app. If http.response.start was not sent yet, send a
+        # 500 with body {"error": "internal", "run_id": <current run id>}; otherwise re-raise.
+        await self.app(scope, receive, send)
+
+app = FastAPI()
+# TASK 1: this reads top to bottom but add_middleware puts each new layer OUTSIDE the previous one.
+# Make the order (outermost first) RunID, CORS, ErrorEnvelope, Auth.
+app.add_middleware(RunID)
+app.add_middleware(CORSMiddleware, allow_origins=[ORIGIN], allow_methods=["POST"], allow_headers=["*"])
+app.add_middleware(ErrorEnvelope)
+app.add_middleware(Auth)
+
+@app.post("/agent/run")
+async def run(body: dict):
+    LOG.append(f"tool=search run_id={run_id_var.get()}")
+    if body.get("task") == "crash":
+        raise RuntimeError("tool returned garbage")
+    return {"answer": "42"}
+
+def demo():
+    c = TestClient(app, raise_server_exceptions=False)
+    h = {"Origin": ORIGIN}
+    for name, headers, body in [("no key", h, {"task": "x"}), ("good", {**h, "x-api-key": "k"}, {"task": "x"}),
+                                ("crash", {**h, "x-api-key": "k"}, {"task": "crash"})]:
+        r = c.post("/agent/run", headers=headers, json=body)
+        print(f"{name:7} {r.status_code} cors={'access-control-allow-origin' in r.headers} "
+              f"run_id={'x-run-id' in r.headers} type={r.headers.get('content-type')}")
+    print("log run ids tagged:", all("run_id=-" not in line for line in LOG))
+
+if __name__ == "__main__":
+    demo()
+```
+
+### Expected output
+`python lab_mw.py` after both tasks. The starter prints `cors=False run_id=False` on the first and third
+lines, a `text/plain` 500, and `False` on the last line.
+
+```
+no key  401 cors=True run_id=True type=application/json
+good    200 cors=True run_id=True type=application/json
+crash   500 cors=True run_id=True type=application/json
+log run ids tagged: True
+```
+
+### Tests
+Save as `test_lab_mw.py` and run `pytest -q`. On the starter three fail on assertions (no CORS header
+on the 401, an untagged auth log line, a plain-text 500 without CORS); the happy-path test passes both
+before and after, as a regression guard.
+
+```python
+from fastapi.testclient import TestClient
+import lab_mw as lab
+
+c = TestClient(lab.app, raise_server_exceptions=False)
+H = {"Origin": lab.ORIGIN}
+
+def setup_function():
+    lab.LOG.clear()
+
+def test_401_reaches_the_browser_with_cors_and_run_id():
+    r = c.post("/agent/run", headers=H, json={"task": "x"})
+    assert r.status_code == 401
+    assert r.headers.get("access-control-allow-origin") == lab.ORIGIN
+    assert "x-run-id" in r.headers
+
+def test_auth_log_line_is_tagged_with_the_run_id():
+    c.post("/agent/run", headers=H, json={"task": "x"})
+    assert lab.LOG and "run_id=-" not in lab.LOG[0], lab.LOG
+
+def test_crash_is_a_json_500_the_chat_ui_can_read():
+    r = c.post("/agent/run", headers={**H, "x-api-key": "k"}, json={"task": "crash"})
+    assert r.status_code == 500
+    assert r.headers.get("access-control-allow-origin") == lab.ORIGIN
+    assert r.json() == {"error": "internal", "run_id": r.headers["x-run-id"]}
+
+def test_good_run_is_untouched():
+    r = c.post("/agent/run", headers={**H, "x-api-key": "k"}, json={"task": "x"})
+    assert r.status_code == 200 and r.json() == {"answer": "42"}
+    assert lab.LOG == [f"tool=search run_id={r.headers['x-run-id']}"]
+```
+
+### Failure scenarios
+- **Put ErrorEnvelope outside CORS.** Observe: the crash test fails on the missing
+  `access-control-allow-origin` header although the body is correct JSON. Debug: print
+  `app.user_middleware` (outermost first) and walk the 500 outward; only layers outside the one that
+  sends it can add headers.
+- **Swallow errors after the stream started.** Drop the "response already started" check, then make the
+  route a `StreamingResponse` that yields one step event and raises. Observe: the test client shows a
+  200 with body `step 0`; the late 500 is lost because the status was already on the wire. Debug: track
+  a `started` flag in a wrapped `send` and re-raise when it is set.
+- **Raise `HTTPException(401)` from Auth.** Observe: the 401 test gets a 500, because only
+  `ExceptionMiddleware`, innermost around the router, converts `HTTPException` into a response. Debug:
+  read the traceback's layer names; middleware must send its own rejection messages.
+
+### Submission
+- **Code:** `lab_mw.py` with the order fixed by the `middleware=[...]` list or reversed
+  `add_middleware` calls, plus a one-line comment stating the outermost-first order.
+- **Test run:** `pytest -q` showing 4 passed.
+- **Trace:** the demo output, matching Expected output.
+- **Short note (5-8 lines):** why a crash 500 skips CORS when only `ServerErrorMiddleware` handles it,
+  and where you would add a tracing layer.
+- **Evaluation:** tests pass and the error envelope never sends a second start message.
 
 ## Why it exists
 - **Cross-cutting concerns need one chain.** Request IDs, auth, CORS, compression, timing, tracing and

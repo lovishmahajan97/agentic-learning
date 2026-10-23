@@ -5,7 +5,8 @@ name: Database design
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/sql
@@ -41,6 +42,163 @@ where a measured read needs it, and index real queries.
   token counts) and jsonb for raw payloads.
 - **What you can skip.** Normal-form theory beyond 3NF and vendor-specific tuning. Know the constraints,
   the composite-index rule and expand/contract; that covers agent state schemas.
+
+## Lab
+### Task
+An agent with a `send_invoice` tool crashed after the tool succeeded and, on resume, replayed step 7: a
+second step row appeared and the customer got a second invoice. You will fix the run and step schema so
+the database itself refuses bad writes and a replayed step reuses its first idempotency key. Time box:
+45-60 minutes.
+- **Prerequisites:** this lesson's Constraints, Multi-tenancy and Modelling agent state sections, and
+  the agent scenario under Examples. SQL basics from the SQL lesson help.
+- **Setup:** Python 3.11+ (standard-library `sqlite3`, checked against SQLite 3.53.1, which has upsert
+  since 3.24), `pip install pytest` (checked against pytest 9.1.1). Save the starter as
+  `agent_schema.py` and the tests as `test_agent_schema.py` in one directory.
+- **Goal:** a typo'd status, a cross-tenant step and a duplicate step all fail with `IntegrityError`, and
+  loading a run's steps in order needs no sort.
+
+### Starter code
+```python
+"""agent_schema.py: run and step tables for a crash-safe agent. Review found three gaps."""
+import sqlite3
+import uuid
+
+SCHEMA = """
+CREATE TABLE agent_runs (
+  id        TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  status    TEXT NOT NULL,                  -- EXERCISE 1: only running, waiting_human, succeeded, failed
+  UNIQUE (tenant_id, id)
+);
+CREATE TABLE agent_steps (
+  id        INTEGER PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+  run_id    TEXT NOT NULL REFERENCES agent_runs (id),  -- EXERCISE 2: a step must stay in its run's tenant
+  step_no   INTEGER NOT NULL,
+  tool_name TEXT,
+  idempotency_key TEXT                      -- EXERCISE 3: one row per (run_id, step_no), even on replay
+);
+"""
+STEPS_QUERY = "SELECT step_no, tool_name FROM agent_steps WHERE run_id = ? ORDER BY step_no"
+
+
+def connect():
+    db = sqlite3.connect(":memory:")
+    db.execute("PRAGMA foreign_keys = ON")       # SQLite enforces FKs only when asked
+    db.executescript(SCHEMA)
+    return db
+
+
+def record_step(db, tenant_id, run_id, step_no, tool_name):
+    """Record a step BEFORE its tool runs and return the idempotency key to pass to the tool.
+    On replay (same run_id, step_no) it must add no row and return the key stored the first time."""
+    key = uuid.uuid4().hex                       # EXERCISE 3: reuse the stored key instead
+    db.execute("INSERT INTO agent_steps (tenant_id, run_id, step_no, tool_name, idempotency_key) "
+               "VALUES (?, ?, ?, ?, ?)", (tenant_id, run_id, step_no, tool_name, key))
+    return key
+
+
+class FakeInvoiceAPI:
+    """Stands in for a payment provider that deduplicates on the idempotency key."""
+
+    def __init__(self):
+        self.sent = {}
+
+    def send(self, key):
+        if key not in self.sent:
+            self.sent[key] = f"inv-{len(self.sent) + 1}"
+        return self.sent[key]
+
+
+if __name__ == "__main__":
+    db = connect()
+    db.execute("INSERT INTO agent_runs VALUES ('r1', 'tenantA', 'running')")
+    api = FakeInvoiceAPI()
+    for attempt in (1, 2):                       # attempt 2 is the replay after a crash
+        key = record_step(db, "tenantA", "r1", 7, "send_invoice")
+        print(f"attempt {attempt}: {api.send(key)}")
+    rows = db.execute("SELECT COUNT(*) FROM agent_steps").fetchone()[0]
+    print("step rows:", rows, "| invoices sent:", len(api.sent))
+    for row in db.execute("EXPLAIN QUERY PLAN " + STEPS_QUERY, ("r1",)):
+        print("plan:", row[-1])
+```
+
+### Expected output
+The starter prints `attempt 2: inv-2`, `step rows: 2 | invoices sent: 2` and a plan of `SCAN agent_steps`
+plus `USE TEMP B-TREE FOR ORDER BY`. After the fix, `python agent_schema.py` prints (the index name
+differs if you add your own index rather than relying on the unique key's):
+
+```text
+attempt 1: inv-1
+attempt 2: inv-1
+step rows: 1 | invoices sent: 1
+plan: SEARCH agent_steps USING INDEX sqlite_autoindex_agent_steps_1 (run_id=?)
+```
+
+### Tests
+On the starter all 4 fail: two with `DID NOT RAISE IntegrityError`, the replay test comparing two
+different random keys, and the plan test showing `SCAN agent_steps | USE TEMP B-TREE FOR ORDER BY`.
+
+```python
+import sqlite3
+
+import pytest
+
+from agent_schema import STEPS_QUERY, connect, record_step
+
+
+@pytest.fixture
+def db():
+    db = connect()
+    db.execute("INSERT INTO agent_runs VALUES ('r1', 'tenantA', 'running')")
+    return db
+
+
+def test_bad_status_rejected(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute("INSERT INTO agent_runs VALUES ('r2', 'tenantA', 'runing')")
+
+
+def test_cross_tenant_step_rejected(db):
+    with pytest.raises(sqlite3.IntegrityError):
+        record_step(db, "tenantB", "r1", 1, "search")
+
+
+def test_replay_returns_same_key_and_one_row(db):
+    first = record_step(db, "tenantA", "r1", 7, "send_invoice")
+    again = record_step(db, "tenantA", "r1", 7, "send_invoice")
+    assert again == first
+    assert db.execute("SELECT COUNT(*) FROM agent_steps").fetchone()[0] == 1
+
+
+def test_ordered_read_uses_index_without_sort(db):
+    plan = " | ".join(r[-1] for r in db.execute("EXPLAIN QUERY PLAN " + STEPS_QUERY, ("r1",)))
+    assert "INDEX" in plan and "TEMP B-TREE" not in plan, plan
+```
+
+### Failure scenarios
+- **Inject: add `UNIQUE (run_id, step_no)` but leave `record_step` unchanged.** The replay now raises
+  `IntegrityError: UNIQUE constraint failed` and the resumed run crashes. Debug: the traceback points at
+  the insert; the constraint is right, the write path must treat the conflict as "already recorded" and
+  read the stored key back.
+- **Inject: use `INSERT OR IGNORE` instead of a targeted `ON CONFLICT (run_id, step_no) DO NOTHING`.**
+  Tests pass, but `OR IGNORE` also silently drops rows that break `NOT NULL` or `CHECK`. Debug: insert a
+  step with `step_no = NULL` and count rows; nothing was written and nothing failed.
+- **Inject: remove `PRAGMA foreign_keys = ON`.** The cross-tenant test fails with `DID NOT RAISE` even
+  though the composite FK is declared. Debug: `PRAGMA foreign_keys` returns 0; SQLite (unlike PostgreSQL)
+  enforces FKs per connection only when asked.
+- **Inject: index `(step_no, run_id)` and drop the unique key.** The plan shows a scan or a temp B-tree
+  again. Debug: read the plan line; equality column first, sort column last.
+
+### Submission
+- **Your fixed `agent_schema.py`**, with the given tests unchanged.
+- **A `pytest -v` log** with all 4 passing, plus the starter's failing run for comparison.
+- **The `python agent_schema.py` output** showing one step row and one invoice after the replay.
+- **One extra test** of your own, for example that a step pointing at a missing run is rejected.
+- **A three-line note** saying which schema rule stops each of the three production defects, and what
+  the PostgreSQL DDL would add (`timestamptz`, `jsonb` arguments, an index on `(run_id, step_no)`).
+- **Evaluated by:** the given tests pass unmodified, your test fails on the starter, and the replay never
+  produces a second invoice.
 
 ## Why it exists
 - **Data outlives code.** Code is rewritten every year; the data it produced is still there a decade

@@ -5,7 +5,8 @@ name: Gradient descent
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/loss-functions
@@ -140,6 +141,22 @@ flowchart TD
     LO --> B
     HI --> B
 ```
+
+## Misconceptions
+- **"A run that goes to NaN needs more or cleaner data."** A loss that falls and then explodes is
+  usually optimisation instability: the surface sharpened until η crossed 2/λ_max. Check the gradient
+  norm for a spike, then lower η, lengthen warmup and enable clipping.
+- **"The learning rate from the last fine-tune will do."** Its stable range depends on curvature, batch
+  size and schedule. Doubling the effective batch halves the updates per epoch, so re-sweep peak η when
+  any of them change.
+- **"Bad local minima are the main reason training fails."** In high dimensions most stationary points
+  are saddles, and many minima are equally good. Outcomes are decided by the schedule, warmup, batch size
+  and initialisation.
+- **"A smaller learning rate is always the safe choice."** Too small looks like a near-linear, barely
+  moving loss and a fine-tune that "did nothing". On the bowl with κ = 50, η = 0.01 leaves w1 at 0.134
+  after 200 steps.
+- **"The lowest training loss is the best checkpoint."** Training loss keeps falling while trajectories
+  are overfitted or general skills are forgotten. Pick the checkpoint on the held-out agent eval.
 
 ## Examples
 ### Worked scenario: learning-rate sweep for a LoRA fine-tune on agent traces

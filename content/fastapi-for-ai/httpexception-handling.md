@@ -5,7 +5,8 @@ name: HTTPException handling
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/middleware-ordering
@@ -38,6 +39,148 @@ leaked internals, checks before streams start, tool errors as observations.
   `retryable` field, which errors end the run and which become tool results, and what reaches the model.
 - **What you can skip.** Starlette's internal middleware details beyond one rule: raising from your own
   middleware gives a 500, so middleware returns responses.
+
+## Lab
+### Task
+An agent's booking tool server answers every failure with a bare `Internal Server Error`, so the model
+cannot tell a bad date from an outage. You give it one Problem Details contract (domain errors, routing
+errors, validation errors and crashes) and write the executor function that turns those responses
+into safe observations for the model.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** Pydantic request and response models, middleware ordering, structured logging.
+- **Runs offline:** `TestClient(app, raise_server_exceptions=False)` returns the 500 a real client sees.
+- **Needs:** `fastapi`, `httpx`, `pytest`; checked with FastAPI 0.115.6 and 0.161.1 on Python 3.12.
+
+### Starter code
+```python
+# errors_lab.py: one error contract for an agent tool server, and an executor that reads it
+import uuid
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+class AppError(Exception):
+    status, code, retryable, retry_after = 500, "internal", False, None
+    def __init__(self, detail: str): self.detail = detail
+class UpstreamBusy(AppError):  status, code, retryable, retry_after = 503, "model_busy", True, 10
+class InvalidDate(AppError):   status, code = 422, "invalid_date"
+
+def problem(req: Request, status: int, code: str, detail, retryable=False, headers=None) -> JSONResponse:
+    rid = req.headers.get("x-request-id") or str(uuid.uuid4())
+    return JSONResponse({"type": f"https://docs.acme.ai/errors/{code}", "title": code, "status": status,
+                         "detail": detail, "code": code, "retryable": retryable, "request_id": rid},
+                        status, headers=headers, media_type="application/problem+json")
+
+app = FastAPI()
+
+# YOUR CODE: register handlers so every failure below leaves as problem(...):
+#   AppError -> its status, code, retryable and Retry-After; Starlette's HTTPException (routing
+#   404/405 too) -> code "http_error"; RequestValidationError -> 422 "invalid_request" with each
+#   error's "input" dropped; any other Exception -> 500 "internal" with a generic detail
+
+class Booking(BaseModel):
+    date: str
+    note: str = ""
+
+@app.post("/tools/book")
+async def book(b: Booking):
+    if len(b.date) != 10:
+        raise InvalidDate("date must be YYYY-MM-DD")
+    if b.date.startswith("2099"):
+        raise UpstreamBusy("model capacity exhausted")
+    if b.date.startswith("2000"):
+        raise RuntimeError("connection to db.internal:5432 refused")   # must never reach a client
+    return {"booked": b.date}
+
+def to_observation(r) -> dict:
+    """Turn a tool server response into what the model sees in its transcript."""
+    # YOUR CODE: 2xx -> the JSON body; 4xx -> {"error": detail, "code": code} so the model can fix
+    # its arguments; 5xx -> {"error": "tool unavailable", "retryable": True}, never the raw body
+    return {"result": r.text}
+
+if __name__ == "__main__":
+    c = TestClient(app, raise_server_exceptions=False)
+    for body in ({"date": "2026-10-22"}, {"date": "22/10"}, {"date": "2099-01-01"}, {"date": "2000-01-01"}):
+        r = c.post("/tools/book", json=body)
+        print(r.status_code, r.headers.get("content-type"), to_observation(r))
+    print(c.get("/nope").status_code, c.get("/nope").headers.get("content-type"))
+```
+
+As given, the bad date, the busy upstream and the crash all print
+`500 text/plain; charset=utf-8 {'result': 'Internal Server Error'}`, and the 404 is plain JSON.
+
+### Expected output
+```
+200 application/json {'booked': '2026-10-22'}
+422 application/problem+json {'error': 'date must be YYYY-MM-DD', 'code': 'invalid_date'}
+503 application/problem+json {'error': 'tool unavailable', 'retryable': True}
+500 application/problem+json {'error': 'tool unavailable', 'retryable': True}
+404 application/problem+json
+```
+
+### Tests
+```python
+# test_errors_lab.py: run with `pytest -q`
+from fastapi.testclient import TestClient
+from errors_lab import app, to_observation
+
+c = TestClient(app, raise_server_exceptions=False)
+PROBLEM = "application/problem+json"
+
+def book(date, **kw):
+    return c.post("/tools/book", json={"date": date, **kw}, headers={"x-request-id": "req-7"})
+
+def test_domain_error_maps_to_503_with_retry_after():
+    r = book("2099-01-01")
+    assert r.status_code == 503 and r.headers["content-type"].startswith(PROBLEM)
+    assert r.headers["retry-after"] == "10"
+    assert r.json()["code"] == "model_busy" and r.json()["retryable"] is True
+
+def test_routing_errors_share_the_envelope():
+    for r in (c.get("/nope"), c.get("/tools/book")):            # 404 and 405 from the router
+        assert r.headers["content-type"].startswith(PROBLEM) and r.json()["code"] == "http_error"
+
+def test_validation_error_does_not_echo_input():
+    r = c.post("/tools/book", json={"note": "sk_live_SECRET"})   # date missing
+    assert r.status_code == 422 and r.json()["code"] == "invalid_request"
+    assert "sk_live_SECRET" not in r.text and '"input"' not in r.text
+
+def test_crash_is_generic_and_traceable():
+    r = book("2000-01-01")
+    assert r.status_code == 500 and r.json()["code"] == "internal"
+    assert "db.internal" not in r.text and r.json()["request_id"] == "req-7"
+
+def test_executor_turns_errors_into_observations():
+    assert to_observation(book("2026-10-22")) == {"booked": "2026-10-22"}
+    assert to_observation(book("22/10")) == {"error": "date must be YYYY-MM-DD", "code": "invalid_date"}
+    assert to_observation(book("2000-01-01")) == {"error": "tool unavailable", "retryable": True}
+```
+
+All five fail on the starter: no handlers are registered, so every error is a plain 500 or FastAPI's
+default shape, and the executor passes raw text to the model.
+
+### Failure scenarios
+- **Inject a handler for `fastapi.HTTPException` only.** The routing test fails: `/nope` still returns
+  `application/json` with `{"detail":"Not Found"}`, because the router raises Starlette's base class.
+  Debug by printing `type(e).__mro__` in a catch-all handler.
+- **Inject `detail=str(e)` in the `Exception` handler.** The crash test fails because
+  `db.internal:5432` reaches the client, and through `to_observation` it would reach the transcript.
+  Grep responses in CI for hostnames and SQL.
+- **Inject an auth middleware that raises `HTTPException(401)`.** The request returns 500 with code
+  `internal`, not 401: the raise happens outside `ExceptionMiddleware`. Return a `JSONResponse` from
+  middleware instead.
+
+### Submission
+- **Your `errors_lab.py`** with the four handlers and `to_observation` done.
+- **A `pytest -q` run** showing 5 passed.
+- **The script's printed output**, matching the expected lines.
+- **A short note** listing which of these failures should end an agent run and which the model should
+  see as a tool result, with one sentence of reasoning each.
+- **Evaluated on:** green tests, one envelope for every status, no `input` or internals echoed, and
+  `request_id` matching the caller's header.
 
 ## Why it exists
 - **AI endpoints fail in many distinct ways.** Invalid input, an unauthorised or over-quota caller, a

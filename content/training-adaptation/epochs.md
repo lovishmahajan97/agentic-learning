@@ -5,7 +5,8 @@ name: Epochs
 kind: concept
 difficulty: intro
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/learning-rate
@@ -154,6 +155,24 @@ flowchart TD
     N -->|"no"| S
     N -->|"yes"| X
 ```
+
+## Misconceptions
+- **"Lower training loss after more epochs means a better model."** Loss on repeated data falls all the
+  way to memorisation. Only held-out loss and agent metrics (tool-call accuracy, task success) can say a
+  later epoch is better; in a small agent fine-tune they often peak at epoch 2 or 3.
+- **"Running 6 epochs instead of 3 is the same run, just longer."** Schedulers run on optimizer steps, so
+  doubling epochs stretches warmup and decay; the learning rate at a given step differs and the runs are
+  not comparable.
+- **"Steps per epoch is rows divided by batch size."** With packing it is total tokens divided by tokens
+  per batch. 1,500 long trajectories packed at 8,192 tokens give 68 steps per epoch, so three epochs are
+  only 204 steps.
+- **"The epoch count is a hyperparameter to pick up front."** It is an upper bound. Evaluate several times
+  per epoch, keep the best checkpoint, and let early stopping with patience end the run.
+- **"The staircase in training loss shows the model learning more each pass."** The drop at each epoch
+  boundary is the model recognising examples it has already seen; with flat or rising validation loss it
+  is memorisation.
+- **"LLMs are pretrained for many epochs."** Pretraining usually ends before one full pass and counts
+  tokens; epochs are a fine-tuning unit.
 
 ## Examples
 ### Planning an agent fine-tune from token counts

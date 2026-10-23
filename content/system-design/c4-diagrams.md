@@ -5,7 +5,8 @@ name: C4 diagrams
 kind: practice
 difficulty: intro
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: background
 related:
   - system-design/ai-solution-architecture
@@ -37,6 +38,64 @@ actually touches.
   pull request that adds a tool.
 - **What you can skip.** Component and Code diagrams of the agent's internals, and formal notations such
   as UML or ArchiMate. Context, Container, Deployment and one Dynamic view cover nearly every agent review.
+
+## Decision case
+### Scenario
+A team sells an operations agent that reads and updates records in a customer's systems. A bank's
+security, privacy and architecture reviewers want diagrams before a VPC pilot, and the team must decide
+how its architecture documentation will be produced and kept current. All figures are illustrative.
+- **System:** 9 tools reaching 7 external systems, plus the hosted model provider; 6 containers (API, run
+  worker, LLM gateway, sandbox, run and memory store, vector store).
+- **Change rate:** about 2 new tools a month.
+- **Topologies:** vendor SaaS plus 2 customer VPC installs, the bank's would be the third.
+- **Constraints:** 10 business days to the bank's review; 1 architect and 6 engineers; reviewers must see
+  data egress and every write-capable tool; diagrams must still be correct at the bank's annual re-review.
+
+### Options
+| Option | How it works | Views to produce | Edits when a tool is added | Staleness risk |
+|---|---|---|---|---|
+| A. Slide diagrams per reviewer | Hand-drawn pictures in a deck | 4 tailored pictures | Each affected slide by hand, often skipped | High: no link to code |
+| B. One text file per diagram | C4-PlantUML or Mermaid C4 files in the repo | Context, Container, one Dynamic run, 4 Deployment views = 7 files | Up to 7 files: Context, Container, Dynamic and every Deployment view showing the tool's target | Medium: files can disagree with each other |
+| C. One Structurizr DSL model, many views | Elements and relationships defined once; views select them; rendered in CI | Same 7 views from one workspace | 1 element and its relationship, plus the Dynamic step if the run uses it | Low: a view cannot show a relationship the model lacks |
+
+At 2 tools a month, B means up to 14 diagram edits a month, against about 2 to 4 for C.
+
+### Decision
+Choose **C, one Structurizr DSL workspace rendered in CI**, because:
+- **Four deployment topologies share one model:** with B, every change is copied into 4 Deployment views
+  by hand, and the bank reviews the one that drifted.
+- **The reviewers' questions map to views:** Context for egress, Container for technology, Deployment
+  for the VPC boundary, a Dynamic view of one run for write actions and the approval step.
+- **The element budget holds:** Context is 1 system, 2 people and 8 external systems, 11 elements;
+  Container adds 6 containers, 16 in total, under the roughly twenty ceiling.
+- **There is an owner:** the architect owns the model, and a code-owner rule on the architecture folder
+  routes every change to them.
+- **The deadline is realistic:** the DSL is small and line-based, and the 7 views come from one model
+  of 8 external systems, 6 containers and 2 people, written once.
+
+**What would change it:** with no one able to own the model, per-diagram C4-PlantUML files (B) stay
+alive more easily; with a single topology and a stable tool set, B's edit count falls to a level hand
+maintenance can sustain.
+
+### Trade-offs accepted
+- **Auto-layout is plainer than a hand-drawn slide.** Watch: reviewer questions about what a box or arrow
+  means, logged per review.
+- **The model depends on one owner.** Watch: open pull requests waiting on the architecture code owner.
+- **Diagrams lag code unless enforced.** Watch: tools registered in code that are missing from the model,
+  checked in CI.
+- **A looping run is awkward as numbered arrows.** Watch: whether reviewers ask how retries and approvals
+  repeat; answer with a sequence diagram beside the Dynamic view.
+
+### Review rubric
+- **Each reviewer's first question is mapped to a named view**, and the write-up says which view answers
+  it.
+- **Egress and write actions are explicit:** the model provider and every write-capable tool target are
+  external systems with labelled, single-direction arrows.
+- **Maintenance cost is counted:** edits per change across all views and topologies, recomputed per
+  option.
+- **The trust boundary is drawn** on a Deployment view for each customer topology.
+- **Element counts stay within budget**, or the write-up splits the view.
+- **Staleness has an owner and a CI check**, plus a concrete condition that would change the tooling.
 
 ## Why it exists
 - **Ad-hoc diagrams mix abstraction levels.** One picture shows a Kubernetes cluster, a "Users" stick

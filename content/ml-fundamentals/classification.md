@@ -5,7 +5,8 @@ name: Classification
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - ml-fundamentals/regression
@@ -148,6 +149,22 @@ flowchart TD
     C["Cost of FP vs FN"] -->|"sets threshold"| D
     D --> L["Label, or abstain to a human"]
 ```
+
+## Misconceptions
+- **"The threshold is 0.5."** That is only optimal when both errors cost the same and the training
+  distribution matches production. With a miss costing 10x a false alarm, the expected-cost threshold is
+  C_FP / (C_FP + C_FN) = 1/11, about 0.09.
+- **"A softmax output is a calibrated probability."** Softmax guarantees the scores sum to one, not that
+  0.8 means right 80% of the time. Check a reliability curve, and calibrate before a threshold uses it.
+- **"99% accuracy means the guardrail works."** With 1% positives, flagging nothing also scores 99%.
+  Look at the confusion matrix and per-class recall at the deployed threshold.
+- **"The LLM told me it is 90% sure, so I have a confidence score."** Verbal confidence has little
+  relation to observed accuracy. Read the label tokens' log-probabilities over a closed label set,
+  normalise and calibrate them.
+- **"Softmax works for any set of labels."** It forces classes to compete for a total of one, so a
+  reply that violates two policies cannot get both tags. Use an independent sigmoid per tag.
+- **"Picking a tool is generation, not classification."** The LM head is a linear layer plus softmax
+  over the vocabulary, so tool choice is a classification and deserves a confusion matrix over tools.
 
 ## Examples
 ### Agent scenario: a router with an abstain branch

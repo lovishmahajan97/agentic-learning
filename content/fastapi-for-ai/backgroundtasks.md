@@ -5,7 +5,8 @@ name: BackgroundTasks
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/job-queues-and-durable-workers
@@ -35,6 +36,163 @@ counters); agent runs, memory extraction and anything that must happen need a du
   exception handling, and keeping task duration well inside the shutdown grace period.
 - **What you can skip.** Starlette internals beyond "runs after the body, sequentially, in this process".
   Remember the decision test: if losing it on a crash is not acceptable, use a queue.
+
+## Lab
+### Task
+Move an agent endpoint's trace write off the response path without letting it hurt users. Today the
+write runs inline, so a trace-DB outage returns a 500. Time box: 30-45 minutes. Prerequisites:
+Dependency injection and Async endpoints.
+- **After the response:** schedule `record_trace` with `BackgroundTasks` so the answer goes out first.
+- **Own session:** the task opens and closes its own `Session`, never the request's.
+- **Guarded:** a failed write is logged as `trace write failed`, never raised.
+- **Idempotent:** an upsert on run id, so a rerun never duplicates the trace.
+
+### Starter code
+Save as `lab_bg.py`. Needs `pip install fastapi httpx pytest` (checked with FastAPI 0.161.1, Starlette
+1.9.0, httpx 0.28.1, pytest 9.1.1, Python 3.12). The fake `Session` stands in for an async DB session.
+
+```python
+import asyncio, logging, uuid
+from fastapi import BackgroundTasks, Depends, FastAPI
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+log = logging.getLogger("trace")
+app = FastAPI()
+EVENTS: list[str] = []                               # ordering log that the tests read
+ROWS: list[dict] = []                                # the fake trace table
+DB = {"down": False}                                 # flip to simulate a trace-DB outage
+
+class Session:
+    """Fake async DB session: add() inserts, merge() upserts on run_id."""
+    def __init__(self):
+        self.closed = False
+    async def _write(self):
+        if self.closed:
+            raise RuntimeError("session is closed")
+        if DB["down"]:
+            raise ConnectionError("trace DB down")
+        await asyncio.sleep(0.01)
+    async def add(self, row: dict) -> None:
+        await self._write(); ROWS.append(row); EVENTS.append("trace_written")
+    async def merge(self, row: dict) -> None:
+        await self._write()
+        ROWS[:] = [r for r in ROWS if r["run_id"] != row["run_id"]] + [row]
+        EVENTS.append("trace_written")
+    async def close(self) -> None:
+        self.closed = True
+
+async def get_session():                             # request-scoped yield dependency
+    s = Session()
+    try:
+        yield s
+    finally:
+        await s.close()
+
+class Ask(BaseModel):
+    prompt: str
+
+async def run_agent(prompt: str) -> tuple[str, list[dict]]:   # fake agent: answer + tool calls
+    return f"echo: {prompt}", [{"tool": "search", "ms": 120}]
+
+async def record_trace(run_id: str, prompt: str, answer: str, steps: list[dict]) -> None:
+    # YOUR CODE 1: open your OWN Session (never the request's), upsert the row with merge(),
+    #              close the session, and log failures with log.exception("trace write failed")
+    #              instead of raising: the client already has its answer.
+    raise NotImplementedError
+
+@app.post("/agent/run")
+async def answer(body: Ask, session: Session = Depends(get_session)):
+    run_id = str(uuid.uuid4())
+    text, steps = await run_agent(body.prompt)
+    # BUG: the trace write runs BEFORE the response, on the request's session, as a plain insert,
+    #      so a trace-DB outage becomes a 500 for the user.
+    await session.add({"run_id": run_id, "prompt": body.prompt, "answer": text, "steps": steps})
+    # YOUR CODE 2: take a BackgroundTasks parameter and schedule record_trace instead.
+    return {"run_id": run_id, "answer": text}
+
+if __name__ == "__main__":
+    client = TestClient(app, raise_server_exceptions=False)
+    r = client.post("/agent/run", json={"prompt": "hi"})
+    print(r.status_code, r.json()["answer"], "| traces:", len(ROWS))
+    DB["down"] = True
+    r = client.post("/agent/run", json={"prompt": "hi again"})
+    print(r.status_code, "| traces:", len(ROWS))
+```
+
+The starter prints `200 echo: hi | traces: 1` and then `500 | traces: 1`: the outage reaches the user.
+
+### Expected output
+With a correct solution, `python lab_bg.py` prints (the outage is logged to stderr, not shown):
+
+```
+200 echo: hi | traces: 1
+200 | traces: 1
+```
+
+### Tests
+Save as `test_lab_bg.py` and run `pytest -q`. On the starter all three fail: the trace is written before
+the response, the outage returns 500, and `record_trace` raises `NotImplementedError`.
+
+```python
+import asyncio, logging
+import pytest
+from fastapi.testclient import TestClient
+from lab_bg import DB, EVENTS, ROWS, app, record_trace
+
+def mark_response_sent(inner):
+    """ASGI wrapper: logs the moment the last body chunk has been handed to the server."""
+    async def asgi(scope, receive, send):
+        async def send_and_mark(msg):
+            await send(msg)
+            if msg["type"] == "http.response.body" and not msg.get("more_body", False):
+                EVENTS.append("response_sent")
+        await inner(scope, receive, send_and_mark)
+    return asgi
+
+client = TestClient(mark_response_sent(app), raise_server_exceptions=False)
+
+@pytest.fixture(autouse=True)
+def reset():
+    EVENTS.clear(); ROWS.clear(); DB["down"] = False
+
+def test_trace_is_written_after_the_response():
+    r = client.post("/agent/run", json={"prompt": "hi"})
+    assert r.status_code == 200
+    assert EVENTS == ["response_sent", "trace_written"]
+    assert ROWS[0]["run_id"] == r.json()["run_id"]
+
+def test_trace_db_outage_does_not_fail_the_user(caplog):
+    DB["down"] = True
+    with caplog.at_level(logging.ERROR, logger="trace"):
+        r = client.post("/agent/run", json={"prompt": "hi"})
+    assert r.status_code == 200 and r.json()["answer"] == "echo: hi"
+    assert "trace write failed" in caplog.text
+
+def test_record_trace_is_idempotent_on_run_id():
+    for _ in range(2):                                   # a retry or a future queue redelivery
+        asyncio.run(record_trace("run-1", "hi", "echo: hi", []))
+    assert [r["run_id"] for r in ROWS] == ["run-1"]
+```
+
+### Failure scenarios
+- **Schedule `session.merge` from the request's session instead of `record_trace`.** On FastAPI 0.161.1
+  the first test still passes, because the yield dependency is still open during background tasks, but
+  the outage test fails with an empty log. Debug: the exception escapes after the response, so only the
+  server log shows it; that is why each task guards itself.
+- **Keep `add()` in the task.** The idempotency test sees `run-1` twice. Debug: count rows per run id.
+- **Write `def record_trace` with a blocking call.** It runs in the shared 40-thread pool. Debug: under
+  load, watch latency on unrelated sync routes rise with trace volume.
+- **Put a 40-second model call (memory extraction) in the task.** It passes here, but dies on every deploy
+  past the 30 s grace period. Debug: compare trace coverage before and after a rollout.
+
+### Submission
+- **Code:** `lab_bg.py` with both YOUR CODE steps done and the fake `Session` unchanged.
+- **Test run:** `pytest -q` showing 3 passed.
+- **Trace:** the output of `python lab_bg.py`, matching the expected output.
+- **Note (3-5 sentences):** which of your own agent's follow-ups could move to this pattern, and which
+  belong on a durable queue, using the loss-on-crash test.
+- **Evaluated on:** passing tests, no request-scoped resource handed to the task, and a logged failure.
 
 ## Why it exists
 - **Every LLM request drags follow-up work.** Persist prompt, response and token usage for observability

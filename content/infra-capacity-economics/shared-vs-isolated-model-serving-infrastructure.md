@@ -5,7 +5,8 @@ name: Shared vs isolated model-serving infrastructure
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/inference-clusters
@@ -39,6 +40,66 @@ isolation on noisy neighbours, compliance and custom configs; most platforms use
   batch.
 - **What you can skip.** On a hosted API this is the provider's problem; you meet the same idea as
   provisioned throughput versus pay-as-you-go, and per-project limits.
+
+## Decision case
+### Scenario
+An internal agent platform serves one self-hosted 70B model to the whole company. A replica holds 48
+concurrent sequences within the latency budget. All figures are illustrative, from a month of
+per-tenant metrics.
+- **Product teams:** 8 teams run interactive agents; each peaks at 30 concurrent sequences, but peaks
+  are spread, so the measured combined peak is 120, not 240. At night the combined load is about 20.
+- **Legal team:** its agent reads privileged documents and peaks at 30 sequences; the compliance rule is
+  "no shared GPU or node with other business units".
+- **Eval team:** a nightly sweep at client concurrency 100 sequences, 01:00 to 04:00.
+- **Constraints:** interactive TTFT p95 under 1.5 s; the sweep must finish inside its 3-hour window;
+  at most 8 replicas of budget; every pool keeps an N+1 spare except batch.
+
+### Options
+| Option | How it works | Replicas | Legal rule | Interactive latency | Eval window |
+|---|---|---|---|---|---|
+| A. Isolate everyone | Each team 1 replica + 1 spare (8 × 2 = 16), legal 2, eval ceil(100 / 48) = 3 | 21 | Met | Isolated | Met |
+| B. One shared pool, no exceptions | Daytime peak 120 + 30 = 150, so ceil(150 / 48) = 4, plus a spare | 5 | Broken | Fair only with caps; legal shares the batch | Met: 100 + 20 = 120 of 240 slots at night |
+| C. Shared pool with logical isolation, legal dedicated | 8 teams and evals share ceil(120 / 48) = 3 + 1 = 4 replicas behind per-tenant in-flight caps, evals tagged batch; legal gets 2 replicas on its own node pool | 6 | Met | Caps and fair-share admission at the gateway | Met: 100 + 20 = 120 of 192 slots at night |
+| D. As C plus a dedicated batch pool | Evals move to their own 3 replicas | 9 | Met | Best | Met |
+
+### Decision
+Choose **C**, because:
+- **It is the only option that meets the legal rule inside the 8-replica budget.** A costs 21, D costs
+  9, and B breaks the compliance rule.
+- **Sharing pays where peaks are spread:** 8 teams need 4 replicas together instead of 16 apart, the
+  peak-of-sum saving.
+- **The eval sweep fits the night trough:** 120 of 192 slots, so a separate batch pool would buy little
+  while costing 3 replicas.
+- **Legal is an exception with a documented reason,** at level 4 rather than a separate cluster,
+  because the rule names GPUs and nodes, not the control plane.
+
+**What would change it:**
+- **Evals moving into daytime:** their 100 sequences would collide with the 120 interactive peak, so
+  D's batch pool earns its cost.
+- **The legal rule relaxing to "no shared prefix cache":** legal joins the shared pool with a
+  tenant-salted cache.
+- **Team peaks becoming correlated:** a combined peak of 240 needs ceil(240 / 48) = 5 + 1 = 6 shared
+  replicas, plus legal's 2, exactly the budget with no slack.
+
+### Trade-offs accepted
+- **Legal's replicas sit mostly idle:** a peak of 30 on 96 slots is about 31%. Watch their utilization in
+  the quarterly exception review.
+- **Admitted eval steps still share the batch** with night-time interactive traffic. Watch interactive
+  p95 TTFT between 01:00 and 04:00.
+- **Tenant-salted caching loses cross-team hits** on the shared agent scaffold prompt. Watch prefix-cache
+  hit rate per tenant.
+- **The gateway now carries fairness logic.** Watch 429s and in-flight sequences per tenant, counted
+  across each run's fan-out.
+
+### Review rubric
+- **Shared capacity is sized from the measured combined peak,** not from the sum of peaks, and the
+  write-up shows both numbers.
+- **Every exception names the requirement that forces it** and the precise level of what is not shared.
+- **Caps count in-flight sequences,** including parallel tool calls, not agent runs.
+- **Batch traffic has a placement argument** (night trough, low priority or its own pool) with slot
+  arithmetic.
+- **Spares are stated per pool** and the replica total recomputes to the budget.
+- **Reversal triggers are measurable:** correlated peaks, a changed rule, or evals moving into daytime.
 
 ## Why it exists
 - **A GPU is efficient only when busy.** Continuous batching reaches its throughput at tens of concurrent

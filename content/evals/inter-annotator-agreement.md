@@ -5,7 +5,8 @@ name: Inter-annotator agreement
 kind: metric
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -172,6 +173,22 @@ flowchart TD
     L -.->|"overlap kappa drops"| R
     C --> J["Judge-human kappa next to human-human"]
 ```
+
+## Misconceptions
+- **"Two reviewers who agree 92% of the time produce reliable labels."** When 94% of runs pass, chance
+  alone gives about 89% agreement, so κ is only 0.29. Agent pass rates are skewed, so this paradox is the
+  normal case; read κ next to p_o and the confusion table.
+- **"Low agreement means the annotators are careless."** It usually means the guideline is ambiguous,
+  especially for judgment calls such as "was the clarifying question needed?". Rewrite the anchors and
+  re-pilot.
+- **"Human–human agreement is a hard ceiling, so a judge above it is better than people."** A strong
+  judge can land slightly above it, because it is compared with error-prone individuals. Labels written by
+  those people still cannot demonstrate it is better than them.
+- **"A correlation of 0.9 means two raters' scores are interchangeable."** Pearson and Spearman ignore a
+  constant offset: a rater always one point higher still gets r = 1. Use ICC for absolute agreement.
+- **"κ = 0.7 on a 30-item pilot settles whether a criterion can gate."** At that size the 95% interval
+  spans roughly 0.26–0.86. Bootstrap it, enlarge the pilot, and compute it per criterion rather than
+  pooled.
 
 ## Examples
 ### The kappa paradox, by hand

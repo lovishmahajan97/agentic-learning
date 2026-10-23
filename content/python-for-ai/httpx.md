@@ -5,7 +5,8 @@ name: httpx
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/asyncio
@@ -36,6 +37,175 @@ your agent waits, fans out and fails.
   `httpx.Limits` sized for your concurrency, a total deadline per tool call, and where retries live.
 - **What you can skip.** HTTP/2 internals and transport plumbing beyond the three transports below.
   Know that a read timeout is not a deadline and that the pool is your concurrency limit.
+
+## Lab
+### Task
+Build the tool executor for one agent step: run every tool call the model requested in parallel on one
+shared `AsyncClient`, give each call a total deadline that covers its retries, retry 429 and 5xx with
+`Retry-After`, and turn every failure into text the model can read. A `MockTransport` plays the tools
+service. Time box: 60 minutes.
+- **Prerequisites:** the asyncio and async/await lessons; the Tenacity lesson for retry policy ideas.
+- **Setup:** Python 3.11+ (for `asyncio.timeout`), `pip install "httpx==0.28.1" pytest` (checked against
+  httpx 0.28.1). Save the starter as `executor.py` and the tests as `test_executor.py`.
+
+### Starter code
+```python
+"""Lab: the tool executor for one agent step: parallel, deadlined, retrying 429/5xx (Python 3.11+)."""
+import asyncio
+import time
+
+import httpx
+
+RETRYABLE = {429, 500, 502, 503, 504}
+
+
+def make_client(transport: httpx.AsyncBaseTransport | None = None) -> httpx.AsyncClient:
+    """The one shared client for tool calls; tests inject a MockTransport here."""
+    return httpx.AsyncClient(base_url="https://tools.internal", transport=transport,
+                             timeout=httpx.Timeout(connect=2.0, read=10.0, write=5.0, pool=1.0),
+                             limits=httpx.Limits(max_connections=50, max_keepalive_connections=20))
+
+
+async def call_tool(client: httpx.AsyncClient, name: str, args: dict,
+                    deadline_s: float = 8.0, max_attempts: int = 3) -> str:
+    """POST /tools/<name>. Return the body text on 2xx. Never raise; return "ERROR: ..." text:
+    - the whole call, retries included, gets deadline_s -> "ERROR: <name> took longer than <deadline_s>s"
+    - retry 429 and 5xx up to max_attempts calls in total, sleeping Retry-After seconds when present
+      (else 0.1 * 2**attempt); after the last attempt -> "ERROR: <name> returned <status>"
+    - other 4xx are not retried -> "ERROR: <name> returned <status>: <first 200 chars of body>"
+    - network failures -> "ERROR: <name> unreachable (<exception class name>)" """
+    raise NotImplementedError("YOUR CODE")
+
+
+async def run_step(client: httpx.AsyncClient, calls: list[tuple[str, dict]], **kw) -> list[str]:
+    """Run every tool call the model asked for in this step; results in request order."""
+    return [await call_tool(client, n, a, **kw) for n, a in calls]     # works, but is it fast?
+
+
+async def demo() -> None:
+    hits: dict[str, int] = {}
+
+    async def upstream(request: httpx.Request) -> httpx.Response:     # a fake tools service
+        name = request.url.path.rsplit("/", 1)[-1]
+        hits[name] = hits.get(name, 0) + 1
+        if name == "get_invoices":
+            await asyncio.sleep(30)                                       # hangs
+        if name == "get_customer" and hits[name] == 1:
+            return httpx.Response(429, headers={"Retry-After": "0.2"})
+        await asyncio.sleep(0.3)
+        return httpx.Response(200, text=f'{{"tool": "{name}"}}')
+
+    async with make_client(httpx.MockTransport(upstream)) as client:
+        t0 = time.perf_counter()
+        results = await run_step(client, [("search_docs", {"q": "vpn"}), ("get_customer", {"id": 7}),
+                                          ("get_invoices", {"id": 7})], deadline_s=1.0)
+        for r in results:
+            print(r)
+        print(f"step took under 1.5 s: {time.perf_counter() - t0 < 1.5}, calls: {hits}")
+
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+### Expected output
+```
+{"tool": "search_docs"}
+{"tool": "get_customer"}
+ERROR: get_invoices took longer than 1.0s
+step took under 1.5 s: True, calls: {'search_docs': 1, 'get_customer': 2, 'get_invoices': 1}
+```
+The step costs the slowest call's deadline (1.0 s), not the sum, and the 429 was absorbed by one retry.
+`pytest -q test_executor.py` reports `6 passed`.
+
+### Tests
+```python
+import asyncio, time
+import httpx
+from executor import call_tool, make_client, run_step
+
+
+def scripted(*responses, delay=0.0):
+    """A fake upstream that replays (status, headers) pairs and counts calls."""
+    seen = []
+
+    async def handler(request):
+        seen.append(request.url.path)
+        await asyncio.sleep(delay)
+        status, headers = responses[min(len(seen), len(responses)) - 1]
+        return httpx.Response(status, headers=headers, text="ok" if status == 200 else "nope")
+    return handler, seen
+
+
+async def call(handler, **kw):
+    async with make_client(httpx.MockTransport(handler)) as client:
+        return await call_tool(client, "search_docs", {"q": "vpn"}, **kw)
+
+
+def test_429_is_retried_after_retry_after():
+    handler, seen = scripted((429, {"Retry-After": "0.2"}), (200, {}))
+    t0 = time.perf_counter()
+    assert asyncio.run(call(handler)) == "ok" and len(seen) == 2
+    assert time.perf_counter() - t0 >= 0.2                         # honoured the header
+
+
+def test_persistent_503_stops_at_max_attempts():
+    handler, seen = scripted((503, {"Retry-After": "0"}))
+    assert asyncio.run(call(handler, max_attempts=3)) == "ERROR: search_docs returned 503"
+    assert len(seen) == 3
+
+
+def test_400_is_not_retried():
+    handler, seen = scripted((400, {}))
+    assert asyncio.run(call(handler)).startswith("ERROR: search_docs returned 400: nope")
+    assert len(seen) == 1
+
+
+def test_hanging_tool_fails_at_its_deadline():
+    handler, _ = scripted((200, {}), delay=30)
+    t0 = time.perf_counter()
+    out = asyncio.run(call(handler, deadline_s=0.3))
+    assert out == "ERROR: search_docs took longer than 0.3s" and time.perf_counter() - t0 < 1.0
+
+
+def test_network_error_becomes_text():
+    def handler(request):
+        raise httpx.ConnectError("refused", request=request)
+    assert asyncio.run(call(handler)) == "ERROR: search_docs unreachable (ConnectError)"
+
+
+def test_step_runs_calls_in_parallel():
+    handler, seen = scripted((200, {}), delay=0.3)
+
+    async def go():
+        async with make_client(httpx.MockTransport(handler)) as client:
+            return await run_step(client, [("a", {}), ("b", {}), ("c", {})])
+    t0 = time.perf_counter()
+    assert asyncio.run(go()) == ["ok", "ok", "ok"]
+    assert time.perf_counter() - t0 < 0.6                          # slowest call, not the sum (0.9 s)
+```
+
+### Failure scenarios
+- **Leave `run_step` as the starter's list comprehension.** Everything passes except the parallel test,
+  which takes about 0.9 s, the sum of three 0.3 s calls. Debug by timing the step; switch to
+  `asyncio.gather` over the same client.
+- **Rely on the client's `read=10.0` instead of `asyncio.timeout`.** The hanging-tool test waits the
+  full 30 s and fails: `MockTransport` applies no httpx timeouts, and against a real server a trickling
+  response never trips the read timeout either. Debug by logging elapsed time per call.
+- **Put the deadline around each attempt instead of the whole loop.** A tool that times out three times
+  burns three deadlines, so one agent step can exceed its budget threefold. Debug by counting attempts
+  inside a deadline failure.
+- **Ignore `Retry-After`.** The 429 test fails its 0.2 s timing assertion; against a real provider the
+  retry lands inside the rate-limit window and fails again.
+
+### Submission
+- **`executor.py`** passing all six tests unmodified, with `make_client` unchanged.
+- **The `pytest -q` output** and the `python executor.py` output matching Expected output.
+- **A short log** from the demo showing per-call attempts and elapsed time.
+- **A note of 3-5 lines:** which calls you would refuse to retry automatically (non-idempotent tools) and
+  how the deadline relates to the agent run's total budget.
+- **Evaluated on:** no exception ever escaping `call_tool`, deadlines covering retries, and a step that
+  costs the slowest call.
 
 ## Why it exists
 - **`requests` is synchronous.** It defined the ergonomic Python HTTP API, but an AI service fanning out

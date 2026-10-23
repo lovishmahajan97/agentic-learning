@@ -5,7 +5,8 @@ name: Backpressure
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/concurrency-limits
@@ -38,6 +39,173 @@ provider 429s inside the loop.
   sheds first, when a run goes async (202 plus a run ID), and how the loop backs off on provider 429s.
 - **What you can skip.** TCP flow-control internals and adaptive limiter maths. Know Little's law, the
   bounded-buffer rule and where to reject.
+
+## Lab
+### Task
+Add backpressure to an agent service's RAG ingest path and its provider retries: bound the queue,
+admit batches all-or-nothing with a 503 and `Retry-After`, keep embedding workers alive when one chunk
+fails, and compute retry delays that honour a provider's `Retry-After` and give up inside the deadline.
+Time box: 45-75 minutes.
+- **Prerequisites:** the concurrency limits and lifespan lessons, and the bounded-queue section below.
+- **Setup:** `pip install fastapi httpx pytest`; checked with Python 3.12, FastAPI 0.161 and pytest 9.1.
+  `slow_embed` stands in for the embedding service and fails on the chunk `"bad"`.
+- **Save** the starter as `lab.py` and the tests as `test_lab.py`, then run `pytest -q`.
+
+### Starter code
+```python
+"""Lab: backpressure for a RAG ingest path and an agent's provider calls. Needs fastapi, httpx."""
+import asyncio, random
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request
+
+async def embed_worker(q: asyncio.Queue, embed, stats: dict):
+    while True:
+        chunk = await q.get()
+        # BUG to fix in LAB 2: one failing chunk raises out of this loop and the worker dies
+        # silently, so drain rate drops. Count failures in stats["failed"] and keep going;
+        # always call q.task_done().
+        await embed(chunk)
+        stats["processed"] += 1
+        q.task_done()
+
+def build_app(embed, workers: int = 2, queue_max: int = 5) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        q = asyncio.Queue()              # BUG to fix in LAB 1: unbounded; use maxsize=queue_max
+        app.state.q, app.state.stats = q, {"processed": 0, "failed": 0}
+        tasks = [asyncio.create_task(embed_worker(q, embed, app.state.stats)) for _ in range(workers)]
+        yield
+        for t in tasks:
+            t.cancel()
+    app = FastAPI(lifespan=lifespan)
+
+    @app.post("/ingest")
+    async def ingest(body: dict, request: Request):
+        q: asyncio.Queue = request.app.state.q
+        # LAB 3: all-or-nothing admission. If the whole batch does not fit under queue_max,
+        # raise HTTPException(503, headers={"Retry-After": "10"}) before enqueuing anything.
+        for c in body["chunks"]:
+            q.put_nowait(c)
+        return {"accepted": len(body["chunks"]), "queued": q.qsize()}
+
+    @app.get("/stats")
+    async def stats(request: Request):
+        return {"queued": request.app.state.q.qsize(), **request.app.state.stats}
+    return app
+
+def next_delay(attempt: int, retry_after: float | None, remaining: float,
+               base: float = 0.5, cap: float = 8.0) -> float | None:
+    """How long an agent step waits before retrying a provider 429 (attempt starts at 0).
+    LAB 4: honour retry_after when the provider sent one; otherwise full jitter:
+    random.uniform(0, min(cap, base * 2 ** attempt)). Return None (give up, surface the error)
+    when the delay would not fit in the remaining deadline."""
+    raise NotImplementedError("lab step 4: next_delay")
+
+async def slow_embed(chunk: str):
+    await asyncio.sleep(0.01)
+    if chunk == "bad":
+        raise ValueError("embedding service rejected the chunk")
+
+if __name__ == "__main__":
+    import time
+    from fastapi.testclient import TestClient
+    with TestClient(build_app(slow_embed, workers=0)) as client:      # no drain: see the bound
+        print("batch of 3:", client.post("/ingest", json={"chunks": ["a", "b", "c"]}).status_code)
+        r = client.post("/ingest", json={"chunks": ["d", "e", "f"]})
+        print("batch of 3 more:", r.status_code, r.headers.get("retry-after"),
+              "queued:", client.get("/stats").json()["queued"])
+    with TestClient(build_app(slow_embed, workers=1)) as client:
+        client.post("/ingest", json={"chunks": ["bad", "x", "y"]})
+        time.sleep(0.5)
+        print("after a bad chunk:", client.get("/stats").json())
+    try:
+        print("retry delays:", next_delay(0, 2.0, remaining=10), next_delay(3, 20.0, remaining=10))
+    except NotImplementedError as e:
+        print(f"not done yet: {e}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints:
+
+```
+batch of 3: 200
+batch of 3 more: 503 10 queued: 3
+after a bad chunk: {'queued': 0, 'processed': 2, 'failed': 1}
+retry delays: 2.0 None
+```
+
+The starter prints `200 None queued: 6` for the second batch and `'processed': 0` with two chunks
+stuck after the bad one, which are the two failures this lab fixes.
+
+### Tests
+```python
+import time
+from fastapi.testclient import TestClient
+import lab
+
+def wait_for(client, pred, timeout=2.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        s = client.get("/stats").json()
+        if pred(s):
+            return s
+        time.sleep(0.02)
+    return client.get("/stats").json()
+
+def test_queue_is_bounded():
+    app = lab.build_app(lab.slow_embed, workers=0, queue_max=5)
+    with TestClient(app):
+        assert app.state.q.maxsize == 5
+
+def test_admission_is_all_or_nothing():
+    with TestClient(lab.build_app(lab.slow_embed, workers=0, queue_max=5)) as client:
+        assert client.post("/ingest", json={"chunks": ["a", "b", "c"]}).status_code == 200
+        r = client.post("/ingest", json={"chunks": ["d", "e", "f"]})
+        assert r.status_code == 503 and r.headers["retry-after"] == "10"
+        assert client.get("/stats").json()["queued"] == 3       # nothing half-accepted
+        assert client.post("/ingest", json={"chunks": ["d", "e"]}).status_code == 200
+
+def test_worker_survives_a_bad_chunk():
+    with TestClient(lab.build_app(lab.slow_embed, workers=1)) as client:
+        client.post("/ingest", json={"chunks": ["bad", "a", "b"]})
+        s = wait_for(client, lambda s: s["processed"] == 2)
+    assert s == {"queued": 0, "processed": 2, "failed": 1}
+
+def test_retry_after_is_honoured_within_deadline():
+    assert lab.next_delay(0, 2.0, remaining=10) == 2.0
+    assert lab.next_delay(3, 20.0, remaining=10) is None          # would miss the deadline
+
+def test_backoff_is_jittered_and_capped():
+    delays = [lab.next_delay(a, None, remaining=100) for a in range(10) for _ in range(50)]
+    assert all(0 <= d <= 8.0 for d in delays)
+    assert len({round(d, 6) for d in delays}) > 100                # jitter, not a fixed schedule
+    assert max(lab.next_delay(0, None, remaining=100) for _ in range(200)) <= 0.5
+```
+
+All five fail on the starter (unbounded queue, 200 instead of 503, a dead worker, and
+`NotImplementedError`); a correct solution passes all five.
+
+### Failure scenarios
+- **Bound the queue but keep the `put_nowait` loop without the pre-check.** The second batch enqueues
+  two chunks, then `QueueFull` escapes: the admission test errors on the second post, and in production
+  the client gets a 500 for a batch that was half accepted. Debug by logging `qsize()` before and after
+  each request.
+- **Catch errors in the worker but forget `task_done()` on the failure path.** Processing continues,
+  but `await q.join()` (used for graceful drains) never returns. Debug with
+  `await asyncio.wait_for(q.join(), 1)` in a test, which times out.
+- **Retry immediately on 429 with no jitter.** Every agent run retries at the same instant and the
+  provider's error rate rises after the first throttle; the jitter test fails on the distinct-delay
+  count. In production, chart retries per second against 429s.
+- **Raise the bound to absorb a burst.** Tests still pass, but at 16 chunks per second a bound of 2,000
+  means the newest chunk waits about 125 s; recompute `L_max = X × W_budget` instead.
+
+### Submission
+- `lab.py` with the four lab steps done, and `test_lab.py` unchanged.
+- A `pytest -q` run showing 5 passed, plus `python lab.py` matching the expected output.
+- A note sizing `queue_max` for your own ingest path from measured drain rate and a latency budget,
+  with the arithmetic shown.
+- Evaluation: no unbounded buffer remains, rejections happen before any work is enqueued, workers
+  survive bad input, and retries never run past the deadline.
 
 ## Why it exists
 - **Every pipeline has a slowest stage,** and in AI services it is almost always the model: a GPU that

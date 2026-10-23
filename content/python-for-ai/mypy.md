@@ -5,7 +5,8 @@ name: mypy
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/type-hints
@@ -37,6 +38,202 @@ unhandled cases without running anything. Unannotated code stays mostly unchecke
   enters, and whether `Any` from `json.loads` leaks into the loop.
 - **What you can skip.** Typing theory beyond variance and narrowing; runtime validation of model output
   is Pydantic's job, not mypy's.
+
+## Lab
+### Task
+A module turns raw model replies into agent steps. It runs, and `mypy --strict` already passes, yet it
+renders a reply with no text as `final: None`. Worse, the checker cannot see a `.strip()` on missing
+text, a misspelled tool-argument key or an unhandled step type, because `Any` sits on every boundary.
+- **What you do:** replace the `Any` boundaries with precise types until mypy reports each planted
+  client bug at the right line.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** Type hints, TypedDict, Literal and Enum, and this lesson's Narrowing and Gradual
+  typing sections.
+- **Setup:** Python 3.11+ (for `typing.assert_never`), `pip install mypy pytest` (checked against mypy
+  2.4.0 and pytest 9.1.1). Save the starter as `agent_types.py` and the tests as
+  `test_agent_types.py`; the tests call mypy through `mypy.api`.
+- **Goal:** the module stays clean under `--strict`, the three client snippets in the tests each fail
+  with the expected error code, and a reply with no text renders as `final: (no text)`.
+
+### Starter code
+```python
+"""agent_types.py: turn raw model replies into typed steps. Runs fine; the types let bugs through."""
+import json
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: str             # a JSON string, as providers send it
+
+
+@dataclass
+class Final:
+    text: Any                  # EXERCISE: a reply can arrive with no text content
+
+
+@dataclass
+class Refusal:
+    reason: str
+
+
+Step = Any                     # EXERCISE: a union of the three step types
+
+
+def parse_step(raw: dict[str, Any]) -> Step:
+    if raw.get("tool_calls"):
+        tc = raw["tool_calls"][0]
+        return ToolCall(tc["id"], tc["function"]["name"], tc["function"]["arguments"])
+    if raw.get("refusal"):
+        return Refusal(raw["refusal"])
+    return Final(raw.get("content"))
+
+
+def search_args(arguments: str) -> dict[str, Any]:   # EXERCISE: a TypedDict with query: str and k: int
+    data = json.loads(arguments)
+    return {"query": str(data["query"]), "k": int(data.get("k", 3))}
+
+
+def render(step: Step) -> str:
+    """What the agent shows the user for one step. Every step type must be handled."""
+    if isinstance(step, ToolCall):
+        args = search_args(step.arguments)
+        return f"tool {step.name}: {args['query']} (top {args['k']})"
+    if isinstance(step, Final):
+        return f"final: {str(step.text).strip()}"   # EXERCISE: no text must render as "(no text)"
+    if isinstance(step, Refusal):
+        return f"refused: {step.reason}"
+    raise AssertionError(f"unhandled step {step!r}")  # EXERCISE: make mypy prove this is unreachable
+
+
+if __name__ == "__main__":
+    replies: list[dict[str, Any]] = [
+        {"tool_calls": [{"id": "c1", "function": {"name": "search", "arguments": '{"query": "refund policy"}'}}]},
+        {"content": "  Refunds take 14 days.  "},
+        {"content": None},
+        {"refusal": "unsafe request"},
+    ]
+    for raw in replies:
+        print(render(parse_step(raw)))
+```
+
+### Expected output
+`python agent_types.py` after the fix (the starter prints `final: None` on line 3), and
+`mypy --strict agent_types.py`:
+
+```text
+tool search: refund policy (top 3)
+final: Refunds take 14 days.
+final: (no text)
+refused: unsafe request
+
+Success: no issues found in 1 source file
+```
+
+The key lines mypy then prints for the three client snippets (paths shortened):
+
+```text
+client.py:3: error: Item "None" of "str | None" has no attribute "strip"  [union-attr]
+client.py:3: error: TypedDict "SearchArgs" has no key "qeury"  [typeddict-item]
+client.py:9: error: Argument 1 to "assert_never" has incompatible type "Refusal"; expected "Never"  [arg-type]
+```
+
+### Tests
+On the starter, 4 of 5 fail. The rendering test fails on `'final: None'`. The first two snippets
+report only `[no-any-return]`, which is `Any` leaking rather than the real bug. The third reports
+`Success`. The strict-clean test passes on both versions.
+
+```python
+import shutil
+import textwrap
+from pathlib import Path
+
+from mypy import api
+
+from agent_types import parse_step, render
+
+HERE = Path(__file__).parent
+
+
+def mypy_strict(tmp_path, code=None):
+    """Run mypy --strict on agent_types.py, plus an optional client module that uses it."""
+    shutil.copy(HERE / "agent_types.py", tmp_path / "agent_types.py")
+    target = tmp_path / "agent_types.py"
+    if code is not None:
+        target = tmp_path / "client.py"
+        target.write_text(textwrap.dedent(code))
+    out, err, status = api.run(["--strict", "--no-incremental", "--cache-dir", str(tmp_path / ".mc"),
+                                str(target)])
+    return status, out
+
+
+def test_rendering_handles_every_step():
+    assert render(parse_step({"content": "  hi  "})) == "final: hi"
+    assert render(parse_step({"content": None})) == "final: (no text)"
+    assert render(parse_step({"refusal": "nope"})) == "refused: nope"
+
+
+def test_module_is_clean_under_strict(tmp_path):
+    status, out = mypy_strict(tmp_path)
+    assert status == 0, out
+
+
+def test_mypy_catches_strip_on_missing_text(tmp_path):
+    status, out = mypy_strict(tmp_path, """
+        from agent_types import Final
+        def shout(step: Final) -> str:
+            return step.text.strip().upper()
+    """)
+    assert status == 1 and "[union-attr]" in out, out
+
+
+def test_mypy_catches_a_misspelled_tool_argument(tmp_path):
+    status, out = mypy_strict(tmp_path, """
+        from agent_types import search_args
+        def query_of(arguments: str) -> str:
+            return search_args(arguments)["qeury"]
+    """)
+    assert status == 1 and "[typeddict-item]" in out, out
+
+
+def test_mypy_catches_an_unhandled_step_type(tmp_path):
+    status, out = mypy_strict(tmp_path, """
+        from typing import assert_never
+        from agent_types import Final, Step, ToolCall
+        def label(step: Step) -> str:
+            if isinstance(step, ToolCall):
+                return "tool"
+            elif isinstance(step, Final):
+                return "final"
+            else:
+                assert_never(step)
+    """)
+    assert status == 1 and "Refusal" in out, out
+```
+
+### Failure scenarios
+- **Inject: delete the `list[dict[str, Any]]` annotation on `replies`.** The strict-clean test fails with
+  `Argument 1 to "parse_step" has incompatible type "object"`, because mypy joins the differently shaped
+  dicts to `object`. Debug: `reveal_type(replies)`, then annotate the literal.
+- **Inject: return `dict[str, Any]` from `search_args` again.** The misspelled-key test is back to
+  `[no-any-return]` only. Debug: run `mypy --any-exprs-report <dir>` and find where `Any` enters.
+- **Inject: keep `raise AssertionError` instead of `assert_never` in `render`, then add a `Handoff`
+  dataclass to `Step`.** mypy says nothing about `render`; the gap appears only when such a reply
+  arrives at runtime. Debug: `assert_never` turns that into a type error at every handler.
+- **Inject: `# type: ignore` on a client line.** The snippet passes and its test fails. Debug: require
+  error codes on ignores and turn on `warn_unused_ignores`, as in this lesson's Production patterns.
+
+### Submission
+- **Your typed `agent_types.py`**, with the given tests unchanged and all 5 passing.
+- **The mypy output** for the three snippets against your version.
+- **One more snippet test of your own**, for example passing `Final(text=3)`, with the error code you
+  expect.
+- **A short note** on why the starter passed `--strict` while hiding all three bugs.
+- **Evaluated by:** no `Any` in the public signatures of `agent_types.py`, no `cast` or ignores, and
+  each snippet failing at the expected line with the expected code.
 
 ## Why it exists
 - **Python ignores hints at runtime.** `def call_model(prompt: str) -> str` happily accepts a list and

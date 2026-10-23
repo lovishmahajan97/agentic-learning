@@ -5,7 +5,8 @@ name: CORS
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/middleware-ordering
@@ -37,6 +38,166 @@ ignore it, and the API still needs real auth.
   `EventSource`).
 - **What you can skip.** CORS for server-side hops: the agent calling LLM providers, tools, MCP servers
   or a vector store from Python never touches it, because no browser is involved.
+
+## Lab
+### Task
+A chat UI at `https://chat.acme.com` reports "the agent is stuck", yet the server logs good runs. You
+fix the CORS policy of the streaming agent API so the UI's preflight passes, its 401s and 429s stay
+readable, and it can read the run id header, all without opening the API to other origins.
+- **Time box:** 30-45 minutes.
+- **Prerequisites:** middleware ordering, server-sent events, and this lesson's preflight section.
+- **Runs offline:** `TestClient` plays the browser by sending `Origin` and preflight headers; a real
+  browser enforces what these responses allow.
+- **Needs:** `fastapi`, `httpx`, `pytest`; checked with FastAPI 0.115.6 and 0.161.1 on Python 3.12.
+
+### Starter code
+```python
+# cors_lab.py: fix the CORS policy of a streaming agent API (FastAPI + TestClient, no browser)
+import json, uuid
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.testclient import TestClient
+
+ORIGINS = {"prod": ["https://chat.acme.com"],
+           "dev": ["https://chat.acme.com", "http://localhost:3000"]}
+RUNS_PER_TOKEN = 2                                   # tiny limit so the lab can hit it
+
+def build_app(env: str = "prod") -> FastAPI:
+    app = FastAPI()
+    used: dict[str, int] = {}
+
+    # YOUR CODE: this policy breaks the chat UI in three ways (see the tests); fix the
+    # arguments and where CORSMiddleware is added. Keep origins exact, never "*".
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ORIGINS["prod"],
+        allow_methods=["POST", "DELETE"],
+        allow_headers=["authorization", "content-type"],
+        expose_headers=["retry-after"],
+        max_age=600,
+    )
+
+    @app.middleware("http")
+    async def rate_limit(request: Request, call_next):
+        tok = request.headers.get("authorization", "")
+        if request.method == "POST" and tok:
+            used[tok] = used.get(tok, 0) + 1
+            if used[tok] > RUNS_PER_TOKEN:
+                return JSONResponse({"detail": "slow down"}, 429, headers={"Retry-After": "20"})
+        return await call_next(request)
+
+    @app.middleware("http")
+    async def auth(request: Request, call_next):
+        if request.method != "OPTIONS" and not request.headers.get("authorization", "").startswith("Bearer "):
+            return JSONResponse({"detail": "missing bearer token"}, 401)
+        return await call_next(request)
+
+    @app.post("/v1/agent/runs")
+    async def start_run(body: dict):
+        run_id = str(uuid.uuid4())
+        async def events():
+            yield f"data: {json.dumps({'type': 'run_started', 'run_id': run_id})}\n\n"
+            yield f"data: {json.dumps({'type': 'final', 'text': 'done'})}\n\n"
+        return StreamingResponse(events(), media_type="text/event-stream", headers={"x-run-id": run_id})
+
+    return app
+
+UI = "https://chat.acme.com"
+ASKED = "authorization, content-type, idempotency-key"   # what the chat UI's fetch sends
+
+def preflight(c, origin, headers=ASKED):
+    r = c.options("/v1/agent/runs", headers={"Origin": origin, "Access-Control-Request-Method": "POST",
+                                             "Access-Control-Request-Headers": headers})
+    return r.status_code, r.headers.get("access-control-allow-origin")
+
+if __name__ == "__main__":
+    c = TestClient(build_app("prod"))
+    print("preflight chat UI:", preflight(c, UI))
+    print("preflight evil:", preflight(c, "https://evil.example"))
+    r = c.post("/v1/agent/runs", json={}, headers={"Origin": UI})
+    print("no token:", r.status_code, r.headers.get("access-control-allow-origin"))
+    h = {"Origin": UI, "Authorization": "Bearer u1", "Idempotency-Key": "k1"}
+    r = c.post("/v1/agent/runs", json={}, headers=h)
+    print("run:", r.status_code, "x-run-id" in r.headers.get("access-control-expose-headers", ""))
+    c.post("/v1/agent/runs", json={}, headers=h)
+    r = c.post("/v1/agent/runs", json={}, headers=h)
+    print("limited:", r.status_code, r.headers.get("access-control-allow-origin"))
+    dev = TestClient(build_app("dev"))
+    print("dev localhost:", preflight(dev, "http://localhost:3000"))
+```
+
+As given, the chat UI's preflight gets 400, the 401 and 429 carry no `access-control-allow-origin`,
+`x-run-id` is not exposed, and the dev origin is refused.
+
+### Expected output
+```
+preflight chat UI: (200, 'https://chat.acme.com')
+preflight evil: (400, None)
+no token: 401 https://chat.acme.com
+run: 200 True
+limited: 429 https://chat.acme.com
+dev localhost: (200, 'http://localhost:3000')
+```
+
+### Tests
+```python
+# test_cors_lab.py: run with `pytest -q`
+from fastapi.testclient import TestClient
+from cors_lab import UI, build_app, preflight
+
+AUTH = {"Origin": UI, "Authorization": "Bearer u1", "Idempotency-Key": "k1"}
+
+def test_preflight_allows_the_ui_and_its_headers():
+    assert preflight(TestClient(build_app()), UI) == (200, UI)
+
+def test_preflight_rejects_other_origins():
+    assert preflight(TestClient(build_app()), "https://evil.example") == (400, None)
+
+def test_401_is_readable_by_the_ui():
+    r = TestClient(build_app()).post("/v1/agent/runs", json={}, headers={"Origin": UI})
+    assert r.status_code == 401
+    assert r.headers.get("access-control-allow-origin") == UI
+
+def test_run_id_header_is_exposed():
+    r = TestClient(build_app()).post("/v1/agent/runs", json={}, headers=AUTH)
+    assert r.status_code == 200 and r.headers.get("x-run-id")
+    assert "x-run-id" in r.headers.get("access-control-expose-headers", "")
+
+def test_429_carries_cors_headers_and_retry_after():
+    c = TestClient(build_app())
+    for _ in range(2):
+        c.post("/v1/agent/runs", json={}, headers=AUTH)
+    r = c.post("/v1/agent/runs", json={}, headers=AUTH)
+    assert r.status_code == 429 and r.headers.get("access-control-allow-origin") == UI
+    assert "retry-after" in r.headers.get("access-control-expose-headers", "")
+
+def test_origins_come_from_the_environment():
+    assert preflight(TestClient(build_app("dev")), "http://localhost:3000")[0] == 200
+    assert preflight(TestClient(build_app("prod")), "http://localhost:3000")[0] == 400
+```
+
+Five fail on the starter. `test_preflight_rejects_other_origins` already passes: it is the guard that
+fails if you "fix" the policy by allowing every origin.
+
+### Failure scenarios
+- **Inject `allow_origins=["*"]` with `allow_credentials=True`.** The evil preflight now returns
+  `(200, 'https://evil.example')`: Starlette reflects any origin. Debug by sending a preflight from a
+  made-up origin; any 200 means the allowlist is not an allowlist.
+- **Inject a trailing slash:** list `"https://chat.acme.com/"`. The UI's preflight returns `(400, None)`
+  although the origin "looks" listed. Compare the `Origin` request header byte for byte with the list.
+- **Move `add_middleware` back above the two `@app.middleware` functions.** Preflights still pass, but
+  the 401 and 429 lose their CORS headers, so a browser reports a CORS error instead of the real
+  status. Debug by checking `access-control-allow-origin` on a short-circuited response.
+
+### Submission
+- **Your `cors_lab.py`** with the fixed policy and middleware order.
+- **A `pytest -q` run** showing 6 passed.
+- **The script's printed output**, matching the expected lines.
+- **A note of 3-5 sentences** explaining why none of this protects the API from `curl`, and which
+  control does.
+- **Evaluated on:** green tests, exact origins per environment, CORS outermost, and only the headers
+  the UI needs listed.
 
 ## Why it exists
 - **The same-origin policy is the browser's basic defence.** A script loaded from `evil.example` must not

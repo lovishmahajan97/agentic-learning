@@ -5,7 +5,8 @@ name: Scalability
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/capacity-planning
@@ -36,6 +37,60 @@ shared stores, not the stateless agent workers.
   on, session or prefix affinity routing, connection pool sizes, and how often the agent writes state.
 - **What you can skip.** Deriving the USL. Know that a serial fraction caps speedup, that coordination can
   make throughput fall, and how to fit α and β from four or five load-test points.
+
+## Decision case
+### Scenario
+The support agent from the "which wall first" example (6 model calls of ~8,000 tokens per task, so 48,000
+tokens per task) runs on a hosted model API. A partner launch in 8 weeks must carry 1.5 tasks/s at peak,
+up from 0.5 today. Limits are illustrative, not quotes.
+- **Current ceiling:** a 2M TPM quota in one region is 33,333 tokens/s, so 33,333 ÷ 48,000 ≈ 0.69
+  tasks/s. The other walls (search tool 10, checkpoint DB 66.67, vector store 150 tasks/s) are far away.
+- **Quota:** the account team cannot promise a raise before launch. A second region in the same
+  residency zone gets its own 2M TPM.
+- **Quality:** task success must not drop on the agent's eval set.
+- **Team:** two engineers; no time to port prompts and evals to a second provider and re-validate them.
+- **Headroom:** peak load must stay at or below 75% of whatever the binding ceiling is, leaving room for
+  retries and bursts.
+
+### Options
+| Option | How it works | Ceiling | Peak use at 1.5 tasks/s | Risk to the deadline |
+|---|---|---|---|---|
+| A. More workers plus a quota request | Scale the stateless tier, wait for a raise to 6M TPM | 0.69 tasks/s until approved; 100,000 ÷ 48,000 ≈ 2.08 after | 216% before, 72% after | Approval is outside the team's control |
+| B. Two regions, same prompts | Hash each run id to one region | 66,667 ÷ 48,000 ≈ 1.39 tasks/s | 108%: fails | Low, but not enough |
+| C. Trim tool results to ~5,000 tokens per call, plus two regions | 30,000 tokens per task across two 2M TPM pools | 66,667 ÷ 30,000 ≈ 2.22 tasks/s | 68% | Medium: needs an eval pass |
+| D. Second provider for overflow | Route overflow runs to another vendor's model | Adds a separate quota | Depends on its quota | High: new prompts, evals, residency review |
+
+### Decision
+Choose **C**, and file the quota request anyway as upside.
+- **Ceiling:** C is the only option that clears 1.5 tasks/s under the 75% headroom rule without waiting on
+  anyone. B alone falls short, and A depends on an approval nobody can schedule.
+- **Workers are not the lever.** Every option keeps the same stateless worker tier; adding workers past
+  0.69 tasks/s today only adds 429s and retries.
+- **Tokens per task is the cheapest lever.** Cutting 48,000 to 30,000 tokens raises every token-bound
+  ceiling by 1.6×, in both regions, and lowers cost per task too.
+- **Quality gate:** the trimmed tool results ship only if task success on the eval set holds.
+- **Why not D:** it is the right long-term hedge but cannot be validated in 8 weeks with two engineers.
+
+**What would change it:** an approved 6M TPM quota before launch makes A plus trimming the simpler setup,
+one region at 1.5 ÷ (100,000 ÷ 30,000) = 45% use. A failed trimming eval forces B plus an urgent quota
+escalation, with launch traffic capped at about 1.0 task/s (75% of 1.39 is 1.04).
+
+### Trade-offs accepted
+- **Two regions to operate.** Deploys, keys and dashboards double. Track 429 rate and quota headroom per
+  region, from the rate-limit response headers.
+- **Less context per step.** Trimmed tool results can drop a field the agent needed. Watch extra tool
+  calls per task and the eval score after every tool schema change.
+- **The next wall moves closer.** At 1.5 tasks/s the search tool runs at 15% of its limit and the
+  checkpoint DB at about 2%; re-run the ceilings table whenever calls per task changes.
+- **Retries still count.** A 10% retry rate lifts quota use from 68% to about 74%, close to the limit;
+  keep one retry layer with a budget.
+
+### Review rubric
+- Converts the launch target into load on every shared limit (tokens, requests, searches, writes) per task.
+- Identifies the binding wall and shows the next one with its margin.
+- Compares options on the same headroom rule, with ceilings recomputed, not asserted.
+- Prefers reducing load per task before adding capacity, and gates it on a named quality eval.
+- Separates levers the team controls from ones that depend on a vendor, and plans for the latter failing.
 
 ## Why it exists
 - **"Twice the machines, twice the throughput" rarely holds.** It holds for perfectly independent work

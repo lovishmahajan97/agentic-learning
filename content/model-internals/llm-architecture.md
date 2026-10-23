@@ -5,7 +5,8 @@ name: LLM architecture (encoder–decoder vs decoder-only)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - model-internals/transformer
@@ -150,6 +151,23 @@ flowchart TD
     DS -->|"append k, v"| KV
     DS --> O2["Answer, appended to stream"]
 ```
+
+## Misconceptions
+- **"A chat model has a separate input channel for the prompt and tool results."** In a decoder-only
+  model, system prompt, tool results and answer are one token sequence; "input" only means positions
+  the loss skipped. A tool result is read exactly like an instruction.
+- **"Reading the prompt is cheap because there is no encoder."** Prefill is fast in wall-clock time
+  because positions run in parallel, but each prompt token still costs a full-stack pass, roughly 2 FLOPs
+  per parameter.
+- **"Parameter count tells you the cost."** Each token passes through only one stack of an
+  encoder–decoder, so 2N parameters split evenly cost about the FLOPs per token of an N-parameter
+  decoder-only model. Compare FLOPs per token and memory.
+- **"Encoder–decoders are obsolete."** They lost the general-purpose race, not every job: Whisper-style
+  speech-to-text encodes long audio once, and encoder-only models still serve embedders and rerankers far
+  more cheaply than a chat model.
+- **"Rewriting earlier history each step costs nothing."** The KV cache is valid only for an unchanged
+  prefix; editing a past message forces recomputation from that point, which removes the decoder-only
+  multi-turn advantage.
 
 ## Examples
 ### Two generation loops side by side

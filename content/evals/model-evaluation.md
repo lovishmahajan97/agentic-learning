@@ -5,7 +5,8 @@ name: Model evaluation
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -174,6 +175,22 @@ flowchart TD
     R --> M["Online evals on live traces"]
     M -->|"new failures become items"| D
 ```
+
+## Misconceptions
+- **"A top leaderboard score means the model will do best in my agent."** A benchmark measures general
+  capability on someone else's tasks, possibly seen in training; it says nothing about your prompt,
+  retrieval or tools. Use it to shortlist, then decide on your own task set.
+- **"Two averages tell me which version is better."** On 100 items each pass rate carries roughly ±8
+  points of noise. Compare on the same items and count the flips; only items that changed verdict carry
+  information about the difference.
+- **"At temperature 0, one run per task is enough."** Agents still vary run to run, and one different
+  early tool choice changes the whole trajectory. Run each task several times and report all-runs-pass
+  reliability next to mean success.
+- **"If the final answer is right, the run was right."** An agent can reach the correct state through a
+  forbidden step, such as a refund issued before the required lookup. Grade the outcome by default and
+  add trajectory assertions for safety and cost.
+- **"Tuning the prompt against the eval set makes the eval better."** It makes that set a biased
+  estimate. Keep a held-out split that iteration never touches and read it only when deciding to ship.
 
 ## Examples
 ### Worked scenario: swapping the embedding model in a RAG assistant

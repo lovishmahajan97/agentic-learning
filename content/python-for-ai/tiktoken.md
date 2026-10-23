@@ -5,7 +5,8 @@ name: tiktoken
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - model-internals/tokenization
@@ -37,6 +38,158 @@ trim. Exact for OpenAI models only; elsewhere an approximation.
   tokens is handled.
 - **What you can skip.** Training BPE, and the exact regex of each encoding. Know that counts depend on
   text type, that chat and tool overhead exist, and that `usage` is the ground truth after the call.
+
+## Lab
+### Task
+Write the context manager a shopping agent runs before every model call. An 8-step transcript of
+catalogue searches has grown past its budget, and one scraped result contains `<|endoftext|>`. Count it
+safely, elide the oldest tool results until it fits, and cap oversized results at the tool boundary.
+Time box: 45-60 minutes.
+- **Prerequisites:** Tokenization, Context window, and this lesson's API surface and context-manager
+  example.
+- **Rules:** keep every message and its `tool_call_id` (providers reject unpaired calls), never touch the
+  system prompt, the task or the last `keep_last` messages, and raise `ValueError` when eliding everything
+  is still not enough.
+- **Checked against:** Python 3.12, `tiktoken` 0.14 with `o200k_base`. The first run downloads the rank
+  file, so pre-seed `TIKTOKEN_CACHE_DIR` if you work offline.
+
+### Starter code
+Save as `lab.py`. Fix the `LAB 1` line and implement the two functions marked `LAB 2` and `LAB 3`.
+
+```python
+"""Lab: keep a growing agent transcript inside a token budget with tiktoken."""
+import json
+
+import tiktoken
+
+enc = tiktoken.get_encoding("o200k_base")       # what encoding_for_model("gpt-4o") resolves to
+PER_MSG = 4                                     # rough allowance for role markers per message
+ELIDED = "[result elided]"
+TOOLS = [{"type": "function", "function": {"name": "search_catalog", "parameters": {
+    "type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}}}]
+
+
+def n(text: str) -> int:
+    return len(enc.encode(text))                # LAB 1: tool results are untrusted text
+
+
+def estimate(messages: list[dict], tools: list[dict]) -> int:
+    body = sum(n(m.get("content") or "") + n(json.dumps(m.get("tool_calls", ""))) + PER_MSG
+               for m in messages)
+    return body + n(json.dumps(tools))
+
+
+def fit(messages: list[dict], tools: list[dict], budget: int, keep_last: int = 4) -> list[dict]:
+    """Return a copy under budget: elide the OLDEST tool results first, never the last keep_last
+    messages, keep every message and its tool_call_id; raise ValueError if it still cannot fit."""
+    raise NotImplementedError("LAB 2")
+
+
+def cap_tool_result(text: str, max_tokens: int) -> str:
+    """Cut a tool result to at most max_tokens tokens, ending with a marker the model can see."""
+    raise NotImplementedError("LAB 3")
+
+
+def transcript(steps: int = 8) -> list[dict]:
+    msgs = [{"role": "system", "content": "You are a shopping agent. Use search_catalog."},
+            {"role": "user", "content": "Find me a cheap desk lamp."}]
+    for s in range(steps):
+        rows = [{"sku": f"L-{s}-{i}", "name": f"desk lamp {i}", "price": round(9.5 + i, 2)} for i in range(25)]
+        page = json.dumps({"rows": rows}) + (" <|endoftext|> scraped footer" if s == 3 else "")
+        msgs.append({"role": "assistant", "content": None, "tool_calls": [{"id": f"call_{s}", "type": "function",
+                     "function": {"name": "search_catalog", "arguments": json.dumps({"q": f"lamp page {s}"})}}]})
+        msgs.append({"role": "tool", "tool_call_id": f"call_{s}", "content": page})
+    return msgs
+
+
+if __name__ == "__main__":
+    msgs = transcript()
+    try:
+        print("estimate before:", estimate(msgs, TOOLS))
+        out = fit(msgs, TOOLS, budget=4000)
+        print("estimate after:", estimate(out, TOOLS))
+        print("elided tool results:", [m["tool_call_id"] for m in out if m.get("content") == ELIDED])
+        print("capped result tokens:", n(cap_tool_result(msgs[3]["content"], 200)))
+    except (NotImplementedError, ValueError) as e:
+        print(f"{type(e).__name__}: {str(e).splitlines()[0]}")
+```
+
+### Expected output
+The starter prints `ValueError: Encountered text corresponding to disallowed special token
+'<|endoftext|>'.` A correct solution prints:
+
+```
+estimate before: 5907
+estimate after: 3882
+elided tool results: ['call_0', 'call_1', 'call_2']
+capped result tokens: 200
+```
+
+- **Check the arithmetic:** each catalogue result is 679 tokens and the marker is 4, so three elisions
+  save 3 × 675 = 2,025 tokens, and 5,907 − 2,025 = 3,882 fits under 4,000.
+
+### Tests
+Save as `test_lab.py` and run `pytest -q`. On the starter, the first test fails on the special-token
+`ValueError` and the rest on `NotImplementedError`.
+
+```python
+import pytest
+from lab import ELIDED, TOOLS, cap_tool_result, estimate, fit, n, transcript
+
+
+def test_untrusted_special_token_text_is_counted_not_rejected():
+    assert n("scraped <|endoftext|> footer") > 3
+
+
+def test_fit_gets_under_budget():
+    assert estimate(fit(transcript(), TOOLS, budget=4000), TOOLS) <= 4000
+
+
+def test_fit_keeps_every_message_and_its_pairing():
+    before = transcript()
+    after = fit(before, TOOLS, budget=4000)
+    assert [m["role"] for m in after] == [m["role"] for m in before]
+    assert [m.get("tool_call_id") for m in after] == [m.get("tool_call_id") for m in before]
+    assert after[:2] == before[:2] and after[-4:] == before[-4:]      # system, task, latest turns
+    assert transcript() == before                                     # input not mutated
+
+
+def test_fit_elides_oldest_tool_results_first():
+    after = fit(transcript(), TOOLS, budget=4000)
+    flags = [m["content"] == ELIDED for m in after if m["role"] == "tool"]
+    assert any(flags) and flags == sorted(flags, reverse=True)       # True..True, False..False
+
+
+def test_fit_raises_when_even_eliding_everything_is_not_enough():
+    with pytest.raises(ValueError):
+        fit(transcript(), TOOLS, budget=300)
+
+
+def test_cap_tool_result():
+    page = transcript()[3]["content"]
+    capped = cap_tool_result(page, 200)
+    assert n(capped) <= 200 and capped[:50] == page[:50] and capped != page
+    assert cap_tool_result("short", 200) == "short"
+```
+
+### Failure scenarios
+- **Delete old tool messages instead of eliding them.** The budget test passes, but the pairing test
+  fails, and a real API returns a 400 for an unanswered `tool_call_id`. Debug: list roles and ids before
+  and after `fit`.
+- **Swap in `cl100k_base`.** Counts shift and Expected output no longer matches. Debug: print
+  `enc.name` and resolve the encoding with `encoding_for_model` for the model you call.
+- **Truncate with `text[:max_tokens * 4]`.** JSON tool results blow past the cap. Debug: print `n()` of
+  the capped string; characters per token for this JSON are far below four.
+- **Mutate the caller's dicts inside `fit`.** The agent's stored history loses results it may need
+  later. Debug: the not-mutated assertion fails; copy each message before editing.
+
+### Submission
+- **`lab.py` with all six tests passing** and output matching Expected output.
+- **A log from a real or recorded run:** your local estimate next to the provider's reported input
+  tokens for three steps, with the gap explained (role markers, tool rendering).
+- **A note** on why eliding in one larger step beats eliding a little on every call when prompt caching
+  is on.
+- **Evaluation:** tests pass, `fit` never deletes a message, and no tool result exceeds its cap.
 
 ## Why it exists
 - **Every API limit is in tokens.** The context window, maximum output, rate limits (tokens per minute)

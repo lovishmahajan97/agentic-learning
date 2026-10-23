@@ -5,7 +5,8 @@ name: Speculative decoding
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - model-internals/kv-cache
@@ -159,6 +160,22 @@ sequenceDiagram
     A->>D: Accepted tokens, roll back rejected KV
     A->>T: Accepted tokens, roll back rejected KV
 ```
+
+## Misconceptions
+- **"It is a quality-for-speed trade, like switching to a smaller model."** The strict accept rule
+  `min(1, p/q)` plus residual sampling emits each token with exactly the target's probability, so agent
+  evals need re-baselining for latency, not quality. Relaxed modes such as Medusa's typical acceptance are
+  the exception.
+- **"Acceptance means the draft's top guess matched."** Under sampling, α = Σ min(p, q) = 1 − TV(p, q):
+  it measures overlap of whole distributions. Only at temperature 0 does it reduce to argmax agreement.
+- **"Turning it on always makes things faster."** With the illustrative 37 ms cycle and γ = 5, α = 0.3
+  gives 25.9 ms per token, slower than the 25 ms baseline. At high concurrency, verification also eats
+  compute that was no longer idle and per-GPU throughput falls.
+- **"More speculative tokens means more speed."** Later positions are accepted less often, so each extra
+  token adds verification work with shrinking payoff; γ has an optimum that drops as batch size grows.
+- **"You need to host a second model."** Prompt lookup drafts from n-grams already in the context, which
+  is strongest exactly where agents spend output: file edits, quoted RAG passages and repeated tool
+  results.
 
 ## Examples
 ### Illustrative cost model: when speculation pays

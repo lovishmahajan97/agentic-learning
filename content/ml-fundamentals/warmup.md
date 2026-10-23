@@ -5,7 +5,8 @@ name: Warmup
 kind: practice
 difficulty: core
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/learning-rate-schedulers
@@ -138,6 +139,21 @@ flowchart TD
     F -->|"resume with optimizer state"| E
     F -->|"new adapter or new phase"| A
 ```
+
+## Misconceptions
+- **"Gradient clipping makes warmup redundant."** Adam's first step is `η · sign(g)` whatever the
+  gradient's size, so clipping a huge gradient changes nothing. Only a smaller η on those first steps
+  shrinks the move.
+- **"Fine-tuning an already-trained model needs no warmup."** The weights are trained, but each new
+  optimizer (and each new LoRA adapter, whose `B` starts at zero) begins with empty `m` and `v`. A fresh
+  optimizer needs a fresh ramp.
+- **"Longer warmup is always safer."** In a 300-step agent fine-tune, a ramp copied from pre-training
+  (2,000 steps) never reaches the peak, so the format is barely learned. Once the early grad-norm spike is
+  gone, extra ramp buys nothing.
+- **"Just lower the peak learning rate instead."** That avoids the early blow-up but trains the whole run
+  too slowly. Warmup gives you a conservative start and an aggressive middle.
+- **"Every resume should repeat warmup."** A true resume restores `m`, `v` and the scheduler, so it skips
+  warmup. Re-warming then wastes steps, and dropping the rate at a resume step points to lost state.
 
 ## Examples
 ### Worked scenario: warmup for a tool-calling LoRA adapter

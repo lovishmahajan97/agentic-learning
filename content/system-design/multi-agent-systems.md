@@ -5,7 +5,8 @@ name: Multi-agent systems
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/multi-agent-patterns
@@ -39,6 +40,63 @@ context, compounding errors and harder tracing mean each split must buy a named 
   single-agent baseline you compare against.
 - **What you can skip.** Agent "societies" and debate research until you have a concrete use. Production
   systems are mostly supervisor plus workers, or a short pipeline with checks.
+
+## Decision case
+### Scenario
+A procurement team wants a supplier-risk agent. Each review covers five independent areas (security,
+finance, legal, sanctions, ESG) from public web pages and filings, then files a ticket. All figures are
+illustrative.
+- **Volume:** 300 reviews a week.
+- **Baseline:** one agent with 20 tools succeeds on 80% of the eval set, takes about 9 minutes and about
+  60k tokens per review.
+- **Constraints:** at least 90% eval success; a report within 10 minutes; at most 300k tokens per
+  review; every area must be covered or explicitly marked missing; the component that reads untrusted
+  pages must not hold the ticket-writing tool.
+
+### Options
+| Option | How it works | Success (arithmetic) | Wall-clock | Tokens per review | Privilege isolation |
+|---|---|---|---|---|---|
+| A. Keep one agent | The baseline, all 20 tools in one loop | 80% measured | ~9 min, sequential | ~60k | None: reads pages and can file tickets |
+| B. Five-stage pipeline | Research, extract, draft, review, file, each stage at about 95% | 0.95⁵ ≈ 77% | Sum of the stages | Moderate | Possible per stage |
+| C. Code-owned fan-out | Code starts one read-only worker per area (about 90% per attempt, one retry), an all-five join, a synthesis call, then code files the ticket | 1 − 0.1² = 0.99 per area, 0.99⁵ ≈ 95% | Slowest worker, ~2-4 min | ~5 × 40k + ~5k ≈ 205k | Full: workers have no write tools |
+
+### Decision
+Choose **C**, because:
+- **It is the only option that clears 90%:** A measures 80% and B multiplies to about 77%.
+- **The decomposition is known,** so code owns the fan-out and join; no model supervisor has to invent
+  the five areas, which removes a routing failure mode.
+- **Latency becomes the slowest worker,** comfortably inside 10 minutes even with a retry.
+- **Privilege isolation is structural:** workers that read untrusted pages are read-only, and the ticket
+  is filed by code from the validated synthesis.
+- **Tokens fit the cap:** about 205k per review against 300k.
+
+A quorum join is rejected here: a 3-of-5 quorum would lift success to about 99.1%, but it would ship
+reviews missing an area, which the coverage constraint forbids.
+
+**What would change it:** a single agent with a narrowed tool set reaching 90% on the eval set; a token
+cap under roughly 100k per review; or areas that turn out dependent (legal scope set by the finance
+finding), which would favour a short pipeline with validators between stages.
+
+### Trade-offs accepted
+- **About 3.4 times the tokens:** 300 reviews cost about 61.5M tokens a week instead of 18M. Watch:
+  tokens per review and the share per worker from child spans.
+- **Retries assume independent failures.** An area with no public data fails twice. Watch: null rate per
+  area, and route repeated nulls to a human rather than adding retries.
+- **More moving parts to trace.** Watch: every worker attempt appears as a child span under the review's
+  run id.
+- **The baseline must stay in the eval suite.** Watch: success and tokens of A and C side by side on
+  every significant change.
+
+### Review rubric
+- **The gain is named:** the write-up says which of context isolation, privilege isolation, parallelism
+  or specialization the split buys, with a number for each claimed gain.
+- **Reliability arithmetic recomputes:** pipeline products, retry and quorum figures follow from stated
+  per-stage rates.
+- **The join rule matches the requirement:** all, quorum or best effort is chosen for a stated reason.
+- **Privilege boundaries are explicit:** which component reads untrusted input and which holds write
+  tools.
+- **Cost is projected at real volume** and compared with a single-agent baseline.
+- **Reversal conditions are measurable,** such as a baseline success rate or token cap that flips it.
 
 ## Why it exists
 - **A single agent degrades as the task grows.** Its context fills with tool definitions, instructions

@@ -5,7 +5,8 @@ name: Backpressure
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - serving-inference/batching-and-concurrency-limits
@@ -160,6 +161,23 @@ flowchart TD
     X -.->|"backoff with jitter"| C["Client slows down"]
     E -.->|"queue wait, KV usage"| M["Metrics and autoscaler"]
 ```
+
+## Misconceptions
+- **"A bigger queue absorbs the spike."** By Little's law, while arrivals exceed service rate the wait
+  grows every second; past the client timeout every queued request is wasted GPU work plus a retry.
+  Bound queue time and reject the excess fast instead.
+- **"High GPU utilisation means we are overloaded."** Utilisation sits near 95% whether the queue is
+  empty or exploding. Queue wait time, the engine's waiting gauge and preemptions are the pressure
+  signals, so alert and autoscale on those.
+- **"Rejecting requests is the failure; serving everything is the goal."** Under overload, serving
+  everything means serving everyone late, and goodput collapses. Fast 503s with `Retry-After` keep the
+  admitted share at normal latency while autoscaling catches up.
+- **"Rate limiting already gives us backpressure."** A rate limit caps one caller's share regardless of
+  server health; backpressure signals that the server as a whole is full. Callers well within quota
+  can still overload you together, so you need both, with 429 versus 503 telling them which happened.
+- **"Gate every model call and the agent is protected."** Rejecting step 7 of a run throws away six
+  paid steps. Admit the whole run before step 1, prioritise in-progress runs at the call gate, and cap
+  per-run fan-out.
 
 ## Examples
 ### Admission gate in front of an engine

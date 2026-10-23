@@ -5,7 +5,8 @@ name: Inference optimization
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - serving-inference/prefill-vs-decode
@@ -168,6 +169,23 @@ flowchart TD
     C1 --> R
     R --> M
 ```
+
+## Misconceptions
+- **"A GPU with more FLOPs makes decode faster."** Batch-1 decode re-reads every weight per token and
+  sits on the bandwidth floor with tensor cores well under 1% busy, so more FLOPs at similar bandwidth
+  buys almost nothing. Fewer bytes (quantized weights or cache) or more requests per weight read do.
+- **"Quantization helps because low-precision math is cheaper."** In decode the math was idle anyway.
+  4-bit weights help because each step reads a quarter of the bytes, which is why the batch-1 step gets
+  roughly 3-4x faster and why the gain shrinks once cache reads or compute dominate the step.
+- **"Speculative decoding trades quality for speed."** Rejection sampling keeps the target model's output
+  distribution unchanged. Its real cost is draft time and verification compute, so it pays at small
+  batch with high acceptance (about 3.4 tokens per pass at α = 0.8, k = 4) and hurts on a busy GPU.
+- **"For an agent, decode is where the GPU time goes."** Without prefix reuse, a 10-step task re-prefills
+  105k tokens, about 56% of its GPU time. A stable, append-only prompt cuts that to 15k tokens before any
+  decode trick is worth trying.
+- **"Turn on every optimization flag and the gains add up."** Each lever shrinks one term of the
+  roofline. Applied in the wrong regime it does nothing or makes things slower, so classify the regime,
+  change one knob, and re-run the load test and agent eval.
 
 ## Examples
 ### A roofline calculator

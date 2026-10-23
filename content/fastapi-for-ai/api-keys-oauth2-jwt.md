@@ -5,7 +5,8 @@ name: API keys / OAuth2 / JWT
 kind: decision
 difficulty: core
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - fastapi-for-ai/dependency-injection
@@ -39,6 +40,68 @@ signed token verified without a lookup.
   arguments), how the user's identity reaches tools (token exchange or a downscoped token per tool
   audience), and which scopes each tool gets.
 - **What you can skip.** Writing your own token issuer or login flow; use the IdP and verify its tokens.
+
+## Decision case
+### Scenario
+A 12-person team runs a multi-tenant support agent. It must choose how identity travels from each
+caller through the agent to its tools before the first enterprise launch. All figures are illustrative.
+- **Callers:** 40 customer backends call `POST /runs` with no human present; about 6,000 support staff
+  in 25 tenants use the chat UI, and 18 of those tenants require SSO through their own IdP.
+- **Tools:** four internal tool services (doc search, tickets, CRM read, refunds), plus Gmail for some
+  tenants through stored OAuth grants.
+- **Scale:** 120,000 runs per day, about 8 tool calls per run, peaks at 5x the daily average.
+- **Constraints:** a prompt-injected run must never reach another tenant's data; a stolen credential
+  must stop working within 15 minutes; auth may add at most 5 ms p99 per tool hop; launch in 8 weeks;
+  nobody on the team has operated an authorization server, and the budget allows no new paid product
+  beyond the existing managed IdP.
+
+Recomputed load: 120,000 / 86,400 s ≈ 1.39 runs/s on average, so about 7 runs/s at peak and
+7 × 8 = 56 tool calls/s. Counting the run's own check, that is about 63 credential checks/s at peak.
+
+### Options
+| Option | How it works | Tenant isolation under injection | Stolen credential dies in 15 min | ≤ 5 ms per hop | 8 weeks, current team |
+|---|---|---|---|---|---|
+| **A. Shared service key** | agent holds one static key per tool and sends `X-User-Id` / `X-Tenant-Id` | fails: the tool trusts headers the agent sets, and the key reaches every tenant | fails: the key lives until someone rotates it | yes: one hash lookup | yes, easiest |
+| **B. Forward the user's JWT** | tools verify the IdP token issued for the agent API | partial: tenant comes from claims, but every tool accepts the same `aud` | only if every customer IdP issues tokens of 15 min or less | yes: local verify with cached JWKS | yes |
+| **C. Per-tool downscoped JWTs** | executor exchanges the user's token (RFC 8693) for a token per tool audience and scope; API keys stay for customer backends | yes: one audience and one scope per call, tenant from claims | yes: 5-minute tokens; API keys revoke instantly by lookup | yes: local verify; at most 4 × 7 = 28 exchanges/s at peak, cached per run | yes, if the IdP supports token exchange |
+| **D. Opaque tokens, introspected per hop** | every tool asks the authorization server about each token | yes | yes: instant | fails: about 63 network calls/s at peak, each a full round trip | risky: the team must run or buy an introspection service |
+
+### Decision
+Choose **C**, keeping hashed API keys for the 40 customer backends and adding introspection only on
+the refunds tool.
+- **Isolation constraint:** only C and D give each tool call a credential that cannot be replayed at
+  another tool or tenant, and in C the model never sees or chooses it.
+- **Latency constraint:** C verifies locally, while D puts a network call on all 63 checks per second.
+- **Revocation constraint:** 5-minute tool tokens beat 15 minutes; API keys are looked up each request,
+  so revoking one is immediate.
+- **Refunds exception:** refunds are rare and high-risk, so an introspection call there costs little
+  and gives instant revocation where money moves.
+- **What would change it:** if the IdP cannot do token exchange, the team runs a small internal signer
+  (ES256) that issues the same per-tool tokens. If a regulator demands instant revocation on every
+  tool, D wins and the latency budget must grow.
+
+### Trade-offs accepted
+- **The IdP is on the tool path.** An exchange outage blocks new tool tokens. Watch exchange error rate
+  and latency, and cache each token for its lifetime per run and audience.
+- **Tokens expire mid-run.** Runs longer than 5 minutes re-exchange. Watch 401s by tool and step, which
+  should be near zero.
+- **More configuration.** Each tool needs its own audience and scope mapping. Contract tests assert
+  that a token for one audience is rejected by every other tool.
+- **API keys remain long-lived secrets.** Watch `last_used_at`, leaked-secret scanner hits and spend by
+  key prefix.
+
+### Review rubric
+- **Constraints first:** the write-up restates each constraint with its number and shows which option
+  fails which constraint, not just a preferred option.
+- **Numbers recomputed:** request rates, peak checks per second and exchange rates are derived from the
+  stated scale, with the arithmetic shown.
+- **Caller split:** customer backends, human users and agent-to-tool calls each get a named mechanism
+  and a reason.
+- **Model kept out of identity:** credentials live in the executor, identity fields are stripped from
+  tool arguments, and tools filter by tenant in the token claims.
+- **Revocation story:** it states how fast each credential type dies and how a leak is detected.
+- **Reversal condition:** it names the facts that would flip the decision, such as missing IdP support
+  or a stricter revocation rule.
 
 ## Why it exists
 - **Every LLM request costs money and touches data.** You must answer *who is this* (authentication) and

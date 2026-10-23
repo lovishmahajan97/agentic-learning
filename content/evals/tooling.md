@@ -5,7 +5,8 @@ name: Tooling (Promptfoo, RAGAS, DeepEval, Braintrust, LangSmith, Langfuse)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -48,6 +49,223 @@ by where traces live and how much grading you own.
 - **What you can skip.** Comparing every feature matrix. Start with the platform your framework already
   traces into, one library for the CI gate, and your own trajectory graders; add prebuilt metrics only
   after calibrating them.
+
+## Lab
+### Task
+Build, locally, the one pipeline every tool in this lesson packages: dataset rows, a target adapter that
+runs the agent per item, outcome and trajectory scorers, per-row scores over *k* samples, and a run
+comparison that refuses mismatched judges.
+
+The agent and the faithfulness judge are local fakes (a seeded stand-in loop and a recorded-style
+judge), so it needs no API key, platform account or network. Time box: 60-90 minutes.
+- **Prerequisites:** Eval harness, LLM-as-a-judge and Tracing; this lesson's How it works, especially
+  "The common shape" and "What is under every prebuilt metric".
+- **Agent goal:** after this, a LangSmith `evaluate` target, a Braintrust `Eval` task or a Promptfoo
+  custom provider is just your `run_experiment` loop with someone else's storage and UI.
+- **Setup:** Python 3.9+ standard library for the starter, plus `pip install pytest` (checked on Python
+  3.9.6 with pytest 8.4.2, and on Python 3.12). Save the starter as `lab_eval_tool.py` and the tests as
+  `test_lab_eval_tool.py`.
+- **Done:** `python lab_eval_tool.py` prints the expected output and `pytest -q` shows 6 passed.
+
+### Starter code
+```python
+"""Lab: the pipeline every eval tool packages, run locally (checked on Python 3.9 and 3.12, stdlib only).
+
+dataset rows -> target (agent loop) -> stored outputs -> scorers -> per-row scores -> compare runs.
+The agent and the judge are local fakes, so no API key or platform account is needed.
+"""
+import random
+
+LIB_VERSION = "lab-evals 1.0"          # stands in for a pinned deepeval/ragas/promptfoo version
+DATASET_VERSION = "support-agent-v3"
+
+DATASET = [
+    {"id": "q1", "question": "How do I enable SCIM?", "slice": "how-to",
+     "required_tools": ["search_kb"], "forbidden_tools": ["issue_refund"], "must_mention": "scim"},
+    {"id": "q2", "question": "What was my last invoice total?", "slice": "account",
+     "required_tools": ["get_account"], "forbidden_tools": ["issue_refund"], "must_mention": "$412.00"},
+    {"id": "q3", "question": "How do I set up SSO?", "slice": "how-to",
+     "required_tools": ["search_kb"], "forbidden_tools": ["issue_refund"], "must_mention": "sso"},
+    {"id": "q4", "question": "Please cancel my subscription.", "slice": "account",
+     "required_tools": ["handoff"], "forbidden_tools": ["issue_refund"], "must_mention": "billing"},
+]
+
+ARTICLES = {
+    "scim": "SCIM is under Settings > Security. Generate a SCIM token. Paste the token into your identity provider.",
+    "sso": "SSO is under Settings > Login. Upload your IdP metadata. Test the SSO connection.",
+}
+
+
+def rng_for(item_id: str, prompt_version: str, sample: int) -> random.Random:
+    """Seeded per (item, version, sample) so every run is reproducible."""
+    return random.Random(f"{item_id}|{prompt_version}|{sample}")
+
+
+def fake_agent(question: str, prompt_version: str, rng: random.Random) -> dict:
+    """Stand-in for your agent loop: returns the answer, the tool calls and the context it saw."""
+    calls, context = [], []
+    if "SCIM" in question or "SSO" in question:
+        calls.append({"name": "search_kb", "args": {"query": question}})
+        doc = "sso" if "SSO" in question else "scim"
+        if doc == "scim" and prompt_version == "v7" and rng.random() < 0.4:
+            doc = "sso"                       # v7 sometimes retrieves the look-alike SSO article
+        context = [ARTICLES[doc]]
+        answer = ARTICLES[doc]                # faithful to whatever was retrieved
+    elif "invoice" in question:
+        if prompt_version == "v8" and rng.random() < 0.7:
+            answer = "Your last invoice total was $380.00."    # v8 skips the tool and invents a figure
+        else:
+            calls.append({"name": "get_account", "args": {"customer_id": "C-12"}})
+            context = ["Your last invoice total was $412.00."]
+            answer = context[0]
+    else:
+        calls.append({"name": "handoff", "args": {"team": "billing"}})
+        context = ["Passed to the billing team."]
+        answer = context[0]
+    return {"answer": answer, "tool_calls": calls, "context": context}
+
+
+def fake_judge_faithfulness(answer: str, context: list, judge_model: str) -> float:
+    """Recorded-judge stand-in for a RAGAS/DeepEval faithfulness metric:
+    supported statements / extracted statements, a statement is supported if the context contains it."""
+    statements = [s.strip().lower() for s in answer.split(". ") if s.strip()]
+    joined = " ".join(context).lower()
+    supported = sum(1 for s in statements if s.rstrip(".") in joined)
+    return supported / len(statements) if statements else 1.0
+
+
+def resolved(output: dict, item: dict) -> bool:
+    """LAB 1 (outcome scorer): True when the answer mentions item["must_mention"], case-insensitively."""
+    raise NotImplementedError
+
+
+def right_tools(output: dict, item: dict) -> bool:
+    """LAB 2 (trajectory scorer): every required tool was called and no forbidden tool was called."""
+    raise NotImplementedError
+
+
+def run_experiment(dataset: list, prompt_version: str, k: int = 5, judge_model: str = "judge-a") -> dict:
+    """LAB 3: run fake_agent k times per item with rng_for(item id, prompt_version, i) and return
+    {"meta": {"prompt_version", "k", "judge_model", "lib_version", "dataset_version"},
+     "rows": {item id: {"outcome", "trajectory", "faithfulness"}}}, each the mean over the k samples."""
+    raise NotImplementedError
+
+
+def compare(base: dict, cand: dict) -> dict:
+    """LAB 4: refuse (ValueError naming the field) when judge_model, lib_version, dataset_version or k
+    differ. Otherwise return {"regressed": [...], "improved": [...]}: sorted ids whose outcome or
+    trajectory moved by at least 2 samples out of k (down for regressed, up for improved)."""
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    v7 = run_experiment(DATASET, "v7")
+    v8 = run_experiment(DATASET, "v8")
+    for run in (v7, v8):
+        for item_id, r in run["rows"].items():
+            print(run["meta"]["prompt_version"], item_id,
+                  f"outcome={r['outcome']:.1f} trajectory={r['trajectory']:.1f} faithfulness={r['faithfulness']:.1f}")
+    print(compare(v7, v8))
+    try:
+        compare(v7, run_experiment(DATASET, "v8", judge_model="judge-b"))
+    except ValueError as e:
+        print("refused:", e)
+```
+
+As given, the script stops with `NotImplementedError` in `run_experiment`, and every test fails with
+`NotImplementedError` until the four LAB items are done.
+
+### Expected output
+```
+v7 q1 outcome=0.4 trajectory=1.0 faithfulness=1.0
+v7 q2 outcome=1.0 trajectory=1.0 faithfulness=1.0
+v7 q3 outcome=1.0 trajectory=1.0 faithfulness=1.0
+v7 q4 outcome=1.0 trajectory=1.0 faithfulness=1.0
+v8 q1 outcome=1.0 trajectory=1.0 faithfulness=1.0
+v8 q2 outcome=0.4 trajectory=0.4 faithfulness=0.4
+v8 q3 outcome=1.0 trajectory=1.0 faithfulness=1.0
+v8 q4 outcome=1.0 trajectory=1.0 faithfulness=1.0
+{'regressed': ['q2'], 'improved': ['q1']}
+refused: judge_model differs: judge-a vs judge-b
+```
+
+Read the v7 q1 row: faithfulness 1.0 with outcome 0.4. On 3 of 5 samples the agent faithfully described
+the SSO article, which the faithfulness ratio cannot see; only the task check catches it. v8 fixes that
+but skips `get_account` on 3 of 5 invoice questions, so q2 regresses by 3 samples on outcome and
+trajectory.
+
+### Tests
+```python
+import pytest
+import lab_eval_tool as lab
+
+ITEM = {"id": "x", "required_tools": ["search_kb"], "forbidden_tools": ["issue_refund"], "must_mention": "scim"}
+
+
+def out(answer, *tools):
+    return {"answer": answer, "tool_calls": [{"name": t, "args": {}} for t in tools], "context": []}
+
+
+def test_outcome_scorer_is_case_insensitive():
+    assert lab.resolved(out("Enable SCIM under Settings."), ITEM)
+    assert not lab.resolved(out("Enable SSO under Settings."), ITEM)
+
+
+def test_trajectory_scorer_checks_required_and_forbidden():
+    assert lab.right_tools(out("ok", "search_kb"), ITEM)
+    assert not lab.right_tools(out("ok"), ITEM)                              # required tool missing
+    assert not lab.right_tools(out("ok", "search_kb", "issue_refund"), ITEM)  # forbidden tool used
+
+
+def test_run_records_meta_and_one_row_per_item():
+    run = lab.run_experiment(lab.DATASET, "v7", k=5)
+    assert run["meta"] == {"prompt_version": "v7", "k": 5, "judge_model": "judge-a",
+                           "lib_version": lab.LIB_VERSION, "dataset_version": lab.DATASET_VERSION}
+    assert set(run["rows"]) == {"q1", "q2", "q3", "q4"}
+    for r in run["rows"].values():
+        assert all(0.0 <= r[m] <= 1.0 for m in ("outcome", "trajectory", "faithfulness"))
+
+
+def test_faithful_to_the_wrong_chunk_is_caught_by_the_outcome_scorer():
+    q1 = lab.run_experiment(lab.DATASET, "v7", k=5)["rows"]["q1"]
+    assert q1["faithfulness"] == 1.0 and q1["outcome"] < 1.0
+
+
+def test_compare_flags_the_skipped_tool_regression():
+    diff = lab.compare(lab.run_experiment(lab.DATASET, "v7"), lab.run_experiment(lab.DATASET, "v8"))
+    assert diff == {"regressed": ["q2"], "improved": ["q1"]}
+
+
+def test_compare_refuses_runs_scored_by_a_different_judge():
+    with pytest.raises(ValueError, match="judge_model"):
+        lab.compare(lab.run_experiment(lab.DATASET, "v7"),
+                    lab.run_experiment(lab.DATASET, "v8", judge_model="judge-b"))
+```
+
+### Failure scenarios
+- **Inject: seed with `random.Random()` instead of `rng_for`.** Observe: the expected output changes
+  between runs and `test_compare_flags_the_skipped_tool_regression` fails now and then. Debug: run the
+  script twice and diff; an unseeded target makes every comparison partly noise, the same reason real
+  tools need *k* samples and a tolerance band.
+- **Inject: score only `faithfulness` and drop `resolved`.** Observe: v7 looks perfect on q1 and the
+  wrong-chunk test fails. Debug: print per-sample answers and their `context`; a context-relative metric
+  passes any answer that matches what was retrieved, right or wrong.
+- **Inject: let `compare` skip the meta check.** Observe: the judge-b run compares cleanly and the last
+  test fails. Debug: log `meta` with every score, as you would the resolved grader model and library
+  version from the lockfile, and refuse comparisons whose measurement setup differs.
+- **Inject: count a 1-sample move as a regression.** Observe: with real agents, almost every item flips
+  between runs. Debug: re-run the unchanged system and count items that move by one sample; that count
+  is your noise floor.
+
+### Submission
+- **Code:** `lab_eval_tool.py` with LAB 1-4 done and `fake_agent` and the judge unchanged.
+- **Test run:** `pytest -q` output showing 6 passed, plus script output matching Expected output.
+- **A port:** a 10-20 line sketch of the same target and two scorers in one real tool of your choice
+  (DeepEval test, LangSmith `evaluate`, Braintrust `Eval` or a Promptfoo custom provider), with its
+  version noted.
+- **A short note (3-5 sentences):** why the q1 row shows faithfulness 1.0 next to outcome 0.4, and which
+  scorer you would make the release gate.
+- **Evaluation:** tests pass, runs are reproducible, and the comparison refuses a changed judge.
 
 ## Why it exists
 - **Every serious team writes the same code.** A runner with concurrency, retries and caching; judge

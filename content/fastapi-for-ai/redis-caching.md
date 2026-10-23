@@ -5,7 +5,8 @@ name: Redis caching
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/redis
@@ -36,6 +37,167 @@ spend and step latency safely.
   data class, stampede protection, eviction policy and the fail-open path when Redis is down.
 - **What you can skip.** Redis internals and clustering. Know cache-aside, the key recipe, `SET NX` locks
   and `maxmemory` policies; that is enough to cache an agent backend safely.
+
+## Lab
+### Task
+Build the embedding cache behind an agent's RAG step: a versioned, tenant-scoped key, cache-aside with
+a jittered TTL, a fail-open path when Redis is down, and single-flight so a burst of identical misses
+pays for one provider call. Time box: 45-60 minutes.
+- **Prerequisites:** the lifespan and shared httpx AsyncClient lessons, and the cache-aside and
+  stampede sections below.
+- **Setup:** Python 3.11+ and pytest; checked with Python 3.12 and pytest 9.1. `FakeRedis` stands in
+  for `redis.asyncio` (same `get` and `set(..., ex=)` calls), so no server is needed.
+- **Save** the starter as `lab.py` and the tests as `test_lab.py` in one folder, then run `pytest -q`.
+
+### Starter code
+```python
+"""Lab: a tenant-safe, fail-open, stampede-proof embedding cache for an agent's RAG step.
+Runs on Python 3.11+ with no packages: FakeRedis stands in for redis.asyncio."""
+import asyncio, hashlib, json, random
+
+class RedisError(Exception):                       # stands in for redis.exceptions.RedisError
+    pass
+
+class FakeRedis:
+    """The subset of redis.asyncio.Redis this lab uses. Set .down = True to simulate an outage."""
+    def __init__(self):
+        self.data, self.ttls, self.down, self.calls = {}, {}, False, []
+    async def get(self, key):
+        self.calls.append(("get", key))
+        if self.down: raise RedisError("connection refused")
+        return self.data.get(key)
+    async def set(self, key, value, ex=None):
+        self.calls.append(("set", key))
+        if self.down: raise RedisError("connection refused")
+        self.data[key], self.ttls[key] = value, ex
+        return True
+
+class FakeEmbedder:
+    """The expensive provider call. Counts calls so tests can prove what the cache saved."""
+    def __init__(self, delay=0.05):
+        self.calls, self.delay = 0, delay
+    async def embed(self, model: str, text: str) -> list[float]:
+        self.calls += 1
+        await asyncio.sleep(self.delay)
+        return [float(len(text)), 1.0, 0.5]
+
+BASE_TTL, JITTER = 7 * 86400, 3600
+
+def cache_key(tenant: str, model: str, text: str, version: str = "v2") -> str:
+    # LAB 1: return f"emb:{version}:{tenant}:{sha}" where sha is the SHA-256 hex digest of the
+    # canonical JSON of {"m": model, "t": text} (sort_keys=True, separators=(",", ":")).
+    raise NotImplementedError("lab step 1: cache_key")
+
+class EmbeddingCache:
+    def __init__(self, r: FakeRedis, embedder: FakeEmbedder):
+        self.r, self.embedder = r, embedder
+        self.inflight: dict[str, asyncio.Future] = {}   # single-flight map for LAB 3
+
+    async def embed(self, tenant: str, model: str, text: str) -> list[float]:
+        # LAB 2: cache-aside. GET the key; on a hit return json.loads(hit). On a miss call
+        # self.embedder.embed, then SET with ex=BASE_TTL + random.randint(0, JITTER).
+        # Any RedisError on GET or SET must fall through (fail open), never reach the caller.
+        # LAB 3: concurrent misses for the same key in this process must share ONE provider call
+        # (store a future in self.inflight, remove it when done, propagate errors to waiters).
+        raise NotImplementedError("lab step 2-3: EmbeddingCache.embed")
+
+async def demo():
+    r, emb = FakeRedis(), FakeEmbedder()
+    cache = EmbeddingCache(r, emb)
+    await cache.embed("t1", "embed-x", "refund policy")
+    await cache.embed("t1", "embed-x", "refund policy")
+    await cache.embed("t2", "embed-x", "refund policy")
+    print(f"sequential: provider calls={emb.calls}")
+    await asyncio.gather(*(cache.embed("t1", "embed-x", "hot query") for _ in range(20)))
+    print(f"after 20 concurrent misses: provider calls={emb.calls}")
+    r.down = True
+    vec = await cache.embed("t1", "embed-x", "redis is down")
+    print(f"redis down: got vector of {len(vec)} dims, provider calls={emb.calls}")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(demo())
+    except NotImplementedError as e:
+        print(f"not done yet: {e}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+sequential: provider calls=2
+after 20 concurrent misses: provider calls=3
+redis down: got vector of 3 dims, provider calls=4
+```
+
+### Tests
+```python
+import asyncio, hashlib, json
+from lab import BASE_TTL, JITTER, EmbeddingCache, FakeEmbedder, FakeRedis, cache_key
+
+def run(coro):
+    return asyncio.run(coro)
+
+def test_key_is_versioned_tenant_scoped_and_canonical():
+    sha = hashlib.sha256(json.dumps({"m": "embed-x", "t": "hi"}, sort_keys=True,
+                                    separators=(",", ":")).encode()).hexdigest()
+    assert cache_key("t1", "embed-x", "hi") == f"emb:v2:t1:{sha}"
+    assert cache_key("t1", "embed-x", "hi") != cache_key("t2", "embed-x", "hi")
+    assert cache_key("t1", "embed-x", "hi") != cache_key("t1", "embed-y", "hi")
+    assert cache_key("t1", "embed-x", "hi", "v3") != cache_key("t1", "embed-x", "hi")
+
+def test_hit_skips_provider_and_tenants_never_share():
+    r, emb = FakeRedis(), FakeEmbedder(delay=0)
+    c = EmbeddingCache(r, emb)
+    first = run(c.embed("t1", "embed-x", "q"))
+    assert run(c.embed("t1", "embed-x", "q")) == first and emb.calls == 1
+    run(c.embed("t2", "embed-x", "q"))
+    assert emb.calls == 2
+
+def test_ttl_has_jitter_within_bounds():
+    r = FakeRedis()
+    run(EmbeddingCache(r, FakeEmbedder(delay=0)).embed("t1", "embed-x", "q"))
+    (ttl,) = r.ttls.values()
+    assert BASE_TTL <= ttl <= BASE_TTL + JITTER
+
+def test_fails_open_when_redis_is_down():
+    r, emb = FakeRedis(), FakeEmbedder(delay=0)
+    r.down = True
+    assert run(EmbeddingCache(r, emb).embed("t1", "embed-x", "q")) == [1.0, 1.0, 0.5]
+    assert emb.calls == 1
+
+def test_concurrent_misses_share_one_provider_call():
+    r, emb = FakeRedis(), FakeEmbedder(delay=0.05)
+    c = EmbeddingCache(r, emb)
+    async def burst():
+        return await asyncio.gather(*(c.embed("t1", "embed-x", "hot") for _ in range(20)))
+    results = run(burst())
+    assert emb.calls == 1 and all(v == results[0] for v in results)
+    assert c.inflight == {}
+```
+
+On the starter all five tests fail with `NotImplementedError`; a correct solution passes all five.
+
+### Failure scenarios
+- **Drop the tenant from the key.** `test_hit_skips_provider_and_tenants_never_share` fails with one
+  provider call instead of two: tenant `t2` was served `t1`'s cached vector. Debug by printing the two
+  keys; in production, grep cache keys for a tenant segment.
+- **Let `RedisError` escape from `GET`.** `test_fails_open_when_redis_is_down` errors with
+  `RedisError: connection refused`, the same outage an agent would hit. Debug by reading the traceback:
+  the cache call, not the provider call, is the raising frame.
+- **Forget to pop the in-flight entry, or pop it before the result is set.** Either later calls await a
+  stale future forever, or the burst makes 20 provider calls. Debug by logging `len(self.inflight)` after
+  the burst and counting `emb.calls`.
+- **Remove the jitter.** The TTL test still passes, but every key written in one burst expires in the
+  same second; check `set(r.ttls.values())` in a burst and expect many distinct values.
+
+### Submission
+- `lab.py` with the three lab steps done and the starter's fakes and `demo()` unchanged.
+- A `pytest -q` run showing 5 passed, plus the `python lab.py` output matching the expected block.
+- A short note (5-8 lines): which agent calls in your own stack you would put behind this cache, which
+  you would never cache, and the key fields each needs.
+- Evaluation: tests pass, no `RedisError` can reach a caller, the key carries version and tenant, and
+  the single-flight map is empty after every burst.
 
 ## Why it exists
 - **Model calls are slow and billed.** A hosted model, embedding API or reranker takes hundreds of

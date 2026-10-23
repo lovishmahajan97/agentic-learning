@@ -5,7 +5,8 @@ name: Caching strategy & cache invalidation
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - serving-inference/caching
@@ -40,6 +41,63 @@ match for a result to stay correct.
 - **What you can skip.** Semantic caching of agent steps in most designs: a step's correct output depends on
   the whole transcript, so near-duplicate queries are rarely safe hits. Spend the effort on prefix and
   tool-result caching first.
+
+## Decision case
+### Scenario
+An HR software vendor runs a policy assistant agent for 400 customer companies (tenants), about
+20,000 runs a day. Each run has about 10 steps over a 10k-token static prefix (system prompt plus tool
+schemas), appending ~2k tokens per step, at $3 per 1M input tokens. Figures are illustrative and match
+the worked scenario below.
+- **Today:** the prompt starts with the current date and the employee's name, so the cached-token share
+  is near zero. Input costs 190k tokens a run, about $11,400 a day.
+- **Tools:** `search_policies` (tenant documents, re-ingested weekly) and `get_employee` (contract,
+  country, leave balance) are read-only; `submit_leave_request` writes.
+- **Isolation:** contracts forbid any data crossing tenants.
+- **Erasure:** an erased employee's data must stop appearing in answers within 1 hour.
+- **Accuracy:** a wrong policy answer is a compliance incident, and the risk owner tolerates at most 1
+  per 10,000 answers from caching.
+- **Team:** two engineers, three weeks; Redis is already in production.
+
+### Options
+| Option | How it works | Input cost per day | Isolation, erasure, accuracy |
+|---|---|---|---|
+| A. Prefix caching only | Static-first, append-only prompt with a moving cache point | 51.2k a run, about $3,072 | Safe; no answer is reused |
+| B. Layered, versioned caches | A, plus read-only tool caches scoped by tenant and user. `search_policies` keys on index version (hours TTL), `get_employee` has a 5-minute TTL, an exact cache serves the temperature-0 intent step, and a reverse index purges on change | About $3,072, plus fewer tool calls and classifier calls | Tenant in every key; purge plus version-checked reads meet 1 hour; no paraphrase matching |
+| C. B plus a per-tenant semantic cache on first turns | Similarity threshold 0.97 | Slightly lower | False hits about 0.3% of requests at the illustrative rate below, 30 per 10,000: fails the accuracy limit |
+| D. Global semantic cache | Shared across tenants, threshold 0.92 | Lowest | Crosses tenants, and false hits about 1.2%: fails two constraints |
+
+### Decision
+Choose **B**, shipping A in week one.
+- **Prefix layout first:** moving the date and name below the static prefix and keeping the transcript
+  append-only cuts input cost about 3.7×, from about $11,400 to $3,072 a day. That saves about $8,300
+  a day with no staleness risk at all.
+- **Tool caches:** they add latency savings without reusing any answer, and the write tool is never
+  cached.
+- **Erasure:** the exact cache's 6-hour TTL (as in the Redis example below) could alone serve erased data for hours. The reverse index and per-answer
+  document versions make removal immediate, including the in-flight race.
+- **Why not C or D:** they fail on the accuracy limit and tenant isolation, not on economics.
+
+**What would change it:** a semantic cache becomes a candidate if a verifier on borderline hits plus a
+sampled audit shows false hits below 0.01% for a set of generic first-turn questions ("when is open
+enrolment?"). Even then it stays per tenant and excludes queries with dates, names or numbers.
+
+### Trade-offs accepted
+- **Cold caches after each deploy.** Versioned keys mean misses after every prompt or index change;
+  replay frequent recent queries to pre-warm and watch hit rate in the first hour.
+- **Lower hit rates per tenant.** Accept them for isolation; monitor hit rate per tenant and layer.
+- **Purge machinery to maintain.** Alert on any hit whose source document no longer exists, and count
+  purges per erasure request.
+- **Prompt layout is now a contract.** Check cached-token share per step after every change to prompt
+  assembly.
+
+### Review rubric
+- Lists what each cached answer or tool result depends on and puts all of it in the key.
+- Recomputes the cost saving per layer from token counts, with illustrative prices labelled.
+- Excludes write tools and failed or partial responses from every cache.
+- Shows how erasure and document updates reach every layer within the stated time.
+- Judges semantic caching against the cost of a wrong answer and the false-hit limit, not hit rate.
+- Names the per-layer metrics (cached-token share, hit rate, served age, false-hit rate) that prove it
+  works.
 
 ## Why it exists
 - **Hits are nearly free; misses are not.** A hit returns in milliseconds and costs almost nothing; a miss

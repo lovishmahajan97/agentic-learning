@@ -5,8 +5,9 @@ name: Distributed training (data / tensor / pipeline parallelism, FSDP, DeepSpee
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: agentic-verified
+status: typed
 agent_relevance: background
+lesson_type: concept
 related:
   - training-adaptation/pre-training
   - training-adaptation/gradient-checkpointing
@@ -211,6 +212,26 @@ flowchart TD
     P --> D
     D --> W["World size = TP x PP x DP"]
 ```
+
+## Misconceptions
+- **"Eight GPUs means each one holds an eighth of the model."** Only sharded schemes do that. Plain DDP
+  keeps the full 16 bytes per parameter on every GPU, 112 GB for a 7B model on each card; ZeRO-3 or FSDP
+  `FULL_SHARD` is what brings it to 14 GB.
+- **"LoRA makes the memory problem go away."** It removes most gradient and optimizer state, but the
+  frozen base still has to live somewhere: a 70B base in bf16 is 140 GB, so even a LoRA on it needs
+  FSDP across GPUs (~17.5 GB each on eight).
+- **"Adding GPUs is a pure speed-up that leaves the recipe alone."** The global batch is N ×
+  micro-batch × accumulation, so moving from 8 to 32 GPUs quadruples it. Re-tune learning rate and
+  warmup, or cut accumulation to keep the global batch fixed, or the loss curve changes.
+- **"Eight GPUs train eight times faster."** Communication eats into it, more so across nodes, where
+  per-layer all-gathers hit slower links. Scaling efficiency is measured in tokens per second per GPU
+  against the one-node run, not assumed.
+- **"Tensor parallelism is the natural way to span nodes."** It all-reduces activations inside every
+  layer, so it belongs inside an NVLink domain. Across nodes, pipeline parallelism or hybrid sharding
+  sends far less, far less often.
+- **"100% GPU utilisation means the run is progressing."** A rank stuck in a mismatched collective can
+  show full utilisation with zero steps. Alert on a step-time heartbeat and set a finite collective
+  timeout.
 
 ## Examples
 ### Worked scenario: sizing a fine-tune for a tool-calling agent

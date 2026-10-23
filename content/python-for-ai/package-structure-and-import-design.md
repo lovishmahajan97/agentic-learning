@@ -5,7 +5,8 @@ name: Package structure & import design
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - python-for-ai/dependency-injection-and-interface-boundaries
@@ -40,6 +41,150 @@ adapters ← entrypoints), and keep heavy SDKs at the edges.
   the built wheel so prompt files actually ship.
 - **What you can skip.** Namespace packages and multi-distribution monorepos, until several teams ship
   agent components independently.
+
+## Lab
+### Task
+Build a mini import-linter: an `ast`-based checker that enforces the layer contract (entrypoints →
+adapters → services → domain) and keeps vendor SDKs out of the agent's domain and services. The agent
+goal is a CI gate that stops a stray `import openai` from making the agent loop untestable without a key.
+Time box: 60-90 min.
+- **Prerequisites:** Dependency injection & interface boundaries; Python packaging basics from uv / poetry / pip.
+- **Setup:** Python 3.10+ (for `ast.unparse` and `X | None` hints) and `pip install pytest`. Save the
+  starter as `lab.py`, the tests as `test_lab.py`.
+- **What you get:** a sample agent package written to a temp directory, with three real violations and two
+  traps (a `TYPE_CHECKING` import and an allowed downward import).
+
+### Starter code
+```python
+"""Lab: a mini import-linter for a layered agent package. Run: python lab.py"""
+from __future__ import annotations
+import ast, pathlib, tempfile, textwrap
+
+LAYERS = ["myapp.entrypoints", "myapp.adapters", "myapp.services", "myapp.domain"]   # high -> low
+FORBIDDEN = {"myapp.domain": {"openai", "anthropic", "torch"},
+             "myapp.services": {"openai", "anthropic", "torch"}}
+
+SAMPLE = {
+    "domain/__init__.py": "",
+    "domain/models.py": "from myapp.adapters.llm import OpenAIClient\n",
+    "services/__init__.py": "",
+    "services/agent.py": """\
+        from typing import TYPE_CHECKING
+        import openai
+        from myapp.domain.models import Message
+        if TYPE_CHECKING:
+            from myapp.entrypoints.cli import App
+        """,
+    "services/memory.py": "from ..adapters import llm\nfrom . import agent\n",
+    "adapters/__init__.py": "",
+    "adapters/llm.py": "import openai\nfrom myapp.services.agent import Agent\n",
+    "entrypoints/__init__.py": "",
+    "entrypoints/cli.py": "from myapp.adapters.llm import OpenAIClient\nimport torch\n",
+}
+
+def write_package(root: pathlib.Path, files: dict[str, str]) -> pathlib.Path:
+    pkg = root / "myapp"
+    for rel, src in files.items():
+        (pkg / rel).parent.mkdir(parents=True, exist_ok=True)
+        (pkg / rel).write_text(textwrap.dedent(src))
+    (pkg / "__init__.py").touch()
+    return root
+
+def module_name(path: pathlib.Path, src_root: pathlib.Path) -> str:
+    parts = list(path.relative_to(src_root).with_suffix("").parts)
+    return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+
+def layer_of(module: str) -> str | None:
+    return next((l for l in LAYERS if module == l or module.startswith(l + ".")), None)
+
+def imports_in(path: pathlib.Path, module: str) -> list[tuple[int, str]]:
+    # YOUR CODE HERE: return (lineno, absolute module) for every import in the file, in line order.
+    # - `import a.b` -> "a.b"; `from a.b import c` -> "a.b"
+    # - relative `from ..x import y` resolves against the file's package ("myapp.services.memory"
+    #   -> package "myapp.services"; for an __init__.py the package is the module itself)
+    # - skip imports nested under `if TYPE_CHECKING:` (they never run)
+    raise NotImplementedError
+
+def check(src_root: pathlib.Path) -> list[tuple[str, int, str, str]]:
+    # YOUR CODE HERE: return sorted (file, lineno, imported, rule) for every violation.
+    # - file is the path relative to src_root, posix style ("myapp/domain/models.py")
+    # - rule "layer": the imported module's layer is HIGHER than the importer's layer
+    # - rule "forbidden": the imported top-level package is in FORBIDDEN[importer's layer]
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    root = write_package(pathlib.Path(tempfile.mkdtemp()), SAMPLE)
+    for file, line, imported, rule in check(root):
+        print(f"{file}:{line} {rule}: {imported}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly these three violations. The adapter importing
+`openai`, the entrypoint importing `torch` and the type-only import of `App` are all allowed.
+
+```
+myapp/domain/models.py:1 layer: myapp.adapters.llm
+myapp/services/agent.py:2 forbidden: openai
+myapp/services/memory.py:1 layer: myapp.adapters
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 4 fail with `NotImplementedError`; a correct solution
+passes all 4 (checked with Python 3.12 and pytest 9.1, standard library only otherwise).
+
+```python
+import pathlib
+from lab import SAMPLE, check, imports_in, write_package
+
+def test_imports_resolve_relative_and_skip_type_checking(tmp_path):
+    root = write_package(tmp_path, SAMPLE)
+    agent = root / "myapp/services/agent.py"
+    assert imports_in(agent, "myapp.services.agent") == [
+        (1, "typing"), (2, "openai"), (3, "myapp.domain.models")]
+    memory = root / "myapp/services/memory.py"
+    assert imports_in(memory, "myapp.services.memory") == [(1, "myapp.adapters"), (2, "myapp.services")]
+
+def test_relative_import_from_package_init(tmp_path):
+    root = write_package(tmp_path, {"services/__init__.py": "from .agent import Agent\n",
+                                    "services/agent.py": ""})
+    assert imports_in(root / "myapp/services/__init__.py", "myapp.services") == [(1, "myapp.services.agent")]
+
+def test_sample_violations(tmp_path):
+    assert check(write_package(tmp_path, SAMPLE)) == [
+        ("myapp/domain/models.py", 1, "myapp.adapters.llm", "layer"),
+        ("myapp/services/agent.py", 2, "openai", "forbidden"),
+        ("myapp/services/memory.py", 1, "myapp.adapters", "layer"),
+    ]
+
+def test_fixed_package_is_clean(tmp_path):
+    fixed = dict(SAMPLE)
+    fixed["domain/models.py"] = "from dataclasses import dataclass\n"
+    fixed["services/agent.py"] = "from myapp.domain.models import Message\n"
+    fixed["services/memory.py"] = "from . import agent\n"
+    assert check(write_package(tmp_path, fixed)) == []
+```
+
+### Failure scenarios
+- **Walk only `tree.body` and miss nested imports.** Function-local and `try/except ImportError` imports
+  slip through. Add `def f(): import torch` to a domain file and confirm `check` flags it; `ast.walk`
+  finds everything but then needs its own `TYPE_CHECKING` exclusion.
+- **Treat `if TYPE_CHECKING:` like any other `if`.** `test_sample_violations` gains an extra
+  `myapp.entrypoints.cli` layer violation. Print `ast.dump(node.test)` for each `ast.If` to see what the
+  guard looks like (`Name` or `typing.TYPE_CHECKING` as an `Attribute`).
+- **Resolve relative imports against the module instead of its package.** `from ..adapters import llm`
+  becomes `myapp.services.adapters`, the layer check misses it and `test_imports_resolve...` fails.
+  Print `(module, node.level, node.module)` for every `ImportFrom` and resolve one by hand.
+- **Compare layers in the wrong direction.** Every allowed downward import (`adapters/llm.py` importing
+  the agent) becomes a violation. The list is ordered high to low, so a lower index is a higher layer.
+
+### Submission
+- **`lab.py`** with `imports_in` and `check` implemented, standard library only.
+- **A green test run** (4 passed) and the output of `python lab.py`.
+- **One extra test** proving a function-local `import torch` in `myapp/domain` is caught.
+- **A note comparing your checker with `import-linter`**: two behaviours it has that yours lacks
+  (for example, indirect import chains and `include_external_packages`).
+- **Evaluated on:** exact violation list, no false positive on the type-only import, and correct relative
+  import resolution for both modules and `__init__.py` files.
 
 ## Why it exists
 - **Notebooks grow into tangles.** One agent notebook becomes a `utils.py`, then forty modules where

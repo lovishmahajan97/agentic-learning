@@ -5,7 +5,8 @@ name: Edge AI deployment
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/hybrid-on-prem
@@ -38,6 +39,64 @@ decode, so keep tools few and escalate hard tasks.
   reused across steps, the step budget, the escalation rule, and which tools may run without the server.
 - **What you can skip.** Kernel-level accelerator tuning. Know the memory, bandwidth and prefill budgets,
   the quantization eval gate and why on-device policy is never trusted.
+
+## Decision case
+### Scenario
+A logistics firm gives warehouse technicians a rugged handheld with a diagnostic agent that reads the
+device's scan logs and opens tickets. All device figures are illustrative and match the calculator
+below.
+- **Device:** the app may use 3 GB; memory bandwidth ~50 GB/s; prefill ~300 tokens per second.
+- **Task shape:** a typical diagnosis is 5 steps, each adding ~200 tokens of tool result and emitting a
+  ~40-token tool call; the cloud agent's system prompt and schemas are 1,200 tokens.
+- **Constraints:** many sites have no signal in the loading bays; scan logs must not leave the device
+  without the technician's consent; a 5-step diagnosis should take under 15 s of model time; the
+  model must pass the team's tool-call validity gate on the agent eval set; a few older handhelds grant
+  only 1 GB.
+
+### Options
+| Option | How it works | Fits 3 GB? | 5-step model time | Offline and privacy |
+|---|---|---|---|---|
+| A. Cloud-only agent | Every step calls the hosted model through the gateway | n/a | Network-bound | Fails offline; uploads every scan log |
+| B. 8B model at 4-bit on device | Port the cloud tool list to a larger local model | No: 8 × 4 ÷ 8 = 4 GB of weights before the cache | n/a | Would be local |
+| C. 3B at 4-bit, small tool surface, escalate | 2 terse tools (400-token schema block), prefix reuse, escalate on invalid calls or step budget, queue escalations offline | Yes: 1.5 GB weights + 0.23 GB cache | 400 + 4 × 200 = 1,200 prefill tokens, ~4 s, plus ~6 s decode = ~10 s | Local by default; escalation needs consent |
+| D. 3B at 8-bit, same design as C | Higher precision for quality | No: 3 GB weights + 0.23 GB cache | Decode ceiling halves to ~17 tok/s | As C |
+
+### Decision
+Choose **C**, because:
+- **It is the only on-device option that fits the 3 GB budget** with the KV cache counted; B and D do
+  not fit before anything else is considered.
+- **It meets the 15 s target at ~10 s.** Keeping the cloud's 1,200-token schemas and re-prefilling each
+  step would cost ~33 s on the same device.
+- **It works in the loading bay,** because the tools are local and escalations wait in a queue until
+  connectivity and consent allow the upload.
+- **Escalation on the first invalid call** bounds both battery drain and the quality risk of a small
+  model.
+
+Older 1 GB handhelds get cloud-only mode, detected at install.
+
+**What would change it:**
+- **The 4-bit 3B failing the tool-call gate:** distil a task-specific model or move more tasks to
+  escalation.
+- **A larger memory grant on the next device generation:** re-run the gate on a bigger 4-bit model.
+- **Diagnoses routinely needing many more steps:** a single escalation becomes faster than the local
+  loop.
+
+### Trade-offs accepted
+- **Quality is capped** by what fits. Watch escalation rate by reason and field quality reports per
+  model variant.
+- **~10 s is still slow.** Show each step in the UI and watch TTFT per step on warm devices.
+- **Sustained speed falls as the device heats.** Watch thermal soak results and field tokens per
+  second.
+- **Two device classes and model versions in the field.** Watch crash rate and version distribution per
+  device class.
+
+### Review rubric
+- **Memory recomputes** from parameters × bits ÷ 8 plus the KV cache, against the app budget.
+- **Loop time is computed per step** with prefill and decode separated, and prefix reuse stated.
+- **The tool surface is cut for the device,** with schema tokens counted.
+- **Escalation is explicit:** its triggers, the consent rule, and offline queueing.
+- **A quantization eval gate** on tool-call validity decides the shipped variant.
+- **Low-end devices have a defined fallback** chosen at install.
 
 ## Why it exists
 - **A cloud call has four costs.** A network round trip, a need for connectivity, uploading the user's

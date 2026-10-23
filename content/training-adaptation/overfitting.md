@@ -5,7 +5,8 @@ name: Overfitting
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - training-adaptation/train-val-test-split
@@ -151,7 +152,42 @@ flowchart TD
     LC -->|"flat"| ST["Fewer steps, lower LR, PEFT, regularise"]
 ```
 
+## Misconceptions
+- **"If validation loss is still fine, the model is not overfitting."** Only if validation is leak-free.
+  A validation set built from the same sessions, templates or near-duplicate traces tracks training loss
+  downward and hides memorisation until production.
+- **"A high score on the agent eval set means the model generalises."** Most eval sets are phrased like
+  the training traces. Paraphrase and unseen-tool-combination slices can peak at epoch 2 and fall while
+  the familiar slice keeps climbing.
+- **"Any train-production gap is overfitting."** A small train-validation gap with a large
+  validation-production gap is distribution shift; regularisation will not fix it, fresh data and a
+  temporal split will.
+- **"Regularisation is the main cure."** Weight decay, dropout and fewer steps trade variance for bias;
+  only more diverse, deduplicated data raises the ceiling. A learning curve over 25%, 50% and 100% of
+  the data says whether more data pays.
+- **"Overfitting needs training."** Keeping every prompt or tool-description change that lifted a
+  100-task eval set fits that set's noise just as gradient steps do.
+- **"Bigger models always overfit more."** Double descent shows heavily over-parameterised models can
+  interpolate and still generalise; trust the held-out curve, not a size rule.
+
 ## Examples
+### Worked scenario: an agent eval that only looked familiar
+Illustrative numbers. A tool-calling model fine-tuned on 2,000 trajectories, evaluated per epoch on three
+held-out slices: requests phrased like training, paraphrased requests, and tasks needing tool combinations
+absent from training.
+
+| Epoch | Familiar phrasing | Paraphrased | New tool combinations |
+|---|---|---|---|
+| 1 | 84% | 80% | 62% |
+| 2 | 91% | 85% | 66% |
+| 4 | 96% | 79% | 55% |
+| 8 | 98% | 68% | 41% |
+
+- **Reading it.** The familiar slice, which is what most teams' eval sets look like, keeps improving.
+  The other two peak at epoch 2 and then fall: the model is learning the traces, not the skill.
+- **Fix.** Select the checkpoint on the paraphrase and new-combination slices, cut epochs, and add more
+  diverse trajectories rather than more of the same.
+
 ### Detecting copied tool arguments
 The agent-specific memorisation check: on held-out requests, flag tool-call argument values that appear
 in training traces but not in the current request. A loss curve cannot show this; a flag is a prompt for
@@ -181,23 +217,6 @@ for f in copied_args(pred_calls, prompts, train_arg_values):
     print("COPIED FROM TRAINING:", f)
 # Flags the amount 49.99 and customer c-77 (real memorisation) and refund_policy_v2 (review: likely fine).
 ```
-
-### Worked scenario: an agent eval that only looked familiar
-Illustrative numbers. A tool-calling model fine-tuned on 2,000 trajectories, evaluated per epoch on three
-held-out slices: requests phrased like training, paraphrased requests, and tasks needing tool combinations
-absent from training.
-
-| Epoch | Familiar phrasing | Paraphrased | New tool combinations |
-|---|---|---|---|
-| 1 | 84% | 80% | 62% |
-| 2 | 91% | 85% | 66% |
-| 4 | 96% | 79% | 55% |
-| 8 | 98% | 68% | 41% |
-
-- **Reading it.** The familiar slice, which is what most teams' eval sets look like, keeps improving.
-  The other two peak at epoch 2 and then fall: the model is learning the traces, not the skill.
-- **Fix.** Select the checkpoint on the paraphrase and new-combination slices, cut epochs, and add more
-  diverse trajectories rather than more of the same.
 
 ### Worked scenario: ten epochs on 2,000 support replies
 Illustrative numbers. A team fine-tunes a 7B instruct model on 2,000 support replies for ten epochs at a

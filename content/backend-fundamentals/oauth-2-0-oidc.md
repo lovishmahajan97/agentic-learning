@@ -5,7 +5,8 @@ name: OAuth 2.0 / OIDC
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/authentication-vs-authorization
@@ -39,6 +40,212 @@ is. Confusing the two is the classic bug.
   runs as the user versus as the agent.
 - **What you can skip.** Writing your own authorization server and the full RFC text. Know the code flow
   with PKCE, the three token types and who validates each; that covers agent tool auth.
+
+## Lab
+### Task
+You build the server side of an agent product's "Connect your account" button: the `/authorize`
+parameters and the callback that turns a code into a verified user key plus vaulted tokens. A fake
+identity provider runs in-process, so the whole flow, including attacks, runs offline.
+- **Agent goal:** the tool runtime ends up with a per-user token keyed on `(iss, sub)`; the agent (the
+  caller) only ever gets the user key back, never a token.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** authentication vs authorization, and this lesson's code-flow, PKCE and
+  three-tokens sections.
+- **Needs:** `pyjwt[crypto]` and `pytest`; checked with PyJWT 2.15.1, cryptography 50.0.2 and pytest
+  9.1.1 on Python 3.12.
+
+### Starter code
+```python
+# oauth_lab.py: the callback of an agent's "Connect your account" flow, against an in-process fake IdP
+import base64, hashlib, secrets, time
+import jwt                                            # pip install "pyjwt[crypto]"
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+ISSUER, CLIENT_ID, PROVIDER = "https://idp.test", "agent-app", "github"
+REDIRECT_URI = "https://agent.test/callback"
+
+def s256(verifier: str) -> str:
+    return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+
+class FakeIdP:
+    """Plays the authorization server: single-use codes, PKCE and redirect checks, RS256 ID tokens."""
+    def __init__(self):
+        self.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        self.codes = {}
+
+    def public_key(self):
+        return self.key.public_key()
+
+    def sign(self, claims: dict) -> str:
+        return jwt.encode(claims, self.key, algorithm="RS256")
+
+    def authorize(self, params: dict, user: str):
+        """The user logged in and consented; returns what lands on redirect_uri: (code, state)."""
+        code = secrets.token_urlsafe(16)
+        self.codes[code] = {**params, "user": user}
+        return code, params.get("state")
+
+    def token(self, code, code_verifier, redirect_uri, client_id) -> dict:
+        req = self.codes.pop(code, None)                       # single use
+        if (req is None or req.get("code_challenge_method") != "S256"
+                or s256(code_verifier or "") != req.get("code_challenge")
+                or redirect_uri != req.get("redirect_uri") or client_id != req.get("client_id")):
+            return {"error": "invalid_grant"}
+        now = int(time.time())
+        claims = {"iss": ISSUER, "sub": req["user"], "aud": client_id, "iat": now, "exp": now + 300,
+                  "nonce": req.get("nonce"), "email": "shared-inbox@corp.test"}
+        return {"access_token": secrets.token_urlsafe(24), "token_type": "Bearer", "expires_in": 3600,
+                "refresh_token": secrets.token_urlsafe(32), "id_token": self.sign(claims)}
+
+def start_login(session: dict) -> dict:
+    """Return the /authorize query parameters. Store state, nonce and the PKCE verifier in `session`."""
+    raise NotImplementedError("YOUR CODE: state, nonce, PKCE pair (S256), stored server-side")
+
+def handle_callback(idp: FakeIdP, session: dict, code: str, state: str, vault: dict) -> tuple:
+    """Check state, exchange the code on the back channel, validate the ID token, store the tokens.
+
+    Return the user key (iss, sub). Tokens go into vault[(user_key, PROVIDER)], never back to the
+    caller (the agent). Raise PermissionError for every rejection.
+    """
+    raise NotImplementedError("YOUR CODE: state check, token exchange, ID-token validation, vault write")
+
+if __name__ == "__main__":
+    idp, vault = FakeIdP(), {}
+    session = {}
+    params = start_login(session)
+    print("authorize params: S256", params["code_challenge"] == s256(session["verifier"]))
+    code, state = idp.authorize(params, user="u-alice")
+    print("callback:", handle_callback(idp, session, code, state, vault))
+    print("vault holds refresh token:", "refresh_token" in vault[((ISSUER, "u-alice"), PROVIDER)])
+
+    def rejected(fn):
+        try:
+            fn(); return "ACCEPTED"
+        except PermissionError:
+            return "rejected"
+
+    victim = {}; code, state = idp.authorize(start_login(victim), user="u-bob")
+    thief = {**victim, "verifier": secrets.token_urlsafe(64)}       # has the code, not the verifier
+    print("stolen code, attacker verifier:", rejected(lambda: handle_callback(idp, thief, code, state, vault)))
+    s2 = {}; code, state = idp.authorize(start_login(s2), user="u-bob")
+    print("forged state:", rejected(lambda: handle_callback(idp, s2, code, "attacker-state", vault)))
+    s3 = {}; p3 = start_login(s3); code, state = idp.authorize(p3, user="u-bob")
+    idp.token = lambda *a: {"id_token": idp.sign({"iss": ISSUER, "sub": "u-bob", "aud": "other-app",
+                            "exp": int(time.time()) + 300, "nonce": s3["nonce"]}), "access_token": "x"}
+    print("ID token for another app:", rejected(lambda: handle_callback(idp, s3, code, state, vault)))
+```
+
+As given, the script stops at the first `NotImplementedError`. Every user of this fake IdP shares one
+email address on purpose, so keying accounts on email shows up as a collision.
+
+### Expected output
+```
+authorize params: S256 True
+callback: ('https://idp.test', 'u-alice')
+vault holds refresh token: True
+stolen code, attacker verifier: rejected
+forged state: rejected
+ID token for another app: rejected
+```
+
+### Tests
+```python
+# test_oauth_lab.py: run with `pytest -q`
+import secrets, time
+import jwt, pytest
+from oauth_lab import CLIENT_ID, ISSUER, PROVIDER, REDIRECT_URI, FakeIdP, handle_callback, s256, start_login
+
+def login(idp, user="u-alice"):
+    session = {}
+    code, state = idp.authorize(start_login(session), user=user)
+    return session, code, state
+
+def forge(idp, session, **override):        # the IdP returns a token we did not ask for
+    claims = {"iss": ISSUER, "sub": "u-alice", "aud": CLIENT_ID, "exp": int(time.time()) + 300,
+              "nonce": session["nonce"], **override}
+    idp.token = lambda *a: {"id_token": idp.sign(claims), "access_token": "at", "refresh_token": "rt"}
+
+def test_authorize_params_use_pkce_state_and_nonce():
+    s1, s2 = {}, {}
+    p1, p2 = start_login(s1), start_login(s2)
+    assert p1["response_type"] == "code" and p1["client_id"] == CLIENT_ID and p1["redirect_uri"] == REDIRECT_URI
+    assert "openid" in p1["scope"].split() and p1["code_challenge_method"] == "S256"
+    assert p1["code_challenge"] == s256(s1["verifier"]) and len(s1["verifier"]) >= 43
+    assert "code_verifier" not in p1                                   # the verifier stays server-side
+    assert p1["state"] == s1["state"] and p1["nonce"] == s1["nonce"]
+    assert s1["state"] != s2["state"] and s1["nonce"] != s2["nonce"]   # fresh per login
+
+def test_happy_path_keys_on_iss_sub_and_vaults_tokens():
+    idp, vault = FakeIdP(), {}
+    session, code, state = login(idp)
+    out = handle_callback(idp, session, code, state, vault)
+    assert out == (ISSUER, "u-alice")
+    rec = vault[((ISSUER, "u-alice"), PROVIDER)]
+    assert rec["refresh_token"] and rec["access_token"]
+    assert not any(isinstance(v, str) and v in (rec["access_token"], rec["refresh_token"]) for v in out)
+
+def test_two_users_sharing_an_email_get_two_keys():
+    idp, vault = FakeIdP(), {}
+    a = handle_callback(idp, *login(idp, "u-alice"), vault)
+    b = handle_callback(idp, *login(idp, "u-bob"), vault)
+    assert a != b and len(vault) == 2
+
+def test_forged_state_is_rejected():
+    idp = FakeIdP()
+    session, code, _ = login(idp)
+    with pytest.raises(PermissionError):
+        handle_callback(idp, session, code, "attacker-state", {})
+
+def test_stolen_code_without_verifier_is_rejected():
+    idp = FakeIdP()
+    session, code, state = login(idp)
+    thief = {**session, "verifier": secrets.token_urlsafe(64)}
+    with pytest.raises(PermissionError):
+        handle_callback(idp, thief, code, state, {})
+
+@pytest.mark.parametrize("override", [{"aud": "other-app"}, {"iss": "https://evil.test"},
+                                      {"nonce": "replayed"}, {"exp": int(time.time()) - 600}])
+def test_bad_id_tokens_are_rejected(override):
+    idp, vault = FakeIdP(), {}
+    session, code, state = login(idp)
+    forge(idp, session, **override)
+    with pytest.raises(PermissionError):
+        handle_callback(idp, session, code, state, vault)
+    assert vault == {}                                                 # nothing stored on rejection
+
+def test_unsigned_token_is_rejected():
+    idp = FakeIdP()
+    session, code, state = login(idp)
+    unsigned = jwt.encode({"iss": ISSUER, "sub": "u-alice", "aud": CLIENT_ID,
+                           "exp": int(time.time()) + 300, "nonce": session["nonce"]}, None, algorithm="none")
+    idp.token = lambda *a: {"id_token": unsigned, "access_token": "at"}
+    with pytest.raises(PermissionError):
+        handle_callback(idp, session, code, state, {})
+```
+
+All 10 fail on the starter with `NotImplementedError`. A correct solution passes all 10; convert
+PyJWT's `InvalidTokenError` subclasses and the IdP's `invalid_grant` response into `PermissionError`.
+
+### Failure scenarios
+- **Inject `options={"verify_aud": False}` into `jwt.decode`.** Only the `aud: other-app` case fails:
+  a token minted for another client now logs a user in (token substitution). Debug by decoding the
+  rejected token without verification and comparing `aud` with your `client_id`.
+- **Inject a user key built from `claims["email"]`.** `test_two_users_sharing_an_email_get_two_keys`
+  fails with one vault entry for two people. Print the claims of both logins; `sub` differs while
+  `email` does not, so key on `(iss, sub)`.
+- **Inject: delete the `nonce` comparison.** The `replayed` case now passes the callback. Log `session["nonce"]` next to `claims.get("nonce")` on every login; any
+  mismatch that still succeeds is the bug.
+- **Inject an early return of the token response "for the agent to use".** The happy-path test fails
+  its no-token-in-output assert; in a real agent that token would reach the transcript and traces.
+
+### Submission
+- **Your `oauth_lab.py`** with both functions implemented and the fake IdP unchanged.
+- **A `pytest -q` run** showing 10 passed.
+- **The script's printed output**, matching the expected lines.
+- **A note of 3-5 sentences** naming which line of your callback stops each attack in the expected
+  output, and why `state` and `nonce` are both needed.
+- **Evaluated on:** green tests, algorithm, issuer and audience pinned in one decode call, `(iss, sub)`
+  as the key, and no token returned to the caller.
 
 ## Why it exists
 - **Password sharing was the old answer.** A third-party calendar app asked for your Google password. That

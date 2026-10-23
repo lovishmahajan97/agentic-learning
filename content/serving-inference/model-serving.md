@@ -5,7 +5,8 @@ name: Model serving
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - serving-inference/engines
@@ -142,7 +143,50 @@ flowchart TD
     D -.->|"stream chunks or tool call"| API
 ```
 
+## Misconceptions
+- **"Serve an LLM like any model: stateless replicas behind a round-robin balancer."** Each request is a
+  stateful loop pinning a growing KV cache on one GPU, replicas take tens of seconds to minutes to warm,
+  and round-robin scatters an agent's transcript across caches. Scale on queue depth and cache use, and
+  route by agent run id.
+- **"How many users a GPU holds is a property of the GPU."** It is free cache tokens divided by sequence
+  length. The same 80 GB card and 8B model hold 128 chats at 2,000 tokens (capped by `--max-num-seqs`),
+  about 52 requests at 8,192 and about 21 agent steps at 20,000.
+- **"Record tokens/s on the dashboard means users are happy."** Throughput rises with batch size while
+  every user's TPOT rises too, so a fleet can set records while streams feel slow. Watch p99 TTFT and
+  TPOT next to tokens/s.
+- **"An agent task's latency is one model call's latency."** It is the sum of every step's queueing,
+  prefill and decode, and later steps carry longer transcripts, so a small per-call regression is paid
+  dozens of times per task.
+- **"With a managed API, serving mechanics are not my problem."** The same machinery runs on the
+  provider's side. Rate limits, prompt-caching rules and token pricing are its visible surface, and they
+  shape prompt layout and step count just as engine flags do.
+
 ## Examples
+### Worked scenario: how many users does one GPU hold?
+An 8B GQA model on one 80 GB GPU, with the flags from the stack example below. Illustrative arithmetic,
+ignoring activation and CUDA-graph memory, which take a few more GB in practice.
+
+| Step | Value |
+|---|---|
+| VRAM the engine may use (`--gpu-memory-utilization 0.9`) | 0.9 × 80 GB = 72 GB |
+| Minus fp16 weights | 72 − 16 = 56 GB for the cache pool |
+| Cache per token (2 × 32 layers × 8 KV heads × 128 dim × 2 bytes) | 131,072 bytes = 128 KB |
+| Pool in tokens | 56 GB ÷ 128 KB ≈ 427,000 tokens |
+| Every request at the 8,192-token cap | ≈ 52 concurrent |
+| Typical request of 2,000 tokens | ≈ 213 fit, but `--max-num-seqs 128` caps it at 128 |
+| Agent steps averaging a 20,000-token transcript (needs a larger `max_model_len`) | ≈ 21 concurrent steps |
+
+- **Read it as:** the binding limit moves between the sequence cap and the memory pool depending on the
+  length mix, so you cannot quote a user count without the length distribution.
+- **For agents:** late steps of a long run are the expensive ones. The same GPU that holds 128 short chats
+  holds about 21 agent steps at 20k tokens, so size from transcript length at step *n*, not step 1.
+
+```python
+pool_tokens = (0.9 * 80e9 - 16e9) / (2 * 32 * 8 * 128 * 2)
+for avg_len in (8192, 2000):
+    print(avg_len, min(int(pool_tokens // avg_len), 128))   # 52, then 128 (seq cap binds)
+```
+
 ### A minimal stack: OpenAI-compatible engine plus a streaming client
 The server flags encode the memory and concurrency decisions above.
 
@@ -216,31 +260,6 @@ for step in range(8):                     # hard cap on agent steps
         args = json.loads(call.function.arguments)
         messages.append({"role": "tool", "tool_call_id": call.id, "content": search_docs(**args)})
 # Watch prompt_tokens climb each step: that growth is what fills the KV pool.
-```
-
-### Worked scenario: how many users does that one GPU hold?
-Same 8B GQA model, one 80 GB GPU, the flags above. Illustrative arithmetic, ignoring activation and
-CUDA-graph memory, which take a few more GB in practice.
-
-| Step | Value |
-|---|---|
-| VRAM the engine may use (`--gpu-memory-utilization 0.9`) | 0.9 × 80 GB = 72 GB |
-| Minus fp16 weights | 72 − 16 = 56 GB for the cache pool |
-| Cache per token (2 × 32 layers × 8 KV heads × 128 dim × 2 bytes) | 131,072 bytes = 128 KB |
-| Pool in tokens | 56 GB ÷ 128 KB ≈ 427,000 tokens |
-| Every request at the 8,192-token cap | ≈ 52 concurrent |
-| Typical request of 2,000 tokens | ≈ 213 fit, but `--max-num-seqs 128` caps it at 128 |
-| Agent steps averaging a 20,000-token transcript (needs a larger `max_model_len`) | ≈ 21 concurrent steps |
-
-- **Read it as:** the binding limit moves between the sequence cap and the memory pool depending on the
-  length mix, so you cannot quote a user count without the length distribution.
-- **For agents:** late steps of a long run are the expensive ones. The same GPU that holds 128 short chats
-  holds about 21 agent steps at 20k tokens, so size from transcript length at step *n*, not step 1.
-
-```python
-pool_tokens = (0.9 * 80e9 - 16e9) / (2 * 32 * 8 * 128 * 2)
-for avg_len in (8192, 2000):
-    print(avg_len, min(int(pool_tokens // avg_len), 128))   # 52, then 128 (seq cap binds)
 ```
 
 ## Production patterns

@@ -5,7 +5,8 @@ name: Citation correctness
 kind: metric
 difficulty: advanced
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -138,6 +139,23 @@ flowchart TD
     X -->|"supported by nothing"| I["Invention or parametric: abstain or fix retrieval"]
     F --> R["Report recall, precision, contradictions, CI"]
 ```
+
+## Misconceptions
+- **"Citation rate tells you citation quality."** It counts presence, not support. In the worked answer
+  below the rate is 0.80 while citation recall is 0.60, and one citation contradicts its claim.
+- **"If the answer is correct, its citations must be fine."** A strong model can state a true fact from
+  pre-training and attach a nearby chunk that does not contain it. Answer correctness, faithfulness and
+  citation correctness are separate measurements.
+- **"More citations per claim can only help."** Attaching extra sources raises recall cheaply while
+  pointing users at passages that add nothing. Citation precision exists to penalise this spraying.
+- **"Give the judge the whole answer and all sources so it has full context."** Extra context lets the
+  judge infer support the cited text does not give, inflating scores against human labels. Send one
+  claim plus only its cited passages, and calibrate the judge per label.
+- **"Partial support is close enough to count as supported."** Partial is where a dropped qualifier or a
+  wrong number hides. Keep a three-way label and report partial separately.
+- **"A two-point gain on 300 questions is a real improvement."** Claims in one answer fail together, so
+  the bootstrap must resample questions, not claims. In the synthetic example below that interval is
+  about plus or minus 3 points, so a two-point move is within noise.
 
 ## Examples
 ### Worked scoring of one answer

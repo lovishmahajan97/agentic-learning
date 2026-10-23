@@ -5,7 +5,8 @@ name: Multi-tenancy
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/tenant-isolation
@@ -38,6 +39,59 @@ prompt, memory, tool credentials, caches and the token meter.
   offboarding workflow that reaches every store.
 - **What you can skip.** Cell-based routing details until you run many independent stacks. Know the
   three sharing models, the tenant directory and the AI-specific places the tenant must reach.
+
+## Decision case
+### Scenario
+An HR-assistant agent SaaS answers policy questions and files requests in each customer's HR system
+through per-tenant OAuth connectors. It must choose the sharing model for its data and agent runtime
+before signing its first enterprise deals. All figures are illustrative.
+- **Tenants:** 600 at launch: 560 self-serve, 36 mid-market, 4 enterprise. 30 tenants, one of them
+  enterprise, require EU data residency.
+- **Load:** a pooled worker fleet with 300 concurrent agent-run slots; runs average 15 steps.
+- **Constraints:** all 4 enterprise contracts require a dedicated database and vector index; 6
+  engineers run the whole platform with one on-call rotation; schema releases go out weekly; offboarding
+  must reach backups within the contract's retention window.
+
+### Options
+| Option | How it works | Enterprise dedicated stores | EU residency | Database stacks to migrate per weekly release |
+|---|---|---|---|---|
+| A. Pool everything | One pooled stack per region with `tenant_id`, row-level security and a tenant-filtered vector index | Fails the 4 contracts | One EU pool | 2 |
+| B. Tiered pool plus silo | Self-serve and mid-market in a US pool and an EU pool; each enterprise tenant gets a silo database and index; shared model fleet and workers with per-tenant caps; placement in the tenant directory | Passes | EU pool plus the EU enterprise silo | 2 + 4 = 6 |
+| C. Silo every tenant | A dedicated database and index per tenant, placed by region | Passes | Passes | 600 |
+
+### Decision
+Choose **B, pooled tiers with an enterprise silo tier**, because:
+- **The contracts rule out A:** physical separation is a written requirement for 4 tenants, and no amount
+  of row-level security satisfies it.
+- **The team rules out C:** 600 migrations a week, 600 restores to test and 600 sets of alerts for 6
+  engineers is per-customer operations again, for 596 tenants that never asked for it.
+- **B keeps operations at 6 stacks** while the tenant directory makes a silo a placement, not a code
+  path; the same agent code runs everywhere, with model, tools and budgets read from tenant config.
+- **Fairness is solved in the pooled runtime:** a cap of 25 concurrent runs per pooled tenant means even
+  the 12 busiest tenants at their cap hold all 300 slots, so pair the cap with weighted fair queueing.
+
+**What would change it:** dozens of tenants demanding dedicated stores would justify bridge (a schema
+per tenant) or cells; a tenant whose long agent transcripts dominate the shared model fleet's KV cache
+would justify dedicated serving capacity.
+
+### Trade-offs accepted
+- **Pooled isolation rests on software.** Watch: two-tenant isolation tests in CI for every endpoint,
+  job and tool, and queries that run without the tenant setting (should be zero).
+- **Silos run a slower release lane.** Watch: schema version drift between the pools and each silo.
+- **Shared model fleet across tiers.** Watch: p95 latency and token share per tenant, top tenant first.
+- **Offboarding spans many stores.** Watch: time from offboarding request to verified deletion, with
+  per-tenant keys crypto-shredded for backups.
+
+### Review rubric
+- **Sharing model is chosen per resource and per tier**, not once for the system, with the tier that
+  pays for a silo named.
+- **Operational cost is counted:** stacks to migrate, back up and alert on, recomputed for each option.
+- **Contracts and residency are mapped to placements** in a tenant directory, with a written promotion
+  path from pool to silo.
+- **Tenant identity reaches every agent surface:** retrieval filter, memory namespace, cache keys,
+  connector tokens and queued runs.
+- **Noisy-neighbour arithmetic is shown:** run caps and queueing are checked against total worker slots.
+- **Reversal triggers are concrete**, and each accepted trade-off names a metric.
 
 ## Why it exists
 - **One deployment per customer does not scale.** Fine for three customers; for three hundred it means

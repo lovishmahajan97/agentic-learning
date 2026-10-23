@@ -5,7 +5,8 @@ name: Agentic RAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -167,6 +168,24 @@ flowchart TD
     V -->|"no"| D
     V -->|"yes"| OUT["Answer with citations"]
 ```
+
+## Misconceptions
+- **"An agent loop fixes poor retrieval."** If single-hop questions fail on ranking or parsing, the
+  agent just retries a broken retriever and adds latency. The loop helps multi-hop, cross-source and
+  ambiguous questions; diagnose the failures before choosing it.
+- **"Telling the model not to open restricted documents enforces permissions."** Retrieved text can
+  inject instructions, and a prompt is not a boundary. The runtime injects the user identity and the
+  tools apply ACL filters, so no query the model writes can reach a forbidden document.
+- **"Token cost grows linearly with steps."** Each step re-sends the history, so *n* steps cost about
+  `n·b + r·n²/2`. At 6 steps with *b* = 2,000 the exact sum is 57,000 input tokens with raw 3k results against 18,000 with pruned
+  snippets; pruning is a cost control, not tidiness.
+- **"More searches means proportionally slower answers."** Independent sub-questions can run as
+  parallel tool calls, so wall-clock latency tracks the number of dependent hops, not total searches.
+- **"The framework's recursion limit is the budget."** In LangGraph, hitting `recursion_limit` raises
+  an error rather than returning a partial answer, and it caps neither tokens nor time. Catch it and
+  enforce token and wall-clock budgets in your own code.
+- **"Citations are reliable because the model saw the documents."** A model can cite an ID it never
+  retrieved. The runtime checks every cited ID against the evidence list before returning the answer.
 
 ## Examples
 ### A minimal agent loop with citation verification

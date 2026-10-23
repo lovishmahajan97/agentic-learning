@@ -5,7 +5,8 @@ name: Self-host vs API
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/build-vs-buy
@@ -37,6 +38,62 @@ busy GPUs justify it, and re-run the numbers as traffic grows.
   interface so a step can move.
 - **What you can skip.** GPU kernel tuning and cluster scheduling until one step clearly dominates spend.
   Know the utilisation formula and the agent token multiplier; that settles most decisions.
+
+## Decision case
+### Scenario
+A legal-tech company runs a contract-review agent for EU law firms. A frontier API plans each review;
+a small-model step extracts clause fields, about 20 calls per contract. All figures are illustrative.
+- **Scale:** 6,000 contracts a day, so 120,000 extraction calls a day and 3.6M a month, each about 3,000
+  input and 250 output tokens (10.8B input, 0.9B output tokens a month). Peak-to-average ratio 3.
+- **Spend today:** planner about $8,000 a month; extraction on a small-model API at $0.15 input and $0.60
+  output per 1M tokens is $1,620 + $540 = $2,160.
+- **Constraints:** model budget $15,000 a month; legal has confirmed in writing that an EU endpoint with
+  zero retention is acceptable; p95 under 2 s per extraction call; three application engineers, none
+  has run GPU inference; GA in 10 weeks; sales forecasts 3× volume within a year.
+- **Measured inputs:** a quantised 8B model serves about 15,000 tokens per second per GPU on replayed
+  extraction traffic (about 4.6 calls per second). GPUs cost $2.50 an hour ($1,825 a month); on-call and
+  upgrades are costed at $4,000 a month. On the team's golden set, the best open 70B-class planner
+  reaches 71% task success against 84% for the frontier API.
+
+### Options
+| Option | How it works | Monthly cost now (at 3×) | Constraints |
+|---|---|---|---|
+| A. API for every step | EU zero-retention endpoint for planner and extractor | $10,160 ($30,480 at 3×, about $14,480 with planner prefix caching) | Meets data, latency and deadline; budget only with caching |
+| B. Hybrid: self-host the extractor | vLLM on 2 GPUs (minimum for redundancy), planner stays on the API | $8,000 + $7,650 = $15,650 | Over budget now; new on-call for a team with no GPU experience |
+| C. Self-host everything | 70B-class planner on two multi-GPU nodes plus the extractor | Far above budget: two 8-GPU nodes alone are $29,200 | Fails the 84% quality bar (71%) and the deadline |
+
+### Decision
+Choose **A**, and make prefix caching on the planner part of the launch.
+- **Data rule:** it does not force hosting, because legal accepted zero-retention EU processing in
+  writing. That removes the only reason to pay for B or C early.
+- **Extractor cost:** at 3.6M calls the API costs $0.0006 per call. Two GPUs plus people cost $7,650,
+  so B loses by about $5,500 a month today. It still loses at 3× ($6,480 against $9,475 on 3 GPUs).
+- **Break-even:** one GPU covers about 4.0M calls a month at a peak ratio of 3. The staircase meets the
+  API line near 31M calls a month (8 GPUs, about $18,600 either way), roughly 8.6× today.
+- **Budget:** the planner, not the extractor, threatens it at 3×. A stable, append-only planner prefix
+  is the lever, as in the worked scenario below.
+
+**What would change it:** extraction volume heading past about 25M calls a month, a client contract that
+forbids any third-party processor, or a provider price change that moves the break-even. Re-run the
+sheet quarterly with traced token counts.
+
+### Trade-offs accepted
+- **Provider dependency on both steps.** Watch deprecation notices and keep both steps behind the
+  per-step client config so the extractor can move with a config change.
+- **No version pinning beyond the vendor's schedule.** Rerun the golden set and tool-call eval on every
+  announced model update.
+- **Budget relies on cache hits.** Alert when the planner's cached-token share falls below its launch
+  baseline, since a prompt-layout change silently undoes the saving.
+- **Rate limits during peaks.** Track 429s per step at the daily peak and negotiate quota ahead of the
+  3× growth.
+
+### Review rubric
+- States the hard constraints (data, latency, team, deadline) and settles them before comparing cost.
+- Costs the agent per task and per step from traced tokens, not per request or from list prices.
+- Computes self-host cost with peak provisioning, redundancy, utilisation and people included.
+- Names the break-even volume or the trigger that would reverse the choice, with a revisit date.
+- Gates any move of a step on that step's golden-set and tool-call validity results.
+- Shows arithmetic a reviewer can recompute, with illustrative figures labelled as such.
 
 ## Why it exists
 - **Opposite cost structures.** An API is pure variable cost: pay per token, scale to zero, someone else

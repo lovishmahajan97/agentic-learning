@@ -5,7 +5,8 @@ name: Inference clusters
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - infra-capacity-economics/gpu-infrastructure
@@ -40,6 +41,60 @@ bursty) is exactly what breaks round-robin and CPU autoscaling.
   class per agent type (interactive versus background).
 - **What you can skip.** If your agents call a hosted API, the provider runs this cluster for you; read
   this for the vocabulary (queue depth, prefix affinity, cold replicas) that explains their latency.
+
+## Decision case
+### Scenario
+A fintech self-hosts a 70B planner model for its customer-support agent because transcripts may not
+leave its cloud account. All figures are illustrative, from the team's own load tests.
+- **Demand:** peak 6,000 output tok/s from about 200 concurrent agent runs of 8 steps each; a nightly
+  eval sweep replays 5,000 recorded runs against the same model.
+- **Replica shape:** a TP=2 replica sustains ~1,500 tok/s within the latency budget; the reserved GPU
+  capacity comes only as 8-GPU nodes, so one node hosts 4 replicas.
+- **Constraints:** TTFT p95 under 2 s for live sessions; survive the loss of one node with no budget
+  breach; at most 24 GPUs (3 nodes); a team of three who run Kubernetes well but have not operated LLM
+  serving; first production traffic in 6 weeks.
+
+### Options
+| Option | How it works | Survives a node loss? | GPUs | Agent prefill (session part, per run) | Fit for team and deadline |
+|---|---|---|---|---|---|
+| A. API-tier pattern | Round-robin load balancer, CPU autoscaling, 7 replicas on 2 nodes | No: 3 replicas left, 4,500 tok/s, below even the 6,000 peak | 16 (2 nodes, 14 in use) | ~36k, every step re-prefills the transcript | Familiar, but CPU never fires and p99 TTFT explodes |
+| B. One LLM-aware pool | Gateway with admission control, run-id affinity with spillover, KEDA on `vllm:num_requests_waiting`, N+1 counted in nodes, batch evals at low priority | Yes: 8 of 12 replicas left, 12,000 tok/s vs 7,800 needed with headroom | 24 (3 nodes) | ~8k | One pool, one router; inside 6 weeks |
+| C. Disaggregated prefill and decode, separate eval pool | Prefill and decode replica classes plus a batch pool, each with its own spare node | Yes | At least 4 nodes (32) under this placement | ~8k, with steadier TPOT | Over budget; KV transfer and three pools to operate |
+| D. As B on 2-GPU nodes | 7 replicas on 7 small nodes, N+1 in replicas equals N+1 in nodes | Yes: 6 left, 9,000 tok/s | 14 | ~8k | Cheapest, but that node shape is not in the reservation |
+
+### Decision
+Choose **B**, because:
+- **It is the only option inside the 24-GPU budget that survives a node loss.** A breaches the budget
+  the moment one node goes; C needs at least 32 GPUs; D is ruled out by the node shape available.
+- **The spare node is not idle GPU time:** the nightly eval sweep runs on it at low priority and is shed
+  first by the gateway, so the headroom pays for itself.
+- **Run-id affinity cuts session prefill about 4.5×** (36k to 8k per run, roughly 7.2M to 1.6M tokens per
+  wave of 200 runs), which is what keeps TTFT inside 2 s on later steps.
+- **It matches the team:** KEDA, readiness probes and node pools are Kubernetes skills they have; only
+  the router logic is new.
+
+**What would change it:** 2-GPU nodes becoming available (D halves the GPU count); long tool outputs
+causing TPOT jitter that chunked prefill does not fix (move toward C); or demand growing past what
+8 surviving replicas carry, which forces a fourth node.
+
+### Trade-offs accepted
+- **Affinity concentrates load** when one tenant's runs fan out. Watch per-replica load skew and the
+  spillover rate.
+- **Evals can be starved at peak** because they are shed first. Watch eval sweep completion time and 429
+  rate for the batch priority class.
+- **Rollouts still cost a cold cache** on each new replica. Watch prefix-cache hit rate and TTFT p95
+  during every deploy; model versions go blue/green.
+- **A custom router is code the team now owns.** Watch router error rate and keep a least-loaded-only
+  fallback mode.
+
+### Review rubric
+- **Pool size recomputes** from peak demand, headroom and the load-tested replica capacity.
+- **The spare is counted in the unit that fails** (nodes when a node hosts several replicas), and the
+  write-up shows the capacity left after that loss.
+- **The routing key is the run id with spillover,** with the prefill saving computed per run.
+- **The scaling signal is engine queue depth or KV usage,** not CPU, with a threshold from a load test.
+- **Interactive and batch traffic have separate priorities,** and the shed order is stated.
+- **Reversal conditions name a measurable trigger** such as node shape, TPOT jitter or demand growth.
 
 ## Why it exists
 - **One replica has a hard ceiling.** Weights plus KV cache must fit in VRAM, decode is bound by memory

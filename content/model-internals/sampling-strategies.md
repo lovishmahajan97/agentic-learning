@@ -5,7 +5,8 @@ name: Sampling strategies (temperature, top-k / top-p, greedy vs beam)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - model-internals/logits
@@ -141,6 +142,20 @@ flowchart TD
     R --> OUT
     BEAM["Beam search: keep B best sequences"] -.->|"alternative to sampling"| OUT
 ```
+
+## Misconceptions
+- **"Temperature 0 makes the agent reproducible."** It fixes the choice rule, not the logits: batch
+  composition and floating-point reductions shift low-order bits, and near-tied tokens flip. Record
+  outputs for replay and assert on parsed fields.
+- **"Greedy decoding returns the most likely answer."** It returns a chain of locally best tokens. With A
+  at 0.5 then 0.3 versus B at 0.4 then 0.9, greedy gets 0.15 while the better sequence has 0.36.
+- **"Beam search gives better chat and tool-call output."** The highest-likelihood open-ended text is
+  bland and repetitive, and beams block streaming. Beam search fits single-target tasks such as
+  translation and speech recognition.
+- **"Top-k 40 is a safe universal cut."** Top-k ignores the distribution's shape: it admits junk when the
+  model is certain and starves a flat distribution. Top-p or min-p adapt the candidate set to confidence.
+- **"A 1% per-step failure rate is good enough."** Agent steps compound: 0.99²⁰ ≈ 82%, so almost one
+  20-step run in five has a bad step. Judge settings on whole trajectories.
 
 ## Examples
 ### A sampler with the usual pipeline

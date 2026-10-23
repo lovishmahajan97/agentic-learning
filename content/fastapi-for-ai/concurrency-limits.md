@@ -5,7 +5,8 @@ name: Concurrency limits (semaphores)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/backpressure
@@ -38,6 +39,213 @@ downstream limit across workers, and fail fast.
   bounded wait, slots taken per call rather than per agent run, and a per-run cap on parallel tool calls.
 - **What you can skip.** Adaptive limiter algorithms. Know Little's law, per-process sizing and the
   streaming release rule; that sizes almost any agent service.
+
+## Lab
+### Task
+Put correct concurrency caps on an agent service: size a per-worker limit from a quota, replace an
+unbounded slot wait with a bounded one that fails fast, stop an agent run from holding its LLM slot
+through tool time, and keep a streaming endpoint's slot until the stream really ends. Time box:
+60-90 minutes.
+- **Prerequisites:** the async endpoints, lifespan and StreamingResponse lessons.
+- **Setup:** Python 3.11+ (for `asyncio.timeout`), plus `pip install fastapi httpx pytest`; checked with
+  Python 3.12, FastAPI 0.161 and pytest 9.1. Fake calls sleep instead of reaching a provider.
+- **Save** the starter as `lab.py` and the tests as `test_lab.py`, then run `pytest -q`.
+
+### Starter code
+```python
+"""Lab: per-dependency concurrency caps for an agent service. Python 3.11+; fastapi for LAB 4."""
+import asyncio
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
+
+class Busy(Exception):
+    """No slot within the bounded wait: 503 at the edge, a tool error inside the agent loop."""
+
+def per_worker_limit(quota: int, workers: int, replicas: int = 1, headroom: float = 0.0) -> int:
+    # LAB 1: floor(quota * (1 - headroom) / (workers * replicas)), but never below 1.
+    raise NotImplementedError("lab step 1: per_worker_limit")
+
+async def call_capped(sem: asyncio.Semaphore, fn, *args, wait_s: float = 0.5):
+    # BUG to fix in LAB 2: this waits forever under overload. Acquire within wait_s or raise
+    # Busy, and release the slot on every path (success, error, cancellation).
+    async with sem:
+        return await fn(*args)
+
+class Deps:
+    """One semaphore per dependency (a bulkhead) plus in-flight counters the tests read."""
+    def __init__(self, llm_n: int, tool_n: int, llm_s: float = 0.1, tool_s: float = 0.3):
+        self.llm, self.tools = asyncio.BoundedSemaphore(llm_n), asyncio.BoundedSemaphore(tool_n)
+        self.llm_s, self.tool_s = llm_s, tool_s
+        self.inflight = {"llm": 0, "tool": 0}
+        self.peak = {"llm": 0, "tool": 0}
+
+    async def _work(self, kind: str, seconds: float):
+        self.inflight[kind] += 1
+        self.peak[kind] = max(self.peak[kind], self.inflight[kind])
+        try:
+            await asyncio.sleep(seconds)          # stands in for the provider or tool call
+        finally:
+            self.inflight[kind] -= 1
+
+    async def llm_call(self): await self._work("llm", self.llm_s)
+    async def tool_call(self): await self._work("tool", self.tool_s)
+
+async def run_agent(deps: Deps, steps: int = 2):
+    # BUG to fix in LAB 3: the LLM slot is held for the whole run, including tool time.
+    # Take each slot only around its own call, with call_capped.
+    async with deps.llm:
+        for _ in range(steps):
+            await deps.llm_call()
+            await deps.tool_call()
+
+async def fake_stream(sem: asyncio.Semaphore, seen: list):
+    for tok in ("Hel", "lo"):
+        seen.append(sem.locked())                 # is the slot still held while we generate?
+        await asyncio.sleep(0)
+        yield tok
+
+def build_app(slots: int) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        app.state.llm_slots = asyncio.BoundedSemaphore(slots) if slots else asyncio.Semaphore(0)
+        app.state.seen = []
+        yield
+    app = FastAPI(lifespan=lifespan)
+
+    @app.post("/chat")
+    async def chat(request: Request):
+        # LAB 4: take a slot with a bounded wait (0.2 s) BEFORE returning; if none, raise
+        # HTTPException(503, headers={"Retry-After": "2"}). Stream fake_stream(sem, app.state.seen)
+        # and release the slot in the generator's finally, not when the endpoint returns.
+        raise NotImplementedError("lab step 4: /chat")
+    return app
+
+async def demo():
+    print(f"per-worker limit for quota 64, 4 workers: {per_worker_limit(64, 4)}")
+    sem, served, rejected = asyncio.BoundedSemaphore(4), 0, 0
+    async def one():
+        nonlocal served, rejected
+        try:
+            await call_capped(sem, asyncio.sleep, 0.3, wait_s=0.1); served += 1
+        except Busy:
+            rejected += 1
+    await asyncio.gather(*(one() for _ in range(12)))
+    print(f"burst of 12 on 4 slots: served={served}, rejected={rejected}")
+    deps = Deps(llm_n=1, tool_n=4)
+    t0 = asyncio.get_running_loop().time()
+    await asyncio.gather(run_agent(deps), run_agent(deps))
+    took = asyncio.get_running_loop().time() - t0
+    print(f"two runs on 1 LLM slot: peak llm={deps.peak['llm']}, under 1.2s={took < 1.2}")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(demo())
+    except NotImplementedError as e:
+        print(f"not done yet: {e}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints:
+
+```
+per-worker limit for quota 64, 4 workers: 16
+burst of 12 on 4 slots: served=4, rejected=8
+two runs on 1 LLM slot: peak llm=1, under 1.2s=True
+```
+
+- **Why under 1.2 s:** each run is two rounds of 0.1 s model plus 0.3 s tool, so 0.8 s alone. Holding the
+  slot per run serialises the two runs (about 1.6 s); per call, run B's model calls fit inside run A's
+  tool time (about 0.9 s).
+
+### Tests
+```python
+import asyncio, time
+import pytest
+from fastapi.testclient import TestClient
+import lab
+
+def test_per_worker_limit_from_quota():
+    assert lab.per_worker_limit(64, 4) == 16
+    assert lab.per_worker_limit(64, 8) == 8
+    assert lab.per_worker_limit(100, 6, headroom=0.1) == 15     # floor(90 / 6)
+    assert lab.per_worker_limit(10, 4, replicas=3) == 1         # never 0
+
+def test_burst_gets_fast_rejections_not_a_queue():
+    async def main():
+        sem, out = asyncio.BoundedSemaphore(4), []
+        async def one():
+            try:
+                await lab.call_capped(sem, asyncio.sleep, 0.3, wait_s=0.1); out.append("ok")
+            except lab.Busy:
+                out.append("busy")
+        await asyncio.gather(*(one() for _ in range(12)))
+        return out, sem
+    t0 = time.monotonic()
+    out, sem = asyncio.run(main())
+    assert out.count("ok") == 4 and out.count("busy") == 8
+    assert time.monotonic() - t0 < 0.6                # nobody waited behind the full queue
+
+def test_slot_released_on_error_and_cancel():
+    async def boom(): raise ValueError("tool failed")
+    async def main():
+        sem = asyncio.BoundedSemaphore(1)
+        with pytest.raises(ValueError):
+            await lab.call_capped(sem, boom)
+        t = asyncio.create_task(lab.call_capped(sem, asyncio.sleep, 10))
+        await asyncio.sleep(0.05); t.cancel()
+        await asyncio.gather(t, return_exceptions=True)
+        return sem.locked()
+    assert asyncio.run(main()) is False
+
+def test_llm_slot_is_taken_per_call_not_per_run():
+    async def main():
+        deps = lab.Deps(llm_n=1, tool_n=4)
+        t0 = time.monotonic()
+        await asyncio.gather(lab.run_agent(deps), lab.run_agent(deps))
+        return deps, time.monotonic() - t0
+    deps, took = asyncio.run(main())
+    assert deps.peak["llm"] == 1                      # the cap still holds
+    assert took < 1.2                                 # run B's model calls overlap run A's tools
+
+def test_stream_holds_slot_until_generator_ends():
+    app = lab.build_app(slots=1)
+    with TestClient(app) as client:
+        r = client.post("/chat")
+        assert r.text == "Hello" and app.state.seen == [True, True]
+        assert not app.state.llm_slots.locked()       # released after the stream finished
+
+def test_full_capacity_returns_503_with_retry_after():
+    with TestClient(lab.build_app(slots=0)) as client:
+        t0 = time.monotonic()
+        r = client.post("/chat")
+    assert r.status_code == 503 and r.headers["retry-after"] == "2"
+    assert time.monotonic() - t0 < 1.0
+```
+
+On the starter five tests fail: `NotImplementedError` for steps 1 and 4, 12 served instead of 4, and
+about 1.6 s for the two runs. The release test already passes, because `async with` releases correctly;
+keep it passing when you rewrite `call_capped` with a manual `acquire()`.
+
+### Failure scenarios
+- **Release in the endpoint instead of the generator,** with `try/finally` around
+  `return StreamingResponse(...)`. Only the stream test fails: `seen` is `[False, False]`, so tokens are
+  generated with the slot already free and real provider concurrency exceeds the cap. Debug by logging
+  `sem.locked()` inside the generator.
+- **Manual `acquire()` with no `try/finally` around the call.** The error-and-cancel test fails with the
+  slot still locked: each failed or cancelled call leaks a slot until the worker looks hung at zero.
+- **Create the semaphore inside `run_agent` or the endpoint.** `peak["llm"]` rises to 2: a per-call
+  semaphore limits nothing. Debug by checking that the semaphore's `id()` is the same across requests.
+- **Scale workers without re-sizing.** `per_worker_limit(64, 4)` reused at 8 workers allows 128 in flight
+  against a quota of 64; watch provider 429s after every scaling change.
+
+### Submission
+- `lab.py` with the four lab steps done, and `test_lab.py` unchanged.
+- A `pytest -q` run showing 6 passed, plus `python lab.py` matching the expected output.
+- A sizing note for your own agent: each dependency, its quota or measured knee, workers and replicas,
+  the resulting `n`, and the throughput ceiling from `n / mean latency`.
+- Evaluation: no unbounded wait remains, slots are taken per call, every path releases, and the stream
+  holds its slot for its whole duration.
 
 ## Why it exists
 - **Async removes the natural brake.** With `async def` endpoints a worker does not run out of threads;

@@ -5,7 +5,8 @@ name: Distributed systems
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - system-design/data-consistency
@@ -189,6 +190,26 @@ flowchart TD
     B -->|"no"| K["Query by key or fail"]
     K -.->|"failure rate high"| CB["Circuit breaker opens"]
 ```
+
+## Misconceptions
+- **A timeout means the call failed, so a retry is safe.** A timeout only says no reply arrived in time;
+  the request may have been processed and the reply lost. Retry a side-effecting tool only with the same
+  idempotency key, or query the receiver by key first.
+- **More retries at more layers make the agent more reliable.** Retries multiply: five layers retrying
+  three times each turn one failure into up to 4⁵ ≈ 1,024 attempts on a dependency that is already
+  struggling. Retry at one layer, with jitter, a budget and the run's remaining deadline.
+- **A lock with an expiry guarantees one holder at a time.** A worker that pauses past its lease still
+  believes it holds it and writes late. Only a fencing token, checked by the resource being written,
+  rejects the stale holder.
+- **W + R > N means every read returns the latest write.** Overlap guarantees a read touches one replica
+  that saw the latest acknowledged write, not linearizability: concurrent writes need a winner rule, a
+  failed write can persist on some replicas, and sloppy quorums break the overlap.
+- **Synchronised server clocks can order events.** NTP corrects drift with jumps, so timestamps from two
+  hosts cannot order events at millisecond granularity, and last-writer-wins silently drops writes. Order
+  by causality instead: version numbers, log offsets or logical clocks.
+- **FLP means consensus cannot work in practice.** FLP rules out guaranteed termination under unbounded
+  delays, not agreement itself. Raft keeps safety (no conflicting commits) under any timing and gives up
+  only liveness while the network misbehaves, which is why 3 or 5 voters run etcd reliably.
 
 ## Examples
 ### Lease lock with fencing tokens

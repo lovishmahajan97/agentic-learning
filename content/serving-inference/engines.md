@@ -5,7 +5,8 @@ name: Engines (vLLM, SGLang, TGI, TensorRT-LLM, Ollama, llama.cpp)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - serving-inference/model-serving
@@ -40,6 +41,171 @@ TensorRT-LLM serve fleets; llama.cpp and Ollama run locally.
   calling and JSON on every engine and model pair.
 - **What you can skip.** Kernel internals and the TensorRT build details unless you run a fixed,
   high-volume model fleet. Most agent teams use a hosted API or vLLM or SGLang.
+
+## Lab
+### Task
+Your support agent runs on a hosted API and the team wants to move it to a self-hosted engine. You build
+the deploy gate for that move.
+- **Contract check:** classify each engine's recorded tool-call response; the agent may switch
+  `base_url` only to engines that pass.
+- **KV plan:** set `--max-model-len` and the concurrent-run cap for 20-step runs on one 80 GB GPU.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** KV cache, and this lesson's capacity calculator and tool-calling contract test.
+- **Runs offline:** the five responses were recorded in OpenAI chat-completions shape, so no GPU, engine
+  or API key is needed. Standard library plus `pytest`; checked on Python 3.12 with pytest 9.1.
+- **Done means** the tests pass and the script prints the expected report.
+
+### Starter code
+```python
+# engine_gate.py: decide whether your agent may switch base_url to a self-hosted engine
+# Offline: the responses below were recorded in OpenAI chat-completions shape; no GPU or server needed.
+import json
+
+TOOLS = [{"type": "function", "function": {
+    "name": "get_order_status",
+    "description": "Look up an order by id",
+    "parameters": {"type": "object", "properties": {"order_id": {"type": "string"}},
+                   "required": ["order_id"]}}}]
+
+def _resp(content=None, tool_calls=None, finish="tool_calls"):
+    return {"choices": [{"finish_reason": finish,
+                         "message": {"role": "assistant", "content": content, "tool_calls": tool_calls}}]}
+
+def _call(name, arguments):
+    return [{"id": "call_1", "type": "function", "function": {"name": name, "arguments": arguments}}]
+
+# Recorded answers to "Where is order A-1042?" with TOOLS attached, one per engine setup.
+RECORDED = {
+    "hosted":         _resp(tool_calls=_call("get_order_status", '{"order_id": "A-1042"}')),
+    "vllm-no-parser": _resp(content='{"name": "get_order_status", "parameters": {"order_id": "A-1042"}}',
+                            finish="stop"),
+    "vllm-parser":    _resp(tool_calls=_call("get_order_status", '{"order_id": "A-1042"}')),
+    "ollama-short":   _resp(tool_calls=_call("get_order_status", '{"order_id": "A-10'), finish="length"),
+    "local-gguf":     _resp(tool_calls=_call("get_order_status", "{}")),
+}
+
+def contract_check(resp: dict, tools: list) -> str:
+    """Return one verdict for the first tool call in a recorded response:
+    "ok"             structured call to a known tool, JSON arguments, every required argument present
+    "text_tool_call" no structured call, but the content is JSON naming a known tool (parser not enabled)
+    "no_tool_call"   no structured call and the content is not a tool call
+    "unknown_tool"   structured call to a tool that is not in `tools`
+    "bad_json"       arguments are not valid JSON
+    "missing_args"   valid JSON, but a required argument is absent
+    """
+    # YOUR CODE: classify the response; check the cases in the order listed above.
+    raise NotImplementedError("contract_check")
+
+def kv_plan(gpu_gb, util, weights_gb, activations_gb, n_layers, n_kv_heads, head_dim,
+            prefix_tokens, tokens_per_step, steps, bytes_el=2) -> dict:
+    """Size vLLM flags for agent runs that start at `prefix_tokens` and grow `tokens_per_step` per step.
+    Return a dict with these int keys:
+      per_token_bytes  K and V for every layer, for one token
+      pool_tokens      (gpu_gb * util - weights_gb - activations_gb) * 1e9 // per_token_bytes
+      peak_tokens      live tokens at the last step: prefix + (steps - 1) * tokens_per_step
+      max_model_len    peak_tokens rounded UP to a multiple of 1024
+      concurrent_runs  how many runs at peak length fit in the pool (floor)
+    """
+    # YOUR CODE
+    raise NotImplementedError("kv_plan")
+
+def ready_engines(recorded: dict, tools: list) -> list:
+    """Names of engines whose recorded response passes the contract, in insertion order."""
+    # YOUR CODE: reuse contract_check
+    raise NotImplementedError("ready_engines")
+
+if __name__ == "__main__":
+    try:
+        for name, resp in RECORDED.items():
+            print(f"{name:<15}{contract_check(resp, TOOLS)}")
+        p = kv_plan(80, 0.90, 16, 4, n_layers=32, n_kv_heads=8, head_dim=128,   # Llama-3.1-8B, 80 GB GPU
+                    prefix_tokens=6_000, tokens_per_step=1_500, steps=20)
+        print(f"KV per token: {p['per_token_bytes'] // 1024} KiB")
+        print(f"KV pool: {p['pool_tokens']:,} tokens")
+        print(f"20-step run peaks at {p['peak_tokens']:,} tokens -> --max-model-len {p['max_model_len']}, "
+              f"{p['concurrent_runs']} concurrent runs")
+        print("switch allowed to:", ", ".join(ready_engines(RECORDED, TOOLS)))
+    except NotImplementedError as e:
+        print("not implemented yet:", e)
+```
+
+As given, it prints `not implemented yet: contract_check`. The recorded cases mirror real failures:
+the parser switch left off, a `max_tokens` too small for the arguments, and a local model that calls
+the tool without its required argument.
+
+### Expected output
+```
+hosted         ok
+vllm-no-parser text_tool_call
+vllm-parser    ok
+ollama-short   bad_json
+local-gguf     missing_args
+KV per token: 128 KiB
+KV pool: 396,728 tokens
+20-step run peaks at 34,500 tokens -> --max-model-len 34816, 11 concurrent runs
+switch allowed to: hosted, vllm-parser
+```
+
+### Tests
+```python
+# test_engine_gate.py: run with `pytest -q`
+import pytest
+from engine_gate import RECORDED, TOOLS, _call, _resp, contract_check, kv_plan, ready_engines
+
+@pytest.mark.parametrize("engine, verdict", [
+    ("hosted", "ok"), ("vllm-no-parser", "text_tool_call"), ("vllm-parser", "ok"),
+    ("ollama-short", "bad_json"), ("local-gguf", "missing_args")])
+def test_recorded_verdicts(engine, verdict):
+    assert contract_check(RECORDED[engine], TOOLS) == verdict
+
+def test_plain_prose_is_not_a_tool_call():
+    assert contract_check(_resp(content="Your order is on its way.", finish="stop"), TOOLS) == "no_tool_call"
+
+def test_unknown_tool_is_caught_before_arguments():
+    assert contract_check(_resp(tool_calls=_call("delete_order", "not json")), TOOLS) == "unknown_tool"
+
+def test_text_naming_an_unknown_tool_is_just_text():
+    assert contract_check(_resp(content='{"name": "refund", "parameters": {}}'), TOOLS) == "no_tool_call"
+
+def test_kv_plan_for_20_step_runs():
+    p = kv_plan(80, 0.90, 16, 4, n_layers=32, n_kv_heads=8, head_dim=128,
+                prefix_tokens=6_000, tokens_per_step=1_500, steps=20)
+    assert p == {"per_token_bytes": 131_072, "pool_tokens": 396_728, "peak_tokens": 34_500,
+                 "max_model_len": 34_816, "concurrent_runs": 11}
+
+def test_kv_plan_short_runs_fit_three_times_more():
+    p = kv_plan(80, 0.90, 16, 4, n_layers=32, n_kv_heads=8, head_dim=128,
+                prefix_tokens=6_000, tokens_per_step=1_500, steps=5)
+    assert (p["peak_tokens"], p["max_model_len"], p["concurrent_runs"]) == (12_000, 12_288, 33)
+
+def test_only_passing_engines_are_ready():
+    assert ready_engines(RECORDED, TOOLS) == ["hosted", "vllm-parser"]
+```
+
+All 11 fail on the starter with `NotImplementedError`; a correct solution passes all 11.
+
+### Failure scenarios
+- **Inject: skip the required-argument check.** `local-gguf` turns `ok` and `ready_engines` admits it,
+  so in production the agent calls `get_order_status` with no id. Debug by printing the verdict per
+  recorded case and diffing against the table; any extra `ok` means a check is missing.
+- **Inject: parse arguments before checking the tool name.** `test_unknown_tool_is_caught_before_arguments`
+  gets `bad_json`, which sends you to fix JSON when the model actually picked a tool you never offered.
+  Debug by checking the order of the cases against the docstring.
+- **Inject: round `max_model_len` down (`peak // 1024 * 1024`).** You get 33792, below the 34,500-token
+  peak, so the engine would refuse the run's last steps for exceeding the context. Debug by asserting
+  `max_model_len >= peak_tokens` before printing flags.
+- **Inject: use 1024³ bytes per GB.** The pool becomes about 426,000 tokens and every capacity number
+  drifts. Debug by matching the unit to the one your engine's startup log reports.
+
+### Submission
+- **`engine_gate.py`** with the three functions implemented and no edits to `RECORDED` or `TOOLS`.
+- **A `pytest -q` run** showing 11 passed, plus the script output matching the expected block exactly.
+- **One extra recorded case** of your own (a response from a real engine if you have one, or a
+  hand-written prose answer) with its verdict and a test for it.
+- **A short note (3-5 sentences)** naming the vLLM flags the `vllm-no-parser` setup is missing, and the
+  `--max-model-len` and run cap you would deploy, tied to the plan's numbers.
+- **Evaluated on:** tests green, verdicts in the documented order, and a note that a reviewer can turn
+  into a `vllm serve` command.
 
 ## Why it exists
 - **A plain `model.generate()` loop wastes the GPU.** It serves one request at a time, allocates KV cache

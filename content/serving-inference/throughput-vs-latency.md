@@ -5,7 +5,8 @@ name: Throughput vs latency
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - serving-inference/continuous-batching
@@ -38,6 +39,73 @@ separate operating points for interactive and background agents.
   per-step timeouts, and admission limits in front of your own replicas.
 - **What you can skip.** Deriving the M/M/1 formula; remember ρ = 0.9 means about 10× service time and
   that the tail breaks first.
+
+## Decision case
+### Scenario
+A support-automation company self-hosts an 8B agent model for two workloads on the same illustrative
+replica as the worked example below (80 GB GPU, ~3.35 TB/s, 4k-token contexts).
+- **Interactive support agents.** Users wait on 10-step runs of about 1,500 output tokens. Daytime peak
+  is 12,000 output tok/s; overnight it falls to about 1,500 tok/s.
+- **Nightly eval and back-office agents.** 400M output tokens per night, finished inside an 8-hour window
+  (28,800 s), so about 13,889 tok/s on average.
+- **Constraints.**
+  - *Latency:* interactive TPOT p95 ≤ 15 ms, so decode per run stays near 22 s.
+  - *Budget:* ≤ $300 per day, at an assumed $3 per GPU-hour, so 4 GPUs ($288 per day).
+  - *Data residency:* traces may not leave the company's cloud account, which rules out a provider
+    batch API.
+  - *Team and deadline:* two platform engineers who already run Kubernetes; six weeks.
+- **Capacity per replica** (from the bandwidth model below): capped at B = 68, step ~14.9 ms and about
+  4,556 tok/s; full at B ≈ 120, step ~22.7 ms and about 5,289 tok/s. Interactive replicas are planned at
+  75 % of capped capacity (about 3,417 tok/s) for burst headroom.
+
+### Options
+| Option | How it works | Latency SLO | Night throughput | Budget |
+|---|---|---|---|---|
+| **1. Shared pool, run full** | 4 replicas at B ≈ 120 all day | Fails: ~23 ms TPOT, ~34 s decode per run | 21,156 tok/s, ample | 4 GPUs, $288 |
+| **2. Shared pool, capped** | 4 replicas at B = 68; batch jobs fill spare slots at night | Step time meets 15 ms, but at night (ρ ≈ 0.84) batch requests hold the slots and interactive runs queue for admission | 18,224 − 1,500 = 16,724 tok/s, done in ~6.6 h | 4 GPUs, $288 |
+| **3. Dedicated pools** | 4 capped interactive + 3 full batch replicas, always on | Meets it, isolated | 15,867 tok/s, done in ~7.0 h | 7 GPUs, $504: over budget |
+| **4. Time-split pools** | Day: 4 capped interactive. Night: 1 capped interactive + 3 replicas relaunched at full batch | Meets it; night interactive load is 1,500 of 3,417 tok/s on its own replica | 15,867 tok/s, done in ~7.0 h | 4 GPUs, $288 |
+
+### Decision
+**Option 4, time-split pools.**
+- **Latency** rules out option 1, and the queueing argument rules out option 2: even with a fast step,
+  a slot held by a batch request lands in interactive TTFT, and that wait is paid on every agent step.
+- **Budget** rules out option 3; option 4 buys the same isolation with the same 4 GPUs by moving three
+  replicas between operating points twice a day.
+- **Day sizing holds.** 12,000 ÷ 3,417 ≈ 3.5, so 4 capped replicas run at ρ ≈ 0.66.
+- **Night sizing holds.** 3 × 5,289 = 15,867 tok/s finishes 400M tokens in about 7.0 h, leaving about an
+  hour of slack in the window.
+- **Team fit.** Two Kubernetes deployments with different `--max-num-seqs` values, scaled on a schedule,
+  are within a two-person team's six weeks.
+- **What would change it.**
+  - *Residency relaxed:* send the nightly work to a provider batch tier (roughly half the interactive
+    price at the time of writing) and shrink the fleet.
+  - *Nightly volume above ~457M tokens* (15,867 × 28,800) or a shorter window: add a fourth batch GPU.
+  - *Night interactive load above ~3,400 tok/s:* keep two interactive replicas at night.
+  - *Engine priority scheduling that load tests show protects interactive TTFT:* option 2 becomes viable
+    and drops the twice-daily switch.
+
+### Trade-offs accepted
+- **Two switchovers a day.** Relaunching replicas drains in-flight work and costs warm-up time. Watch
+  switchover duration and batch requests failed during the drain.
+- **Thin night margin.** About one hour of slack: watch nightly completion time and tokens per night,
+  and alert when the projected finish passes the window.
+- **Lower daytime efficiency.** Capped replicas give about 14 % fewer tokens per GPU than running full
+  (4,556 vs 5,289). Watch goodput per GPU-hour in capacity reviews.
+- **One interactive replica at night.** No redundancy for night users; watch night TTFT p95 and replica
+  restarts, and fail over to a batch replica if it goes down.
+
+### Review rubric
+- **Constraints first.** The write-up states the latency SLO, budget, residency rule and window as
+  numbers before naming any option.
+- **Sizing is shown.** Replica counts come from per-replica capacity at the SLO-capped batch, with
+  headroom stated, and every figure can be recomputed from the inputs.
+- **Queueing is addressed.** It explains where interactive requests wait (admission, not only step time)
+  and why utilisation near 1 is acceptable for batch but not for interactive traffic.
+- **Each rejected option names its failing constraint**, not a vague preference.
+- **Reversal triggers are measurable**, such as a token volume, a load level or a test result.
+- **Monitoring is named** for every accepted trade-off: the metric and the threshold that would trigger
+  a change.
 
 ## Why it exists
 - **A GPU at concurrency 1 is mostly idle.** It streams 16 GB of weights through its memory system to

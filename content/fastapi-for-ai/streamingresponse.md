@@ -5,7 +5,8 @@ name: StreamingResponse
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/server-sent-events
@@ -38,6 +39,144 @@ mid-run errors go in-band and nothing may buffer.
   before the first byte, cancelling the upstream model and tools on disconnect, and buffering on every hop.
 - **What you can skip.** HTTP/2 framing details and chunked-encoding byte formats. Know the ASGI message
   order, the frozen-headers rule and the proxy buffering trap; that is enough to ship and debug agent streams.
+
+## Lab
+### Task
+Turn a fake tool-calling agent into a streamed NDJSON endpoint that a UI or a supervisor agent can
+parse safely. Time box: 45-60 minutes. Prerequisites: Async endpoints and HTTPException handling.
+- **Validate first:** a prompt over 8000 characters gets a real 413 before any byte is streamed.
+- **Typed records:** every agent event becomes one JSON line, and a successful run ends with `done`.
+- **In-band failure:** a tool that raises after the 200 went out ends the stream with a typed `error` line.
+- **Wire hygiene:** `application/x-ndjson` and `X-Accel-Buffering: no` on the response.
+
+### Starter code
+Save as `lab_stream.py`. Runs with `pip install fastapi httpx` (checked with FastAPI 0.161.1, Starlette
+1.9.0, httpx 0.28.1, Python 3.12); the YOUR CODE path raises `NotImplementedError` until you fill it in.
+
+```python
+import asyncio, json
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
+from pydantic import BaseModel
+
+app = FastAPI()
+
+class Ask(BaseModel):
+    prompt: str
+    fail_tool: bool = False                            # lets tests force a mid-run tool failure
+
+async def search_orders(q: str, fail: bool) -> str:   # a fake tool; no network
+    await asyncio.sleep(0.01)
+    if fail:
+        raise TimeoutError("orders API timed out")
+    return "order 1042: shipped"
+
+async def agent_loop(prompt: str, fail_tool: bool):
+    """Fake agent: step 1 calls a tool, step 2 streams the answer."""
+    yield {"type": "step", "n": 1}
+    yield {"type": "tool_call", "name": "search_orders"}
+    result = await search_orders(prompt, fail_tool)
+    yield {"type": "tool_result", "name": "search_orders", "summary": result[:80]}
+    yield {"type": "step", "n": 2}
+    for word in "Your order has shipped.".split():
+        yield {"type": "delta", "text": word + " "}
+
+@app.post("/agent/run")
+async def run(body: Ask):
+    # YOUR CODE 1: reject prompts over 8000 characters with a real 413, BEFORE any byte is streamed.
+    async def ndjson():
+        # YOUR CODE 2: yield one JSON object per line for every event from agent_loop,
+        #         then a final {"type": "done"} line.
+        # YOUR CODE 3: if the loop raises after streaming started, yield
+        #         {"type": "error", "error": "<exception class name>"} as the last line instead.
+        raise NotImplementedError
+        yield
+    # YOUR CODE 4: set media_type to NDJSON and disable proxy buffering for this route.
+    return StreamingResponse(ndjson())
+
+if __name__ == "__main__":
+    client = TestClient(app)
+    for fail in (False, True):
+        with client.stream("POST", "/agent/run", json={"prompt": "where is 1042?", "fail_tool": fail}) as r:
+            print(r.status_code, r.headers["content-type"])
+            for line in r.iter_lines():
+                print(line)
+```
+
+### Expected output
+`python lab_stream.py` with a correct solution prints:
+
+```
+200 application/x-ndjson
+{"type": "step", "n": 1}
+{"type": "tool_call", "name": "search_orders"}
+{"type": "tool_result", "name": "search_orders", "summary": "order 1042: shipped"}
+{"type": "step", "n": 2}
+{"type": "delta", "text": "Your "}
+{"type": "delta", "text": "order "}
+{"type": "delta", "text": "has "}
+{"type": "delta", "text": "shipped. "}
+{"type": "done"}
+200 application/x-ndjson
+{"type": "step", "n": 1}
+{"type": "tool_call", "name": "search_orders"}
+{"type": "error", "error": "TimeoutError"}
+```
+
+### Tests
+Save as `test_lab_stream.py` next to the starter and run `pytest -q`. On the starter all three fail: no
+content type, no records, and a 200 where the 413 belongs.
+
+```python
+import json
+from fastapi.testclient import TestClient
+from lab_stream import app
+
+client = TestClient(app, raise_server_exceptions=False)
+
+def records(payload):
+    with client.stream("POST", "/agent/run", json=payload) as r:
+        return r, [json.loads(line) for line in r.iter_lines() if line]
+
+def test_happy_path_is_typed_ndjson_ending_in_done():
+    r, recs = records({"prompt": "hi"})
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("application/x-ndjson")
+    assert r.headers["x-accel-buffering"] == "no"
+    assert [x["type"] for x in recs] == ["step", "tool_call", "tool_result", "step",
+                                         "delta", "delta", "delta", "delta", "done"]
+
+def test_tool_failure_mid_stream_is_an_in_band_error():
+    r, recs = records({"prompt": "hi", "fail_tool": True})
+    assert r.status_code == 200                      # headers were already sent
+    assert recs[-1] == {"type": "error", "error": "TimeoutError"}
+    assert not any(x["type"] == "done" for x in recs)
+
+def test_oversized_prompt_is_rejected_before_streaming():
+    r = client.post("/agent/run", json={"prompt": "x" * 8001})
+    assert r.status_code == 413
+```
+
+### Failure scenarios
+- **Raise `HTTPException(413)` inside `ndjson()` instead of before it.** The client sees a 200 and a
+  broken or empty body. Debug: log when the response object is returned versus when the check runs; the
+  check must precede `return StreamingResponse(...)`.
+- **Drop the `try/except` around the loop.** The failing-tool test sees a truncated stream with neither
+  `done` nor `error`, and the server log shows a traceback after a 200. Debug: count runs ending without
+  a terminal record.
+- **Yield dicts or forget the `"\n"`.** Records glue together and `json.loads` fails on the client.
+  Debug: print `repr(line)` from `iter_lines()` to see the framing.
+- **Make `search_orders` call `time.sleep`.** Tests still pass, but concurrent streams stall each other.
+  Debug: run two `curl -N` clients at once and compare first-byte times.
+
+### Submission
+- **Code:** `lab_stream.py` with every YOUR CODE step done and no change to `agent_loop` or the tests.
+- **Test run:** the `pytest -q` output showing 3 passed.
+- **Trace:** the output of `python lab_stream.py`, matching the expected output above.
+- **Note (3-5 sentences):** why the 413 must happen before the first byte and what a client should do
+  with a stream that ends without `done` or `error`.
+- **Evaluated on:** passing tests, an unchanged event protocol, and a note that names frozen headers.
 
 ## Why it exists
 - **The default path buffers.** The handler returns a value, FastAPI serialises it, Starlette sets
