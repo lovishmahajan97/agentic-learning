@@ -5,7 +5,8 @@ name: Statement of work
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/success-metrics-kpis
@@ -33,6 +34,72 @@ statistical acceptance on a frozen eval set, named tools and actions, dated depe
   as explicitly in or out of scope, and making credentials and sandbox access dated customer obligations.
 - **What you can skip.** The legal terms in the MSA. Leave liability and IP wording to counsel, and this
   lesson is not legal advice.
+
+## Decision case
+### Scenario
+A parcel carrier wants an agent for "where is my parcel" and delay emails, about 25,000 a month. It reads
+tracking with `get_tracking`, drafts a reply, and may issue a goodwill credit of up to €20 with
+`issue_credit`. Procurement asks for a fixed price that guarantees "90% fully automated". All figures are
+illustrative.
+
+Constraints:
+- **Budget.** Procurement needs a cap: €220,000 in total.
+- **Deadline.** Go-live before peak season, 16 weeks from signature.
+- **Unseen data.** The delivery team has not seen a single email; a sample arrives in week 2, after the
+  data processing agreement is signed.
+- **Write approval.** The customer's security review of `issue_credit` takes about 3 weeks.
+- **One contract preferred.** Procurement dislikes running two separate tenders.
+
+### Options
+| Option | How it works | Budget certainty | Who carries quality risk | Fits 16 weeks and unseen data? |
+|---|---|---|---|---|
+| **A. Fixed price, 90% guaranteed** | One SOW, full scope including autonomous credits | High, until the dispute | Vendor, priced blind | No: the target was never measured |
+| **B. Time and materials, capped** | Hourly billing up to €220k, no quality commitment | Cap only | Customer, with no acceptance test | Yes, but no definition of done |
+| **C. Phased under one SOW** | Phase 1: €45k fixed fee, weeks 1-4, measure on real emails. Gate. Phase 2: €150k in milestones, weeks 5-16, thresholds set from Phase 1. €25k change budget | €220k cap | Shared, after measurement | Yes |
+| **D. Outcome-based fee** | For example €1.20 per resolved email, uncapped | Low: about €18k a month at 60% resolution, more in peak | Vendor | Needs an agreed attribution rule first |
+
+### Decision
+Choose **C**, because the constraints rule out the others:
+- **The 90% target cannot be priced yet.** Nobody has measured feasibility or a human baseline on these
+  emails. Phase 1 does that on 500 real emails and reports achievable resolution per intent.
+- **One contract, two commitments.** A single SOW with a gate clause meets procurement's preference, and
+  either side may stop at the gate with the findings delivered. €45k + €150k + €25k = €220k, the cap.
+- **Acceptance becomes a computation.** If Phase 1 measures 84% resolution, Phase 2 might accept at 80% on
+  300 frozen scenarios, which allows up to 60 failures.
+- **The write tool is scoped by approval.** The security review starts in week 1, in parallel. Until it
+  passes, `issue_credit` drafts a credit for a human to approve; after it passes, credits up to €20 run
+  automatically.
+- **"Never more than €20" is enforced, not just tested.** A tool validator rejects larger amounts. A clean
+  run of 300 scenarios alone only bounds the rate below about 1% (3/300).
+
+What would change it:
+- **Data seen earlier.** If 500 representative emails were shared under NDA before signature, Phase 1
+  could shrink to 2 weeks.
+- **Measured feasibility.** If Phase 1 measured 92% or more on the customer's own emails, a fixed price
+  for Phase 2 becomes reasonable.
+- **Procurement insists on fixed price for everything.** Then fix the price for Phase 1 only and keep
+  Phase 2 as a priced option.
+
+### Trade-offs accepted
+- **No 90% guarantee at signature.** The sponsor must sell a gate to procurement. Mitigate with a dated
+  Phase 1 report and a written go or no-go rule.
+- **The customer may pay €45k for a no-go.** That is the price of learning feasibility before committing
+  €150k; record findings so they are reusable.
+- **Phase 2 starts with only 12 weeks.** A late email sample moves milestones day for day; track slip
+  days at every steering meeting.
+- **Credits stay human-approved if the review slips.** Watch approval rate per draft so the case for
+  automation is ready when the review passes.
+
+### Review rubric
+- **No guarantee before measurement.** The write-up commits to effort until feasibility is measured on
+  the customer's data.
+- **Acceptance is a computation.** It names the frozen set size, thresholds, allowed failures and the
+  harness.
+- **Every write tool has a scope and an approval rule,** with zero-tolerance limits backed by a control.
+- **Money adds up.** Phase fees and contingency sum to the cap, and each payment ties to a gate.
+- **Dependencies are dated.** Data and security review dates have a day-for-day consequence.
+- **Reversal conditions are concrete.** It names the measurement or procurement rule that would change
+  the structure.
 
 ## Why it exists
 - **Two parties start with different finish lines.** The customer imagines "an agent that answers our

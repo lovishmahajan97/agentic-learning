@@ -5,7 +5,8 @@ name: Data residency
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - security-governance-compliance/data-classification
@@ -39,6 +40,64 @@ staff. Sovereignty differs: whose law can compel access.
 - **What you can skip.** Interpreting transfer law yourself. Ask the customer whether they mean residency,
   localisation or sovereignty, let counsel own the legal assessment, and own the data-flow map and the
   routing rules.
+
+## Decision case
+### Scenario
+A US software company sells a procurement agent that reads supplier contracts, compares quotes and
+drafts purchase orders. It has signed its first three EU enterprise customers and has 40 more in the
+pipeline. All figures are illustrative planning numbers, not benchmarks.
+- **Contract terms:** customer data is stored and processed only in the EU, and the model provider does
+  not retain prompts. Counsel confirmed with each customer that they mean residency, not sovereignty: a
+  US-headquartered provider is acceptable.
+- **Scale:** 150,000 agent runs a month at about 12 model calls each, so 1.8 million calls a month, about
+  60,000 a day.
+- **Quality:** on the agent eval set, the newest model (global endpoint only) scores 93%; the best model
+  on the provider's EU endpoint scores 91%; the release bar is 90%.
+- **Availability commitment:** 99.5% a month, which allows 0.005 x 30 x 24 = 3.6 hours of downtime.
+- **Team and deadline:** 5 engineers, none with GPU operations experience, 12 weeks to the first go-live.
+
+### Options
+| Option | How it works | Meets contract? | Quality | Operations and deadline |
+|---|---|---|---|---|
+| US stack with transfer safeguards | Keep everything in the US under standard contractual clauses | no: processing leaves the EU | 93% | nothing new |
+| EU cell plus provider EU endpoint | Full stack in an EU region, gateway pinned to the EU zero-retention endpoint, in-region tools, traces, memory and backups, fail closed | yes | 91%, above the bar | fits: no new skills |
+| EU cell plus self-hosted open-weight model | As above, but the model runs on your own EU GPUs | yes | unknown until evaluated | no: new GPU operations within 12 weeks |
+| Deploy into each customer's cloud | One stack per customer | yes | depends on model | no: 43 stacks to operate if the pipeline closes |
+
+### Decision
+**An EU regional cell with the provider's EU zero-retention endpoint and a fail-closed gateway.** It meets
+the contract on every hop, stays above the quality bar, and uses skills the team already has.
+- **Every hop moved:** the agent-run table lists model calls, tool servers, OCR, memory, checkpoints,
+  traces and backups; each is pinned to the EU cell or replaced with an in-region service.
+- **Fail closed:** if the EU endpoint is unavailable, runs queue and the gateway alerts; nothing falls back
+  to the global endpoint.
+- **Evidence:** the data-flow map and sub-processor list are generated from configuration and shared with
+  customers, and the staging drill runs weekly.
+
+**What would change it.** A customer requiring sovereignty (no provider subject to foreign law) moves that
+tenant to a self-hosted model or a customer-cloud deployment. If the EU model falls below the 90% bar,
+or the newest model's lead becomes decisive for buyers, re-evaluate self-hosting with a dedicated
+operations hire.
+
+### Trade-offs accepted
+- **Two points of quality.** EU tenants get 91% rather than 93%. Re-run the eval whenever the EU endpoint
+  gains a model, and track task success per region.
+- **Availability during provider incidents.** Queued runs count against the 3.6 hours. Track EU endpoint
+  minutes unavailable per month and keep queue time visible to customers.
+- **A second stack to run.** Two regions double deploys and on-call surface. Keep one codebase with
+  region as configuration, and alert on configuration drift between cells.
+- **Follow-the-sun support weakens,** because only EU staff see unredacted EU data.
+
+### Review rubric
+- **Term clarified:** the write-up records whether the customer means residency, localisation or
+  sovereignty, and who confirmed it.
+- **Every hop mapped:** model, provider retention, tools, memory, checkpoints, caches, traces, backups and
+  human access each have a location.
+- **Fail-closed behaviour defined and tested:** what happens when the in-region endpoint is down, with a
+  drill.
+- **Numbers recomputed:** call volume, downtime budget and quality gap follow from stated inputs and are
+  labelled illustrative.
+- **Change triggers stated:** which customer demand or eval result would move the decision.
 
 ## Why it exists
 - **Regulators want data within reach of their own law.** Governments, regulators and contracts set the

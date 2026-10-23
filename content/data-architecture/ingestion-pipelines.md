@@ -5,7 +5,8 @@ name: Ingestion pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - data-architecture/etl-elt-for-rag
@@ -38,6 +39,66 @@ cites deleted, stale or forbidden documents.
   carried as a field, and `fetched_at` plus `source_version` passed through to the agent for citations.
 - **What you can skip.** Writing your own CDC engine or streaming platform. Use Debezium or a managed
   connector and spend the time on deletes, ACLs and freshness alarms.
+
+## Decision case
+### Scenario
+A retailer is launching two agents on one ingestion platform. A policy agent answers staff questions
+over a Confluence space; a refunds agent approves refunds using order status from a Postgres `orders`
+table. All figures are illustrative.
+
+- **Confluence:** 150,000 pages averaging 2,000 tokens, about 1% changed per day. The API exposes
+  `updated_at` and a list endpoint (250 ids per call); the service account's rate limit is 10 requests a second.
+- **Orders:** 2 million rows and about 50,000 changes a day (under one a second on average). Rows are
+  hard-deleted on erasure requests.
+
+Constraints:
+- **Freshness.** Order status must reach the agent within 60 seconds; policy edits within 1 hour.
+- **Deletes.** Legal requires a deleted policy or an erased order to stop appearing in tool results within 12 hours.
+- **Quota.** Ingestion may use at most a quarter of the Confluence rate limit, because other integrations share it.
+- **Team.** Two data engineers with Airflow experience and none with Kafka. The DBA will allow one logical
+  replication slot if WAL retention is alarmed.
+- **Deadline.** Both agents go live in 6 weeks.
+
+### Options
+| Option | How it works | Freshness (60 s orders, 1 h docs) | Deletes within 12 h | Confluence calls a day | Team load |
+|---|---|---|---|---|---|
+| **A. Nightly full re-crawl** | Fetch and embed everything every night | Fails both: up to 24 h | Only if the index is rebuilt from scratch | 150,000 fetches, about 4.2 h at the full 10 per second | Low |
+| **B. Cursor poll plus reconcile everywhere** | 15-minute Confluence cursor and a 30-second `updated_at` poll on orders, both with overlap; snapshot diffs every 12 h | Docs pass; orders mostly pass but miss late-committed rows until the next poll or reconcile | Pass, but a 2-million-row snapshot diff of orders twice a day | About 2,800 | Low |
+| **C. Push and CDC everywhere** | Confluence webhooks plus Debezium on orders | Pass | Webhooks are lossy, so docs still need a reconcile | About 2,800 plus webhook handling | High: two streaming paths |
+| **D. Tiered by source** | Confluence on B's cursor plus 12-hourly reconcile; orders on Debezium CDC with an initial snapshot | Pass: docs 15 min, orders in seconds | Pass: tombstones for docs, delete events for orders | About 2,800 | Medium: one CDC path |
+
+Call counts for B and D: 1,500 changed pages fetched, 96 polls, and two listings of 600 calls each.
+
+### Decision
+Choose **D**, because the two sources face different binding constraints:
+- **Confluence is bound by quota, not freshness.** 2,800 calls a day uses about 0.3% of 864,000 calls a day at
+  10 per second, far inside the quarter allowed. A full crawl would use the whole limit for 4.2 hours. A 15-minute poll beats the 1-hour target fourfold.
+- **Orders are bound by correctness.** The refunds agent acts on status, and a timestamp cursor misses hard
+  deletes and late commits, so the ordered, delete-inclusive stream from CDC is worth one streaming path.
+- **The team can run one CDC path, not two.** Webhooks would add a second streaming system for docs
+  that are already 4x fresher than required.
+- **Embedding cost follows change.** About 3 million tokens a day instead of 300 million for a nightly re-crawl.
+
+What would change it:
+- **No replication slot.** If the DBA refuses, use B for orders, and have the refund tool re-read the order row from a
+  replica before acting, so ingestion lag cannot cause a wrong refund.
+- **A tighter delete deadline.** At 1 hour, reconcile Confluence hourly: 14,400 listing calls a day, still under 2% of the limit.
+- **A source with a change feed.** If the wiki moves to SharePoint, Graph delta queries report deletes and the reconcile becomes a safety net.
+
+### Trade-offs accepted
+- **A replication slot on the primary.** A stalled consumer retains WAL and can fill the disk. Watch slot lag in
+  `pg_replication_slots` and page before disk reaches a set threshold.
+- **Deleted pages can linger up to 12 hours.** Watch tombstones emitted per reconcile; a rising count means the cursor misses deletes the source should report.
+- **Every raw version is kept.** Storage grows with edits; review it monthly and keep the last N versions of large binaries.
+- **Docs are up to 15 minutes stale.** Return `fetched_at` and a stale flag so the policy agent can say so.
+
+### Review rubric
+- **Change mode per source.** The write-up classifies each source by how it exposes change and deletes, not one mode for all.
+- **Constraints carry numbers.** Freshness, delete deadline, quota and team skills are stated before options are compared.
+- **Quota and cost are computed.** Calls and tokens per day are derived for each option and checked against the limit.
+- **Deletes have a named mechanism and deadline.** Tombstones, reconcile interval or CDC delete events, with the worst-case lag.
+- **The operating risk is monitored.** Slot lag, DLQ depth or change-ratio alarms are named for the chosen design.
+- **Reversal conditions are concrete.** It says which refusal, deadline or source change flips the choice.
 
 ## Why it exists
 - **The first version is always a script.** List everything in Confluence or an S3 bucket, embed it,

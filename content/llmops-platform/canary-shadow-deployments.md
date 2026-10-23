@@ -5,7 +5,8 @@ name: Canary / shadow deployments
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - llmops-platform/rollback
@@ -38,6 +39,65 @@ turn "ship the new agent and hope" into measured exposure.
   cost per task, escalation rate.
 - **What you can skip.** Service-mesh internals and statistics beyond the `n ≈ 16 · σ² / δ²` rule of
   thumb; that is enough to plan a ramp.
+
+## Decision case
+### Scenario
+A support agent (search, read-order and refund tools) must move from bundle-v12 to bundle-v13, which
+swaps in a different model family. Offline evals show v13 slightly ahead. All figures are illustrative.
+- **Traffic:** 20,000 sessions a day; v12 costs about $0.031 per task.
+- **Constraints:**
+  - the vendor retires v12's model snapshot in 28 days;
+  - extra evaluation spend (shadow inference) at most $1,000;
+  - before a quality verdict, at most 5% of daily sessions (1,000) may see v13;
+  - refunds are real money, so the refund tool can never run in a mirrored arm;
+  - two engineers; the gateway already hashes users, but dry-run tool adapters take about 3 days to build.
+- **Sample sizes (n ≈ 16 · σ² / δ²):** schema failures 0.5% → 5% need 212 per arm; a 0.1-point judge
+  shift needs 1,024; a refund rate doubling from 3% to 6% needs 16 × 0.045 × 0.955 / 0.03² ≈ 764.
+
+### Options
+| Option | How it works | Extra spend | Exposure before a quality verdict | Calendar (one fix-and-retry) | Refund risk |
+|---|---|---|---|---|---|
+| **A. Big-bang after the eval gate** | flip 100% once offline evals pass | $0 | 20,000 sessions a day: fails | 1 day | every refund decided by an unobserved model |
+| **B. Canary only** | 1% (2 d), 5% (2 d), 25% (1 d), 50% (1 d), 100% | $0 | 200 a day at 1%, 1,000 at 5%: fits | 6 d, 13 d with a retry | real refunds from the first session |
+| **C. Shadow 20% with dry-run tools, then B** | 3 d build, 3 d shadow plus a 2% A-vs-A slice, then the canary ramp | 12,000 × $0.031 = $372 + $37 = $409 | 0 during shadow, then as B | 12 d, 22 d with a retry (1 d fix, 3 d shadow, 6 d canary) | first tool choices checked with no money moving |
+| **D. Shadow 100% for 3 days, then B** | as C, every session mirrored | 60,000 × $0.031 = $1,860: fails | as C | as C | as C, with more rare intents covered |
+
+### Decision
+Choose **C**, because it is the only option that meets every constraint and catches loop regressions
+with nobody exposed.
+- **Exposure:** A puts all 20,000 daily sessions on an unmeasured model. C exposes nobody until shadow is
+  clean, then at most 1,000 a day until the 5% step has 2,000 sessions, enough for the 1,024 judge and
+  764 refund samples.
+- **Budget:** $409 fits under $1,000; D's $1,860 does not.
+- **Deadline:** 22 days with one retry fits 28. B is faster but buys nothing the deadline needs.
+- **Refunds:** the refund tool is stubbed in shadow and the intended calls are logged, so C compares refund
+  decisions before any money moves. B learns that from real refunds.
+- **The longer-loop failure** (steps per task 4.1 → 6.3) shows up in shadow pairs, so it costs a fix
+  instead of a rollback.
+
+**What would change it:**
+- **Retirement in under about 12 days:** go to B with the steps held only to their minimum samples.
+- **A patch release of the same model family** with clean offline evals: B alone is enough.
+- **Shadow budget above $1,860:** D covers rare intents and tenants faster.
+
+### Trade-offs accepted
+- **Three days of engineering on dry-run adapters.** They pay back on every later migration; track
+  argument-validation failures per tool so they stay faithful to the real tools.
+- **Shadow cannot see multi-turn or post-tool behaviour.** Completion rate and real refund behaviour are
+  read only in canary, so the refund-rate guard is the tightest one there.
+- **The ramp is slow at 1%.** Two days at 200 sessions only rules out catastrophic breakage; quality is
+  judged at 5% and 25%, not earlier.
+- **Sticky cohorts concentrate harm.** The 5% cohort gets every v13 defect; change the salt per
+  experiment and watch escalations for that cohort.
+
+### Review rubric
+- **Every constraint is a number**, and each option is scored against it in one table.
+- **Sample sizes are computed** for the guard metrics that decide each step, and step durations hold
+  at least that many sessions per arm.
+- **Side-effecting tools are named**, with how each is stubbed in shadow and guarded in canary.
+- **The calendar includes one fix-and-retry cycle** and still meets the deadline.
+- **Shadow disagreement is read against an A-vs-A floor**, not as a raw percentage.
+- **At least two conditions that would change the choice** are stated, each tied to a measurable fact.
 
 ## Why it exists
 - **Offline evals only say "probably better".** They score a few hundred curated cases; they cannot tell

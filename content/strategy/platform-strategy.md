@@ -5,7 +5,8 @@ name: Platform strategy
 kind: decision
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - llmops-platform/centralized-vs-federated-ai-platform
@@ -33,6 +34,68 @@ credentials, traces); leave agent logic with teams; build after demand appears.
   request with team and feature, and keeping your agent loop, prompts and tool selection team-owned.
 - **What you can skip.** Funding-model politics and org design detail; know the three scoring questions
   and the break-even inequality well enough to argue where your agent's needs belong.
+
+## Decision case
+### Scenario
+A payments company has three agent teams in production pilots (disputes, merchant onboarding, internal
+IT) and two more planned within two quarters. A new platform team must decide what its first quarterly
+release contains. All figures are illustrative, in $k per year unless stated.
+- **Capacity:** 3 platform engineers × 13 weeks = 39 engineer-weeks (ew) this quarter.
+- **Audit:** the regulator expects a trail of every agent action within 6 months, linking the action to
+  the run, the credential and the triggering tool result.
+- **Residency:** all model traffic must stay in EU regions.
+- **Latency:** product teams will accept at most 50 ms added p99 per model call from any shared hop.
+- **Variance:** the three teams use two different agent frameworks and very different tool sets.
+- **Break-even inputs from the inventory (n = 3 today):**
+
+| Capability | c_team | C_platform | c_adopt | Coordination | Incident term |
+|---|---|---|---|---|---|
+| Scoped tool credentials + traces | 40 | 90 | 8 | 15 | 100 |
+| Shared agent framework and runtime | 50 | 160 | 40 | 25 | 0 |
+
+### Options
+| Option | How it works | Effort vs 39 ew | Audit by month 6 | Break-even (n = 3) | Latency and variance |
+|---|---|---|---|---|---|
+| Full agent platform | Gateway, budgets, credentials, traces and a mandated shared agent runtime | About 60 | Likely late: runtime work crowds out the trail | Runtime fails: 150 vs 160 + 120 + 25 = 305 | Two teams must rewrite their loops |
+| Thin core | Operate an open-source gateway (10 ew), per-run budgets (6), scoped tool credentials (12), one trace schema (8); frameworks stay with teams | 36 | Yes | Credentials + traces pass: 120 + 100 = 220 vs 90 + 24 + 15 = 129 | One hop, measured against the 50 ms budget |
+| Standards only | Publish a trace format and credential policy; each team implements it | About 2 | Unlikely: three implementations to audit | No platform cost, but the expected incident cost (100) remains | No hop |
+
+### Decision
+**Thin core.** It is the only option that fits 39 ew (with 3 ew spare), meets the 6-month audit
+requirement with one trace store, and centralises exactly the capabilities that clear break-even.
+
+The shared runtime fails break-even even at five teams (250 vs 160 + 200 + 25 = 385), because its adoption
+cost (40) sits close to each team's own cost (50).
+- **Residency is enforced in one place:** the gateway routes only to EU-region model endpoints, and direct
+  provider keys are revoked.
+- **Teams keep their loops, prompts and tool selection;** they adopt the gateway key, run-ID tags and
+  credentials issued by the shared tool layer.
+
+**What would change it.**
+- **The gateway hop measures above 50 ms p99** under load: deploy it per region beside the agents, or let
+  latency-critical traffic use a sidecar that still writes the shared trace.
+- **A third team adopts the same framework** and its adoption cost drops toward 10: re-run break-even
+  for a paved-road runtime next quarter.
+- **The audit deadline moves earlier than the quarter:** ship credentials and traces first (20 ew) and
+  defer per-run budgets.
+
+### Trade-offs accepted
+- **Duplicated agent loops across teams.** Accept it while variance is high; watch the number of
+  frameworks in use and the share of loop code that teams copy from each other.
+- **Every model call takes a new dependency.** Watch gateway availability and added p99 per team, with a
+  documented fail-closed rule for dispute actions.
+- **Generic tool descriptions from the shared tool layer.** Teams may wrap them; watch tool-selection
+  errors in each team's eval after migration.
+
+### Review rubric
+- **Break-even shown per capability:** the write-up plugs numbers into the inequality, incident term
+  included, and the arithmetic checks.
+- **Capacity respected:** the first release fits the team's engineer-weeks, with what is deferred named.
+- **Externalities identified:** audit, residency and spend are traced to concrete regulatory or
+  financial requirements.
+- **Variance kept local:** high-variance pieces (agent loops, retrieval) stay team-owned with a reason.
+- **Shared hop engineered:** latency budget, availability and down-mode are stated for the gateway.
+- **Revisit triggers stated:** which adoption or latency measurement would reopen the boundary.
 
 ## Why it exists
 - **The same needs recur.** Past a couple of AI projects, every team needs an API key to a model

@@ -5,8 +5,9 @@ name: Tracing
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: agentic-verified
+status: typed
 agent_relevance: core
+lesson_type: lab
 related:
   - observability/spans
   - observability/distributed-tracing-across-services
@@ -40,7 +41,9 @@ in order to debug them.
 ## Lab
 ### Task
 Make one agent turn's trace tell the truth. The model asked for three tools in one step; the starter
-runs them in a thread pool, which silently splits the turn into four traces. Its self-time maths also
+runs them in a thread pool, which silently splits the turn into four traces.
+
+Its self-time maths also
 double-counts parallel children, and it cannot name the critical path, so you cannot say which tool to
 speed up. Time box: 45-60 minutes.
 - **Prerequisites:** this lesson's How it works (context propagation, self time, the critical path) and
@@ -134,7 +137,7 @@ def print_tree(spans):
     try:
         print("critical path:", " > ".join(critical_path(root, spans)))
     except NotImplementedError:
-        print("critical path: TODO")
+        print("critical path: (LAB 3 not done)")
 
 
 if __name__ == "__main__":
@@ -143,7 +146,8 @@ if __name__ == "__main__":
 ```
 
 As given, it runs and prints `traces: 4`, a first `agent.step` with only its generation under it and
-0.30 s of unexplained self time, and `critical path: TODO`: the tool spans became orphan traces.
+0.30 s of unexplained self time, and `critical path: (LAB 3 not done)`: the tool spans became orphan
+traces.
 
 ### Expected output
 ```
@@ -220,9 +224,9 @@ critical path in the last two.
   Observe: `RuntimeError: cannot enter context: ... is already entered` as two threads run the same
   context at once. Debug: read which call raised; a `Context` can be entered by one thread at a time,
   so copy it per task.
-- **Inject: remove the `_current.reset(token)` call.** Observe: the second `agent.step` is nested under
-  the first and the root's self time looks negative or tiny. Debug: print each span's `parent_id`; a
-  span that never restores its parent leaves later siblings attached to it.
+- **Inject: remove the `_current.reset(token)` call.** Observe: the tools and the second `agent.step`
+  nest under the first `generation`, which shows a negative self time. Debug: print each span's
+  `parent_id`; a span that never restores its parent leaves later siblings attached to it.
 - **Inject: run the tools with `asyncio.gather` on tasks created before `agent.step` opens.** Observe:
   tool spans hang off the root instead of the step. Debug: a task copies the context at creation, so
   create tasks inside the span that should parent them.

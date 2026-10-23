@@ -5,7 +5,8 @@ name: Business continuity
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: background
 related:
   - reliability/disaster-recovery
@@ -38,6 +39,66 @@ Disaster recovery is its technical subset; a business impact analysis comes firs
   whether a validated second model exists, and how manual or fallback work is reconciled afterwards.
 - **What you can skip.** The ISO 22301 management-system details and BIA templates; the business owns
   those. Know the RTO + catch-up rule and build the ladder rungs that are engineering's.
+
+## Decision case
+### Scenario
+An insurer's claims-triage agent classifies first notices of loss and routes them to adjusters. It runs
+on one provider's fine-tuned model, and the provider has just announced that model's retirement in 90
+days. No outage has happened; the function still stops on day 91. All figures are illustrative.
+- **BIA entry:** about 2 million model calls a month; maximum tolerable downtime 4 hours, because the
+  regulator expects claims acknowledged within that window.
+- **Quality floor:** at least 94% on the 1,200-item eval set, so 1,128 items. Today's tuned model scores
+  1,141 (95.1%).
+- **Constraints:** EU data residency for prompts, 2 engineers, a 30-day procurement cycle for any new
+  vendor, and the risk committee has flagged single-vendor concentration in its last two reviews.
+
+### Options
+| Option | How it works | Eval score | Fits 90 days | Vendor concentration |
+|---|---|---|---|---|
+| A. Same provider's successor | port prompts, re-tune when tuning opens on day 30 | 1,124 (93.7%) prompted, 4 short; tuned score unknown | about 30 + 14 tune + 7 eval + 14 shadow = 65 days, if tuning closes the gap | unchanged |
+| B. Second provider as primary | port prompts and tool schemas, keep A's successor validated as rung-1 fallback | 1,133 (94.4%) prompted, 5 above the floor | 30 procurement + 21 port + 14 shadow = 65 days | removed: two validated vendors |
+| C. Self-host an open-weights model | tune a small model on past claims | 1,118 (93.2%), 10 short | GPUs, serving and on-call the team has never run | removed, but adds an ops dependency |
+| D. Ask for an extension | negotiate more time | unchanged | depends on the vendor | unchanged |
+
+### Decision
+**Option B: move to a second EU-hosted provider, and keep the first provider's successor as the
+validated fallback.** It is the only option that clears the 1,128 floor today, without depending on a
+tuning run whose result is unknown.
+
+It also resolves the concentration risk the committee raised. Both
+A and B take about 65 days, so B leaves the same 25 days of slack against the deadline.
+- **Why not A:** it might work, but it bets the deadline on a tuning result and leaves the next
+  deprecation just as dangerous.
+- **Why not C:** 10 items short, and it trades a vendor risk for an operations risk the team cannot staff.
+- **Why not D:** an extension is a request, not a plan; ask for it anyway as slack.
+
+**What would change it.** If procurement cannot sign within 30 days, start A in parallel and pick
+whichever passes the eval first.
+
+If the successor, once tuned, beats the second provider on the eval
+set, swap which one is primary and which is fallback. If residency rules out the second provider, A
+becomes the only path and the extension becomes urgent.
+
+### Trade-offs accepted
+- **A thin quality margin.** 5 items above the floor. Run the eval set on every prompt change and alert
+  below 1,133.
+- **Higher run cost.** The second provider may cost more per token; track cost per claim weekly.
+- **Two prompt sets to maintain.** The fallback is only real if it is exercised: route traffic to it for
+  one hour each month and record its score.
+- **The fallback is below the floor.** At 93.7% it is a degraded rung, so its outputs go to human review
+  while it is active, with a banner and a reconciliation sample afterwards.
+
+### Review rubric
+- **Function first:** the write-up starts from the BIA entry (volume, maximum tolerable downtime,
+  quality floor), not from model names.
+- **Evidence, not brochures:** every option has an eval score on the same set, converted to items
+  against the floor.
+- **Timeline arithmetic:** each option's path to production sums to a date inside the notice period
+  with stated slack.
+- **Concentration addressed:** the write-up says whether the next deprecation will be a crisis or
+  scheduled work.
+- **Degraded rung defined:** what happens to outputs while a below-floor fallback is serving.
+- **Reversal condition:** names the procurement, eval or residency result that would move the decision.
 
 ## Why it exists
 - **DR answers "how do we bring the system back", not the hour in between.** Which functions must keep

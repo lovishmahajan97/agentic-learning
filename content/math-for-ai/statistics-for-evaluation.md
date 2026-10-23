@@ -5,7 +5,8 @@ name: Statistics for evaluation
 kind: practice
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -105,6 +106,22 @@ flowchart TD
     Z -->|"add tasks or repeats"| R
     S --> H["Confirm on held-out split"]
 ```
+
+## Misconceptions
+- **"If the two confidence intervals overlap, there is no real difference."** Overlap is the wrong test:
+  the paired interval for B − A cancels shared task difficulty and can exclude zero while the two separate
+  intervals still overlap. Compare the difference, not the two scores.
+- **"p = 0.04 means a 96% chance the new prompt is better."** A p-value is the probability of a delta at
+  least this large if the true difference were zero. It says nothing direct about how likely the change
+  works or how big the gain is; the interval does that.
+- **"Doubling the eval set halves the error bar."** SE shrinks with the square root of n, so doubling n
+  cuts it by about 29%; halving it takes 4x the tasks and 4x the spend.
+- **"Five samples per task gives five times the sample size."** Repeats of one task are correlated; they
+  reduce sampling noise within the task but not task-to-task variation. Average per task, then treat the
+  task as the unit you count and resample.
+- **"The best of 20 variants shows the gain you will get."** Picking the max on the same set that scored
+  it inflates the result: about 64% of the time at least one variant looks significant by luck. Confirm
+  the single pick on a held-out split.
 
 ## Examples
 ### Is B's +2.5 points real? Unpaired intervals versus a paired bootstrap

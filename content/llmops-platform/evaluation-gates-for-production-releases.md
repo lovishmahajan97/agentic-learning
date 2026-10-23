@@ -5,7 +5,8 @@ name: Evaluation gates for production releases
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - llmops-platform/ci-cd-for-prompts-and-models
@@ -39,6 +40,66 @@ champion, per-slice floors and cost, step and latency budgets, with overrides re
   how many repeats safety items get.
 - **What you can skip.** Deriving bootstrap theory. Know that the test is paired, that you read the lower
   bound against −δ, and that inconclusive means review.
+
+## Decision case
+### Scenario
+The refund agent from the worked scenario below issues real refunds. It has 300 tasks plus 50 safety
+tasks, and it cuts two release candidates a week. The current gate blocks when the candidate scores
+below the champion's stored score. Engineers re-run it until green about half the time.
+
+Facts and constraints, with illustrative figures:
+- **Budget.** At most 1,000 agent task runs per release candidate.
+- **Product tolerance.** A drop of more than 3 points in task success is unacceptable. Smaller drops can
+  ship if cost and steps hold.
+- **Safety.** No forbidden refund may reach users. The team's worry is a task that misbehaves in about
+  1 run in 10.
+- **Flip rate.** About one task in fifteen changes verdict between bundles (f ≈ 0.067). On 300 paired
+  tasks the 95% half-width is 1.96 × √(0.067 / 300) ≈ ±2.9 points.
+- **Detection over repeats.** A task that is unsafe 1 run in 10 is caught by k repeats with probability
+  1 − 0.9^k: 10% at k = 1, 41% at k = 5 and 65% at k = 10.
+
+### Options
+| Option | How it works | Runs per candidate | Flaking on noise | Catches a 1-in-10 unsafe task | Fits budget |
+|---|---|---|---|---|---|
+| **A. Block if below the stored champion score** | Today's gate, safety run once | 300 + 50 = 350 | High: one-point moves block | 10% | Yes |
+| **B. Paired non-inferiority, δ = 2, safety once** | Champion re-run on the same tasks, slices block | 600 + 50 = 650 | Frequent reviews: ±2.9 is wider than δ | 10% | Yes |
+| **C. Paired, δ = 3, safety k = 5, slices review-only, budgets on steps and cost** | Three outcomes, every safety repeat must pass | 600 + 250 = 850 | Low: an equal candidate's lower bound of about −2.9 clears −3 | 41% | Yes |
+| **D. As C with safety k = 10** | Twice the safety repeats | 600 + 500 = 1,100 | Low | 65% | No |
+
+### Decision
+Choose **C**:
+- **δ follows the product tolerance and the noise floor.** The 3-point tolerance is just above the
+  ±2.9-point half-width, so an unchanged candidate passes instead of landing in review. B's δ = 2 is
+  tighter than the noise floor, which is the pitfall that produces re-runs.
+- **Safety repeats fit the budget.** k = 5 costs 250 runs, and 850 stays within 1,000. D's k = 10 does not
+  fit.
+- **Slice verdicts go to review, not block.** A 40-item slice cannot decide a 4-point margin
+  (its interval in the example below is [−15, +5]). A human reads its flipped items instead.
+- **Steps and cost are budgets** because a candidate that loops more is a cost regression that success
+  does not show.
+
+What would change it:
+- **A larger budget.** At 1,100 runs per candidate, move to D.
+- **A higher flip rate.** At f = 0.10 the half-width is ±3.6 points, and equal candidates land in review.
+  Grow the task set to about 1.96² × 0.10 / 0.03² ≈ 427 tasks, or widen δ with the product owner.
+- **Read-only tools.** If refunds moved behind human approval, safety repeats could drop to k = 1.
+
+### Trade-offs accepted
+- **k = 5 still misses a single 1-in-10 unsafe task 59% of the time.** Three such tasks would be caught
+  with probability 1 − 0.9^15 ≈ 79%. Back this with the runtime refund limit and the canary, and watch
+  per-task failures across repeats rather than the pass rate.
+- **Two-point regressions can ship.** That is what δ = 3 means. Watch the canary's online success
+  against the champion.
+- **Slice reviews cost human time.** Watch the review-queue age; a growing queue means grow the slice.
+- **Overrides remain possible.** Record approver, reason and expiry, and watch the override rate.
+
+### Review rubric
+- **δ is justified twice:** by product tolerance and by a computed half-width it must not undercut.
+- **Safety detection is quantified** as a probability over repeats, with the backstop for what it misses.
+- **Run counts per option are summed** and checked against the budget.
+- **Inconclusive has a defined route** (bigger run or a human), neither pass nor block.
+- **Agent budgets are gated:** steps and cost per task, measured in the same run as success.
+- **Reversal conditions are quantified,** such as the flip rate or budget that flips the choice.
 
 ## Why it exists
 - **Without a gate, release testing is "someone looked" or "the aggregate went up".** Both reach users. The

@@ -5,7 +5,8 @@ name: AutoGen / AG2 (conversational multi-agent)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - agents/frameworks
@@ -38,6 +39,130 @@ the community fork AG2, which keeps the original API.
   termination conditions, code-execution sandboxing and the model client.
 - **What you can skip.** The lineage trivia beyond what you need to pick the right package and read old
   examples correctly; the next section gives exactly that.
+
+## Lab
+### Task
+Fix the termination of a writer-critic team, the runaway case from this lesson's Check yourself. You
+accept APPROVE only from the critic, add a hard message cap, and report how each run ended, so a
+self-approved draft or a critic that never approves shows up in your logs instead of on the bill.
+- **Time box:** 30-60 minutes.
+- **Prerequisites:** this lesson's AgentChat section and the investigator-reviewer example;
+  multi-agent patterns.
+- **Runs offline:** each agent uses `ReplayChatCompletionClient`, which replays recorded model replies,
+  so no key is needed. The team, agents and termination conditions are the real ones.
+- **Needs:** `autogen-agentchat`, `autogen-ext` and `pytest`; checked with 0.7.5 of all three AutoGen
+  packages on Python 3.12. This is the Microsoft line; in AG2 the same fix is an
+  `is_termination_msg` that checks the sender, plus `max_turns`.
+
+### Starter code
+```python
+# critic_team.py: termination you can trust in a writer-critic team (AutoGen AgentChat 0.4+, offline)
+import asyncio
+from autogen_agentchat.agents import AssistantAgent
+from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination
+from autogen_agentchat.teams import RoundRobinGroupChat
+from autogen_ext.models.replay import ReplayChatCompletionClient
+
+CAP = 6  # hard cap on messages in a run, counting the task message
+
+def build_team(writer_replies: list[str], critic_replies: list[str]) -> RoundRobinGroupChat:
+    """Each agent replays recorded model replies, so runs are deterministic and need no key."""
+    writer = AssistantAgent("writer", model_client=ReplayChatCompletionClient(writer_replies),
+                            system_message="Draft a status update. Revise on feedback.")
+    critic = AssistantAgent("critic", model_client=ReplayChatCompletionClient(critic_replies),
+                            system_message="Check the draft names cause, impact and ETA. "
+                                           "Say APPROVE only when all three are present.")
+    # YOUR CODE 1: anyone who says APPROVE ends the run, and nothing bounds a critic that never
+    # approves. Accept APPROVE only from "critic", and OR it with MaxMessageTermination(CAP).
+    stop = TextMentionTermination("APPROVE")
+    return RoundRobinGroupChat([writer, critic], termination_condition=stop)
+
+async def review(writer_replies: list[str], critic_replies: list[str]) -> dict:
+    result = await build_team(writer_replies, critic_replies).run(task="Write the checkout incident update.")
+    last = result.messages[-1]
+    # YOUR CODE 2: approved must be True only when the last message is the critic's APPROVE,
+    # and capped must be True when the run ended by the message cap
+    return {"messages": len(result.messages), "approved": "APPROVE" in last.to_text(),
+            "capped": False}
+
+GOOD = (["Draft 1: checkout is down.", "Draft 2: checkout down; cause: bad deploy; impact: 30% of "
+         "orders; ETA 14:00 UTC."], ["Missing cause, impact and ETA.", "APPROVE"])
+SELF_APPROVED = (["Draft 1: checkout is down. Looks complete to me, APPROVE.",
+                  "Draft 2: checkout down; cause: bad deploy.", "Draft 3: checkout down; cause: bad deploy."],
+                 ["Missing cause, impact and ETA.", "Missing impact and ETA."])
+STUBBORN = ([f"Draft {i}: checkout is down." for i in range(1, 6)],
+            ["Missing cause, impact and ETA."] * 5)
+
+async def main():
+    for name, (w, c) in [("good", GOOD), ("self-approved", SELF_APPROVED), ("stubborn", STUBBORN)]:
+        try:
+            print(name, "->", await review(w, c))
+        except Exception as e:  # e.g. the replay runs out of replies: an unbounded run
+            print(name, "-> crashed with", type(e).__name__)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+As given, `self-approved` stops after 2 messages with `approved: True` (the writer said APPROVE), and
+`stubborn` keeps going until the replay runs out of replies, ending in `crashed with RuntimeError`
+plus a logged traceback. With a real model that run would continue and bill instead.
+
+### Expected output
+```
+good -> {'messages': 5, 'approved': True, 'capped': False}
+self-approved -> {'messages': 6, 'approved': False, 'capped': True}
+stubborn -> {'messages': 6, 'approved': False, 'capped': True}
+```
+
+### Tests
+```python
+# test_critic_team.py: run with `pytest -q`
+import asyncio
+import critic_team as m
+
+def review(case):
+    return asyncio.run(m.review(*case))
+
+def test_critic_approval_ends_the_run():
+    assert review(m.GOOD) == {"messages": 5, "approved": True, "capped": False}
+
+def test_writer_cannot_approve_its_own_draft():
+    r = review(m.SELF_APPROVED)
+    assert r["approved"] is False
+    assert r["messages"] > 2
+
+def test_stubborn_critic_hits_the_cap():
+    assert review(m.STUBBORN) == {"messages": m.CAP, "approved": False, "capped": True}
+
+def test_cap_counts_every_message_including_the_task():
+    w, c = m.STUBBORN
+    team = m.build_team(w, c)
+    result = asyncio.run(team.run(task="Write the checkout incident update."))
+    assert len(result.messages) == m.CAP
+    assert result.messages[0].source == "user"
+```
+
+On the starter 3 of 4 fail: the self-approval, and two runs that crash with "No more mock responses
+available". The `GOOD` case passes on purpose, so a fix that never approves is caught.
+
+### Failure scenarios
+- **Inject AND instead of OR:** combine the conditions with `&`. Both must fire, so a critic's APPROVE
+  at message 5 no longer ends the run, and all three cases crash once the replies run out. Print
+  `result.stop_reason` per run; it names the condition that actually fired.
+- **Inject a cap that ignores the task message:** set the cap assuming only agent messages count. Runs
+  end one agent turn earlier than you planned. Check `result.messages[0].source`; the task is message 1.
+- **Inject a polite critic:** change the critic's reply to "Not APPROVED yet, missing ETA." A plain
+  text match ends the run on a rejection. Make the approval token unambiguous (a line that is exactly
+  `APPROVE`) and add the rejection to your test set.
+
+### Submission
+- **Your `critic_team.py`** with both `YOUR CODE` steps done and nothing else changed.
+- **A `pytest -q` run** showing 4 passed, plus the script output matching the expected lines.
+- **The `stop_reason`** printed for each of the three cases.
+- **A short note** on what alert you would set on the share of runs that end by the cap, and what a
+  rising share usually means.
+- **Evaluated on:** green tests, approval accepted only from the critic, and every run bounded.
 
 ## Why it exists
 - **Some problems improve with critique.** A writer plus a reviewer, or a coder plus a test runner,

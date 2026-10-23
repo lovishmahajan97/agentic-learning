@@ -5,7 +5,8 @@ name: Few-shot prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/zero-shot
@@ -153,6 +154,25 @@ flowchart TD
     P --> M["Model copies the shown format"]
     M --> L["Label plus neighbour labels logged"]
 ```
+
+## Misconceptions
+- **"Few-shot examples teach the model the task's facts."** They mainly specify format, label space and
+  boundaries. Random labels kept much of the gain in studies of many models; examples do not supply
+  knowledge the model lacks, so a knowledge gap needs retrieval or a tool.
+- **"More examples are always better."** Returns diminish after a few to around ten (illustrative), and
+  every example is paid on every call. Coverage of boundary cases and every label beats count.
+- **"Order and label mix do not matter if each example is correct."** Majority-label and recency bias
+  are measured effects, and order alone can swing accuracy on the same set. Balance labels and choose the
+  order by eval.
+- **"The instruction wins if it conflicts with an example."** The demonstrated pattern usually wins: an
+  instruction for one sentence loses to three paragraph-long examples. Every example must obey every
+  rule.
+- **"Realistic example values make demonstrations better."** The model copies surface details, so a
+  realistic order ID can leak into a real tool call. Use obvious placeholders such as `ORDER-EXAMPLE-1`
+  and block calls that carry them.
+- **"Dynamic selection is a free accuracy upgrade."** Per-request examples break the shared prefix and
+  forfeit caching unless they sit after the cached block, and add a retrieval step plus a store to
+  maintain.
 
 ## Examples
 ### Dynamic few-shot selection

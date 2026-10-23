@@ -5,7 +5,8 @@ name: Gradient clipping
 kind: practice
 difficulty: core
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/backpropagation
@@ -161,6 +162,22 @@ flowchart TD
     G --> I["optimizer.step, then zero_grad"]
     H --> I
 ```
+
+## Misconceptions
+- **"Clipping changes the direction of the update."** Global norm clipping multiplies every gradient by
+  one scalar, so the step points exactly where backprop said, only shorter. Per-tensor, per-micro-batch
+  and value clipping are the variants that change direction.
+- **"Adam normalizes steps, so it does not need clipping."** The raw step is normalized, but the spike
+  still enters `v`. One gradient 50× normal inflates `v` and slows that parameter for hundreds of steps
+  (β2 = 0.999), which shows up as a plateau nobody can explain.
+- **"A clip that fires every step means the run is well protected."** It means the clip is throttling,
+  not filtering outliers: a hidden learning-rate cut under SGD, or a switch to unit-norm gradients under
+  Adam. Look for a summed loss, too high a learning rate or a copied threshold.
+- **"`max_norm = 1.0` is a universal constant."** The global norm sums over every parameter, so its
+  typical value depends on model size, precision and batch. Set the threshold from a plot of healthy
+  pre-clip norms.
+- **"Clipping fixes bad training data."** It shrinks the batch holding a broken transcript or a 25k-token
+  tool dump and hides the bug. Log trace ids with the pre-clip norm and fix the data.
 
 ## Examples
 ### A training step in the correct order

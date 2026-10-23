@@ -5,7 +5,8 @@ name: Runbooks
 kind: practice
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -39,6 +40,69 @@ alert-linked, mitigation-first and rehearsed.
   mode), which actions the on-call may take without approval, and the trace fields responders need.
 - **What you can skip.** Writing a runbook per code path. Write one per alert or symptom, starting with
   provider outage, rate limits, cost runaway and unsafe actions.
+
+## Decision case
+### Scenario
+A logistics company's dispatch agent (it reads shipments and can book carriers through a
+`book_carrier` write tool) is handed to the customer's operations team in 4 weeks. Their on-call has
+never seen the code. All hours below are illustrative planning figures.
+- **Alerts:** 8 paging alerts exist: provider outage, provider rate limits, cost runaway or loop, tool
+  misbehaving, unsafe write actions, prompt injection reported, stale index, guardrail-block surge.
+- **Missing levers:** 3 of the mitigations need levers the agent does not have yet: a per-tool disable
+  flag, a read-only mode for `book_carrier`, and a per-tenant task cap. Building each takes about 8 hours.
+- **Vendor time:** 2 engineers can give about 10 hours a week each to operations work, so about 80
+  hours before handoff.
+- **Customer time:** the on-call team can attend 2 game-day sessions of 3 hours; rehearsing one runbook
+  takes about 1 hour, so at most 6 runbooks can be rehearsed with them.
+- **Access:** the customer's on-call cannot sign in to the vendor's wiki or cloud console.
+
+### Options
+| Option | How it works | Vendor hours | Rehearsed by customer on-call | Every step has a lever |
+|---|---|---|---|---|
+| One operations guide | A single architecture and operations document | about 24 | 0 | no: steps say "disable the tool" with no flag |
+| 8 runbooks, unrehearsed | One runbook per alert at about 4 hours each, no new levers | 8 x 4 = 32 | 0 | no: 3 runbooks end in "redeploy" |
+| 8 runbooks, levers built, top 6 rehearsed | As above, plus 3 levers and 2 game days with 2 vendor engineers present | 32 + 3 x 8 + 2 x 3 x 2 = 68 | 6 of 8 | yes |
+| Automated remediation for all 8 | Scripts that act on each alert without a human | about 8 x 16 = 128: over the 80 available | 0 | yes, but hidden inside automation |
+
+### Decision
+**Write all 8 runbooks, build the 3 missing levers, and rehearse the 6 likeliest or most harmful
+situations with the customer's on-call.**
+
+Provider outage, rate limits, cost runaway, tool misbehaving,
+unsafe write actions and prompt injection get game days; stale index and guardrail-block surge get a
+30-minute tabletop walk-through each and an "untested: escalate early" banner.
+- **It fits both budgets.** About 68 vendor hours plus 1 hour of tabletops is within 80, and 6
+  rehearsals fill the customer's two 3-hour sessions.
+- **Every step can be executed.** With the per-tool flag, read-only mode and tenant cap built, no
+  runbook ends in a redeploy the customer cannot perform.
+- **Rehearsal follows risk.** The unsafe-write and injection runbooks protect against irreversible
+  bookings and data exposure, so they are rehearsed first.
+- **It is stored where the customer works.** Runbooks live in the customer's own wiki with a mirrored
+  offline copy, because the vendor wiki is unreachable to them.
+
+**What would change it.**
+- **A third game-day session:** rehearse the remaining 2 and drop the banners.
+- **One alert paging repeatedly with identical steps:** promote that runbook's steps to a script first.
+- **Less vendor time:** cut the guide-style content first, never the levers.
+
+### Trade-offs accepted
+- **Two runbooks are untested.** Untested means likely broken. Watch: their first real use is reviewed
+  in the postmortem, and they are first in line for the next game day.
+- **No automation at handoff.** Mitigation needs a human awake. Watch: time to mitigate per alert, and
+  promote any step run identically in several incidents.
+- **Docs in the customer's tools drift from the code.** Watch: the runbook lint (alert links and
+  last-tested dates) runs in CI, and every flag name is checked against live config.
+
+### Review rubric
+- **One runbook per alert:** the write-up maps every paging alert to exactly one runbook.
+- **Levers checked:** each mitigation step names a flag or command that exists, and missing levers are
+  costed and built.
+- **Rehearsal prioritised by risk:** the choice of what to rehearse is justified by likelihood and harm,
+  within the stated customer time.
+- **Access model matched:** runbooks are reachable with the on-call's own access, with a mirror outside
+  the blast radius.
+- **Hours recomputed:** each option's cost adds up against the stated budget.
+- **Untested items flagged:** anything not rehearsed is labelled and scheduled.
 
 ## Why it exists
 - **Fix-it knowledge lives in a few heads.** Which dashboard shows the real problem, which flag switches

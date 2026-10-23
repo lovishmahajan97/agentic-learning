@@ -5,7 +5,8 @@ name: Experiment tracking (MLflow, W&B)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - llmops-platform/model-registry
@@ -38,6 +39,68 @@ data model and differ in hosting, UI and ecosystem.
   per-task trajectories as artifacts.
 - **What you can skip.** Sweep orchestration and system metrics unless you fine-tune. Most agent teams need
   runs, params, a handful of metrics and an artifact per eval.
+
+## Decision case
+### Scenario
+A healthtech company runs a patient-intake agent. Four engineers tune prompts, tools and step budgets;
+two ML engineers fine-tune a small tool-calling model on de-identified agent traces once a month. Agent
+traces already go to an observability platform the team self-hosts in its VPC. Eval results today live in
+notebooks and Slack.
+
+Facts and constraints, with illustrative figures:
+- **Data residency.** Traces and eval outputs can contain patient data, so they must stay in the VPC.
+  Training nodes have no internet egress.
+- **Budget.** No new per-seat SaaS contract this fiscal year.
+- **Operations.** One platform engineer, part-time, runs shared tooling.
+- **Audit.** Every promoted fine-tune must link to its run, training-set hash, base revision and eval
+  evidence.
+- **Agent eval volume.** About 40 runs a week on a 300-task golden set. At about 50 KB of trajectory per
+  task, that is 15 MB a run, 600 MB a week, about 31 GB a year.
+- **Fine-tune volume.** About 16 runs a month (two sweeps of 8), each keeping 3 adapter checkpoints of
+  about 80 MB: 16 × 240 MB, about 3.8 GB a month or 46 GB a year.
+
+### Options
+| Option | How it works | Residency and no egress | Budget | Ops load | Fit for agent evals | Fit for fine-tunes and registry |
+|---|---|---|---|---|---|---|
+| **A. Self-hosted MLflow for everything** | Agent eval runs and training runs in one tracker, registry included | Yes | Yes | One new server, database and bucket | Eval runs are separate from the traces they came from; linked by hand | Yes |
+| **B. W&B SaaS** | Hosted projects, sweeps and artifacts | No: data leaves the VPC | No: a new seat contract | Lowest | Good UI | Good, but outside the VPC |
+| **C. W&B self-hosted server** | The same product run in the VPC | Yes | No: still a contract | One new server | Good | Good |
+| **D. Split by artifact class** | Agent evals as dataset runs in the observability platform already hosted; fine-tunes and the registry in self-hosted MLflow | Yes | Yes | One new server, same as A | Eval items link straight to production traces | Yes |
+
+### Decision
+Choose **D**:
+- **Residency and budget remove B and C.** B fails both; C fails the budget.
+- **Between A and D, the deciding fact is where error analysis starts.** Agent regressions are found in
+  production traces, and the golden set is built from them. Keeping agent evals next to those traces
+  saves the four engineers a manual join on every investigation.
+- **D costs the same to operate as A.** The observability platform is already run; MLflow is the one new
+  service either way, and it gives fine-tunes lineage into the registry.
+- **One system of record per artifact class:** agent eval runs live in the observability platform, training
+  runs and model versions in MLflow, and neither is copied into the other.
+
+What would change it:
+- **Evals stop starting from traces.** If the golden set became purely synthetic, A gives one tool and one
+  UI for the same operating cost.
+- **No more fine-tuning.** Drop MLflow and keep only the observability platform.
+- **Residency relaxed and sweeps daily.** W&B's sweeps and UI start to justify a contract.
+
+### Trade-offs accepted
+- **Two UIs and a cross-link.** An agent eval of a fine-tune must log the registered model version as a
+  param, and the MLflow version must carry the eval run id as a tag. Watch the share of promoted versions
+  carrying both.
+- **Storage grows by about 77 GB a year** (31 + 46). Apply lifecycle rules to eval artifacts, excluding
+  anything a registered version references, and watch bucket growth.
+- **MLflow ranks on last values.** Log `best_eval_acc` and its step for fine-tunes, and watch the gap
+  between last and best.
+- **A part-time operator.** Watch MLflow server latency on `log_metrics` and back up the backend store.
+
+### Review rubric
+- **Constraints are explicit and checked per option,** with residency and egress tested, not assumed.
+- **Volumes are estimated** (runs a week, artifact size per run) and turned into a yearly storage figure.
+- **Each artifact class has one named system of record,** and the cross-link between them is specified.
+- **The choice turns on a workflow fact,** such as where error analysis starts, not on a feature list.
+- **Operating cost is tied to the people** who will run the service.
+- **Reversal conditions are concrete** and name the fact that would flip the choice.
 
 ## Why it exists
 - **Runs outpace memory.** Week one is a spreadsheet of learning rates and scores. By week three it is

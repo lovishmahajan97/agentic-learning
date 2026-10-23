@@ -5,7 +5,8 @@ name: Model registry
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - llmops-platform/experiment-tracking
@@ -38,6 +39,70 @@ running" has one answer and rollback is a pointer move.
   resolved version into the agent's trace.
 - **What you can skip.** Registry internals and the old fixed-stage workflow. If your agent only calls one
   hosted model, a pinned snapshot id in config is enough until a second model or a fine-tune appears.
+
+## Decision case
+### Scenario
+An insurance company's claims agent has run for a year on one hosted LLM, pinned by snapshot id in a
+config file. The next quarter adds three model roles: a self-hosted 8B tool-calling model fine-tuned
+monthly and served merged in fp16, an embedder behind the claims-document index, and a guard classifier.
+
+Facts and constraints, with illustrative figures:
+- **Size.** Each fine-tuned version is about 16 GB (8 billion × 2 bytes), served on 12 GPU replicas.
+- **Rollback drill.** The self-hosted model must be back on the previous version within 5 minutes.
+- **Audit.** A SOC 2 audit in four months will ask who approved each model that served production and on
+  what evidence.
+- **Team.** Three ML engineers who already log training runs to MLflow tracking.
+- **Incident history.** An embedder swap last year silently broke retrieval for a week.
+
+Rollback arithmetic for the 8B model, all rates illustrative:
+- **Not cached.** 12 replicas pull 12 × 16 = 192 GB through about 1 GB/s of shared object-store bandwidth:
+  192 seconds. Add about 16 seconds to hash 16 GB and about 60 seconds to load: about 268 seconds, 4.5
+  minutes, which leaves almost no margin.
+- **Previous champion cached on each node.** 16 + 60 = 76 seconds.
+
+### Options
+| Option | How it works | Rollback under 5 min | Audit: who approved what | Embedder-index guard | Effort |
+|---|---|---|---|---|---|
+| **A. Pinned URIs and hashes in config** | Each role pinned in a config file, changed by PR | No: a PR and deploy | Partial: git blame, no evidence link | Manual | Lowest |
+| **B. MLflow registry, all four roles** | Versions from tracked runs, `champion` aliases moved only by CI, a virtual version for the hosted LLM, previous champion kept warm | Yes: about 76 s with the cache | Yes: alias permissions, evidence tags, lineage to runs | Startup check against index metadata | Moderate; the tracking server already exists |
+| **C. Private Hub repositories pinned by sha** | Weights in Hub repos, config pins commit shas | No: a config change and deploy | Partial: commit history, no run lineage | Manual | Low |
+| **D. Register model plus prompt as one bundle** | One versioned unit per combination, one alias move | Yes, if cached | Yes | Yes | High: every prompt edit or retrain makes a new bundle |
+
+### Decision
+Choose **B**:
+- **The drill rules out A and C,** because both make rollback a deploy rather than a pointer move.
+- **The audit favours B.** Restricting `champion` moves to a CI account that requires an
+  `eval_fingerprint` tag answers "who approved what, on which evidence" directly, and lineage comes from
+  runs the team already tracks.
+- **The incident is fixed structurally.** Embedder versions resolve from the registry and the agent
+  refuses to start on an index mismatch.
+- **D blurs attribution across four roles** and multiplies versions on every prompt edit; the release
+  bundle can reference a model version and a prompt version instead.
+
+What would change it:
+- **The fine-tune is dropped.** With one hosted model again, A is the honest minimum.
+- **The company standardises on the Hub** for all artifacts and the auditor accepts commit history plus a
+  signed approval file. Then C plus virtual versions is viable.
+- **Bandwidth.** With about 4 GB/s of shared bandwidth, an uncached pull is 48 seconds and keeping the
+  previous champion warm becomes optional rather than required.
+
+### Trade-offs accepted
+- **Storage.** 12 monthly versions × 16 GB = 192 GB a year before retention; watch the bucket size and
+  apply the lifecycle policy's retention period.
+- **The registry is a startup dependency.** If it is down, new replicas cannot resolve aliases; keep the
+  last resolved role manifest on disk and alert when it is used.
+- **Replicas disagree during a rollout.** Watch the resolved versions logged by each replica and alert on
+  disagreement outside a rollout window.
+- **Ceremony for the hosted LLM.** A virtual version adds a step to a snapshot bump; watch that every run's
+  root span still names all four resolved roles.
+
+### Review rubric
+- **Every model role is listed,** including judge, guard and embedder, not just the main LLM.
+- **Rollback time is computed end to end** (download, hash, load) and compared with the drill limit.
+- **Promotion authority is named:** who or what can move `champion`, and what evidence it requires.
+- **The embedder-index coupling is guarded** by a check that fails loudly.
+- **Storage and retention are sized** with the version count and size per version.
+- **Reversal conditions are concrete,** such as dropping the fine-tune or a change in bandwidth.
 
 ## Why it exists
 - **Files in a bucket do not say what is serving.** Names like `adapter_final_v2_really.safetensors`,

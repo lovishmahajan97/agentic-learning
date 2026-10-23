@@ -5,7 +5,8 @@ name: Model lifecycle & deprecation policy
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - llmops-platform/model-registry
@@ -38,6 +39,69 @@ and archives. Without it, every sunset is an emergency.
   completion, tool-call accuracy, cost per task) on the successor, and canarying the switch.
 - **What you can skip.** Designing the platform-wide state machine, unless you run the platform; consume
   its dates and freeze rules instead.
+
+## Decision case
+### Scenario
+A lender's AI platform team learns today that the provider snapshot behind most of its agents retires in
+120 days. It must choose how the company migrates. All figures are illustrative.
+- **Consumers:** 18 agents across 6 product teams pin the snapshot; 4 of them are customer-facing
+  loan-servicing agents, where policy requires an evaluated, signed-off change.
+- **Effort:** one agent migration takes about 3 engineer-days (task-level eval, fixes, re-run) plus a 7-day
+  canary. All 18 take 18 × 3 = 54 engineer-days.
+- **Constraints:**
+  - the platform team has 15 engineer-days free in the window;
+  - no agent's cost per task may rise more than 20% without a finance sign-off (the lesson's research
+    agent rose 50% at equal price);
+  - zero failed requests on sunset day;
+  - the policy's dates: freeze new pins at sunset − 60 days (day 60), brownouts from sunset − 14 days
+    (day 106).
+
+### Options
+| Option | How it works | Platform effort | Regulated agents | Sunset-day risk | Cost control |
+|---|---|---|---|---|---|
+| **A. Auto-upgrade deployments** | let the provider redirect to the successor at retirement | about 1 day | unreviewed change: fails | none | unseen until the invoice |
+| **B. Platform migrates everyone** | platform team runs every eval and canary | 54 days: fails | evaluated, by people who do not own the golden sets | low if finished | checked per agent |
+| **C. Teams migrate under the policy** | platform builds the inventory, upgrade job, CI pin check and brownouts; each team migrates its agents | about 10 days (inventory 2, upgrade job 5, pin check 1, brownouts 2) | evaluated and signed off by the owning team | low: brownouts flush stragglers | migration checklist per agent |
+| **D. Wait until forced** | stay pinned, migrate when errors start | 0 now, 54 days in the last weeks | rushed, unevaluated: fails | high | none |
+
+### Decision
+Choose **C, team-owned migrations under a platform policy**, because it is the only option that fits the
+platform's capacity and keeps every regulated change evaluated.
+- **Capacity:** about 10 platform days fit the 15 available. The 54 days of migration work spread across
+  six teams, about 9 days each.
+- **Compliance:** the four loan-servicing agents are evaluated on their owners' golden sets and canaried,
+  which A cannot offer and B does with the wrong people.
+- **Calendar:** a team migrating three agents back to back needs about 9 working days plus a final 7-day
+  canary, well before the day-106 brownouts. The freeze on day 60 stops the list growing meanwhile.
+- **Sunset day:** brownouts surface any caller the telemetry inventory missed, in announced windows
+  instead of on day 120.
+- **Cost:** the upgrade job reports cost per task for every agent, so a rise above 20% goes to finance
+  before promotion, not after the invoice.
+
+**What would change it:**
+- **Four or fewer consuming agents:** B fits (4 × 3 = 12 days) and spares the teams.
+- **Notice under 60 days:** the expedited path. Freeze at once, migrate the regulated agents first, and
+  allow auto-upgrade only on low-stakes internal agents, recorded per deployment.
+- **A successor with the same tokenizer and tool-call format:** a shorter checklist, but still a task-level
+  eval run.
+
+### Trade-offs accepted
+- **Product teams lose about 9 engineer-days each.** Track migration items per team weekly; a team
+  without a passing successor run by the freeze date gets a dated exception, not a silent extension.
+- **Two model versions run for up to 120 days.** Both are monitored and paid for; watch the request share
+  still on the old snapshot fall to zero.
+- **Brownouts cause deliberate errors.** Announce every window, and list the callers that hit it.
+- **The archive covers bundles and logged samples only.** The provider snapshot cannot be re-run after
+  sunset, so the replay capture must finish before day 120.
+
+### Review rubric
+- **The consumer inventory comes from telemetry joined with pins**, with a count and an owner per agent.
+- **Effort is computed** (agents × days per migration) and compared with who has the capacity.
+- **The dated plan is consistent:** announce, freeze, brownouts and sunset follow from the policy values.
+- **The migration check covers more than quality:** cost per task, quota, tokenizer and tool-call
+  strictness.
+- **Regulated or customer-facing agents are named** and never auto-upgraded.
+- **At least two conditions that would change the choice** are stated, each tied to a measurable fact.
 
 ## Why it exists
 - **Models do not stay still.** Providers retire snapshots on published schedules and ship successors that

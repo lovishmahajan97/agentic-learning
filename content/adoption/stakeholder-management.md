@@ -5,7 +5,8 @@ name: Stakeholder management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - strategy/stakeholder-alignment
@@ -34,6 +35,70 @@ never engaged, not on the model.
   update so expectations stay real.
 - **What you can skip.** Stakeholder theory beyond the power-interest grid and RACI. A register with a
   weekly staleness check covers most agent projects.
+
+## Decision case
+### Scenario
+A manufacturer's HR director sponsors an HR service agent for 9,000 employees. It answers policy
+questions from the HR knowledge base, looks up the employee's own record, and can correct leave balances
+through a write tool.
+
+The sponsor has announced go-live for week 8, and today is week 0. All lead times and shares are
+illustrative planning numbers.
+- **Value mix from last quarter's tickets:** about 60% are policy questions and record lookups (read
+  only), about 25% are leave-balance corrections (write), the rest go to people.
+- **Security review:** 6-week queue for tools that write to the HR system; read-only integrations use a
+  2-week lane.
+- **Data access:** the HR system's data owner needs 3 weeks for a personal-data access request.
+- **Works council:** a 5-week consultation, which can start once the role-impact statement for HR staff
+  is written (week 1).
+- **Design readiness:** the read-only tool list and data flow are stable by week 1; the write tool,
+  with its approval gate and rollback path, is stable by week 3.
+
+### Options
+| Option | How it works | Latest approval | Meets week 8? | Stakeholder cost |
+|---|---|---|---|---|
+| Full scope in one review | Submit read and write tools together when the write design is ready | Security: 3 + 6 = week 9 | No | Sponsor's announced date slips at the last moment |
+| Read-only pilot, write as a delta | Submit read-only at week 1, the write tool as a separate delta at week 3 | Read-only: works council 1 + 5 = week 6, data access 1 + 3 = week 4, security 1 + 2 = week 3; write: week 9 | Yes, for about 60% of tickets | Sponsor must re-announce scope; security sees two packages |
+| Ask the CISO to jump the queue | Sponsor escalates for priority on the full package | Uncertain: depends on what else is waiting | Maybe | Spends the sponsor's credit with security on a date, not a risk |
+| Move go-live to week 10 | Full scope, one review, honest new date | Week 9, with a week of buffer | No, by design | Sponsor re-announces the date |
+
+### Decision
+**Read-only pilot at week 8, write tool as a delta review.** The binding constraint is the 6-week write
+review, which no engineering speed can shorten; splitting the scope moves 60% of the value inside the
+announced date and leaves the write tool on its own clock.
+- **The works council and data owner start in week 1** for the whole scope, including the write tool, so
+  neither has to be reopened when writes are added.
+- **The delta package goes to the same security reviewer** at week 3, naming the new tool, its scope, the
+  credential, the human approval on every write and the rollback path. With approval at week 9, writes
+  can be enabled from week 9 at the earliest.
+- **The sponsor re-announces now**, in week 0, as "policy and lookups from week 8, leave corrections
+  after security sign-off", rather than slipping at week 7.
+
+**What would change it.**
+- **If read-only integrations also need the 6-week queue,** approval lands at 1 + 6 = week 7, still
+  inside week 8, so the plan holds with one week of slack and no room for follow-up questions.
+- **If leave corrections were most of the value,** a read-only launch would disappoint users and the
+  honest week-10 date would be better.
+
+### Trade-offs accepted
+- **Two review packages instead of one.** Watch for reviewer follow-up questions on the delta; many
+  questions mean the first package left the write path unclear.
+- **Users meet an agent that cannot fix balances yet.** Watch the share of week-8 conversations that end
+  in a handoff for a leave correction, and show it to the sponsor as the case for the write tool.
+- **The sponsor re-announces scope.** Keep the rationale in one source of truth so HR, IT and the works
+  council hear the same story.
+
+### Review rubric
+- **Lead times laid out backwards from go-live:** each approval has a submission week, a decision week and
+  its prerequisite.
+- **Binding constraint named:** the write-up identifies which review sets the real date and says why
+  engineering cannot move it.
+- **Scope split tied to value:** the share of work the reduced scope covers is stated from data.
+- **Veto holders engaged on the whole scope early:** consultation and data access cover future tools, so
+  they are not reopened.
+- **Sponsor expectations reset early:** the date or scope change is communicated before the deadline, not
+  at it.
+- **Reversal triggers stated:** the write-up says which lead time or value share would change the plan.
 
 ## Why it exists
 - **Agent deployments touch many groups.** The sponsor funds it, a process owner's team uses it, IT runs

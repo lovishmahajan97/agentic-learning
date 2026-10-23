@@ -5,7 +5,8 @@ name: Precision / recall / F1
 kind: metric
 difficulty: intro
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - ml-fundamentals/confusion-matrix
@@ -158,6 +159,21 @@ flowchart TD
     F --> T
     T --> X["Confirm pair once on test split"]
 ```
+
+## Misconceptions
+- **"Precision is a property of the model."** It also depends on the base rate. The same detector with TPR
+  0.9 and FPR 0.01 has precision ≈ 0.91 at 10% prevalence and ≈ 0.48 at 1%, so a balanced benchmark
+  overstates production precision. Recall transfers; precision does not.
+- **"F1 is the neutral default metric."** It assumes a false alarm costs the same as a miss and ignores true
+  negatives, so relabelling the positive class changes it. Use Fβ or a constraint such as "recall ≥ 0.9 at
+  best precision" when one error is clearly more expensive.
+- **"Report F1 at τ = 0.5."** The threshold is a knob, not part of the model. For calibrated scores the
+  F1-maximising threshold is half the F1 it achieves, so it is never above 0.5 and usually far below it on
+  rare positives. Sweep τ on validation.
+- **"Micro-F1 is a fair multi-class summary."** In single-label multi-class it equals accuracy, so a router
+  that never picks a rare tool still scores 0.94. Report macro and per-class recall with support.
+- **"If the RAG answer is wrong, fix the prompt."** If recall@k is the problem, the right chunk never
+  reaches the generator. Measure recall@k separately before tuning generation.
 
 ## Examples
 ### Hallucination detector: thresholds, a recall spec, micro vs macro

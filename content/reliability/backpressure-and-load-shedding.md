@@ -5,7 +5,8 @@ name: Backpressure & load shedding
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - fastapi-for-ai/backpressure
@@ -40,6 +41,60 @@ and cheaply so admitted runs finish within budget.
   whose user left.
 - **What you can skip.** Queueing-theory proofs. Keep Little's law, the M/M/1 shape and
   `max_queue ≈ service_rate × max_acceptable_wait`; they size every limit you will set.
+
+## Decision case
+### Scenario
+An agent platform hits a provider token quota every Monday morning, and a launch in 3 weeks will make
+the peak worse. Three workloads share one quota. All figures are illustrative.
+- **Quota:** 2.0 million tokens a minute, fixed until a contract change that takes longer than 3 weeks.
+- **Peak demand (2 hours):** interactive chat agents 40 runs a minute × 15,000 tokens = 0.6M; background
+  research agents 20 × 60,000 = 1.2M; batch document summaries 300 × 2,000 = 0.6M. Total 2.4M, 20% over.
+- **Off-peak demand:** 1.4M tokens a minute.
+- **Targets:** interactive first token within 3 s at p95; research runs finish within 30 minutes; batch
+  summaries within 6 hours of arrival.
+
+### Options
+| Option | How it works | Interactive at peak | Batch | Fits 3 weeks |
+|---|---|---|---|---|
+| A. Bigger queue and autoscaling | queue everything FIFO, add workers | after 30 min the excess is 0.4M × 30 = 12M tokens, a 12M / 2M = 6 minute wait for every new arrival | served late with the rest | yes, but more workers cannot raise a quota |
+| B. Retry 429s harder | every step retries on 429 with backoff | each call has about a 2.0 / 2.4 ≈ 83% chance; a 10-call run without retries finishes 0.833^10 ≈ 16% of the time, and retries add load | competes equally with chat | yes, and it feeds a metastable retry storm |
+| C. Run-level admission by priority | estimate tokens per run type, admit interactive and research first, batch gets what is left | 0.6M admitted, within quota | gets 0.2M of 0.6M: 200 docs a minute deferred | yes: a gate plus token estimates |
+| D. More quota or a second provider | contract change or failover | solves it | solves it | no: lead time exceeds 3 weeks, and a second model needs evals |
+
+### Decision
+**Option C now, and start D for next quarter.** Admitting whole runs against the token budget keeps
+interactive and research inside quota (0.6M + 1.2M = 1.8M), so neither is shed. Batch takes the
+remaining 0.2M tokens a minute.
+
+Over a 2 hour peak, batch defers 200 × 120 = 24,000 documents, 48M tokens. Off-peak spare capacity is
+2.0M − 1.4M = 0.6M a minute, so the backlog drains in 48 / 0.6 = 80 minutes. The worst batch delay is
+about 2 hours plus 80 minutes, 3 hours 20 minutes, inside 6 hours.
+- **Why not A:** the bottleneck is quota, not workers, so the queue converts overload into a 6 minute wait.
+- **Why not B:** random 429s spread across steps burn quota on runs that never finish.
+- **Why not D now:** it cannot land in 3 weeks; it is the fix for growth, not for this launch.
+
+**What would change it.** A peak of length T hours delays batch by about T hours plus 40T minutes, so
+peaks longer than about 3.6 hours break the 6 hour target and D becomes urgent. So does interactive plus
+research demand passing 2.0M on its own, because then shedding would hit users.
+
+### Trade-offs accepted
+- **Batch runs late on Mondays.** Publish the expected delay and alert on batch queue age above 4 hours.
+- **Token estimates can be wrong.** An underestimate lets admitted runs overrun the quota and draw 429s
+  mid-run. Track estimate error per run type and lower the admission budget if it passes 10%.
+- **A gate is a new failure point.** If it fails open, the quota is overrun; if closed, everything is
+  rejected. Alert on admission rate dropping to zero.
+- **Rejected interactive runs are possible above forecast.** They get a fast 503 with `Retry-After`;
+  monitor interactive rejections and the share retried.
+
+### Review rubric
+- **Load in the limiting unit:** demand is stated in tokens a minute per workload against the quota, not
+  in requests or CPU.
+- **Little's law applied:** the write-up computes backlog and wait for the queueing option and shows why
+  a bigger queue fails.
+- **Priority is a policy:** it states which class is shed first and why, tied to each class's target.
+- **Backlog drain checked:** deferred work is sized and its drain time compared with the deadline.
+- **Retry behaviour named:** clients honour `Retry-After` with jitter and a retry budget.
+- **Reversal condition:** names the peak length or demand that would force more quota.
 
 ## Why it exists
 - **Little's law makes overload arithmetic.** `L = λ × W`: requests inside equal arrival rate times time

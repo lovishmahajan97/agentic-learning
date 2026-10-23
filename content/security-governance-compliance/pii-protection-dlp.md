@@ -5,7 +5,8 @@ name: PII protection / DLP
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - safety-security/pii-redaction
@@ -39,6 +40,64 @@ redact, tokenize, block or alert at each crossing.
 - **What you can skip.** Building detectors from scratch. Use an analyzer such as Presidio plus checksums
   and exact data match, and put your effort into enforcement points and measuring recall on your own
   traffic.
+
+## Decision case
+### Scenario
+An EU telehealth company adds a booking and support agent. Patients describe symptoms in free text; the
+agent calls an internal `find_slot` tool and a `book_appointment` tool, and uses an external model
+provider. All figures are illustrative planning numbers, not benchmarks.
+- **Volume:** 40,000 conversations a month; about 30% (12,000) mention health details.
+- **DPO requirements:** no direct identifiers (name, email, phone, patient ID) sent to the provider and
+  none in traces. A data processing agreement with the provider, covering health data processed in the
+  EU, is already signed.
+- **Product need:** the model must read symptoms to route to the right clinic; booking tools need real
+  identifiers inside the company's boundary.
+- **Latency:** DLP may add at most 150 ms at p95 per model call.
+- **Team and deadline:** 3 engineers, no GPU operations experience, 8 weeks.
+- **Detector quality:** on a 2,000-conversation labelled sample, the pipeline catches every identifier in
+  97% of conversations.
+
+### Options
+| Option | How it works | Meets DPO rule? | Product works? | Fits team and deadline? |
+|---|---|---|---|---|
+| Block on detection | Refuse any message with identifiers or health terms | yes | no: about 30% of conversations refused | yes |
+| Pseudonymise at gateway and tool wrapper | Placeholders to the provider, real values only inside `book_appointment`, masking in the trace collector | mostly: the 3% recall gap leaks to a processor under DPA | yes | yes: Presidio plus exact data match on the patient table |
+| Self-host a model in the VPC | Raw text never leaves; traces still masked | yes, by location | yes, if quality holds | no: GPU operations are new to the team |
+| Raw to provider, redact traces only | Rely on the DPA | no | yes | yes |
+
+### Decision
+**Pseudonymise at the gateway and in a tool-call wrapper, with masking in the trace collector.** It is
+the only option that meets the DPO rule for almost all traffic while keeping symptom routing, inside the
+team's skills.
+- **Detection layers:** exact data match on hashed emails, phones and patient IDs from the patient table,
+  NER for names, checksums for card numbers, which are blocked outright.
+- **Return path:** one mapping per conversation, held in memory with a 15-minute TTL, never logged; tools
+  inside the boundary get real values at dispatch.
+- **Residual exposure:** at 97% recall, 3% of 40,000 = 1,200 conversations a month still send at least one
+  raw identifier to the provider. The DPA is the backstop for those, which the DPO must accept in writing.
+
+**What would change it.** If the DPO rules that no health text may reach any external processor, self-host
+despite the operations cost. If recall for one language falls below the agreed floor, route that language
+to staff until detectors improve. If labelled recall reaches 99.5%, the residual drops to 200 a month.
+
+### Trade-offs accepted
+- **A known leak rate to a contracted processor.** Re-measure recall monthly on a fresh labelled sample,
+  per language, and report the residual count to the DPO.
+- **Latency.** Track DLP p95 per call against the 150 ms budget; NER is the slowest layer.
+- **The mapping is a sensitive store.** Alert if any mapping key or real value appears in a trace scan.
+- **Pseudonymised data is still personal data,** so retention, access and erasure rules still apply to
+  prompts at the provider and in traces.
+
+### Review rubric
+- **Destinations listed first:** provider, traces, tools, memory and indexes each get an action per data
+  class before detectors are chosen.
+- **Residual quantified:** the write-up turns measured recall into an expected number of leaking
+  conversations and names who accepts it.
+- **Recall measured on real traffic:** a labelled sample of the product's own conversations, per language,
+  not a synthetic set.
+- **Return path designed:** where real values are restored, the mapping's lifetime, and that it is never
+  logged.
+- **Change triggers stated:** which legal ruling or recall number would move the decision.
 
 ## Why it exists
 - **Personal data stopped living in typed columns.** A `ssn` field could be encrypted, masked and

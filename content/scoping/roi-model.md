@@ -5,7 +5,8 @@ name: ROI model
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/success-metrics-kpis
@@ -32,6 +33,72 @@ heroic number, because capture rate and adoption usually decide it.
   and review design. Each moves cost per successful task and therefore break-even.
 - **What you can skip.** Corporate-finance theory beyond ROI, payback month and NPV. Let the customer's
   finance owner supply the discount rate and capture rate.
+
+## Decision case
+### Scenario
+An IT service desk for a 25,000-person company handles 30,000 tickets a month at a loaded cost of $0.90
+per minute. Access and password tickets are 35% of volume (10,500 a month). The CIO must pick one
+project for next year. All figures are illustrative.
+
+Constraints:
+- **Budget.** At most $140,000 one-time.
+- **Payback.** Within 12 months at finance's base capture rate of 0.6 (the desk has open requisitions it
+  would not fill).
+- **Downside.** Still positive over 24 months at finance's pessimistic capture of 0.3.
+- **Write approval.** Agent actions that reset credentials need a security review, expected to take about
+  3 months.
+- **Team.** Two engineers.
+
+### Options
+Each option uses a 3-month adoption ramp (a third, two thirds, then full) and an undiscounted 24-month
+horizon.
+
+| Option | How it works (build; recurring) | Payback at capture 0.6 | 24-month net at 0.6 | 24-month net at 0.3 | Fits budget? |
+|---|---|---|---|---|---|
+| **A. Templates and self-service forms** | Access tickets only: 2 minutes saved, 80% adoption ($30k; $1k/month) | month 5 | +$155k | +$50k | Yes |
+| **B. Assistive drafting agent** | All tickets: 3.5 minutes saved net of review, 70% adoption, $0.10 per attempted ticket ($110k; $10k/month) | month 6 | +$563k | +$106k | Yes |
+| **C. Autonomous access resolver** | Access tickets: 70% audited success saves 10 minutes, failures add 2 minutes of review, $0.30 per attempt; starts month 4 after approval ($150k; $11.2k/month) | month 11 | +$342k | −$21k | No |
+| **D. Templates plus agent on the rest** | A for access tickets, B for the other 65% ($130k; $9.95k/month) | month 7 | +$433k | +$32k | Yes |
+
+### Decision
+Choose **B**, because it is the only option that clears every constraint with margin:
+- **It wins against the next-best alternative, not against zero.** B's 24-month net is about $408k above
+  templates (A), for $80k more build cost.
+- **D shows why combining is worse here.** Templates save 2 minutes at 80% adoption on access tickets,
+  while the agent saves 3.5 minutes at 70%. Giving those tickets to templates lowers the total.
+- **C fails on two constraints.** It is over budget, and the approval delay plus higher run cost turn
+  it negative at capture 0.3.
+- **The downside holds.** At capture 0.3, B is still about +$106k over 24 months, although payback slips
+  to month 14.
+
+Break-even values, which the pilot must measure:
+- **Capture.** Payback within 12 months needs a capture rate of at least about 0.32. That is finance's
+  call, so get it in writing from the hiring plan.
+- **Minutes saved.** At capture 0.6, a 12-month payback needs about 1.9 minutes saved per ticket. The
+  pilot must measure minutes saved net of review to better than that margin.
+
+What would change it:
+- **Lower measured savings.** If the pilot shows under 1.9 minutes saved, ship templates (A) and revisit.
+- **Higher autonomous success.** If security approves writes early and the measured autonomous success
+  rate rises well above 70%, re-run C, because full resolution saves 10 minutes per ticket.
+
+### Trade-offs accepted
+- **Payback rests on capture.** At 0.3 the case survives but payback slips to month 14. Watch
+  backfilled requisitions; a filled requisition means freed time is not becoming savings.
+- **Assistive means review minutes stay.** Watch minutes saved net of review weekly in the pilot traces.
+- **Drafting every ticket costs tokens on unused drafts.** Watch agent spend per attempted ticket against
+  the $0.10 assumed and cap steps per run.
+- **No autonomy in year one.** Access tickets keep a human in the loop; revisit with measured success rate.
+
+### Review rubric
+- **Next-best alternative costed.** The write-up compares the agent with a non-agent option and states the
+  incremental value.
+- **Capture rate comes from finance.** It names the source (hiring plan, overtime, backlog) and tests a
+  pessimistic value.
+- **Cost per attempt, not per success.** Recurring cost covers every attempted run, retries and review.
+- **Break-even is stated for the riskiest inputs,** with the pilot designed to measure them.
+- **Constraints are checked one by one,** with the option that fails each named.
+- **Reversal conditions are numbers,** such as a measured minutes-saved or capture threshold.
 
 ## Why it exists
 - **Budget holders reason in payback and NPV, not eval scores.** Agent projects compete with every other

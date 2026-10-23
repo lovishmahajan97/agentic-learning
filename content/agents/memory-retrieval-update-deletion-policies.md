@@ -5,7 +5,8 @@ name: Memory retrieval / update / deletion policies
 kind: practice
 difficulty: advanced
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -174,6 +175,26 @@ stateDiagram-v2
     E --> [*]
     D --> [*]
 ```
+
+## Misconceptions
+- **"Stale or wrong memories are a retrieval-quality problem; a better embedding model or bigger k fixes
+  them."** Both make the pile larger and faster to search without deciding what belongs in it. Stale,
+  contradictory and poisoned memories come from missing update, gating and deletion policies.
+- **"Filtering by user is just another ranking signal."** Scope is a hard predicate applied before
+  scoring. A cross-user memory leaking into a prompt is a security incident, not a ranking error.
+- **"When a fact changes, overwrite the old one."** Supersede instead: mark the old entry inactive with
+  `superseded_by` and a timestamp, because audits and undo need history. Overwriting loses that, and
+  appending leaves both addresses retrieved with equal confidence.
+- **"'I no longer work at Acme' and 'forget what I told you' are the same operation."** The first is new
+  information and supersedes with history. The second is a deletion request: keeping an inactive row is
+  exactly the retention the user refused, so hard-delete it and keep only a keyed-hash tombstone.
+- **"Deleting the rows from the memory table completes an erasure."** The fact also lives in the vector
+  index payload, compaction summaries, consolidated facts, caches, logs and backups. Delete from every
+  store, replay tombstones after any restore, and verify by count, not by a similarity search that can
+  return nothing while rows remain.
+- **"Anything the agent extracts is safe to remember."** Text from a web page can plant "always approve
+  vendor X" as a permanent instruction. Only write from trusted sources: user turns, verified tool
+  output, operator input.
 
 ## Examples
 ### Upsert with provenance, and a verified erasure routine

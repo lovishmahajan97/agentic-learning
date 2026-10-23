@@ -5,7 +5,8 @@ name: Private endpoints
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -43,6 +44,66 @@ override; DNS is where most failures live.
   whether your own agent SaaS is published over PrivateLink.
 - **What you can skip.** Provider-network internals and load-balancer routing. Know the four parts
   (interface, published service, DNS override, policy) and the one-way property.
+
+## Decision case
+### Scenario
+A bank's platform team must connect its agent workloads to their dependencies before a security audit.
+All figures are illustrative planning numbers, not quotes or SLAs.
+- **Workloads:** 12 agent VPCs (one per business team) in one AWS region, each spread over 2 zones.
+- **Dependencies per agent:** 5 interface services: the model runtime API, the token service, key
+  management, log delivery and the bank's vector-store vendor, offered over PrivateLink. Object storage
+  uses a gateway endpoint inside each VPC.
+- **Hard rule from data-loss prevention:** no internet egress from agent subnets, because a
+  prompt-injected agent with a NAT route can send data anywhere.
+- **Hybrid callers:** nightly agent eval jobs run on on-prem servers linked by VPN and must reach the
+  model API privately.
+- **Team and deadline:** 3 platform engineers, 6 weeks, everything in Terraform.
+
+### Options
+| Option | How it works | No internet egress | On-prem eval path | Interfaces to run | Effort for 3 people |
+|---|---|---|---|---|---|
+| NAT plus egress proxy allowlist | NAT gateway, proxy filters by hostname | no: a route to the internet exists, guarded only by proxy rules | over VPN to the proxy | none | low |
+| Endpoints in every VPC | 5 interface endpoints per VPC, one interface per zone, private DNS on | yes | needs DNS forwarding into one of the 12 VPCs | 12 x 5 x 2 = 120 | high: 60 endpoints to review and keep identical |
+| Shared endpoint hub | 5 endpoints in one hub VPC, private DNS zones shared with spokes, spokes attached by a transit network | yes | one inbound resolver in the hub | 5 x 2 = 10 | medium: one module, one DNS design |
+
+### Decision
+**Shared endpoint hub, with object storage on gateway endpoints in each spoke and NAT routes removed from
+every agent subnet.**
+- **It meets the hard rule.** No agent subnet has an internet route, so a call that resolves publicly
+  fails loudly instead of leaking.
+- **One place for hybrid DNS.** On-prem resolvers forward the service domains to a single inbound
+  resolver in the hub, so the eval jobs and every spoke resolve the same private IPs.
+- **It fits the team.** 10 interfaces and 5 endpoints in one module instead of 60 endpoints across 12
+  state files. A new team's VPC becomes a transit attachment plus a zone association.
+- **Why not NAT plus proxy:** the proxy is one misconfigured rule away from an open path, which is the
+  exact risk the rule exists to remove.
+
+**What would change it.**
+- **Fewer VPCs:** with 2 or 3, per-VPC endpoints are simpler than a transit network.
+- **A stricter policy for one team** (for example, model invoke limited to one role): give that team its
+  own endpoint in its VPC.
+- **Per-spoke resource policies:** if a service must accept traffic only from a specific spoke, per-VPC
+  endpoints are needed, because a hub endpoint id identifies the hub, not the caller's VPC.
+
+### Trade-offs accepted
+- **Shared blast radius.** One bad security-group or DNS change breaks all 12 VPCs. Watch: the private
+  resolution check runs as a deploy gate in every spoke, and endpoint changes go through plan review.
+- **Coarser policy.** Endpoint policies apply to every spoke at once. Watch: denied-request counts per
+  calling role.
+- **Transit charges and an extra hop.** Cross-VPC traffic pays transit data charges. Watch: per-GB cost
+  per spoke and p95 model-call latency against the previous baseline.
+- **Hub-zone dependency.** Each zone's interface is a shared point of failure. Watch: both zones serve
+  traffic, and a zone-failure drill passes.
+
+### Review rubric
+- **Rule restated as a test:** the write-up turns "no egress" into something checkable (zero NAT routes,
+  zero bytes via NAT in flow logs).
+- **Every caller listed:** spokes, on-prem eval jobs and CI, each with its DNS path.
+- **Counts recomputed:** endpoints and interfaces per option follow from VPCs x services x zones.
+- **Policy granularity addressed:** says whether a shared endpoint is precise enough for each service's
+  resource policy.
+- **Failure domains named:** what a single bad change breaks and how a deploy gate catches it.
+- **Flip conditions stated:** the VPC count or policy need at which a different option wins.
 
 ## Why it exists
 - **The subnet has no internet route on purpose.** A bank's application subnet still needs a hosted

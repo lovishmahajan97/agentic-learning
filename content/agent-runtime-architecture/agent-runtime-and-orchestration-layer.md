@@ -5,7 +5,8 @@ name: Agent runtime & orchestration layer
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/agent-loop
@@ -38,6 +39,69 @@ effects, and rules need one enforcement point.
   derived from the parent run.
 - **What you can skip.** Building your own workflow engine or scheduler from scratch. Assemble from an
   engine or framework, but know the layers so you can see what each one leaves to you.
+
+## Decision case
+### Scenario
+A mid-size e-commerce company is moving its support agent from a demo to production. The agent reads
+orders, drafts replies, sends customer emails and issues refunds. All figures are illustrative planning
+numbers.
+- **Volume:** about 2,000 runs a day, averaging 25 steps (50,000 step writes a day, about 0.6 a second,
+  roughly 6 a second at a 10x peak).
+- **Duration:** most runs finish in 2-40 minutes; about 15% (300 a day) park for a refund approval with a
+  median wait of 6 hours, so about 300 × 6 / 24 = 75 runs sit parked at any moment.
+- **Hard requirements:** no duplicated email or refund after a crash or deploy, every tool call audited,
+  and a parked run that holds no thread.
+- **Team and deadline:** four Python engineers, no one has run a workflow engine, production in 8 weeks,
+  and agent code ships daily, so a 3-day parked run crosses about 3 deploys.
+- **Existing stack:** Postgres, a Kubernetes cluster and a queue; data must stay in the company's cloud
+  account.
+
+### Options
+| Option | How it works | Crash and deploy safety | Long approvals | Team and deadline | Policy, tenancy, audit |
+|---|---|---|---|---|---|
+| Inline loop in the handler | `while` loop with a step cap and retries | fails: transcript lost, side effects re-run | fails: a thread waits or the request times out | fastest to ship | bespoke per agent |
+| LangGraph with a Postgres checkpointer | graph state saved after each node; `interrupt()` before consequential tools, resume by thread id | good, if tools carry idempotency keys | good: the thread is parked in Postgres | Python-native, small learning curve | still ours: gate, keys, audit |
+| Temporal workflows and activities | the loop is a workflow, model and tool calls are activities with retries and heartbeats | strongest: durable timers, retries, heartbeats | strong: a workflow can wait for a signal for days | new cluster to run, and deterministic replay to learn | still ours |
+| Hosted vendor agent API | the vendor runs the loop and tool dispatch | depends on the vendor's state model | varies | quick start | still ours, and data leaves our account |
+
+### Decision
+**LangGraph with a Postgres checkpointer, plus our own policy gate in a single dispatch node and
+idempotency keys of the form `run_id:call_id` in every side-effecting tool adapter.**
+- **Fits the deadline and skills:** it runs on the Postgres and Kubernetes we already operate, in the
+  language the team writes, so the 8 weeks go on the gate and the tools rather than on a new platform.
+- **Meets the hard requirements:** the checkpoint is the persisted log, `interrupt()` parks the 75
+  waiting runs with no thread attached, and idempotency keys make a re-issued refund land once.
+- **Load is trivial:** about 6 writes a second at peak is far below what one Postgres instance handles.
+- **Why not Temporal now:** its guarantees are stronger, but deterministic replay plus daily code changes
+  for runs that cross 3 deploys forces workflow versioning the team has never done.
+- **Why not hosted:** residency rules it out, and policy and audit would still be ours.
+
+**What would change it.**
+- **Runs that wait weeks on timers, or a team that already runs Temporal:** choose Temporal.
+- **No side effects and runs under a minute:** keep the inline loop with a step cap.
+- **Several agent teams sharing one platform:** move the gate and budgets into a shared control plane
+  whichever engine runs the loop.
+
+### Trade-offs accepted
+- **Resume re-runs the interrupted node.** Keep side effects out of the node that calls `interrupt()`
+  and watch for duplicate-key rejections in tool adapters.
+- **No built-in lease across workers.** We take a row lock on the run before resuming and alert on
+  rejected or concurrent resumes of one thread.
+- **Checkpoint growth.** Storage grows with steps; we set retention and compaction, and chart checkpoint
+  bytes per run.
+- **Graph changes break old checkpoints.** A deploy that renames nodes can strand parked runs; we test
+  resuming a parked run from the previous release in CI and track parked runs that fail to resume.
+
+### Review rubric
+- **Requirements before tools:** the write-up states crash safety, waiting time, audit and residency as
+  constraints, then rates each option on them.
+- **Numbers recomputed:** step writes per second and parked runs (arrival rate times wait) follow from
+  the stated volumes.
+- **Exactly-once is not claimed from the engine:** idempotency keys and write-ahead ordering are named as
+  the learner's job whichever option wins.
+- **What stays ours is listed:** policy gate, tenancy, credentials and audit, for every option.
+- **Flip conditions are concrete:** run length, team experience or platform scope that would change the
+  choice.
 
 ## Why it exists
 - **The first agent is a `while` loop in a request handler.** Call the model, run any tool call, append the

@@ -5,7 +5,8 @@ name: AI risk management
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - security-governance-compliance/ai-inventory-and-use-case-risk-classification
@@ -38,6 +39,65 @@ limit what tools can do, and live KRIs show when risk moves.
   restrictions, amount caps), the evidence each control has, and the KRI that would move if a control broke.
 - **What you can skip.** Mapping every clause of NIST AI RMF and ISO/IEC 23894 against each other. Know the
   four functions, write cause-event-consequence risks, and score residual risk against an agreed appetite.
+
+## Decision case
+### Scenario
+A B2B software company runs an account-management agent that reads inbound customer email, looks up the
+CRM and replies with `send_email`.
+
+The register's top entry: "Because inbound email is untrusted, an
+injected instruction may make the agent email account data to an attacker's address, leading to a data
+breach." All scores use the lesson's 1-5 scales and are illustrative judgements.
+- **Volume:** 4,000 outbound agent emails a day; about 6% (240) go to an address not already on the
+  account's CRM record.
+- **Inherent rating:** likelihood 3 × impact 5 = 15.
+- **Constraints:**
+  - appetite 8, and the impact floor of 5 needs the CISO's sign-off;
+  - account managers can review at most 500 emails a day;
+  - customers expect a reply within 1 hour in business hours;
+  - the team has 4 weeks before the agent moves from pilot to all accounts.
+
+### Options
+| Option | How it works | Residual (L × I) | Review load a day vs 500 | Reply time |
+|---|---|---|---|---|
+| **A. Detect** | injection classifier on inbound mail, flagged mail goes to a human | 2 × 5 = 10: above appetite, impact floor | flagged mail only | fast |
+| **B. Approve every email** | all 4,000 drafts need a human click | 1 × 5 = 5: impact floor still applies | 4,000: 8 × capacity | queues for hours |
+| **C. Limit recipients** | the tool can only address contacts on the thread's CRM account; any other recipient needs approval | 1 × 3 = 3: data can reach only that customer's own contacts | 240 | fast for 94% |
+| **D. Avoid** | remove `send_email`; the agent drafts, people send | 1 × 3 = 3 | 4,000 manual sends | slow |
+
+### Decision
+Choose **C, a recipient allow-list enforced in the tool, with approval for new recipients**, because it is
+the only option under appetite that also fits the review budget.
+- **Appetite:** a residual of 3 sits well under 8; A's 10 does not, because a classifier against an
+  adaptive attacker leaves likelihood at 2.
+- **Impact, not only likelihood:** C lowers impact from 5 to 3 because the attacker's own address is no
+  longer reachable without a person. That also clears the impact floor, so no CISO acceptance is needed.
+- **Review load:** 240 approvals a day fits under 500; B needs 4,000 and would turn into rubber-stamping.
+- **Reply time:** 94% of emails still go out in minutes, unlike B and D.
+- **Keep A as a second layer:** the classifier still runs and feeds a KRI, but no longer carries the risk.
+
+**What would change it:**
+- **New-recipient share rising above about 12%** (480 a day): approvals near capacity; split approval by
+  domain or add reviewers.
+- **A compromised customer mailbox** being used as the attacker channel: recipients on the CRM record are
+  then not trustworthy; re-score impact and consider approval on attachments.
+- **Contract terms that forbid any automated outbound email:** D becomes the only option.
+
+### Trade-offs accepted
+- **Legitimate new contacts wait for a person.** About 240 replies a day are slower. Track their time to
+  send and the approval rejection rate; a rate near zero suggests the gate could narrow.
+- **The allow-list is only as good as the CRM.** A poisoned CRM contact defeats it. Log CRM contact
+  changes made in the last day before an email and alert when an agent email goes to one.
+- **Scores are judgements.** Ask the second line to re-score this entry independently before rollout and
+  record the gap.
+
+### Review rubric
+- **The risk is written cause-event-consequence**, with inherent and residual scores on anchored scales.
+- **Each option's residual is scored against appetite and the impact floor**, not just ranked.
+- **Capability limits are preferred over detection** where they exist, with the reason stated.
+- **Human review load is computed** and compared with capacity before approval is chosen as a control.
+- **Every control has a KRI** with a named metric and alert threshold.
+- **Conditions that would reopen the decision** are listed with the number or event that triggers them.
 
 ## Why it exists
 - **Traditional reviews assume specified, stable behaviour:** test against the spec, fix deviations, ship. AI

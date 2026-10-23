@@ -5,7 +5,8 @@ name: Background jobs / durable workers
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/message-queues
@@ -40,6 +41,228 @@ tools must be idempotent.
   latency, the checkpoint granularity, which provider errors are retryable, and per-tenant concurrency caps.
 - **What you can skip.** Writing your own workflow engine. Know leases, fencing, idempotency, Little's law
   and when a table stops being enough.
+
+## Lab
+### Task
+A research agent runs as a durable job with a lease and a checkpoint per step, and three defects reached
+production: a run resumed after `kill -9` restarted at step 0, a worker that stalled past its lease
+overwrote the new holder's steps, and a permanent `400` from the provider was retried five times.
+
+You will fix `run_job` against an in-memory job record with a fake clock that mirrors the jobs table,
+so no database is needed. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's lease, Finish/retry/dead-letter, Idempotency and agent-run sections,
+  and the lease-expiry runnable under Examples.
+- **Setup:** Python 3.11+, standard library only, `pip install pytest` (checked against pytest 9.1.1).
+  Save the starter as `agent_jobs.py` and the tests as `test_agent_jobs.py` in one directory.
+- **Goal:** a resumed run calls the model only for unfinished steps, a pre-empted worker writes nothing
+  after losing its lease, permanent errors go `dead` at once, and retryable ones wait `backoff(attempts)`.
+
+### Starter code
+```python
+"""agent_jobs.py: an agent run as a durable job with leases and per-step checkpoints. In memory, with a
+fake clock, mirroring the jobs table: a resumed run restarted at step 0, a pre-empted worker overwrote
+the new holder's work, and a permanent 400 was retried five times."""
+from dataclasses import dataclass
+
+
+@dataclass
+class Job:
+    id: str
+    steps: int                       # agent steps in this run
+    state: str = "queued"
+    locked_by: str = ""
+    lease_until: float = 0.0
+    run_at: float = 0.0
+    attempts: int = 0
+    error: str = ""
+
+
+class RetryableError(Exception):
+    """429, 5xx or a timeout from the model provider."""
+
+
+class PermanentError(Exception):
+    """4xx, a validation failure, a missing document."""
+
+
+class WorkerCrash(BaseException):
+    """kill -9 or an OOM kill: never reaches an `except Exception` handler."""
+
+
+def backoff(attempt):
+    return min(2 ** attempt, 300)    # production adds jitter; kept exact here so tests can check it
+
+
+def claim(job, worker, now, lease_s=300):
+    orphaned = job.state == "running" and job.lease_until < now
+    if (job.state == "queued" and job.run_at <= now) or orphaned:
+        job.state, job.locked_by, job.lease_until = "running", worker, now + lease_s
+        job.attempts += 1
+        return True
+    return False
+
+
+def run_job(job, worker, now, checkpoints, do_step, max_attempts=5):
+    """Run a claimed job's steps in order; do_step(step) calls the model and tools and returns output.
+    checkpoints maps (job_id, step) to output and is the run's durable record."""
+    try:
+        for step in range(job.steps):
+            out = do_step(step)                  # EXERCISE 1: replay recorded steps, do not redo them
+            checkpoints[(job.id, step)] = out    # EXERCISE 2: only the lease holder may write
+        job.state = "succeeded"                  # EXERCISE 2
+    except Exception as e:                       # EXERCISE 3: permanent -> dead, retryable -> backoff
+        job.error = str(e)
+        job.state = "dead" if job.attempts >= max_attempts else "queued"
+        job.run_at = now
+
+
+if __name__ == "__main__":
+    checkpoints, calls = {}, []
+    job = Job("run-7", steps=5)
+
+    def crash_at_3(step):
+        calls.append(step)
+        if step == 3 and calls.count(3) == 1:
+            raise WorkerCrash("kill -9 during step 3")
+        return f"out{step}"
+
+    claim(job, "A", now=0)
+    try:
+        run_job(job, "A", 0, checkpoints, crash_at_3)
+    except WorkerCrash:
+        pass
+    claim(job, "B", now=301)                     # A's lease expired
+    run_job(job, "B", 301, checkpoints, crash_at_3)
+    print("steps called:", calls, "| state:", job.state)
+
+    stale = Job("run-8", steps=3)
+    claim(stale, "A", now=0)
+
+    def slow_a(step):
+        if step == 1:                            # A stalls past its lease; B takes over and finishes
+            claim(stale, "B", now=301)
+            run_job(stale, "B", 301, checkpoints, lambda s: f"B{s}")
+        return f"A{step}"
+
+    run_job(stale, "A", 0, checkpoints, slow_a)
+    print("run-8 checkpoints:", [checkpoints[("run-8", s)] for s in range(3)], "| locked_by:", stale.locked_by)
+
+    for err in (PermanentError("400 invalid tool schema"), RetryableError("429 rate limited")):
+        j = Job("run-9", steps=1)
+        claim(j, "A", now=1000)
+
+        def fail(step, err=err):
+            raise err
+
+        run_job(j, "A", 1000, checkpoints, fail)
+        print(type(err).__name__, "->", j.state, "| retry at:", j.run_at if j.state == "queued" else "never")
+```
+
+### Expected output
+The starter prints `steps called: [0, 1, 2, 3, 0, 1, 2, 3, 4]`, `run-8 checkpoints: ['B0', 'A1', 'A2']`
+and `queued | retry at: 1000` for both errors. After the fix, `python agent_jobs.py` prints:
+
+```text
+steps called: [0, 1, 2, 3, 3, 4] | state: succeeded
+run-8 checkpoints: ['A0', 'B1', 'B2'] | locked_by: B
+PermanentError -> dead | retry at: never
+RetryableError -> queued | retry at: 1002
+```
+
+### Tests
+On the starter all 4 fail: the resume test with `At index 4 diff: 0 != 3`, the fence test with
+`['B0', 'A1', 'A2'] == ['A0', 'B1', 'B2']`, `('queued', 1) == ('dead', 1)`, and
+`assert 1000 == (1000 + 2)` for the backoff.
+
+```python
+import pytest
+
+from agent_jobs import Job, PermanentError, RetryableError, WorkerCrash, backoff, claim, run_job
+
+
+def test_resume_replays_checkpoints_instead_of_redoing_steps():
+    checkpoints, calls = {}, []
+    job = Job("run-7", steps=5)
+
+    def do_step(step):
+        calls.append(step)
+        if step == 3 and calls.count(3) == 1:
+            raise WorkerCrash("kill -9")
+        return f"out{step}"
+
+    assert claim(job, "A", now=0)
+    with pytest.raises(WorkerCrash):
+        run_job(job, "A", 0, checkpoints, do_step)
+    assert claim(job, "B", now=301)
+    run_job(job, "B", 301, checkpoints, do_step)
+    assert calls == [0, 1, 2, 3, 3, 4]
+    assert job.state == "succeeded" and job.attempts == 2
+
+
+def test_preempted_worker_cannot_overwrite_new_holder():
+    checkpoints, a_steps = {}, []
+    job = Job("run-8", steps=3)
+    claim(job, "A", now=0)
+
+    def slow_a(step):
+        a_steps.append(step)
+        if step == 1:
+            assert claim(job, "B", now=301)
+            run_job(job, "B", 301, checkpoints, lambda s: f"B{s}")
+        return f"A{step}"
+
+    run_job(job, "A", 0, checkpoints, slow_a)
+    assert [checkpoints[("run-8", s)] for s in range(3)] == ["A0", "B1", "B2"]
+    assert a_steps == [0, 1]                     # A stops once it sees it lost the lease
+    assert job.state == "succeeded" and job.locked_by == "B"
+
+
+def test_permanent_error_goes_dead_on_first_attempt():
+    job = Job("run-9", steps=1)
+    claim(job, "A", now=1000)
+
+    def fail(step):
+        raise PermanentError("400 invalid tool schema")
+
+    run_job(job, "A", 1000, {}, fail)
+    assert (job.state, job.attempts) == ("dead", 1)
+
+
+def test_retryable_error_is_rescheduled_with_backoff():
+    job = Job("run-9", steps=1)
+    claim(job, "A", now=1000)
+
+    def fail(step):
+        raise RetryableError("429 rate limited")
+
+    run_job(job, "A", 1000, {}, fail)
+    assert job.state == "queued"
+    assert job.run_at == 1000 + backoff(1)
+    assert not claim(job, "B", now=1001)         # not before the backoff
+```
+
+### Failure scenarios
+- **Inject: fence the final `succeeded` but not each checkpoint.** The fence test fails on `a_steps`
+  or on step 1, because A writes `A1` after B finished. Debug: log `(worker, step, locked_by)` on every
+  write; in SQL every write carries `AND locked_by = %s`.
+- **Inject: `except BaseException` in `run_job`.** A `kill -9` cannot be caught in real life, so the
+  test's `WorkerCrash` now marks the job `queued` instead of leaving it to lease expiry, and the resume
+  test fails. Debug: a real OOM kill reaches no handler, so recovery must not depend on one.
+- **Inject: replay by calling `do_step` and discarding its output.** The trace looks resumed, but the
+  model ran again and may pick a different tool. Debug: count model calls per resumed run; above one
+  means steps are being regenerated, not replayed.
+- **Inject: classify by message text (`"429" in str(e)`).** It works until a provider changes wording.
+  Debug: classify by exception type or HTTP status, and test both branches.
+
+### Submission
+- **Your fixed `agent_jobs.py`**, with the given tests unchanged.
+- **A `pytest -v` log** with all 4 passing, plus the starter's failing run for comparison.
+- **The `python agent_jobs.py` output** after the fix.
+- **One extra test** of your own, for example that a retryable error on the fifth attempt goes `dead`.
+- **A short note** translating each fix to the psycopg worker above: the checkpoint lookup, the
+  `DONE` fence on `locked_by`, and the `RetryableError` branch with `backoff`.
+- **Evaluated by:** the given tests pass unmodified, your test fails on the starter, and no worker
+  writes after losing its lease.
 
 ## Why it exists
 - **Some work outlasts any client's patience.** Embedding a 300-page PDF, running a twenty-step agent,

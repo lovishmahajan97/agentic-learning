@@ -5,7 +5,8 @@ name: Model cards
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - security-governance-compliance/model-governance
@@ -38,6 +39,64 @@ release because agent behaviour cannot be read from weights or code.
   the running agent drifts from its card.
 - **What you can skip.** Polishing prose and long ethics essays for a low-risk internal agent. A half-page
   card with honest out-of-scope lines and sliced eval numbers beats ten pages of boilerplate.
+
+## Decision case
+### Scenario
+An insurer runs 40 agents in production and must decide how to document them before an internal audit.
+All figures are illustrative.
+- **Portfolio:** 4 agents are high-risk (claims routing, fraud triage, two that touch credit decisions);
+  36 are low or medium risk (internal search, ticket tagging, drafting).
+- **Change rate:** each agent ships about one prompt, tool or model change a week, so 40 changes a week.
+- **Constraints:**
+  - the governance team has 2 reviewers with 6 hours a week each for card review, 12 hours in all;
+  - a full nine-section review takes about 3 hours, a half-page card about 0.5 hours;
+  - the 4 high-risk agents need EU AI Act technical documentation tied to the deployed version;
+  - 2 platform engineers and 10 weeks until the audit;
+  - no version may ship with a tool its card does not declare.
+- **Trigger rate:** a review of last quarter's changes shows about 25% touched tools, intended use or the
+  eval set; the rest were wording tweaks re-scored by the eval pipeline.
+
+### Options
+| Option | How it works | Review hours a week | Audit evidence | Tool creep |
+|---|---|---|---|---|
+| **A. Wiki page per agent** | free-text page written at launch, edited by hand | near 0 | fails: not tied to a version, numbers not reproducible | not caught |
+| **B. Full card, full review, every release** | nine-section card for all 40 agents, board reviews each change | 40 × 3 = 120: 10 × capacity | strong | caught, but the queue stalls releases |
+| **C. Tiered system cards as a registry gate** | card keyed to model, prompt hash and tool list; numbers generated from the gating eval run; human sections re-reviewed only on a trigger; depth by risk tier | high: 4 × 25% × 3 = 3; low: 36 × 25% × 0.5 = 4.5; total 7.5 | strong for the 4 high-risk agents, adequate for the rest | caught automatically by the gate |
+
+### Decision
+Choose **C, tiered system cards enforced at promotion**, because it is the only option that fits the
+review budget and still produces version-tied evidence.
+- **Capacity:** 7.5 hours a week fits under 12, while B needs 120.
+- **Audit:** every number traces to a stored eval run and every card to one version, which A cannot show.
+- **Tool creep:** the gate diffs the running tool list against the card, so no reviewer has to notice it.
+- **Delivery:** the gate is one registry check plus a card generator, a fit for 2 engineers in 10 weeks.
+
+**What would change it:**
+- **More high-risk agents:** at 12 high-risk and 28 low-risk, review needs 12 × 0.25 × 3 + 28 × 0.25 ×
+  0.5 = 9 + 3.5 = 12.5 hours, over capacity; add a reviewer or cut trigger scope.
+- **A rule requiring sign-off on every release:** the 4 high-risk agents alone need 4 × 3 = 12 hours, so
+  the low tier would need its own reviewer.
+- **A trigger rate well above 25%:** recompute; at 40% the total is 4.8 + 7.2 = 12 hours, with no slack.
+
+### Trade-offs accepted
+- **Wording changes ship without human review.** A prompt edit can shift behaviour that the eval set does
+  not cover. Watch slice scores per release and the share of releases that skipped review.
+- **Low-risk cards are thin.** Half a page will not satisfy a customer who wants detail; write a fuller
+  card on request and track how often that happens.
+- **Risk tiers can be wrong.** An agent tagged low-risk may gain a write tool. Re-tier on every tool change
+  and alert when a low-tier agent holds a write tool.
+- **The 25% trigger rate is a guess from one quarter.** Measure it monthly and recompute capacity.
+
+### Review rubric
+- **Review capacity is computed** from agent count, change rate, trigger rate and hours per review, and
+  compared with the hours available.
+- **The card is keyed to an immutable version** (model, prompt hash, tool list), and a mismatch blocks
+  promotion.
+- **Depth scales with risk tier**, with named criteria for what makes an agent high-risk.
+- **Re-review triggers are listed explicitly** (tools, intended use, eval set, training data), not left to
+  judgement.
+- **Unmeasured or under-sampled slices block release** in the high-risk tier.
+- **At least two conditions that would change the choice** are stated with the number that flips it.
 
 ## Why it exists
 - **A trained model, and even more an agent, is an opaque function.** Another team, a customer or a

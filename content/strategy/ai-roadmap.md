@@ -5,7 +5,8 @@ name: AI roadmap
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/ai-use-case-discovery
@@ -34,6 +35,64 @@ not to named models or dates for everything.
   obvious.
 - **What you can skip.** Portfolio-finance detail and long-horizon theme planning; know the value formula,
   the feasibility axes and the gate idea well enough to argue for or against an agent project.
+
+## Decision case
+### Scenario
+A B2B software company's operations group wants its first agents in production within two quarters. All
+figures are illustrative planning numbers, not benchmarks.
+- **Team:** 4 engineers for 26 weeks, so 4 × 26 = 104 engineer-weeks (ew), or 52 per quarter.
+- **Candidates, valued with the roadmap formula** (volume × value per unit × capture × automation share −
+  run and review cost):
+  - **Ticket triage agent:** tags and routes 50,000 tickets a year through an existing ticket API;
+    50,000 × $1.50 × 0.6 × 0.7 − ($2,000 run + $5,000 review) = $24,500 a year. Every action is reversible.
+  - **Invoice-dispute agent:** 6,000 disputes a year, $30 handling saved each, automation share 0.5;
+    180,000 × 0.6 × 0.5 − ($1,800 + $12,000) = $40,200. It issues credits, which are irreversible, and no
+    credit API exists yet. Finance experts often disagree on the right credit, so evaluability is low.
+  - **Call-summary agent:** writes CRM notes; 20,000 × $1.00 × 0.5 × 0.8 − ($400 + $2,000) = $5,600.
+- **Effort estimates:** gateway 6 ew, eval harness 8, tool layer 6, approval UI 8, credit API 16; agents:
+  triage 12, disputes 20, summaries 8; a 300-case dispute feasibility eval 6.
+- **Constraints:** compliance forbids credits without a human approval; the board wants one agent live
+  by month 6; nobody can be hired this half.
+
+### Options
+| Option | How it works | Effort vs 104 ew | Live by month 6 | Compliance |
+|---|---|---|---|---|
+| Flagship first | Build everything the dispute agent needs (gateway, harness, tool layer, approval UI, credit API) and ship it | 6 + 8 + 6 + 8 + 16 + 20 = 64 | Only if the feasibility eval passes; nothing else ships | Fits only with approval on every credit |
+| All three in parallel | Three streams, each building its own plumbing | (20 + 12) + (20 + 8) + (20 + 8 + 16 + 20) = 124 | No: over capacity by 20 ew | Same as flagship |
+| Sequenced with gates | Q1: shared foundations + triage (38 ew, including the dispute feasibility eval); Q2: approval UI, credit API and dispute agent in act-with-approval mode (44 ew); summaries parked | 38 + 44 = 82 | Yes: triage live in Q1 | Credits always approved by a human |
+
+### Decision
+**Sequenced with gates.** It is the only option that fits 104 ew with headroom (22 ew), ships an agent
+before month 6 whatever the dispute eval says, and leaves the gateway, harness and tool layer the dispute
+agent reuses.
+
+The higher-value dispute agent goes second because two of its blockers, low evaluability and
+a missing credit API, are exactly what the feasibility eval and Q2 work are meant to resolve.
+- **The dispute row's gate is written now:** proceed to build in Q2 if the 300-case eval meets the agreed
+  credit-accuracy bar; stop after two iterations below it.
+- **Summaries are "wait" with a trigger:** re-score when triage's tool layer covers the CRM.
+
+**What would change it.**
+- **The dispute eval fails twice:** park disputes and spend Q2 on summaries (8 ew) plus hardening triage.
+- **A credit API already existed:** 16 ew disappear, and the dispute agent could start in Q1 beside triage.
+- **Triage's cost per task at full volume rose from $0.04 to $0.14:** run cost becomes $7,000 and its value
+  falls to $19,500, still positive, so the order holds.
+
+### Trade-offs accepted
+- **Headline value arrives later.** The $40,200 item waits a quarter; watch the dispute eval's result date
+  so the delay buys information, not drift.
+- **Credits stay human-approved in Q2.** Expect a queue; track approvals per day and reviewer edit rate as
+  evidence for the next autonomy rung.
+- **Summaries may never ship.** Accept it while their value is $5,600; check the re-score trigger quarterly.
+
+### Review rubric
+- **Value computed, not asserted:** each candidate's annual value is derived from the formula with stated
+  inputs, and the arithmetic checks.
+- **Capacity checked per option:** engineer-weeks are summed against the team's real capacity.
+- **Foundations counted once:** the plan shows which shared pieces each agent reuses.
+- **Autonomy tied to reversibility:** irreversible actions start at draft or act-with-approval.
+- **Gates pre-registered:** each row has a pass bar, eval size and kill condition before work starts.
+- **Reversal triggers named:** the write-up says which result or estimate would reorder the plan.
 
 ## Why it exists
 - **AI projects fail on data, evaluation and adoption, not models.** The roadmap schedules those

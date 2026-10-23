@@ -5,7 +5,8 @@ name: SCIM provisioning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - enterprise-integration/sso-iam-integration
@@ -38,6 +39,67 @@ current group membership.
   retrieval filter.
 - **What you can skip.** The full RFC schema catalogue and bulk operations. Know `/Users`, `/Groups`,
   `PatchOp` shapes, 409 on duplicates, paging and the per-IdP quirks.
+
+## Decision case
+### Scenario
+An agent platform serves 20 enterprise tenants with 30,000 users; 12 tenants use Entra ID and 8 use Okta.
+Retrieval is filtered by group membership, and 4,000 users run nightly background agents. Security
+reviews now ask how the directory reaches you. Figures are illustrative.
+- **Leavers:** all access, including running and scheduled agents, ends within 1 hour of deactivation in
+  the IdP.
+- **Team moves:** a group change reaches the retrieval filter within 1 hour.
+- **Customer policy:** most customers refuse to give a vendor read credentials to their directory.
+- **Volume:** the largest group has 5,000 members and changes about 20 times a day.
+- **IdP delivery:** Okta pushes on the change event; Entra's provisioning cycle is assumed at about 40
+  minutes for planning.
+- **Team and deadline:** 2 engineers, 8 weeks before the next security review.
+
+### Options
+| Option | How changes arrive | Leaver bound | Group change bound | Directory credentials | Fits 8 weeks |
+|---|---|---|---|---|---|
+| JIT provisioning only | at each SSO login | never, for a leaver who stops logging in | next login | none | yes |
+| Nightly poll of the customer directory | you call each tenant's directory API | up to 24 h | up to 24 h | read access per tenant, mostly refused | yes |
+| Build a SCIM 2.0 endpoint | IdP pushes `/Users` and `/Groups` changes | about 40 min on Entra, near-immediate on Okta | same | none, the IdP calls you | yes, with per-IdP tests |
+| Hosted directory-sync service | vendor receives SCIM, sends you events | vendor delay plus about 40 min | same | none, but a new sub-processor per customer | yes, if every tenant approves the vendor |
+
+Group volume under SCIM: 20 incremental patches a day write about 20 members; the same 20 changes as
+full replaces would write 20 x 5,000 = 100,000 members and, without diffing, invalidate all 5,000 users'
+caches each time.
+
+### Decision
+**Build a SCIM 2.0 endpoint, handle group changes as incremental patches that invalidate only the changed
+principals, and treat `active=false` as a revocation event that also stops agents.** It is the only
+option inside both 1-hour bounds that needs no directory credentials and no new sub-processor.
+- **Why not JIT:** a leaver who never logs in again keeps scheduled agents and tokens forever.
+- **Why not polling:** it fails both bounds and needs credentials most customers refuse.
+- **Why not the hosted service:** 20 separate sub-processor approvals put the review date at risk.
+- **Agent side:** the runtime checks the principal before every tool step, so a run started before
+  deactivation stops at its next step.
+- **Join key:** the IdP's immutable user ID sent as `externalId`, shared with the SSO login.
+
+**What would change it.** Many more IdP products with quirks, or no engineers to own per-IdP tests, make
+the hosted service worth its approvals. A tenant whose IdP cannot push SCIM gets short sessions and a
+daily directory export under a written exception.
+
+### Trade-offs accepted
+- **Per-IdP quirks are yours.** Replay captured Okta and Entra payloads in CI (string booleans, path-less
+  replaces) and monitor 4xx rate per IdP.
+- **Entra's cycle sets the floor.** About 40 minutes of the 1-hour budget is the IdP's; a monthly canary
+  leaver measures the real time to loss of access per tenant.
+- **Soft deactivation everywhere.** Inactive users stay in tables, so schedulers and memory retrieval must
+  exclude them; monitor steps executed after deactivation, which should be zero.
+- **Another credential to guard.** Per-tenant SCIM tokens are stored hashed with two valid during rotation;
+  monitor auth failures per tenant.
+
+### Review rubric
+- **Bounds stated and met:** leaver and team-move bounds computed from IdP delivery time plus your own
+  processing, per IdP.
+- **Deactivation scope complete:** sessions, API tokens, stored tool tokens, scheduled and in-flight agents
+  and ACL caches.
+- **Join key chosen:** an immutable ID shared by SCIM and SSO, not email.
+- **Volume reasoned:** group change cost compared for incremental patches versus replaces.
+- **Customer policy respected:** credential and sub-processor constraints decide between options.
+- **Proof planned:** a canary leaver test and per-IdP contract tests, with the metrics to watch.
 
 ## Why it exists
 - **JIT provisioning never learns who left.** Creating an account at first SSO sign-in looks sufficient,

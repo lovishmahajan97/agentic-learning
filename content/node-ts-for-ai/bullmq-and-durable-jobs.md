@@ -5,7 +5,8 @@ name: BullMQ & durable jobs
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - node-ts-for-ai/redis
@@ -37,6 +38,236 @@ be idempotent, and durability equals Redis's.
   and backoff, `concurrency` and `limiter`, retention, and graceful `worker.close()` on deploy.
 - **What you can skip.** The Lua scripts behind each state transition and BullMQ Pro features. Know the
   lifecycle, the stall mechanism and at-least-once delivery; that is what breaks agent runs.
+
+## Lab
+### Task
+Make a one-job-per-step agent processor safe under at-least-once delivery. The first draft works
+until a step is redelivered after a stall: the email tool fires a second time, the step's insert hits
+a unique key, and the run is stuck. You fix the processor and compute the retry schedule its queue
+settings imply.
+- **Agent goal:** a crash or stall repeats at most one step's model call, never a side effect, and a
+  looping run stops at its step budget.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** this lesson's "Custom job ids and dedup", "Locks and stalled jobs" and "Agent
+  scenario: one job per agent step"; PostgreSQL transactions & migrations for why `saveStep` is unique.
+- **Needs:** Node 20+ with `npm i -D tsx vitest`; no Redis. The processor has BullMQ's processor shape,
+  so the same function runs in a real `Worker`; the in-memory queue copies BullMQ's job-id rules.
+  Checked with Node 24.21, tsx 4.23 and vitest 5.0.5.
+
+### Starter code
+```ts
+// bullmq-lab.ts: an idempotent one-job-per-step agent processor
+import { randomUUID } from "node:crypto";
+// The processor has BullMQ's Processor shape, (job) => Promise<result>, so it plugs into a real
+// Worker unchanged. Here a small in-memory queue with BullMQ's jobId rules stands in for Redis.
+export type StepData = { runId: string; step: number };
+export type Job = { id: string; name: string; data: StepData; attemptsMade: number };
+export type ToolCall = { name: string; args: Record<string, unknown> };
+export type Turn = { text?: string; toolCalls: ToolCall[] };
+export type StepRecord = { status: "ok" | "budget-exhausted"; turn?: Turn; results?: string[] };
+export interface StepQueue { add(name: string, data: StepData, opts: { jobId: string }): Promise<void> }
+export interface RunStore {
+  load(runId: string): Promise<{ lastStep: number; done: boolean }>;
+  saveStep(runId: string, step: number, rec: StepRecord, done: boolean): Promise<void>;   // unique (runId, step)
+}
+export type Tool = (args: Record<string, unknown>, idempotencyKey: string) => Promise<string>;
+export type Deps = { queue: StepQueue; store: RunStore; model: (runId: string, step: number) => Promise<Turn>;
+                     tools: Record<string, Tool>; maxSteps: number };
+
+export class FakeQueue implements StepQueue {
+  jobs = new Map<string, Job>();
+  waiting: string[] = [];
+  async add(name: string, data: StepData, { jobId }: { jobId: string }) {
+    if (/^\d+$/.test(jobId) || jobId.includes(":")) throw new Error(`invalid custom jobId ${jobId}`);   // BullMQ's rule
+    if (this.jobs.has(jobId)) return;                                  // same id still stored: a no-op, like BullMQ
+    this.jobs.set(jobId, { id: jobId, name, data, attemptsMade: 0 });
+    this.waiting.push(jobId);
+  }
+}
+
+export class MemoryStore implements RunStore {
+  rows = new Map<string, StepRecord>();
+  runs = new Map<string, { lastStep: number; done: boolean }>();
+  async load(runId: string) { return this.runs.get(runId) ?? { lastStep: -1, done: false }; }
+  async saveStep(runId: string, step: number, rec: StepRecord, done: boolean) {
+    const k = `${runId}/${step}`;
+    if (this.rows.has(k)) throw new Error(`duplicate key (run_id, step)=(${runId}, ${step})`);
+    this.rows.set(k, rec);
+    this.runs.set(runId, { lastStep: step, done });
+  }
+}
+
+// A worker loop with at-least-once delivery: steps in `redeliver` are processed a second time,
+// as after a stall (lock expired) or a crash before the job was marked completed.
+export async function runQueue(q: FakeQueue, processor: (job: Job) => Promise<unknown>, redeliver: number[] = []) {
+  while (q.waiting.length) {
+    const id = q.waiting.shift()!;
+    const job = q.jobs.get(id)!;
+    for (let n = 0; n < (redeliver.includes(job.data.step) ? 2 : 1); n++) {
+      console.log(id, "->", JSON.stringify(await processor({ ...job, attemptsMade: n })));
+    }
+  }
+}
+
+// YOUR CODE 1: the first draft. Make it safe under at-least-once delivery:
+// - deterministic, valid job ids: `run-<runId>-step-<n>`;
+// - a redelivered step that is already committed returns { skipped: true } and, if the run is not
+//   done and this was its last step, re-adds the next step (a no-op when it already exists);
+// - pass `run-<runId>-step-<n>` as the idempotency key to every tool;
+// - at step >= maxSteps, save { status: "budget-exhausted" } as a final step and return { done: true }.
+export function createProcessor({ queue, store, model, tools }: Deps) {
+  return async (job: Job) => {
+    const { runId, step } = job.data;
+    const turn = await model(runId, step);
+    const results: string[] = [];
+    for (const c of turn.toolCalls) results.push(await tools[c.name](c.args, ""));
+    const done = turn.toolCalls.length === 0;
+    await store.saveStep(runId, step, { status: "ok", turn, results }, done);
+    if (done) return { done: true };
+    await queue.add("step", { runId, step: step + 1 }, { jobId: `run-${runId}-${randomUUID()}` });
+    return { next: step + 1 };
+  };
+}
+
+// YOUR CODE 2: the waits BullMQ's { type: "exponential", delay } backoff produces between `attempts` tries.
+export function backoffDelays(attempts: number, delayMs: number): number[] {
+  throw new Error("not implemented: backoffDelays");
+}
+
+// Demo fixtures: a 3-step run (search, send an email, answer) and a tool that dedupes on its key.
+export function fixtures() {
+  const sent = new Set<string>();
+  let emails = 0;
+  const script: Turn[] = [
+    { toolCalls: [{ name: "search", args: { q: "refund policy" } }] },
+    { toolCalls: [{ name: "send_email", args: { to: "c@example.com" } }] },
+    { text: "Refund sent.", toolCalls: [] },
+  ];
+  const tools: Record<string, Tool> = {
+    search: async () => "30-day refunds",
+    send_email: async (_a, key) => { if (!key || !sent.has(key)) { emails++; if (key) sent.add(key); } return "sent"; },
+  };
+  return { tools, model: async (_r: string, step: number) => script[step] ?? script[2], emails: () => emails };
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const queue = new FakeQueue(), store = new MemoryStore(), f = fixtures();
+  const processor = createProcessor({ queue, store, model: f.model, tools: f.tools, maxSteps: 20 });
+  await queue.add("step", { runId: "r1", step: 0 }, { jobId: "run-r1-step-0" });
+  try { await runQueue(queue, processor, [1]); }
+  catch (e) { console.log("worker error:", (e as Error).message); }
+  console.log("emails sent", f.emails(), "| steps saved", store.rows.size);
+  try { console.log("backoff", backoffDelays(5, 2_000)); } catch (e) { console.log((e as Error).message); }
+}
+```
+
+Run it with `npx tsx bullmq-lab.ts`. As given, step 1 gets a random job id, its redelivery sends the
+email again (`emails sent 2`) and then dies on `duplicate key (run_id, step)=(r1, 1)`, so the run
+never reaches step 2.
+
+### Expected output
+```
+run-r1-step-0 -> {"next":1}
+run-r1-step-1 -> {"next":2}
+run-r1-step-1 -> {"skipped":true}
+run-r1-step-2 -> {"done":true}
+emails sent 1 | steps saved 3
+backoff [ 2000, 4000, 8000, 16000 ]
+```
+
+### Tests
+```ts
+// bullmq-lab.test.ts: run with `npx vitest run`
+import { describe, expect, it } from "vitest";
+import { backoffDelays, createProcessor, fixtures, FakeQueue, MemoryStore, type Job, type Tool } from "./bullmq-lab";
+
+function setup(maxSteps = 20, tools?: Record<string, Tool>) {
+  const queue = new FakeQueue(), store = new MemoryStore(), f = fixtures();
+  const processor = createProcessor({ queue, store, model: f.model, tools: tools ?? f.tools, maxSteps });
+  const job = (step: number, attemptsMade = 0): Job =>
+    ({ id: `run-r1-step-${step}`, name: "step", data: { runId: "r1", step }, attemptsMade });
+  return { queue, store, f, processor, job };
+}
+async function drain(q: FakeQueue, p: (j: Job) => Promise<unknown>) {
+  while (q.waiting.length) await p(q.jobs.get(q.waiting.shift()!)!);
+}
+
+describe("agent step processor", () => {
+  it("runs a 3-step run with deterministic, valid job ids", async () => {
+    const { queue, store, processor } = setup();
+    await queue.add("step", { runId: "r1", step: 0 }, { jobId: "run-r1-step-0" });
+    await drain(queue, processor);
+    expect([...queue.jobs.keys()]).toEqual(["run-r1-step-0", "run-r1-step-1", "run-r1-step-2"]);
+    expect(await store.load("r1")).toEqual({ lastStep: 2, done: true });
+  });
+  it("skips a redelivered step without re-running its tools", async () => {
+    const { processor, f, job } = setup();
+    await processor(job(0));
+    expect(await processor(job(1))).toEqual({ next: 2 });
+    expect(await processor(job(1, 1))).toEqual({ skipped: true });
+    expect(f.emails()).toBe(1);
+  });
+  it("re-enqueues the next step after a crash between save and add", async () => {
+    const { queue, store, processor, job } = setup();
+    await processor(job(0));
+    const realAdd = queue.add.bind(queue);
+    queue.add = async () => { queue.add = realAdd; throw new Error("worker killed"); };
+    await expect(processor(job(1))).rejects.toThrow("worker killed");
+    expect(await store.load("r1")).toEqual({ lastStep: 1, done: false });
+    expect(await processor(job(1, 1))).toEqual({ skipped: true });
+    expect(queue.waiting).toContain("run-r1-step-2");
+  });
+  it("hands every tool the step's idempotency key", async () => {
+    const keys: string[] = [];
+    const spy: Tool = async (_a, key) => { keys.push(key); return "ok"; };
+    const { processor, job } = setup(20, { search: spy, send_email: spy });
+    await processor(job(0));
+    await processor(job(1));
+    expect(keys).toEqual(["run-r1-step-0", "run-r1-step-1"]);
+  });
+  it("stops a looping run at the step budget", async () => {
+    const { queue, store, processor, job } = setup(2);
+    await processor(job(0));
+    await processor(job(1));
+    expect(await processor(job(2))).toEqual({ done: true });
+    expect(store.rows.get("r1/2")).toEqual({ status: "budget-exhausted" });
+    expect(queue.jobs.has("run-r1-step-3")).toBe(false);
+  });
+});
+
+describe("backoffDelays", () => {
+  it("matches BullMQ's exponential schedule", () => {
+    expect(backoffDelays(5, 2_000)).toEqual([2_000, 4_000, 8_000, 16_000]);
+    expect(backoffDelays(1, 1_000)).toEqual([]);
+  });
+});
+```
+
+All 6 fail on the starter: random ids (`AssertionError` on the job keys), `duplicate key (run_id,
+step)=(r1, 1)` on both redelivery tests, empty idempotency keys, a step-2 row saved as `ok` instead of
+`budget-exhausted`, and `not implemented: backoffDelays`.
+
+### Failure scenarios
+- **Inject the colon id `run:<runId>:step:<n>`.** The queue throws `invalid custom jobId`, as BullMQ
+  does for ids containing `:`. Step 0 commits, every retry then fails on `add`, and the run stops at
+  step 0; alert on runs with no new step for longer than one step's p99.
+- **Inject the redelivery check after the model call.** Tests still pass, but every redelivery pays
+  for a model call whose result is thrown away. Count model calls per step id in a test; a committed
+  step must cost zero.
+- **Inject `if (run.lastStep >= step) return { skipped: true }` without the re-add.** The crash test
+  fails: step 1 is committed, step 2 was never enqueued, and nothing will ever enqueue it. This is the
+  gap the outbox pattern closes for good.
+- **Inject a tool key built from `job.attemptsMade`.** Each redelivery gets a fresh key and the
+  email goes out twice. Keys must come from the step's identity, never from the attempt.
+
+### Submission
+- **Your `bullmq-lab.ts`** with both `YOUR CODE` parts done and the fakes and fixtures unchanged.
+- **A `npx vitest run` log** showing 6 passed.
+- **The `npx tsx bullmq-lab.ts` output**, matching the expected lines.
+- **A note of 3-5 sentences:** what a stall costs a run with your processor (model calls, tool calls,
+  rows), and how long a job with `attempts: 5` and a 2 s base delay waits before it lands in `failed`.
+- **Evaluated on:** deterministic `run-<id>-step-<n>` ids, a committed-step check before any paid
+  call, the re-add after a crash, tool keys from the step and a step budget that ends the run.
 
 ## Why it exists
 - **A request is the wrong unit for long work.** An agent run takes two minutes, calls the model eight

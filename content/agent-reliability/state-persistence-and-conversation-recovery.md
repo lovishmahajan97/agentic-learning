@@ -5,7 +5,8 @@ name: State persistence & conversation recovery
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -39,6 +40,176 @@ number and interrupted turns are repaired, never dangling or duplicated.
   events, and how edits become branches.
 - **What you can skip.** Using a provider's hosted thread as your record of truth. Derive provider messages
   from your own log so you can swap models and re-derive any past context.
+
+## Lab
+### Task
+Put a refund assistant's transcript on a SQLite event log that the in-memory example cannot give you:
+a database-enforced idempotent submit, edits stored as branches with an active leaf, and a context
+builder whose window cut never separates a tool call from its result. Time box: 60-90 min.
+- **Prerequisites:** Tool calling; Durable execution & checkpointing; the event-log store in this
+  lesson's Examples.
+- **Setup:** Python 3.10+ with SQLite 3.24 or newer (for `ON CONFLICT ... DO NOTHING`) and
+  `pip install pytest`. Checked with Python 3.13 (SQLite 3.53) and pytest 9.1. Save the starter as
+  `lab.py` and the tests as `test_lab.py`.
+- **No model calls:** assistant and tool events are appended by the script, as a harness would.
+
+### Starter code
+```python
+"""Lab: a branching conversation event log on SQLite with idempotent submit and a safe context cut.
+Run: python lab.py"""
+import json, sqlite3
+
+SCHEMA = """
+create table turns (turn_id text primary key, conversation_id text not null, parent_turn text);
+create table events (conversation_id text not null, seq integer not null, turn_id text not null,
+                     type text not null, payload text not null, primary key (conversation_id, seq));
+"""
+
+class Log:
+    def __init__(self):
+        self.db = sqlite3.connect(":memory:", isolation_level=None)
+        self.db.executescript(SCHEMA)
+
+    def append(self, cid, turn_id, type_, payload) -> int:
+        seq = self.db.execute("select coalesce(max(seq), 0) + 1 from events where conversation_id = ?",
+                              (cid,)).fetchone()[0]
+        self.db.execute("insert into events values (?, ?, ?, ?, ?)",
+                        (cid, seq, turn_id, type_, json.dumps(payload)))
+        return seq
+
+    def since(self, cid, after_seq):                      # reconnect catch-up by seq
+        rows = self.db.execute("select seq, type from events where conversation_id = ? and seq > ?"
+                               " order by seq", (cid, after_seq)).fetchall()
+        return rows
+
+    def submit(self, cid, turn_id, text, parent=None) -> bool:
+        """Record the turn with INSERT ... ON CONFLICT (turn_id) DO NOTHING; only if a row was
+        inserted, append the "user" event {"text": text}. Return True if this call created it."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+    def edit(self, cid, edited_turn, new_turn_id, text) -> bool:
+        """An edit is a branch: a new turn whose parent is the EDITED turn's parent."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+    def path(self, leaf) -> list[str]:
+        """Turn ids from the root to leaf, following parent_turn."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+    def context(self, cid, leaf, recent) -> list[tuple]:
+        """(seq, type, payload) of the events on path(leaf), in seq order, keeping the last
+        `recent` of them, but move the cut earlier so no kept tool_result loses its tool_call."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+def demo():
+    log = Log()
+    log.submit("c1", "t1", "refund order 1182")
+    log.append("c1", "t1", "tool_call", {"id": "t_a", "name": "lookup_order"})
+    log.append("c1", "t1", "tool_result", {"id": "t_a", "amount": 40})
+    log.append("c1", "t1", "assistant", {"text": "Refund of $40 possible. Proceed?"})
+    log.submit("c1", "t2", "yes", parent="t1")
+    log.append("c1", "t2", "assistant", {"text": "Refunded."})
+    created = log.edit("c1", "t2", "t2b", "no, store credit instead")
+    retried = log.edit("c1", "t2", "t2b", "no, store credit instead")   # client resends the POST
+    log.append("c1", "t2b", "assistant", {"text": "Issued $40 store credit."})
+    return log, created, retried
+
+if __name__ == "__main__":
+    log, created, retried = demo()
+    print("edit created:", created, "| retried POST created:", retried)
+    print("path:", log.path("t2b"))
+    print("catch-up after seq 4:", log.since("c1", 4))
+    for seq, type_, payload in log.context("c1", "t2b", recent=4):
+        print(seq, type_, payload)
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+edit created: True | retried POST created: False
+path: ['t1', 't2b']
+catch-up after seq 4: [(5, 'user'), (6, 'assistant'), (7, 'user'), (8, 'assistant')]
+2 tool_call {'id': 't_a', 'name': 'lookup_order'}
+3 tool_result {'id': 't_a', 'amount': 40}
+4 assistant {'text': 'Refund of $40 possible. Proceed?'}
+7 user {'text': 'no, store credit instead'}
+8 assistant {'text': 'Issued $40 store credit.'}
+```
+
+- **Read it:** the log still holds the abandoned branch (seq 5 and 6) for audit and catch-up, while the
+  context for leaf `t2b` skips it. A plain "last 4" would start at seq 3, a result without its call.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (Python 3.13, pytest 9.1).
+
+```python
+from lab import Log, demo
+
+def users(log):
+    return log.db.execute("select count(*) from events where type = 'user'").fetchone()[0]
+
+def test_submit_is_idempotent_on_turn_id():
+    log = Log()
+    assert log.submit("c1", "t1", "hi") is True
+    assert log.submit("c1", "t1", "hi") is False
+    assert users(log) == 1 and log.since("c1", 0) == [(1, "user")]
+
+def test_edit_branches_from_the_edited_turns_parent():
+    log, created, retried = demo()
+    assert (created, retried) == (True, False) and users(log) == 3
+    assert log.path("t2b") == ["t1", "t2b"] and log.path("t2") == ["t1", "t2"]
+
+def test_log_keeps_the_abandoned_branch():
+    log, _, _ = demo()
+    assert [t for _, t in log.since("c1", 4)] == ["user", "assistant", "user", "assistant"]
+
+def test_context_never_includes_the_abandoned_branch():
+    log, _, _ = demo()
+    texts = [p.get("text") for _, _, p in log.context("c1", "t2b", recent=100)]
+    assert "Refunded." not in texts and "yes" not in texts and texts[-1] == "Issued $40 store credit."
+
+def test_context_cut_keeps_tool_pairs_together():
+    log, _, _ = demo()
+    ctx = log.context("c1", "t2b", recent=4)
+    assert [s for s, _, _ in ctx] == [2, 3, 4, 7, 8]
+    assert ctx[0][1] == "tool_call" and ctx[0][2]["id"] == "t_a"
+    assert [s for s, _, _ in log.context("c1", "t2b", recent=2)] == [7, 8]
+
+def test_cut_handles_parallel_calls():
+    log = Log()
+    log.submit("c9", "t1", "compare two orders")
+    for type_, id_ in [("tool_call", "x"), ("tool_call", "y"), ("tool_result", "x"), ("tool_result", "y")]:
+        log.append("c9", "t1", type_, {"id": id_})
+    log.append("c9", "t1", "assistant", {"text": "Order x is newer."})
+    assert [s for s, _, _ in log.context("c9", "t1", recent=2)] == [2, 3, 4, 5, 6]
+```
+
+### Failure scenarios
+- **Give the edit the edited turn as its parent.** `path("t2b")` becomes `['t1', 't2', 't2b']` and the
+  context carries "yes" and "Refunded.", so the model believes a refund it never issued on this branch.
+  Print the path for the active leaf and compare it with the turn the user edited.
+- **Append the user event before the insert into `turns`.** The retried POST adds a second user event
+  (`users == 4`) even though the turn row deduped. Find identical user events seconds apart and check
+  which statement ran first.
+- **Step back only while the cut lands on a `tool_result`.** The single-call case passes, but parallel
+  calls keep `result x` without `call x`; a real API rejects that request. Diff tool call ids against
+  tool result ids in every built context, and fail the build if any result is unmatched.
+
+### Submission
+- **`lab.py`** with `submit`, `edit`, `path` and `context` implemented; `append`, `since` and `demo`
+  unchanged.
+- **A green run** of `pytest -q test_lab.py` (6 passed) and the output of `python lab.py`.
+- **One extra test of your own:** a regenerate under turn `t2b` (a new run, same turn) that adds a second
+  assistant event, and what the context should show.
+- **A short note:** how you would add a summary event so `context()` starts from the latest summary on
+  the active path instead of the root.
+- **Evaluated on:** one user event per turn id, a context that never contains the abandoned branch or an
+  unmatched tool result, and a log that still holds every event.
 
 ## Why it exists
 - **Three timescales get confused.** A multi-turn assistant lives for days or months; the HTTP request

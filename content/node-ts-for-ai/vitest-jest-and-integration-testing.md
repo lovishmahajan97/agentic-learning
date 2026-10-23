@@ -5,7 +5,8 @@ name: Vitest / Jest & integration testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - node-ts-for-ai/dependency-injection
@@ -39,6 +40,179 @@ and scored evals against the real model.
   `maxRetries: 0` on test clients, fail-closed networking, and the threshold that gates promotion.
 - **What you can skip.** Snapshotting model text and deep Jest-versus-Vitest comparisons; pick one runner
   and spend the effort on fakes and fixtures.
+
+## Lab
+### Task
+Build the bottom layer of the test pyramid for an agent loop: a scripted fake model, and the loop fixes its
+tests demand. The starter's loop has no step budget and crashes on a failing or unknown tool, the two bugs
+an eval would only show as a vague drop in task success.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** this lesson's "Three kinds of double" section and the scripted-trajectory example;
+  Dependency injection.
+- **Runs offline:** no SDK, no key, no network. Checked with Node 24.21 (it runs `.ts` files directly) and
+  Vitest 5.0.5; on older Node run the starter with `npx tsx agent.ts`.
+- **Setup:** `npm init -y && npm pkg set type=module && npm i -D vitest`, then save the two files below.
+
+### Starter code
+```ts
+// agent.ts: a tool-calling loop with an injected model, plus the scripted fake its tests use
+import { fileURLToPath } from "node:url";
+
+export type ToolCall = { id: string; name: string; input: unknown };
+export type ToolResult = { id: string; isError: boolean; content: string };
+export type Turn = { toolCalls: ToolCall[] } | { text: string };
+export type HistoryItem = { task: string } | Turn | { toolResults: ToolResult[] };
+export interface Model { next(history: HistoryItem[]): Promise<Turn> }
+export type Tools = Record<string, (input: any) => Promise<unknown>>;
+
+const SAFETY_CAP = 50;   // a hard stop so the starter cannot hang a test run; not the step budget
+
+export async function runAgent(task: string, opts: { model: Model; tools: Tools; maxSteps: number }) {
+  const history: HistoryItem[] = [{ task }];
+  for (let step = 1; step <= SAFETY_CAP; step++) {
+    // YOUR CODE 1: enforce opts.maxSteps. A model that keeps calling tools must make the run
+    // reject with an Error whose message contains "step budget" after exactly maxSteps model calls.
+    const turn = await opts.model.next(history);
+    history.push(turn);
+    if ("text" in turn) return { text: turn.text, steps: step };
+    const toolResults: ToolResult[] = [];
+    for (const call of turn.toolCalls) {
+      // YOUR CODE 2: an unknown tool name or a tool that throws must become
+      // { id: call.id, isError: true, content: <message for the model> } instead of crashing the run.
+      const out = await opts.tools[call.name](call.input);
+      toolResults.push({ id: call.id, isError: false, content: JSON.stringify(out) });
+    }
+    history.push({ toolResults });   // every result for this turn, keyed by the call id
+  }
+  return { text: "", steps: SAFETY_CAP };
+}
+
+// A scripted fake model: returns the given turns in order and records a COPY of each history it saw,
+// because runAgent keeps mutating the same array.
+export function scripted(...turns: Turn[]) {
+  const seen: HistoryItem[][] = [];
+  // YOUR CODE 3: implement next(history): push structuredClone(history) to `seen`, then return the
+  // next scripted turn, or { text: "done" } once the script is used up. Also count calls in `calls`.
+  const model = {
+    calls: 0,
+    async next(_history: HistoryItem[]): Promise<Turn> { throw new Error("not implemented: scripted fake"); },
+  };
+  return { model, seen };
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const { model, seen } = scripted(
+    { toolCalls: [{ id: "c1", name: "lookup_order", input: { orderId: "ord_42" } },
+                  { id: "c2", name: "refund_order", input: { orderId: "ord_42" } }] },
+    { text: "Order ord_42 has shipped; I could not start the refund." },
+  );
+  const tools: Tools = { lookup_order: async ({ orderId }) => ({ orderId, status: "shipped" }) };
+  const out = await runAgent("where is ord_42, and refund it", { model, tools, maxSteps: 4 });
+  console.log(out);
+  console.log("step 2 saw:", JSON.stringify(seen[1].at(-1)));
+}
+```
+
+As given, `node agent.ts` stops with `Error: not implemented: scripted fake`. Do YOUR CODE 3 first; the remaining
+failures then point at the loop itself.
+
+### Expected output
+```
+{
+  text: 'Order ord_42 has shipped; I could not start the refund.',
+  steps: 2
+}
+step 2 saw: {"toolResults":[{"id":"c1","isError":false,"content":"{\"orderId\":\"ord_42\",\"status\":\"shipped\"}"},{"id":"c2","isError":true,"content":"unknown tool refund_order"}]}
+```
+
+The error text for `c2` is yours to word; the tests only require that it names the tool.
+
+### Tests
+```ts
+// agent.test.ts: run with `npx vitest run`
+import { describe, it, expect, vi } from "vitest";
+import { runAgent, scripted } from "./agent";
+
+const lookup = async ({ orderId }: { orderId: string }) => ({ orderId, status: "shipped" });
+
+describe("scripted fake", () => {
+  it("replays turns in order and records copies of each history", async () => {
+    const { model, seen } = scripted({ text: "a" }, { text: "b" });
+    const h = [{ task: "x" }];
+    expect(await model.next(h)).toEqual({ text: "a" });
+    h.push({ task: "mutated later" });
+    expect(await model.next(h)).toEqual({ text: "b" });
+    expect(await model.next(h)).toEqual({ text: "done" });
+    expect(seen[0]).toEqual([{ task: "x" }]);          // a copy, not the live array
+    expect(model.calls).toBe(3);
+  });
+});
+
+describe("runAgent", () => {
+  it("dispatches the tool, keys the result by call id, then answers", async () => {
+    const { model, seen } = scripted(
+      { toolCalls: [{ id: "c1", name: "lookup_order", input: { orderId: "ord_42" } }] },
+      { text: "Order ord_42 has shipped." },
+    );
+    const tool = vi.fn(lookup);
+    const out = await runAgent("where is ord_42?", { model, tools: { lookup_order: tool }, maxSteps: 4 });
+    expect(tool).toHaveBeenCalledWith({ orderId: "ord_42" });
+    expect(out).toEqual({ text: "Order ord_42 has shipped.", steps: 2 });
+    expect(seen[1].at(-1)).toMatchObject({ toolResults: [{ id: "c1", isError: false }] });
+  });
+
+  it("stops at the step budget when the model keeps calling tools", async () => {
+    const loop = { next: vi.fn(async () => ({ toolCalls: [{ id: "c", name: "search", input: {} }] })) };
+    await expect(runAgent("x", { model: loop, tools: { search: async () => [] }, maxSteps: 3 }))
+      .rejects.toThrow(/step budget/);
+    expect(loop.next).toHaveBeenCalledTimes(3);
+  });
+
+  it("feeds a throwing tool back to the model as an error result", async () => {
+    const { model, seen } = scripted({ toolCalls: [{ id: "c1", name: "lookup_order", input: {} }] }, { text: "Sorry" });
+    const failing = async () => { throw new Error("upstream down"); };
+    await expect(runAgent("x", { model, tools: { lookup_order: failing }, maxSteps: 4 })).resolves.toMatchObject({ text: "Sorry" });
+    expect(seen[1].at(-1)).toMatchObject({ toolResults: [{ id: "c1", isError: true, content: expect.stringContaining("upstream down") }] });
+  });
+
+  it("turns an unknown tool name into an error result, keeping parallel results in order", async () => {
+    const { model, seen } = scripted(
+      { toolCalls: [{ id: "a", name: "lookup_order", input: { orderId: "ord_1" } }, { id: "b", name: "refund_order", input: {} }] },
+      { text: "ok" },
+    );
+    await runAgent("x", { model, tools: { lookup_order: lookup }, maxSteps: 4 });
+    expect(seen[1].at(-1)).toMatchObject({ toolResults: [
+      { id: "a", isError: false }, { id: "b", isError: true, content: expect.stringContaining("refund_order") }] });
+  });
+});
+```
+
+On the starter all five fail: four with `not implemented: scripted fake`, and the budget test with
+`promise resolved "{ text: '', steps: 50 }" instead of rejecting`. After YOUR CODE 3 alone, the two
+error-result tests fail on the crash (`upstream down`, and `opts.tools[call.name] is not a function`).
+
+### Failure scenarios
+- **Inject a live-array fake:** push `history` instead of `structuredClone(history)` into `seen`. The
+  first test fails because `seen[0]` now contains the later item. Print `seen` after a run; identical
+  entries for every step mean the fake recorded references, which is why the lesson's example copies.
+- **Inject an off-by-one budget:** check `step >= opts.maxSteps` before the call. The budget test sees 2
+  calls instead of 3. Read the `toHaveBeenCalledTimes` diff, then decide whether `maxSteps` counts model
+  calls or tool rounds and write that down in the function's comment.
+- **Inject a swallowed error:** catch the tool error but push `isError: false`. The model would read a
+  failure as data. The `toMatchObject` diff shows `isError` flipped; grep your loop for every place that
+  builds a `ToolResult`.
+- **Inject a real-network leak:** import an SDK client at module scope in `agent.ts`. Tests still pass
+  offline but CI now needs a key to import the file. Run the suite with no provider key in the
+  environment; a key error at import time means the model is no longer injected.
+
+### Submission
+- **Your `agent.ts`** with the three `YOUR CODE` parts done and the file's exports unchanged.
+- **A `npx vitest run` log** showing 5 passed, and the `node agent.ts` output matching the expected lines.
+- **One extra scripted trajectory test** of your own, built from a real or imagined production trace
+  (for example two parallel tool calls where one throws), and red before your fix.
+- **A short note** (3-5 lines) on what this suite cannot catch and which layer of this lesson catches it.
+- **Evaluated on:** green tests with no network or key, results keyed by call id, the budget counted in
+  model calls, and failures returned to the model rather than thrown.
 
 ## Why it exists
 - **The model call breaks every test assumption.** It takes seconds, costs money per token, needs a

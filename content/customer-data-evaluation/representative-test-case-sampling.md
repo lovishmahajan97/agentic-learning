@@ -5,7 +5,8 @@ name: Representative test-case sampling
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - evals/golden-dataset
@@ -32,6 +33,70 @@ trustworthy headline plus enough cases per segment to act on.
   dedup of templated requests, re-weighting for the headline, and the leak check against prompt examples.
 - **What you can skip.** Survey-sampling theory beyond the formulas here; stratify, floor, re-weight and
   report intervals, and you have what an agent eval needs.
+
+## Decision case
+### Scenario
+A telecom customer's support agent can call `issue_refund` and `cancel_plan`. It handles about 20,000
+sessions a month. Using the `agent_stratum` key from the Examples, traffic splits 85% read-short, 9%
+read-long, 5% write-short and 1% write-long (illustrative mix). Go-live is in 5 weeks.
+
+The customer signed two acceptance bars:
+- **Headline.** Weighted task success of at least 90%, measured with a 95% half-width of 5 points or less.
+- **Write safety.** Fewer than 1% wrong writes (a refund or cancellation the policy forbids), shown before
+  go-live, not after.
+
+Constraints:
+- **Label budget.** SMEs can grade 500 whole sessions before the date, and no more.
+- **Unit.** Sessions, deduplicated by cluster, from the last 8 weeks of traces.
+- **Uncertainty.** The intervals below assume a pass rate near 90% in every stratum.
+
+### Options
+| Option | Allocation of 500 (read-short / read-long / write-short / write-long) | Headline half-width | Write sessions, and the zero-failure bound (3/n) |
+|---|---|---|---|
+| **A. Proportional** | 425 / 45 / 25 / 5 | ±2.6 points | 30, so at best "under 10%": fails the write bar |
+| **B. Floor of 60, rest proportional** | 281 / 83 / 73 / 63 | ±3.1 points | 136, at best "under 2.2%": fails |
+| **C. B now, prove writes after launch** | as B, plus human approval on every refund for the first month | ±3.1 points | Many labels, but after go-live: fails "shown before go-live" |
+| **D. Write strata sized by the rule of three** | 140 / 60 / 240 / 60 | ±4.3 points | 300, so "under 1%" if none fail |
+
+### Decision
+Choose **D**, because the write bar is the hardest constraint and it fixes the allocation:
+- **The rule of three sets the write count.** Showing under 1% with zero failures needs about 3 / 0.01 = 300
+  write sessions. Only D reaches it within 500.
+- **The headline bar still holds.** D's weighted half-width is about ±4.3 points, inside the agreed 5,
+  because the bulk stratum keeps 140 items and the oversampled write strata carry tiny weights.
+- **Write-long keeps its own floor.** 60 of the 300 are long sessions, where loops and unsafe writes
+  concentrate, so a failure cluster there is visible rather than averaged away.
+- **Report weighted, never raw.** Write sessions are 60% of D but 6% of traffic, so only the re-weighted
+  estimate is quoted as the headline, never the raw average.
+
+What would change it:
+- **Any wrong write in the 300.** One failure lifts the 95% upper bound to about 1.6% (Poisson
+  approximation), so the bar is not shown. Fix the cause, then draw fresh write sessions rather than
+  re-grading the same ones.
+- **Approval-gated launch.** If the customer accepts human approval on every refund at launch, C becomes
+  viable and frees budget for the bulk.
+- **A tighter headline bar.** At ±3 points the 500 cannot satisfy both bars; ask for more SME time or a
+  later date.
+
+### Trade-offs accepted
+- **A wider headline interval.** ±4.3 instead of ±2.6 for proportional. Watch the gap between the eval
+  estimate and production QA after launch.
+- **Read-long gets only 60 items,** about ±7.6 points. Enough to spot a large gap from read-short, not to
+  rank prompts on it; track its production escalation rate.
+- **A pass on a stale window.** 8 weeks of traces miss any task types a new tool creates. Resample a slice
+  from new traffic after each tool release.
+- **Wrong writes outside the log.** Cases routed to a phone team never reach the traces. Keep the code-level
+  guard on `issue_refund`, because sampling cannot prove what was never logged.
+
+### Review rubric
+- **Each bar is translated into a count.** The write-up turns every acceptance bar into the items it needs,
+  using the interval formula or the rule of three.
+- **Allocations are computed.** Every option shows per-stratum counts that sum to the budget, plus the
+  resulting headline interval.
+- **The headline is re-weighted.** It reports Σ W_h·p_h with its standard error, not the raw average.
+- **Strata come from behaviour.** Write vs read and step-count band are used, not only intent.
+- **Failure handling is planned.** It says what happens to the decision if one bad write appears.
+- **Blind spots are named.** It lists traffic the sample cannot contain and the control that covers it.
 
 ## Why it exists
 - **An eval score is an estimate of future traffic,** and an estimate is only as good as the sample behind

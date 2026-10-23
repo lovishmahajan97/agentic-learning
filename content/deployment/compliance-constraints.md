@@ -5,7 +5,8 @@ name: Compliance constraints
 kind: concept
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -43,6 +44,66 @@ memory, traces and oversight; deep treatment lives in security-governance-compli
   making oversight an auditable event.
 - **What you can skip.** Interpreting the law and classifying an AI Act risk tier; counsel does that.
   Know the regimes well enough to translate them into constraints and evidence.
+
+## Decision case
+### Scenario
+You run a claims agent for an EU insurer. Your company is the processor; the insurer is the controller.
+Last release an engineer added a US-region fallback for when the EU model endpoint errors. All figures
+are illustrative planning numbers, not provider SLAs.
+- **Contract:** processing of claim data, including prompts and traces, stays in the EU. Any new
+  subprocessor needs the insurer's prior approval.
+- **Availability target:** 99.5% a month for the agent, so 720 h x 0.005 = 3.6 hours of downtime
+  allowed in a 30-day month.
+- **History:** model errors in the primary EU region totalled 4 hours in the worst month of the last
+  quarter, more than the 3.6-hour allowance if there is no fallback.
+- **Support:** your on-call rota includes US engineers, who today can open full-content traces.
+- **Quality:** a second provider's model has not been run on your 150-case tool-calling eval set.
+- **Deadline:** the insurer's audit is in 6 weeks.
+
+### Options
+| Option | How it works | EU-only processing | 99.5% in a 4-hour month | New subprocessor | Effort before audit |
+|---|---|---|---|---|---|
+| Keep US fallback, add transfer safeguards | fallback stays; rely on contractual transfer mechanisms | no: breaks the EU-only clause | yes | no | low, but needs a contract change the insurer has not offered |
+| Second EU region, same provider | gateway allows `eu-west-1` and `eu-central-1` only; fails over between them | yes | yes, for a single-region outage | no | low: a policy change plus a failover test |
+| Second provider in the EU | add another provider's EU endpoint as fallback | yes | yes, also for a provider-wide outage | yes: insurer approval and a DPA | high: approval cycle plus eval run |
+| EU only, degraded mode | no fallback; queue claims and tell users the assistant is paused | yes | no: 4 h is over 3.6 h | no | lowest |
+
+### Decision
+**Remove the US route today, fail over between two EU regions of the current provider, and add a
+degraded mode for when both fail.**
+- **It satisfies the hard constraint.** The gateway policy denies every region outside the two EU ones,
+  so a future fallback cannot reintroduce the US by a code change alone, and refusal logs become audit
+  evidence.
+- **It covers the measured risk.** The 4-hour month was a single-region problem, which a second EU
+  region absorbs.
+- **No new subprocessor before the audit.** Adding a second provider needs the insurer's approval and
+  an eval run, which do not fit 6 weeks; start that process in parallel.
+- **Close the remote-access gap.** Turn content logging off for this tenant, so traces keep request id,
+  token counts and a keyed hash; only EU-based staff may open the insurer's content store, with access
+  logged.
+
+**What would change it.** If the provider had a provider-wide outage, the second-provider option moves
+up, once the insurer approves it and its model passes the eval set. If the insurer signed a transfer
+clause allowing US processing, a US fallback becomes a contract question rather than a breach.
+
+### Trade-offs accepted
+- **No protection from a provider-wide outage.** Watch: errors by region and provider; the degraded
+  mode's activation count and duration.
+- **Harder debugging for US on-call.** Watch: incident time to diagnose, and requests to open content,
+  each logged and approved.
+- **Second-region quality drift.** Watch: run the 150-case eval set against both EU regions before
+  enabling failover and after any model version change.
+- **Policy as the single chokepoint.** Watch: gateway refusals per release, and a CI test that fails if
+  any non-EU region appears in the tenant's policy.
+
+### Review rubric
+- **Obligation to evidence:** each clause is traced to a constraint, a control and the evidence it emits.
+- **Conflict named and resolved:** residency vs failover is stated as a conflict with an explicit
+  resolution.
+- **Numbers recomputed:** the downtime allowance and its comparison with the observed outage are shown.
+- **Who as well as where:** remote access by support staff is treated as part of residency.
+- **Subprocessor changes handled:** any new provider goes through controller approval and the eval set.
+- **Flip conditions stated:** which contract change or outage pattern would change the choice.
 
 ## Why it exists
 - **Finished is not deployable.** A hospital cannot send patient notes to a model provider that has not

@@ -5,7 +5,8 @@ name: Output validation (Pydantic, Instructor, Outlines)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -165,6 +166,22 @@ flowchart TD
     R -->|"yes, send error text"| G
     R -->|"no"| Q["Fallback or review queue"]
 ```
+
+## Misconceptions
+- **"Structured outputs mean the output is valid."** Provider schemas and constrained decoding guarantee
+  shape only. A `deny` with `amount_cents` of 8999, a future date or a well-formed but nonexistent
+  `order_id` all pass; meaning needs Pydantic validators and reference-data checks.
+- **"Constrained decoding makes the model more accurate."** It forces syntax, not truth: a model that does
+  not know a field fills it with something plausible. Allow `null` or an `unknown` value where ignorance
+  is a legitimate answer, and order fields so the model reasons before it commits.
+- **"When validation fails, retry."** A truncated output (`stop_reason` is `max_tokens`) fails again,
+  and a retry without the `ValidationError` text repeats the same mistake. A retry rate past a few
+  percent means fix the prompt or schema, not raise `max_retries`.
+- **"Pydantic's defaults are safe for money and ids."** Lax mode quietly coerces `"8999"` to `8999`,
+  hiding the model's error. Use strict mode where the type carries meaning.
+- **"A bad tool argument should raise an exception."** In an agent, raising kills a run the model could
+  repair. Return the error as an error tool result from the executor, and cap repairs per tool so a stuck
+  model does not burn the step budget.
 
 ## Examples
 ### One contract, three jobs

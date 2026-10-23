@@ -5,7 +5,8 @@ name: OpenAI / Anthropic Node SDKs
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - node-ts-for-ai/api-clients-with-retries-and-circuit-breakers
@@ -38,6 +39,183 @@ in explicit versus automatic prompt caching.
   the loop.
 - **What you can skip.** Writing your own SSE parser or argument-fragment reassembly; `.finalMessage()` and
   the stream helpers do it. Tool runners are optional once you understand the loop they hide.
+
+## Lab
+### Task
+Fix a hand-written agent loop on the Anthropic SDK so it survives the cases a real run hits: parallel tool
+calls, a bad argument, a model that never stops and a truncated answer.
+
+The real SDK builds and parses
+every request; a `fetch` passed to the client replays recorded responses and returns the API's 400 for a
+broken `tool_use` / `tool_result` pairing, so no key or network is needed.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** this lesson's tool-call round trip and budgeted-loop examples; Runtime schema
+  validation; Vitest / Jest & integration testing (recorded fixtures).
+- **Version:** checked with `@anthropic-ai/sdk` 1.1.0, `zod` 4.6.7, Vitest 5.0.5 and Node 24.21, using
+  only `messages.create`, the `fetch`, `apiKey` and `maxRetries` client options, and `_request_id`.
+- **Setup:** `npm init -y && npm pkg set type=module && npm i @anthropic-ai/sdk zod && npm i -D vitest`.
+
+### Starter code
+```ts
+// agent.ts: a budgeted tool loop on the real Anthropic SDK, replayed against recorded responses (no key)
+import Anthropic from "@anthropic-ai/sdk";
+import { z } from "zod";
+import { fileURLToPath } from "node:url";
+
+const ORDERS: Record<string, string> = { ord_42: "shipped", ord_7: "processing" };
+const LookupOrder = z.object({ orderId: z.string().regex(/^ord_\w+$/) });
+export const tools: Anthropic.Tool[] = [{ name: "lookup_order", description: "Fetch an order by id",
+  input_schema: { type: "object", properties: { orderId: { type: "string" } }, required: ["orderId"] } }];
+const handlers: Record<string, (input: unknown) => Promise<string>> = {
+  lookup_order: async (input) => {
+    const { orderId } = LookupOrder.parse(input);            // throws a ZodError on a bad id
+    return JSON.stringify({ orderId, status: ORDERS[orderId] ?? "not found" });
+  },
+};
+
+export async function runAgent(client: Anthropic, task: string, maxSteps = 6) {
+  const messages: Anthropic.MessageParam[] = [{ role: "user", content: task }];
+  for (let step = 1; ; step++) {
+    // YOUR CODE 1: stop with an Error containing "step budget" once maxSteps model calls are spent
+    const msg = await client.messages.create(
+      { model: "claude-opus-5-5", max_tokens: 1024, system: "Use tools for order data.", tools, messages });
+    console.log(`step ${step} stop=${msg.stop_reason} tools=${msg.content.filter((b) => b.type === "tool_use")
+      .map((b) => b.name).join(",") || "-"} in=${msg.usage.input_tokens} id=${msg._request_id}`);
+    const text = msg.content.flatMap((b) => (b.type === "text" ? [b.text] : [])).join("");
+    if (msg.stop_reason === "end_turn") return { text, steps: step };
+    // YOUR CODE 2: any stop reason other than "tool_use" (max_tokens, refusal, pause_turn, a new one)
+    // must end the run with an Error naming it, instead of looping on it
+    messages.push({ role: "assistant", content: text });     // BUG: drops the tool_use blocks
+    for (const b of msg.content) {
+      if (b.type !== "tool_use") continue;
+      // YOUR CODE 3: a throwing or unknown tool must become a tool_result with is_error: true
+      const content = await handlers[b.name](b.input);
+      messages.push({ role: "user", content: [{ type: "tool_result", tool_use_id: b.id, content }] });  // BUG
+    }
+  }
+}
+
+// ---- test harness: a fetch that replays recorded Messages and rejects what the real API rejects ----
+type Recorded = { stop_reason: string; content: unknown[]; input_tokens: number };
+export function replay(recorded: Recorded[]) {
+  const requests: any[] = [];
+  const fetch = async (_url: string | URL | Request, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    requests.push(body);
+    if (requests.length > 50) return Response.json({ type: "error", error: { type: "invalid_request_error",
+      message: "replay: over 50 requests, the loop never stopped" } }, { status: 400 });
+    const m: any[] = body.messages;
+    for (let i = 0; i < m.length; i++) {                     // the API's tool_use / tool_result pairing rule
+      const ids = Array.isArray(m[i].content) ? m[i].content.filter((b: any) => b.type === "tool_use").map((b: any) => b.id) : [];
+      const next = Array.isArray(m[i + 1]?.content) ? m[i + 1].content : [];
+      const orphan = (Array.isArray(m[i].content) ? m[i].content : []).filter((b: any) => b.type === "tool_result" &&
+        !(Array.isArray(m[i - 1]?.content) && m[i - 1].content.some((u: any) => u.type === "tool_use" && u.id === b.tool_use_id)));
+      if (orphan.length) return Response.json({ type: "error", error: { type: "invalid_request_error",
+        message: `unexpected tool_use_id found in tool_result blocks: ${orphan[0].tool_use_id}` } }, { status: 400 });
+      const missing = ids.filter((id: string) => !next.some((b: any) => b.type === "tool_result" && b.tool_use_id === id));
+      if (ids.length && (m[i + 1]?.role !== "user" || missing.length))
+        return Response.json({ type: "error", error: { type: "invalid_request_error",
+          message: `tool_use ids were found without tool_result blocks immediately after: ${missing.join(", ")}` } },
+          { status: 400 });
+    }
+    const r = recorded[Math.min(requests.length - 1, recorded.length - 1)];
+    return Response.json({ id: `msg_${requests.length}`, type: "message", role: "assistant", model: body.model,
+      content: r.content, stop_reason: r.stop_reason, stop_sequence: null,
+      usage: { input_tokens: r.input_tokens, output_tokens: 40 } }, { headers: { "request-id": `req_${requests.length}` } });
+  };
+  return { client: new Anthropic({ apiKey: "test-key", maxRetries: 0, fetch }), requests };
+}
+
+export const PARALLEL: Recorded[] = [
+  { stop_reason: "tool_use", input_tokens: 1200, content: [{ type: "text", text: "Checking both orders." },
+    { type: "tool_use", id: "toolu_1", name: "lookup_order", input: { orderId: "ord_42" } },
+    { type: "tool_use", id: "toolu_2", name: "lookup_order", input: { orderId: "ord_7" } }] },
+  { stop_reason: "end_turn", input_tokens: 1450, content: [{ type: "text", text: "ord_42 has shipped; ord_7 is processing." }] },
+];
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const { client } = replay(PARALLEL);
+  console.log(await runAgent(client, "Where are ord_42 and ord_7?"));
+}
+```
+
+As given, `node agent.ts` prints step 1, then dies with `BadRequestError: 400` (`unexpected tool_use_id
+found in tool_result blocks: toolu_1`), because the echoed assistant turn lost its `tool_use` blocks.
+
+### Expected output
+```
+step 1 stop=tool_use tools=lookup_order,lookup_order in=1200 id=req_1
+step 2 stop=end_turn tools=- in=1450 id=req_2
+{ text: 'ord_42 has shipped; ord_7 is processing.', steps: 2 }
+```
+
+### Tests
+```ts
+// agent.test.ts: run with `npx vitest run`
+import { it, expect } from "vitest";
+import { runAgent, replay, PARALLEL } from "./agent";
+
+const call = (id: string, orderId: string) => ({ type: "tool_use", id, name: "lookup_order", input: { orderId } });
+const done = { stop_reason: "end_turn", input_tokens: 900, content: [{ type: "text", text: "Done." }] };
+
+it("echoes the assistant turn and returns parallel results in one user message", async () => {
+  const { client, requests } = replay(PARALLEL);
+  expect(await runAgent(client, "Where are ord_42 and ord_7?")).toEqual(
+    { text: "ord_42 has shipped; ord_7 is processing.", steps: 2 });
+  const [, assistant, results] = requests[1].messages;
+  expect(assistant.content).toEqual(PARALLEL[0].content);                       // unchanged, text included
+  expect(results.content.map((b: any) => b.tool_use_id)).toEqual(["toolu_1", "toolu_2"]);
+});
+
+it("sends a bad argument back as an is_error result the model can recover from", async () => {
+  const { client, requests } = replay([
+    { stop_reason: "tool_use", input_tokens: 800, content: [call("toolu_1", "42")] }, done]);
+  await expect(runAgent(client, "Where is 42?")).resolves.toMatchObject({ steps: 2 });
+  expect(requests[1].messages.at(-1).content[0]).toMatchObject({ tool_use_id: "toolu_1", is_error: true });
+});
+
+it("stops a looping model at the step budget", async () => {
+  const { client, requests } = replay([{ stop_reason: "tool_use", input_tokens: 800, content: [call("toolu_1", "ord_42")] }]);
+  await expect(runAgent(client, "loop", 3)).rejects.toThrow(/step budget/);
+  expect(requests).toHaveLength(3);
+});
+
+it("treats max_tokens as a failure branch, not a reason to call again", async () => {
+  const { client, requests } = replay([{ stop_reason: "max_tokens", input_tokens: 800, content: [{ type: "text", text: "{\"partial" }] }]);
+  await expect(runAgent(client, "x")).rejects.toThrow(/max_tokens/);
+  expect(requests).toHaveLength(1);
+});
+```
+
+On the starter: the first test fails with the 400 above, the second with an uncaught `ZodError` from the
+handler, and the budget and `max_tokens` tests get a 400 instead of their own error (the replay's
+50-request guard fires on a loop that never stops).
+
+### Failure scenarios
+- **Inject split results:** after fixing the echo, push one `user` message per `tool_result`. The replay
+  returns `tool_use ids were found without tool_result blocks immediately after: toolu_2`, the 400 from
+  this lesson's pitfalls. Print `requests[1].messages` and check that the message after each assistant
+  turn starts with every result for that turn.
+- **Inject a string-arguments bug:** call `JSON.parse(b.input)` as you would for OpenAI's
+  `function.arguments`. Every tool call comes back as an `is_error` result carrying a `SyntaxError`
+  message. Log `typeof b.input`: Anthropic's `input` is already an object.
+- **Inject an outer retry:** construct the client with the default `maxRetries` and wrap `create` in your
+  own 3-attempt loop, then make the replay return a 500. Count `requests`: one call becomes 9 requests,
+  the multiplication in this lesson's Check yourself. Keep one retry layer.
+- **Inject a missing default branch:** handle only `end_turn` and `tool_use`. A `max_tokens` reply loops
+  until the guard fires. Log `stop_reason` per step (the starter already does) and alert on any value your
+  code does not name.
+
+### Submission
+- **Your `agent.ts`** with the three `YOUR CODE` parts done and both `BUG` lines fixed; the replay harness
+  unchanged.
+- **A `npx vitest run` log** showing 4 passed, and the `node agent.ts` output matching the expected lines.
+- **One new recorded case** of your own (for example a `refusal` stop reason or an unknown tool name) with
+  a test that was red before your fix.
+- **A short note** with the worst-case wall clock of one 6-step run at `timeout: 60_000` and
+  `maxRetries: 2`, computed as in this lesson's worked scenario.
+- **Evaluated on:** green tests, the assistant turn echoed unchanged, all results for a turn in one user
+  message, failures returned as `is_error`, and every stop reason handled explicitly.
 
 ## Why it exists
 - **A hand-rolled `fetch` fails in predictable ways.** Under load the provider returns 429 or 529, and the

@@ -5,7 +5,8 @@ name: Speech-to-text (Whisper)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - multimodal/tts
@@ -164,6 +165,24 @@ flowchart TD
     G -->|"no"| O["Segment with start and end times"]
     O -->|"advance to last timestamp"| W
 ```
+
+## Misconceptions
+- **"Whisper streams if you feed it smaller chunks."** The encoder always sees a 30-second window, so
+  chunking means padding and re-decoding overlapping pieces, which adds latency and flickering partials.
+  Live turns need a streaming-native model.
+- **"Hallucinated sentences mean noisy audio or too small a model."** The decoder is a language model: on
+  silence or hold music it keeps writing fluent text whatever the size. VAD before decoding, plus the
+  compression-ratio and log-probability fallbacks, removes the trigger.
+- **"Raw WER is a fair way to compare models."** Casing, punctuation and "twenty five" versus "25" count
+  as errors, so one transcript scores 0.6 raw and 0.111 normalised. Normalise first, and track entity
+  accuracy, which WER underweights.
+- **"The transcript says who said what."** Whisper emits one undifferentiated stream; speaker labels come
+  from a separate diarization model whose errors cluster at crosstalk and fast turn-taking.
+- **"Segment timestamps are good enough for word alignment."** They can be off by a second or more;
+  subtitles and audio redaction need forced alignment (WhisperX-style).
+- **"Once WER is low, the agent can act on the transcript."** One misheard digit in an account number is
+  a wrong action, not a typo. Pass word confidences and confirm low-confidence entities before a tool
+  runs.
 
 ## Examples
 ### Transcribing a call with faster-whisper

@@ -5,7 +5,8 @@ name: Circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - reliability/bulkheads
@@ -38,6 +39,66 @@ around instead of hanging.
   agent sees when it is open: a fallback model, or a structured tool error the model can reason about.
 - **What you can skip.** Hand-writing a production breaker. Use a library; understand the three states,
   the minimum-calls guard and the retry ordering well enough to configure and debug it.
+
+## Decision case
+### Scenario
+A support-agent service sends its model calls to four deployments (two models in two regions), about 10
+calls per second each, 40 in total. All figures are illustrative.
+- **The incident to design for:** one deployment starts timing out every call while the other three stay
+  healthy, which is the common shape of a provider degradation.
+- **Resources:** the service has 400 concurrent call slots. Healthy calls take 3 seconds at the p99.
+- **Fallback:** a secondary provider is contracted, but it costs more per call and its tool-call format
+  has passed the evals only on the main task set.
+- **Constraints:**
+  - agent turns at most 10 seconds at the p95, even during a single-deployment outage;
+  - the 400 slots must never fill;
+  - your own 4xx bugs (a bad prompt template) must not trigger failover;
+  - a Python team with two weeks.
+
+### Options
+| Option | How it works | Slots held while one deployment hangs | Turn latency on the sick path | Healthy deployments | Effort |
+|---|---|---|---|---|---|
+| **A. Timeouts and retries only** | 30 s timeout, 3 attempts | 10 × 30 × 3 = 900 at steady state: fails | 90 s, then an error | unaffected until slots run out | none |
+| **B. One consecutive-count breaker for the provider** | trip after 5 failures in a row, all 40 calls a second counted together | about 10 × 30 = 300 until it trips | 30 s turns for about a minute | healthy calls break the run of failures, so 5 in a row takes about 1,364 calls (34 s) once timeouts land; the trip then fails all four over | a library default, one day |
+| **C. Ratio breaker per deployment, timeout inside, bulkhead beside** | key by provider × model × region; window 50, minimum 20, 50% trip ratio; 8 s timeout and slow calls counted; bulkhead of 60 per deployment; 4xx ignored; `CircuitOpen` non-retryable | at most 60, the bulkhead | 8 s, then the fallback; trips about 10 s in | untouched | about two weeks |
+| **D. Mesh outlier detection only** | eject hosts after consecutive 5xx | no cap: the provider is one external hostname, and timeouts are not 5xx | 30 s | ejects nothing useful | a config change |
+
+### Decision
+Choose **C**, because it is the only option that holds every constraint during a single-deployment outage.
+- **Slots:** the bulkhead caps the sick deployment at 60 slots, so 340 remain. Normal demand is 10 × 3 = 30
+  per deployment, so the three healthy ones need about 90.
+- **Latency:** an 8-second timeout inside the breaker bounds the worst turn below the 10-second limit. The
+  first 20 calls fail within about 10 seconds, so the breaker trips well before B's minute.
+- **Blast radius:** keying by failure domain keeps three quarters of traffic on the primary. B's
+  provider-wide breaker sends it all to the pricier secondary.
+- **4xx:** ignored exceptions keep a bad prompt from opening a healthy breaker.
+
+**What would change it:**
+- **Traffic per deployment below about 1 call a second:** 20 calls then take over 20 seconds to collect,
+  so use a consecutive count or a time-based window.
+- **No contracted secondary:** keep the breaker, but the open state queues the task and tells the user.
+- **A vendor that fails whole regions, not deployments:** a coarser per-region key is enough.
+
+### Trade-offs accepted
+- **False trips at a 50% ratio** during short bursts. Alert when a breaker opens and closes within one
+  reset interval more than a few times an hour.
+- **Fallback answers differ.** Run the agent eval set with each breaker forced open in CI, and watch the
+  quality gap per release.
+- **Per-replica state.** With four replicas each sees 2.5 calls a second per deployment and trips on its
+  own, after about 16 seconds (8 s to start 20 calls plus the 8 s timeout) instead of 10. Move to shared
+  state if replicas grow past what the minimum can absorb.
+- **Fallback cost.** Watch spend per route while a breaker is open; a long outage moves a quarter of
+  traffic to the pricier provider.
+
+### Review rubric
+- **Breakers are keyed by a named failure domain,** with call volume per key shown to reach the minimum.
+- **Failure classification is explicit:** timeouts, 5xx and slow calls count; 4xx and model argument
+  errors do not.
+- **Time to trip and slots held before it are computed** from rate, timeout and minimum calls, with a
+  bulkhead covering that window.
+- **Composition is stated:** retry outside, breaker, timeout inside, and `CircuitOpen` never retried.
+- **The open state has a defined agent behavior:** a fallback model or a structured `tool_unavailable`
+  result, evaluated with the breaker forced open.
 
 ## Why it exists
 - **Failing dependencies drain callers.** Every caller that keeps trying a failing or timing-out

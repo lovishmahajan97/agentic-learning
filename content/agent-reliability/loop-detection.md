@@ -5,7 +5,8 @@ name: Loop detection
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -38,6 +39,148 @@ allowance and making repetition visible is the cheapest fix.
   wording of the inform message.
 - **What you can skip.** Semantic near-duplicate detection on day one. Exact repeats plus (action, result)
   hashing catch most loops at almost no cost.
+
+## Lab
+### Task
+Build the two pieces the example guard leaves out: a per-tool `strip_volatile()` so the no-progress
+signal fires on a failing test whose output carries a fresh duration and request id each run, and an
+orchestrator-level `HandoffGuard` that stops router-billing ping-pong and runaway delegation depth.
+Time box: 40-60 min.
+- **Prerequisites:** The agent loop; Max-step budgets; the result-aware guard in this lesson's Examples.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13 and pytest 9.1). Save the
+  starter as `lab.py` and the tests as `test_lab.py`.
+- **No model calls:** tool results and handoffs are scripted.
+
+### Starter code
+```python
+"""Lab: no-progress detection with volatile fields stripped, plus an orchestrator handoff guard.
+Run: python lab.py"""
+import copy, hashlib, json
+from collections import Counter
+
+def canon(*parts) -> str:
+    raw = json.dumps(parts, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha1(raw.encode()).hexdigest()
+
+def strip_volatile(result, paths: list[str]):
+    """Return a copy of result without the dotted paths ("meta.request_id"); never mutate the input.
+    Non-dict results and missing paths are left alone."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+class NoProgress:
+    """Counts stale repeats: the same canonical (tool, args) whose stripped result was seen before."""
+    def __init__(self, volatile: dict[str, list[str]]):
+        self.volatile, self.seen, self.stale = volatile, set(), Counter()
+
+    def observe(self, tool: str, args: dict, result) -> int:
+        # YOUR CODE HERE: strip the tool's volatile paths, hash (tool, args, stripped result);
+        # if that hash was seen, bump stale[canon(tool, args)]; remember it; return the stale count
+        raise NotImplementedError
+
+class HandoffGuard:
+    """Lives in the orchestrator, where agent-to-agent loops are visible."""
+    def __init__(self, max_repeats: int = 2, max_depth: int = 3):
+        self.max_repeats, self.max_depth, self.counts = max_repeats, max_depth, Counter()
+
+    def on_handoff(self, frm: str, to: str, task_id: str, depth: int) -> str:
+        # YOUR CODE HERE: "human" if depth > max_depth, or if this (frm, to, task_id) has now
+        # been seen more than max_repeats times; otherwise "ok"
+        raise NotImplementedError
+
+VOLATILE = {"run_tests": ["duration_ms", "meta.request_id"]}
+
+def make_result(i, failing=2):
+    return {"failing": failing, "duration_ms": 900 + i, "meta": {"request_id": f"req-{i}", "runner": "ci-1"}}
+
+if __name__ == "__main__":
+    raw, guarded = NoProgress({}), NoProgress(VOLATILE)
+    for i in range(4):
+        r = make_result(i)
+        print(f"run_tests #{i + 1}: stale raw={raw.observe('run_tests', {'path': 'tests/'}, r)}"
+              f" stripped={guarded.observe('run_tests', {'path': 'tests/'}, r)}")
+    fixing = NoProgress(VOLATILE)
+    print("edit-test cycle:", [fixing.observe("run_tests", {"path": "tests/"}, make_result(i, failing=3 - i))
+                               for i in range(4)])
+    g = HandoffGuard()
+    hops = [("router", "billing"), ("billing", "router")] * 3
+    print("ping-pong:", [g.on_handoff(a, b, "ticket-88", depth=1) for a, b in hops])
+    print("deep delegation:", [HandoffGuard().on_handoff("planner", f"sub{d}", "t9", depth=d) for d in (1, 2, 3, 4)])
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+run_tests #1: stale raw=0 stripped=0
+run_tests #2: stale raw=0 stripped=1
+run_tests #3: stale raw=0 stripped=2
+run_tests #4: stale raw=0 stripped=3
+edit-test cycle: [0, 0, 0, 0]
+ping-pong: ['ok', 'ok', 'ok', 'ok', 'human', 'human']
+deep delegation: ['ok', 'ok', 'ok', 'human']
+```
+
+- **Read it:** without stripping, the stuck test never repeats, so the ladder in the example would never
+  climb; with stripping, the stale count reaches 3 by the fourth run, past the example guard's inform
+  (1) and block (2) thresholds.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution
+passes all 5 (Python 3.13, pytest 9.1).
+
+```python
+from lab import VOLATILE, HandoffGuard, NoProgress, strip_volatile, make_result as out
+
+def test_strip_volatile_copies_and_removes_nested_paths():
+    r = out(0)
+    s = strip_volatile(r, ["duration_ms", "meta.request_id", "meta.missing", "nope.deep"])
+    assert s == {"failing": 2, "meta": {"runner": "ci-1"}}
+    assert r["meta"]["request_id"] == "req-0" and "duration_ms" in r   # input untouched
+    assert strip_volatile("plain text", ["a"]) == "plain text"
+
+def test_stale_repeats_found_only_after_stripping():
+    raw, guarded = NoProgress({}), NoProgress(VOLATILE)
+    a = {"path": "tests/"}
+    assert [raw.observe("run_tests", a, out(i)) for i in range(4)] == [0, 0, 0, 0]
+    assert [guarded.observe("run_tests", a, out(i)) for i in range(4)] == [0, 1, 2, 3]
+
+def test_progress_and_different_args_are_not_stale():
+    np = NoProgress(VOLATILE)
+    assert [np.observe("run_tests", {"path": "tests/"}, out(i, failing=3 - i)) for i in range(4)] == [0] * 4
+    assert np.observe("run_tests", {"path": "other/"}, out(9, failing=0)) == 0
+
+def test_handoff_ping_pong_goes_to_a_human():
+    g = HandoffGuard()
+    hops = [("router", "billing"), ("billing", "router")] * 3
+    assert [g.on_handoff(a, b, "ticket-88", depth=1) for a, b in hops] == ["ok"] * 4 + ["human"] * 2
+    assert g.on_handoff("router", "billing", "ticket-99", depth=1) == "ok"   # another task
+
+def test_depth_cap():
+    assert HandoffGuard().on_handoff("planner", "sub", "t9", depth=4) == "human"
+    assert HandoffGuard(max_depth=4).on_handoff("planner", "sub", "t9", depth=4) == "ok"
+```
+
+### Failure scenarios
+- **Hash only (tool, args) in `observe`, not the result.** The edit-test cycle prints `[0, 1, 2, 3]`:
+  a run whose failing count drops every time is treated as stuck, the "raw call counts" pitfall. Log
+  the result hash next to each stale bump and check whether it actually repeated.
+- **Strip by deleting keys from the input dict.** The first test fails on "input untouched", and in
+  production the trace loses the request ids that support needs. Diff the logged tool result before and
+  after `observe()` runs.
+- **Key handoffs on (from, to) without the task id.** The `ticket-99` assertion fails: a second,
+  healthy ticket inherits the first ticket's count and goes to a human. Print the counter keys after the
+  ping-pong to see that two tasks share one bucket.
+
+### Submission
+- **`lab.py`** with `strip_volatile`, `NoProgress.observe` and `HandoffGuard.on_handoff` implemented.
+- **A green run** of `pytest -q test_lab.py` (5 passed) and the output of `python lab.py`.
+- **A volatile-field list for two of your own tools** (or two real APIs you call), with the field each
+  path removes and why it changes between identical calls.
+- **A short note:** where `HandoffGuard` sits in your orchestrator and what the human hand-off carries
+  (task id, the repeated hops, the last result from each agent).
+- **Evaluated on:** stale repeats detected only when the stripped result repeats, no false positive on
+  progress, and handoff loops stopped per task.
 
 ## Why it exists
 - **Same context in, same action out.** A model picks its next action from the context; if the context

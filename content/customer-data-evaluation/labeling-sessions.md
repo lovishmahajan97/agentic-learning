@@ -5,7 +5,8 @@ name: Labeling sessions
 kind: practice
 difficulty: intro
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - customer-data-evaluation/golden-dataset-creation-with-client-smes
@@ -32,6 +33,72 @@ stall, and tacit rules surface only live. The facilitator drives throughput whil
   how traces are rendered, and having an engineer in the room who can explain what the agent saw.
 - **What you can skip.** Building bespoke tooling; a self-hosted labelling tool or a controlled spreadsheet
   works if it opens on the item and captures label, rationale and reviewer.
+
+## Decision case
+### Scenario
+A logistics customer needs a 400-trace golden set for its multi-step claims agent within 8 weeks, to
+calibrate an LLM judge and set the acceptance bar. Three claims SMEs review: two in London, one in
+Singapore. Figures are illustrative; batch sizes use `batch_size` from the Examples.
+
+- **Expert time.** Each SME gives 150 minutes a week.
+- **Speed.** Last week's dry run measured about 3 minutes per 6-step trace.
+- **Per batch.** 3 gold checks per reviewer and a 25% double-label fraction.
+
+Constraints:
+- **Time zones.** The only shared working window is about 1 hour, once a week (late afternoon in Singapore).
+- **Rules must surface.** Disagreements must become logged decisions with the claims director, because they
+  feed the guideline, the judge prompt and the agent's system prompt.
+- **Governance.** Traces stay in the customer's tenant; the labelling tool runs there.
+
+### Options
+| Option | How it works | Traces per week | Weeks to 400 | Rules and quality |
+|---|---|---|---|---|
+| **A. Weekly live session** | Calibration, labelling and disagreement review in the 1-hour overlap, about 30 minutes of it labelling | 16 | 25: misses the deadline | Best for rules, but the slot is too short |
+| **B. Async link only** | Each SME labels 150 minutes a week alone | 112 on paper | 4 on paper, but async stalls on a day-one burst and a long tail | No calibration, and splits arrive as numbers in a column |
+| **C. Async labelling plus a live review** | 120 minutes async labelling each, then 30 minutes live: silent calibration, then splits | 88 | 5 (400 / 88 ≈ 4.5) | Splits resolved weekly with the director |
+| **D. Two-day on-site workshop** | About 600 labelling minutes each in one block | 472 in one go | 1 | Fatigue after an hour or two, travel for one SME, no fixes between rounds |
+
+### Decision
+Choose **C**, because the time-zone window is the binding constraint and rules must still surface live:
+- **It meets the deadline with slack.** 88 traces a week reaches 400 in 5 weeks, leaving 3 weeks for relabels
+  after guideline changes.
+- **Independence comes for free.** Async labels are committed before the live call, so discussion cannot
+  turn the loudest opinion into the label.
+- **The live 30 minutes does what only live time can.** Silent calibration on a few shared traces, then
+  about 22 doubled traces a week are reviewed for splits, and each outcome goes into the decision log with
+  item IDs.
+- **The stall risk of async is managed, not ignored.** The sponsor books the 120-minute async blocks in each
+  SME's calendar, and the facilitator checks completion the day before the live call.
+
+What would change it:
+- **Async completion falls.** If any SME finishes under 80% of their batch two weeks running (a team
+  threshold, not a standard), raise it with the sponsor and move part of their labelling into a second
+  shared slot.
+- **A wider overlap.** If the Singapore SME's hours shift to give a 90-minute window, the full live
+  session format (A) returns, with 50 labelling minutes.
+- **Stable, high agreement.** Once pooled agreement and gold-check accuracy hold for several weeks, the live
+  call can go fortnightly.
+
+### Trade-offs accepted
+- **Async labellers cannot ask questions in the moment.** Watch the "unsure" rate per reviewer and add the
+  items they mark to the next silent calibration.
+- **Fatigue is invisible async.** Track minutes per trace and gold-check accuracy by position in the batch,
+  and split a 120-minute block into two if late items degrade.
+- **One live session's agreement is noisy.** At 80% agreement, 22 doubles carry about ±17 points, so
+  report agreement pooled over four weeks next to the weekly figure.
+- **The director's time is fixed at 30 minutes.** Splits that need more go on an escalation list with a due
+  date, tracked in the decision log.
+
+### Review rubric
+- **Capacity is computed.** The write-up sizes each format with reviewers, minutes, minutes per trace,
+  gold checks and the double fraction, and states weeks to the target.
+- **The binding constraint is named.** It identifies the one constraint (here the shared window) that
+  eliminates options, with numbers.
+- **Independence is protected.** Labels are committed before any discussion in the chosen format.
+- **Rules have a path.** Splits become logged decisions with item IDs that reach the guideline, judge and
+  agent prompt.
+- **Stall and fatigue are monitored.** It names a completion check and a quality-by-position check.
+- **Reversal triggers are stated** as observable thresholds, labelled as team choices where they are.
 
 ## Why it exists
 - **SMEs are the bottleneck of every customer evaluation.** They are senior, booked, and labelling is not

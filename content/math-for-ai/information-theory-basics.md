@@ -5,7 +5,8 @@ name: Information theory basics
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: understand
 code_tested: yes
@@ -106,6 +107,23 @@ flowchart TD
     M --> KR
     KR --> RL["RLHF: reward minus beta times KL"]
 ```
+
+## Misconceptions
+- **"A well-trained model drives loss toward zero."** Cross-entropy can never drop below the entropy of
+  the target. Real next tokens are genuinely uncertain, so validation loss has a floor above 0; a
+  training loss near 0 on agent traces usually means memorization, not mastery.
+- **"KL divergence is a distance between distributions."** It is not symmetric (0.184 versus 0.192 in the
+  example) and has no triangle inequality. Which distribution comes first changes what the student is
+  punished for, so it is a design choice in distillation.
+- **"Lower perplexity means a better model."** Perplexity only compares models with the same tokenizer on
+  the same text, and even then it measures fit to text, not tool-call accuracy. Use bits per byte across
+  tokenizers and task evals for agents.
+- **"Low entropy or a high logprob means the answer is right."** It means the model is confident, and
+  models can be confidently wrong. Entropy is a routing signal only after you bin it against measured
+  accuracy on labeled traces.
+- **"The RLHF KL penalty just slows learning; remove it for more reward."** It is the leash that stops the
+  policy drifting into text that games the reward model. Rising reward with a fast-climbing KL is the
+  classic sign of reward hacking.
 
 ## Examples
 ### Entropy, cross-entropy, KL and perplexity on real numbers

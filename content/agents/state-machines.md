@@ -5,7 +5,8 @@ name: State machines
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -151,6 +152,22 @@ stateDiagram-v2
     DONE --> [*]
     FAILED --> [*]
 ```
+
+## Misconceptions
+- **"A state machine means the agent is no longer autonomous."** The model still chooses what to do
+  next; the machine only fixes the set of legal next steps. That is the middle ground between a
+  hard-coded pipeline and a free loop.
+- **"A rule in the system prompt is as good as a guard."** A prompt rule is a preference the model weighs
+  against everything else in context, including an injected "skip the tests". A guard is a predicate in
+  the harness that the model cannot argue with.
+- **"Once a guard fact is true, the guard stays satisfied."** `tests_passed` describes the code when the
+  tests ran. Unless an edit clears it, the sequence test, pass, edit, finish satisfies the guard and
+  ships untested code.
+- **"The transcript is enough to resume a crashed run."** A transcript records what was said, not where
+  the run is. Resuming needs a persisted (state, data, step) plus idempotency keys, because a side effect
+  may have completed just before the crash.
+- **"More states means more control."** A state is a phase where the allowed actions differ or a point to
+  resume from. Four to eight is typical; thirty states is a workflow and should be plain code.
 
 ## Examples
 ### A bug-fix agent as a small machine

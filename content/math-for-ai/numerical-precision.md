@@ -5,7 +5,8 @@ name: Numerical precision
 kind: concept
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -110,6 +111,23 @@ flowchart TD
     LG -.->|"naive exp in fp16"| INF["inf, then NaN"]
     INF -.-> BAD["Garbage tokens or crash"]
 ```
+
+## Misconceptions
+- **"fp16 and bf16 are interchangeable 16-bit formats."** Same bytes, different split: fp16 spends bits on
+  digits and tops out at 65,504, bf16 keeps fp32's range with only 7 mantissa bits. A bf16-trained model
+  cast to fp16 can overflow on some prompts and emit garbage.
+- **"A NaN in the output means corrupted weights."** More often it is arithmetic: one value overflows to
+  inf, `inf − inf` gives NaN, and NaN spreads. A naive fp16 softmax of logits as ordinary as 12 does
+  this; subtracting the max fixes it.
+- **"int8 loses a fixed, tiny amount of precision on every weight."** Error depends on the scale, and one
+  outlier sets the scale for its whole group: with a 2.5 weight in the row, −0.05 comes back as −0.0591,
+  an 18% error. Per-group scales exist for this.
+- **"If the quantized model chats well, its tool calls are fine."** Quantization error shifts close
+  logits, and strict JSON or exact arguments notice first. Gate the checkpoint on a paired tool-call eval,
+  not a few chat prompts.
+- **"Greedy decoding replays bit-identically."** Batch size, kernel choice and summation order change
+  low-order bits, and a near-tie between two tokens can then flip. Test replays on outcomes and tool
+  sequences, not exact text.
 
 ## Examples
 ### Overflow, swamping, bf16 rounding and int8 outliers

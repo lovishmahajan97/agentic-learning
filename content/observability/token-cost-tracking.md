@@ -5,8 +5,9 @@ name: Token / cost tracking
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
 agent_relevance: core
+lesson_type: lab
 related:
   - observability/monitoring
   - observability/spans
@@ -38,6 +39,190 @@ inside the loop.
   by feature, tenant, prompt version and run id.
 - **What you can skip.** Provider billing internals. Know the usage fields per provider, the
   history-growth arithmetic and cost per successful task.
+
+## Lab
+### Task
+Cost a looping agent run from recorded provider usage and stop it on budget. No API key is needed: the
+run is replayed from usage objects shaped like the Anthropic and OpenAI responses.
+
+The starter has three defects: the OpenAI adapter bills cached tokens twice, the price lookup applies
+July's price cut to a June call, and the budget check compares one call with the cap instead of the
+run's total, so a run of cheap steps never stops. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's How it works (usage fields, the dated price table, budgets) and the
+  first example's neutral usage dict.
+- **Setup:** Python 3.12, standard library only, plus `pip install pytest` (checked on pytest 9.1). Save
+  the starter as `lab_cost.py` and the tests as `test_lab_cost.py`.
+- **Done:** `python lab_cost.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: cost an agent run from recorded usage and stop it on budget (checked on Python 3.12, stdlib only)."""
+from dataclasses import dataclass
+from datetime import date
+from types import SimpleNamespace as NS
+
+
+@dataclass(frozen=True)
+class Price:        # USD per million tokens; illustrative placeholders, not any vendor's list
+    input: float; output: float; cache_write: float; cache_read: float; effective: date
+
+
+PRICES = {          # model -> price rows, newest first
+    "example-model": [Price(1.0, 5.0, 1.25, 0.1, date(2026, 7, 1)),
+                      Price(2.0, 10.0, 2.5, 0.2, date(2025, 1, 1))],
+    "example-judge": [Price(1.0, 4.0, 0.0, 0.25, date(2025, 1, 1))],
+}
+
+
+def price_for(model, on):
+    """LAB 2: return the row in force on `on`: the newest row whose effective date is <= on."""
+    return PRICES[model][0]                                    # BUG: always today's newest price
+
+
+def cost_usd(model, usage, on):
+    p = price_for(model, on)
+    return (usage["uncached_input"] * p.input + usage["cache_write"] * p.cache_write
+            + usage["cache_read"] * p.cache_read + usage["output"] * p.output) / 1_000_000
+
+
+def from_anthropic(u):     # messages usage: input_tokens EXCLUDES cache reads and writes
+    return {"uncached_input": u.input_tokens, "cache_read": u.cache_read_input_tokens or 0,
+            "cache_write": u.cache_creation_input_tokens or 0, "output": u.output_tokens}
+
+
+def from_openai(u):
+    """LAB 1: chat completions usage. prompt_tokens INCLUDES the cached tokens reported in
+    prompt_tokens_details.cached_tokens; map it so no token is billed twice."""
+    return {"uncached_input": u.prompt_tokens,                 # BUG: cached tokens counted twice
+            "cache_read": u.prompt_tokens_details.cached_tokens,
+            "cache_write": 0, "output": u.completion_tokens}
+
+
+class BudgetExceeded(Exception):
+    pass
+
+
+class RunBudget:
+    def __init__(self, max_usd, max_steps=20):
+        self.max_usd, self.max_steps = max_usd, max_steps
+        self.spent, self.last, self.steps = 0.0, 0.0, 0
+
+    def charge(self, cost):
+        self.spent += cost; self.last = cost
+
+    def check_before_step(self):
+        """LAB 3: called before every step. Raise BudgetExceeded("cost") once the run's TOTAL
+        spend has reached max_usd, or BudgetExceeded("steps") when max_steps would be exceeded."""
+        if self.steps + 1 > self.max_steps:
+            raise BudgetExceeded("steps")
+        if self.last >= self.max_usd:                          # BUG: compares one call, not the run
+            raise BudgetExceeded("cost")
+        self.steps += 1
+
+
+def recorded_step(k):      # replayed usage from a run that looped; every step resends a growing transcript
+    if k == 1:             # first step writes the 8,000-token cacheable prefix
+        return NS(input_tokens=400, cache_creation_input_tokens=8000, cache_read_input_tokens=0,
+                  output_tokens=300)
+    return NS(input_tokens=400 + 1500 * (k - 1), cache_creation_input_tokens=0,
+              cache_read_input_tokens=8000, output_tokens=300)
+
+
+RUN_DATE = date(2026, 6, 15)
+JUDGE_USAGE = NS(prompt_tokens=9000, completion_tokens=200, prompt_tokens_details=NS(cached_tokens=8000))
+
+
+def run_agent(budget, steps=12, verbose=False):
+    try:
+        for k in range(1, steps + 1):
+            budget.check_before_step()
+            c = cost_usd("example-model", from_anthropic(recorded_step(k)), RUN_DATE)
+            budget.charge(c)
+            if verbose:
+                print(f"step {k:>2}: ${c:.4f}  run total ${budget.spent:.4f}")
+        return "final_answer"
+    except BudgetExceeded as e:
+        return f"{e}_budget"
+
+
+if __name__ == "__main__":
+    b = RunBudget(max_usd=0.05)
+    reason = run_agent(b, verbose=True)
+    print(f"stop_reason={reason} steps={b.steps} spent=${b.spent:.4f}")
+    print(f"judge call: ${cost_usd('example-judge', from_openai(JUDGE_USAGE), RUN_DATE):.4f}")
+```
+
+As given, it runs all 12 steps at the halved July price (`step  1: $0.0119`), ends with
+`stop_reason=final_answer steps=12 spent=$0.1406`, and prices the judge call at `$0.0118`.
+
+### Expected output
+```
+step  1: $0.0238  run total $0.0238
+step  2: $0.0084  run total $0.0322
+step  3: $0.0114  run total $0.0436
+step  4: $0.0144  run total $0.0580
+stop_reason=cost_budget steps=4 spent=$0.0580
+judge call: $0.0038
+```
+
+Recompute by hand at the June prices (2, 10, 2.5 and 0.2 dollars per million):
+- **Step 1:** 400 × 2 + 8,000 × 2.5 + 300 × 10 = 23,800 micro-dollars, $0.0238.
+- **Step k ≥ 2:** (2 × (400 + 1,500 × (k − 1)) + 8,000 × 0.2 + 300 × 10) / 1e6, so step 2 is $0.0084
+  and each later step adds $0.0030.
+- **Judge:** 1,000 × 1 + 8,000 × 0.25 + 200 × 4 = 3,800 micro-dollars, $0.0038.
+- **The run stops at $0.0580, 16% over the $0.05 cap,** because a check before a step cannot know that
+  step's cost; gate on a pre-call estimate if the cap must be strict.
+
+### Tests
+```python
+from datetime import date
+import pytest
+import lab_cost as lab
+
+
+def test_openai_adapter_does_not_double_count_cached_tokens():
+    usage = lab.from_openai(lab.JUDGE_USAGE)
+    assert usage == {"uncached_input": 1000, "cache_read": 8000, "cache_write": 0, "output": 200}
+    assert lab.cost_usd("example-judge", usage, lab.RUN_DATE) == pytest.approx(0.0038)
+
+
+def test_cost_uses_the_price_in_force_on_the_call_date():
+    assert lab.price_for("example-model", date(2026, 6, 15)).input == 2.0
+    assert lab.price_for("example-model", date(2026, 7, 1)).input == 1.0
+    step1 = lab.from_anthropic(lab.recorded_step(1))
+    assert lab.cost_usd("example-model", step1, lab.RUN_DATE) == pytest.approx(0.0238)
+
+
+def test_budget_stops_the_run_on_total_spend_before_the_next_step():
+    budget = lab.RunBudget(max_usd=0.05)
+    assert lab.run_agent(budget) == "cost_budget"
+    assert budget.steps == 4 and budget.spent == pytest.approx(0.0580)
+    capped = lab.RunBudget(max_usd=10.0, max_steps=3)          # the step cap still applies
+    assert lab.run_agent(capped) == "steps_budget" and capped.steps == 3
+```
+
+On the starter all three fail for the intended reason: `uncached_input` is 9000 instead of 1000, the
+June lookup returns the July row (input price 1.0), and the run ends with `final_answer` after 12 steps.
+
+### Failure scenarios
+- **Inject: map `cache_creation_input_tokens` to 0 in `from_anthropic`.** Observe: step 1 drops to
+  $0.0038 and the run stops one step later, after 5 steps at $0.0554. Debug: sum cache-write tokens per
+  day and compare with the invoice line for cache writes; a zero column means an adapter dropped it.
+- **Inject: store the price rows oldest first.** Observe: `next(...)` returns the 2025 row for July
+  calls too, so post-cut costs read double. Debug: assert on load that rows are sorted newest first, and
+  test one date on each side of every effective date.
+- **Inject: subtract `cached_tokens` with no default,** then replay a response where it is `None`.
+  Observe: `TypeError` in the adapter and a missing cost record for that call. Debug: count calls
+  without a cost record per route; default absent usage fields to 0 in the adapter.
+
+### Submission
+- **Code:** your `lab_cost.py` with LAB 1-3 done and every `# BUG` line fixed.
+- **Test run:** `pytest -q` showing 3 passed, plus your output next to Expected output.
+- **A per-run table from your own agent:** steps, uncached, cache-read, cache-write and output tokens,
+  and cost per run, computed from real `usage` objects for at least 10 runs.
+- **A short note (3-5 sentences):** how you would make the cap strict using a pre-call estimate, and why
+  accounting must still use the response usage.
+- **Evaluation:** tests pass, every number in your table recomputes from tokens and the dated price row.
 
 ## Why it exists
 - **The invoice is one number per model per month.** It cannot tell you that summarisation costs three

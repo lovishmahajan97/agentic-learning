@@ -5,7 +5,8 @@ name: API versioning & backward compatibility
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - backend-fundamentals/rest-graphql-api-design
@@ -40,6 +41,176 @@ deprecation and sunset, for APIs, models, prompts and tools alike.
   renames, pinned model and prompt versions with evals before switching, and version tags in traces.
 - **What you can skip.** Picking between every versioning style in the abstract. Know the breaking list,
   expand and contract, and the deprecation headers.
+
+## Lab
+### Task
+A pull request calls itself a "small cleanup" of the `search_tickets` tool: it renames `q`, retypes
+`customer_id`, lowers the `limit` cap and drops a status value. Deployed agents still send the v1
+arguments from their prompts. Build the CI gate that catches this, and the headers a deprecated tool
+or route must carry. Time box: 45-75 minutes.
+- **Prerequisites:** this lesson's What counts as breaking, Deprecation lifecycle and Catching breaks
+  before they ship; the Pydantic basics from the Python lesson.
+- **Setup:** Python 3.12 with `pip install pydantic pytest` (checked on Pydantic 2.14, pytest 9.1).
+  Save the starter as `lab_versioning.py` and the tests as `test_lab_versioning.py`.
+- **Done:** `python lab_versioning.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: a breaking-change gate for agent tool schemas (checked on Python 3.12, Pydantic 2.14)."""
+from datetime import datetime, timezone
+from typing import Literal
+from pydantic import BaseModel, ConfigDict, Field
+
+
+def breaking_changes(old: dict, new: dict) -> list[str]:
+    """Compare two tool-argument JSON Schemas from the calling agent's side: a change is breaking
+    when a call that was valid against `old` can be invalid (or mean something else) against `new`.
+
+    Return sorted strings, one per break, exactly in these forms:
+      "<prop>: removed"
+      "<prop>: newly required"                       (new required prop, or optional -> required)
+      "<prop>: type <old> -> <new>"
+      "<prop>: enum values removed [<sorted list repr>]"
+      "<prop>: maximum <old> -> <new>"                (only when lowered; same for maxLength)
+      "<prop>: minimum <old> -> <new>"                (only when raised)
+    Additive or relaxing changes (new optional prop, enum value added, wider bounds) are not breaks.
+    """
+    old_p, new_p = old.get("properties", {}), new.get("properties", {})
+    out = [f"{name}: removed" for name in old_p if name not in new_p]
+    # LAB 1: detect the other five kinds of break listed above.
+    return sorted(out)
+
+
+def deprecation_headers(deprecated_at: datetime, sunset_at: datetime, guide: str) -> dict[str, str]:
+    """LAB 2: headers for every response of a deprecated tool or route:
+    Deprecation (RFC 9745): "@<unix seconds>";  Sunset (RFC 8594): an HTTP date such as
+    "Sat, 31 Oct 2026 00:00:00 GMT";  Link: '<guide>; rel="deprecation"'."""
+    return {"Deprecation": "true", "Sunset": sunset_at.isoformat()}   # BUG: not the RFC formats
+
+
+class SearchTicketsV1(BaseModel):                  # what deployed agents were prompted with
+    model_config = ConfigDict(extra="forbid")
+    q: str
+    customer_id: int = 0
+    limit: int = Field(10, ge=1, le=50)
+    status: Literal["open", "closed", "pending"] = "open"
+
+
+class SearchTicketsV2(BaseModel):                  # the "small cleanup" proposed in a PR
+    model_config = ConfigDict(extra="forbid")
+    query: str
+    customer_id: str = ""
+    limit: int = Field(10, ge=1, le=20)
+    status: Literal["open", "closed"] = "open"
+    include_archived: bool = False
+
+
+if __name__ == "__main__":
+    changes = breaking_changes(SearchTicketsV1.model_json_schema(), SearchTicketsV2.model_json_schema())
+    print(f"{len(changes)} breaking changes:")
+    for c in changes:
+        print(" -", c)
+    utc = timezone.utc
+    hdrs = deprecation_headers(datetime(2026, 1, 1, tzinfo=utc), datetime(2026, 10, 31, tzinfo=utc),
+                               "/docs/migrate-search-v2")
+    for k, v in hdrs.items():
+        print(f"{k}: {v}")
+```
+
+As given, it reports `1 breaking changes: - q: removed`, then `Deprecation: true` (an early draft's
+form) and an ISO-format `Sunset`, neither of which the RFCs define.
+
+### Expected output
+```
+5 breaking changes:
+ - customer_id: type integer -> string
+ - limit: maximum 50 -> 20
+ - q: removed
+ - query: newly required
+ - status: enum values removed ['pending']
+Deprecation: @1767225600
+Sunset: Sat, 31 Oct 2026 00:00:00 GMT
+Link: </docs/migrate-search-v2>; rel="deprecation"
+```
+
+`include_archived` is a new optional argument, so it is correctly absent: additive changes pass.
+
+### Tests
+```python
+from datetime import datetime, timezone
+import lab_versioning as lab
+
+
+def obj(props: dict, required=()):
+    return {"type": "object", "properties": props, "required": list(required)}
+
+
+S = {"type": "string"}
+I = {"type": "integer"}
+
+
+def test_the_proposed_v2_is_caught():
+    assert lab.breaking_changes(lab.SearchTicketsV1.model_json_schema(),
+                                lab.SearchTicketsV2.model_json_schema()) == [
+        "customer_id: type integer -> string",
+        "limit: maximum 50 -> 20",
+        "q: removed",
+        "query: newly required",
+        "status: enum values removed ['pending']",
+    ]
+
+
+def test_optional_becoming_required_is_a_break():
+    assert lab.breaking_changes(obj({"q": S, "lang": S}, ["q"]), obj({"q": S, "lang": S}, ["q", "lang"])) == [
+        "lang: newly required"]
+
+
+def test_tightened_bounds_are_breaks_and_relaxed_ones_are_not():
+    old = obj({"n": {**I, "minimum": 1, "maximum": 50}, "s": {**S, "maxLength": 200}})
+    assert lab.breaking_changes(old, obj({"n": {**I, "minimum": 5, "maximum": 50}, "s": {**S, "maxLength": 100}})) == [
+        "n: minimum 1 -> 5", "s: maxLength 200 -> 100"]
+    assert lab.breaking_changes(old, obj({"n": {**I, "minimum": 0, "maximum": 100}, "s": S})) == []
+
+
+def test_additive_changes_pass_the_gate():
+    old = obj({"q": S, "status": {**S, "enum": ["open", "closed"]}}, ["q"])
+    new = obj({"q": S, "status": {**S, "enum": ["open", "closed", "snoozed"]}, "limit": I}, [])
+    assert lab.breaking_changes(old, new) == []
+    assert lab.breaking_changes(old, old) == []
+
+
+def test_deprecation_headers_use_the_rfc_formats():
+    utc = timezone.utc
+    h = lab.deprecation_headers(datetime(2026, 1, 1, tzinfo=utc), datetime(2026, 10, 31, tzinfo=utc), "/docs/m")
+    assert h == {"Deprecation": "@1767225600",
+                 "Sunset": "Sat, 31 Oct 2026 00:00:00 GMT",
+                 "Link": '</docs/m>; rel="deprecation"'}
+```
+
+On the starter, 4 of 5 fail: the v2 diff finds only `q: removed`, the optional-to-required and
+tightened-bound cases return `[]`, and the headers use the draft formats. The additive test passes and
+guards against a gate that cries wolf.
+
+### Failure scenarios
+- **Inject: compare enum lists with `!=`.** Observe: the additive test fails because adding `snoozed`
+  is flagged. Debug: from the agent's side only removed values break calls; a gate that blocks additive
+  changes teaches the team to bypass it.
+- **Inject: make `status` `Literal[...] | None` in both versions and drop `pending`.** Observe: the gate
+  returns `[]`, a silent false negative, because Pydantic emits the enum inside `anyOf`. Debug: print
+  the schema; resolve `anyOf` and `$ref` before diffing, or run a full tool such as oasdiff.
+- **Inject: ship the expand phase from Examples** (`AliasChoices("query", "q")`). Observe: the gate still
+  reports `q: removed` and `query: newly required`, although old agents keep working. Debug: the
+  schema shows only what is advertised, not every alias accepted; record a dated allowlist entry tied to
+  the legacy-name counter instead of disabling the gate.
+
+### Submission
+- **Code:** `lab_versioning.py` with LAB 1 and LAB 2 done, standard library plus Pydantic only.
+- **Test run:** `pytest -q` showing 5 passed, plus the script output matching Expected output.
+- **A CI snippet:** the command or workflow step that runs the gate on the tool schemas of `main` and
+  the branch, and fails the build on any line of output.
+- **A short note (3-5 sentences):** how you would ship the `q` to `query` rename instead, using expand
+  and contract, the legacy counter and the headers from LAB 2.
+- **Evaluation:** tests pass, every break kind has a test, and additive changes stay green.
 
 ## Why it exists
 - **Clients are distributed in time as well as space.** A mobile app users never update, a partner

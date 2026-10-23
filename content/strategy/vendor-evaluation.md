@@ -5,7 +5,8 @@ name: Vendor evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/model-selection
@@ -34,6 +35,67 @@ cost per completed task), then exit terms.
   task formula.
 - **What you can skip.** Procurement mechanics and contract negotiation detail; know the gates, the noise
   interval on your eval size and the exit-cost questions.
+
+## Decision case
+### Scenario
+A manufacturer is choosing the model behind a procurement agent that reads purchase requests, checks the
+supplier catalogue and budget through tools, and drafts a purchase order in the ERP.
+
+A run that does not
+reach a correct end state goes to a buyer, at about $1.00 of buyer time per failed run. All figures are
+illustrative, and the candidates are hypothetical.
+- **Volume:** about 20,000 requests a month.
+- **Gates:** EU processing, no training on customer data, a pinnable model version.
+- **Latency:** p95 for a whole run under 20 s, because the requester waits in a form.
+- **Budget:** at most $0.25 per request, including buyer fixes of failed runs.
+- **Exit:** the model must sit behind the company's gateway alias; no multi-year commitment.
+- **Bake-off:** 300 held-out tasks, tool descriptions tuned per model on a separate 60-task dev split,
+  same loop and sandboxed tools for every candidate.
+
+### Options
+| Measure | X: frontier API | Y: cheaper API | Z: self-hosted open-weight |
+|---|---|---|---|
+| Gates | Pass | Pass | Pass (runs in own EU data centre) |
+| Price per step | $0.015 | $0.005 | Fixed GPU cost of $6,000 a month, so $0.30 per request at 20,000 |
+| Steps per run, completion | 6, 0.90 | 9, 0.86 | 10, 0.80 |
+| Cost per request incl. fixes | 0.09 + 0.10 × 1.00 = $0.190 | 0.045 + 0.14 × 1.00 = $0.185 | 0.30 + 0.20 × 1.00 = $0.50 |
+| Run p95 (p95 per step × steps) | 2.0 × 6 = 12 s | 1.5 × 9 = 13.5 s | 2.5 × 10 = 25 s |
+| Fits budget and latency | Yes | Yes | No on both |
+
+### Decision
+**Y as the primary model behind the alias, with X configured as the tested fallback.** Z fails the latency
+and cost constraints. X and Y both pass, and the evidence does not separate them.
+- **Completion is a statistical tie.** The 4-point gap (0.90 vs 0.86) comes from 30 tasks only X completed
+  and 18 only Y completed; an exact sign test on those 48 disagreements gives p ≈ 0.11, so the gap is
+  inside the noise.
+- **Cost is a near tie:** $0.185 against $0.190 per request, about $3,700 against $3,800 a month.
+- **So the tie-breaks are headroom and exit.** Y leaves more room under the $0.25 budget if steps grow,
+  and keeping X warm behind the same alias keeps exit cost low.
+
+**What would change it.**
+- **Fix cost per failed run above $1.125.** The cost lines cross where 0.09 + 0.10f = 0.045 + 0.14f, so
+  f = $1.125. At $2.00, X costs $0.29 and Y $0.325, both over budget, and X would be preferred while
+  failure rates are cut.
+- **A larger paired sample separates them:** re-run on 600 tasks if the buyers report more failures than
+  the bake-off predicted.
+- **Volume triples to 60,000:** Z's fixed cost falls to $0.10 per request, so re-test it if its latency improves.
+
+### Trade-offs accepted
+- **Y takes 50% more steps than X.** More steps mean more places to fail; watch steps per completed task
+  and invalid tool calls per model version in production traces.
+- **Maintaining a fallback costs prompt work.** Two models' tool descriptions must stay tuned; re-run the
+  bake-off job whenever either vendor ships a version.
+- **The decision rests on an assumed $1.00 fix cost.** Measure real buyer time on failed runs in the first
+  month and recompute the crossover.
+
+### Review rubric
+- **Gates applied before scores:** any candidate failing data use, residency or pinning is excluded first.
+- **Cost per completed task derived:** steps, step price and the cost of handling failed runs are combined,
+  and the arithmetic checks.
+- **Latency measured per run, at load:** per-step p95 times steps, compared with the user-facing budget.
+- **Noise checked with a paired test:** the write-up reports disagreements and says whether the gap is real.
+- **Crossover stated:** the input value at which the choice flips is computed, not guessed.
+- **Exit kept cheap:** the choice sits behind an interface, with a fallback or a re-run trigger named.
 
 ## Why it exists
 - **AI vendors differ most on what a demo never shows.** The decisive properties are often

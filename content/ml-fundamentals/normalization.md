@@ -5,7 +5,8 @@ name: Normalization (LayerNorm, RMSNorm)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 related:
   - ml-fundamentals/residual-connections
@@ -175,25 +176,23 @@ flowchart TD
     NF --> H["Output head: logits"]
 ```
 
+## Misconceptions
+- **"Normalization makes each feature zero-mean and unit-variance across the batch."** That is BatchNorm.
+  LayerNorm and RMSNorm work per token, across that token's own features, so the result is the same at
+  batch size 1 or 1,024 and does not depend on who else is batched on the server.
+- **"RMSNorm is LayerNorm with a cheaper formula, so outputs match."** It drops the mean subtraction and
+  the bias. `[11, 12, 13, 14]` keeps its offset under RMSNorm, so swapping one for the other in a port
+  changes the model.
+- **"`ε` is a negligible numerical detail."** It is baked into the checkpoint, and 1e-8 becomes exactly
+  zero in fp16. A wrong `ε` or gain convention (`w` vs `1 + w`) gives logits that match to two digits and
+  tool calls that drift after a few hundred tokens.
+- **"Pre-LN normalizes the residual stream."** It normalizes each sublayer's input and leaves the stream
+  untouched, so the stream's norm grows with depth. Only the final norm rescales it before the head.
+- **"Norm gains are ordinary weights, so weight decay is fine."** Decaying `γ` toward zero fights the
+  normalization and makes per-layer effective learning rates wander. Put 1-D parameters in a no-decay
+  group.
+
 ## Examples
-### Worked scenario: a self-hosted agent model that drifts on long trajectories
-A team ports an open RMSNorm model into a custom inference path for its coding agent. Short prompts look
-fine; long multi-step runs produce more malformed tool calls than the hosted reference. Rates below are
-illustrative.
-
-| Check | Reference | Port | What it revealed |
-|---|---|---|---|
-| Logits on 20 fixed prompts | baseline | match to two digits | not enough: the gap is small per token |
-| Valid tool-call JSON over 200 long trajectories | ~99% | ~93% | errors compound over hundreds of tokens |
-| `ε` in the port | `rms_norm_eps` from config | hard-coded default | first mismatch |
-| Where `γ` is applied | before casting back to bf16 | after the cast | second mismatch |
-| After fixing both, plus fp32 statistics | ~99% | ~99% | per-layer hidden states now match |
-
-- **The lesson:** a port is not done when short logits match; test long greedy generations with the agent's
-  real tool schemas.
-- **The fastest localization** is comparing per-layer hidden states against the reference to find the
-  first layer that diverges.
-
 ### LayerNorm and RMSNorm from scratch, plus the Pre-LN block
 A from-scratch LayerNorm and RMSNorm checked against the built-in, with one token's numbers in the
 comments, then the Pre-LN block every modern decoder layer reduces to. The offset test is the point:
@@ -229,6 +228,24 @@ class PreLNBlock(torch.nn.Module):     # norm on the sublayer INPUT; the residua
         x = x + self.attn(self.n1(x))
         return x + self.mlp(self.n2(x))
 ```
+
+### Worked scenario: a self-hosted agent model that drifts on long trajectories
+A team ports an open RMSNorm model into a custom inference path for its coding agent. Short prompts look
+fine; long multi-step runs produce more malformed tool calls than the hosted reference. Rates below are
+illustrative.
+
+| Check | Reference | Port | What it revealed |
+|---|---|---|---|
+| Logits on 20 fixed prompts | baseline | match to two digits | not enough: the gap is small per token |
+| Valid tool-call JSON over 200 long trajectories | ~99% | ~93% | errors compound over hundreds of tokens |
+| `ε` in the port | `rms_norm_eps` from config | hard-coded default | first mismatch |
+| Where `γ` is applied | before casting back to bf16 | after the cast | second mismatch |
+| After fixing both, plus fp32 statistics | ~99% | ~99% | per-layer hidden states now match |
+
+- **The lesson:** a port is not done when short logits match; test long greedy generations with the agent's
+  real tool schemas.
+- **The fastest localization** is comparing per-layer hidden states against the reference to find the
+  first layer that diverges.
 
 ### Production snippet: keep norm gains out of weight decay
 Handing `model.parameters()` to AdamW as one group decays every norm gain toward zero. The common fix

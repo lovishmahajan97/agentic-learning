@@ -5,7 +5,8 @@ name: Evaluation frameworks
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - evals/eval-harness
@@ -39,6 +40,75 @@ can compare and accept.
   scorers (final-state checks, tool-call validity, steps, judges), and the dataset of tasks.
 - **What you can skip.** Capability benchmark harnesses, unless you are choosing a base model for the
   agent. They say nothing about your prompts, tools and retrieval.
+
+## Decision case
+### Scenario
+A fintech company runs three agents, each with its own eval script. The support agent reports "87% pass"
+from a CSV. The analyst agent reports "judge score 0.71" from JSONL. The KYC agent is a long multi-turn
+agent with sandboxed write tools, and its team has no script at all.
+
+A platform team of three is asked
+for one evaluation setup in 8 weeks, because the company is about to choose a new model snapshot for all
+three.
+
+Facts and constraints, with illustrative figures:
+- **Golden sets.** 400 support tasks, 250 analyst tasks and 600 KYC tasks: 1,250 tasks in total. Agent
+  tasks average about 8 model calls each. The support and analyst sets also need a judge call per item,
+  650 in all.
+- **The migration compares three bundles** (the champion and two candidates). Cold, that is
+  3 × 1,250 × 8 = 30,000 agent model calls plus 3 × 650 = 1,950 judge calls. At an illustrative $0.01 per
+  call, $300 + $19.50 = $319.50.
+- **Residency.** Production traces hold customer financial data and may not leave the company network.
+- **Comparability.** The model decision must rest on numbers all three teams accept.
+- **Fit.** The KYC agent's side effects and multi-turn flow must be evaluated, not skipped.
+
+### Options
+| Option | How it works | Residency | KYC agent fits | Cross-team comparability | 8-week feasibility |
+|---|---|---|---|---|---|
+| **A. Adopt one application framework as-is** | Every team moves to, say, Promptfoo configs | Yes, runs locally | No: the KYC team forks within weeks | Only for teams that fit | Yes |
+| **B. Adopt a SaaS platform-integrated tool** | Datasets, experiments and traces in the vendor's cloud | No | With a custom target adapter | Yes | Yes |
+| **C. Build everything** | Own runner, store, UI and comparison | Yes | Yes | Yes | No: three people rebuild the non-differentiating parts |
+| **D. Thin layer on the five interfaces** | Shared dataset schema, a versioned scorer package and a runner that stores raw trajectories by generation id, writing to a self-hosted open-source platform; Promptfoo kept for prompt-level CI checks | Yes | Yes: the KYC target is the real loop with sandboxed tools | Yes | Yes: build the target adapters and scorers only |
+
+### Decision
+Choose **D**:
+- **Residency removes B.** **Fit removes A,** because the team that most needs evaluation is the one it
+  cannot model.
+- **D builds only the differentiating assets:** datasets, scorers and target adapters. The runner pattern
+  and the results store come from existing open-source parts, which is what makes 8 weeks realistic and
+  rules out C.
+- **Stored raw outputs pay for themselves during the migration.** If the judge rubric is revised
+  mid-migration, re-scoring all three bundles costs 1,950 judge calls ($19.50), not a fresh $319.50 run.
+- **Comparability comes from the schema.** Every team reports per-slice scores with `scorer@version`
+  and a dataset hash, so "87%" and "0.71" become numbers on a shared footing.
+
+What would change it:
+- **Residency relaxed.** B plus a custom KYC target adapter would save the platform team the store and
+  UI work.
+- **No long-running agents.** If the KYC agent were retired, A alone would cover prompt-level work.
+- **No capacity to run a self-hosted store.** Then keep D's layer but write results to the existing data
+  warehouse, at the cost of a thinner UI.
+
+### Trade-offs accepted
+- **The team owns a scorer package and a runner.** Watch how many teams' runs use an out-of-date scorer
+  version.
+- **Dataset migration work.** 1,250 items must move to the shared schema before the model decision. Watch
+  item counts per dataset version so a lost row is noticed.
+- **Judge calibration costs human time.** Two judges at about 200 labelled items each is 400 labels.
+  Watch judge-to-human agreement on every rubric change.
+- **Promptfoo and the thin layer coexist.** Two tools for prompt-level checks risk diverging. Watch that
+  shared scorer logic lives only in the package.
+
+### Review rubric
+- **Hard constraints eliminate options** (residency, fit for the hardest agent) before preferences rank
+  the rest.
+- **Build effort is limited to differentiating assets,** with the runner and store adopted, and this is
+  stated.
+- **Eval cost is computed** for the actual decision (bundles × tasks × calls), including what a scorer
+  change costs with and without stored raw outputs.
+- **Comparability is concrete:** a shared item schema, versioned scorers and dataset hashes.
+- **Agent trajectories are scored,** not just final answers, with side effects sandboxed.
+- **Reversal conditions are concrete facts** about residency, agent shape or operating capacity.
 
 ## Why it exists
 - **A second team builds a second engine.** The `evals/eval-harness` lesson explains one engine. Team A

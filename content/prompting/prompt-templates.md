@@ -5,7 +5,8 @@ name: Prompt templates
 kind: practice
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/prompt-engineering
@@ -161,6 +162,25 @@ flowchart TD
     CT --> C[("Prefix cache on static bytes")]
     C --> M["Model"]
 ```
+
+## Misconceptions
+- **"A prompt template is the model's chat template."** They are two layers. Yours turns variables into
+  message content; the chat template (applied server-side, or by `apply_chat_template` when self-hosting)
+  turns role-tagged messages into tokens with role markers.
+- **"Templating user text is safe because the engine escapes it."** It is safe only when the text is a
+  value. Feeding user text in as template source is template injection; a value can also contain your
+  closing delimiter, so escape or reject it.
+- **"Any per-tenant or per-request setting can go in the static zone."** Each distinct static rendering
+  is its own cache entry. Low-cardinality settings are fine; a per-request word limit took 10,000
+  requests from 100 prefixes to 8,730 and best-case reuse from 99% to 13%.
+- **"Whitespace and formatting in a template do not matter."** Every byte of the prefix is a cache key;
+  reformatting a template or leaking blank lines changes bytes on every request. Control whitespace and
+  snapshot-test the output.
+- **"A missing variable will just render empty."** Without strict undefined handling it can render as
+  "None" or nothing, and the model politely answers the broken prompt. Validate with a schema and fail
+  at render time.
+- **"Re-rendering the agent's history each step is cleaner."** It invalidates the cache from the first
+  changed byte onward. Render static and per-run zones once, then append the trajectory.
 
 ## Examples
 ### A typed, tested Jinja template

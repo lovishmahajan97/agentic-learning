@@ -5,7 +5,8 @@ name: Timeboxing
 kind: practice
 difficulty: core
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/rapid-prototyping-poc
@@ -31,6 +32,66 @@ the box closes.
   written on day 0, the order of work (riskiest tool or integration first) and the midpoint arithmetic.
 - **What you can skip.** Formal estimation of agent "features". Estimate the plumbing; box the unknowns,
   such as whether the model picks the right tool reliably.
+
+## Decision case
+### Scenario
+A freight insurer asks a forward-deployed team to "build the claims-intake agent in six weeks". The agent
+reads a claim email, looks up the policy, and opens a claim record through the insurer's claims API. All
+figures are illustrative.
+- **The decision it feeds:** the insurer's board meets in 20 working days to approve or drop a six-month
+  build by about five engineers, roughly 600 person-days.
+- **Constraints:**
+  - three engineers, and at most 40 person-days before the board meeting;
+  - nobody knows yet whether the claims API grants a sandboxed write scope (the riskiest assumption);
+  - claims handlers can label at most 150 past claims in the first week;
+  - the board needs a go, pivot or stop with evidence, not a progress report.
+- **Value of the answer:** if there is a one-in-three chance the evidence flips the board's choice, it is
+  worth about 600 / 3 = 200 person-days, far more than any box below costs.
+
+### Options
+| Option | How it works | Person-days | Ready for day 20? | Riskiest assumption tested |
+|---|---|---|---|---|
+| **A. Fixed-scope estimate** | plan the full agent as six weeks of features | 3 × 30 = 90: over budget | no: ends on day 30 | late, inside the build |
+| **B. One two-week PoC box** | 10 days on the whole agent, exit rule on day 0 | 3 × 10 = 30 | yes, readout day 10 | whenever someone gets to it; a write-scope refusal on day 8 voids the box |
+| **C. Spike, then PoC box** | 3-day spike by 2 engineers on API write access while the third builds the replay harness; then a 10-day PoC box by all 3 if the spike passes | 3 × 3 + 3 × 10 = 39 | yes, readout day 13, 7 days slack | first, on days 1-3 |
+| **D. Open-ended exploration** | "improve the agent until it is good" | unbounded | no decision date | maybe never |
+
+### Decision
+Choose **C, a spike followed by a PoC box**, because it is the only option that fits every constraint.
+- **Budget:** 39 person-days fits under 40; A needs 90.
+- **Deadline:** the readout lands on day 13, leaving 7 working days to write it up; A and D give the board
+  nothing on day 20.
+- **Risk order:** the write scope is tested on days 1-3. If it fails, the team stops after 9 person-days and
+  recommends a draft-only agent, instead of learning it on day 8 as B might.
+- **Exit rule, written on day 0:** at least 75% task success on the 150 labeled claims with zero uncaught
+  wrong claim records means pilot; 60-75% means one more box scoped to the largest failure bucket; below
+  60% means stop and recommend agent drafts with a human filing.
+- **Noise floor:** at about 70% success on 150 tasks, one standard error is about 3.7 points (the 95%
+  half-width about 7.3), so the midpoint check ignores moves of a point or two.
+
+**What would change it:**
+- **The insurer already grants sandbox write scopes to vendors:** skip the spike and run B.
+- **The board date moves out by a month:** add a second box on cost per task before the readout.
+- **The board would fund the build whatever the result:** the box buys nothing; shrink it to the spike.
+
+### Trade-offs accepted
+- **A shorter PoC box.** The spike eats into calendar time, so the PoC gets no extension inside the 20 days.
+  Watch the midpoint arithmetic and cut "could" items early.
+- **150 tasks only.** The ±7.3-point half-width makes a result near 75% inconclusive. Report it as such
+  rather than rounding up, and size the next box's eval set from it.
+- **One person-day of slack.** 39 of 40 leaves no room for a slipped spike. If API access takes longer than
+  3 days, treat that as the spike's answer and pivot to a draft-only agent.
+- **A pre-written rule may be wrong.** Allow one revision at the midpoint, with the reason in the decision
+  record.
+
+### Review rubric
+- **The box answers one question** with a numeric or yes/no answer tied to the decision it feeds.
+- **Box cost is compared with the value of the answer**, with the arithmetic shown.
+- **The riskiest assumption is scheduled first**, and the write-up says what happens if it fails.
+- **The exit rule is written before work starts**, maps every result to exactly one decision, and includes a
+  guardrail on wrong write actions.
+- **The eval set's noise floor is computed** and used to read the midpoint and final numbers.
+- **At least two conditions that would change the plan are named**, each tied to an observable fact.
 
 ## Why it exists
 - **AI work breaks classic estimation.** Estimation assumes known work: list the features, sum the effort.

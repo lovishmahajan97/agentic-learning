@@ -5,7 +5,8 @@ name: Vendor exit strategy
 kind: decision
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/ai-gateway
@@ -38,6 +39,65 @@ embeddings, fine-tunes and vendor-held memory.
   a degraded mode that works with no vendor at all.
 - **What you can skip.** Abstracting every proprietary feature away. Use a vendor-specific capability when
   its value beats the exit cost you have written down.
+
+## Decision case
+### Scenario
+An EU bank runs a customer-service agent on one vendor for generation, tool calling and embeddings. The
+agent supports a function the bank classes as important under DORA, so the regulator expects a tested exit
+plan. The team must choose how ready to be.
+
+All costs are illustrative, in $k over a 2-year horizon,
+including the business impact of the time to exit.
+- **Probability of a forced or stressed exit within 2 years:** estimated at 0.15.
+- **Cost of an exit unprepared:** 2,500 (about a week without the agent plus an emergency migration).
+- **Constraints:**
+  - after a vendor failure, degraded service within 4 hours and full service within 2 weeks;
+  - a readiness budget of 120 a year, so 240 over the horizon;
+  - 3 engineers on the agent team;
+  - customer history and agent memory must stay in the bank's own systems (already true).
+
+### Options
+| Option | How it works | Cost of exit if prepared | Cost of staying ready | Expected saving: 0.15 × (2,500 − prepared) | Net | Degraded in 4 h? |
+|---|---|---|---|---|---|---|
+| **A. Cold** | owned data and prompts only; nothing pre-built | 2,500 | about 20 | 0 | about −20 | no: re-embedding alone takes days |
+| **B. Warm standby** | weekly eval run on a second model for the critical prompts, a standby index of the most-retrieved documents, a tested degraded mode | 400 | 180 | 315 | +135 | yes |
+| **C. Active-active** | 10% of live traffic on a second vendor, every prompt maintained twice | 150 | 600 | 352.5 | −247.5 | yes, in seconds |
+
+### Decision
+Choose **B, warm standby**, because it is the only option with a positive net value that also meets the
+4-hour degraded-service target within budget.
+- **Value:** B saves an expected 315 for 180 of readiness cost; C saves 352.5 but costs 600.
+- **Budget:** B's 180 fits under 240; C's 600 does not.
+- **Target:** the standby index and degraded mode give service in hours, which A cannot.
+- **Incremental check:** moving from B to C buys 0.15 × (400 − 150) = 37.5 of expected saving for 420
+  more cost, so C loses at any probability, since even at certainty it buys only 250.
+
+**What would change it:**
+- **A much higher exit probability** (vendor financial trouble): at 0.3, B nets +450 and C +105, so B still
+  wins, but the case for testing the full migration grows.
+- **A contract or regulator demanding no interruption at all:** the hours in degraded mode then carry a
+  cost B cannot avoid, and C becomes the requirement, not an option.
+- **A second vendor cheaper per token at volume:** the cost of staying ready in C falls and must be
+  recomputed.
+
+### Trade-offs accepted
+- **Non-critical prompts drift on the alternative.** Only the critical prompts run weekly. Track how many
+  production prompts have not been evaluated on the alternative in the last quarter.
+- **Degraded mode is worse service.** Customers get search and templated answers for hours. Measure its
+  task success in the quarterly drill and publish the number in the exit plan.
+- **The 0.15 probability is a judgement.** Revisit it at each renewal and after any vendor incident.
+- **Fine-tunes stay vendor-bound.** Keep training data and recipe in the bank's repository so one can be
+  rebuilt elsewhere.
+
+### Review rubric
+- **Each option is priced with the readiness formula** over a stated horizon, with costs that include the
+  business impact of time to exit.
+- **The incremental value of the next readiness level is computed**, not only each option against doing
+  nothing.
+- **Planned and stressed exits are separated**, with a time target for each.
+- **The plan names what is pre-built** (second model, standby index, degraded mode) and how it is tested.
+- **Ownership of state is checked:** history, memory, prompts and eval sets live in your systems.
+- **Guessed probabilities and costs are flagged**, with a review trigger.
 
 ## Why it exists
 - **Organizations leave AI vendors for many reasons:** price changes, a model deprecated on the vendor's

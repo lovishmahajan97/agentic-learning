@@ -5,7 +5,8 @@ name: Prompt caching
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/system-prompt
@@ -155,6 +156,23 @@ flowchart TD
     RD -.->|"read refreshes TTL"| C
     T --> O["Decode output as usual"]
 ```
+
+## Misconceptions
+- **"Similar prompts will share the cache."** Reuse needs an exact token prefix, because each position's
+  K and V depend on every earlier token; one timestamp at the top of the system prompt makes every
+  request a miss from that byte on.
+- **"Turning caching on can only save money."** A write costs about 1.25× ordinary input and is wasted if
+  never read; in the 10-step agent example a per-step reminder at the top costs ~203k
+  full-price-equivalent tokens versus 162.5k uncached.
+- **"Only edits to the text break the cache."** Reordering or adding tools, switching models, or toggling
+  thinking and effort per request also invalidate it, even when the visible text is byte-identical.
+- **"Fifty parallel calls on one document pay for one write."** An entry is readable only once the first
+  response has started, so simultaneous requests all miss; warm with one request, then fan out.
+- **"Prompt caching is a response cache, so it can return a stale answer."** It reuses attention state
+  the model would compute anyway, so the output distribution matches an uncached call; a semantic cache
+  that returns stored answers is a different thing.
+- **"Caching makes the whole response faster."** It skips prefill only: time-to-first-token and input
+  cost fall, while output tokens are decoded and billed as before.
 
 ## Examples
 ### Two calls sharing a 20k-token prefix

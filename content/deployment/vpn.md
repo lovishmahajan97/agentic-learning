@@ -5,7 +5,8 @@ name: VPN
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -41,6 +42,67 @@ scope, routing and MTU need design.
   model a tool is unavailable rather than inviting a retry loop.
 - **What you can skip.** IKE cryptographic details and BGP path selection. Know the ports, the two
   tunnels, the MSS clamp and how overlap is solved; network teams do the rest.
+
+## Decision case
+### Scenario
+You run a cloud-hosted claims agent. An insurer wants an 8-week pilot in which the agent answers
+adjusters' questions using two on-prem systems. All figures are illustrative assumptions to measure,
+not quotes or SLAs.
+- **Live tool:** `lookup_policy` queries an on-prem SQL database during each conversation, because a
+  policy's status changes during the day. About 400 conversations a day at 3 lookups each, so
+  400 x 3 = 1,200 tool calls a day.
+- **RAG ingestion:** a 1.5 TB claims archive on an on-prem file server, then about 3 GB of changes a day.
+- **Link:** the insurer's uplink can give an effective 300 Mbit/s to this traffic.
+- **Addressing:** the insurer uses 10.0.0.0/8 throughout; your production VPC is 10.40.0.0/16, which
+  overlaps.
+- **Security:** nothing on-prem gets a public IP. The network team will allow only named hosts and ports.
+- **Deadline:** the pilot starts in 8 weeks; the insurer's carrier quotes 10 to 16 weeks for a dedicated
+  circuit.
+
+### Options
+| Option | How it works | Live `lookup_policy` | 1.5 TB initial sync | Ready in 8 weeks | Exposure |
+|---|---|---|---|---|---|
+| Nightly SFTP export | insurer pushes database extracts and file deltas once a night | no: data up to a day old | by disk or a long SFTP job | yes | small, but a manual process |
+| Site-to-site IPsec VPN | two tunnels with BGP into a new integration VPC, /32 routes to 2 hosts | yes | 1.5 TB x 8 = 12,000 Gbit / 0.3 Gbit/s = 40,000 s, about 11 h | yes: days to set up | joined networks, narrowed by routes and port filters |
+| Dedicated circuit, IPsec on top | carrier circuit into the cloud, encrypted over it | yes | faster and more predictable | no: 10 to 16 weeks | as the VPN, with private transport |
+
+### Decision
+**A site-to-site IPsec VPN: both tunnels on BGP, terminated in a new integration VPC, with only the two
+hosts routed and only their two ports allowed.**
+- **It is the only option that serves live lookups by week 8.** SFTP fails the freshness need; the circuit
+  misses the date.
+- **The address overlap is solved on your side.** Confirm the insurer uses nothing in 172.16.0.0/12,
+  then build the integration VPC as 172.31.240.0/22, so neither side re-addresses or runs NAT.
+- **The numbers fit.** The initial sync is about 11 hours, run over a weekend with a bandwidth cap. The
+  daily delta is 3 GB x 8 = 24 Gbit / 0.3 Gbit/s = 80 s. The 1,200 small lookups are negligible traffic.
+- **Agent behaviour is designed in:** MSS clamped at the gateway, tool deadlines sized from measured
+  failover time, one retry for this read, and a non-retryable error the model is told not to repeat.
+
+**What would change it.**
+- **Traffic or jitter:** if steady traffic grows well past the tunnel's documented limits, or tool
+  latency jitter breaks the conversation target, order the circuit during the pilot and keep the VPN as
+  backup.
+- **No joined networks at all:** if the insurer's security team refuses, move the agent's data plane
+  into their environment instead (see Customer VPC / on-prem / air-gapped deployment).
+
+### Trade-offs accepted
+- **Internet-path variability.** Tool latency varies with the path. Watch: p95 `lookup_policy` latency
+  and errors per backend next to tunnel state.
+- **Joined networks.** A tunnel can carry anything routable. Watch: the received BGP prefix list in every
+  change review, which must stay equal to the two tool backends.
+- **Failover resets.** In-flight calls fail when routes move. Watch: identical consecutive tool calls per
+  trace (target zero) and a failover drill during a scripted agent run.
+- **A second network to run.** Watch: per-tunnel state; alert when either tunnel is down.
+
+### Review rubric
+- **Need classified:** says which flows need live access and which tolerate batch, before choosing a link.
+- **Arithmetic shown:** sync and delta times follow from size x 8 / effective rate, with the rate
+  labelled as an assumption to measure.
+- **Addressing checked first:** overlap identified and solved with a named, verified range.
+- **Scope made explicit:** routes, hosts and ports listed and tied to the agent's tool backends.
+- **Agent failure handling:** timeouts, retries and the model-facing error are part of the design.
+- **Exit criteria:** names the measurement that would trigger a dedicated circuit or a different
+  deployment model.
 
 ## Why it exists
 - **The data has no public IP.** Your RAG product runs in the cloud; the customer's contracts and ticket

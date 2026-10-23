@@ -188,7 +188,7 @@ def test_the_recorded_turn():
 
 ### Submission
 - **`lab.py` and `test_lab.py`,** plus three consecutive `python -m pytest -q` runs showing 6 passed.
-- **The output of `python lab.py`,** with a two-line timeline of when each call started and ended.
+- **The output of `python lab.py`,** with a short timeline of when each call started and ended.
 - **One extension:** a fifth tool that depends on `search`'s result, run after the parallel batch,
   with a test that it starts only once `search` is done.
 - **A note of 2-4 sentences:** how you would pick `max_parallel` and `budget_s` for a real provider,

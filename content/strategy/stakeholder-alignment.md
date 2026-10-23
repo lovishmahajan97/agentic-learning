@@ -5,7 +5,8 @@ name: Stakeholder alignment
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: background
 related:
   - adoption/stakeholder-management
@@ -33,6 +34,64 @@ who can pause it, because "does it work?" needs an agreed operating point.
   same-slice human baseline) and putting every agreed limit in config, not code.
 - **What you can skip.** Running the stakeholder meetings and change-management detail; know what goes on
   the one-pager so you can build exactly what it says.
+
+## Decision case
+### Scenario
+An IT department is building an access-request agent that reads employee requests and grants software
+access by adding licences and group memberships through identity-system tools. All figures are
+illustrative.
+- **Volume:** 3,000 requests a month: 55% standard catalogue apps, 35% paid licences, 10% privileged
+  groups (admin consoles, finance systems).
+- **IT operations (sponsor):** at least 50% of requests granted without a human.
+- **Security (veto holder):** red lines are no automatic grant to a privileged group, and at most 10 wrong
+  grants a month from the agent.
+- **Approvers:** 1,500 approvals a month of capacity across the service desk.
+- **Offline replay of past requests:** wrong-grant rate 0.4% on standard apps (8 of 2,000 replayed), 1.5%
+  on paid licences; if everything above a 0.9 confidence threshold were granted (85% of requests,
+  privileged included), the rate would be 1.2%.
+- **Human baseline on the same slice:** service-desk staff made 0.3% wrong grants on standard-app requests.
+
+### Options
+| Option | Auto-granted | Approvals queued per month | Wrong grants per month | Red lines |
+|---|---|---|---|---|
+| Approve everything | 0% | 3,000 | 0 from the agent | Queue is twice the 1,500 capacity |
+| Standard apps only | 55% | 1,350 | 3,000 × 0.55 × 0.4% = 6.6 | Met |
+| Standard + paid under $20 (21% of requests) | 76% | 720 | 3,000 × (0.55 × 0.4% + 0.21 × 1.5%) ≈ 16 | Breaches the 10 limit |
+| Confidence threshold 0.9 | 85% | 450 | 3,000 × 0.85 × 1.2% ≈ 31 | Breaches both, includes privileged grants |
+
+### Decision
+**Standard apps only, as a provisional operating point.** It is the only option that meets the sponsor's
+50%, fits approver capacity (1,350 of 1,500) and stays inside both security red lines. Security saw this
+table one-to-one before the decision meeting, so the meeting ratified it.
+- **The margin is thin, and the one-pager says so.** 8 errors in 2,000 replays gives an upper 95% bound of
+  about 0.68%, which is 3,000 × 0.55 × 0.68% ≈ 11 wrong grants a month, just over the limit.
+- **So the rollback trigger is owned by security:** if a rolling audit of auto-grants projects more than
+  10 a month, the agent drops to approve-everything mode without a deploy.
+- **Paid licences and privileged groups go through the approval gate,** enforced in the grant tool's config.
+
+**What would change it.**
+- **Three months of audits at or below 0.4%:** reopen the under-$20 paid tier, but only once its own
+  rate is at or below about 0.54%, since 6.6 + 3,000 × 0.21 × r ≤ 10 needs r ≤ 0.54%.
+- **Approver capacity falls below 1,350:** the plan fails on queue length, so either add approvers or
+  revisit the paid tier first.
+
+### Trade-offs accepted
+- **The agent is slightly worse than humans on its slice:** about 6.6 against 4.95 wrong grants a month at
+  0.3%. Security accepts this because standard grants are reversible; a daily audit revokes wrong ones
+  within 24 hours.
+- **The sponsor gets 55%, not 76%.** Show the paid-tier error rate monthly so the next step is evidence,
+  not lobbying.
+- **The approval queue runs near capacity.** Watch queue age; if it grows, staff the queue before the agent
+  takes more scope.
+
+### Review rubric
+- **Red lines kept separate from goals:** constraints are listed as limits, and no option trades one away.
+- **Options computed per stakeholder metric:** auto share, queue and wrong grants are derived, and the
+  arithmetic checks.
+- **Fair baseline used:** the agent is compared with humans on the same slice of requests.
+- **Noise acknowledged:** the interval on the error rate is reported and reflected in the trigger.
+- **Agent limits made config:** action classes, the approval gate and the kill-switch owner are named.
+- **Reopen conditions stated:** the evidence that would widen or narrow scope is written down.
 
 ## Why it exists
 - **More parties than a typical feature.** A business owner who wants a cost or speed gain, operators whose

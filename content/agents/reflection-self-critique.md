@@ -5,7 +5,8 @@ name: Reflection / self-critique
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -143,6 +144,26 @@ flowchart TD
     B -->|"yes"| R["Reflect: specific cause and fix"]
     R -->|"append lesson"| T
 ```
+
+## Misconceptions
+- **"Asking the model to check its answer catches its mistakes."** With no new evidence the model
+  re-rolls, biased toward changing its answer because the prompt implies something is wrong. Studies of
+  intrinsic self-correction on reasoning found it often fails to help and sometimes hurts; the critique
+  must bring new information such as a failing test or a tool result.
+- **"More reflection iterations means a better answer."** Revisions are not monotone: attempt 3 can be
+  worse than attempt 2. Keep the best-scoring attempt, cap iterations, and stop when the evaluator
+  passes or the diff is trivial.
+- **"A separate critic model removes the self-agreement bias."** A fresh context or another model weakens
+  it but does not remove it; LLM judges favour outputs that resemble their own. Measure critic-versus-human
+  agreement on your task before trusting the critic.
+- **"Reflexion's coding gains came from the model thinking harder."** They came from grounding: the
+  agent ran unit tests, turned the outcome into a verbal lesson and carried it into the next trial.
+  The signal came from running code, not rereading it.
+- **"A review step is cheap insurance on every task."** An always-on LLM critic adds at least one call even
+  when the first attempt was right: at a 90% one-shot pass rate it costs about +120% calls versus about
+  +20% for a gated loop that reflects only on failures.
+- **"A free-text verdict like 'looks good overall' is enough."** It cannot drive the revise step or a
+  stopping rule. Make the critic return a pass flag and a structured list of issues.
 
 ## Examples
 ### Test-grounded code repair with keep-best

@@ -5,7 +5,8 @@ name: Data contracts
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - data-architecture/ingestion-pipelines
@@ -39,6 +40,69 @@ changes, so the contract makes the producer fail loudly at write time.
   validating tool responses before they enter the model's context.
 - **What you can skip.** Choosing between contract specification standards and data-mesh governance
   debates. One typed model per crossing, checked in CI, covers most agent pipelines.
+
+## Decision case
+### Scenario
+A B2B software company's support agent depends on six datasets owned by other teams. Last quarter three
+silent upstream changes (a renamed text field, integer category ids, a unit change) each took about
+4 days to notice, so roughly 12 days of degraded answers in total. The AI team owns none of the producers.
+
+| Crossing | Producer | Volume or shape | Risk |
+|---|---|---|---|
+| Ticket stream into the RAG index | Ticketing team, Kafka | about 48,000 records a day | High: text and filter fields |
+| CRM account metadata for filters | CRM team, nightly batch | 1 partition a night | High: `tenant_id`, `access_scope` |
+| Orders API behind `get_order` | Commerce team | live tool calls | High: units and status values |
+| Three low-change reference tables | Various | weekly | Low |
+
+Constraints (figures illustrative):
+- **Producer time.** Each high-risk producer team agreed to one sprint; the low-change owners to nothing.
+- **Detection target.** A break must be caught within one hourly partition, at about 2,000 tickets an hour.
+- **No skewed index.** A partition missing a whole category must never be published.
+- **Producers ship weekly** and must not wait on AI-team deploys.
+
+### Options
+| Option | How it works | Time to detect | Attribution | Producer effort | Semantic changes |
+|---|---|---|---|---|---|
+| **A. Consumer-side checks only** | AI team validates on ingestion and in tool wrappers | About an hour, after bad data is written | Late: AI team chases the producer | None | Missed unless the AI team guesses the rule |
+| **B. Producer contracts on the 3 high-risk crossings** | Registry `FORWARD` on the topic, quality suite and breaker on the CRM partition, response schema on the orders API; consumers validate the same contracts | At write or at registration, minutes | Correct: the producer's CI or gate fails | One sprint each | Caught when units and taxonomy versions are in the contract |
+| **C. Company-wide contract programme** | Contracts for all 6 crossings and the wider warehouse | Minutes | Correct | Months, many teams | Caught |
+| **D. AI-team sign-off on every upstream change** | Producers wait for review | Before release | Correct | High ongoing cost | Depends on reviewers |
+
+### Decision
+Choose **B**, producer contracts where the risk is, with consumer validation everywhere:
+- **It fits the agreed producer time.** Three teams, one sprint each, and nothing asked of the low-change owners.
+- **It meets the detection target at the right place.** Registry rejection and producer CI fail before any
+  record is written, and the CRM gate fails the partition instead of the agent's filters matching nothing.
+- **`FORWARD` matches who ships first.** Producers ship weekly, so today's data must stay readable by the
+  chunker and tool wrapper deployed last month.
+- **The breaker protects the index.** At about 2,000 tickets an hour, a 1% threshold allows about 20 bad
+  records before the partition fails, plus the category distribution check on survivors.
+- **Semantics are in the contract.** `total_usd` is dollars and the category taxonomy is versioned, so the
+  unit change from last quarter needs a major version, not a quiet deploy.
+- **D is rejected** because it makes the AI team a bottleneck and still relies on humans spotting breaks.
+
+What would change it:
+- **A producer team refuses.** Fall back to A for that crossing, with lineage-derived alerts to its owner.
+- **Categories churn weekly.** Replace the closed value set with a reference table the contract points to.
+- **More agent teams start consuming these datasets.** Then C's shared cost pays off.
+
+### Trade-offs accepted
+- **Low-change tables stay consumer-checked.** A break there is found after it lands; watch the AI-side
+  violation rate per table.
+- **Producers own a spec.** Their CI blocks some changes; watch breaking-change requests per quarter and the
+  length of dual-production windows.
+- **Hard tool errors.** `get_order` fails on contract violations rather than guessing; watch violation errors
+  per tool in traces and degrade by omitting optional fields.
+- **Empty hours instead of skewed ones.** A failed partition means no new tickets for that hour; watch failed
+  partitions and the oldest dead-letter age.
+
+### Review rubric
+- **Crossings are ranked by risk,** with each listed and tied to what silently breaks in the agent.
+- **Enforcement sits at the producer** for the high-risk crossings, with the mechanism named for each.
+- **The compatibility direction is stated and justified** by who deploys first.
+- **A batch threshold is specified,** with the arithmetic for the partition size.
+- **Semantics are covered,** with units, taxonomy versions and a `contract_version` stamped on records.
+- **Fallbacks are named** for producers that will not adopt a contract.
 
 ## Why it exists
 - **Upstream changes break AI pipelines silently.** The ticketing team renames `resolution_text` to

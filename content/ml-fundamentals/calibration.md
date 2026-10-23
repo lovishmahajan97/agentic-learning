@@ -5,7 +5,8 @@ name: Calibration
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - ml-fundamentals/roc-auc
@@ -178,21 +179,23 @@ flowchart TD
     MON -->|"ECE drifts up"| CAL
 ```
 
+## Misconceptions
+- **"A model with high AUC or accuracy gives trustworthy probabilities."** Discrimination and calibration
+  are orthogonal: a model can rank perfectly with every score in [0.49, 0.51]. Measure calibration
+  separately with a reliability diagram, ECE or Brier on held-out labels.
+- **"When the LLM says it is 90% sure, it is right 90% of the time."** Verbalised confidence is generated
+  text and tends to cluster in a narrow high band regardless of correctness. Treat it as a feature to
+  calibrate against labelled runs, or use sampling agreement instead.
+- **"Temperature scaling will make a weak confidence signal useful for escalation."** It divides every logit
+  by one constant, so it cannot reorder answers. If the risk–coverage curve is flat, you need a better
+  signal, not a better calibrator.
+- **"Calibrate once and the probabilities stay calibrated."** Calibration holds for one distribution; under
+  drift models usually become more overconfident. Treat ECE on fresh labelled samples as a weekly monitor.
+- **"Class weights only change the decision, not the probabilities."** Rebalancing shifts the implied base
+  rate: a model trained on a 50/50 set that says 0.6 means about 0.07 at 5% prevalence. Recalibrate at
+  deployment prevalence or apply the prior-shift correction.
+
 ## Examples
-### Worked scenario: reading an overconfident reliability table
-A five-class classifier's predictions on 1,000 held-out items fall into five confidence bins of 200 each.
-
-| Bin | Mean confidence | Observed accuracy | Gap |
-|---|---|---|---|
-| 1 | 0.55 | 0.52 | 0.03 |
-| 2 | 0.65 | 0.58 | 0.07 |
-| 3 | 0.75 | 0.64 | 0.11 |
-| 4 | 0.85 | 0.70 | 0.15 |
-| 5 | 0.96 | 0.80 | 0.16 |
-
-- **Every bin sits below the diagonal.** ECE = 0.2 × (0.03 + 0.07 + 0.11 + 0.15 + 0.16) = 0.104.
-- **Mean confidence is 0.75 against an overall accuracy of 0.65:** a classic overconfident network.
-
 ### Agent scenario: setting a support agent's handoff threshold from costs
 A support agent answers tickets or hands off to a human. A human review costs $2; a wrong answer shipped
 costs $20 (refunds, churn). Answer only when the expected cost of answering, (1 − p) × 20, is below 2,
@@ -224,6 +227,20 @@ per 10,000 tickets (illustrative figures):
 | Calibrated, cut at 0.9 from costs | ~2,000 (20%) | ~4% of ~8,000 ≈ 320 | ~$4,000 + ~$6,400 ≈ $10,400 |
 
 The honest escalation rate is four times higher, and total cost drops by more than 5×.
+
+### Worked scenario: reading an overconfident reliability table
+A five-class classifier's predictions on 1,000 held-out items fall into five confidence bins of 200 each.
+
+| Bin | Mean confidence | Observed accuracy | Gap |
+|---|---|---|---|
+| 1 | 0.55 | 0.52 | 0.03 |
+| 2 | 0.65 | 0.58 | 0.07 |
+| 3 | 0.75 | 0.64 | 0.11 |
+| 4 | 0.85 | 0.70 | 0.15 |
+| 5 | 0.96 | 0.80 | 0.16 |
+
+- **Every bin sits below the diagonal.** ECE = 0.2 × (0.03 + 0.07 + 0.11 + 0.15 + 0.16) = 0.104.
+- **Mean confidence is 0.75 against an overall accuracy of 0.65:** a classic overconfident network.
 
 ### Temperature scaling on synthetic overconfident logits
 The code fits a temperature on synthetic logits built to be exactly twice as sharp as they should be, so the

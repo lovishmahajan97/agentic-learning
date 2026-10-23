@@ -5,7 +5,8 @@ name: LangSmith for agents (tracing, datasets, evaluators, prompt hub)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - observability/langsmith
@@ -38,6 +39,164 @@ how LangChain and LangGraph teams debug and regression-test agents.
   threads, which evaluators gate a release, and which prompt version production pulls.
 - **What you can skip.** Re-learning tracing basics; the observability LangSmith lesson covers runs,
   transport and feedback. This lesson is the agent workflow on top.
+
+## Lab
+### Task
+Build the regression gate that would have caught the model swap in this lesson's worked scenario: two
+code evaluators in LangSmith's `(inputs, outputs, reference_outputs) -> {"key", "score"}` shape, an
+experiment runner with repetitions, and a gate that fails a candidate whose scores drop. Time box:
+45-60 min.
+- **Prerequisites:** Golden datasets; Agent trajectory evaluation; LangGraph fundamentals.
+- **Setup:** Python 3.10+, `pip install langsmith agentevals pytest` (checked with langsmith 0.14.12,
+  agentevals 0.0.9, Python 3.13). Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **No account, keys or model calls:** agent runs are recorded, and `@traceable` only sends traces when
+  `LANGSMITH_TRACING=true`. The evaluators drop unchanged into `evaluate(target, data=..., evaluators=[...])`.
+
+### Starter code
+```python
+"""Lab: an offline regression gate for a refund agent, with LangSmith-style evaluators.
+Run: python lab.py   (no LangSmith account needed: runs are recorded, @traceable is a no-op
+unless LANGSMITH_TRACING=true)"""
+import itertools
+from statistics import mean
+from typing import Callable
+from agentevals.trajectory.match import create_trajectory_match_evaluator
+from langsmith import traceable
+
+def user(text):         return {"role": "user", "content": text}
+def tool(text):         return {"role": "tool", "content": text}
+def answer(text):       return {"role": "assistant", "content": text}
+def calls(*names):      return {"role": "assistant", "content": "", "tool_calls": [
+                            {"function": {"name": n, "arguments": "{}"}} for n in names]}
+
+REFUND = [calls("order_status"), tool("delivered"), calls("issue_refund"), tool("rf-1")]
+SKIPPED = [calls("issue_refund"), tool("rf-1")]                  # refunded without checking delivery
+DATASET = [                                                     # reference trajectories and answers
+    {"inputs": {"question": f"Refund order {o}"},
+     "reference_outputs": {"answer": "refunded", "messages": [user(o), *REFUND, answer("Refunded.")]}}
+    for o in ("A-1", "A-2", "A-3", "A-4", "A-5")
+] + [{"inputs": {"question": "Where is order A-6?"},
+      "reference_outputs": {"answer": "delivered", "messages": [user("A-6"), calls("order_status"),
+                                                               tool("delivered"), answer("Delivered.")]}}]
+
+def recorded(steps):    return [user("q"), *steps, answer("Refunded, ref rf-1.")]
+STATUS_ONLY = [user("q"), calls("order_status"), tool("delivered"), answer("It was delivered.")]
+RECORDINGS = {          # model -> variants per example; each repetition replays the next one
+    "old-model": [[recorded(REFUND)]] * 5 + [[STATUS_ONLY]],
+    "new-model": [[recorded(REFUND)], [recorded(SKIPPED)], [recorded(SKIPPED), recorded(REFUND)],
+                  [recorded(REFUND)], [recorded(REFUND)], [STATUS_ONLY]],
+}
+
+def make_target(model: str) -> Callable[[dict], dict]:
+    """Replays recorded agent runs; in production this calls agent.invoke and is traced."""
+    cursors = [itertools.cycle(variants) for variants in RECORDINGS[model]]
+    index = {ex["inputs"]["question"]: i for i, ex in enumerate(DATASET)}
+    @traceable(run_type="chain", name=f"refund-agent-{model}")
+    def target(inputs: dict) -> dict:
+        messages = next(cursors[index[inputs["question"]]])
+        return {"messages": messages, "answer": messages[-1]["content"]}
+    return target
+
+superset = create_trajectory_match_evaluator(trajectory_match_mode="superset", tool_args_match_mode="ignore")
+
+def tool_path(inputs: dict, outputs: dict, reference_outputs: dict) -> dict:
+    return superset(outputs=outputs["messages"], reference_outputs=reference_outputs["messages"])
+
+def correct(inputs: dict, outputs: dict, reference_outputs: dict) -> dict:
+    # YOUR CODE HERE: {"key": "correct", "score": True if the reference answer appears in
+    # outputs["answer"], ignoring case}
+    raise NotImplementedError
+
+def no_refund_before_status(inputs: dict, outputs: dict, reference_outputs: dict) -> dict:
+    # YOUR CODE HERE: {"key": "no_refund_before_status", "score": False if any issue_refund
+    # tool call comes before the first order_status call, else True}
+    raise NotImplementedError
+
+def run_experiment(target, dataset, evaluators, repetitions: int = 1) -> dict[str, float]:
+    # YOUR CODE HERE: run target on every example `repetitions` times, apply every evaluator to
+    # each run, and return {evaluator key: mean score} rounded to 3 decimals (True counts as 1)
+    raise NotImplementedError
+
+def gate(baseline: dict[str, float], candidate: dict[str, float], max_drop: float = 0.02) -> list[str]:
+    # YOUR CODE HERE: sorted keys whose candidate score is more than max_drop below baseline
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    evaluators = [correct, tool_path, no_refund_before_status]
+    old = run_experiment(make_target("old-model"), DATASET, evaluators, repetitions=2)
+    new = run_experiment(make_target("new-model"), DATASET, evaluators, repetitions=2)
+    print("old:", old)
+    print("new:", new)
+    print("regressed:", gate(old, new) or "none")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly. The new model skips the status check in 3 of 12
+runs (example 2 twice, example 3 once), so both path scores are 9/12 = 0.75 while answers stay at 1.0:
+
+```
+old: {'correct': 1.0, 'trajectory_superset_match': 1.0, 'no_refund_before_status': 1.0}
+new: {'correct': 1.0, 'trajectory_superset_match': 0.75, 'no_refund_before_status': 0.75}
+regressed: ['no_refund_before_status', 'trajectory_superset_match']
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 4 fail with `NotImplementedError`; a correct solution
+passes all 4 (langsmith 0.14.12, agentevals 0.0.9, pytest 9.1).
+
+```python
+from lab import (DATASET, REFUND, SKIPPED, calls, correct, gate, make_target, no_refund_before_status,
+                 recorded, run_experiment, tool, tool_path)
+
+REF = DATASET[0]["reference_outputs"]
+
+def test_correct_is_case_insensitive_containment():
+    assert correct({}, {"answer": "Refunded, ref rf-1."}, REF) == {"key": "correct", "score": True}
+    assert correct({}, {"answer": "I could not help."}, REF)["score"] is False
+
+def test_refund_before_status_is_caught():
+    assert no_refund_before_status({}, {"messages": recorded(REFUND)}, REF)["score"] is True
+    assert no_refund_before_status({}, {"messages": recorded(SKIPPED)}, REF)["score"] is False
+    late = recorded([calls("issue_refund"), tool("rf"), calls("order_status"), tool("delivered")])
+    assert no_refund_before_status({}, {"messages": late}, REF) == {"key": "no_refund_before_status",
+                                                                   "score": False}
+
+def test_experiment_averages_over_repetitions():
+    ev = [correct, tool_path, no_refund_before_status]
+    new = run_experiment(make_target("new-model"), DATASET, ev, repetitions=2)
+    assert new == {"correct": 1.0, "trajectory_superset_match": 0.75, "no_refund_before_status": 0.75}
+    one = run_experiment(make_target("new-model"), DATASET, ev, repetitions=1)
+    assert one["no_refund_before_status"] == 0.667
+
+def test_gate_flags_path_regressions_but_not_answers():
+    old = {"correct": 1.0, "trajectory_superset_match": 1.0, "no_refund_before_status": 1.0}
+    new = {"correct": 0.99, "trajectory_superset_match": 0.75, "no_refund_before_status": 0.75}
+    assert gate(old, new) == ["no_refund_before_status", "trajectory_superset_match"]
+    assert gate(old, old) == []
+```
+
+### Failure scenarios
+- **Gate on `correct` alone.** The gate prints `none` and the swap ships, exactly as in the worked
+  scenario. Print every evaluator's mean side by side, and require at least one path evaluator for any
+  agent with a consequential tool.
+- **Check only that `order_status` appears somewhere.** The `late` trajectory (refund, then status)
+  passes and the test fails. Compare positions in the tool-call list, not membership.
+- **Run one repetition.** The new model scores 4/6 = 0.667 on one run and 0.75 over two; with a
+  stochastic agent, single runs move by more than your `max_drop`. Report the spread per example and use
+  `num_repetitions` of 3 or more in `evaluate`.
+- **Read `reference_outputs["messages"]` inside `no_refund_before_status`.** The reference path always
+  checks status first, so the evaluator scores 1.0 for every model and the gate never flags it. Print one
+  evaluator result per run while building, and test each evaluator on a known-bad trajectory.
+
+### Submission
+- **`lab.py`** with `correct`, `no_refund_before_status`, `run_experiment` and `gate` implemented.
+- **A green test run** (4 passed) and the output of `python lab.py`.
+- **A CI script** that exits non-zero when `gate` returns any key, and a run of it failing on the
+  new model.
+- **A short note:** how you would move this to LangSmith (`evaluate` on a dataset, the same evaluators,
+  `num_repetitions=3`) and which production traces you would add as examples.
+- **Evaluated on:** tests passing, evaluators in LangSmith's return shape, averages over repetitions, and
+  a gate that catches path regressions the answer score hides.
 
 ## Why it exists
 - **Final-answer checks miss agent bugs.** An agent can reach a right answer by a wrong path (refunding

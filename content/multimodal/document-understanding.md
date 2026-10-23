@@ -5,7 +5,8 @@ name: Document understanding
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - multimodal/ocr
@@ -178,6 +179,22 @@ flowchart TD
     V -->|"yes"| P["Straight-through to ledger"]
     V -->|"no, with reason"| H["Human review queue"]
 ```
+
+## Misconceptions
+- **"OCR text plus an LLM is the same as reading the document."** Flattening discards where things sit:
+  which number is in the Total box, which column a price belongs to. The LLM then reasons over a guessed
+  reading order and swaps values with full confidence.
+- **"Making every field required gives more complete output."** A required slot with no visible value
+  gets a plausible invented one. Make fields nullable and instruct the model never to guess, so absence
+  is representable and checkable.
+- **"Arithmetic checks catch invented amounts."** An invented tax line with a matching total passes
+  subtotal + tax = total. Only provenance, the value appearing verbatim on the page, exposes it.
+- **"Higher model accuracy is what makes extraction trustworthy."** At 96% field accuracy wrong totals
+  still reach the ledger daily if nothing detects them. Validation and review routing make errors
+  visible and bounded; report escaped-error rate, not average accuracy.
+- **"Telling the agent not to pay flagged invoices is enough."** A rule in the prompt can be overridden
+  by an instruction printed in the document. Read in a step with no side-effecting tools, and enforce
+  the clean-status check inside the payment tool.
 
 ## Examples
 ### Extract one invoice page with validation and review routing

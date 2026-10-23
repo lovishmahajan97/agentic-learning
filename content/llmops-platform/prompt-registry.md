@@ -5,7 +5,8 @@ name: Prompt registry
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - prompting/prompt-versioning
@@ -38,6 +39,71 @@ history, evidence and rollback without a code deploy.
   per step.
 - **What you can skip.** Vendor comparisons. The immutable-version and mutable-label split matters; the
   product hosting it rarely does.
+
+## Decision case
+### Scenario
+A B2B company runs a contract-review agent for 30 enterprise tenants. Its behaviour lives in a system
+prompt, a planner prompt and four tool descriptions.
+
+Three product managers and four forward-deployed engineers make about 20 prompt edits a week. Many are
+tenant variants that quote a customer's own contract policy. Today prompts are string constants, so
+every edit is a code deploy.
+
+Facts and constraints, with illustrative figures:
+- **Rollback speed.** After a bad refund-clause prompt last month, the rule is that a rollback must reach
+  every one of 50 replicas within 2 minutes. A code redeploy takes about 20 minutes.
+- **Data residency.** Tenant variants contain customer contract text and must stay in the EU region.
+  The team's hosted observability workspace is in a US region.
+- **Team.** A platform team of two already runs an EU config service with pub/sub change events.
+- **Deadline.** Six weeks, because two new tenants sign with custom policies.
+- **Forensics.** Every agent step must be traceable to the exact text it ran with.
+
+### Options
+| Option | How it works | Rollback within 2 min | EU residency | Non-engineer editing | Build and run cost |
+|---|---|---|---|---|---|
+| **A. Git directory, baked into the image** | Prompts in the repo, rendered at build | No: a redeploy, about 20 min | Yes | Through PRs only | Lowest |
+| **B. Hosted registry in the current US workspace** | Labels, UI and trace linkage from the vendor SDK | Yes: 60 s TTL | No: tenant text leaves the EU | Yes | Low |
+| **C. Self-hosted open-source platform in the EU** | Run an observability platform with prompt management in-region | Yes: TTL | Yes | Yes | A new stateful service for a team of two |
+| **D. Home-grown versions and labels on the EU config service** | Append-only versions, compare-and-set labels, pub/sub eviction, a small diff and edit UI | Yes: push eviction, 60 s TTL backstop | Yes | Yes, once the UI exists | A few hundred lines plus the UI |
+
+### Decision
+Choose **D**:
+- **Residency rules out B,** however good its UI is.
+- **The 2-minute rollback rules out A.** A label move that needs a redeploy is the baked-image pitfall.
+- **D reuses what the team already operates.** The config service already lives in the EU and already
+  emits change events, so push eviction is a subscriber, not a project. C would add a new database-backed
+  service to a team of two inside a six-week deadline.
+- **The split that matters is kept:** immutable versions with digests, labels moved by compare-and-set
+  only by the CI account, tenant labels that fall back to `production`, and version and digest stamped on
+  every agent step.
+
+What would change it:
+- **Traces move to the EU.** If the team self-hosts its tracing in the EU anyway, C wins: trace linkage
+  and the UI come free, and the operating cost is already paid.
+- **Residency is relaxed** by contract, which makes B the cheapest path.
+- **Edits fall to a few a month by engineers.** Then a git directory loaded from an object store at
+  runtime, not baked in, is enough.
+
+### Trade-offs accepted
+- **The team builds and owns the UI, diff and audit view.** Watch PM time from edit to a reviewed
+  version; if it grows, buy rather than extend.
+- **No out-of-the-box trace linkage.** Watch the share of production spans carrying a registered
+  version and digest; anything under 100% is a gap.
+- **In-flight runs keep their pinned version** after a rollback, and some runs last up to 5 minutes, which
+  is longer than the 2-minute rule. Add a cancel path for runs on a revoked version and count them.
+- **Storage grows forever.** About 20 × 52 = 1,040 versions a year at a few kilobytes each is a few
+  megabytes, which is negligible; revisit only if tenant counts grow by orders of magnitude.
+
+### Review rubric
+- **Hard constraints eliminate options first,** naming which constraint removes which option.
+- **Rollback time is computed per option** from TTL, push eviction or redeploy time, and compared with
+  the stated limit.
+- **The immutable-version and mutable-label split survives** in whatever is chosen, with who may move
+  `production` named.
+- **Agent specifics are handled:** per-run pinning, tool descriptions inside the version, and what happens
+  to in-flight runs on rollback.
+- **Operating cost is tied to the team** that will run it, not to a feature list.
+- **Reversal conditions are concrete facts,** such as where traces live or a change in residency terms.
 
 ## Why it exists
 - **Prompts are behaviour-defining config edited by people who do not ship code.** String constants are

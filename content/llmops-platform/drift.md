@@ -5,7 +5,8 @@ name: Drift
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - llmops-platform/model-monitoring
@@ -39,6 +40,70 @@ reference window; act only if outcomes changed.
   (prompt plus tool schemas), the reference window, and which slices get extra judging when they shift.
 - **What you can skip.** Deriving PSI or two-sample test theory; know what each detects, the rule-of-thumb
   cut-offs, and that only labels reveal concept drift.
+
+## Decision case
+### Scenario
+A retailer's RAG support agent (order lookup, returns and policy search tools) serves 25 regional
+storefronts. The team must pick a drift programme for the next year. All figures are illustrative.
+- **Traffic:** 30,000 runs a day; the policy corpus changes a few times a month, without notice to the
+  agent team.
+- **Constraints:**
+  - catch an upstream model, prompt or tool change within 24 hours;
+  - catch concept drift (a policy that changed its answer) within 3 days, because legal treats stale
+    return terms as a compliance issue;
+  - human review capacity is 150 labels a day;
+  - detection budget at most $400 a month; about $0.02 per agent probe task;
+  - one engineer at half time.
+
+### Options
+| Option | How it works | Component change caught | Concept drift caught | Labels a day | Cost a month |
+|---|---|---|---|---|---|
+| **A. Scheduled refresh** | weekly re-index and weekly golden-set run, no detectors | up to 7 days: fails | up to 7 days: fails | 0 | re-index compute only |
+| **B. Input detectors only** | daily PSI per storefront and intent, weekly embedding two-sample test | partly, via output proxies | never: inputs look the same | 0 | small (scheduled jobs) |
+| **C. Layered triage** | bundle hash and response model id per trace; daily frozen probes (200 tasks, recorded and live); a daily corpus freshness diff against the policy system; PSI ranks slices for labels | minutes (hash, model id) to 24 h (probes) | within a day of the policy edit | 150: 50 stratified plus 100 on top-ranked slices | 200 × 2 × $0.02 × 30 = $240 plus jobs |
+| **D. Label heavily** | human review of 2% of runs daily | after labels arrive | days, if reviewers know the new policy | 600: fails | reviewer time |
+
+### Decision
+Choose **C, layered triage**, because it is the only option that meets both detection deadlines with the
+label capacity the team has.
+- **Component changes:** the bundle hash and response model id catch prompt edits and alias updates
+  within minutes. Recorded-versus-live probes catch a tool changing shape within 24 hours, which A's
+  weekly run cannot.
+- **Concept drift:** B is blind to it by definition. C compares indexed policy versions with the policy
+  system daily, so a changed return window is re-indexed and re-validated within a day, inside the 3-day
+  limit.
+- **Labels:** PSI decides where the 150 daily labels go instead of being the alarm. D needs 600 a day,
+  four times capacity.
+- **Budget:** $240 of probes plus small jobs fits under $400, and the half-time engineer runs one triage
+  path (the probe-first fork in the diagram) instead of four dashboards.
+
+**What would change it:**
+- **The policy system offers change events:** replace the daily diff with event-driven re-indexing of
+  the changed documents.
+- **Outcome labels arrive within hours** (for example a resolved flag from the ticketing system): shift
+  label spend toward outcome monitoring and shrink the human queue.
+- **A deliberate decision to track a provider alias** for a low-stakes storefront: keep probes, drop the
+  pinning alert for that slice.
+
+### Trade-offs accepted
+- **Concept drift outside the policy corpus is still label-bound.** A changed shipping partner that no
+  document mentions shows up only through the 150 labels; watch the judged error rate on the returns and
+  shipping intents.
+- **200 probes miss rare tasks.** Add every confirmed incident case to the probe set and review its
+  coverage by intent quarterly.
+- **PSI cut-offs are borrowed from credit risk.** Re-derive them from six months of alerts and track how
+  many shifted slices showed a real error-rate change.
+- **Advancing the reference window can hide drift.** Advance it only after a validated fix, and log who
+  advanced it and why.
+
+### Review rubric
+- **Each drift source is named** (model, prompt, tool, corpus, task mix, concept) with the detector that
+  catches it and its detection time.
+- **Concept drift has a label or source-of-truth path**, not an input statistic.
+- **Label demand is computed** and compared with review capacity.
+- **Probe costs are recomputed** from tasks × runs × cost × days.
+- **The write-up separates "moved" from "broke"**: an input shift triggers labels, not a fix.
+- **At least two conditions that would change the choice** are stated, each tied to a measurable fact.
 
 ## Why it exists
 - **Every evaluation is a snapshot.** A golden set, a canary and a benchmark all say "acceptable on

@@ -5,7 +5,8 @@ name: Security questionnaires
 kind: practice
 difficulty: intro
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: background
 mastery: evaluate
 code_tested: yes
@@ -41,6 +42,63 @@ commitments, so they must match how the agent really works.
   answer.
 - **What you can skip.** Scoring methodology and SIG versus CAIQ details. Know that answers are scored,
   become findings, and are often incorporated into the contract.
+
+## Decision case
+### Scenario
+A 25-person startup sells a support agent that reads tickets, calls a hosted model and can create
+refunds through a tool behind an approval gate. All figures are illustrative planning numbers.
+- **Volume:** 9 enterprise deals this quarter, each sending a questionnaire of about 300 questions:
+  9 x 300 = 2,700 questions.
+- **Capacity:** 2 security engineers can give a quarter of their time for 13 weeks:
+  2 x 40 h x 0.25 x 13 = 260 hours.
+- **Effort assumptions:** writing an answer from scratch takes about 10 minutes with the owner's input;
+  reviewing a draft from approved material takes about 2 minutes. About 70% of questions match an
+  existing answer once a library exists.
+- **No audit report yet.** A SOC 2 Type II needs an observation period, so no report arrives this quarter.
+- **Known gaps:** agent traces keep full prompts for 30 days, and a recent change added a US-hosted
+  model fallback, while 4 of the 9 buyers ask about EU-only processing.
+
+### Options
+| Option | How it works | Hours this quarter | Consistency across 9 buyers | Misstatement risk |
+|---|---|---|---|---|
+| Answer each from scratch | account team plus engineers per deal | 2,700 x 10 min = 450 h, over the 260 h budget | low: answers drift between deals | high |
+| Answer library plus drafting agent | owner-approved entries; an agent drafts only from fresh matches and routes the rest to owners | 1,890 x 2 min = 63 h plus 810 x 10 min = 135 h, total 198 h | high: every answer traces to a library id | low, if owners approve every draft |
+| Wait for SOC 2 first | delay questionnaires until the report exists | 0 h now, deals slip | n/a | n/a, but the quarter's deals stall |
+
+### Decision
+**Build the answer library with a drafting agent that refuses to guess, start the SOC 2 work in
+parallel, and fix the two known gaps before they become answers.**
+- **It fits the budget.** 198 h is within 260 h; answering from scratch needs 450 h.
+- **It removes divergence.** Every sent answer traces to a library entry with an owner, evidence and a
+  review date.
+- **Honest answers on the gaps.** Prompt retention is answered "Yes, 30 days, access-restricted,
+  deletable on request". For the 4 EU buyers the answer is per data flow: pin their routing to EU
+  regions and say so, rather than claiming "never leaves the EU" while a US fallback exists.
+- **Generated from config:** the agent section (tools that write, approval gates, retention) is
+  exported from the tool registry, so the refund tool is never described as read-only.
+
+**What would change it.** If deal volume doubled, the SOC 2 report becomes urgent, because removing an
+illustrative third of questions saves more than any drafting gain. With only one or two deals a year, a
+library without the drafting agent is enough.
+
+### Trade-offs accepted
+- **Library upkeep.** Entries go stale. Watch: the share of entries past their review date, blocked
+  until re-approved.
+- **Drafting-agent errors.** A fluent wrong draft is the main risk. Watch: the owner edit rate on drafts
+  and any answer sent without an approval record (target zero).
+- **Disclosed gaps may cost a deal.** Watch: findings per buyer and their disposition (accepted,
+  mitigated, contracted).
+- **Audit cost without revenue proof.** Watch: questions answered by reference to the report once it
+  exists.
+
+### Review rubric
+- **Workload computed:** questions, hours and capacity follow from stated inputs, labelled illustrative.
+- **Every answer traceable:** the design ties each sent answer to an owner, evidence and a review date.
+- **Gaps answered honestly:** known gaps get "Partially" or "Yes" with a mechanism and a dated plan.
+- **Per-flow AI answers:** training use, retention and region answered separately for each model path.
+- **Agent safety in the drafting tool:** it drafts only from approved, fresh entries and refuses
+  otherwise.
+- **Flip conditions stated:** the deal volume at which an audit report beats more drafting.
 
 ## Why it exists
 - **Buyers cannot inspect every vendor.** A large company may have thousands of vendors, each a possible

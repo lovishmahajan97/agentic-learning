@@ -5,7 +5,8 @@ name: Incremental synchronization & CDC
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - enterprise-integration/webhooks
@@ -40,6 +41,64 @@ expensive the agent's answers are.
   than the index.
 - **What you can skip.** Running Kafka and Debezium yourself for a pilot. Start with a watermark plus soft
   deletes, learn the failure modes below, and move to log-based CDC when the numbers demand it.
+
+## Decision case
+### Scenario
+A support agent answers from an index of the customer's on-prem PostgreSQL ticket database, run by a
+vendor application you cannot modify. You must choose the sync mechanism for production. Figures are
+illustrative.
+- **Data:** 2 million tickets; about 10,000 changed rows a day, of which about 1,500 change text.
+- **Deletes:** the application hard-deletes tickets (no `deleted_at`); legal requires deleted tickets out
+  of agent answers within 1 hour.
+- **Freshness:** the agent may state a ticket's status only if the data is under 5 minutes old.
+- **DBA rules:** no triggers or schema changes on the vendor's tables; one logical replication slot is
+  allowed only with a retained-WAL cap and an alert. WAL rate is 2 GB an hour; 50 GB of disk is free.
+- **Team:** 2 engineers; the platform team already runs a managed Kafka cluster.
+
+### Options
+| Option | How it works | Re-embeds per day | Hard deletes gone within | Status freshness | DBA rules |
+|---|---|---|---|---|---|
+| Nightly full reload | reload and diff hashes | up to 2,000,000 | up to 24 h | up to 24 h | passes |
+| Watermark every 5 min, hash gate | overlap window, keyset paging | about 1,500 | never without a key comparison | up to about 5 min | passes |
+| Trigger-based changelog | triggers write changes and deletes to a table | about 1,500 | minutes | minutes | fails: triggers not allowed |
+| Log-based CDC, hash gate | Debezium reads the slot into Kafka; LSN-guarded consumer | about 1,500 | seconds | seconds | passes with cap and alert |
+
+Watermark plus hourly key-only reconciliation would meet the delete rule, but costs 2 million x 24 = 48
+million key reads a day on the source or a replica.
+
+### Decision
+**Log-based CDC with a hash-gated, LSN-guarded consumer, weekly key and hash reconciliation, and a
+retrieval tool that reports index lag.** It is the only option that sees hard deletes within the hour
+without triggers or tens of millions of key reads, and it keeps re-embeds at about 1,500 a day.
+- **Slot safety:** at 2 GB an hour, a stalled slot fills 50 GB in about 25 hours. Set
+  `max_slot_wal_keep_size` to 20 GB (invalidation after about 10 hours) and page at 10 GB retained, about 5
+  hours of stall.
+- **Consumer rules:** upsert by key, skip events with an older LSN, keep tombstones, never write the
+  unchanged-TOAST placeholder, and update metadata in place when the text hash is unchanged.
+- **Agent side:** each hit carries `source_updated_at`, and when lag exceeds 5 minutes for a status
+  question the agent calls a live lookup tool instead.
+
+**What would change it.** If the DBA refuses a slot, use the 5-minute watermark plus hourly key-only
+reconciliation on a replica and accept its read cost. If the vendor adds soft deletes, the watermark alone
+meets every constraint with no pipeline to run.
+
+### Trade-offs accepted
+- **A pipeline to operate.** Connector upgrades, Kafka topics and schema changes are ongoing work; monitor
+  consumer deserialization errors after every vendor upgrade.
+- **The customer's disk is at stake.** Alert on retained WAL per slot and on inactive slots, with a
+  runbook to drop orphaned slots.
+- **Cap invalidation forces a re-snapshot.** Use incremental snapshots so the stream keeps flowing; track
+  snapshot progress and time to catch up.
+- **Default replica identity.** Deletes carry only the key, so the index must be addressable by ticket ID;
+  monitor deletes that matched no indexed document.
+
+### Review rubric
+- **Delete semantics found first:** states whether the source soft- or hard-deletes before choosing.
+- **Numbers recomputed:** re-embeds per day, slot fill time and reconciliation cost from stated inputs.
+- **Source protected:** WAL cap, retained-WAL alert and orphaned-slot runbook agreed with the DBA.
+- **Consumer correctness:** idempotent upserts, LSN guard, tombstones, placeholder handling and hash gate.
+- **Agent sees freshness:** lag and modified time in tool results, with a live fallback for volatile fields.
+- **Fallback named:** what happens if the slot is refused or the source changes its delete behaviour.
 
 ## Why it exists
 - **The index is a derived copy of a moving source.** Tickets are edited, records reassigned, documents

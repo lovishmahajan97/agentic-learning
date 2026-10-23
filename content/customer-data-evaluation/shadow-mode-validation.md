@@ -5,7 +5,8 @@ name: Shadow-mode validation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - llmops-platform/canary-shadow-deployments
@@ -34,6 +35,67 @@ safe only if every write tool is stubbed.
   calls, intended writes, steps, cost); the self-agreement baseline; and the exit criteria.
 - **What you can skip.** Mesh-level mirroring details unless your candidate is a separate HTTP service;
   most agent shadows are queue-based workers.
+
+## Decision case
+### Scenario
+An insurer runs your claims-triage agent on about 9,000 claims a week. It reads claims and policies and
+can call `update_claim`, `send_email` and `issue_payment`. The insurer wants to move from the hosted model
+to a model running in its own cloud account, which its data team has already approved.
+
+Constraints (figures illustrative):
+- **No exposure before evidence.** The insurer's risk committee will not let any claimant see candidate
+  output until it has reviewed evidence from real traffic.
+- **Deadline.** The committee meets in 3 weeks, so evidence must be ready in under 3 weeks.
+- **SME time.** Two claims handlers can adjudicate about 150 disagreements a week between them.
+- **Budget.** At most $1,000 of extra inference, at an assumed $0.04 per candidate run.
+- **Coverage.** The window must include month-end, when bulk claims arrive.
+- **No duplicate actions.** No claimant may get a second email or payment.
+
+### Options
+| Option | How it works | Meets deadline? | Exposure | Cost | Evidence quality |
+|---|---|---|---|---|---|
+| **A. Replay last month's logs** | Run the candidate offline on logged claims with recorded reads | Yes, days | None | About $720 for 18,000 logs | Right distribution, but stale: no live latency, rate limits or this month's new forms |
+| **B. Async shadow on 100% for 2 weeks** | Queue fork after production answers; dry-run writes; 5% self-agreement slice | Yes: 2 weeks plus 1 for readout | None | 18,000 × $0.04 + 900 × $0.04 = $756 | Live traffic, about 1,080 disagreements at 6%, 300 adjudicated |
+| **C. Async shadow on 25% for 4 weeks** | Same fork, sampled | No: 4 weeks | None | 9,000 × $0.04 = $360 | About 540 disagreements, same 300 adjudicated, but late |
+| **D. 5% canary straight away** | Candidate answers 5% of claimants, with rollback triggers | Yes | Real claimants | Low | User outcomes, but forbidden by the committee |
+
+### Decision
+Choose **B**, timed so the 2 weeks span month-end:
+- **It is the only option inside the rules and the deadline.** D breaks the exposure rule, and C misses
+  the committee date.
+- **It beats A on live evidence.** The committee's question is "our traffic, this month", and only a live
+  fork shows latency, timeouts and new forms.
+- **SME capacity sets the sample, not traffic.** 150 a week for 2 weeks gives 300 adjudicated, matching
+  the worked readout, where a 140 to 90 split gives a rough interval of 55% to 67%.
+- **Writes are data.** `issue_payment` and `send_email` run as dry-run stubs, and intended writes are
+  diffed against production's real writes.
+- **Budget holds.** $756 is under $1,000, including the self-agreement slice that calibrates disagreement.
+
+What would change it:
+- **No approval for the candidate's hosting.** Then even shadow is an unapproved transfer, and only A
+  on approved infrastructure remains.
+- **A write tool that cannot be dry-run.** Then shadow is unsafe for that tool; replay it from logs instead.
+- **The committee allows exposure.** Then shorten shadow to 1 week and move to D with rollback triggers.
+
+### Trade-offs accepted
+- **No user-outcome signal.** Shadow cannot show whether claimants or handlers would have acted on the
+  output. Watch it in the follow-up canary with rollback on reopen and complaint rates.
+- **One-step counterfactuals.** Multi-turn claim chats only test the candidate's next turn. Watch
+  divergence on turn two onwards during the canary.
+- **Latency is not under identical load.** The async worker runs later. Check p95 again in the canary.
+- **Doubled inference for 2 weeks.** Watch shadow cost per day and stop at the volume target.
+
+### Review rubric
+- **Side effects are neutralised by design.** The write-up lists every write tool and says how each is
+  dry-run, and what happens with an undeclared tool.
+- **Volume follows from adjudication capacity.** It sizes the window from how many disagreements SMEs
+  can judge and states the resulting interval.
+- **Disagreement is calibrated.** It includes a production-versus-production baseline and reads the gap.
+- **The window covers known cycles.** It names month-end or weekly peaks and schedules around them.
+- **Blind spots lead to a next step.** It says shadow cannot measure user outcomes and names the canary
+  and its rollback triggers.
+- **Reversal conditions are concrete.** It names the approval, tooling or committee fact that would
+  change the option.
 
 ## Why it exists
 - **Curated sets miss the long tail.** Golden sets and regression suites are chosen by people, so they

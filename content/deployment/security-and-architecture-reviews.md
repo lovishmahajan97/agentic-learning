@@ -5,7 +5,8 @@ name: Security & architecture reviews
 kind: practice
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -42,6 +43,63 @@ accurate diagram, a threat model and evidence tests; leave with dated findings.
   recipients enforced in code, read-only by default), and keeping evidence tests in CI so they stay true.
 - **What you can skip.** The governance mechanics of a customer's review board. Know the flow (intake,
   pre-read, session, findings, decision) and what each finding outcome means.
+
+## Decision case
+### Scenario
+An insurer approved your read-only claims assistant last year after a full review. Product now wants a
+write tool, `update_claim_status`, live in 4 weeks. All figures are illustrative planning numbers.
+- **Volume:** 3,000 claims a day; the agent would propose a status change on about 20%, so
+  3,000 x 0.2 = 600 proposed writes a day, spread over 40 adjusters, or 600 / 40 = 15 each.
+- **Review calendar:** the insurer's board meets every 2 weeks. The original full review took 7 weeks
+  from intake to approval; delta reviews have taken about 2 weeks.
+- **Approval conditions:** last year's approval named the tool list and said any new write tool,
+  model provider or region triggers re-review.
+- **Risk:** claim documents are uploaded by claimants, so an indirect prompt injection could ask the
+  agent to mark a claim approved.
+- **Team:** 1 architect and 2 engineers can spend 2 weeks on review work.
+
+### Options
+| Option | How it works | Fits 4 weeks | Honours the approval conditions | What bounds an injected write |
+|---|---|---|---|---|
+| Ship behind a feature flag, no review | flag off by default, turned on per adjuster team | yes | no: a new write tool without re-review breaks a condition | only the prompt |
+| Full re-review of the whole system | new pre-read for everything, full board cycle | no: about 7 weeks | yes | whatever the design adds |
+| Delta review of the new tool | new DFD arrow, credential, STRIDE rows and evidence tests for this tool only | yes: about 2 weeks, one board cycle | yes | limits in tool code plus an approval gate |
+
+### Decision
+**A delta review, bringing a write tool narrowed so its threat rows are short.**
+- **Tool limits in code, not in the prompt:** the tool may move a claim only between "open", "pending
+  documents" and "ready for adjuster". It can never approve, pay or close; those stay human actions in
+  the claims system.
+- **Approval gate:** every proposed change is shown to the adjuster, who confirms it. At about 15 a day
+  each, that is a workload the adjusters can absorb.
+- **Scoped credential:** the tool acts with the adjuster's delegated token, so it can touch only claims
+  that adjuster may edit, and every write is logged with user, claim, trace id and source document.
+- **Evidence tests:** calls with "approved" or another adjuster's claim are denied, plus injection eval
+  cases built from planted instructions in claim documents.
+- **Why not the flag:** it would put the whole approval at risk for a 2-week saving.
+
+**What would change it.** If the tool needed to approve or pay, the blast radius changes enough that a
+full review is the honest answer. If confirmations ran far above 15 per adjuster a day, revisit which
+transitions need a human.
+
+### Trade-offs accepted
+- **Less automation than product asked for.** Watch: adjuster confirmation rate and time to confirm.
+- **Delta review relies on the old approval still being true.** Watch: diff the deployed tool registry,
+  routing config and egress destinations against last year's pre-read before submitting.
+- **Approval fatigue.** Adjusters may click through. Watch: share of confirmations under 2 seconds and
+  sampled audits of confirmed changes.
+- **Injection is bounded, not prevented.** Watch: denied tool calls per day and new injection cases
+  added to the eval set.
+
+### Review rubric
+- **Trigger recognized:** the write-up cites the approval condition and explains why this change needs
+  review.
+- **Scope matched to change:** chooses delta or full review from what the change alters, with reasons.
+- **Capability limits shown:** allowed transitions, credential scope and approval gate are enforced
+  outside the model.
+- **Evidence named:** tests that call the tool with out-of-scope arguments and injection eval results.
+- **Numbers recomputed:** writes per day and per approver follow from stated inputs.
+- **Flip conditions stated:** what tool capability would require a full review instead.
 
 ## Why it exists
 - **A questionnaire captures claims; a review tests the design.** It cannot tell the buyer how your

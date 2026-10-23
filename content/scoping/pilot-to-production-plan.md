@@ -5,7 +5,8 @@ name: Pilot → production plan
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/rapid-prototyping-poc
@@ -34,6 +35,66 @@ work, so a successful pilot does not stall.
   metrics (task success, override rate, error escapes, cost per task) and the production-gap list.
 - **What you can skip.** Heavy statistics for tiny internal agents with easy rollback; a short pilot and a
   checklist will do.
+
+## Decision case
+### Scenario
+The insurer from the worked scenarios below wants to pilot an agent that drafts replies and proposes small
+refunds. Its service organisation has 400 agents in 20 teams of 20. All figures are illustrative.
+- **The metric:** median handle time of 11.0 minutes; the pilot must detect a 15% cut, 1.65 minutes, with a
+  per-ticket σ of about 4 minutes.
+- **Constraints:**
+  - go/no-go at the end of pilot week 6, after two baseline weeks;
+  - operations can release at most two teams (40 agents) into the pilot;
+  - refunds may not run without review until the agent agrees with human decisions on at least 98% of 500
+    shadow cases;
+  - security and privacy reviews take about 4 weeks each and can run in parallel;
+  - the sponsor wants production within weeks of a go, not months.
+- **Volume:** the pilot teams see about 120 refund-eligible tickets a week, so 720 in six weeks.
+
+### Options
+| Option | How it works | Credible effect estimate? | Transfers to typical users? | Refund evidence | Go to production |
+|---|---|---|---|---|---|
+| **A. One volunteer team, before/after** | team uses drafts and refund proposals; gaps worked after go | no: seasonality is credited to the agent | no | none: proposals only | about 4 weeks of reviews after go |
+| **B. Two volunteer teams plus two comparison teams** | difference-in-differences, autonomy set per action, gaps after go | yes | weak: volunteers inflate it | shadow, 720 cases | about 4 weeks after go |
+| **C. One volunteer and one typical team, two matched comparison teams** | as B, plus the production-gap list started in week 1 with owners | yes | better | shadow, 720 cases | reviews done by week 4, before go |
+| **D. No pilot: shadow mode for all 400** | score proposed drafts and refunds on live traffic for six weeks | accuracy only, no handle time | n/a | shadow, plenty | adoption still unmeasured |
+
+### Decision
+Choose **C**, because it is the only option that meets every constraint at once.
+- **Sample size:** 16 × 4² / 1.65² ≈ 95 independent tickets per group; with about 200 tickets per human agent
+  and an ICC of 0.05 the design effect is 10.95, so about 1,030 tickets, roughly six agents' worth. Forty
+  agents per arm clear it; team-level differences are what the comparison group and difference-in-differences
+  absorb.
+- **Cohort:** one typical team checks that results transfer beyond volunteers, inside the 40-agent cap.
+- **Refund autonomy:** 720 shadow cases exceed the 500 required; at 98% agreement, 500 cases give a 95%
+  half-width of about ±1.2 points.
+- **Speed after go:** reviews started in week 1 finish around week 4, before the week-6 decision.
+- **Rollback:** pooled two-week audits of 400 tickets with an 88% trigger. That fires falsely about 1.8% of
+  the time at a true 91% and catches a real drop to 85% about 95% of the time; a single-week 90% trigger on
+  200 would fire falsely about 31% of the time.
+
+**What would change it:**
+- **An expected effect so large that before/after convinces:** drop the comparison teams.
+- **Operations allow four teams:** add two more typical teams to tighten the team-level comparison.
+- **Shadow agreement below 98% at week 6:** go on drafts only; refunds stay in shadow under a new box.
+
+### Trade-offs accepted
+- **Two comparison teams wait six weeks** for the tool. Watch for comparison teams changing behaviour, which
+  would distort the second term of the estimate.
+- **Parallel review effort may be wasted** on a no-go. Accepted because the PoC evidence was strong.
+- **Two teams per arm is thin at team level.** Report the per-team effects next to the pooled one; if they
+  disagree sharply, extend before scaling.
+- **Novelty can inflate early weeks.** Read the weekly trend for weeks 4-6, not the six-week mean alone.
+
+### Review rubric
+- **The baseline and comparison group are fixed before the pilot**, with the effect computed as a
+  difference-in-differences.
+- **Sample size accounts for clustering** by the unit the tool is assigned to.
+- **Autonomy is set per action** with the evidence and volume needed to step each one up.
+- **The production-gap list has owners and starts with the pilot**, with review durations checked against
+  the go date.
+- **Rollback triggers have computed false-alarm and detection rates.**
+- **At least two conditions that would change the plan are named.**
 
 ## Why it exists
 - **A PoC cannot answer the adoption questions.** It shows "can it work?" on a sample, not whether people use

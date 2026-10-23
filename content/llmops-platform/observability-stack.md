@@ -5,7 +5,8 @@ name: Observability stack
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - observability/tracing
@@ -40,6 +41,68 @@ scores attached to traces, and alerting.
   and scores written back by trace id.
 - **What you can skip.** Running the collector fleet yourself if a platform team does; you still own
   instrumentation and attributes.
+
+## Decision case
+### Scenario
+A SaaS company has six product teams shipping agents; each picked its own tracing approach. Finance and
+compliance now both want answers the current setup cannot give. All figures are illustrative.
+- **Traffic:** 1,000,000 requests a day, 30 KB average payload (prompt, retrieved chunks, completion).
+- **Constraints:**
+  - payloads of EU tenants must stay inside the company's own EU cloud account;
+  - attributed model spend must match the provider invoice within 5%, by team and tenant;
+  - payload storage capped at 1 TB;
+  - low-scored agent runs must be exportable to eval datasets by trace id;
+  - a platform team of 3 engineers and 8 weeks.
+- **Today:** two teams use vendor SDKs posting to vendor clouds, two log prompts as text lines, and two
+  rely on the existing APM.
+
+### Options
+| Option | How it works | EU residency | Spend within 5% | Payload volume | Eval loop | Effort |
+|---|---|---|---|---|---|---|
+| **A. Status quo** | each team keeps its tool | prompts already in a log SaaS: fails | no shared keys: fails | unknown | two teams only | 0 |
+| **B. One vendor SDK and cloud for all** | re-instrument every team in one vendor's SDK | payloads leave the account: fails | yes, inside the vendor | vendor-held | yes | 6 teams re-instrument; lock-in |
+| **C. OpenTelemetry stack** | OTel SDK, collector tier with redaction and tail sampling, token-usage metric on the full stream, EU payload store with TTL, self-hosted LLM trace viewer | payloads stay in the account | token metric counts every call | 30 GB a day × 30-day TTL = 900 GB | scores by trace id | collectors, payload store, contract test: fits 8 weeks |
+| **D. Extend the existing APM** | add custom spans to the APM | depends on payload handling | no tokens or cost: fails | none stored | no scores: fails | small |
+
+### Decision
+Choose **C, an OpenTelemetry stack the platform owns**, because it is the only option that meets
+residency, attribution and the eval loop together.
+- **Residency:** the collector redacts by data class and payloads go to an EU store referenced from spans,
+  so EU prompts never leave the account. B sends them to the vendor; A already leaked them to a log SaaS.
+- **Attribution:** cost comes from the unsampled token-usage metric, not from the tail-sampled trace
+  store, which keeps only about 6.9% of traces and would undercount spend. A CI contract test makes
+  tenant and bundle mandatory on every model span.
+- **Storage:** a 30-day payload TTL gives 900 GB, under the 1 TB cap; the 90-day retention in the worked
+  numbers (2.7 TB) would not fit.
+- **Eval loop:** judge scores and thumbs-down land on the gateway's trace id, so low-scored runs export
+  straight to datasets.
+- **Effort:** instrumentation stays the teams' job; the platform builds the shared layers, which fits 3
+  engineers in 8 weeks.
+
+**What would change it:**
+- **No residency constraint:** keep OTel instrumentation, but use a vendor cloud that accepts OTLP as the
+  analysis backend and skip self-hosting.
+- **A compliance rule demanding 90-day payloads:** the 1 TB cap must rise to about 2.7 TB, or payloads
+  must be sampled.
+- **Back to a single team:** one LLM tracing tool over OTel is enough.
+
+### Trade-offs accepted
+- **A self-hosted trace viewer to operate.** Watch its uptime and ingestion lag like any service.
+- **30 days of payloads.** Incidents older than a month are debugged from spans and metrics only. Track
+  how often an investigation needed an expired payload.
+- **Tail sampling needs a trace-id-aware load balancer.** Monitor late-arriving spans per policy.
+- **Moving all six teams onto OpenTelemetry.** Track the share of model spans missing mandatory attributes until it
+  reaches zero.
+
+### Review rubric
+- **Each constraint maps to a layer** (instrumentation, collector, stores, analysis, alerting) that
+  satisfies it.
+- **Spend is computed from an unsampled source**, and the write-up says why the sampled trace store cannot
+  match the invoice.
+- **Payload volume is recomputed** from requests × size × retention and compared with the cap.
+- **Sensitive payloads have a named store, TTL and redaction rule** per data class.
+- **Scores join to traces by one id**, and the path from a low score to an eval dataset is shown.
+- **At least two conditions that would change the choice** are stated, each tied to a measurable fact.
 
 ## Why it exists
 - **One team, one vendor SDK works; many teams break it in four places at once.**

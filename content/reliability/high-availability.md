@@ -5,7 +5,8 @@ name: High availability
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - reliability/fault-tolerance
@@ -39,6 +40,65 @@ model provider usually caps you.
   long runs before deploys.
 - **What you can skip.** Building your own consensus or database failover; buy managed multi-zone
   databases and queues. Know the series, parallel and MTTR formulas, which cover most design reviews.
+
+## Decision case
+### Scenario
+A B2B SaaS company runs a support agent inside its customer portal. Customers complain that "the
+assistant keeps failing", yet every dashboard is green. The team has 8 weeks to fix it. All figures are
+illustrative planning numbers, not vendor SLAs.
+- **Scale:** 300,000 runs a month. Each run makes 12 model calls and 6 tool calls (3 reads, 3 writes,
+  including `create_ticket`).
+- **Dependencies:** model calls succeed 99.9% of the time, internal tool calls 99.5%. Logs show half of
+  the model failures are isolated blips (timeouts, 429, 5xx) and half fall inside sustained provider
+  incidents. Tool failures are isolated pod restarts.
+- **Target:** 99.5% of runs complete without an infrastructure error each month, at most 1,500 failed runs.
+- **Constraints:** EU data residency for prompts and transcripts (any second provider must be EU-hosted
+  and contracted), 3 engineers, no budget for a second GPU fleet, and write tools must never act twice.
+
+Baseline: 0.999^12 × 0.995^6 ≈ 95.88%, about 12,360 failed runs a month, more than 8 times the budget.
+
+### Options
+| Option | How it works | Run success (independent failures) | Residency and budget | Fits 8 weeks |
+|---|---|---|---|---|
+| A. More replicas and zones | 3 zones, N+1 agent workers | ≈ 95.88%, unchanged: the workers were never the bottleneck | fine | yes, but solves nothing |
+| B. Step retries with checkpoints | one jittered retry per step, idempotency keys on writes, run state saved after each step | blips: 0.0005² = 2.5e-7 per model call; tools: 0.995 becomes 0.999975. Runs overlapping an incident (0.05%) still fail: ≈ 99.93%, about 196 failed runs | no new vendor | yes |
+| C. B plus an EU second provider | breaker opens on the primary, fallback model with portable prompts | ≈ 99.98%, about 46 failed runs, if outages are independent | new EU contract, portable prompts and evals, fallback answers differ | tight: procurement plus an eval pass on the fallback |
+
+### Decision
+**Option B: step-level retries with idempotency keys and checkpointed run state.** It brings failures
+from about 12,360 to about 196 a month, well under the 1,500 budget, with no new vendor, so residency
+is untouched. The retries add about 0.042 calls per run (12 × 0.001 + 6 × 0.005), a negligible cost.
+- **Why not A:** replicas raise the availability of a tier that is already near 100%; the series chain of
+  model and tool calls is what fails.
+- **Why not C now:** it buys about 150 fewer failed runs a month for a new contract, a second eval suite
+  and a product sign-off on "available but different" answers.
+
+**What would change it.** A target of 99.95% or tighter (at most 150 failures) puts B at about 196 and
+over budget, so C becomes necessary. So would logs showing that most provider failures are sustained
+incidents rather than blips. If a second provider is already contracted in the EU, C's cost falls to the
+eval work.
+
+### Trade-offs accepted
+- **Sustained provider incidents still fail runs.** Track runs failed during incidents separately, and
+  page when the monthly count passes half the budget (750).
+- **Retries can duplicate side effects.** Every write tool takes an idempotency key derived from run id and
+  step number. Alert on any duplicate key with a different payload.
+- **A checkpoint write per step.** Adds latency to each step. Watch p95 step latency and the share of runs
+  resumed from a checkpoint versus restarted from step 1.
+- **Retries stretch tail latency during blips.** Cap at one retry, and alert when the retry rate per
+  dependency doubles, since that signals an incident rather than blips.
+
+### Review rubric
+- **Run-level arithmetic:** the write-up computes run success from per-call rates and call counts, not
+  from server uptime, and turns it into failed runs per month.
+- **Correlation stated:** it separates isolated failures from sustained incidents and says which
+  options each one defeats.
+- **Constraints applied:** residency, team size, budget and the no-double-write rule each rule an
+  option in or out explicitly.
+- **Side effects handled:** any retry design names idempotency keys or another dedup mechanism for writes.
+- **Reversal condition:** it names the target or evidence (such as a 99.95% contract) that would move
+  the decision to the next option.
+- **Signals:** each accepted trade-off has a metric or alert with a threshold.
 
 ## Why it exists
 - **A single server is a single point of failure.** One disk, one kernel panic, one bad deploy, one

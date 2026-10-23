@@ -5,7 +5,8 @@ name: Training data pipelines
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - training-adaptation/data-curation
@@ -40,6 +41,66 @@ correctly or just memorized your eval tasks.
   mixture weights for rare tools.
 - **What you can skip.** Pretraining-scale web filtering and the theory behind quality classifiers. Keep the
   MinHash intuition, the masking rule and the repetition arithmetic.
+
+## Decision case
+### Scenario
+A subscription company runs a support agent on a large hosted model with 6 tools. Finance wants cost per
+conversation cut sharply, and the team proposes distilling the agent into a smaller open-weight model with
+LoRA. All figures are illustrative.
+
+- **Data.** 120,000 logged runs from the last 3 months, about 3,000 tokens each (360 million tokens).
+- **Eval.** A 600-task agent eval suite, written from real tickets of the same period.
+- **Tools.** The `cancel_subscription` tool appears in only 400 successful, distinct runs. Its `reason` argument was
+  renamed 5 weeks ago.
+
+Constraints:
+- **Privacy.** Traces contain customer emails and card fragments; they must be scrubbed before training
+  and must stay in the EU region.
+- **Validity.** The tuned model must beat the base small model on held-out tasks, not just on the suite it was trained near.
+- **Team and hardware.** Two ML engineers, one 8-GPU node, no Spark cluster.
+- **Deadline.** A go or no-go in 4 weeks.
+
+### Options
+| Option | How it works | Privacy | Eval validity | Fits team and 4 weeks |
+|---|---|---|---|---|
+| **A. Export JSONL and train** | Dump all runs, random 90/10 split, provider-style formatting at load time | Fails unless scrubbed separately | Fails: retries and eval-period tickets leak across splits | Yes, in days |
+| **B. Single-node staged pipeline** | Outcome filter, exact and MinHash dedup by task, decontaminate against the 600 tasks, PII scrub, offline template render with serving tool schemas and role masks, packed shards plus manifest hash | Pass: scrub is a blocking stage in-region | Pass: group split by task after clustering | Yes: 360 million tokens fit on one machine |
+| **C. Distributed pretraining-style pipeline** | `datatrove` on a cluster, a model-based quality classifier, streaming shards | Pass | Pass | No: cluster setup eats the deadline for data that fits on one node |
+| **D. Do not fine-tune yet** | Fix prompts and tool descriptions on the large model | Pass | Not applicable | Yes, but the per-call price of the large model is the cost problem, so it cannot meet the goal |
+
+### Decision
+Choose **B**, because the binding constraints are validity and privacy, not scale:
+- **Scale does not justify C.** 120,000 runs and 360 million tokens are a single-node job; MinHash on 66,000
+  surviving runs takes minutes with `datasketch`.
+- **The funnel is computed before training.** The outcome filter keeps about 55% (66,000), dedup by task
+  leaves about 25,000, and decontamination removes about 4% (1,000), leaving 24,000 trajectories, or about
+  72 million tokens per epoch.
+- **Rare tools get an explicit weight.** At 10% of a 24,000-example epoch, the 400 `cancel_subscription` runs
+  would be drawn 2,400 times, 6 passes. Cap it at 5%: 1,200 draws, 3 passes.
+- **The rename is handled in the data.** Runs older than 5 weeks are re-rendered with the current schema or dropped,
+  so the model never learns the old argument name.
+- **The eval is protected.** Splitting by task and decontaminating against the 600 tasks is what lets the go or no-go mean something.
+
+What would change it:
+- **Much more data.** At billions of tokens or many sources, the dedup and quality stages outgrow one node: move toward C.
+- **Unstable tools.** If schemas still change weekly, or fewer than a few hundred successful runs exist per
+  tool, choose D and revisit when the tool set settles.
+- **A hosted fine-tuning service.** The stages stay; only the render step targets the service's format.
+
+### Trade-offs accepted
+- **No model-based quality filter.** The outcome filter stands in for it. Hand-review 50 kept trajectories per
+  dataset version and log what fraction a reviewer would reject.
+- **MinHash may merge distinct but templated runs.** Watch the cluster-size distribution; one giant cluster means a template problem, not real duplicates.
+- **Filtering thins rare tools.** Track examples and passes per tool in the manifest, and tool-call validity per tool on held-out tasks.
+- **Decontamination by n-gram misses paraphrases.** Keep a second eval set of tasks dated after the export as the final check.
+
+### Review rubric
+- **Fine-tuning is justified first.** The write-up says why prompts, tools or retrieval cannot meet the goal.
+- **The funnel has numbers.** Runs left after each stage and tokens per epoch are derived, not guessed.
+- **Splits and decontamination are by group.** Task or session grouping after clustering is explicit, with the eval set named.
+- **Masking and schemas are specified.** Which roles carry loss, and how schema changes in old traces are handled.
+- **Repetition is computed per small source.** Passes per rare tool are calculated and capped.
+- **The scale choice is argued.** It explains why the tooling matches the data volume and what volume would change it.
 
 ## Why it exists
 - **"Export a JSONL file and point the trainer at it" fails invisibly.** The failures do not show in the

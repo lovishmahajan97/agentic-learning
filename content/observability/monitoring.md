@@ -5,8 +5,9 @@ name: Monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
 agent_relevance: useful
+lesson_type: lab
 related:
   - observability/latency-percentiles
   - observability/token-cost-tracking
@@ -38,6 +39,176 @@ proxies and sampled quality scores.
   SLOs, and which burns page.
 - **What you can skip.** Time-series database internals and anomaly-detection models. Know metric types,
   cardinality, SLOs and the burn-rate arithmetic.
+
+## Lab
+### Task
+Instrument a support agent so the v13-to-v14 prompt regression from the worked scenario shows up in
+metrics the same day, and write the alert policy that tickets it without paging anyone.
+
+The starter labels runs by `run_id` (400 series for 400 runs), has no prompt-version dimension, and
+pages on any bad hour, even one that has already ended. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's How it works (metric types, cardinality, agent-level signals,
+  burn-rate alerting) and its runnable burn-rate example.
+- **Setup:** Python 3.12 with `pip install prometheus_client pytest` (checked on prometheus_client 0.26,
+  pytest 9.1). Save the starter as `lab_monitoring.py` and the tests as `test_lab_monitoring.py`. No
+  Prometheus server is needed: the lab reads its own `CollectorRegistry`.
+- **Done:** `python lab_monitoring.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: catch a silent agent regression from metrics (checked on Python 3.12, prometheus_client 0.26)."""
+from prometheus_client import CollectorRegistry, Counter, Histogram
+
+REGISTRY = CollectorRegistry()                  # a private registry, so tests start clean
+SLO = 0.95                                      # 95% of runs end with a final answer, over 30 days
+BUDGET = 1 - SLO
+
+# LAB 1: label runs by agent, prompt_version and stop_reason only (bounded sets), and label the
+# steps histogram by agent and prompt_version, so a prompt deploy can be compared with the last one.
+RUNS = Counter("agent_runs", "Agent runs", ["agent", "run_id", "stop_reason"],     # BUG: run_id label
+               registry=REGISTRY)
+STEPS = Histogram("agent_steps", "Loop iterations per run", ["agent"],             # BUG: no prompt_version
+                  buckets=(1, 2, 3, 5, 8, 13, 20), registry=REGISTRY)
+
+
+def record_run(agent, prompt_version, run_id, stop_reason, steps):
+    RUNS.labels(agent, run_id, stop_reason).inc()
+    STEPS.labels(agent).observe(steps)
+
+
+def series(name):
+    return [s for fam in REGISTRY.collect() for s in fam.samples if s.name == name]
+
+
+def failed_ratio(agent, prompt_version):
+    """LAB 2: share of this agent's runs for this prompt version whose stop_reason is not
+    "final_answer", read back from REGISTRY (sum the agent_runs_total samples)."""
+    raise NotImplementedError
+
+
+def mean_steps(agent, prompt_version):
+    labels = {"agent": agent, "prompt_version": prompt_version}
+    total = REGISTRY.get_sample_value("agent_steps_sum", labels)
+    count = REGISTRY.get_sample_value("agent_steps_count", labels)
+    return None if total is None else round(total / count, 2)
+
+
+def burn(bad_ratio):
+    return bad_ratio / BUDGET
+
+
+def decide(bad_1h, bad_5m, bad_3d):
+    """LAB 3: multiwindow burn-rate policy. "page" only if the burn exceeds 14.4 over BOTH the
+    last hour and the last 5 minutes; otherwise "ticket" if the 3-day burn exceeds 1; else "ok"."""
+    if burn(bad_1h) > 14.4:                     # BUG: no 5 m confirmation, and slow burns never ticket
+        return "page"
+    return "ok"
+
+
+def simulate():
+    for i in range(200):                        # v13: 5% of runs hit the step budget
+        budget_hit = i % 20 == 0
+        record_run("support", "v13", f"r13-{i}", "step_budget" if budget_hit else "final_answer",
+                   8 if budget_hit else 3)
+    for i in range(200):                        # v14: re-searches before answering; 11% give up
+        budget_hit = i % 100 < 11
+        record_run("support", "v14", f"r14-{i}", "step_budget" if budget_hit else "final_answer",
+                   8 if budget_hit else 6)
+
+
+if __name__ == "__main__":
+    simulate()
+    print("agent_runs_total series:", len(series("agent_runs_total")))
+    for v in ("v13", "v14"):
+        try:
+            r = failed_ratio("support", v)
+            print(f"{v}: failed {r:.1%}  burn {burn(r):.1f}  mean steps {mean_steps('support', v)}")
+        except NotImplementedError:
+            print(f"{v}: failed (LAB 2 not done)  mean steps {mean_steps('support', v)}")
+    cases = {"v14 creep": (0.11, 0.11, 0.11), "brownout": (0.80, 0.80, 0.08),
+             "recovered": (0.80, 0.02, 0.06), "v13 steady": (0.05, 0.05, 0.05)}
+    for name, windows in cases.items():
+        print(f"{name:<11} -> {decide(*windows)}")
+```
+
+As given, it runs and prints `agent_runs_total series: 400`, `mean steps None` for both versions,
+`v14 creep -> ok` (a slow burn nobody hears about) and `recovered -> page` (a page for a finished
+incident).
+
+### Expected output
+```
+agent_runs_total series: 4
+v13: failed 5.0%  burn 1.0  mean steps 3.25
+v14: failed 11.0%  burn 2.2  mean steps 6.22
+v14 creep   -> ticket
+brownout    -> page
+recovered   -> ticket
+v13 steady  -> ok
+```
+
+The numbers recompute by hand:
+- **v13:** fails 10 of 200 runs (5%, burn 1.0), mean steps (190 × 3 + 10 × 8) / 200 = 3.25.
+- **v14:** fails 22 of 200 (11%, burn 2.2, budget gone in about 14 days), mean steps
+  (178 × 6 + 22 × 8) / 200 = 6.22.
+- **Page threshold:** a page needs a bad ratio above 14.4 × 5% = 72% on both short
+windows.
+
+### Tests
+```python
+import pytest
+import lab_monitoring as lab
+
+
+@pytest.fixture(scope="module")
+def simulated():
+    lab.simulate()
+
+
+def test_run_series_stay_bounded(simulated):
+    samples = lab.series("agent_runs_total")
+    assert len(samples) == 4, f"{len(samples)} series: an unbounded label leaked in"
+    assert {tuple(sorted(s.labels)) for s in samples} == {("agent", "prompt_version", "stop_reason")}
+
+
+def test_failed_ratio_and_steps_per_prompt_version(simulated):
+    assert lab.failed_ratio("support", "v13") == pytest.approx(0.05)
+    assert lab.failed_ratio("support", "v14") == pytest.approx(0.11)
+    assert (lab.mean_steps("support", "v13"), lab.mean_steps("support", "v14")) == (3.25, 6.22)
+
+
+def test_multiwindow_decision():
+    cases = [((0.11, 0.11, 0.11), "ticket"),     # burn 2.2: budget gone in about 14 days
+             ((0.80, 0.80, 0.08), "page"),       # burn 16 on both short windows
+             ((0.80, 0.02, 0.06), "ticket"),     # bad hour already over: no page, but 3 d burn 1.2
+             ((0.05, 0.05, 0.05), "ok")]         # exactly on budget
+    assert [lab.decide(*w) for w, _ in cases] == [want for _, want in cases]
+```
+
+On the starter all three fail for the intended reason: 400 series instead of 4, `NotImplementedError`
+from `failed_ratio`, and `ok` and `page` where the policy says `ticket`.
+
+### Failure scenarios
+- **Inject: add a `tenant` label to `STEPS` and record 50 tenants.** Observe: `agent_steps_bucket`
+  grows to 800 samples (2 versions × 50 tenants × 8 buckets including `+Inf`), plus a count, sum and
+  created sample per label set. Debug: count samples per metric name after a load test; per-tenant
+  detail belongs in the cost table or logs.
+- **Inject: re-create `REGISTRY` and both metrics between the v13 and v14 loops,** as a process
+  restart does.
+  Observe: `failed_ratio("support", "v13")` raises `ZeroDivisionError`. Debug: raw counter totals reset
+  on restart; compare versions with `rate()` over a window in Prometheus, never with lifetime totals.
+- **Inject: count only `stop_reason == "step_budget"` as failed,** then add a `loop_detected` stop.
+  Observe: the failed ratio stays flat while runs give up another way. Debug: define bad as "not a
+  final answer", so new stopping reasons are counted by default.
+
+### Submission
+- **Code:** your `lab_monitoring.py` with LAB 1-3 done and every `# BUG` line fixed.
+- **Test run:** `pytest -q` showing 3 passed, plus your output next to Expected output.
+- **A PromQL note:** the expression for the v14 failed ratio over 1 h, written against
+  `agent_runs_total`, and the matching 5 m and 3 d variants your alert rule uses.
+- **A short note (3-5 sentences):** why the v14 regression is a ticket and not a page, and which
+  signal would have caught it before the step-budget share moved.
+- **Evaluation:** tests pass, every label set is bounded, and the alert policy never pages on a burn
+  that has stopped.
 
 ## Why it exists
 - **You cannot read traces faster than users produce them,** and you cannot afford to learn about an

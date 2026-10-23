@@ -5,7 +5,8 @@ name: Success metrics / KPIs
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/baseline-measurement-before-deployment
@@ -35,6 +36,71 @@ completion alone proves no value and single metrics get gamed.
   what you log per step. Those choices move the drivers and decide which guardrails you need.
 - **What you can skip.** Formal experiment-design theory. The `n ≈ 16σ²/δ²` rule of thumb and a written
   spec per metric are enough to scope an agent pilot.
+
+## Decision case
+### Scenario
+A broadband provider is piloting a support chat agent with read tools (`get_account`, `check_outage`)
+and one write tool (`book_engineer_visit`). About 3,000 eligible chats arrive each week. The VP of
+Customer Care proposes one success criterion: "containment of at least 70%".
+
+Constraints (figures illustrative):
+- **Deadline.** The steering group decides expand or stop at the end of week 8.
+- **Sponsor's number.** The CFO reports cost per resolved contact, measured at $6.40 for human agents.
+- **Data.** No new warehouse: only a join on the ticket ID that the agent already logs in the CRM.
+- **People.** One analyst at 20% time, about 8 hours a week.
+- **Known guardrail.** The 7-day repeat-contact rate is 12% today; a rise to 14% would be unacceptable.
+
+### Options
+| Option | How it works | Fits the CFO's number? | Catches gaming? | Fits data and people? |
+|---|---|---|---|---|
+| **A. Containment only** | Pass if 70% of chats end without a human | No: containment is not cost | No: ending chats early raises it | Yes, one counter |
+| **B. Agent evals as criterion** | Pass on golden-set task completion and tool-call accuracy | No: says nothing about money | No: the agent self-reports success | Yes, already built |
+| **C. CSAT only** | Pass if post-chat CSAT holds | No | Partly: unhappy customers often skip the survey | Yes |
+| **D. Metric tree with holdout** | Outcome: cost per successfully resolved contact. Drivers: true resolution, adoption. Quality: audited completion. Guardrails: repeat contact, CSAT, severe escalations. 25% holdout | Yes, it is the outcome | Yes, guardrails paired with each driver | Yes, all from the ticket join plus a weekly audit |
+
+### Decision
+Choose **D**, with a 25% holdout, because three constraints point to it:
+- **The outcome must be the CFO's number.** Containment becomes a driver, defined strictly as no human
+  touch and no repeat contact within 7 days, so the agent cannot win by closing chats.
+- **The guardrail sets the holdout size.** Detecting 12% to 14% needs about 16 × 0.12 × 0.88 / 0.02² ≈
+  4,224 chats per group. A 25% holdout gets 750 a week and reaches that in about 5.6 weeks, inside the
+  8-week window. A 10% holdout (300 a week) would need about 14 weeks.
+- **The audit fits the analyst.** Reviewing 100 "completed" runs a week at 3 minutes each is 5 hours,
+  within the 8 available.
+
+The decision rule, signed before launch:
+- **Expand** if cost per resolved contact is at most $4.80 (25% below $6.40) and no repeat-contact rise
+  above 2 points is detected.
+- **Stop or rescope** if the reduction is under 10%, that is above $5.76.
+
+What would change it:
+- **Lower volume.** At 1,000 chats a week, a 25% holdout needs about 17 weeks, so replace the raw guardrail
+  with targeted audits of chats on high-risk intents.
+- **A different sponsor goal.** If the sponsor cared about churn rather than cost, the outcome KPI becomes
+  retention of contacted customers and CSAT moves up the tree.
+
+### Trade-offs accepted
+- **A quarter of customers wait for the agent.** The holdout delays savings for 8 weeks. Keep it for the
+  full window rather than ending it after one good week, which would inflate the measured effect.
+- **Smaller shifts go unseen.** A 1-point repeat-contact rise is below what 4,224 per group can detect.
+  Watch the trend on the dashboard and in the weekly audit.
+- **Containment looks lower than the sponsor expects.** The strict definition removes reopened chats.
+  Report the self-reported and audited figures side by side so the gap is visible, not hidden.
+- **The analyst's audit is a sample.** 100 runs a week cannot see a rare failure; back
+  `book_engineer_visit` with a deterministic check that a visit matches an open fault.
+
+### Review rubric
+- **Outcome first.** The write-up names one outcome KPI that the sponsor already reports, with its
+  measured baseline.
+- **Every driver has its cheat and its guardrail.** Each optimised metric is paired with the cheapest way
+  to game it and the counter-metric that catches it.
+- **Detectability is computed.** It states the per-group sample for the guardrail and how many weeks of
+  traffic that takes at the chosen holdout share.
+- **The agent's self-report is not ground truth.** Level-3 quality comes from an audit or a join to the
+  business record, with the audit's hours costed.
+- **The decision rule is pre-agreed.** Expand and stop thresholds are numbers derived from the baseline,
+  signed before launch.
+- **Reversal conditions are concrete.** It names the volume or sponsor goal that would change the design.
 
 ## Why it exists
 - **Agent projects fail at the review meeting, not in the middle.** The demo impressed, the pilot ran six

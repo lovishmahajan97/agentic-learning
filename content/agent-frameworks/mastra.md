@@ -5,7 +5,8 @@ name: Mastra (TypeScript agents and workflows)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/frameworks
@@ -36,6 +37,182 @@ one project structure.
   workflow steps and their schemas, and where storage lives.
 - **What you can skip.** The AI SDK's low-level streaming protocol; Mastra wraps it. Read the AI SDK
   lesson only when you need custom UI streaming.
+
+## Lab
+### Task
+Turn a refund flow that pays out immediately into one that pauses for a human. You implement the
+suspend and resume in a Mastra workflow step, make the execute step honour a rejection, and write the
+`approveRefund` handler that the approval UI calls later with nothing but a run id.
+
+This is the pattern behind "agents decide, workflows enforce": the agent can start a refund, never
+finish one.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** this lesson's mental model (agent versus workflow, schemas everywhere, storage);
+  async/await and Zod basics.
+- **Runs offline:** workflows need no model, so there is no API key; `InMemoryStore` stands in for the
+  Postgres or LibSQL storage you would use in production.
+- **Setup:** `npm init -y && npm pkg set type=module && npm i @mastra/core zod vitest tsx`; checked
+  with `@mastra/core` 1.79.0, zod 4.6.7, vitest 5.0.5 and Node 24. Run with `npx tsx refund.ts`.
+
+### Starter code
+```typescript
+// refund.ts: an approval-gated refund workflow in Mastra that survives a new request handler
+import { Mastra } from "@mastra/core";
+import { InMemoryStore } from "@mastra/core/storage";
+import { createStep, createWorkflow } from "@mastra/core/workflows";
+import { z } from "zod";
+
+export const ORDERS: Record<string, number> = { A100: 40, A101: 250 };   // order totals
+export const REFUNDS: { orderId: string; amount: number }[] = [];       // the side effect
+
+const Req = z.object({ orderId: z.string(), amount: z.number().positive() });
+const Decided = Req.extend({ approved: z.boolean() });
+
+const draft = createStep({
+  id: "draft",
+  inputSchema: Req,
+  outputSchema: Req,
+  execute: async ({ inputData }) => {
+    const total = ORDERS[inputData.orderId];
+    if (total === undefined) throw new Error(`unknown order ${inputData.orderId}`);
+    return { orderId: inputData.orderId, amount: Math.min(inputData.amount, total) };
+  },
+});
+
+const approve = createStep({
+  id: "approve",
+  inputSchema: Req,
+  outputSchema: Decided,
+  suspendSchema: Req,
+  resumeSchema: z.object({ approved: z.boolean() }),
+  execute: async ({ inputData, resumeData, suspend }) => {
+    // YOUR CODE: with no resumeData, suspend with the drafted refund as the payload so a human
+    // can review it; when resumed, carry the human's decision forward
+    return { ...inputData, approved: true };
+  },
+});
+
+const execute = createStep({
+  id: "execute",
+  inputSchema: Decided,
+  outputSchema: z.object({ orderId: z.string(), status: z.enum(["refunded", "rejected"]) }),
+  execute: async ({ inputData }) => {
+    // YOUR CODE: call the refund API (push to REFUNDS) only when approved
+    REFUNDS.push({ orderId: inputData.orderId, amount: inputData.amount });
+    return { orderId: inputData.orderId, status: "refunded" as const };
+  },
+});
+
+export const refundWorkflow = createWorkflow({
+  id: "refund",
+  inputSchema: Req,
+  outputSchema: z.object({ orderId: z.string(), status: z.enum(["refunded", "rejected"]) }),
+}).then(draft).then(approve).then(execute).commit();
+
+export const mastra = new Mastra({
+  workflows: { refundWorkflow }, storage: new InMemoryStore(), logger: false,
+});
+
+export async function startRefund(orderId: string, amount: number) {
+  const run = await mastra.getWorkflow("refundWorkflow").createRun();
+  const res = await run.start({ inputData: { orderId, amount } });
+  return { runId: run.runId, res };
+}
+
+type RunResult = Awaited<ReturnType<typeof startRefund>>["res"];
+
+// Called later by the approval UI, in a different request: only the runId survives.
+export async function approveRefund(runId: string, approved: boolean): Promise<RunResult> {
+  // YOUR CODE: get a run handle for this runId and resume the "approve" step with the decision
+  throw new Error("not implemented");
+}
+
+if (process.argv[1]?.endsWith("refund.ts")) {
+  const a = await startRefund("A101", 300);
+  console.log("start:", a.res.status, JSON.stringify(a.res.steps.approve?.suspendPayload ?? null),
+    "refunds:", REFUNDS.length);
+  const b = await startRefund("A100", 10);
+  try {
+    const done = await approveRefund(a.runId, true);
+    const no = await approveRefund(b.runId, false);
+    console.log("approved:", done.status, JSON.stringify(done.status === "success" ? done.result : null));
+    console.log("rejected:", no.status, JSON.stringify(no.status === "success" ? no.result : null));
+  } catch (e) {
+    console.log("resume failed:", (e as Error).message);
+  }
+  console.log("refunds:", JSON.stringify(REFUNDS));
+}
+```
+
+As given it prints `start: success null refunds: 1`, then `resume failed: not implemented`, and both
+refunds have been paid with no human involved.
+
+### Expected output
+```
+start: suspended {"orderId":"A101","amount":250} refunds: 0
+approved: success {"orderId":"A101","status":"refunded"}
+rejected: success {"orderId":"A100","status":"rejected"}
+refunds: [{"orderId":"A101","amount":250}]
+```
+
+### Tests
+```typescript
+// refund.test.ts: run with `npx vitest run`
+import { beforeEach, expect, test } from "vitest";
+import { approveRefund, REFUNDS, startRefund } from "./refund";
+
+beforeEach(() => { REFUNDS.length = 0; });
+
+test("a refund pauses for approval and moves no money", async () => {
+  const { res } = await startRefund("A101", 300);
+  expect(res.status).toBe("suspended");
+  expect(res.steps.approve?.suspendPayload).toEqual({ orderId: "A101", amount: 250 });  // capped
+  expect(REFUNDS).toEqual([]);
+});
+
+test("approval in a later request resumes from the stored snapshot", async () => {
+  const { runId } = await startRefund("A101", 300);
+  const done = await approveRefund(runId, true);
+  expect(done.status).toBe("success");
+  if (done.status === "success") expect(done.result).toEqual({ orderId: "A101", status: "refunded" });
+  expect(REFUNDS).toEqual([{ orderId: "A101", amount: 250 }]);
+});
+
+test("a rejected refund never calls the refund API", async () => {
+  const { runId } = await startRefund("A100", 10);
+  const no = await approveRefund(runId, false);
+  if (no.status === "success") expect(no.result).toEqual({ orderId: "A100", status: "rejected" });
+  else throw new Error(`expected success, got ${no.status}`);
+  expect(REFUNDS).toEqual([]);
+});
+
+test("bad arguments fail at the schema boundary", async () => {
+  await expect(startRefund("A100", -5)).rejects.toThrow(/Invalid input data/);
+  expect(REFUNDS).toEqual([]);
+});
+```
+
+On the starter three tests fail (`expected 'success' to be 'suspended'`, then `not implemented`); the
+schema test passes already and guards the Zod boundary.
+
+### Failure scenarios
+- **Resume with a fresh run.** Calling `createRun()` without the stored `runId` throws "This workflow
+  run was not suspended". Debug by logging the run id at start and at resume; they must match.
+- **Misspell the step id in `resume`.** Mastra answers that the step was not suspended and lists the
+  suspended steps, for example `[approve]`. Read that list instead of guessing.
+- **Click approve twice.** The second resume throws "not suspended" and no second refund is paid; keep
+  a test for it, because a UI retry is the usual way money moves twice.
+- **Keep `InMemoryStore` in production.** Everything passes locally, but a deploy or a second replica
+  loses every suspended refund. Swap in a shared Postgres or LibSQL store and alert on suspended-run age.
+
+### Submission
+- **Code:** `refund.ts` with the three `YOUR CODE` parts done; schemas, `startRefund` and the demo block
+  unchanged.
+- **Test run:** `npx vitest run` showing 4 passed.
+- **Program output:** the four lines from `npx tsx refund.ts`, matching Expected output.
+- **Extra test:** one you wrote showing a double approval pays exactly once.
+- **Short note (5 lines):** which storage you would use in production, and how the agent would start
+  this workflow as a tool without being able to resume it.
 
 ## Why it exists
 - **TypeScript teams need agent infrastructure too.** Most frameworks are Python-first; a Next.js or Node

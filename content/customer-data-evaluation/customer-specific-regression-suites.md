@@ -5,7 +5,8 @@ name: Customer-specific regression suites
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - evals/regression-tests
@@ -34,6 +35,68 @@ production. Averages hide one tenant's broken agent; this does not.
   trajectory or only the outcome, and the gate: paired flips plus a correction across tenants.
 - **What you can skip.** Deriving McNemar or Holm by hand. Know that you compare paired flips, that small
   suites have little power, and that many tenants inflate false blocks.
+
+## Decision case
+### Scenario
+A platform team runs one shared invoice-extraction agent for 40 enterprise tenants. Each tenant has its
+own feature flags, field formats and an escalation limit enforced through a tool call. The team merges
+about 15 pull requests a week that touch shared prompts, tool schemas or the parser. A model upgrade is
+planned next quarter.
+
+Constraints (figures illustrative):
+- **Suite size.** About 150 cases per tenant, 6,000 in all, built from acceptance cases and fixed incidents.
+- **PR latency.** CI on a pull request must finish in under 10 minutes. At 50 parallel runs and about
+  10 seconds per case, every 1,000 case runs take about 3.3 minutes.
+- **Eval budget.** At most $1,500 a week, at an assumed $0.01 per case run.
+- **Data boundary.** Each tenant's suite stays in its contracted region and is never mixed with others.
+- **Trust.** Engineers already ignore a gate that blocked "random" tenants twice last month.
+
+### Options
+| Option | How it works | PR latency | Weekly cost | Catches one tenant's break? | False blocks |
+|---|---|---|---|---|---|
+| **A. Global golden set** | One 3,000-case blend, gate on the average | Fits if sampled | Low | No: a 4% tenant dropping 12 points moves the average about half a point | Rare |
+| **B. Full per-tenant suites on every PR, uncorrected p < 0.05** | All 6,000 cases, candidate vs production, McNemar per tenant | Fails: 12,000 runs take about 40 minutes | 15 × $120 = $1,800, over budget | Yes | About 0.87 chance per harmless release that some tenant blocks |
+| **C. Tiered per-tenant gate** | 20-case smoke per tenant on PR; full suite nightly; blocking tier hard-blocks; Holm-corrected flips go to "inspect"; failing tenants pinned | 1,600 runs, about 5.3 minutes | 15 × $16 + 7 × $120 = $1,080 | Yes, via blocking cases and per-tenant flips | Familywise rate held near 0.05 |
+| **D. Manual SME sign-off per tenant** | Each tenant's SME reviews sample outputs before release | Days, not minutes | Staff time, not tokens | Sometimes, on what the SME happens to read | Low, but slow |
+
+### Decision
+Choose **C**, because it is the only option that meets latency, budget and trust together:
+- **PR latency holds.** The smoke tier is 40 × 20 cases × 2 sides = 1,600 runs, about 5.3 minutes.
+- **Budget holds.** $240 of smoke plus $840 of nightly runs is $1,080 a week, under $1,500.
+- **Hard blocks come only from blocking cases.** Contract rules, past incidents and escalation
+  trajectories block a tenant outright, which is how the tool-schema rename example gets caught even at
+  a McNemar p of about 0.22.
+- **Statistics inform, Holm decides.** Per-tenant McNemar p-values are Holm-corrected across 40 tenants,
+  so a harmless change falsely flags someone about 5% of the time instead of 87%.
+- **One failing tenant does not stall the fleet.** It is pinned to the old version through tenant config.
+
+What would change it:
+- **Fleet growth.** At about 75 tenants the smoke tier reaches 3,000 runs and 10 minutes, so smoke must
+  shrink to the blocking cases only, or concurrency must rise.
+- **A model swap.** It changes every case, so run the full suite with repetitions before release,
+  regardless of the PR tier.
+- **A single tenant.** Then A is the customer suite, and the per-tenant machinery is not worth building.
+
+### Trade-offs accepted
+- **Smoke misses rare regressions on PRs.** A break outside the 20 smoke cases surfaces overnight. Watch
+  how many nightly failures were not seen on the PR, and promote those cases into smoke.
+- **Holm lowers sensitivity per tenant.** Small real drops become "inspect", not "block". Watch the
+  inspect queue weekly and the complaint rate per tenant.
+- **Pinned tenants mean extra live versions.** Watch the count of pinned tenants and their age, and set
+  a maximum pin duration.
+- **Frozen context hides index regressions.** Keep the separate live-index suite for ingestion changes.
+
+### Review rubric
+- **Constraints carry numbers.** The write-up states case counts, runs per tier, latency and weekly cost,
+  and the arithmetic adds up.
+- **Hard blocks are deterministic.** It names which cases block (contract, incident, trajectory) and
+  keeps significance tests out of hard blocks for small suites.
+- **Multiple comparisons are handled.** It computes the uncorrected false-block rate for the fleet and
+  names a correction or an "inspect" tier.
+- **A failing tenant has a path.** It explains per-tenant pinning and how long a pin may last.
+- **Agent behaviour is asserted.** It includes trajectory and forbidden-tool assertions with recorded
+  tool responses, not only final answers.
+- **Reversal conditions are concrete.** It names the fleet size or change type that would flip the choice.
 
 ## Why it exists
 - **Every shared change hits every customer at once.** Base prompt, model version, retriever and parser

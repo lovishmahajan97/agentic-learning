@@ -5,7 +5,8 @@ name: Adoption & value-realization measurement
 kind: metric
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - adoption/usage-analytics
@@ -38,6 +39,66 @@ apart: adoption leads weekly, realized value renews the contract.
   counted.
 - **What you can skip.** Econometrics beyond difference-in-differences, placebo weeks and team-level
   resampling; those three cover most agent deployments.
+
+## Decision case
+### Scenario
+A ticket-resolution agent goes live across a customer's 4 support regions, about 2,500 eligible tickets
+a week each (10,000 in total). The renewal decision is at day 120 (about week 17), and finance wants a
+ranged, net-of-run-cost estimate. All figures are illustrative planning numbers.
+- **Politics:** the sponsor will not keep any region off the agent for more than 6 weeks, and refuses a
+  region-level holdout.
+- **Router:** the agent sits behind a ticket router, so a random share of tickets can skip it.
+- **Value at stake:** using the agent example above at 70% completion, about $18,333 a week net over 5,000
+  runs, or roughly $3.67 per attempted run.
+- **Data:** 8 weeks of pre-launch handling times per region; reopen rate is the agreed guardrail.
+- **Team:** one analyst, plus the FDE who owns the rollout calendar.
+
+### Options
+| Option | How it works | Credible at week 6 | Credible at day 120 | Cost and politics |
+|---|---|---|---|---|
+| Before/after | compare with the 8 pre-launch weeks | weak: concurrent changes credited | weaker still: drift accumulates | free |
+| Matched comparison | a similar business unit without the agent | selection bias remains | same | needs another unit's data |
+| Staggered DiD | regions live at weeks 0, 2, 4 and 6; compare with not-yet-live regions, placebo band | yes | no control left after week 6 | meets the 6-week limit |
+| Staggered DiD plus 5% ticket holdout | as above, and the router keeps 5% of tickets from the agent through day 120 | yes | yes: a randomised control | about 5% of value forgone |
+
+### Decision
+**Staggered go-lives at weeks 0, 2, 4 and 6 with difference-in-differences, plus a 5% ticket-level
+holdout at the router kept through day 120.** The stagger gives the early workflow-level estimate; the
+holdout is the only control still standing when the renewal number is computed.
+- **Why the stagger alone fails the renewal:** after week 6 every region is live, so a 90-day re-check
+  would fall back to before/after.
+- **Holdout precision:** from week 7 to week 16 the holdout collects 500 × 10 = 5,000 tickets against
+  95,000 treated. With an illustrative 20-minute spread in handling time, the standard error of the
+  difference is about `20 × sqrt(1/5000 + 1/95000) ≈ 0.29` minutes, far below a 5-minute effect.
+- **Why ticket-level errors are fair here:** the ticket, not the region, is randomised, so claim-level
+  noise is the right noise. The DiD keeps its placebo band.
+- **Cost:** 500 held-out tickets a week at an attempt share of 0.5 is 250 runs × $3.67 ≈ $917 a week,
+  5% of the $18,333.
+
+**What would change it.**
+- **No ticket holdout allowed:** keep the stagger and report the day-120 number as before/after,
+  labelled weakest.
+- **Gain needs whole-team change,** such as a new staffing model: the ticket holdout understates it, so
+  lean on the DiD.
+- **Only 2 regions:** the stagger is one comparison, so the holdout becomes primary.
+
+### Trade-offs accepted
+- **Contamination biases the holdout toward zero.** Staff handle both kinds of ticket and copy the agent's
+  phrasing; compare holdout handling time with the pre-launch baseline and report the holdout as a floor.
+- **About 5% of value forgone.** Show it on the renewal slide and end the holdout at day 120.
+- **Per-ticket, not workflow, effect.** The holdout misses backlog and staffing effects; conversion is
+  still checked separately through backlog and overtime.
+- **Uneven waits.** Region D waits 6 weeks; publish the calendar early and track its pre-period trend.
+
+### Review rubric
+- **Value equation written first,** including run cost and takeover cost, before any design is chosen.
+- **Each design rated at both checkpoints:** the write-up says which control still exists at the renewal
+  date, not only at week 6.
+- **Error bars match the unit of randomisation:** placebo spread for region-level DiD, ticket-level
+  error only where tickets were randomised.
+- **Holdout cost recomputed** from stated volume, attempt share and value per run.
+- **Bias directions named:** contamination, novelty and self-selection, each with the direction it pushes.
+- **Flip conditions stated:** what evidence or politics would make a different design primary.
 
 ## Why it exists
 - **Every deployment is sold on a projection.** An ROI model says something like "25% faster claims

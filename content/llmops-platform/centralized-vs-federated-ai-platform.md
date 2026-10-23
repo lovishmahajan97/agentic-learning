@@ -5,7 +5,8 @@ name: Centralized vs federated AI platform
 kind: decision
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - strategy/platform-strategy
@@ -37,6 +38,69 @@ budgets, audit, telemetry) with domain-owned prompts, evals, tools and agents.
   your team, plus registering the agent and its tools in the inventory.
 - **What you can skip.** Team Topologies and Data Mesh theory; know the mandatory core, the paved road and
   why quality ownership stays with you.
+
+## Decision case
+### Scenario
+A payments software company has 8 teams shipping agents. One business unit, EU payments, runs agents
+with refund and chargeback tools. The CTO asks for a platform model. All figures are illustrative.
+- **Today:** about $60k a month of model spend across 5 provider accounts; each team wires its own
+  tracing; a nightly batch job on a shared key causes 429s for the support agent.
+- **Constraints:**
+  - EU payments traffic must stay inside the company's EU network, so it cannot route through a US gateway;
+  - the audit in 4 months asks "which agents can move money", answered as a query, not a survey;
+  - a team reaches its first production call within 2 days of asking;
+  - interactive agents never get 429s caused by another team's batch work;
+  - the platform team has 4 engineers, about 80 engineer-days a month.
+
+### Options
+| Option | How it works | EU residency | Money-moving audit | Onboarding | Quota isolation | Platform load |
+|---|---|---|---|---|---|---|
+| **A. Full centralization** | platform owns keys, gateway, prompts and reviews every change | only if the gateway moves to the EU, for everyone | yes | queue: 8 teams × 3 requests × 2 days = 48 of 80 days on review | yes | over half on review: fails |
+| **B. Federated, policy document** | teams keep keys, tools and tracing | yes | no inventory: fails | fast | separate accounts, no shared pool | low; 8 × 6 = 48 engineer-weeks duplicated in the teams |
+| **C. Thin core, one US gateway** | mandatory gateway, virtual keys, tool inventory, trace pipeline, paved road | fails, or EU payments keeps its own keys and leaves a hole in the inventory | partial | self-service | per-team keys and priority classes | one quarter to build |
+| **D. Thin core, central control plane, EU data-plane replicas** | as C; EU payments runs gateway and agent-runtime replicas in its network on central config | yes | yes: every agent's tools and side-effect classes in one registry | self-service | per-team keys and priority classes | as C plus operating one EU replica set |
+
+### Decision
+Choose **D**, because it is the only option that meets residency and the audit together without turning
+the platform into a review queue.
+- **Residency:** EU payments traffic and payloads stay in its network; only configuration flows in from
+  the central control plane, and only telemetry aggregates flow out.
+- **Audit:** every agent registers its tools with a side-effect class (read-only, reversible,
+  consequential). CI rejects calls to unregistered tools, so "which agents can move money" is a query.
+  B cannot answer it, and C answers it only if EU payments joins.
+- **Quota:** per-team virtual keys with tokens-per-minute limits and an interactive-before-batch priority
+  class end the nightly 429s.
+- **Capacity:** prompts, golden sets and refund thresholds stay with the teams, so the platform spends
+  nothing on review. A spends 48 of its 80 monthly days there.
+- **Money:** one pooled account means even a 10% volume discount is about $6k a month, which helps pay for
+  the EU replicas.
+
+**What would change it:**
+- **The provider offers an EU endpoint the EU unit accepts through a central EU gateway:** C is enough,
+  with one less deployment to run.
+- **EU payments becomes a separate legal entity with its own auditors:** give it its own control plane,
+  which is federation for that unit only.
+- **Fewer than about four teams:** no platform; make the most mature team's stack reusable.
+
+### Trade-offs accepted
+- **A second data-plane deployment to operate.** It is on-call surface justified by regulation. Monitor
+  its config version and staleness like every other replica.
+- **Self-service needs product work first.** Until onboarding is self-service, teams wait; publish the
+  lead time and track the median against the 2-day target.
+- **Domain-owned quality varies by team.** The paved road's eval harness and judge narrow the gap; track
+  how many teams run a golden set in CI.
+- **Revoking direct keys forces migrations.** Do it on a dated schedule and track the share of invoice
+  spend the gateway can attribute.
+
+### Review rubric
+- **The mandatory core is listed explicitly**, and each item is justified by "only works when complete".
+- **Quality ownership stays with domains**, and the write-up says which artefacts each team keeps.
+- **Residency or isolation needs are mapped to the control-plane and data-plane split**, not to a
+  separate platform by default.
+- **Platform load is computed** (review requests × effort) against the team's capacity.
+- **Adoption metrics are named** (spend through the gateway, onboarding time, unregistered tools found)
+  with targets.
+- **At least two conditions that would change the choice** are stated, each tied to a measurable fact.
 
 ## Why it exists
 - **Adoption outruns any decision.** A team can reach production with a provider API key and a credit

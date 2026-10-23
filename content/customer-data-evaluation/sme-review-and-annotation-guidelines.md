@@ -5,7 +5,8 @@ name: SME review & annotation guidelines
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - evals/rubrics
@@ -33,6 +34,76 @@ randomised and independent, with agreement measured, so eval numbers do not inhe
   before you trust a judge.
 - **What you can skip.** Choosing between agreement statistics in depth; know when to use Cohen's κ,
   Fleiss' κ and Krippendorff's α, and always report agreement on the fail class.
+
+## Decision case
+### Scenario
+The HR customer from the Examples runs a benefits-policy agent that retrieves policy text and can change an
+enrolment. Over a 4-week pilot, SME review labels must do two jobs: decide whether prompt v13 replaces v12,
+and calibrate an LLM judge that will take over weekly review. All figures are illustrative.
+
+- **Expert time.** Three HR SMEs give 300 minutes a week in total. At about 3 minutes per trace review,
+  that is 100 reviews a week, or 400 over the pilot.
+- **Pass rate.** Around 85% of traces pass today, so fails are the scarce class.
+- **Calibration so far.** The v0.3 batch gave raw agreement 0.80, κ about 0.52 and fail-specific agreement
+  0.67, with 7 of 10 disagreements citing G3.
+
+Constraints:
+- **Actions matter.** A wrong enrolment change is the costliest error, so an action verdict must be separate.
+- **Judge bar.** The judge may replace SMEs only once human agreement has been measured per criterion,
+  because the judge cannot be shown to beat it.
+- **Governance.** Traces contain employee data and are reviewed inside the customer's tenant.
+
+### Options
+| Option | How it works | Traces judged in 400 reviews | v13 vs v12: 95% half-width on the difference | Can it calibrate a judge? |
+|---|---|---|---|---|
+| **A. Holistic 1 to 5, unblinded, single** | One reviewer scores each trace | 400 | About ±7.0 points if scores were reliable, but version bias is unmeasured | No: no agreement measured |
+| **B. Card, blind and shuffled, single** | v0.4 card, per-criterion binary labels | 400 | About ±7.0 points | No: still no agreement estimate |
+| **C. Card, blind, shuffled, 20% double, known-answer seeds** | B plus 63 double-labelled traces and 20 known-answer items | 315 | About ±7.9 points | Yes: κ and fail-specific agreement per criterion |
+| **D. Everything double-labelled** | Every trace by two SMEs | 200 | About ±9.9 points | Yes, with the most agreement data |
+
+Half-widths assume an 85% pass rate and an even split between versions.
+
+### Decision
+Choose **C**, because the judge bar requires measured agreement and the budget cannot afford D:
+- **A and B cannot calibrate a judge.** Without a double-labelled subset there is no human bar for the judge
+  to be compared against, which breaks a hard constraint.
+- **C fits the budget exactly.** 315 traces plus 63 second labels plus 20 known-answer items is 398 of 400 reviews.
+- **D widens the comparison by about 25%.** About ±9.9 points instead of ±7.9, for agreement data
+  that C already supplies.
+- **Blinding protects the version decision.** Shuffled per reviewer, with version ids stripped, so v13
+  cannot win on reviewer expectations.
+- **The v0.4 card fixes G3 first.** The calibration split was a guideline defect, so the pilot starts on the
+  rewritten section with its boundary pair, and A1 (actions) is checked before any answer criterion.
+
+What would change it:
+- **Too few fails to measure.** At about 15% fails, 63 double-labelled traces hold only around 10 failed
+  items, so fail-specific agreement is coarse. If it stays unstable, double-label more of week 4 before
+  trusting the judge.
+- **A small expected gain.** If v13 is expected to move the pass rate by only 2 to 3 points, no protocol
+  in 400 reviews can show it; use pairwise preference on a shared item set instead.
+- **Persistent splits.** If one section keeps causing disagreement after a rewrite, it is a policy gap for
+  the policy owner, not a protocol choice.
+
+### Trade-offs accepted
+- **Fewer traces judged.** 315 instead of 400, so only large version differences are visible. State the
+  ±7.9 point limit in the decision memo.
+- **Known-answer items cost 20 reviews.** They catch reviewer drift; report each reviewer's accuracy on
+  them as a recalibration prompt, not a performance score.
+- **Blinding hides context.** Reviewers see the input, tool calls and results, never the system identity.
+  Watch the "unsure" rate per criterion for signs they lack context.
+- **Binary labels lose gradation.** Where two versions both pass, add pairwise preference later.
+
+### Review rubric
+- **Budget becomes reviews.** The write-up converts SME minutes into reviews, then into traces judged,
+  second labels and seeds, and shows they sum to the budget.
+- **Each label use has a requirement.** It separates what the version comparison needs from what judge
+  calibration needs.
+- **Precision is stated for the comparison.** It gives the half-width on the version difference, not only
+  per version.
+- **Fail-class agreement is reported,** with its count, alongside raw agreement and κ.
+- **Bias controls are concrete.** Blinding, per-reviewer shuffling and independent labelling before
+  discussion are all specified.
+- **Actions are judged separately.** An action criterion is checked first, with a separate verdict.
 
 ## Why it exists
 - **Experts apply private standards.** Ask three senior experts "is this answer good?" and one fails it for

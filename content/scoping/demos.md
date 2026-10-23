@@ -5,7 +5,8 @@ name: Demos
 kind: practice
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/rapid-prototyping-poc
@@ -32,6 +33,61 @@ failure and labels which tools are live.
   approval step before any write action, and the aggregate task-success number you quote.
 - **What you can skip.** Polished UI. Audiences deciding on an agent pilot care more about the trace,
   the hand-off to a human and the success rate than about styling.
+
+## Decision case
+### Scenario
+A team has finished a PoC of the six-step support agent from the worked scenario below: look up the
+customer, read the order, check policy, draft a reply, propose a refund, wait for approval. All figures
+are illustrative.
+- **The meeting:** 30 minutes with the customer's COO, who decides whether to fund a six-week pilot, and a
+  security reviewer, who must approve the agent's tool access.
+- **Evidence in hand:** 72% task success on 150 replayed tickets; per-step stability of about 0.97 in
+  rehearsal, so one whole task behaves as rehearsed about 0.83 of the time.
+- **Constraints:**
+  - the meeting runs over the customer's VPN, which added multi-second stalls in one rehearsal;
+  - the refund tool must not touch production; it is a sandbox stub;
+  - the sales lead wants five tasks shown live, picked from those that "look best";
+  - the meeting must end with a pilot decision and a security sign-off path.
+
+### Options
+| Option | How it works | Chance the live part goes as rehearsed | Honesty of the picture | Serves both audiences? |
+|---|---|---|---|---|
+| **A. Five curated tasks, all live** | the sales lead's picks, no numbers shown | 0.97³⁰ ≈ 0.40, so a failure 60% of the time | implies near 100% against a real 72% | no: nothing on permissions |
+| **B. One live, two recorded, numbers and a failed trace** | the most stable task live (19 of 20 rehearsal runs), two labeled recordings, the 72%, one failed eval task caught by the approval gate | about 0.95, with a recorded fallback cued | matches the eval | yes: trace and tool permissions for security, outcome for the COO |
+| **C. Fully recorded walkthrough** | a polished video of three tasks plus the numbers | 1.0 | honest if labeled | partly: no real latency, weaker credibility |
+| **D. No demo, send the eval report** | a written readout | n/a | honest | no: the COO will not decide from a report |
+
+### Decision
+Choose **B**, because it is the only option that meets every constraint at once.
+- **Live risk:** one live task at 0.95 with a fallback replaces a 60% chance of a visible failure under A.
+- **VPN:** two segments are recorded and labeled, so a stall costs one segment, not the meeting.
+- **Honesty:** quoting the 72% beside three examples keeps the anecdote from standing in for the evidence;
+  A's curation would overstate success by about 28 points.
+- **Security:** the trace shows which tools are live and read-only, and the failed task shows the approval
+  gate pausing before the stubbed refund.
+- **Decision on the table:** the last five minutes present pilot scope and success metric.
+
+**What would change it:**
+- **A stable network and per-task stability near 1.0:** run all three tasks live for credibility.
+- **Two separate meetings:** split into an outcome demo for the COO and a permissions review for security.
+- **Eval success well below the pilot target:** demo the failure analysis and a narrower scope instead.
+
+### Trade-offs accepted
+- **Less live drama.** One live task impresses less than five. Watch the COO's questions; if they ask "is it
+  real?", offer to run a fresh ticket live after the meeting.
+- **A disappointed sales lead.** The curated set is dropped. Share the compounding arithmetic before the
+  meeting so the choice is agreed, not imposed.
+- **Recorded latency is not live latency.** Quote p95 latency from the eval runs beside each recording.
+- **Showing a failure costs some excitement.** Pair it with the gate that caught it, so it reads as
+  containment.
+
+### Review rubric
+- **The audience's decision is named** in one sentence before any segment is planned.
+- **Live-run odds are computed** from measured rehearsal stability, compounded across steps and tasks.
+- **Demo inputs come from the eval set**, and the aggregate number is quoted beside them.
+- **Every stubbed tool and recorded segment is labeled** on screen or on a slide.
+- **A contained failure is shown on purpose**, with the gate or hand-off that caught it.
+- **The plan says what would change the format**, tied to network, stability or audience facts.
 
 ## Why it exists
 - **Decision-makers judge by what they see.** Most people who fund, approve or adopt an AI system will never

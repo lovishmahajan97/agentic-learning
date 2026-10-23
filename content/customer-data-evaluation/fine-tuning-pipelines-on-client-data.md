@@ -5,7 +5,8 @@ name: Fine-tuning pipelines on client data
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - training-adaptation/fine-tune-vs-rag-vs-prompt-decision
@@ -34,6 +35,70 @@ deprecations, deletion requests and new labels force reruns.
   gate against the prompted agent.
 - **What you can skip.** Training-loop internals and full fine-tuning; a per-customer LoRA adapter on a
   standard trainer covers most agent uses.
+
+## Decision case
+### Scenario
+A logistics customer runs your support agent at about 50,000 conversations a day. Step one, choosing one
+of 30 queues and a tool, runs on a large prompted model. It is the routing step from the distillation
+example: 31,000 qualifying traces, and the prompted agent agrees with the human queue 90% of the time.
+
+Constraints (figures illustrative):
+- **Cost.** Step one costs about $0.02 per conversation, so $1,000 a day. Finance wants it cut by at
+  least half.
+- **Latency.** Step one takes about 2.5 seconds; the customer wants under 1 second.
+- **Data boundary.** The data processing agreement permits training, but only inside the customer's EU
+  cloud account, and the customer owns the resulting adapter.
+- **Deletion.** About one data-subject deletion request a month must reach every derived artifact.
+- **Quality floor.** The customer accepts at most a 2-point drop in routing agreement, and tool calls
+  must be at least 99.5% schema-valid.
+- **Team.** Two ML engineers, one of whom has run LoRA training before.
+
+### Options
+| Option | How it works | Data boundary | Cost and latency | Deletion and portability |
+|---|---|---|---|---|
+| **A. Keep prompting** | Tighten the prompt, try a smaller prompted model | Fine | Prompt work has plateaued; a smaller prompted model has not been measured against the floor | Nothing to retrain |
+| **B. Provider's hosted fine-tuning** | Upload traces, tune a hosted model | Fails: data leaves the customer's account | Likely cheaper and faster per call | Model lives at the provider; cannot be exported; retrain on its replacement when the base is retired |
+| **C. Self-hosted LoRA adapter, automated pipeline** | Permission gate, redaction, split by conversation, adapter on an open model in the customer's cloud, gate against the prompted agent | Fine | Assume a serving node at about $100 a day; sub-second on a mid-size model | Rerun monthly from the manifest; adapter is small and owned by the customer |
+| **D. Full fine-tune of the open model** | Same pipeline, all weights updated | Fine | Same serving cost | Each rerun is far heavier, and nothing shows 31,000 traces need it |
+
+### Decision
+Choose **C**, for step one only:
+- **It is the only option that meets both cost and the data boundary.** B fails the agreement, and A has
+  not shown it can reach half the cost.
+- **The quality floor holds.** Routing agreement is 89% against 90%, a 1-point drop inside the 2-point
+  floor. Schema validity is 99.6%, above 99.5%.
+- **Invalid calls fall back.** The 0.4% invalid calls, about 200 conversations a day, go back to the
+  prompted model for about $4 a day.
+- **The saving is large.** $1,000 a day becomes about $104 including fallback, close to $27,000 a month.
+- **Monthly deletion is affordable** because the adapter is small and the manifest says which runs
+  contained the record.
+
+What would change it:
+- **Volume.** Below a few thousand conversations a day, the serving node costs more than prompting saves,
+  so A wins.
+- **A flat learning curve below the floor.** If the 25%, 50% and 100% points flatten under 88%, more
+  traces will not help; keep the prompted step.
+- **An EU-hosted provider option that the agreement allows.** Then B is worth a cost comparison, accepting
+  the lock-in.
+
+### Trade-offs accepted
+- **One point of routing agreement.** Watch the human-queue override rate per day against the prompted
+  baseline, with a rollback flag.
+- **Retraining on every base-model change.** Watch the open model's release notes, and keep the pipeline
+  green with a monthly rerun.
+- **A second serving stack.** Watch per-adapter latency and GPU utilisation.
+- **Schema drift.** Watch tool-call validity after any tool schema change, and re-render traces first.
+
+### Review rubric
+- **Permission comes first.** The write-up quotes what the agreement allows, where training may run and
+  who owns the weights.
+- **The baseline is the prompted agent.** It compares against the prompted step on held-out conversations,
+  not against a weaker model.
+- **The split unit is stated.** It splits by conversation or case and says how near-duplicates are handled.
+- **Cost arithmetic includes fallback and serving.** Daily costs before and after add up.
+- **Deletion has a path.** It explains how a request reaches the adapter, cached datasets and eval logs.
+- **Reversal conditions are concrete.** It names the volume, learning-curve or agreement fact that would
+  change the choice.
 
 ## Why it exists
 - **Sometimes fine-tuning is right.** Hundreds of house-specific labels, a rigid output format, a house

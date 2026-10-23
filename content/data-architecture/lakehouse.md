@@ -5,7 +5,8 @@ name: Lakehouse
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: background
 related:
   - data-architecture/etl-elt-for-rag
@@ -40,6 +41,60 @@ travel and real deletes behind them.
 - **What you can skip.** The internals of Iceberg manifests or Hudi indexes, and the choice of format unless
   you own the platform. Know that commits are atomic, snapshots expire, and the lakehouse never serves the
   agent's request path.
+
+## Decision case
+### Scenario
+A B2B SaaS company runs three agents (support, sales research, internal IT) on one platform and must choose
+where agent data lives. All figures are illustrative.
+
+- **Traces.** About 300 million agent steps a month at roughly 2 KB a row: 600 GB a month, 7.2 TB after a year.
+- **Retrieval data.** 10 million chunks with 1,024-dimension float32 embeddings: about 41 GB per embedding model.
+- **Readers.** Spark ingestion jobs, a Python eval harness, a SQL dashboard engine, and quarterly fine-tune exports.
+
+Constraints:
+- **Deletion.** A user's traces, chunks and memory must be physically gone within 30 days of a request.
+- **Reproducibility.** Release evals must be re-runnable against the exact data they scored for 90 days.
+- **Latency.** Retrieval tools need under 100 ms, so the store behind them is a separate vector database whatever is chosen here.
+- **Team.** Four platform engineers on AWS in one EU region; no appetite for a second copy of the data in a warehouse.
+
+### Options
+| Option | How it works | 7.2 TB of scans across engines | 30-day physical delete | 90-day eval reproducibility | Ops load |
+|---|---|---|---|---|---|
+| **A. Postgres for everything** | Trace, chunk and embedding tables in one database | Weak: analytical scans compete with OLTP; other engines need extracts | Pass: `DELETE` plus vacuum | Fails without manual snapshot copies | Low at first, grows with size |
+| **B. Plain Parquet on S3** | Spark writes directories; readers list files | Pass for scans | Weak: rewrite files by hand, no record of what changed | Fails: readers can see half-written jobs | Low, but correctness is unmanaged |
+| **C. Open table format on S3 with a catalog** | Iceberg or Delta tables, date- and tenant-partitioned, with compaction and snapshot expiry jobs | Pass: all engines read one copy | Pass if expiry runs inside the deadline | Pass for retained snapshots; conflicts with deletion beyond that | Medium: compaction, expiry, a catalog |
+| **D. Proprietary warehouse** | Load everything into a managed warehouse | Pass for SQL; poor fit for Python and embeddings | Pass | Pass with warehouse time travel inside its window | Low, but a second copy for ML tooling |
+
+### Decision
+Choose **C**, because it is the only option that serves every reader from one copy and gives atomic
+snapshots and real deletes:
+- **Engines decide it.** Spark, Python and SQL all read the same tables through one catalog, so no extract drifts.
+- **Deletion fits the deadline by construction.** Deletes run as one batched job a week, then snapshot expiry
+  removes old files after 7 days. Worst case: 7 + 7 = 14 days (plus a day if expiry runs daily), inside 30, leaving 16 days for the vector-index and memory purges and a failed-run retry.
+- **Reproducibility is split from retention.** Time travel cannot cover 90 days without breaking the 30-day
+  delete, so each release eval materializes its scored rows as an eval dataset. Deletion requests also
+  delete from those datasets.
+- **Concurrency is designed in.** Trace appends partition by date; the weekly delete job and compaction are
+  serialized through one queue, so they do not fight over the same files.
+
+What would change it:
+- **Smaller data.** At tens of GB a year with one reader, A is simpler and should win.
+- **An existing warehouse commitment.** If the company already runs a warehouse with good Python access, D avoids building catalog and maintenance jobs.
+- **A shorter deletion SLA.** At 7 days, deletes run daily and expiry drops to 3 days, which shortens time-travel debugging.
+
+### Trade-offs accepted
+- **Short time travel.** Only 7 days of snapshots for debugging. Watch for evals pinned to a version about to expire and alert before it does.
+- **Maintenance is ours.** Compaction and expiry are scheduled jobs. Watch average file size per table and time from deletion request to physical removal.
+- **Materialized eval sets are extra copies.** Each must be listed in the deletion job's scope; audit that list monthly.
+- **Format choice is ecosystem-bound.** Check each engine's read and write support for the chosen format at the versions in use; interoperability layers soften but do not remove the choice.
+
+### Review rubric
+- **Readers and volumes come first.** The write-up lists every engine and the data size it scans before choosing a store.
+- **Deletion is traced to physical removal.** It computes the worst-case days from request to vacuum, including derived stores.
+- **The retention conflict is resolved explicitly.** It says how long-lived reproducibility coexists with the deletion deadline.
+- **Serving is kept off the lakehouse.** The request-path store is named and shown to be rebuilt from tables.
+- **Maintenance is owned.** Compaction, expiry and writer serialization have schedules and monitored signals.
+- **Reversal conditions are concrete.** It names the data size, existing platform or SLA that flips the choice.
 
 ## Why it exists
 - **The lake was cheap but was not a table.** Files in S3 or similar held raw and semi-structured data that

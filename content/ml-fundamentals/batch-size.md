@@ -5,7 +5,8 @@ name: Batch size
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/gradient-descent
@@ -183,6 +184,24 @@ flowchart TD
     G --> H["Compare runs on loss vs tokens"]
     H -.->|"noise scale grows"| B
 ```
+
+## Misconceptions
+- **"Use the biggest batch that fits on the GPU."** Too small wastes hardware, but too large wastes data.
+  On 3,000 agent traces, an effective batch of 128 leaves 69 optimizer steps over 3 epochs, too few for
+  the adapter to learn the tool format.
+- **"Gradient accumulation makes training faster."** It raises the effective batch at the same per-GPU
+  memory, but each step still runs every micro-batch in sequence. Only more data-parallel GPUs shorten
+  the run.
+- **"Large batches generalize worse by nature."** Most of the early sharp-minima gap closed once learning
+  rate, warmup and step count were re-tuned for the larger batch. Copying a small-batch recipe to a large
+  batch is what hurts.
+- **"Batch size and learning rate are independent knobs."** A bigger batch gives a more trustworthy
+  gradient and justifies a bigger step (linear for SGD, roughly square-root for Adam, then re-tune).
+  Changing one without the other compares two different optimizers.
+- **"Batch 64 means the same thing in every run."** The gradient estimate depends on tokens, not rows. At
+  2k vs 8k context, or with agent traces of very different lengths, "64" carries 4× different signal.
+- **"The training batch and the serving batch are the same knob."** Serving batches concurrent requests to
+  amortize weight reads, and its cost is latency, not gradient noise.
 
 ## Examples
 ### Worked scenario: batch size for a tool-calling adapter

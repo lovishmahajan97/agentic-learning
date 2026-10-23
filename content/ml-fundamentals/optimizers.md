@@ -5,7 +5,8 @@ name: Optimizers (Adam, AdamW)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/gradient-descent
@@ -164,6 +165,22 @@ flowchart TD
     U --> W2["Updated theta"]
     L2["Adam plus L2: lambda theta into g"] -.->|"coupled, avoid"| G
 ```
+
+## Misconceptions
+- **"`torch.optim.Adam(weight_decay=...)` is the same as AdamW."** It adds λθ to the gradient, where it
+  is divided by √v̂, so large-gradient weights are barely regularised. `torch.optim.AdamW` shrinks every
+  weight by the same factor (1 − ηλ) per step.
+- **"A learning rate is a learning rate, whatever the optimizer."** Adam moves each parameter by about η
+  per step regardless of gradient scale, so SGD's 0.1 diverges at once. LoRA and full fine-tuning also
+  need different ranges, around 1e-4 to 3e-4 versus 1e-5 to 5e-5 (illustrative).
+- **"If the bf16 weights fit, the fine-tune fits."** Full AdamW in mixed precision is about 16 bytes per
+  parameter, 112 GB for 7B before activations; m and v alone are 56 GB. LoRA keeps state only for the
+  adapters.
+- **"Adaptive optimizers make warmup unnecessary."** Bias correction fixes the zero start, but early v
+  is still estimated from a handful of samples. Skipping warmup produces early loss spikes.
+- **"Optimizer state is disposable; the weights are the checkpoint."** Resuming without m and v
+  restarts both from zero and shows up as a loss spike at the resume point. Save `optimizer.state_dict()`
+  with every checkpoint.
 
 ## Examples
 ### Worked scenario: full fine-tune or LoRA for a 7B tool-calling model

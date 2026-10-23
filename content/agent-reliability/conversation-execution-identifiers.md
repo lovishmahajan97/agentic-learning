@@ -5,7 +5,8 @@ name: Conversation / execution identifiers
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -41,6 +42,181 @@ which); conflating them makes retries double-act and logs impossible to join.
   `contextvars`, and tenant-scoped lookups.
 - **What you can skip.** Building on the provider's conversation or thread id. Keep your own hierarchy and
   store provider ids as attributes for support cases.
+
+## Lab
+### Task
+Implement the id rules for one agent turn: a resent POST returns the existing run, a crash-resume
+reproduces the same idempotency key, a regenerate gets a new run id with `attempt = 2`, and every
+lookup is scoped by the tenant from the auth token. Time box: 40-60 min.
+- **Prerequisites:** The agent loop; Tracing; the `Ids` example and worked trace in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13 and pytest 9.1). Save the
+  starter as `lab.py` and the tests as `test_lab.py`.
+- **No model calls:** the ticket API is a fake that dedupes on `Idempotency-Key`; run ids come from an
+  injected counter so the output is reproducible (production would mint UUIDv4 or UUIDv7).
+
+### Starter code
+```python
+"""Lab: turn, run and attempt ids that make a resend, a crash-resume and a regenerate behave correctly.
+Run: python lab.py"""
+import hashlib, itertools, uuid
+from dataclasses import dataclass
+
+class NotFound(Exception): pass
+
+@dataclass(frozen=True)
+class Run:
+    tenant_id: str
+    conversation_id: str
+    turn_id: str                      # minted by the client
+    run_id: str                       # minted by the server, one per attempt
+    attempt: int
+
+def idem_key(run_id: str, step: int, call_index: int) -> str:
+    # YOUR CODE HERE: derive, never mint: sha256 of "run_id:step:call_index", first 32 hex chars
+    raise NotImplementedError
+
+class Runtime:
+    def __init__(self, mint=lambda: uuid.uuid4().hex):
+        self.mint = mint
+        self.conversations = {}       # conversation_id -> tenant_id
+        self.runs = {}                # (conversation_id, turn_id) -> [Run, ...] in attempt order
+
+    def start_conversation(self, tenant_id, conversation_id):
+        self.conversations[conversation_id] = tenant_id
+
+    def conversation(self, auth_tenant, conversation_id) -> str:
+        """Scoped lookup: the tenant comes from the auth token, never from the request.
+        Return the conversation id, or raise NotFound (also for another tenant's id)."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+    def submit(self, auth_tenant, conversation_id, turn_id) -> Run:
+        """POST of a turn. A resend of a known turn_id returns its latest run and mints nothing;
+        a new turn_id gets a fresh run with attempt 1. Scope by tenant first."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+    def regenerate(self, auth_tenant, conversation_id, turn_id) -> Run:
+        """New work for the same turn: a new run_id with attempt = previous attempt + 1.
+        Raise NotFound for a turn that was never submitted."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+class TicketAPI:                      # dedupes on the Idempotency-Key header
+    def __init__(self): self.by_key, self.created = {}, 0
+    def create(self, title, headers):
+        key = headers["Idempotency-Key"]
+        if key not in self.by_key:
+            self.created += 1
+            self.by_key[key] = f"T-{self.created}"
+        return self.by_key[key]
+
+def call_tool(api, run: Run, step: int, call_index: int, title: str):
+    headers = {"X-Run-Id": run.run_id, "Idempotency-Key": idem_key(run.run_id, step, call_index)}
+    return api.create(title, headers=headers)
+
+if __name__ == "__main__":
+    counter = itertools.count(1)
+    rt, api = Runtime(mint=lambda: f"r_{next(counter)}"), TicketAPI()
+    rt.start_conversation("acme", "c_9")
+    first = rt.submit("acme", "c_9", "t_41")
+    resent = rt.submit("acme", "c_9", "t_41")                  # client timed out and re-sent
+    print("resend:", first.run_id, resent.run_id, "attempt", resent.attempt)
+    print("step 3:", call_tool(api, first, 3, 0, "Fix login"))
+    print("crash-resume:", call_tool(api, first, 3, 0, "Fix login"))   # same run, same step
+    again = rt.regenerate("acme", "c_9", "t_41")
+    print("regenerate:", again.run_id, "attempt", again.attempt, "->", call_tool(api, again, 3, 0, "Fix login"))
+    print("tickets created:", api.created)
+    try:
+        rt.conversation("globex", "c_9")
+    except NotFound:
+        print("globex reading c_9: not found")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+resend: r_1 r_1 attempt 1
+step 3: T-1
+crash-resume: T-1
+regenerate: r_2 attempt 2 -> T-2
+tickets created: 2
+globex reading c_9: not found
+```
+
+- **Read it:** this is the worked trace from the Examples, executed. The second ticket is correct only
+  because the regenerate is new work the user asked for; the ids make that visible.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 4 fail with `NotImplementedError`; a correct solution
+passes all 4 (Python 3.13, pytest 9.1).
+
+```python
+import hashlib, itertools
+import pytest
+from lab import NotFound, Runtime, TicketAPI, call_tool, idem_key
+
+def runtime():
+    counter = itertools.count(1)
+    rt = Runtime(mint=lambda: f"r_{next(counter)}")
+    rt.start_conversation("acme", "c_9")
+    return rt
+
+def test_key_is_derived_and_stable():
+    assert idem_key("r_a", 3, 0) == idem_key("r_a", 3, 0)
+    assert idem_key("r_a", 3, 0) == hashlib.sha256(b"r_a:3:0").hexdigest()[:32]
+    assert len({idem_key("r_a", 3, 0), idem_key("r_a", 3, 1), idem_key("r_b", 3, 0)}) == 3
+
+def test_resend_mints_nothing():
+    rt = runtime()
+    a, b = rt.submit("acme", "c_9", "t_41"), rt.submit("acme", "c_9", "t_41")
+    assert a == b and a.run_id == "r_1" and a.attempt == 1
+    assert rt.submit("acme", "c_9", "t_42").run_id == "r_2"
+
+def test_crash_resume_dedupes_but_regenerate_is_new_work():
+    rt, api = runtime(), TicketAPI()
+    run = rt.submit("acme", "c_9", "t_41")
+    assert call_tool(api, run, 3, 0, "x") == call_tool(api, run, 3, 0, "x") == "T-1"
+    regen = rt.regenerate("acme", "c_9", "t_41")
+    assert (regen.run_id, regen.attempt, regen.turn_id) == ("r_2", 2, "t_41")
+    assert call_tool(api, regen, 3, 0, "x") == "T-2" and api.created == 2
+    assert rt.submit("acme", "c_9", "t_41") == regen          # a resend now returns the latest run
+
+def test_ids_are_scoped_by_the_authenticated_tenant():
+    rt = runtime()
+    assert rt.conversation("acme", "c_9") == "c_9"
+    for tenant, cid in [("globex", "c_9"), ("acme", "c_missing")]:
+        with pytest.raises(NotFound):
+            rt.conversation(tenant, cid)
+    with pytest.raises(NotFound):
+        rt.submit("globex", "c_9", "t_99")
+    with pytest.raises(NotFound):
+        rt.regenerate("acme", "c_9", "t_never_submitted")
+```
+
+### Failure scenarios
+- **Mint the key with `uuid.uuid4()` inside `idem_key`.** `crash-resume` prints `T-2` and three tickets
+  exist: the resumed step no longer matches the first attempt downstream. Log the key per attempt of one
+  (run, step, index); different values mean it is minted, not derived.
+- **Mint a run on every `submit`.** The resend line prints `r_1 r_2`: one turn now has two runs and two
+  agents working on it. Count distinct runs per (conversation, turn) for turns with `attempt == 1`.
+- **Reuse the run id on regenerate and bump only `attempt`.** The regenerate prints `T-1`: the new
+  attempt silently dedupes against the old one, so the user's "try again" does nothing. Check that run
+  ids differ across attempts of one turn.
+- **Look the conversation up by id alone.** The last line disappears because `globex` can read
+  `acme`'s conversation, the insecure direct object reference. Keep a test that fetches another
+  tenant's id and expects not-found.
+
+### Submission
+- **`lab.py`** with `idem_key`, `conversation`, `submit` and `regenerate` implemented.
+- **A green run** of `pytest -q test_lab.py` (4 passed) and the output of `python lab.py`.
+- **A JSON-lines log** from your own variant that tags every `call_tool` line with tenant, conversation,
+  turn, run, attempt and step, plus the one query that rebuilds turn `t_41` from it.
+- **A short note:** what the regenerated run must read from the first attempt before it calls
+  `create_ticket`, so `T-2` is a decision rather than an accident.
+- **Evaluated on:** the resend mints nothing, the resume reproduces the key, the regenerate gets new ids
+  with `attempt = 2`, and no cross-tenant read succeeds.
 
 ## Why it exists
 - **One session id cannot explain an incident.** "The agent created two tickets": two create calls in

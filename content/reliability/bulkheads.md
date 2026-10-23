@@ -5,7 +5,8 @@ name: Bulkheads
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - reliability/circuit-breakers
@@ -38,6 +39,73 @@ detects failure; the price is capacity that cannot be borrowed.
   agent does when a compartment is full.
 - **What you can skip.** Queueing theory beyond Little's law. Concurrency = rate × time in system is enough
   to size every cap in this lesson.
+
+## Decision case
+### Scenario
+One fleet of 300 agent workers runs interactive support agents by day and a document-review batch by
+night. Each run holds a worker for its whole duration. All figures are illustrative.
+- **Interactive load:** 3 runs a second at 15 seconds each, so 3 × 15 = 45 workers by Little's law.
+- **Nightly batch:** 10,000 runs at 60 seconds each, 600,000 worker-seconds, due within 8 hours.
+- **Tools:**
+  - a customer CRM at 6 calls a second, 0.5 s at the p99, with a 30-second timeout its slowest
+    month-end queries need;
+  - a code sandbox with 12 VMs at 2 calls a second, 4 s at the p99.
+- **The incident to design for:** the CRM hangs until its timeout. On a shared pool that is 6 × 30 = 180
+  stuck workers.
+- **Constraints:**
+  - interactive p95 queue wait under 2 seconds;
+  - the batch finishes overnight;
+  - health checks stay green;
+  - no new node pool this quarter;
+  - two engineers and two weeks.
+
+### Options
+| Option | How it works | CRM hang | Interactive wait while batch runs | Batch time | Infra and effort |
+|---|---|---|---|---|---|
+| **A. Double the shared pool** | 600 workers, one queue, one HTTP client | 180 of 600 held: survives | fails: 10,000 queued batch runs take every free worker | 600,000 ÷ 600 = 1,000 s | twice the pods; trivial |
+| **B. Per-tool bulkheads, one queue** | semaphore per tool (CRM 25, sandbox 12), one HTTP client per upstream, a separate health path | capped at 25; other CRM calls get `tool_busy` in 50 ms | fails: batch still fills the shared queue | 600,000 ÷ 300 = 2,000 s | no new infra; about a week |
+| **C. B plus separate queues** | B's bulkheads inside two consumer groups: interactive 150 workers, batch 150 | capped at 25 in each group | 45 needed of 150; 45 + 25 stuck = 70 even with the CRM hung | 600,000 ÷ 150 = 4,000 s, about 67 min | no new infra; about two weeks |
+| **D. Separate deployments** | own node pool per workload class | isolated | isolated | as C or better | needs a new node pool: fails |
+
+### Decision
+Choose **C**, because B's tool bulkheads fix the hang but only a separate queue fixes the batch.
+- **CRM hang:** a cap of 25 holds at most 25 workers. At 6 calls a second it still admits everything
+  until the CRM's average latency passes 25 ÷ 6 ≈ 4.2 s, over eight times its 0.5 s p99.
+- **Interactive wait:** the interactive group never queues behind batch runs. Even with the CRM pinned it
+  uses 70 of its 150 workers.
+- **Batch:** 67 minutes fits the night many times over, so capping it at half the fleet costs nothing
+  that matters.
+- **Sandbox:** its cap of 12 equals the VM count, so the bulkhead also protects the sandbox itself.
+- **Infra:** no new node pool. D's extra isolation buys nothing these constraints ask for.
+
+**What would change it:**
+- **A batch deadline under about an hour:** 600,000 ÷ 3,600 ≈ 167 workers, more than 150. Use a soft
+  partition (a guaranteed minimum plus shared overflow) or resize the split.
+- **Interactive traffic past about 8 runs a second:** 125 ÷ 15 ≈ 8.3, the rate at which 150 workers minus
+  25 CRM-stuck ones run out.
+- **A tenant paying for isolation, or a vendor key limit to isolate:** move to D.
+
+### Trade-offs accepted
+- **The batch group's 150 workers idle by day.** Scale batch consumers down on a schedule, and watch
+  total utilization against the bill.
+- **`tool_busy` answers carry less context.** Watch the `tool_busy` rate per tool, and score runs that
+  answered without the CRM on the eval set.
+- **Caps can be mis-sized.** Rejections at normal traffic mean the cap was sized from the mean. Watch
+  rejections per bulkhead when the dependency is healthy.
+- **The hang still costs 25 workers for 30 seconds each.** Pair the bulkhead with a breaker so permits
+  free up once failures are observed.
+
+### Review rubric
+- **Every cap is derived with Little's law** from tool-call rate and p99 latency, with the tolerated
+  average latency (cap ÷ rate) stated.
+- **The oversubscription check is shown:** with one compartment pinned, the healthy paths' demand still
+  fits.
+- **Workload classes are separated** when batch and interactive agents share a fleet, not only
+  dependencies.
+- **Health and admission paths are named** as their own compartment.
+- **A full compartment has a defined agent behavior,** such as a `tool_busy` result or a degraded answer,
+  never an unbounded wait.
+- **At least two triggers that would change the split** are stated as numbers.
 
 ## Why it exists
 - **One slow dependency becomes a full outage.** A service with one pool of 200 workers calls an LLM, a

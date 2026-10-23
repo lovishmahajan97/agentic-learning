@@ -5,7 +5,8 @@ name: SAML SSO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: background
 related:
   - enterprise-integration/sso-iam-integration
@@ -35,6 +36,70 @@ correlation and replay, then derive the agent's user identity.
   IdP-initiated login is allowed, and the rule that API and tool calls use OAuth tokens, not SAML.
 - **What you can skip.** XML canonicalization details and hand-rolled signature code. Know the flow, the
   validation checklist and the famous attacks well enough to configure and test a library.
+
+## Decision case
+### Scenario
+Your agent product signs 12 customers in with OIDC. A bank with 5,000 employees will sign only if its
+IdP can sign users in with SAML 2.0, including a tile in its employee portal (IdP-initiated login).
+Figures are illustrative.
+- **Security:** the bank's pen test runs in 6 weeks and includes signature wrapping, replay and XXE cases.
+- **Sub-processors:** any new third party that sees identity data needs the bank's approval, which
+  typically takes 8 or more weeks.
+- **Load:** about 5,000 logins in a one-hour morning peak; assertions valid for 5 minutes, with 2
+  minutes of allowed skew.
+- **Agent impact:** SAML group attributes decide which tools the support agent may call, including a
+  refund tool.
+- **Team:** one engineer who knows OIDC well and has never shipped SAML; app runs on 6 nodes behind a
+  load balancer.
+
+### Options
+| Option | How it works | Wins the deal | Pen test risk in 6 weeks | Sub-processor approval |
+|---|---|---|---|---|
+| OIDC only | decline SAML, offer OIDC | no | none | none |
+| Hosted identity broker | broker accepts SAML, hands your app OIDC | yes | low: broker owns XML security | needed, about 8 weeks, misses the date |
+| Maintained SAML library in the app | per-tenant config of a widely used library, checklist tests in CI | yes | moderate, testable with the negative matrix | none |
+| Hand-rolled on `signxml` and `lxml` | your own ACS code like the example above | yes | high: wrapping, comments, XXE all on you | none |
+
+Replay cache sizing for the shared store: 5,000 logins in 3,600 seconds is about 1.4 a second. Each ID
+lives until `NotOnOrAfter` plus skew, 7 minutes or 420 seconds, so about 1.4 x 420, roughly 580 entries
+at peak. Memory is not the constraint; sharing across the 6 nodes is.
+
+### Decision
+**A maintained SAML library inside the app, SP-initiated by default, with IdP-initiated login enabled
+only for the bank's tenant under strict controls.** It wins the deal, avoids the 8-week sub-processor
+approval, and keeps the pen-test risk to configuration you can test.
+- **Why not the broker:** technically the safest path, but its approval misses the 6-week pen test. Keep
+  it on the roadmap for the next SAML customers.
+- **Why not hand-rolled:** every known SAML attack becomes your code's problem, with one engineer new to
+  SAML.
+- **IdP-initiated controls:** a shared Redis replay cache with set-if-absent and a TTL until
+  `NotOnOrAfter`, 5-minute validity, and a fixed landing page instead of an arbitrary RelayState.
+- **Agent principal:** key on (tenant, IdP entity ID, persistent NameID); unmapped groups grant no tools.
+
+**What would change it.** Three or more SAML customers in the pipeline, or a broker already approved by
+the bank, would make the broker cheaper than owning SAML. A bank that drops the portal tile means
+IdP-initiated stays off.
+
+### Trade-offs accepted
+- **You own SAML security.** Run the 8-row negative test matrix in CI on every library upgrade and track
+  the library's security advisories.
+- **IdP-initiated weakens correlation.** No `InResponseTo` for portal logins; monitor replay rejections,
+  which should stay near zero.
+- **Certificate rotation can break one tenant.** Store two certificates and alert 30 days before expiry;
+  monitor signature failures per tenant.
+- **Attribute drift removes tools.** A renamed groups attribute leaves agents with no tools; alert on
+  sessions with an empty tool set per tenant.
+
+### Review rubric
+- **Constraints decide:** names the deal requirement, pen-test date, sub-processor rules and team skill,
+  and rejects options against them.
+- **Checklist covered:** signature on the signed element, issuer, audience, recipient, time window,
+  `InResponseTo` and replay all appear in the plan.
+- **IdP-initiated handled explicitly:** either disabled, or allowed with named compensating controls.
+- **Numbers recomputed:** replay-cache size or login rate follows from stated inputs.
+- **Agent principal defined:** stable key, mapped tools, fail-closed on unknown groups, OAuth for
+  downstream tools.
+- **Exit path:** when to move to a broker or OIDC, and what evidence triggers it.
 
 ## Why it exists
 - **Every app kept its own passwords.** Cross-domain single sign-on meant cookies that browsers would not

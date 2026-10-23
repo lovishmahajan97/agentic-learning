@@ -5,7 +5,8 @@ name: customer support agent (triage, retrieval, refunds with approval)
 kind: practice
 difficulty: core
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/tool-calling
@@ -39,6 +40,61 @@ resolved without a human, with no wrong refunds.
   turn.
 - **What you can skip at first.** Voice, multi-language and proactive outreach. A text channel with one
   write action already exercises every hard part.
+
+## Decision case
+### Scenario
+An online store is about to let its support agent issue refunds. The tool already blocks anything outside
+policy (window, ownership, one refund per order), so the open question is the auto-refund limit: below it
+the tool executes, above it a human approves. All figures are illustrative planning numbers.
+- **Volume:** 12,000 tickets a month, 18% of them refund requests, so 12,000 x 0.18 = 2,160 refunds.
+- **Amount mix:** 70% are up to 50 dollars (average 25), 20% are 50-150 dollars (average 90), 10% are
+  above 150 dollars.
+- **Shadow mode:** on in-policy refunds the agent disagreed with the human decision 1.5% of the time
+  (for example, it refunded a parcel the carrier shows as delivered). Treat each one as a wrong refund.
+- **Approval capacity:** two support leads with 40 hours a month for approvals, about 2 minutes each.
+- **Loss budget:** finance accepts up to 800 dollars a month in wrong in-policy refunds.
+- **Deadline:** launch in 6 weeks, with no new hires.
+
+### Options
+| Option | How it works | Approval hours a month | Expected wrong-refund loss | Fits? |
+|---|---|---|---|---|
+| Approve every refund | Tool parks all refunds for a human | 2,160 x 2 min = 72 h | about 0 | no: 72 h is over 40 h |
+| Auto up to 50 dollars | Tool executes the 1,512 small ones, parks 648 | 648 x 2 min = 21.6 h | 1,512 x 0.015 x 25 = about 567 dollars | yes on both |
+| Auto up to 150 dollars | Tool executes 1,944, parks 216 | 216 x 2 min = 7.2 h | 567 + 432 x 0.015 x 90 = about 1,150 dollars | no: over 800 dollars |
+
+### Decision
+**Auto-refund up to 50 dollars; everything above goes to approval with the evidence attached.** It is the
+only option inside both the 40-hour approval capacity and the 800-dollar loss budget, and it needs no new
+staff before the deadline.
+- **Limit in config, enforced in the tool:** `AUTO_LIMIT` is read from config, so changing it is a
+  reviewed change, not a prompt edit.
+- **Approval task carries the case:** order, delivery status, conversation summary and proposed amount,
+  so 2 minutes per approval stays realistic.
+- **Rejected approvals become eval cases,** so the regression suite learns where the agent's judgement fails.
+
+**What would change it.**
+- **Lower error rate:** if shadow disagreement falls to 0.8% in both bands, the 150-dollar limit costs
+  1,512 x 0.008 x 25 + 432 x 0.008 x 90 = about 613 dollars and fits the budget.
+- **Higher volume:** if tickets double, approvals at the 50-dollar limit reach 43.2 hours, over
+  capacity; add an approver or revisit the limit with fresh error data.
+
+### Trade-offs accepted
+- **About 567 dollars a month of wrong small refunds.** Track wrong-refund amount weekly from approval
+  rejections and audit samples, and alert if it trends past 800.
+- **Customers above 50 dollars wait for a human.** Watch approval latency against a target such as 4
+  business hours, and the share of those tickets that reopen.
+- **One limit for every intent.** Damaged-item and late-delivery refunds may deserve different limits;
+  slice disagreement rate per intent before splitting the rule.
+
+### Review rubric
+- **Constraints stated as numbers:** volume, amount bands, error rate, approval capacity and loss budget
+  appear before any option is chosen.
+- **Arithmetic shown and correct:** approval hours and expected loss follow from the stated inputs for
+  every option.
+- **Enforcement point named:** the limit lives in the tool or its config, not in the prompt.
+- **Error rate has a source:** the write-up says where the rate comes from (shadow mode, audit) and how
+  it is re-measured.
+- **Change triggers explicit:** which error rate or volume would move the limit, with the recomputed numbers.
 
 ## Why it exists
 - **The user problem.** Customers wait hours for answers that are already in the help centre, and simple

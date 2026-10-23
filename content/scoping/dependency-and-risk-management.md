@@ -5,7 +5,8 @@ name: Dependency & risk management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/statement-of-work
@@ -37,6 +38,75 @@ with cheap spikes, so surprises arrive in week one.
   pre-agreed contingencies.
 - **What you can skip.** Formal risk-management frameworks in depth. The NIST AI RMF has its own lesson; a
   living RAID log with numbers is what scoping needs.
+
+## Decision case
+### Scenario
+A freight forwarder is piloting a customs-declaration agent. It reads shipments with `get_shipment`,
+proposes tariff codes, and files declarations through the customs broker's API with
+`submit_declaration`. The pilot has 12 weeks and a go-live fixed by a contract renewal. All figures are
+illustrative.
+
+Constraints and the week-1 RAID log:
+- **Slack.** 6 working days on the critical path; the end date cannot move.
+- **Data residency.** Declaration data must stay in the EU; the CISO has not yet approved the external
+  model API.
+- **Team.** Three engineers, with about 5 engineer-days spare off the critical path.
+
+| ID | Risk on the critical path | Prob | Impact | Expected |
+|---|---|---|---|---|
+| R1 | Broker's filing sandbox arrives late | 0.5 | 12 days | 6.0 days |
+| R2 | CISO rejects the external model API for EU data | 0.25 | 24 days (rebuild on an in-region model) | 6.0 days |
+| R3 | Write approval for `submit_declaration` refused or late | 0.4 | 20 days | 8.0 days |
+
+Total critical-path exposure is 20.0 expected days against 6 of slack, so the plan as drawn is not
+credible.
+
+### Options
+| Option | How it works | Exposure vs 6 days slack | Meets the fixed date? | Cost |
+|---|---|---|---|---|
+| **A. Pad the schedule** | Add 3 weeks (15 days) of buffer | 20.0 vs 21 | No: moves go-live | None in engineering |
+| **B. Provider adapter and in-region fallback** | Model calls behind an adapter; R2's impact falls from 24 to 4 days | 15.0 | No | 5 engineer-days, off the critical path |
+| **C. Drafts instead of writes in the pilot** | The agent prepares the declaration and a broker submits it; R3 leaves the pilot, R1 falls to 3 days because drafts are checked against the broker's published schema | 7.5 | No | Smaller pilot saving per declaration |
+| **D. B and C together** | Adapter plus draft-only filing | 2.5 | Yes | 5 engineer-days and the smaller saving |
+
+### Decision
+Choose **D**, because no single response brings exposure under the slack:
+- **C removes the fatal risk.** A refused write approval would leave the pilot without its core action.
+  That is a risk to plan by impact, not expected days, and drafting avoids it outright.
+- **B turns R2 into a configuration switch.** With the adapter, a CISO rejection costs about 4 days, so
+  R2's expected delay falls from 6.0 to 1.0.
+- **The arithmetic holds.** R1 at 0.5 × 3 = 1.5 plus R2 at 0.25 × 4 = 1.0 gives 2.5 expected days, inside
+  the 6 of slack.
+- **The spare effort pays for it.** The adapter uses the 5 spare engineer-days, which are off the critical
+  path.
+
+Start the security review and the write-approval request on day 0 anyway, so `submit_declaration` can be
+promoted after the pilot.
+
+What would change it:
+- **Written API approval by day 10.** If the CISO approves the external model API in writing, drop the
+  adapter build and spend the days on the eval set.
+- **Sandbox delivered in week 1.** Then R1 is retired, and C alone (exposure 6.0) fits the slack exactly,
+  with no margin; keep B.
+- **The case needs autonomous filing.** If the ROI break-even needs automatic submission, a draft-only
+  pilot cannot prove the value, and the end date must move instead.
+
+### Trade-offs accepted
+- **The pilot shows a smaller saving.** Brokers still review and submit each draft. Watch draft
+  acceptance rate and minutes per approval, the evidence for promoting the write tool.
+- **The adapter is effort that may never be used.** It is cheap insurance against a 24-day rebuild;
+  monitor the CISO decision date as a trigger.
+- **Numbers are rankings, not forecasts.** Re-run exposure after each spike and report the trend weekly.
+- **Approval risk moves to the next phase.** Keep R3 open in the RAID log with a named owner and date.
+
+### Review rubric
+- **Exposure is computed against slack,** with probability and impact in days for each critical-path risk.
+- **Fatal risks are planned by impact.** The write-up names any risk that would stop the pilot and
+  avoids or contains it, whatever its expected days.
+- **Each response shows its effect** on the numbers, and the combination is checked against the slack.
+- **Cost of each response is stated,** including what the pilot can no longer prove.
+- **Triggers are dated and owned,** such as an approval deadline that switches to the contingency.
+- **Reversal conditions are concrete.** It names the approval, delivery or ROI fact that changes it.
 
 ## Why it exists
 - **The plan says "weeks 1–2: data ingestion"; reality differs.** Week 1 is spent learning the document

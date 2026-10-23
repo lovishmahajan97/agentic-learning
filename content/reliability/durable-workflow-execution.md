@@ -5,7 +5,8 @@ name: Durable workflow execution
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agent-reliability/durable-execution-and-checkpointing
@@ -39,6 +40,59 @@ re-calling the model or repeating tools.
   identity, step budgets with continue-as-new, and payload size.
 - **What you can skip.** The engine's internal history store and sharding. Learn replay, determinism and
   at-least-once activities; that explains every bug you will meet.
+
+## Decision case
+### Scenario
+A procurement team wants a vendor-onboarding agent: it collects documents by email, runs sanctions and
+tax checks through tools, asks a buyer to approve, then creates the vendor in the ERP. Vendors take up
+to 14 days to reply. All figures are illustrative.
+- **Volume:** 1,500 onboardings a week, about 40 model and tool steps each, average duration 6 days. By
+  Little's law about 1,500 / 7 × 6 ≈ 1,286 runs are in flight at any moment, most of them waiting.
+- **Waits and reminders:** remind the vendor on day 3 and day 7, escalate to the buyer on day 14.
+- **Compensation:** if the sanctions check fails after the ERP record exists, the record must be
+  deactivated and the buyer told.
+- **Constraints:** 4 Python engineers on Kubernetes with Postgres, nobody has run a workflow engine,
+  live in 8 weeks, and weekly deploys must not lose or repeat any step.
+
+### Options
+| Option | How it works | 14-day waits and reminders | Resume without repeats | Compensation | Fits team and 8 weeks |
+|---|---|---|---|---|---|
+| A. Status column plus cron | a run table, a sweeper job, retries per step | polling sweeper you write | only as good as your status updates; races with crashes | hand-written | familiar, but grows the bugs in Why it exists |
+| B. Framework checkpointer | agent graph with a Postgres checkpointer, pause on approval | pause works; timers need an external scheduler | resumes at the last superstep; tool idempotency is yours | hand-written | fits, with a scheduler and saga code added |
+| C. Code-first durable engine | Temporal-style workflow; model and tools as activities | durable timers and signals, no worker held | replay returns recorded results; activities keyed by workflow, run and activity ID | `try`/`except` saga in workflow code | a new runtime to learn and operate |
+| D. Declarative state machine | Step Functions style JSON states | built in | built in | built in | awkward for a loop whose next step is chosen by the model |
+
+### Decision
+**Option C, a code-first durable engine.** Multi-day waits with reminders, about 1,286 runs mostly
+asleep, a compensation path and weekly deploys are exactly what timers, signals, replay and sagas are
+for. In A or B the team would rebuild each of them, and that home-grown copy is where steps run twice.
+- **Why not A:** a sweeper plus status column is the hand-built fix whose races this lesson describes.
+- **Why not B:** fine for short runs with one approval, but 14-day timers and the saga become custom code.
+- **Why not D:** the model picks the next tool, and data-dependent branching is painful in JSON states.
+
+**What would change it.** If runs took minutes and waited at most one approval, B is lighter and enough.
+If the flow became a fixed pipeline and the company already ran Step Functions, D would fit. If the team
+cannot take on a new runtime this quarter, choose B and budget the scheduler and saga work explicitly.
+
+### Trade-offs accepted
+- **Determinism rules.** A change to workflow code can break replay of in-flight runs. Keep model and
+  tool calls in activities, use versioning patches, and replay recorded histories in CI before deploys.
+- **Another system to run.** Monitor task-queue backlog and schedule-to-start latency, and drill a
+  worker kill during a vendor wait.
+- **Activities are at least once.** ERP and email tools take an idempotency key from workflow ID, run ID
+  and activity ID; alert on any duplicate key with a different payload.
+- **History growth.** Pass document and transcript references, not payloads, and continue-as-new on a step
+  budget; alert on history size per run.
+
+### Review rubric
+- **Run shape quantified:** the write-up states steps per run, longest wait and in-flight runs (with the
+  Little's law arithmetic) before naming a tool.
+- **Primitives mapped:** each requirement (wait, reminder, approval, compensation, resume) is matched to a
+  mechanism in every option, not to a feature list.
+- **Side effects:** the write-up shows how a retried or replayed step avoids acting twice.
+- **Change over time:** it says how code changes reach runs that are already 10 days in.
+- **Operational cost:** the option's runtime has an owner, metrics and a drill.
+- **Reversal condition:** names the run length or team constraint that would make a lighter option right.
 
 ## Why it exists
 - **Real processes span time and systems.** Draft a reply with a model, wait for a human to approve,

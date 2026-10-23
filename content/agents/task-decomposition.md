@@ -5,7 +5,8 @@ name: Task decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -148,6 +149,25 @@ flowchart TD
     C -->|"table only"| R["recommend: strongest model"]
     R --> O["Deliverable"]
 ```
+
+## Misconceptions
+- **"Smaller subtasks are always better."** Each subtask costs a model call, a context setup and a
+  coordination step, and shared context gets re-explained every time. Right-sized means one call can
+  finish it against a clear success criterion with a handful of tool calls.
+- **"If each step is 95% reliable, the agent is about 95% reliable."** Failures multiply along a chain:
+  ten unverified steps at 95% finish cleanly about 60% of the time (0.95¹⁰ ≈ 0.60). A check plus one
+  retry per step lifts the same chain to about 97.5%, assuming independent failures the check catches.
+- **"Passing the full upstream transcript is safer, nothing gets lost."** It makes downstream steps
+  attend to irrelevant detail and every consumer of that edge pays for the tokens. Pass structured
+  results with fixed fields plus a shared read-only task brief.
+- **"Split the deliverable the way a document is outlined."** Narrative pieces ("introduction", "body")
+  share almost all their context and contradict each other. Cut at verification, data and tool
+  boundaries instead.
+- **"Decomposition and planning are the same thing."** Planning decides order; decomposition decides
+  shape: granularity, the dependency graph and the contract at each seam. A perfect order over badly
+  shaped subtasks still fails.
+- **"More subtasks means more latency."** With concurrency, wall-clock time follows the critical path:
+  a four-way fan-out plus merge at 20 s each takes 40 s, while a five-deep chain takes 100 s.
 
 ## Examples
 ### DAG executor that passes only declared dependencies

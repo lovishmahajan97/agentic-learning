@@ -5,7 +5,8 @@ name: Production feedback classification
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - evals/error-analysis
@@ -34,6 +35,69 @@ traces against a grown taxonomy says what and who fixes it.
   trajectory), routing by severity and calibrated confidence, and prevalence estimates on random samples.
 - **What you can skip.** Fancy classifier training at first; an LLM classifier with a strict schema and a
   weekly SME sample is enough until volume is high.
+
+## Decision case
+### Scenario
+An e-commerce customer runs your five-tool order-support agent. Each week it produces about 1,000
+negative signals: 600 escalations, as in the agent scenario below, plus 400 thumbs-downs and edits. The
+customer wants a weekly report of failure modes with owners, and wants any harmful failure looked at fast.
+
+Constraints (figures illustrative):
+- **SME time.** Two support leads can review 400 items a week. 100 of those are a random calibration
+  sample, which leaves 300 for a review queue.
+- **Severity.** Every severity-3 or higher item (users acted on a wrong answer) must reach a human within
+  2 business days. About 15% of items, so 150 a week, are severity 3 or higher.
+- **Calibration.** At the calibrated threshold of 0.9 from the example below, about 61.4% of labels are
+  confident enough to auto-route; assume the same share for the other 850 items.
+- **Cost.** An assumed $0.01 per trace classification; the budget is not the binding constraint.
+- **Data.** Traces contain addresses and order details, so classification runs under the production data
+  agreement.
+
+### Options
+| Option | How it works | Severity-3 coverage | Human queue per week | Owner attribution |
+|---|---|---|---|---|
+| **A. Humans read a random 300** | No classifier; SMEs label a sample | About 30%: 70% of harmful items go unread | 300 | Good, on the sample only |
+| **B. Comment-only LLM classifier** | Classify the feedback text | Severity guessed from comments | Small | Poor: most items become "wrong answer" |
+| **C. Trace-level classifier, single pass** | Full trajectory, calibrated threshold, severity 3+ always human | 100% | 150 + about 328 low-confidence = about 478, over capacity | Good, by step |
+| **D. C plus a second pass on low-confidence items** | A different model reclassifies the 328 below threshold; only disagreements go to humans | 100% | 150 + about 131 = about 281, at an assumed 40% disagreement | Good, by step |
+
+### Decision
+Choose **D**, because it is the only option that covers every harmful item inside SME capacity:
+- **Severity is never left to confidence.** All 150 severity-3+ items go to humans, like the invented
+  "delivered" answers in the agent scenario.
+- **The second pass replaces most human reads.** Of about 328 low-confidence items, about 197 agree on
+  both passes and auto-route flagged "agreed, low confidence"; about 131 disagree and reach humans.
+- **The queue fits.** About 281 items is under the 300 available.
+- **Cost is trivial.** About 1,328 classifications a week is about $13.
+- **Trace-level input makes owners real.** Bad tool arguments go to the tool schema, unhandled errors to
+  the loop, legitimate escalations to nobody.
+
+What would change it:
+- **Disagreement above about 46%.** At 150 + 0.46 × 328 the queue reaches about 300, so raise the threshold
+  for the second pass or add reviewer time.
+- **Severity-3 share rising.** If it grows past the queue, the customer must fund more review, because
+  that rule is not relaxed.
+- **A few thousand stable labels.** Then a small trained classifier replaces the first pass and cuts cost.
+
+### Trade-offs accepted
+- **Agreed low-confidence labels are unverified.** Two models can agree and both be wrong. Watch their
+  error rate on the weekly random sample, reported separately from confident labels.
+- **The random sample is only 100 items.** Per-class recall for rare classes is noisy. Watch the
+  confidence intervals, and pool several weeks before correcting prevalence.
+- **Twice the model calls on a third of items.** Watch disagreement rate per model version, since a model
+  upgrade can shift it.
+- **Taxonomy drift.** Watch the "other" share and schedule open coding when it rises.
+
+### Review rubric
+- **Capacity arithmetic is shown.** The write-up computes queue size from volume, severity share and
+  confidence share, and compares it with reviewer hours.
+- **Severity overrides confidence.** It routes the top severities to humans regardless of score.
+- **The classifier sees the trace.** It lists the trajectory fields given to the classifier and how owners
+  follow from them.
+- **Calibration is measured.** It names the random sample, per-class precision and recall, and how the
+  threshold was set.
+- **Prevalence is corrected.** It distinguishes feedback rates from true rates and says how they are estimated.
+- **Reversal conditions are concrete.** It names the disagreement rate or volume that would change the design.
 
 ## Why it exists
 - **There is far more feedback than anyone can read.** Explicit signals are sparse and terse: a

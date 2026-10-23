@@ -5,7 +5,8 @@ name: Planning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -135,6 +136,25 @@ flowchart TD
     R -->|"yes: done steps plus failure history"| P
     R -->|"no"| X["Give up with plan and history"]
 ```
+
+## Misconceptions
+- **"A strong enough model does not need a plan; give it a bigger context."** Long contexts dilute
+  attention and each step still leans on the latest tool output. The drift is structural: nothing in a
+  greedy loop represents the whole task, so a compact plan with statuses fixes what context size cannot.
+- **"Planning up front is always better than ReAct."** Interleaved loops win in unpredictable
+  environments because every decision uses the freshest observation. Up-front plans and ReWOO placeholders
+  break when results surprise them; pick the cheapest placement that survives your failure cases.
+- **"The plan is done when every step has run."** Running is not finishing. Each step needs a `done_when`
+  written at planning time and checked, ideally by code (tests pass, a row exists), not by the model
+  judging its own executor's output.
+- **"When a step fails, replan immediately."** One failure is often transient, so retry once first. Two
+  failures suggest the plan's premise is wrong; then replan with the finished steps and failure history,
+  and cap replans (for example, three) so the agent does not plan forever.
+- **"The plan stays in the model's head once it is written."** Plans decay as they scroll out of
+  context. Re-inject the plan with statuses at the top of each turn or keep it in a todo file the agent
+  re-reads.
+- **"Tree search makes any agent smarter."** Search only pays off with a cheap, reliable evaluator such
+  as a test suite; without one it becomes expensive sampling.
 
 ## Examples
 ### Plan-then-execute with verification and bounded replanning

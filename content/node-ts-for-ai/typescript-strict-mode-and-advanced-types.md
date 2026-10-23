@@ -5,7 +5,8 @@ name: TypeScript strict mode & advanced types
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - node-ts-for-ai/runtime-schema-validation
@@ -34,6 +35,225 @@ and `unknown` they make contract mismatches fail at compile time, not mid-run.
   `any` and `as`, and the rule that tool arguments are `unknown` until parsed.
 - **What you can skip.** Writing deep conditional or template-literal types from memory. Know they exist
   for SDK wrappers and tool registries; spend your effort on unions, narrowing and the parse boundary.
+
+## Lab
+### Task
+Build the typed core of a tool-calling agent turn: a generic `defineTool` that ties each parser to its
+handler, an `unknown`-to-`StreamEvent` boundary written without `as`, and a `dispatch` that turns bad
+model arguments into error tool results instead of crashes. Time box: 45-75 minutes.
+- **Prerequisites:** this lesson's narrowing, generics and discriminated-union sections; the runtime
+  schema validation lesson is useful but not required.
+- **Setup:** an empty folder with `"type": "module"` in `package.json`, then
+  `npm i -D typescript vitest @types/node`. Checked with Node 24.21, TypeScript 7.0 and Vitest 5.0.
+- **tsconfig.json:** `"strict": true`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`,
+  `"module": "nodenext"`, `"noEmit": true`, `allowImportingTsExtensions`, `verbatimModuleSyntax`,
+  `erasableSyntaxOnly` and `"types": ["node"]`. The last three let Node 24 run `.ts` files directly.
+- **Save** the starter as `lab.ts` and the tests as `lab.test.ts`. The type tests run under `npx tsc --noEmit`,
+  the behaviour tests under `npx vitest run`.
+
+### Starter code
+```ts
+// Lab: a strictly typed tool registry and event boundary for an agent loop.
+// Run: node lab.ts   Check: npx tsc --noEmit && npx vitest run
+import { pathToFileURL } from "node:url";
+
+export type Usage = { inputTokens: number; outputTokens: number };
+export type StreamEvent =
+  | { type: "text_delta"; text: string }
+  | { type: "tool_call"; id: string; name: string; args: unknown }
+  | { type: "done"; usage: Usage };
+
+export type Tool<A, R> = { name: string; parse: (x: unknown) => A; run: (args: A) => Promise<R> };
+export type Runner = (rawArgs: unknown) => Promise<unknown>;
+export type ToolResult = { toolCallId: string; content: string; isError: boolean };
+
+// LAB 1: make defineTool generic so parse's output type must equal run's input type.
+// `any` lets a mismatched pair compile (the @ts-expect-error lines in the tests catch it).
+export function defineTool(spec: Tool<any, any>): Tool<any, any> {
+  return spec;
+}
+
+export function isRecord(x: unknown): x is Record<string, unknown> {
+  return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
+export const getWeather = defineTool({
+  name: "get_weather",
+  parse: (x) => {
+    if (!isRecord(x) || typeof x.city !== "string" || !x.city.trim()) throw new Error("city must be a non-empty string");
+    return { city: x.city };
+  },
+  run: async (args) => `Sunny in ${args.city}`,
+});
+
+export const lookupOrder = defineTool({
+  name: "lookup_order",
+  parse: (x) => {
+    if (!isRecord(x) || typeof x.orderId !== "string" || !/^ord_\d+$/.test(x.orderId)) {
+      throw new Error("orderId must be a string like ord_123");
+    }
+    return { orderId: x.orderId };
+  },
+  run: async (args) => ({ orderId: args.orderId, status: "shipped" }),
+});
+
+export function runnerOf<A, R>(tool: Tool<A, R>): Runner {
+  return async (raw) => tool.run(tool.parse(raw)); // the pair stays together; the map hides A
+}
+
+export const registry: ReadonlyMap<string, Runner> = new Map([
+  [getWeather.name, runnerOf(getWeather)],
+  [lookupOrder.name, runnerOf(lookupOrder)],
+]);
+
+// LAB 2: narrow an unknown wire value into a StreamEvent without `as`. Check every field the
+// variant claims; throw Error(`bad event: ${JSON.stringify(x)}`) for anything else.
+export function parseEvent(x: unknown): StreamEvent {
+  throw new Error("not implemented: lab step 2 (parseEvent)");
+}
+
+// LAB 3: run one tool call and never throw. Unknown tool -> content `unknown tool <name>`;
+// a parse or run error -> its message; success -> the value (JSON.stringify unless a string).
+export async function dispatch(tools: ReadonlyMap<string, Runner>, call: { id: string; name: string; args: unknown }): Promise<ToolResult> {
+  throw new Error("not implemented: lab step 3 (dispatch)");
+}
+
+export function assertNever(x: never): never {
+  throw new Error(`unhandled event: ${JSON.stringify(x)}`);
+}
+
+export async function runTurn(wire: unknown[], tools: ReadonlyMap<string, Runner>) {
+  let text = "";
+  const results: ToolResult[] = [];
+  let usage: Usage | undefined;
+  for (const raw of wire) {
+    const ev = parseEvent(raw);
+    switch (ev.type) {
+      case "text_delta": text += ev.text; break;
+      case "tool_call": results.push(await dispatch(tools, ev)); break;
+      case "done": usage = ev.usage; break;
+      default: assertNever(ev); // compile error the day a variant is added and not handled
+    }
+  }
+  return { text, results, usage };
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  const wire: unknown[] = JSON.parse(`[
+    {"type":"text_delta","text":"Checking "},
+    {"type":"text_delta","text":"that for you."},
+    {"type":"tool_call","id":"c1","name":"get_weather","args":{"city":"Oslo"}},
+    {"type":"tool_call","id":"c2","name":"lookup_order","args":{"orderId":42}},
+    {"type":"tool_call","id":"c3","name":"send_email","args":{}},
+    {"type":"done","usage":{"inputTokens":812,"outputTokens":64}}
+  ]`);
+  try {
+    const out = await runTurn(wire, registry);
+    console.log("text:", out.text);
+    for (const r of out.results) console.log(r.toolCallId, r.isError ? "error" : "ok", r.content);
+    console.log("usage:", out.usage?.outputTokens);
+  } catch (e) {
+    console.log(e instanceof Error ? e.message : e);
+  }
+}
+```
+
+### Expected output
+`node lab.ts` with a correct solution prints:
+
+```
+text: Checking that for you.
+c1 ok Sunny in Oslo
+c2 error orderId must be a string like ord_123
+c3 error unknown tool send_email
+usage: 64
+```
+
+The starter prints `not implemented: lab step 2 (parseEvent)`, and `npx tsc --noEmit` reports two
+`Unused '@ts-expect-error' directive` errors, because `any` lets the mismatched tool compile.
+
+### Tests
+```ts
+import { describe, expect, test } from "vitest";
+import { defineTool, dispatch, getWeather, parseEvent, registry, runTurn } from "./lab.ts";
+
+describe("types (checked by npx tsc --noEmit)", () => {
+  test("a mismatched parse/run pair and wrong args do not compile", () => {
+    const typeOnly = () => {
+      // @ts-expect-error run expects { orderId } but parse produces { city }
+      defineTool({ name: "bad", parse: () => ({ city: "x" }), run: async (a: { orderId: string }) => a.orderId });
+      // @ts-expect-error get_weather takes { city: string }
+      void getWeather.run({ town: "Oslo" });
+    };
+    expect(typeof typeOnly).toBe("function"); // never called: these lines exist for tsc
+  });
+});
+
+describe("parseEvent", () => {
+  test("accepts each valid variant", () => {
+    expect(parseEvent({ type: "text_delta", text: "hi" })).toEqual({ type: "text_delta", text: "hi" });
+    expect(parseEvent({ type: "tool_call", id: "c1", name: "get_weather", args: { city: "Oslo" } }).type).toBe("tool_call");
+    expect(parseEvent({ type: "done", usage: { inputTokens: 1, outputTokens: 2 } }).type).toBe("done");
+  });
+  test("rejects unknown variants and missing fields", () => {
+    expect(() => parseEvent({ type: "citation", url: "x" })).toThrow(/bad event/);
+    expect(() => parseEvent({ type: "text_delta" })).toThrow(/bad event/);
+    expect(() => parseEvent({ type: "done", usage: { inputTokens: "1", outputTokens: 2 } })).toThrow(/bad event/);
+    expect(() => parseEvent(null)).toThrow(/bad event/);
+  });
+});
+
+describe("dispatch", () => {
+  test("bad arguments and unknown tools become error results, not crashes", async () => {
+    expect(await dispatch(registry, { id: "a", name: "get_weather", args: { city: "Oslo" } }))
+      .toEqual({ toolCallId: "a", content: "Sunny in Oslo", isError: false });
+    expect(await dispatch(registry, { id: "b", name: "lookup_order", args: { orderId: 42 } }))
+      .toEqual({ toolCallId: "b", content: "orderId must be a string like ord_123", isError: true });
+    expect(await dispatch(registry, { id: "c", name: "send_email", args: {} }))
+      .toEqual({ toolCallId: "c", content: "unknown tool send_email", isError: true });
+  });
+  test("non-string results are JSON", async () => {
+    const r = await dispatch(registry, { id: "d", name: "lookup_order", args: { orderId: "ord_7" } });
+    expect(JSON.parse(r.content)).toEqual({ orderId: "ord_7", status: "shipped" });
+  });
+});
+
+test("a full turn survives a malformed tool call", async () => {
+  const out = await runTurn([
+    { type: "text_delta", text: "ok" },
+    { type: "tool_call", id: "x", name: "get_weather", args: {} },
+    { type: "done", usage: { inputTokens: 5, outputTokens: 1 } },
+  ], registry);
+  expect(out.text).toBe("ok");
+  expect(out.results[0]?.isError).toBe(true);
+  expect(out.usage?.outputTokens).toBe(1);
+});
+```
+
+On the starter, five Vitest tests fail with `not implemented` (or the wrong error message) and `tsc` fails
+on the two unused directives. A correct solution passes `tsc --noEmit` with zero errors and all six tests.
+
+### Failure scenarios
+- **Write `parseEvent` as `return x as StreamEvent`.** Everything compiles, but the `citation` and missing-
+  `text` tests fail, and in a real loop the `default` branch throws `unhandled event` mid-run. Debug by
+  grepping for ` as ` in boundary code: a cast is the one place the compiler stopped checking.
+- **Store tools as `Map<string, Tool<unknown, unknown>>`.** Under `strictFunctionTypes` a
+  `Tool<{ city: string }, string>` does not fit, because its `run` cannot accept `unknown`. Reaching for
+  `as` breaks the guarantee; `runnerOf` closes over each pair instead, so the map never sees `A`.
+- **Let `dispatch` rethrow parse errors.** The malformed `lookup_order` call kills the whole turn and the
+  other results are lost. The full-turn test fails; fix by returning the message as an error result.
+- **Guard checks less than it claims** (only `typeof x.usage === "object"`). The string `inputTokens`
+  test fails; reading `usage.inputTokens + 1` later would concatenate strings.
+
+### Submission
+- **Your `lab.ts`** with all three LAB steps done and no `any` or `as` left, apart from the starter's
+  provided helpers.
+- **A clean `npx tsc --noEmit`** run (zero errors, so both `@ts-expect-error` lines are used).
+- **The `npx vitest run` output** showing six passing tests.
+- **One added variant:** add `{ type: "error"; message: string }` to `StreamEvent`, paste the compile error
+  `tsc` gives in `runTurn`, then handle it.
+- **A short note** (3-5 sentences) on why `runnerOf` is type-safe without a cast.
+- **Evaluated on:** tests and `tsc` passing, no casts at the boundary, and a correct explanation in the note.
 
 ## Why it exists
 - **Agent services are glue between shapeless data.** JSON from a model, tool-call arguments the model

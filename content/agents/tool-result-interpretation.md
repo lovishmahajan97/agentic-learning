@@ -5,7 +5,8 @@ name: Tool-result interpretation
 kind: concept
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -137,6 +138,25 @@ flowchart TD
     R --> M["Model reads"]
     M --> G["Harness gate before consequential action"]
 ```
+
+## Misconceptions
+- **"An empty list clearly means nothing was found."** `[]` after a timeout looks identical to `[]` after a
+  real search, and the model states the false negative as fact. Return `"status": "empty"` for a search
+  that ran, and `is_error: true` for one that did not.
+- **"Putting the error message in the content is enough."** Without `is_error`, an error is just text the
+  model may narrate as the answer or ignore. The flag is the trained signal to recover; a 200 response
+  whose body says "unauthorized" still needs it.
+- **"Return the full payload so the model has everything."** Every extra field is tokens and a chance to
+  quote a sibling field by mistake, and raw payloads drive transcript growth. Project the task's fields,
+  cap the size, say when you truncated, and offer a handle for the rest.
+- **"Labelling retrieved content stops prompt injection."** The model cannot reliably separate retrieved
+  text from instructions, so labels lower the success rate without removing it. The defence that holds
+  is in the harness: least privilege and approval for consequential actions after an untrusted read.
+- **"After a write, the model knows the new state."** It still holds the read it made before the write
+  and will answer from it. Write tools should return the record as stored.
+- **"Old results can be cleared freely to save context."** Clearing rewrites history and invalidates the
+  prompt cache from the first edited block, and it can blind later reasoning. Clear in batches at a
+  threshold and keep a one-line summary or reference.
 
 ## Examples
 ### A result normalizer

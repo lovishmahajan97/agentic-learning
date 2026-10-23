@@ -5,7 +5,8 @@ name: Hypercare
 kind: practice
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes

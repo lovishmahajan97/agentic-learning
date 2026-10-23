@@ -39,6 +39,184 @@ them, writes verdicts back onto spans and visualises embeddings.
 - **What you can skip.** UMAP internals and drift monitoring unless retrieval quality is your problem.
   Know the ingestion path and how an evaluation joins back to a span id.
 
+## Lab
+### Task
+Build the evaluation job that puts hallucination labels on a RAG agent's spans, and fix the three bugs
+that made last week's dashboard read 0%. Time box: 45-60 minutes. Prerequisites: OpenTelemetry and
+Hallucination evaluation, plus the join example in this lesson.
+- **Join:** one row per agent run, keyed by the root span id, with the same trace's documents as reference.
+- **Rails:** snap judge text to `factual` or `hallucinated`, else `NOT_PARSABLE`.
+- **No empty references:** a run whose retriever found nothing is skipped and listed, never judged.
+
+### Starter code
+Save as `lab_phoenix.py`. Needs `pip install opentelemetry-sdk pytest` (checked with opentelemetry-sdk
+1.45.1, pytest 9.1.1, Python 3.12). The spans are real OTel spans with OpenInference attribute names; an
+in-memory exporter stands in for the Phoenix server, and `JUDGE` holds recorded judge outputs instead of
+a paid judge model.
+
+```python
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+KIND = "openinference.span.kind"                      # OpenInference attribute names, as plain strings
+EXPORTER = InMemorySpanExporter()                     # stands in for OTLP to a Phoenix server
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(EXPORTER))
+tracer = provider.get_tracer("support-agent")
+
+KB = {"password": "Reset your password under Settings > Security > Reset password.",
+      "refund": "Refunds are available within 14 days of purchase.",
+      "export": "Export your data from Settings > Data > Export as CSV."}
+RUNS = [("How do I reset my password?", "password", "Go to Settings > Security > Reset password."),
+        ("Can I get a refund after 30 days?", "refund", "Yes, refunds are available for 60 days."),
+        ("Do you support SSO?", None, "Yes, we support SAML and OIDC."),          # retrieval found nothing
+        ("How do I export my data?", "export", "Use Settings > Data > Export as CSV.")]
+# Recorded judge outputs (a real judge model would produce these from a hallucination template).
+JUDGE = {"How do I reset my password?": "factual",
+         "Can I get a refund after 30 days?": "Hallucinated.",
+         "Do you support SSO?": "factual",
+         "How do I export my data?": "The answer is factual, not hallucinated."}
+RAILS = ["factual", "hallucinated"]
+
+def run_agent(question: str, topic, answer: str) -> None:
+    with tracer.start_as_current_span("support.agent") as agent:
+        agent.set_attributes({KIND: "AGENT", "input.value": question})
+        with tracer.start_as_current_span("retrieve") as r:
+            r.set_attributes({KIND: "RETRIEVER", "input.value": question})
+            for i, doc in enumerate([KB[topic]] if topic else []):        # flattened document list
+                r.set_attribute(f"retrieval.documents.{i}.document.content", doc)
+        with tracer.start_as_current_span("llm") as llm:
+            llm.set_attributes({KIND: "LLM", "output.value": answer})
+        agent.set_attribute("output.value", answer)
+
+def qa_with_reference(spans) -> dict:
+    """One row per answered agent run: input, output, and the retrieved documents of the same trace."""
+    docs: dict = {}
+    for s in spans:
+        if s.attributes.get(KIND) == "RETRIEVER":
+            n = sum(1 for k in s.attributes if k.startswith("retrieval.documents."))
+            docs.setdefault(s.context.trace_id, []).extend(
+                s.attributes[f"retrieval.documents.{i}.document.content"] for i in range(n))
+    rows = {}
+    for s in spans:
+        if s.parent is None and s.attributes.get(KIND) == "AGENT":
+            # BUG: keyed by trace id, so write-back cannot land on the span that was judged.
+            # YOUR CODE 1: key each row by the root span's id as 16 hex characters.
+            rows[f"{s.context.trace_id:032x}"] = {
+                "input": s.attributes["input.value"], "output": s.attributes["output.value"],
+                "reference": "\n".join(docs.get(s.context.trace_id, []))}
+    return rows
+
+def snap_to_rails(raw: str, rails: list) -> str:
+    # BUG: free text is kept as the label, so "Hallucinated." never counts as hallucinated.
+    # YOUR CODE 2: case-insensitive; exactly one rail in the text -> that rail, else "NOT_PARSABLE".
+    return raw.strip().lower()
+
+def span_evaluations(rows: dict, judge) -> tuple:
+    """Returns ({span_id: label}, [questions skipped for lack of a reference])."""
+    evals, skipped = {}, []
+    for span_id, row in rows.items():
+        # BUG: a run with no retrieved documents is graded against nothing and comes back "factual".
+        # YOUR CODE 3: skip rows with an empty reference (record the question) and never call the judge.
+        evals[span_id] = snap_to_rails(judge(row), RAILS)
+    return evals, skipped
+
+def hallucination_rate(evals: dict) -> tuple:
+    labels = [v for v in evals.values() if v in RAILS]
+    return (labels.count("hallucinated") / len(labels) if labels else 0.0), len(labels)
+
+if __name__ == "__main__":
+    for run in RUNS:
+        run_agent(*run)
+    spans = EXPORTER.get_finished_spans()
+    rows = qa_with_reference(spans)
+    evals, skipped = span_evaluations(rows, lambda row: JUDGE[row["input"]])
+    for span_id, label in evals.items():
+        print(f"{rows[span_id]['input']} -> {label}")
+    print("skipped, no reference:", skipped)
+    rate, n = hallucination_rate(evals)
+    print(f"judged hallucination rate: {rate:.1%} of {n} parseable")
+    roots = {f"{s.context.span_id:016x}" for s in spans if s.parent is None}
+    print("keys are root span ids:", set(rows) == roots)
+```
+
+The starter prints `judged hallucination rate: 0.0% of 2 parseable` and `keys are root span ids: False`:
+the refund answer's `hallucinated.` label is not a rail, and the SSO run was "factual" against nothing.
+
+### Expected output
+With a correct solution, `python lab_phoenix.py` prints:
+
+```
+How do I reset my password? -> factual
+Can I get a refund after 30 days? -> hallucinated
+How do I export my data? -> NOT_PARSABLE
+skipped, no reference: ['Do you support SSO?']
+judged hallucination rate: 50.0% of 2 parseable
+keys are root span ids: True
+```
+
+### Tests
+Save as `test_lab_phoenix.py` and run `pytest -q`. On the starter all seven fail: the row keys are
+32-hex trace ids, every rail case returns lowercased free text, nothing is skipped, and the rate is 0.0.
+
+```python
+import pytest
+from lab_phoenix import (EXPORTER, JUDGE, RAILS, RUNS, hallucination_rate, qa_with_reference,
+                         run_agent, snap_to_rails, span_evaluations)
+
+@pytest.fixture
+def spans():
+    EXPORTER.clear()
+    for run in RUNS:
+        run_agent(*run)
+    return EXPORTER.get_finished_spans()
+
+def test_rows_are_keyed_by_root_span_id(spans):
+    rows = qa_with_reference(spans)
+    roots = {f"{s.context.span_id:016x}": s for s in spans if s.parent is None}
+    assert set(rows) == set(roots)
+    for span_id, row in rows.items():
+        assert row["input"] == roots[span_id].attributes["input.value"]
+
+@pytest.mark.parametrize("raw, label", [("Factual: it matches", "factual"),
+                                        ("Hallucinated.", "hallucinated"),
+                                        ("The answer is factual, not hallucinated.", "NOT_PARSABLE"),
+                                        ("I cannot tell", "NOT_PARSABLE")])
+def test_snap_to_rails(raw, label):
+    assert snap_to_rails(raw, RAILS) == label
+
+def test_empty_reference_is_skipped_not_judged(spans):
+    asked = []
+    def judge(row):
+        asked.append(row["input"])
+        return JUDGE[row["input"]]
+    evals, skipped = span_evaluations(qa_with_reference(spans), judge)
+    assert skipped == ["Do you support SSO?"]
+    assert "Do you support SSO?" not in asked and len(evals) == 3
+
+def test_rate_counts_only_parseable_labels(spans):
+    evals, _ = span_evaluations(qa_with_reference(spans), lambda row: JUDGE[row["input"]])
+    assert hallucination_rate(evals) == (0.5, 2)
+```
+
+### Failure scenarios
+- **Count `NOT_PARSABLE` as factual.** The rate drops to 1 in 3 (33.3%) and looks better than it is. Debug:
+  report the parseable count next to the rate, and read the explanations of unparseable rows.
+- **Return the first rail found.** `The answer is factual, not hallucinated.` becomes `factual`, so a
+  confused verdict is counted as a clean one. Debug: the parametrized case with both rails catches it.
+- **Join documents across the whole export.** Every row gets every document, so a wrong answer looks
+  supported. Debug: assert each reference comes from retriever spans with the row's own `trace_id`.
+- **Judge with the generator model.** Labels drift toward `factual`. Debug: hand-label 10 rows and compare
+  with the judge before trusting the rate.
+
+### Submission
+- `lab_phoenix.py` and a `pytest -q` run showing 7 passed.
+- The six printed lines, matching the expected output exactly.
+- One sentence on what the skipped SSO run tells you about the corpus, not the model.
+- The write-back call you would make against a real Phoenix server, and the version you checked it on.
+- A reviewer checks that no row with an empty reference can reach the judge.
+
 ## Why it exists
 - **RAG debugging needs three answers per request:** which chunks were retrieved, were they relevant, and did
   the answer stay inside them. That needs traces carrying the documents and messages plus a quality judgement

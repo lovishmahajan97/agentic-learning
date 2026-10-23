@@ -5,7 +5,8 @@ name: SSO / IAM integration (Okta, Entra ID)
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - enterprise-integration/saml-sso
@@ -39,6 +40,69 @@ deprovisioning and delegated tokens per downstream tool call.
   never handing the agent a shared god-mode credential.
 - **What you can skip.** Implementing OIDC yourself or memorising every claim. Use a maintained library;
   know the five validation checks, the Entra `tid` hole, groups overage and delegation flows.
+
+## Decision case
+### Scenario
+A startup sells a multi-tenant agent that reads a user's Microsoft 365 and Jira data, answers questions,
+and runs nightly "summarize my week" tasks. Three customers are signing: two on Entra ID, one on Okta,
+4,000 users in total. You must decide how the agent's tool calls authenticate and how leavers lose
+access. Figures are illustrative.
+- **Security questionnaire:** a leaver loses all access, including scheduled agent work, within 1 hour of
+  being disabled in the IdP; every downstream action is attributable to a person.
+- **Agent behaviour:** about 1,500 nightly tasks run with no browser open; interactive sessions last up to
+  8 hours.
+- **IdP facts:** both Entra customers will enable SCIM; measured delivery of a deactivation is about 40
+  minutes; downstream access tokens live about 60 minutes.
+- **Team and deadline:** 2 engineers, 6 weeks to the first go-live.
+- **Non-negotiable in every option:** per-tenant `iss` and `tid` checks and users keyed by `tid` plus `oid`
+  or issuer plus `sub`.
+
+### Options
+| Option | How tools authenticate | Leaver exposure (worst case) | Per-person audit | Fits 6 weeks |
+|---|---|---|---|---|
+| Shared service account, JIT, 7-day sessions | one app credential per tenant for every tool | up to 7 days in the app; nightly tasks never stop | no, one bot account | easily |
+| Delegated tokens, JIT, 8-hour sessions | on-behalf-of or token exchange per tool call | 8 hours of app session; stored refresh tokens keep tasks alive | yes | yes |
+| Delegated tokens plus SCIM revocation | as above; SCIM `active: false` kills sessions, cancels tasks, drops tokens | about 40 minutes | yes | yes, one more endpoint |
+| Per-tenant service account with app-side ACLs | app credential plus your own copy of permissions | ACL sync lag plus session length | partly, in your own logs | no: replicating permissions is the long pole |
+
+Exposure arithmetic for the third option: deactivation arrives in about 40 minutes, the handler revokes
+sessions and refresh tokens and deletes cached downstream tokens, so nothing survives past 40 minutes. If
+the handler kept cached access tokens, worst case would be 40 + 60 = 100 minutes, over the 1-hour limit.
+
+### Decision
+**Delegated tokens per tool call, plus SCIM deactivation that revokes sessions, cancels scheduled agent
+tasks, and deletes stored refresh and cached access tokens.** It is the only option that meets both the
+1-hour leaver rule (about 40 minutes) and per-person audit within 6 weeks.
+- **Why not the service account:** it fails audit, lets the agent exceed the user's permissions, and
+  leaves nightly tasks running for leavers.
+- **Why not delegation without SCIM:** IdP disablement stops new token exchanges, but the app's own
+  8-hour session and stored task state outlive it.
+- **Why not app-side ACLs:** it rebuilds Microsoft 365 and Jira permissions the sources already enforce.
+- **Okta customer:** if they cannot enable SCIM for go-live, cap their sessions at 1 hour and check the
+  user is active before every nightly task.
+
+**What would change it.** A job with no user behind it (tenant-wide indexing) can use an app credential
+with narrow scopes. If customers accept a 24-hour leaver rule, JIT with short sessions is enough for a pilot.
+
+### Trade-offs accepted
+- **Exchange failures become user-visible.** Missing consent, MFA step-up or disabled users fail the tool
+  call with a clear error and never fall back to an app token. Monitor exchange failures by error code.
+- **Another endpoint per IdP.** SCIM quirks differ between Entra and Okta; a monthly canary deactivation
+  measures time to loss of access against the 1-hour target.
+- **Shorter sessions for one tenant.** More re-logins for the Okta customer until SCIM is on; track login
+  success rate per tenant.
+- **Token storage is sensitive.** Refresh tokens for 1,500 nightly tasks are encrypted at rest and never
+  placed in prompts; alert on any token pattern found in traces.
+
+### Review rubric
+- **Exposure as a number:** worst-case leaver access computed from delivery time, session length and token
+  lifetimes, and compared with the stated limit.
+- **Background work covered:** scheduled tasks and stored refresh tokens are part of deprovisioning.
+- **Delegation explicit:** names on-behalf-of or token exchange per tool call and forbids silent fallback
+  to app credentials.
+- **Tenant binding stated:** issuer and tenant checks and a stable user key, with a negative test.
+- **Fallback per customer:** what happens for a tenant that cannot enable SCIM by the deadline.
+- **Monitoring named:** canary deactivation, exchange failures and per-tenant login success.
 
 ## Why it exists
 - **Enterprises run identity centrally.** Thousands of employees join, move and leave. Security enforces

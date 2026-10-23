@@ -5,7 +5,8 @@ name: API & SDK integration
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/openai-sdk
@@ -41,6 +42,218 @@ observability, because SDK defaults ignore your run budget.
   breaker with a fallback model.
 - **What you can skip.** Writing your own HTTP client or SSE parser. Know the timeout phases, the error
   classes and the `a·t + S` arithmetic.
+
+## Lab
+### Task
+Turn a naive provider call into an adapter an agent loop can trust. The starter retries every error
+including 400s, mints a new idempotency key on each attempt, ignores `Retry-After` and has no total
+deadline, so a hung provider holds the step for as long as it likes.
+
+You will add the error taxonomy, one retry policy inside one deadline, and the mapping from failures to
+tool results. Time box: 60-90 minutes.
+- **Prerequisites:** this lesson's How it works (error classes, timeouts, retries and budgets), and the
+  Python lesson's lab for asyncio basics.
+- **Setup:** Python 3.12 (for `asyncio.timeout_at`) with `pip install httpx pytest` (checked on httpx
+  0.28, pytest 9.1). The provider is a local `httpx.MockTransport` fake: no network, no API key. Save
+  the starter as `lab_adapter.py` and the tests as `test_lab_adapter.py`.
+- **Done:** `python lab_adapter.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: a vendor adapter an agent can trust (checked on Python 3.12, httpx 0.28)."""
+import asyncio, random, time, uuid
+import httpx
+
+
+class RetryableError(Exception):
+    def __init__(self, msg: str, retry_after: float | None = None):
+        super().__init__(msg)
+        self.retry_after = retry_after
+
+
+class TerminalError(Exception): ...
+class StopRun(Exception): ...                      # credentials or policy: a human must act
+
+
+def classify(r: httpx.Response) -> None:
+    """LAB 1: return on status < 400. Raise RetryableError for 429 and 5xx, carrying the
+    Retry-After seconds when the header is a number. Raise TerminalError("HTTP <code>: <body[:200]>")
+    for every other 4xx."""
+    r.raise_for_status()                           # BUG: one exception type for every failure
+
+
+async def complete(client: httpx.AsyncClient, payload: dict, idem_key: str,
+                   attempts: int = 3, budget_s: float = 5.0, base_s: float = 0.05) -> dict:
+    """LAB 2: retry only RetryableError, httpx.TimeoutException and httpx.TransportError.
+    Sleep the Retry-After hint, else full jitter random.uniform(0, min(1.0, base_s * 2**n)).
+    Send the SAME Idempotency-Key on every attempt. If the next sleep would pass the deadline,
+    re-raise instead of sleeping. Raise TimeoutError once budget_s has elapsed in total."""
+    last: Exception | None = None
+    for n in range(attempts):
+        try:
+            r = await client.post("/v1/complete", json=payload,
+                                  headers={"Idempotency-Key": str(uuid.uuid4())})  # BUG: new key each try
+            classify(r)
+            return r.json()
+        except Exception as e:                     # BUG: retries 4xx too, no backoff, no deadline
+            last = e
+    raise last
+
+
+async def run_tool(client: httpx.AsyncClient, args: dict, run_id: str, step: int,
+                   budget_s: float = 5.0) -> dict:
+    """LAB 3: decide what the model sees. Success -> {"ok": body}. 401/403 -> raise StopRun(msg).
+    Any other TerminalError -> {"error": msg}. Retries exhausted or TimeoutError ->
+    {"error": "lookup unavailable; try another approach"}."""
+    return {"ok": await complete(client, args, idem_key=f"{run_id}:{step}", budget_s=budget_s)}
+
+
+# ---- a scripted fake provider: no network, no API key ---------------------------------------
+def fake_provider(script: list) -> tuple[httpx.AsyncClient, list[str]]:
+    """Each item is an httpx.Response to return, or a number of seconds to hang."""
+    keys: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        keys.append(request.headers.get("idempotency-key", ""))
+        item = script[min(len(keys), len(script)) - 1]
+        if isinstance(item, (int, float)):
+            await asyncio.sleep(item)              # a provider that accepted the call and went quiet
+            return httpx.Response(200, json={"text": "too late"})
+        return item
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://llm.test")
+    return client, keys
+
+
+OK = httpx.Response(200, json={"text": "Refunds take 5 days."})
+SCENARIOS = {
+    "flaky 503, 503, 200": ([httpx.Response(503), httpx.Response(503), OK], 5.0),
+    "bad request 422": ([httpx.Response(422, json={"detail": "max_tokens must be <= 4096"})], 5.0),
+    "auth 401": ([httpx.Response(401, text="invalid key")], 5.0),
+    "rate limited, Retry-After 30": ([httpx.Response(429, headers={"retry-after": "30"})], 5.0),
+    "hung upstream": ([3], 1.0),
+}
+
+
+async def main() -> None:
+    for name, (script, budget) in SCENARIOS.items():
+        client, keys = fake_provider(script)
+        start = time.perf_counter()
+        try:
+            out = await run_tool(client, {"prompt": "refund policy?"}, "run_7", 3, budget_s=budget)
+        except StopRun as e:
+            out = f"StopRun: {e}"
+        except Exception as e:
+            out = f"raised {type(e).__name__}"
+        print(f"{name} -> {out} | attempts={len(keys)} keys={len(set(keys))} "
+              f"t={time.perf_counter() - start:.1f}s")
+        await client.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+As given, the 422, 401 and 429 cases each print `raised HTTPStatusError | attempts=3 keys=3`, the flaky
+case succeeds with `keys=3` (three different keys for one logical call), and the hung upstream returns
+`too late` after `t=3.0s` despite its 1-second budget.
+
+### Expected output
+```
+flaky 503, 503, 200 -> {'ok': {'text': 'Refunds take 5 days.'}} | attempts=3 keys=1 t=0.0s
+bad request 422 -> {'error': 'HTTP 422: {"detail":"max_tokens must be <= 4096"}'} | attempts=1 keys=1 t=0.0s
+auth 401 -> StopRun: HTTP 401: invalid key | attempts=1 keys=1 t=0.0s
+rate limited, Retry-After 30 -> {'error': 'lookup unavailable; try another approach'} | attempts=1 keys=1 t=0.0s
+hung upstream -> {'error': 'lookup unavailable; try another approach'} | attempts=1 keys=1 t=1.0s
+```
+
+### Tests
+```python
+import asyncio, time
+import httpx
+import pytest
+import lab_adapter as lab
+
+R = httpx.Response
+OK = R(200, json={"text": "ok"})
+
+
+def run(script, budget=5.0):
+    async def go():
+        client, keys = lab.fake_provider(script)
+        start = time.perf_counter()
+        try:
+            out = await lab.run_tool(client, {"prompt": "p"}, "run_1", 2, budget_s=budget)
+        finally:
+            await client.aclose()
+        return out, keys, time.perf_counter() - start
+    return asyncio.run(go())
+
+
+def test_classify_splits_retryable_from_terminal():
+    with pytest.raises(lab.RetryableError) as e:
+        lab.classify(R(429, headers={"retry-after": "7"}))
+    assert e.value.retry_after == 7.0
+    with pytest.raises(lab.RetryableError):
+        lab.classify(R(503))
+    with pytest.raises(lab.TerminalError, match="HTTP 422: bad field"):
+        lab.classify(R(422, text="bad field"))
+
+
+def test_transient_failures_retry_with_one_idempotency_key():
+    out, keys, _ = run([R(503), R(502), OK])
+    assert out == {"ok": {"text": "ok"}}
+    assert len(keys) == 3 and set(keys) == {"run_1:2"}
+
+
+def test_terminal_errors_are_not_retried_and_reach_the_model():
+    out, keys, _ = run([R(422, text="max_tokens must be <= 4096")])
+    assert out == {"error": "HTTP 422: max_tokens must be <= 4096"} and len(keys) == 1
+
+
+def test_auth_errors_stop_the_run():
+    with pytest.raises(lab.StopRun, match="HTTP 401"):
+        run([R(401, text="invalid key")])
+
+
+def test_retry_after_past_the_deadline_fails_fast():
+    out, keys, elapsed = run([R(429, headers={"retry-after": "30"})], budget=2.0)
+    assert out == {"error": "lookup unavailable; try another approach"}
+    assert len(keys) == 1 and elapsed < 0.5
+
+
+def test_total_deadline_bounds_a_hung_provider():
+    out, keys, elapsed = run([3], budget=1.0)
+    assert out == {"error": "lookup unavailable; try another approach"}
+    assert 0.9 < elapsed < 1.5, f"took {elapsed:.2f} s; the 1 s budget must cap it"
+```
+
+On the starter all six fail: `raise_for_status` refuses a bare response (`RuntimeError`, so nothing is
+classified), the flaky call sends three different keys, the 422, 401 and 429 cases surface as
+`httpx.HTTPStatusError` after three attempts, and the hung provider answers after 3 s.
+
+### Failure scenarios
+- **Inject: keep `except Exception` in `complete`.** Observe: the 422 test shows 3 attempts; in
+  production every bad tool argument costs three calls before the model sees the error. Debug: log
+  attempt count with status per call and alert when 4xx responses have attempts above 1.
+- **Inject: build the key with `uuid4()` inside the loop.** Observe: `keys=3` for one logical call, so a
+  provider or payment API that timed out after acting runs it again. Debug: group upstream logs by
+  idempotency key and run id plus step; one step should map to one key.
+- **Inject: sleep the `Retry-After` hint without checking the deadline.** Observe: the 429 test takes
+  2.0 s and ends in `TimeoutError` instead of failing at once. Debug: log the chosen delay next to the
+  remaining budget; a delay larger than the budget should never be slept.
+- **Inject: return 401 as `{"error": ...}`.** Observe: the auth test fails; in a live run the model
+  retries with invented credentials or loops. Debug: count tool results by status class per run, and
+  page on any 401 or 403 reaching the model.
+
+### Submission
+- **Code:** `lab_adapter.py` with LAB 1-3 done, retries in exactly this layer and nowhere else.
+- **Test run:** `pytest -q` showing 6 passed, plus the script output matching Expected output.
+- **A call log:** one line per attempt for the flaky scenario with status, attempt number, key and
+  elapsed time, as you would ship it to tracing.
+- **A short note (3-5 sentences):** how you would set the real SDK client (`max_retries=0`, explicit
+  `timeout`) so its retries do not multiply yours, using the `a·t + S` arithmetic.
+- **Evaluation:** tests pass, worst-case latency is bounded by the budget, and no 4xx is retried.
 
 ## Why it exists
 - **Every remote system misbehaves on schedule.** A model provider, vector database, CRM or payment

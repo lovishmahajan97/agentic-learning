@@ -5,7 +5,8 @@ name: Tool privilege escalation
 kind: concept
 difficulty: core
 est_minutes: 17
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -154,6 +155,26 @@ flowchart TD
     H --> T
     T --> L[("Audit log: principal, args, source")]
 ```
+
+## Misconceptions
+- **"A good system prompt keeps the model from misusing its tools."** Instructions and injected data
+  are the same kind of text to the model, so a rule like "never email outside the company" is a
+  probability, not a boundary. The boundary is authorization code in the dispatcher the model cannot see.
+- **"Giving the agent its own service account is least privilege."** The orchestrator's identity is
+  just a static credential with a new label: every caller gets its full authority. Least privilege
+  means each call runs with the requester's delegated, attenuated scopes.
+- **"If the user has the scope, the call is authorized."** Scope checks stop vertical moves only.
+  "Read orders" passes for order 88213 even when it belongs to someone else; horizontal escalation
+  needs a per-object ownership check on the structured argument.
+- **"Reviewing each tool call on its own is enough."** The attack is often a composition: read a
+  private file, then POST to a URL, each harmless alone. Break the chain with taint-based restriction
+  (no egress after untrusted content) instead of judging calls in isolation.
+- **"Tool descriptions from an MCP server are configuration, so they are trusted."** They are
+  model-visible text written by someone else and can carry instructions. Pin and hash manifests at
+  review time and re-review on change.
+- **"Sub-agents can use their own identity because the orchestrator already checked."** One hop in,
+  the principal is lost and the callee's broader tools become an escalation ladder. Pass the original
+  principal and a subset of its scopes along every hand-off.
 
 ## Examples
 ### A tool registry that authorizes outside the model

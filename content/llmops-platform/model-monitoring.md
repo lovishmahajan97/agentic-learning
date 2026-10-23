@@ -5,7 +5,8 @@ name: Model monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - llmops-platform/drift
@@ -39,6 +40,66 @@ over live traffic, sliced by version and tenant, so silent regressions become al
   tags on every span.
 - **What you can skip.** Classic ML label-drift dashboards for tabular models; for agents, task-level
   proxies and sampled judging do most of the work.
+
+## Decision case
+### Scenario
+A B2B platform runs one RAG support agent for 40 tenants and must choose how to sample its online
+groundedness judge. All figures are illustrative.
+- **Traffic:** 100,000 runs a day. Four large tenants run 15,000 a day each (60,000); 36 small tenants
+  share the other 40,000, between 300 and 4,000 runs a day each.
+- **Judge:** about $0.01 per judged run; groundedness scores have sd ≈ 0.8.
+- **Constraints:**
+  - online-judge spend at most $1,000 a month (30 days);
+  - detect a 0.4-point groundedness drop for **every** tenant within one day, because contracts
+    promise per-tenant quality reviews;
+  - at most a couple of false pages a week, or on-call mutes the channel;
+  - proxies (steps per task, search-call rate, citation presence) already run on 100% of traffic.
+- **Detection floor:** a daily drop is detectable when it exceeds 2 standard errors of the difference,
+  2 × √(2 × 0.64 / n). That reaches 0.4 at n = 32 judged runs per tenant per side; a floor of 50 gives
+  2 × 0.16 = 0.32.
+
+### Options
+| Option | How it works | Judged a day | Cost a month | Smallest tenant judged a day | Meets the 0.4 target |
+|---|---|---|---|---|---|
+| **A. Uniform 1%** | judge 1 in 100 runs | 1,000 | 1,000 × 30 × $0.01 = $300 | 300 × 1% = 3 | no: 2 se ≈ 1.3 |
+| **B. Uniform 5%** | judge 1 in 20 runs | 5,000 | $1,500: fails | 15 | no: 2 se ≈ 0.58 |
+| **C. 1% plus a per-tenant floor of 50** | 1% everywhere, topped up to 50 a day per tenant | 4 × 150 + 36 × 50 = 2,400 | $720 | 50 | yes: 2 se = 0.32 |
+| **D. Judge everything** | every run scored | 100,000 | $30,000: fails | 300 | yes |
+
+### Decision
+Choose **C, stratified sampling with a per-tenant floor**, because it is the only option that meets the
+per-tenant detection target inside the budget.
+- **Detection:** every tenant gets 50 judged runs a day, so a 0.32-point drop is visible; A and B leave
+  small tenants at 3 and 15, where only drops of 1.3 and 0.58 show.
+- **Budget:** $720 fits under $1,000, leaving $280 for the review queue's re-judging.
+- **Where the money goes:** 1,800 of the 2,400 daily judgments go to small tenants, the slices uniform
+  sampling starves. The four large tenants already clear the floor at 1%.
+- **Noise:** 40 tenants checked daily at a 5% false rate would give about 2 false alerts a day, so a judge
+  drop opens a ticket and needs two consecutive days to escalate. Only proxy SLO burn rates page.
+
+**What would change it:**
+- **The contract drops per-tenant quality reviews:** A at $300 covers the aggregate.
+- **Slicing by tenant and 5 intents (200 slices):** the floor would cost 10,000 judged a day, $3,000 a
+  month. Floor the tenants and let intents share the sample instead.
+- **Judge cost falls tenfold:** D becomes affordable at about $3,000 a month only if the budget grows.
+
+### Trade-offs accepted
+- **Small tenants are over-sampled per run.** Their judged runs cost more per unit of traffic; track
+  judge spend per tenant so the floor stays explained.
+- **Daily windows, not hourly, for small tenants.** A drop shows within a day, not an hour. The 100%
+  proxies (search-call rate, citations) still catch alias updates within the first hour.
+- **Two-day persistence delays escalation.** A real drop opens a ticket on day one; escalation waits for
+  day two. Watch the ticket queue age.
+- **The judge itself can drift.** Pin its snapshot and re-measure judge-human agreement monthly.
+
+### Review rubric
+- **The detection target is written as a number** (effect size, slice, time window) before choosing a
+  sampling rate.
+- **Judged samples per slice are computed** for the smallest slice, not only the average.
+- **Costs are recomputed** from judged runs a day × days × cost per judgment.
+- **The false-alert rate across all slices is estimated**, and page versus ticket routing follows from it.
+- **Cheap 100% proxies are named** as the fast layer, with the judge as confirmation.
+- **At least two conditions that would change the choice** are stated, each tied to a measurable fact.
 
 ## Why it exists
 - **Correctness is not a status code.** The model confidently cites the wrong refund policy; the retriever

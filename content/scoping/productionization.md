@@ -5,7 +5,8 @@ name: Productionization
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - scoping/pilot-to-production-plan
@@ -34,6 +35,69 @@ traces, tool security and ownership as risk-ordered hardening.
   the identity each tool call runs as, model pinning, and what gets logged and redacted.
 - **What you can skip.** Building your own gateway or tracing backend on day one; a shared library or an
   existing platform covers it, as long as the concerns above are handled somewhere.
+
+## Decision case
+### Scenario
+A pilot of an internal knowledge agent succeeded. It answers staff questions over internal documents and can
+open IT tickets (one write tool). The prototype calls a model alias directly, retrieves with an admin service
+account, logs nothing, and retries in three layers. All figures are illustrative.
+- **Launch load:** a peak of 4 tasks per second at a mean of 5 model calls each, so 20 calls per second; at
+  6 seconds per call that is 120 in flight and, at 3,500 tokens a call, 4.2 million tokens per minute.
+- **Constraints:**
+  - company-wide launch in 4 weeks, with two engineers, so 40 person-days;
+  - documents carry per-user permissions, and security will block launch without user-scoped retrieval;
+  - the quota tier allows 5 million tokens per minute, 84% used at peak;
+  - a chat answer must arrive within 60 seconds or hand off;
+  - a platform team already runs a shared LLM gateway with timeouts, retries, a circuit breaker, quotas,
+    model pinning, cost attribution and trace export.
+- **Retry stack today:** 3 attempts in the app × 3 in the gateway × 3 in the SDK = up to 27 provider calls per
+  model call.
+
+### Options
+| Option | How it works | Effort (person-days) | Fits 4 weeks? | Retry and quota risk |
+|---|---|---|---|---|
+| **A. Harden in the app** | auth 8, eval gate 6, tracing 8, retries and schemas at 3 call sites 12, own quotas and breaker 10, loop budgets and idempotency 6, runbook 4 | 54 | no | fixed, but duplicated logic per call site |
+| **B. Adopt the gateway, harden the rest** | auth 8, eval gate 6, gateway onboarding and pinning 5, loop budgets and idempotency 6, trace export 3, runbook and on-call 4, canary 4 | 36 | yes, 4 days spare | gateway owns retries (3), app and SDK off: worst case 3 calls |
+| **C. Build a dedicated gateway first** | as A, plus a new service | 80 or more | no: about 8 weeks | fixed, eventually |
+| **D. Launch the prototype with dashboards** | add monitoring only | about 4 | yes | 27× amplification can exhaust the quota in an incident; fails security |
+
+### Decision
+Choose **B**, because it is the only option that is both shippable in 4 weeks and launchable at all.
+- **Security first:** user-scoped retrieval and tool calls land in week 1, because data exposure is the most
+  damaging and least visible failure; D fails here outright.
+- **Budget:** 36 person-days fits under 40; A needs 54 and C twice the window.
+- **Retries:** with the gateway as the only retry owner, worst-case calls drop from 27 to 3 per model call.
+  Even that 3× at peak (12.6 million tokens a minute) exceeds the quota, so the gateway's circuit breaker
+  must shed load to the hand-off.
+- **Deadline:** the loop passes one 60-second task deadline into every call, so per-call retries cannot
+  stack across 5 steps past it.
+- **Write safety:** the ticket tool gets an idempotency key, so a timeout after success does not open a
+  duplicate.
+- **Quality:** the pilot's eval set becomes a CI gate and the model is pinned through the gateway.
+
+**What would change it:**
+- **No shared gateway exists:** cut scope to auth, eval gate, one retry owner and loop budgets, and delay
+  the launch rather than ship A half-done.
+- **Peak load above the quota with no retries at all:** request a higher tier or cap output length first.
+- **The agent gains a high-impact write tool such as refunds:** add an approval gate before launch.
+
+### Trade-offs accepted
+- **A dependency on the platform team.** Their outage or change is yours. Track gateway incidents and agree
+  an escalation path.
+- **Only 4 spare person-days.** The deprecation calendar and per-tenant cost reports wait until after launch;
+  list them on the gap tracker with dates.
+- **16% quota headroom at peak.** Alert at 80% of tokens per minute and watch steps per task, since a
+  prompt regression that adds steps eats the headroom first.
+- **Gateway defaults may not suit chat.** Check its timeout and attempt counts against the 60-second
+  deadline in the first canary.
+
+### Review rubric
+- **Hardening is ordered by severity and silence of failure**, with authorization first.
+- **Effort is estimated per item and summed** against the available person-days.
+- **Exactly one retry owner is named**, with worst-case calls per request computed.
+- **Capacity is checked** with Little's law and tokens per minute against the quota tier.
+- **The agent loop has step, spend and deadline limits**, and write tools carry idempotency keys.
+- **Deferred items are listed with dates**, and at least two conditions that would change the plan are named.
 
 ## Why it exists
 - **A prototype makes every time-saving assumption.** One user, clean inputs, a provider that always

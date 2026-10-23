@@ -5,7 +5,8 @@ name: Threat modeling
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - security-governance-compliance/ai-security
@@ -40,6 +41,63 @@ every output that becomes an action.
   model change.
 - **What you can skip.** Precise risk scores and exhaustive taxonomies. Coarse buckets, STRIDE as a
   completeness prompt and attacker stories you can turn into eval cases carry nearly all the value.
+
+## Decision case
+### Scenario
+A fintech's agent platform team serves five product teams that ship agent changes weekly. The CISO
+wants every change threat modeled; the product teams want no new queue. All figures are illustrative
+planning numbers, not benchmarks.
+- **Volume:** about 12 agent changes a month (new tools, new content sources, prompt and model swaps).
+- **Security capacity:** one AppSec engineer with 40% of their time on AI, so 0.4 x 20 working days = 8
+  days a month.
+- **Cost of depth:** a facilitated STRIDE workshop with diagram, attack trees for the top threats and
+  register updates takes about 2 AppSec days per change; a self-serve diagram plus checklist takes a
+  product engineer about 1 hour and an AppSec spot-check about 30 minutes.
+- **Risk mix:** from last quarter's changes, about 3 a month add a side-effecting tool, an untrusted
+  content source, a new identity or regulated data; the other 9 are prompt edits and read-only tools.
+- **Constraint:** no change may wait more than 5 working days for security review.
+
+### Options
+| Option | How it works | AppSec days a month | Catches structural flaws? | Meets 5-day wait? |
+|---|---|---|---|---|
+| Full STRIDE for every change | Workshop, attack trees, register update each time | 12 x 2 = 24, three times capacity | yes | no: a queue forms within weeks |
+| Checklist for every change | Teams answer an OWASP-based checklist | about 12 x 0.5 h = 6 h | rarely: ticks boxes, misses flows | yes |
+| Tiered by trigger | A CI check reads the design doc; any new tool, source, identity or regulated data triggers full STRIDE, the rest get diagram plus checklist | 3 x 2 + 9 x 0.5 h = 6 days plus 4.5 h, under 7 days | yes, where flows change | yes |
+| Pre-launch red team only | External red team twice a year | 0 ongoing | finds instances, not classes | yes, but late |
+
+### Decision
+**Tiered by trigger, with the register linted in CI.** Depth follows what changed in the data-flow
+diagram, which is where new threats come from, and it fits inside the 8 available days with about 1 day
+spare for incidents.
+- **Triggers are mechanical:** the design-doc template asks four yes/no questions (new tool with side
+  effects, new untrusted source, new identity or credential, regulated data). Any yes routes to the full
+  pass; the answers live in the pull request so an auditor can see them.
+- **Every tier still updates the register,** and the CI lint from the examples blocks merges with a threat
+  lacking a decision, owner or test.
+- **Red teaming stays,** as validation of the register twice a year, not as the model.
+
+**What would change it.** If triggered changes reach 4 a month, load is 4 x 2 days plus 8 x 0.5 h,
+about 8.5 days, over capacity: train one engineer per product team to facilitate, with AppSec reviewing the output. If a missed
+threat in an untriggered change causes an incident, add its pattern as a fifth trigger.
+
+### Trade-offs accepted
+- **Untriggered changes get a lighter look.** A prompt edit can still widen what an agent does. Watch
+  incidents and red-team findings traced to untriggered changes; any one of them reviews the triggers.
+- **Self-reported trigger answers can be wrong.** Diff each agent's tool manifest in CI and flag a new tool
+  or scope when the design doc answered no.
+- **Coarse likelihood and impact ratings.** Two reviewers may disagree on ordering. Accept it, because the
+  ratings only order the work; every threat still needs a decision.
+
+### Review rubric
+- **Capacity math shown:** the write-up computes review load per option from change volume and per-review
+  cost, and compares it to available security time.
+- **Triggers tied to flows:** depth is decided by changes to the data-flow diagram (tools, sources,
+  identities, data classes), not by team or feature size.
+- **Output is testable:** every tier ends in register entries with a decision, an owner and a named test
+  or review date, checked in CI.
+- **Escape hatch for misclassification:** a mechanical check catches a change that skipped the full tier.
+- **Red teaming placed correctly:** it validates the model rather than replacing it.
+- **Change triggers stated:** the write-up says which volume or incident would reopen the decision.
 
 ## Why it exists
 - **Controls chosen without a model are chosen at random.** Threat modeling finds classes of problems,

@@ -5,7 +5,8 @@ name: Failure analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - delivery-ownership/production-debugging
@@ -32,6 +33,66 @@ weight by severity, and fix the top of the list.
   scale, and whether each trace records per-step outputs so the originating stage can be named.
 - **What you can skip.** Heavy statistics. Proportions with a standard error and a frequency × severity
   score are enough to rank fixes.
+
+## Decision case
+### Scenario
+The ticket-triage agent from the worked scenario reads a ticket, looks up the account and files it to a
+queue. It fails on 9% of runs, and leadership asks what the team should do with its next four weeks.
+All figures are illustrative planning numbers.
+- **Scale:** about 4,000 runs a day, so 0.09 x 4,000 = 360 failed runs a day.
+- **Evidence:** 150 random failed trajectories coded by first bad step: invented account ID 34%, tool
+  error ignored 22%, wrong queue with correct context 18%, should have asked the user 14%, step budget
+  hit 12%.
+- **Budget:** cost per run may rise by at most 20%.
+- **Team and deadline:** 2 engineers, 4 weeks, and a measurable drop in the failure rate by then.
+- **Severity:** a ticket filed under an invented account lands in another customer's history, so the
+  top category is also the most harmful.
+
+### Options
+| Option | How it works | Categories it can reach | Fits cost and 4 weeks? |
+|---|---|---|---|
+| Larger model | Swap the model, keep the harness | Mainly wrong queue (18%), some spillover | No: raises cost per run on every call |
+| Fine-tune on corrected trajectories | Label good runs, train, evaluate | Model-behaviour categories, at most 18% + 14% directly | Risky: labelling and evals eat most of 4 weeks |
+| Stage fixes at the first bad step | Validator rejects account IDs not returned by a prior lookup; structured tool errors and a block on `file_ticket` after a failed lookup | 34% + 22% = 56% of failures | Yes: code in the harness, no cost per run |
+| Classifier first | Build an LLM judge for all five categories, fix later | None in 4 weeks | No fix ships by the deadline |
+
+### Decision
+**Stage fixes, then confirm with a fresh sample.** Using the lesson's formula, failure rate x share x
+efficacy, with guessed efficacies of 0.9 for the validator and 0.8 for structured errors:
+- **Validator:** 0.09 x 0.34 x 0.9 ≈ 2.8 points.
+- **Structured errors:** 0.09 x 0.22 x 0.8 ≈ 1.6 points.
+- **Together:** about 4.3 points, from 9% to roughly 4.7%, or about 0.0434 x 4,000 ≈ 174 fewer failed
+  runs a day.
+- **Larger model, fixing half of wrong-queue failures:** 0.09 x 0.18 x 0.5 ≈ 0.8 points (about 32 runs a
+  day), while breaking the cost cap.
+- **Uncertainty does not flip the order:** the top share's 95% interval is roughly 26%-42%, and even its
+  low end beats the 18% the model can reach.
+
+**What would change it:**
+- **Model errors now dominate:** if the post-fix sample shows wrong-queue errors with correct context on
+  top, a model change or fine-tune becomes the cheapest next lever.
+- **Cost cap lifted:** with no cap and the model category largest, the swap would deserve a trial.
+- **Tiny volume:** with a handful of failures a week, read them all instead of sampling.
+
+### Trade-offs accepted
+- **Wrong-queue errors stay for now.** About 18% of failures are untouched; track that category's share
+  in the next sample.
+- **The validator can reject real IDs.** Watch its rejection rate and spot-check rejected runs weekly.
+- **150 cases can miss rare, severe modes.** Keep labelling a random slice of all traffic, flagged or
+  not, to catch silent failures.
+- **Efficacies are guesses.** The fix-confirmation sample after week 4 replaces them with measured
+  shares and intervals.
+
+### Review rubric
+- **Ranking from a random sample:** the write-up says how cases were drawn and codes the first bad step
+  and stage, not the visible bad action.
+- **Ceilings computed:** each option's best case is failure rate x share x efficacy, with every number
+  recomputed and efficacies labelled as guesses.
+- **Severity applied:** a rare but harmful category is ranked by harm as well as frequency.
+- **Constraints checked:** each option is judged against cost, team size and deadline, not only
+  expected reduction.
+- **Confirmation planned:** a post-fix sample with intervals shows whether the category shrank, and the
+  write-up names what result would change the plan.
 
 ## Why it exists
 - **Debugging explains one failure; products fail in hundreds of ways a day.** An answer misses a detail,

@@ -5,7 +5,8 @@ name: Legacy system integration
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - enterprise-integration/enterprise-connectors
@@ -38,6 +39,69 @@ path and translates legacy codes, so quirks stop at one boundary.
   message during maintenance windows.
 - **What you can skip.** Writing COBOL or CICS programs. You need to read a copybook, decode `COMP-3`, apply
   Little's law and make writes idempotent; the legacy owners run the rest.
+
+## Decision case
+### Scenario
+An insurer wants a customer-service agent that answers "what is the status of my claim?" and updates a
+claim's contact address. Claims live on a mainframe the insurer will not change. Figures are illustrative.
+- **Load:** 8 user questions a second at peak, about 2.5 claim lookups each, so 20 lookups a second; about
+  1 question in 50 ends in an address update, so 8 x 0.02 = 0.16 writes a second.
+- **Capacity:** operations allows 10 concurrent sessions on the CICS gateway, at about 1.5 seconds per
+  transaction; nightly batch runs 01:00 to 06:00 with no online access.
+- **Existing interfaces:** a reporting replica of the claims tables with lag under 5 minutes; the
+  call-centre transaction for address changes, reachable through the gateway, with a 12-character customer
+  reference field that is stored and searchable; a nightly SFTP extract.
+- **Rules:** status answers at most 1 hour old; every write runs the system's validation; no duplicate
+  writes.
+- **Team and deadline:** 3 engineers, no COBOL skills; pilot in 10 weeks.
+
+### Options
+| Option | Reads | Writes | Load on mainframe at peak | Freshness | Fits team and 10 weeks |
+|---|---|---|---|---|---|
+| Direct SQL on the primary | queries on live tables | table updates | reads compete with online work | current | fails: writes bypass business rules |
+| Nightly extract and update file | parsed EBCDIC extract | batch update file | near zero online | up to 24 h | fails the 1-hour rule |
+| Replica reads, gateway writes | reporting replica behind the anti-corruption layer | call-centre transaction with client reference | 0.16 x 1.5 = 0.24 sessions | under 5 min | fits |
+| Screen automation for both | drive the green screen | drive the green screen | far over 10 sessions at human speed | current | fragile; any screen change breaks it |
+
+Little's law on the gateway if every lookup hit it: 20 x 1.5 = 30 sessions in flight against 10 allowed.
+Moving reads to the replica leaves only writes there, about 0.24 sessions on average.
+
+### Decision
+**Read from the existing replica and write through the call-centre transaction, both behind one
+anti-corruption layer that exposes `get_claim(id)` and `update_contact(claim_id, address, ref)`.** It is
+the least invasive path that meets the 1-hour freshness rule, runs validation on every write, and keeps
+the gateway far under its 10-session limit.
+- **Why not direct SQL:** writes skip rules that live in application code, and reads compete with batch.
+- **Why not the nightly files:** a status up to 24 hours old fails the freshness rule; keep them for
+  reconciliation instead.
+- **Why not screen automation:** it reaches the same transaction more slowly and breaks on screen changes.
+- **Write safety:** record the 12-character reference before sending, look it up after a timeout, and
+  return "applied", "scheduled" or "in doubt, reference X" to the model.
+
+**What would change it.** No replica would mean extract plus read cache with an "as of" time and a
+limiter on gateway reads. No searchable reference field would mean a single queue consumer plus
+reconciliation against the next extract. A funded replacement makes the layer the strangler-fig facade.
+
+### Trade-offs accepted
+- **Replica lag after a write.** A just-updated address may not appear for up to 5 minutes, so the agent
+  confirms from the write's reply or a reference lookup, not by rereading the replica. Monitor replica lag.
+- **Gateway sessions are shared with the call centre.** Reserve at most 2 of the 10 sessions for agent
+  writes with a bulkhead limiter; monitor in-flight calls and rejections.
+- **No writes 01:00 to 06:00.** Tools return "scheduled" or "try after 06:00" during batch; monitor calls
+  attempted inside the window, which should be zero.
+- **A code table to own.** The layer fails on unknown status codes instead of passing `07` to the model;
+  alert on unknown-code counts.
+
+### Review rubric
+- **Interfaces inventoried first:** lists existing interfaces, batch windows, record layouts and capacity
+  before choosing a path.
+- **Load computed:** applies Little's law to stated arrival rates and latency and compares with the
+  session limit.
+- **Least invasive path justified:** explains why each riskier path was rejected against the constraints.
+- **Writes made safe:** a persisted, queryable client reference, lookup-before-retry, and honest
+  in-doubt results to the model.
+- **Agent behaviour designed:** per-session budgets, maintenance messages and named states, not raw codes.
+- **Change triggers named:** what missing interface or new fact would switch the design.
 
 ## Why it exists
 - **The system of record is old and staying.** In most large enterprises policies, accounts, claims or

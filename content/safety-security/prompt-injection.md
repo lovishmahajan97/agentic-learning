@@ -5,7 +5,8 @@ name: Prompt injection (direct, indirect)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -161,6 +162,23 @@ flowchart TD
     A -->|"yes"| S["Execute, log provenance"]
     H --> S
 ```
+
+## Misconceptions
+- **"Prompt injection is a user typing ignore previous instructions."** That is direct injection. For
+  agents the bigger risk is indirect: the payload sits in a web page, email, tool result, MCP tool
+  description, memory entry or sub-agent message the user never sees, and the agent acts with the
+  user's privileges.
+- **"Delimiters plus a rule not to follow instructions in the data fix it."** The rule is itself text in
+  the same stream, and a payload can name and dismiss the delimiters. There is no second channel like a
+  prepared statement, so spotlighting lowers the success rate but is not a boundary.
+- **"A detector with 99% recall makes us safe."** An adaptive attacker retries offline: at 1% slip per
+  paraphrase, 100 tries get through about 63% of the time. A recipient allowlist in the executor holds at
+  every try because it never reads the words.
+- **"An agent with no send tool cannot leak data."** A markdown image in the answer makes the client
+  perform a GET with the data encoded in the URL. Scrubbing output URLs to an allowlist is an injection
+  defence, not hygiene.
+- **"A defence that drives attack success to zero is the best one."** Refusing everything scores 0% too.
+  Report utility under attack alongside attack success, as AgentDojo-style suites do.
 
 ## Examples
 ### Email assistant: quarantine, canary, recipient policy

@@ -5,7 +5,8 @@ name: Max-step budgets
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -39,6 +40,200 @@ every exhaustion as a stuck-agent signal.
   the sub-budgets handed to child agents.
 - **What you can skip.** Tuning one global step count by feel. Derive numbers from successful-run traces
   and spend the effort on the exhaustion path instead.
+
+## Lab
+### Task
+Finish a `Budget` for a stuck research agent: project each working call against the limit minus a
+wrap-up reserve, cap `web_search` at three calls, and persist the counters so a crash-resume continues
+spending from where it stopped. Time box: 45-75 min.
+- **Prerequisites:** The agent loop; Stopping conditions / termination; the first example in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13 and pytest 9.1). Save the
+  starter as `lab.py` and the tests as `test_lab.py`.
+- **No model calls:** `stuck_model` never submits and reports usage like a real response (input = the
+  context it was sent, output = 1k tokens).
+
+### Starter code
+```python
+"""Lab: a token budget with a wrap-up reserve, per-tool caps and resumable counters. Run: python lab.py"""
+from dataclasses import dataclass, field
+from types import SimpleNamespace as NS
+
+@dataclass
+class Budget:
+    max_steps: int = 20
+    max_tokens: int = 400_000
+    reserve: int = 100_000                 # spendable only by the no-tools wrap-up call
+    tool_caps: dict = field(default_factory=lambda: {"web_search": 3})
+    steps: int = 0
+    tokens: int = 0
+    tool_counts: dict = field(default_factory=dict)
+
+    def charge(self, usage):               # usage block from the API response
+        self.steps += 1
+        self.tokens += usage.input_tokens + usage.output_tokens
+
+    def fits(self, ctx: int, max_out: int) -> bool:
+        """Could one more call of this size run at all (the wrap-up may use the reserve)?"""
+        return self.steps + 1 <= self.max_steps and self.tokens + ctx + max_out <= self.max_tokens
+
+    def can_afford(self, ctx: int, max_out: int) -> bool:
+        # YOUR CODE HERE: a WORKING call is allowed only if steps + 1 <= max_steps and the
+        # projected tokens + ctx + max_out stay within max_tokens - reserve
+        raise NotImplementedError
+
+    def allow_tool(self, name: str) -> bool:
+        # YOUR CODE HERE: count this call in tool_counts; return False once the count would
+        # exceed tool_caps[name] (tools without a cap are always allowed)
+        raise NotImplementedError
+
+    def to_dict(self) -> dict:
+        # YOUR CODE HERE: everything a resumed run needs, as plain JSON-able values
+        raise NotImplementedError
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Budget":
+        # YOUR CODE HERE: rebuild the budget so counters continue, never restart at zero
+        raise NotImplementedError
+
+class Crash(Exception): pass
+
+def run(cp: dict, model, tools: dict, budget: Budget, max_out=4_000, crash_at=None):
+    """cp is the durable checkpoint: {"n": steps done by the agent, "budget": dict}."""
+    while True:
+        ctx = 15_000 * (cp["n"] + 1)                      # the transcript grows 15k per step
+        if not budget.can_afford(ctx, max_out):
+            if not budget.fits(ctx, max_out):
+                return {"status": "partial", "reason": "no_reserve", "draft": None}
+            r = model(ctx, tools=None)                     # wrap-up: tools withheld
+            budget.charge(r.usage)
+            return {"status": "partial", "reason": "budget_exhausted", "draft": r.text}
+        r = model(ctx, tools=list(tools))
+        budget.charge(r.usage)
+        for name in r.tool_calls:
+            out = tools[name]() if budget.allow_tool(name) else f"refused: {name} cap reached"
+            r.results.append(out)
+        cp["n"] += 1
+        cp["budget"] = budget.to_dict()                    # persisted with the checkpoint
+        if crash_at == cp["n"]:
+            raise Crash(f"worker died after step {cp['n']}")
+
+def stuck_model(tool="web_search"):
+    """Never submits; reports real usage: input = context sent, output = 1k."""
+    def model(ctx, tools):
+        calls = [tool] if tools else []
+        return NS(usage=NS(input_tokens=ctx, output_tokens=1_000), tool_calls=calls,
+                  results=[], text=None if tools else "done / remaining / blocked")
+    return model
+
+def counting_tools():
+    hits = {"web_search": 0}
+    def web_search():
+        hits["web_search"] += 1
+        return "results"
+    return {"web_search": web_search}, hits
+
+if __name__ == "__main__":
+    tools, hits = counting_tools()
+    b = Budget()
+    out = run({"n": 0}, stuck_model(), tools, b)
+    print(out["status"], out["reason"], f"steps={b.steps} tokens={b.tokens} searches={hits['web_search']}")
+
+    cp, tools, hits = {"n": 0}, *counting_tools()
+    try:
+        run(cp, stuck_model(), tools, Budget(), crash_at=3)
+    except Crash as e:
+        print("crash:", e, f"tokens so far={cp['budget']['tokens']}")
+    b2 = Budget.from_dict(cp["budget"])
+    out = run(cp, stuck_model(), tools, b2)
+    print("resumed:", out["reason"], f"steps={b2.steps} tokens={b2.tokens} searches={hits['web_search']}")
+
+    tight = Budget(reserve=10_000)
+    out = run({"n": 0}, stuck_model(), counting_tools()[0], tight)
+    print("tight reserve:", out["reason"], f"tokens={tight.tokens}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+partial budget_exhausted steps=6 tokens=321000 searches=3
+crash: worker died after step 3 tokens so far=93000
+resumed: budget_exhausted steps=6 tokens=321000 searches=3
+tight reserve: no_reserve tokens=321000
+```
+
+- **Read the numbers:** after 5 working steps the run has spent 15k × 15 + 5k = 230k. Step six would
+  project 230k + 90k + 4k = 324k, over the 300k working line, so work stops; the 91k wrap-up call fits
+  only because the reserve keeps the 300k-400k band free, and the run ends at 321k. With a 10k reserve a sixth step fits, and then nothing is left for the
+  wrap-up.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution
+passes all 5 (Python 3.13, pytest 9.1).
+
+```python
+import json
+from lab import Budget, Crash, counting_tools, run, stuck_model
+
+def test_can_afford_projects_and_keeps_the_reserve():
+    b = Budget(tokens=230_000)
+    assert b.can_afford(66_000, 4_000)            # 300k exactly: allowed
+    assert not b.can_afford(67_000, 4_000)        # would eat into the reserve
+    assert b.fits(90_000, 4_000)                  # but the wrap-up still fits
+    assert not Budget(steps=20).can_afford(1, 1)
+
+def test_per_tool_cap():
+    b = Budget()
+    assert [b.allow_tool("web_search") for _ in range(4)] == [True, True, True, False]
+    assert all(b.allow_tool("read_file") for _ in range(10))
+
+def test_stuck_run_ends_partial_with_wrap_up_inside_the_limit():
+    tools, hits = counting_tools()
+    b = Budget()
+    out = run({"n": 0}, stuck_model(), tools, b)
+    assert out == {"status": "partial", "reason": "budget_exhausted",
+                   "draft": "done / remaining / blocked"}
+    assert (b.steps, b.tokens, hits["web_search"]) == (6, 321_000, 3)
+    assert b.tokens <= b.max_tokens
+
+def test_counters_survive_a_crash_and_round_trip_through_json():
+    cp, (tools, hits) = {"n": 0}, counting_tools()
+    try:
+        run(cp, stuck_model(), tools, Budget(), crash_at=3)
+    except Crash:
+        pass
+    saved = json.loads(json.dumps(cp["budget"]))   # what a real store gives back
+    b = Budget.from_dict(saved)
+    assert (b.steps, b.tokens, b.tool_counts) == (3, 93_000, {"web_search": 3})
+    run(cp, stuck_model(), tools, b)
+    assert (b.steps, b.tokens, hits["web_search"]) == (6, 321_000, 3)
+
+def test_reserve_too_small_is_reported_not_overspent():
+    b = Budget(reserve=10_000)
+    out = run({"n": 0}, stuck_model(), counting_tools()[0], b)
+    assert out["reason"] == "no_reserve" and b.tokens == 321_000 <= b.max_tokens
+```
+
+### Failure scenarios
+- **Compare against `max_tokens` instead of `max_tokens - reserve`.** The first line becomes `partial
+  no_reserve` at 321000 tokens: a sixth working step ran and the wrap-up no longer fits. Print the
+  projection beside both lines for every step and see which one the last working call crossed.
+- **Return a fresh `Budget()` from `from_dict`.** The resume prints `steps=4 tokens=334000 searches=6`:
+  the counters restarted, so the attempts together spent 93k + 334k = 427k against a 400k limit and the
+  search cap let through six calls. Sum tokens per run id across attempts to catch it.
+- **Leave the tools on for the wrap-up call** (`tools=list(tools)`). The draft comes back `None`
+  because the model answered with another tool call instead of a summary. Check the wrap-up response for
+  tool calls and fail the test if there are any.
+
+### Submission
+- **`lab.py`** with the four `Budget` methods implemented; `run()` and the fakes unchanged.
+- **A green run** of `pytest -q test_lab.py` (5 passed) and the output of `python lab.py`.
+- **A short table:** tokens after each step for the default run, recomputed by hand, matching the 230k
+  and 321k above.
+- **A note:** how you would size `reserve` from real traces instead of a constant (hint: the context size
+  at the step where successful runs end).
+- **Evaluated on:** no run, resumed or not, exceeds `max_tokens`; the wrap-up always has room or the run
+  says `no_reserve`; per-tool counts survive a crash.
 
 ## Why it exists
 - **Stuck models never stop themselves.** A stuck model keeps calling tools until something external

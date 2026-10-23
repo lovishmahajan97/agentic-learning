@@ -5,7 +5,8 @@ name: Worker threads for CPU-bound tasks
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
@@ -33,6 +34,211 @@ streaming; pool them and transfer or share large data.
   per-worker heap cap, and transfer versus clone for buffers.
 - **What you can skip.** `Atomics.wait` protocols and lock-free designs. Know clone, transfer and
   `SharedArrayBuffer`, and that model and tool HTTP calls never need a worker.
+
+## Lab
+### Task
+Finish the worker pool an agent server uses for its CPU steps (scoring cached embeddings, parsing
+uploads): transfer the query instead of cloning it, survive a worker that crashes on a malformed
+document, and let a stopped agent run free its slot through a shared cancel flag. Time box: 60-90 minutes.
+- **Prerequisites:** this lesson's message passing, transfer, pooling and cancellation sections; the
+  AbortController lesson for the signal.
+- **Setup:** an empty folder with `"type": "module"` in `package.json`, `npm i -D vitest @types/node`.
+  Checked with Node 24.21 and Vitest 5.0. Node 24 strips types natively, so the same `lab.ts` is both the
+  pool and the worker script (`new Worker(new URL(import.meta.url))`).
+- **Fake work:** `spinMs` stands in for a long parse, and `crash: true` for a parser bug. The matrix is a
+  `SharedArrayBuffer` in which row `i` is a unit vector on axis `i % 64`.
+- **Save** the starter as `lab.ts` and the tests as `lab.test.ts`, then run `node lab.ts` and
+  `npx vitest run`.
+
+### Starter code
+```ts
+// Lab: a worker pool for an agent server's CPU steps (scoring cached embeddings).
+// Run: node lab.ts   Test: npx vitest run   (this file is both the pool and the worker script)
+import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
+import { pathToFileURL } from "node:url";
+
+export type Job = { query: Float32Array; k: number; spinMs?: number; crash?: boolean };
+export type Hit = { index: number; score: number };
+type Reply = { hits: Hit[] } | { cancelled: true };
+
+if (!isMainThread && workerData?.role === "scorer") {
+  const vectors = new Float32Array(workerData.shared as SharedArrayBuffer);  // shared, never cloned
+  const dim = workerData.dim as number;
+  const flag = new Int32Array(workerData.flag as SharedArrayBuffer);         // 1 = cancel this job
+  parentPort!.on("message", ({ query, k, spinMs, crash }: Job) => {
+    if (crash) throw new Error("malformed document");       // stands in for a parser bug
+    const until = performance.now() + (spinMs ?? 0);        // stands in for a long parse
+    for (let i = 0; performance.now() < until; i++) {
+      if (i % 10_000 === 0 && Atomics.load(flag, 0) === 1) { parentPort!.postMessage({ cancelled: true }); return; }
+    }
+    const hits: Hit[] = [];
+    for (let i = 0; i < vectors.length / dim; i++) {
+      let dot = 0;
+      for (let d = 0; d < dim; d++) dot += query[d]! * vectors[i * dim + d]!;
+      hits.push({ index: i, score: dot });
+    }
+    parentPort!.postMessage({ hits: hits.sort((a, b) => b.score - a.score).slice(0, k) });
+  });
+}
+
+type Slot = { w: Worker; flag: Int32Array };
+
+export class Pool {
+  private idle: Slot[] = [];
+  private queue: Array<(s: Slot) => void> = [];
+  live = 0;
+  restarts = 0;
+  private readonly opts: { size: number; shared: SharedArrayBuffer; dim: number };
+  constructor(opts: { size: number; shared: SharedArrayBuffer; dim: number }) {
+    this.opts = opts;
+    for (let i = 0; i < opts.size; i++) this.idle.push(this.spawn());
+  }
+  private spawn(): Slot {
+    const flag = new Int32Array(new SharedArrayBuffer(4));
+    const w = new Worker(new URL(import.meta.url), {
+      workerData: { role: "scorer", shared: this.opts.shared, dim: this.opts.dim, flag: flag.buffer },
+      resourceLimits: { maxOldGenerationSizeMb: 64 },
+    });
+    this.live++;
+    w.once("exit", () => { this.live--; });
+    return { w, flag };
+  }
+  private release(s: Slot) {
+    const next = this.queue.shift();
+    if (next) next(s); else this.idle.push(s);
+  }
+  // LAB 1: transfer job.query's buffer instead of cloning it (postMessage's transfer list).
+  // LAB 2: on a worker 'error', reject the job, and put a fresh worker (restarts++) back in the pool.
+  // LAB 3: if `signal` aborts, set the slot's flag with Atomics.store; when the worker replies
+  //        { cancelled: true }, reset the flag, release the slot (no restart) and reject with signal.reason.
+  run(job: Job, signal?: AbortSignal): Promise<Hit[]> {
+    return new Promise((resolve, reject) => {
+      const start = (s: Slot) => {
+        s.w.once("message", (r: Reply) => { this.release(s); if ("hits" in r) resolve(r.hits); });
+        s.w.once("error", reject);
+        s.w.postMessage(job);
+      };
+      const s = this.idle.pop();
+      if (s) start(s); else this.queue.push(start);
+    });
+  }
+  async close() { await Promise.all([...this.idle].map((s) => s.w.terminate())); }
+}
+
+export function sharedMatrix(n: number, dim: number) {
+  const shared = new SharedArrayBuffer(n * dim * 4);
+  const m = new Float32Array(shared);
+  for (let i = 0; i < n; i++) m[i * dim + (i % dim)] = 1;    // row i is a unit vector on axis i % dim
+  return shared;
+}
+
+if (isMainThread && import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  const dim = 64;
+  const pool = new Pool({ size: 2, shared: sharedMatrix(5_000, dim), dim });
+  const query = new Float32Array(dim); query[3] = 1;
+  const hits = await pool.run({ query, k: 2 });
+  console.log("top:", hits.map((h) => h.index).join(","), "| query length after send:", query.length);
+  await pool.run({ query: new Float32Array(dim), k: 1, crash: true }).catch((e: Error) => console.log("job failed:", e.message));
+  await new Promise((r) => setTimeout(r, 50));
+  console.log("live workers:", pool.live, "restarts:", pool.restarts);
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 50);
+  const t0 = performance.now();
+  await pool.run({ query: new Float32Array(dim), k: 1, spinMs: 1500 }, ac.signal)
+    .then(() => console.log("cancel: job ran to completion"), (e: Error) => console.log("cancel:", e.name));
+  console.log("stopped within 500 ms:", performance.now() - t0 < 500);
+  await pool.close();
+}
+```
+
+### Expected output
+`node lab.ts` with a correct solution prints:
+
+```
+top: 3,67 | query length after send: 0
+job failed: malformed document
+live workers: 2 restarts: 1
+cancel: AbortError
+stopped within 500 ms: true
+```
+
+The starter prints `query length after send: 64` (cloned), `live workers: 1 restarts: 0` (the pool
+shrank), `cancel: job ran to completion` and `false`: the full 1.5 s spin ran after the stop.
+
+### Tests
+```ts
+import { afterEach, expect, test } from "vitest";
+import { Pool, sharedMatrix } from "./lab.ts";
+
+const dim = 64;
+let pool: Pool;
+const make = () => (pool = new Pool({ size: 2, shared: sharedMatrix(5_000, dim), dim }));
+const axis = (a: number) => { const q = new Float32Array(dim); q[a] = 1; return q; };
+afterEach(async () => { await pool.close(); });
+
+test("scores against the shared matrix", async () => {
+  make();
+  const hits = await pool.run({ query: axis(5), k: 3 });
+  expect(hits.map((h) => h.index)).toEqual([5, 69, 133]);
+  expect(hits[0]?.score).toBe(1);
+});
+
+test("the query buffer is transferred, not cloned", async () => {
+  make();
+  const q = axis(1);
+  const p = pool.run({ query: q, k: 1 });
+  expect(q.length).toBe(0);                    // detached on send
+  await p;
+});
+
+test("a crashing job is rejected and its worker replaced", async () => {
+  make();
+  await expect(pool.run({ query: axis(0), k: 1, crash: true })).rejects.toThrow("malformed document");
+  await new Promise((r) => setTimeout(r, 100));
+  expect(pool.live).toBe(2);
+  expect(pool.restarts).toBe(1);
+  const again = await Promise.all([pool.run({ query: axis(2), k: 1 }), pool.run({ query: axis(4), k: 1 })]);
+  expect(again.map((h) => h[0]?.index)).toEqual([2, 4]);
+});
+
+test("abort stops a running job without restarting the worker", async () => {
+  make();
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 50);
+  const t0 = performance.now();
+  await expect(pool.run({ query: axis(0), k: 1, spinMs: 2_000 }, ac.signal)).rejects.toMatchObject({ name: "AbortError" });
+  expect(performance.now() - t0).toBeLessThan(500);
+  expect(pool.restarts).toBe(0);
+  expect((await pool.run({ query: axis(7), k: 1, spinMs: 20 }))[0]?.index).toBe(7);   // slot reused, flag reset
+});
+```
+
+On the starter three fail: `expected 64 to be +0`, `expected 1 to be 2` and `promise resolved ... instead
+of rejecting` after the full 2 s spin. Scoring already works; a correct solution passes all four.
+
+### Failure scenarios
+- **Read `query` after sending it.** Once transfer works, any later `query[d]` on the main thread reads
+  `undefined` from a zero-length view, so a "log the query norm" line prints `NaN`. Debug by checking
+  `.length` right after `postMessage`; copy what you still need first.
+- **Reject the crashed job but do not spawn a replacement.** The job fails correctly, yet `live` drops to
+  1 (the starter's behaviour), and a pool of size 1 would queue every later job forever. Debug by
+  exporting live workers as a gauge and alerting when it falls below the target size.
+- **Forget to reset the cancel flag.** The next long job on that slot sees `1` at its first poll and
+  "cancels" at once, rejecting with no reason. The slot-reuse test (a 20 ms job after the abort) catches
+  it; reset with `Atomics.store(flag, 0, 0)` before release.
+- **Use `worker.terminate()` for every abort.** Abort works, but `restarts` climbs with every stopped run
+  and each replacement pays startup again; the `restarts` assertion catches it. Keep `terminate` for jobs
+  that ignore the flag.
+
+### Submission
+- **Your `lab.ts`** with the three LAB steps done, and a passing `npx vitest run` (four tests).
+- **The `node lab.ts` output**, matching the expected output.
+- **A measurement:** main-thread `monitorEventLoopDelay` max while the pool scores 50,000 × 1,536 vectors
+  versus scoring them inline.
+- **A note** (3-5 sentences) on how you would size this pool and its `maxOldGenerationSizeMb` for a 4-CPU,
+  4 GB container running an agent server.
+- **Evaluated on:** tests passing, transfer (not clone) for the query, no pool shrinkage after crashes, and
+  cancellation without restarts.
 
 ## Why it exists
 - **Some AI steps are genuinely compute.** Counting tokens with a BPE tokenizer over a 200-page document,

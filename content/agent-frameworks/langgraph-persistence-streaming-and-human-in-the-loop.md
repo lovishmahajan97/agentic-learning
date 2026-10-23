@@ -5,7 +5,8 @@ name: LangGraph persistence, streaming and human-in-the-loop (checkpointers, int
 kind: tool
 difficulty: advanced
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agent-frameworks/langgraph-fundamentals
@@ -37,6 +38,189 @@ updates, LLM tokens and custom progress events while the run is in flight.
   what payload a reviewer sees, and which stream modes reach the UI.
 - **What you can skip.** Checkpoint serialization internals. Know that state must be serializable and
   that the node with the interrupt re-runs from its top on resume.
+
+## Lab
+### Task
+Fix a refund-approval agent that has three production bugs: the "refund pending" email repeats on
+resume, a retried refund after a lost response pays twice, and a paused approval disappears when the worker
+restarts. The agent goal is an approval gate that is durable and exactly-once in effect. Time box: 45-75 min.
+- **Prerequisites:** LangGraph fundamentals; Human-in-the-loop; Idempotent tool execution.
+- **Setup:** Python 3.10+, `pip install langgraph langgraph-checkpoint-sqlite pytest` (checked with
+  langgraph 1.2.16, langgraph-checkpoint-sqlite 3.1.2, Python 3.13). Save the starter as `lab.py`, the
+  tests as `test_lab.py`.
+- **No payment provider:** `FakePayments` dedupes by idempotency key like a real API and can lose its
+  first response. A second `make_app` on the same SQLite file stands in for a restarted worker.
+- **This is a fix lab:** the starter runs and shows the bugs; the three `YOUR CODE HERE` markers point at
+  them.
+
+### Starter code
+```python
+"""Lab: fix a refund-approval graph so it survives restarts and never repeats side effects.
+Run: python lab.py   (the starter runs, and shows the bugs)"""
+import sqlite3
+import uuid
+from typing import TypedDict
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
+
+ORDERS = {"A1001": 120.0, "B2002": 30.0}
+
+class Refund(TypedDict, total=False):
+    order_id: str
+    amount: float
+    decision: str
+    receipt: str
+
+class FakePayments:
+    """Dedupes by idempotency key, like real payment APIs. fail_once loses the first response."""
+    def __init__(self, fail_once: bool = False):
+        self.created: dict[str, str] = {}
+        self.fail_once = fail_once
+    def refund(self, key: str, order_id: str, amount: float) -> str:
+        if key not in self.created:
+            self.created[key] = f"rf-{len(self.created) + 1}"
+        if self.fail_once:
+            self.fail_once = False
+            raise ConnectionError("response lost after the refund was created")
+        return self.created[key]
+
+def make_app(db_path: str, outbox: list, payments: FakePayments):
+    """Build the graph. Calling it again with the same db_path simulates a restarted worker."""
+    def propose(state: Refund) -> dict:
+        return {"amount": ORDERS[state["order_id"]]}
+
+    def approve(state: Refund) -> dict:
+        if state["amount"] < 50:
+            return {"decision": "approve"}
+        # YOUR CODE HERE (bug 1): this email repeats on resume; move it into its own node
+        outbox.append(f"refund pending for {state['order_id']}")
+        answer = interrupt({"question": f"Refund {state['amount']} for {state['order_id']}?"})
+        return {"decision": answer}
+
+    def execute(state: Refund) -> dict:
+        if state["decision"] != "approve":
+            return {"receipt": "cancelled"}
+        key = str(uuid.uuid4())  # YOUR CODE HERE (bug 2): a retried node must reuse the same key
+        return {"receipt": payments.refund(key, state["order_id"], state["amount"])}
+
+    g = StateGraph(Refund)
+    g.add_node("propose", propose); g.add_node("approve", approve); g.add_node("execute", execute)
+    g.add_edge(START, "propose"); g.add_edge("propose", "approve")
+    g.add_edge("approve", "execute"); g.add_edge("execute", END)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    # YOUR CODE HERE (bug 3): an in-memory saver dies with the process; use SqliteSaver(conn)
+    return g.compile(checkpointer=InMemorySaver())
+
+def cfg(order_id: str) -> dict:
+    return {"configurable": {"thread_id": f"refund-{order_id}"}}
+
+if __name__ == "__main__":
+    import os, tempfile
+    db = os.path.join(tempfile.mkdtemp(), "checkpoints.db")
+    outbox, payments = [], FakePayments(fail_once=True)
+    worker1 = make_app(db, outbox, payments)
+    worker1.invoke({"order_id": "A1001"}, cfg("A1001"))
+    worker2 = make_app(db, outbox, payments)            # a deploy happened while the run was paused
+    paused_at = worker2.get_state(cfg("A1001")).next
+    print("paused at:", paused_at)
+    if not paused_at:
+        print("the paused run was lost in the restart")
+    else:
+        try:
+            worker2.invoke(Command(resume="approve"), cfg("A1001"))
+        except ConnectionError as e:
+            print("first attempt:", e)
+            print("retry receipt:", worker2.invoke(None, cfg("A1001"))["receipt"])
+    print("emails:", outbox)
+    print("refunds created:", len(payments.created))
+```
+
+### Expected output
+The starter prints `paused at: ()` and `the paused run was lost in the restart`. With all three bugs
+fixed, `python lab.py` prints exactly:
+
+```
+paused at: ('approve',)
+first attempt: response lost after the refund was created
+retry receipt: rf-1
+emails: ['refund pending for A1001']
+refunds created: 1
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 4 fail with `AssertionError`s that name the bugs: an empty
+`next` after the restart, a second email, and receipt `rf-2` from a second refund. A correct solution
+passes all 4 (langgraph 1.2.16, pytest 9.1).
+
+```python
+import pytest
+from langgraph.types import Command
+from lab import FakePayments, cfg, make_app
+
+@pytest.fixture
+def db(tmp_path):
+    return str(tmp_path / "checkpoints.db")
+
+def test_pause_survives_a_restart(db):
+    outbox, pay = [], FakePayments()
+    make_app(db, outbox, pay).invoke({"order_id": "A1001"}, cfg("A1001"))
+    worker2 = make_app(db, outbox, pay)                     # new connection, new compiled graph
+    snap = worker2.get_state(cfg("A1001"))
+    assert snap.next == ("approve",)
+    assert snap.tasks[0].interrupts[0].value == {"question": "Refund 120.0 for A1001?"}
+    assert worker2.invoke(Command(resume="approve"), cfg("A1001"))["receipt"] == "rf-1"
+
+def test_notification_is_sent_once_across_the_pause(db):
+    outbox, pay = [], FakePayments()
+    app = make_app(db, outbox, pay)
+    app.invoke({"order_id": "A1001"}, cfg("A1001"))
+    app.invoke(Command(resume="approve"), cfg("A1001"))
+    assert outbox == ["refund pending for A1001"]
+
+def test_lost_response_retry_refunds_once(db):
+    outbox, pay = [], FakePayments(fail_once=True)
+    app = make_app(db, outbox, pay)
+    app.invoke({"order_id": "A1001"}, cfg("A1001"))
+    with pytest.raises(ConnectionError):
+        app.invoke(Command(resume="approve"), cfg("A1001"))
+    assert app.invoke(None, cfg("A1001"))["receipt"] == "rf-1"   # retry the failed node
+    assert len(pay.created) == 1
+
+def test_reject_and_small_refunds(db):
+    outbox, pay = [], FakePayments()
+    app = make_app(db, outbox, pay)
+    app.invoke({"order_id": "A1001"}, cfg("A1001"))
+    assert app.invoke(Command(resume="reject"), cfg("A1001"))["receipt"] == "cancelled"
+    out = app.invoke({"order_id": "B2002"}, cfg("B2002"))         # under 50: no pause, no email
+    assert out["receipt"] == "rf-1" and outbox == ["refund pending for A1001"]
+```
+
+### Failure scenarios
+- **Resume on a different `thread_id`.** There is no checkpoint, so the run starts from `START` with an
+  empty input and `propose` fails with `KeyError: 'order_id'`. Log the thread id at pause and at resume;
+  derive it from the order, never from a request id.
+- **Keep a random idempotency key.** The lost-response test returns `rf-2`: the retried `execute` node
+  created a second refund. Print `payments.created` after the retry; the key must come from state (order
+  or thread), so every re-run of the node sends the same one.
+- **Put a client object in state** (for example `payments`). The first checkpoint write fails with
+  `TypeError: Type is not msgpack serializable: FakePayments`. Keep only data in state and close over or
+  inject clients, as `make_app` does.
+- **Send the email in `notify` for every order.** The small-refund test fails because `B2002` (amount
+  30.0) gets an email though nothing waits for approval. Check each side-effect node's guard against the
+  routing condition.
+
+### Submission
+- **`lab.py`** with a separate `notify` node before `approve`, a deterministic refund key, and a
+  `SqliteSaver` checkpointer.
+- **A green test run** (4 passed) and the output of `python lab.py`.
+- **The checkpoint history** of thread `refund-A1001` after the run (`len(list(get_state_history(cfg)))`
+  and each snapshot's `next`), with one line on where the failed `execute` attempt shows up.
+- **A short note:** what changes for `PostgresSaver` with several workers (`setup()`, shared database,
+  retention of closed threads).
+- **Evaluated on:** tests passing, one email and one refund per approval, and a pause that survives a new
+  process.
 
 ## Why it exists
 - **Approvals take hours, processes do not wait.** A refund agent cannot hold a Python frame open until a

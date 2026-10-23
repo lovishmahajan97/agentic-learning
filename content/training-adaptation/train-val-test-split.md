@@ -163,8 +163,8 @@ flowchart TD
 - **"The split ratio sets how trustworthy the score is."** Absolute size does: the standard error is
   about `sqrt(p·(1−p)/n)`, so 200 tasks at 90% is about ±2 points whatever fraction of the data they are.
 - **"Two configs with overlapping error bars cannot be told apart."** Scored on the same tasks, only the
-  discordant tasks carry evidence; 15 vs 30 discordant tasks gives McNemar p ≈ 0.04 despite ±2.6-point
-  bars on each config.
+  discordant tasks carry evidence; 15 vs 30 discordant tasks gives McNemar p ≈ 0.04 even though the two
+  configs' 95% intervals (about ±5 points each at 300 tasks) overlap widely.
 - **"A prompt-only agent has no training set, so it cannot overfit."** Every prompt tweak kept because the
   dev score rose is fitting; few-shot examples are training data and must not appear in the eval set.
 

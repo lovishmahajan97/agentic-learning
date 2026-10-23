@@ -5,7 +5,8 @@ name: Data classification
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - security-governance-compliance/pii-protection-dlp
@@ -36,6 +37,61 @@ into chunks, embeddings, memory, summaries and fine-tuned weights.
   labels for cross-source agent outputs, and the reviewed path for declassifying redacted data.
 - **What you can skip.** Designing a scheme from scratch. Reuse the organisation's existing labels and spend
   the effort mapping agent artifacts and sinks onto them.
+
+## Decision case
+### Scenario
+A 3,000-person manufacturer is connecting an internal copilot agent to its document estate. The agent
+retrieves, summarises and can post to team channels. The question is how labels get onto the corpus and
+its derived chunks. All figures are illustrative planning numbers, not benchmarks.
+- **Corpus:** 1.2 million documents in 8 source systems (wiki, HR, finance, CRM, engineering drives and
+  others), about 20 chunks each, so about 24 million chunks.
+- **Endpoints under the control matrix:** an external API approved up to Internal, a zero-retention EU
+  endpoint up to Confidential, and a self-hosted model for Restricted that handles 8 requests a second.
+- **Traffic:** copilot peak of 40 requests a second, so the self-hosted model can serve at most 8 / 40 =
+  20% of peak.
+- **Audit need:** answer "which stores and indexes hold Restricted data" from metadata, not interviews.
+- **Deadline:** pilot in 10 weeks with 2 engineers and part-time data owners.
+
+### Options
+| Option | How it works | Effort | Label accuracy | Fits capacity? |
+|---|---|---|---|---|
+| Owner labels every document | Owners review each document | 1.2M x 30 s = 10,000 hours | high, but never finishes | yes |
+| Everything Restricted until declassified | Safe default, owners downgrade on request | low up front | over-labels nearly everything | no: 100% of traffic to an endpoint sized for 20% |
+| Scanner assigns labels both ways | DLP decides each chunk's label | low | misses lower labels silently | yes, but unsafe |
+| Source defaults plus scan-raise per chunk | Owners label each of the 8 sources (and folders where a source is mixed); chunks inherit, the scanner may only raise a chunk's label; sessions use high-water mark | about a week of owner time | good where sources are coherent | yes, if the Restricted share stays under 20% |
+
+### Decision
+**Source defaults set by owners, inheritance to every chunk, scanner raises only, and a session
+high-water mark in the orchestrator.** It is the only option that labels all 24 million chunks before the
+pilot without making the self-hosted endpoint the bottleneck.
+- **Capacity check:** in a pilot sample, 70% of requests stayed Internal or below, 25% reached
+  Confidential and 5% Restricted. 5% of 40 = 2 requests a second to the self-hosted model, well under 8.
+- **Audit answer:** every chunk payload, trace and memory entry carries its label, so the Restricted
+  stores are a metadata query.
+- **Aggregates labelled explicitly:** cross-source outputs such as "account health overview" get a label
+  set by the feature owner, not the computed maximum.
+
+**What would change it.** If the Restricted share passes 20% of peak, add self-hosted capacity or split
+sessions so Restricted reads run separately. If a source turns out to be a mixed dump with no coherent
+default, label it per folder before it is indexed.
+
+### Trade-offs accepted
+- **Label creep.** High-water mark only ratchets up. Track the share of sessions ending Confidential or
+  higher and run the reviewed declassification path for redacted outputs.
+- **Scanner false negatives.** A health note inside a wiki page stays Internal if the detector misses it.
+  Sample chunks monthly for missed labels and report the rate per source.
+- **Coarse sessions block harmless calls.** After a Confidential read, web search is refused. Count calls
+  refused by label and reorder public lookups before sensitive reads.
+
+### Review rubric
+- **Assignment path stated:** the write-up says who or what sets each label (owner, inheritance, scanner)
+  and that scanners never lower one.
+- **Effort and capacity computed:** labelling effort and routed traffic per endpoint follow from the
+  corpus size and label mix.
+- **Derivation covered:** chunks, embeddings, summaries, memory and any fine-tuned adapter carry a label.
+- **Labels separated from ACLs:** retrieval filters by entitlement first; the label then picks the
+  destination.
+- **Change triggers stated:** which label mix or source finding would reopen the decision.
 
 ## Why it exists
 - **Every control asks the same question.** How bad would it be if this leaked, was altered, or was

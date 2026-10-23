@@ -5,7 +5,8 @@ name: Data lineage
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - data-architecture/model-and-dataset-provenance
@@ -39,6 +40,70 @@ graph traversals, so lineage makes debugging and deletion possible.
   whether deletion drills run.
 - **What you can skip.** Column-level lineage across the warehouse and catalog vendor comparisons. Start
   with a lineage table, chunk stamps and the trace join.
+
+## Decision case
+### Scenario
+A fintech runs a customer-support agent with a RAG index, long-term memory and a monthly fine-tune on
+agent traces. Its data protection officer now requires two things: erasure requests completed and proven
+within 30 days, and disputed answers explained within 5 business days. Today nothing records which
+document version a chunk came from.
+
+Constraints (figures illustrative):
+- **Scale.** 40 million chunks from 3 ingestion jobs under Airflow; about 2 million memory writes and
+  5 million semantic-cache entries a month; one fine-tuning job a month.
+- **Team and time.** Two platform engineers for one quarter (about 12 weeks).
+- **Storage.** Stamping about 150 bytes of lineage per chunk is 40M × 150 B = 6 GB; that is acceptable.
+- **Proof.** Erasure must be shown by a repeatable drill, not by a statement that the code deletes it.
+- **Ownership.** Only the AI platform team queries the graph this year; the warehouse team has its own tools.
+
+### Options
+| Option | How it works | Erasure proof | Dispute explanation | Fits 12 weeks? |
+|---|---|---|---|---|
+| **A. Declared lineage** | DAG files and READMEs imported into a catalog | No: shows intended graph, not versions or request-path copies | No: no chunk-to-version link | Yes |
+| **B. Full catalog, column-level everywhere** | OpenLineage from every job into a catalog, column-level across the warehouse, record-level for AI data | Yes | Yes | No: warehouse coverage alone is a multi-quarter project |
+| **C. Run-time lineage for AI data only** | Airflow OpenLineage events into a lineage table or Marquez; chunk stamps; trace join; input ids on memory and cache writes; versioned training snapshots | Yes, through forward traversal and drills | Yes, trace to chunk to document version | Yes |
+| **D. Request-path ids only** | Input ids on memories and caches, nothing for batch jobs | Partial: misses chunks' versions and training snapshots | Partial | Yes |
+
+### Decision
+Choose **C**, run-time lineage scoped to what feeds the agent:
+- **It answers both DPO questions within the quarter.** Forward traversal from a customer's documents
+  reaches chunks, vectors, memories, cache rows and the training snapshot. The trace's chunk ids resolve
+  to a document version for disputes.
+- **Run-time capture is required for proof.** A, like any declared graph, describes what could run, so a
+  drill built on it can pass while a real copy survives.
+- **Record level only where deletion and citation need it.** The warehouse stays table-level, which removes
+  most of B's effort.
+- **The request path is in scope from day one.** About 7 million memory and cache rows a month would
+  otherwise be the hole that breaks the 30-day erasure.
+- **Weights are named, not cleaned.** Traversal names the monthly checkpoints trained on a snapshot holding
+  the data; the retention policy decides whether to retrain or retire them.
+
+What would change it:
+- **A second team needs to query the graph.** Then send the same OpenLineage events to a shared catalog
+  rather than rebuild.
+- **Regulators ask for column-level derivations of reported figures.** Then the warehouse part of B becomes
+  required work, planned separately.
+- **The fine-tune is dropped.** Then training snapshots leave scope and C shrinks.
+
+### Trade-offs accepted
+- **An owned lineage table instead of a catalog.** Less tooling, more custom queries; watch how often
+  people ask questions the table cannot answer.
+- **No column-level lineage.** Schema-change impact on the warehouse stays manual; watch incidents caused
+  by upstream column changes.
+- **Instrumentation debt on every new writer.** Any new tool that persists state must record input ids;
+  enforce it with a CI coverage gate and watch derived rows with empty input-id fields.
+- **Snapshot storage.** Retaining training snapshots costs space; watch retained snapshot size against the
+  window in which "was this example trained on" can still be asked.
+
+### Review rubric
+- **Questions drive scope.** The write-up names the questions lineage must answer (erasure, disputes,
+  regressions) and the granularity each needs.
+- **Capture is at run time,** with named facets (input versions, code commit, container digest, row counts).
+- **Request-path artifacts are covered:** memories, caches, saved answers and feedback copies record input ids.
+- **The trace join is specified:** retrieved chunk ids on the retrieval tool's span, resolving to a document
+  version.
+- **Proof is a drill:** a scheduled forward traversal and purge with a pass rate and a time target.
+- **Limits are honest:** it says what lineage cannot do for model weights and what decides that instead.
 
 ## Why it exists
 - **AI systems are long chains of transformations.** Source documents become parsed text, then chunks,

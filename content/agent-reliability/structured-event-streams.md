@@ -5,7 +5,8 @@ name: Structured event streams
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -43,6 +44,229 @@ replayable source of truth instead of four drifting formats.
   events are durable before the agent acts, payloads by reference, and upcasters for schema changes.
 - **What you can skip.** Full event-sourcing and CQRS frameworks. A single writer per run, an
   append-only table with a unique `(run_id, seq)` and a pure fold cover most agents.
+
+## Lab
+### Task
+Build the event stream under an agent run: a SQLite log with a single-writer `seq`, an upcaster for last
+month's event shape, a pure fold, a durable-first tool call and SSE replay from `Last-Event-ID`.
+Time box: 60-90 min.
+- **The agent-facing goal:** crash a worker mid-call and show that resume sees the ambiguous call as
+  pending, not as never run.
+- **Prerequisites:** The agent loop; Streaming; the fold and clock-skew examples in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13, pytest 9.1 and the stdlib
+  `sqlite3`). Save the starter as `lab.py` and the tests as `test_lab.py`.
+- **No services:** an in-memory SQLite table stands in for Postgres, and `Crash` (a `BaseException`)
+  stands in for the worker process dying.
+- **You implement five small functions:** `EventLog.append`, `upcast`, `apply`, `call_tool` and
+  `frames_after`.
+
+### Starter code
+```python
+"""Lab: a durable, versioned event stream for an agent run, with fold, crash resume and SSE replay.
+Run: python lab.py"""
+import json
+import sqlite3
+
+CURRENT_VERSION = {"tool.call.result": 2}          # every other type is at version 1
+
+class Crash(BaseException):
+    """Simulates the worker process dying mid-call; not an Exception, so nothing should catch it."""
+
+class EventLog:
+    """Append-only log. The agent process is the single writer for a run; seq starts at 1 per run."""
+    def __init__(self):
+        self.db = sqlite3.connect(":memory:")
+        self.db.execute("CREATE TABLE events (run_id TEXT, seq INTEGER, type TEXT, version INTEGER,"
+                        " payload TEXT, UNIQUE (run_id, seq))")
+
+    def append(self, run_id: str, type: str, payload: dict, version: int | None = None) -> dict:
+        """Assign seq = 1 + the highest seq stored for run_id (1 for a new run), insert the row
+        (payload as JSON; version defaults to CURRENT_VERSION.get(type, 1)) and return the event as
+        {"run_id", "seq", "type", "version", "payload"}."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+    def read(self, run_id: str, after_seq: int = 0) -> list[dict]:
+        rows = self.db.execute("SELECT run_id, seq, type, version, payload FROM events"
+                               " WHERE run_id = ? AND seq > ? ORDER BY seq", (run_id, after_seq))
+        return [{"run_id": r, "seq": s, "type": t, "version": v, "payload": json.loads(p)}
+                for r, s, t, v, p in rows]
+
+def upcast(ev: dict) -> dict:
+    """Return the event in its current shape without mutating the input.
+    tool.call.result v1 payload {"call_id", "status": "ok" | "error", "error"?} becomes v2
+    {"call_id", "ok": <bool>, "error": <str or None>}. A version newer than CURRENT_VERSION raises
+    ValueError (refuse to misparse). Anything else is returned unchanged."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def apply(state: dict, ev: dict) -> dict:
+    """Pure fold over upcast events. No clock, no I/O.
+    llm.response        -> messages += {"role": "assistant", "content": text}
+    tool.call.requested -> pending[call_id] = idem_key
+    tool.call.result    -> remove call_id from pending; messages += {"role": "tool", "call_id", "ok"}
+    run.completed       -> done = True, answer = payload answer"""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def rebuild(events: list[dict]) -> dict:
+    state = {"messages": [], "pending": {}, "done": False, "answer": None}
+    for ev in sorted(events, key=lambda e: e["seq"]):             # by seq, never by timestamp
+        state = apply(state, upcast(ev))
+    return state
+
+def call_tool(log: EventLog, run_id: str, call_id: str, name: str, args: dict, tool) -> dict:
+    """Durable first, then act. Append tool.call.requested {"call_id", "name", "args",
+    "idem_key": f"{run_id}:{call_id}"} BEFORE calling tool(args, idem_key). Then append
+    tool.call.result {"call_id", "ok": True, "error": None} or, if the tool raises an Exception,
+    {"call_id", "ok": False, "error": <exception class name>}. Return the result payload.
+    A Crash must propagate with no result event written."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def frames_after(log: EventLog, run_id: str, last_event_id: str | None) -> list[str]:
+    """SSE frames for every event after the browser's Last-Event-ID (None means from the start):
+    f"id: {seq}\\nevent: {type}\\ndata: {json.dumps(payload)}\\n\\n" """
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def lookup_order(args, idem_key):
+    return {"order_id": args["order_id"], "status": "shipped"}
+
+def refund(args, idem_key):
+    raise Crash()                                   # the worker dies after the request is durable
+
+if __name__ == "__main__":
+    log = EventLog()
+    log.append("old", "tool.call.requested", {"call_id": "c0", "name": "lookup_order", "args": {}, "idem_key": "old:c0"})
+    log.append("old", "tool.call.result", {"call_id": "c0", "status": "ok"}, version=1)   # last month's shape
+    print("old run replays:", rebuild(log.read("old"))["messages"])
+
+    log.append("r1", "run.started", {"task": "refund o1"})
+    log.append("r1", "llm.response", {"text": "Checking the order first."})
+    print("c1:", call_tool(log, "r1", "c1", "lookup_order", {"order_id": "o1"}, lookup_order))
+    try:
+        call_tool(log, "r1", "c2", "refund", {"order_id": "o1"}, refund)
+    except Crash:
+        print("worker crashed during c2")
+    state = rebuild(log.read("r1"))
+    print("pending after crash:", state["pending"])
+    print("types:", [e["type"] for e in log.read("r1")])
+    print("reconnect after id 3:", [f.split("\n")[0] for f in frames_after(log, "r1", "3")])
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+old run replays: [{'role': 'tool', 'call_id': 'c0', 'ok': True}]
+c1: {'call_id': 'c1', 'ok': True, 'error': None}
+worker crashed during c2
+pending after crash: {'c2': 'r1:c2'}
+types: ['run.started', 'llm.response', 'tool.call.requested', 'tool.call.result', 'tool.call.requested']
+reconnect after id 3: ['id: 4', 'id: 5']
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (Python 3.13, pytest 9.1).
+
+```python
+import copy
+import json
+import sqlite3
+import pytest
+from lab import Crash, EventLog, apply, call_tool, frames_after, rebuild, upcast
+
+def ok_tool(args, key):
+    return "done"
+
+def failing_tool(args, key):
+    raise TimeoutError("vendor")
+
+def crashing_tool(args, key):
+    raise Crash()
+
+def test_single_writer_assigns_seq_per_run_and_the_key_is_unique():
+    log = EventLog()
+    assert [log.append("a", "run.started", {})["seq"] for _ in range(3)] == [1, 2, 3]
+    assert log.append("b", "run.started", {})["seq"] == 1
+    assert log.read("a")[0]["version"] == 1 and log.read("a", after_seq=2)[0]["seq"] == 3
+    with pytest.raises(sqlite3.IntegrityError):
+        log.db.execute("INSERT INTO events VALUES ('a', 2, 'x', 1, '{}')")
+
+def test_upcaster_converts_v1_without_mutating_and_refuses_the_future():
+    v1 = {"run_id": "r", "seq": 2, "type": "tool.call.result", "version": 1,
+          "payload": {"call_id": "c0", "status": "error", "error": "timeout"}}
+    snapshot = json.dumps(v1)
+    v2 = upcast(v1)
+    assert v2["version"] == 2 and v2["payload"] == {"call_id": "c0", "ok": False, "error": "timeout"}
+    assert json.dumps(v1) == snapshot
+    with pytest.raises(ValueError):
+        upcast({**v1, "version": 3})
+
+def test_request_is_durable_before_the_tool_runs():
+    log = EventLog()
+    seen = []
+    def spy(args, key):
+        seen.append([e["type"] for e in log.read("r")])
+        return "ok"
+    call_tool(log, "r", "c1", "spy", {}, spy)
+    assert seen == [["tool.call.requested"]]
+    assert log.read("r")[0]["payload"]["idem_key"] == "r:c1"
+
+def test_tool_errors_are_events_and_crashes_leave_a_pending_call():
+    log = EventLog()
+    assert call_tool(log, "r", "c1", "t", {}, failing_tool) == {"call_id": "c1", "ok": False, "error": "TimeoutError"}
+    with pytest.raises(Crash):
+        call_tool(log, "r", "c2", "t", {}, crashing_tool)
+    state = rebuild(log.read("r"))
+    assert state["pending"] == {"c2": "r:c2"}
+    assert state["messages"] == [{"role": "tool", "call_id": "c1", "ok": False}]
+
+def test_checkpoint_plus_tail_equals_full_fold():
+    log = EventLog()
+    log.append("r", "llm.response", {"text": "hi"})
+    call_tool(log, "r", "c1", "t", {}, ok_tool)
+    log.append("r", "run.completed", {"answer": "done"})
+    full = rebuild(log.read("r"))
+    assert full["done"] is True and full["answer"] == "done" and full["pending"] == {}
+    events = log.read("r")
+    resumed = copy.deepcopy(rebuild(events[:2]))                # checkpoint at seq 2
+    for ev in events[2:]:
+        resumed = apply(resumed, upcast(ev))
+    assert resumed == full and rebuild(list(reversed(events))) == full
+
+def test_reconnect_gets_no_gaps_and_no_duplicates():
+    log = EventLog()
+    for i in range(5):
+        log.append("r", "llm.response", {"text": str(i)})
+    first = frames_after(log, "r", None)
+    assert first[0] == 'id: 1\nevent: llm.response\ndata: {"text": "0"}\n\n'
+    again = frames_after(log, "r", "3")
+    assert [f.split("\n")[0] for f in again] == ["id: 4", "id: 5"]
+```
+
+### Failure scenarios
+- **Append `tool.call.requested` after the tool returns.** The durable-first test fails, and after a
+  crash the fold shows nothing pending, so resume would run the refund again. Read the event types in
+  order: every tool's request must precede anything the tool did.
+- **Catch `BaseException` in `call_tool`.** The crash is swallowed and recorded as a failed result, so the
+  log claims to know an outcome nobody saw. Only `Exception` is a tool error; process death leaves the
+  call pending by design.
+- **Upcast by editing `ev["payload"]` in place.** The no-mutation assertion fails; in production a
+  replay rewrites cached history. Compare a JSON snapshot of the event before and after the upcast.
+- **Use `seq >= last_event_id` in `frames_after`.** The reconnect returns frame 3 twice and the UI shows a
+  duplicated step. Log the client's `Last-Event-ID` and the first `seq` sent on every reconnect.
+
+### Submission
+- **`lab.py`** with the five functions implemented; `read`, `rebuild` and the tools unchanged.
+- **A green test run** (6 passed) and the printed output of `python lab.py`.
+- **One extra test** of your own: a second v1 shape (a missing `error` key) and what the fold records.
+- **A short note** on how the runtime should resolve the pending `c2` (same idempotency key, or a status
+  lookup) and why it must not assume the refund did not happen.
+- **Evaluated on:** `seq` from one writer, durable-first ordering, a pure fold that survives old
+  versions, and gap-free, duplicate-free replay.
 
 ## Why it exists
 - **Every new consumer invents a format.** The first agent returns a final answer. The second needs a

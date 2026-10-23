@@ -5,7 +5,8 @@ name: A2A protocol (Agent2Agent)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -176,6 +177,24 @@ stateDiagram-v2
     canceled --> [*]
     rejected --> [*]
 ```
+
+## Misconceptions
+- **"A2A is just MCP for agents; wrap the peer as a tool and you are done."** A tool call is a
+  synchronous typed function. A peer agent may run for minutes, pause in `input-required` to ask back,
+  and return several artifacts, so it needs a task id and a lifecycle, not a single return value.
+- **"A follow-up question reopens the finished task."** Terminal tasks are immutable. A new request
+  ("now refund the second invoice too") is a new task in the same `contextId`; only an interrupted task
+  (`input-required`, `auth-required`) is continued on the same task id.
+- **"A push notification tells you the result."** The payload is a hint from an unverified sender until
+  proven otherwise. Check the token or signature agreed at registration, then read the authoritative
+  state with `tasks/get`.
+- **"Output from a partner's agent is trusted because we authenticated the partner."** Authentication
+  says who sent it, not that it is safe. Peer artifacts and questions reach your model like a web page
+  would, so fence them off as untrusted input.
+- **"Opacity means you cannot debug across agents."** You cannot see the peer's internals, but you can
+  join logs: record the remote task id on your span so both teams can trace the same task.
+- **"Polling is fine for any task length."** Polling every 2 s for a twenty-minute task is 600 requests;
+  at 1,000 tasks a day that is about 600,000 requests of overhead. Long tasks belong on push.
 
 ## Examples
 ### Minimal client: discover, send, poll, answer questions

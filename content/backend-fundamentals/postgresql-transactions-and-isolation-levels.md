@@ -5,7 +5,8 @@ name: PostgreSQL transactions & isolation levels
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/database-design
@@ -39,6 +40,220 @@ with atomic updates, row locks, or SERIALIZABLE plus retries.
   `40001`, and timeouts that kill leaked transactions.
 - **What you can skip.** SSI internals and the full anomaly literature. Know the four anomalies, which
   level allows which, and the "reserve, commit, call, settle" pattern.
+
+## Lab
+### Task
+Two agent workers share a tenant's token budget, and three defects showed up together: concurrent
+reservations overspend, every step holds a transaction open across the model call, and a resumed
+worker crashes on a step another worker already claimed.
+
+You will fix `reserve` and `run_step` so they follow "reserve, commit, call, settle". The lab runs on
+standard-library SQLite with two connections to one file, standing in for PostgreSQL at READ COMMITTED;
+a trace callback slips worker B in just before worker A writes, so the race is deterministic. Time box:
+45-60 minutes.
+- **Prerequisites:** this lesson's lost-update walk-through and Transaction boundaries section, and the
+  agent scenario under Examples. Database design (unique step rows) helps.
+- **Setup:** Python 3.11+ (checked against SQLite 3.53.1; `RETURNING` needs 3.35+), `pip install
+  pytest` (checked against pytest 9.1.1). Save the starter as `agent_budget.py` and the tests as
+  `test_agent_budget.py` in one directory.
+- **Goal:** exactly one of two racing reservations is granted, no transaction is open during the model
+  call, a second claim of a step returns `"already claimed"`, and a crash mid-call leaves the claim.
+
+### Starter code
+```python
+"""agent_budget.py: token budgets and step execution for concurrent agent runs. SQLite stands in for
+PostgreSQL at READ COMMITTED here: the lost update and the transaction-boundary bugs have the same shape."""
+import os
+import sqlite3
+import tempfile
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS tenants (
+  id INTEGER PRIMARY KEY, tokens_used INTEGER NOT NULL, budget INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS steps (
+  run_id TEXT NOT NULL, step INTEGER NOT NULL, tenant_id INTEGER NOT NULL,
+  reserved INTEGER NOT NULL, tokens INTEGER, status TEXT NOT NULL, UNIQUE (run_id, step));
+"""
+
+
+def connect(path):
+    db = sqlite3.connect(path, isolation_level=None, timeout=5)   # autocommit; BEGIN explicitly
+    db.executescript(SCHEMA)
+    return db
+
+
+def reserve(db, tenant_id, cost):
+    """Add cost to the tenant's usage if it stays within budget. True if reserved."""
+    used, budget = db.execute("SELECT tokens_used, budget FROM tenants WHERE id = ?",
+                              (tenant_id,)).fetchone()
+    if used + cost > budget:
+        return False
+    db.execute("UPDATE tenants SET tokens_used = ? WHERE id = ?",   # EXERCISE 1: lost update
+               (used + cost, tenant_id))
+    return True
+
+
+def run_step(db, tenant_id, run_id, step, estimate, call_model):
+    """Reserve, claim, call, settle. Returns "done", "over budget" or "already claimed".
+    call_model(idempotency_key) returns the tokens actually used."""
+    db.execute("BEGIN")                          # EXERCISE 2: no transaction across the model call
+    try:
+        if not reserve(db, tenant_id, estimate):
+            db.execute("ROLLBACK")
+            return "over budget"
+        db.execute("INSERT INTO steps VALUES (?, ?, ?, ?, NULL, 'claimed')",   # EXERCISE 3: a second
+                   (run_id, step, tenant_id, estimate))                         # claim must not crash
+        actual = call_model(f"{run_id}:{step}")
+        db.execute("UPDATE steps SET tokens = ?, status = 'done' WHERE run_id = ? AND step = ?",
+                   (actual, run_id, step))
+        db.execute("UPDATE tenants SET tokens_used = tokens_used + ? WHERE id = ?",
+                   (actual - estimate, tenant_id))
+        db.execute("COMMIT")
+        return "done"
+    except Exception:
+        db.execute("ROLLBACK")
+        raise
+
+
+if __name__ == "__main__":
+    path = os.path.join(tempfile.mkdtemp(), "agent.db")
+    a, b = connect(path), connect(path)          # two workers, two connections
+    a.execute("INSERT INTO tenants VALUES (42, 999000, 1000000)")
+    granted = []
+
+    def slip_b_in(sql):                          # run worker B just before worker A writes
+        if sql.upper().startswith("UPDATE") and not granted:
+            granted.append(reserve(b, 42, 800))
+
+    a.set_trace_callback(slip_b_in)
+    granted.append(reserve(a, 42, 800))
+    a.set_trace_callback(None)
+    used = a.execute("SELECT tokens_used FROM tenants").fetchone()[0]
+    print("granted:", granted.count(True), "| tokens_used:", used)
+
+    a.execute("UPDATE tenants SET tokens_used = 0")
+    seen = []
+
+    def model(key):                              # what another worker sees during the model call
+        seen.append(b.execute("SELECT status FROM steps WHERE run_id = 'r1' AND step = 7").fetchone())
+        return 500
+
+    print("step 7:", run_step(a, 42, "r1", 7, 800, model), "| claim visible during call:", seen[0])
+    try:
+        print("step 7 again:", run_step(b, 42, "r1", 7, 800, model))
+    except sqlite3.Error as e:
+        print("step 7 again:", type(e).__name__, e)
+    print("tokens_used:", a.execute("SELECT tokens_used FROM tenants").fetchone()[0])
+```
+
+### Expected output
+The starter prints `granted: 2 | tokens_used: 999800` (two grants, one counted: the lost update),
+`claim visible during call: None` and `IntegrityError UNIQUE constraint failed: steps.run_id, steps.step`.
+After the fix, `python agent_budget.py` prints:
+
+```text
+granted: 1 | tokens_used: 999800
+step 7: done | claim visible during call: ('claimed',)
+step 7 again: already claimed
+tokens_used: 500
+```
+
+### Tests
+On the starter all 4 fail: `assert 2 == 1` on the grants, `assert not True` on `a.in_transaction`
+inside the model call, `IntegrityError` on the second claim, and `assert None == ('claimed', 800)`
+after the crash. The race test admits only a single-statement fix, because a lock held by worker A
+would make worker B wait on the same thread.
+
+```python
+import pytest
+
+from agent_budget import connect, reserve, run_step
+
+
+@pytest.fixture
+def dbs(tmp_path):
+    a, b = connect(tmp_path / "agent.db"), connect(tmp_path / "agent.db")
+    a.execute("INSERT INTO tenants VALUES (42, 999000, 1000000)")
+    return a, b
+
+
+def used(db):
+    return db.execute("SELECT tokens_used FROM tenants WHERE id = 42").fetchone()[0]
+
+
+def test_concurrent_reserves_grant_only_what_fits(dbs):
+    a, b = dbs
+    results = []
+
+    def slip_b_in(sql):                          # B runs in full just before A's write
+        if sql.upper().startswith("UPDATE") and not results:
+            results.append(reserve(b, 42, 800))
+
+    a.set_trace_callback(slip_b_in)
+    results.append(reserve(a, 42, 800))
+    assert len(results) == 2, "reserve must write with an UPDATE"
+    assert results.count(True) == 1
+    assert used(a) == 999_800
+
+
+def test_claim_is_committed_before_the_model_call(dbs):
+    a, b = dbs
+    a.execute("UPDATE tenants SET tokens_used = 0")
+
+    def model(key):
+        assert not a.in_transaction
+        assert b.execute("SELECT status FROM steps WHERE run_id = 'r1' AND step = 7").fetchone() == ("claimed",)
+        return 500
+
+    assert run_step(a, 42, "r1", 7, 800, model) == "done"
+    assert used(a) == 500                        # settle released the unused 300
+
+
+def test_second_claim_of_a_step_is_refused(dbs):
+    a, b = dbs
+    calls = []
+    model = lambda key: calls.append(key) or 100
+    assert run_step(a, 42, "r1", 7, 800, model) == "done"
+    assert run_step(b, 42, "r1", 7, 800, model) == "already claimed"
+    assert calls == ["r1:7"]
+    assert used(a) == 999_100
+
+
+def test_crash_during_call_leaves_the_claim(dbs):
+    a, b = dbs
+
+    def crash(key):
+        raise TimeoutError("provider timed out")
+
+    with pytest.raises(TimeoutError):
+        run_step(a, 42, "r1", 3, 800, crash)
+    assert b.execute("SELECT status, reserved FROM steps WHERE run_id = 'r1' AND step = 3").fetchone() == ("claimed", 800)
+```
+
+### Failure scenarios
+- **Inject: reserve before claiming, then catch the unique violation.** The second-claim test fails
+  with `assert 999900 == 999100` if the reservation is committed, or works only by rolling back both. Debug:
+  claim first in the same short transaction, and roll back the claim when the budget refuses.
+- **Inject: commit the claim but settle with `SET tokens_used = <computed value>`.** A concurrent
+  reservation between call and settle is overwritten: the lost update again, in the settle step. Debug:
+  run the race callback against settle; adjust with `tokens_used + (actual - estimate)`.
+- **Inject: catch the `IntegrityError` and keep using the transaction.** In PostgreSQL every later
+  statement fails with `current transaction is aborted`. Debug: use `ON CONFLICT DO NOTHING` and check
+  the affected row count, or roll back to a savepoint.
+- **Inject: forget the second `COMMIT` in settle.** The demo looks right on connection A while worker B
+  still reads `('claimed',)`. Debug: read from the other connection, or check `a.in_transaction`.
+
+### Submission
+- **Your fixed `agent_budget.py`**, with the given tests unchanged.
+- **A `pytest -v` log** with all 4 passing, plus the starter's failing run for comparison.
+- **The `python agent_budget.py` output** after the fix.
+- **One extra test** of your own, for example that an estimate over the remaining budget returns
+  `"over budget"` and leaves no step row.
+- **A short note** translating each fix to PostgreSQL: the conditional `UPDATE ... RETURNING`, the
+  unique `(run_id, step)` claim committed before the call, and what `idle_in_transaction_session_timeout`
+  would have caught in the starter.
+- **Evaluated by:** the given tests pass unmodified, your test fails on the starter, and no model call
+  runs inside a transaction.
 
 ## Why it exists
 - **Crashes split related writes.** Without transactions, a crash between "insert the message" and

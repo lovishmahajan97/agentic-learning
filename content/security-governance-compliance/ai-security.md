@@ -5,7 +5,8 @@ name: AI security
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - security-governance-compliance/threat-modeling
@@ -40,6 +41,64 @@ output handling, approval gates and monitoring, not cleverer prompts.
   loop steps.
 - **What you can skip.** Memorising every OWASP or ATLAS entry. Learn the three facts and the trifecta
   test; they let you review any agent design in minutes and pick the deeper lessons that apply.
+
+## Decision case
+### Scenario
+A B2B software company wants a sales-research agent. For each prospect it browses the prospect's
+website and news, reads the account's history in the CRM, and writes a personalised outreach email.
+Security must sign off before launch. All figures are illustrative planning numbers, not benchmarks.
+- **Scale:** 60 sales reps, about 40 prospects each a day, so 60 x 40 = 2,400 runs a day; at about 5
+  fetched pages per run that is 12,000 untrusted pages a day.
+- **Security requirement:** no session may hold untrusted content, CRM access and an outbound channel
+  unless a code-enforced break sits between them. The system prompt does not count.
+- **Product requirement:** reps keep their own voice and already reread every outreach email before
+  sending; nobody wants automatic sending in this release.
+- **Latency:** research for one prospect finishes within 90 s.
+- **Team and deadline:** 3 Python engineers, launch in 6 weeks.
+
+### Options
+| Option | How it works | Breaks the trifecta in code? | Rep effort | Fits 6 weeks? |
+|---|---|---|---|---|
+| Guardrail prompt plus input classifier | One agent with `fetch_url`, `read_crm`, `send_email`; prompt forbids following page instructions | No: both controls are inside the steerable channel | none | yes, but fails the security requirement |
+| One agent, taint plus approval on every send | Reading a page taints the run; each send needs the rep to approve the exact arguments | Yes, via the human | 40 approvals a rep a day, which reps do anyway as rereads | yes |
+| Split sessions plus drafts only | A reader session browses with no CRM and no send tools and returns schema-validated fields; a writer session reads CRM scoped to the rep and can only create a draft in the rep's mailbox | Yes: no single session holds all three legs, and the only exit is a draft a human sends | same rereads, no new clicks | yes, about a week more than option two |
+
+### Decision
+**Split sessions with drafts only.** The reader holds untrusted content but no sensitive data and no
+channel out. The writer holds CRM data, but its only output is `create_draft`, sent to the prospect's
+domain from the CRM record, never an address taken from a page.
+- **Why it meets the security requirement:** the break is structural, so it holds even when the reader
+  is fully steered; the worst a poisoned page can do is put false text into a draft a rep reads.
+- **Why not approval on every send:** it relies on 2,400 human checks a day staying careful, while the
+  split removes the leg without asking reps for anything new.
+- **Why not the guardrail prompt:** it does not change what a steered model can do.
+
+**What would change it.** If the business later wants automatic sequences with no human send, keep the
+split and add a recipient allowlist, outbound DLP on the draft body and a canary scan before any send. If
+browsing is replaced by a curated internal news feed, the untrusted leg shrinks and a single session
+becomes defensible.
+
+### Trade-offs accepted
+- **Coarser research.** The writer sees only the reader's typed fields (company summary capped at 600
+  characters, recent events, product names), not raw pages. Watch draft quality ratings from reps and the
+  share of drafts rewritten by more than half.
+- **Injected text can still reach a draft.** The summary field is free text from untrusted pages, so it
+  stays tainted. Strip links and images from it, log its source URLs, and alert when a draft contains a
+  URL or address not present in the CRM record.
+- **Two sessions cost more tokens and time.** Track p95 research time against the 90 s budget and tokens
+  per run.
+
+### Review rubric
+- **Trifecta mapped per session:** the write-up lists, for each session, which of untrusted content,
+  sensitive access and channel out it holds, and shows no session holds all three without a code break.
+- **Controls sit outside the model:** every claimed control names the code or token scope that enforces
+  it; prompt instructions and classifiers appear only as defence in depth.
+- **Numbers follow from inputs:** runs, pages and approval load are recomputed from reps, prospects and
+  pages per run, and labelled illustrative.
+- **Residual risk named:** the write-up says what a fully steered reader can still cause and how it is
+  detected.
+- **Change triggers stated:** it names the product change (automatic sending, new tools) that would
+  reopen the decision.
 
 ## Why it exists
 Three things changed when an LLM went into the system.

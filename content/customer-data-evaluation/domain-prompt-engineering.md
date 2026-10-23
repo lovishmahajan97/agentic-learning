@@ -5,7 +5,8 @@ name: Domain prompt engineering
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - prompting/prompt-engineering
@@ -35,6 +36,76 @@ path, each rule traced to an SME decision and eval case.
   and the eval gate every prompt change must pass.
 - **What you can skip.** Clever phrasing and persona tricks. The work is elicitation from SMEs, explicit
   definitions and testing on held-out customer cases.
+
+## Decision case
+### Scenario
+A logistics-software vendor runs the shipment-exception triage agent from the Examples for Acme, on
+prompt `acme-freight-v7`. Two more freight customers sign, and must be live in 6 weeks. All numbers
+below are illustrative.
+
+- **Volume.** About 3,000 triage runs a day across the three customers, averaging 4 model steps per run,
+  so about 12,000 steps a day, each re-sending the system prompt.
+- **Knowledge.** SME interviews show the three share most of about 15 rules. A shared base (procedure, shared
+  rules, tool schemas, common glossary) is about 3,500 tokens; each customer's differences fit in
+  an overlay of up to 800 tokens.
+- **Change rate.** Each customer's policy owner changes a few rules a month, not weekly.
+
+Constraints:
+- **Write actions.** `issue_sla_credit` moves money, so every credit must trace to a prompt version and a
+  cited rule id for audit.
+- **Latency.** p95 of 20 seconds per triage run (the team's own SLO).
+- **People.** Two engineers and one FDE; each customer gives about 4 SME hours a week.
+- **Eval data.** Each customer has a golden set of about 240 cases (160 iteration, 80 holdout), as Acme does.
+
+### Options
+| Option | How it works | Onboarding in 6 weeks | Audit and traceability | Cost per step and latency |
+|---|---|---|---|---|
+| **A. One full prompt per customer** | Copy `acme-freight-v7`, edit per customer | Fast for the first copy | One version id each, but a base fix must be hand-applied 3 times and drifts | About 4,300 tokens per step, cacheable |
+| **B. Shared base plus overlays, inline** | Compose base and overlay at build time, one version id per composed prompt | Fits: new work is the overlay and glossary interviews | Every trace logs one composed id, every output cites a rule | About 4,300 tokens per step (3,500 + 800), stable prefix, cacheable |
+| **C. Core inline, rules retrieved** | Keep procedure inline, fetch customer rules with a retrieval tool | Needs a retrieval index and its own eval | Harder: the rule set varies per run, so the trace must log what was retrieved | Smaller prefix, but about one extra step per run (4 becomes 5) |
+| **D. Fine-tune on SME-labelled traces** | Train the behaviour in, short prompt | Does not fit: 240 gold cases per customer is too few to train on and still hold out | Weak: rules are no longer inspectable text | Smallest prompt |
+
+### Decision
+Choose **B**, because the constraints reward inspectable rules and the knowledge is still small:
+- **The deciding knowledge fits.** Retrieval starts to win once rules number in the dozens; here there are
+  about 15 and each composed prompt is about 4,300 tokens, so inlining keeps every rule in view on every step.
+- **Audit is a hard constraint.** One composed version id per trace plus a cited rule id maps each credit
+  to exact text. Option C would make the rules in force differ per run.
+- **Per-request facts already go through tools.** Consignee contracts and shipment data come from
+  `get_shipment` results, not from the prompt, as in "Separate stable knowledge from per-request context".
+- **Six weeks is spent on SME interviews,** not infrastructure: each new customer needs only an overlay, its
+  glossary entries and its golden set.
+
+What would change it:
+- **Rule count.** If a customer's overlay grows into the dozens of rules, or a policy owner starts changing
+  rules weekly, move that customer's long tail to retrieval (C) and keep the procedure inline.
+- **Divergence.** If overlays start overriding most base rules, the base is no longer shared; split it (A).
+- **Style failures.** If a skill keeps failing after several prompt rounds and labelled data grows enough to
+  train and still hold out, try D.
+
+### Trade-offs accepted
+- **One base edit touches every customer.** Watch it with the eval gate: any base change runs all three
+  golden sets, and the merge is blocked if any customer drops beyond the agreed tolerance.
+- **The full prefix is re-sent on every step.** About 4,300 tokens times 12,000 steps is about 51.6 million
+  prefix tokens a day. Keep it byte-stable for caching and monitor cached input tokens per step.
+- **Overlay rules can conflict with base rules.** State in the overlay which base rule each override
+  replaces, and track per-rule citation counts; a never-cited rule is an ablation candidate.
+- **SME hours stay the bottleneck.** About 4 hours a week per customer limits how many rules can be
+  elicited and checked, so prioritise the terms behind the largest definition-error clusters.
+
+### Review rubric
+- **Constraints carry numbers.** The write-up states volume, steps per run, prompt size, change rate and
+  deadline before comparing options.
+- **Knowledge is placed deliberately.** It says what goes in the base, what in overlays, and what arrives
+  as per-request tool results, with a reason for each.
+- **Write actions are traceable.** Every consequential tool call maps to a prompt version id and a cited
+  rule, and the write-up says where that is logged.
+- **Cost is recomputed.** Prefix tokens per day follow from tokens per step times steps per day, and
+  caching is treated as provider-dependent, not assumed.
+- **The eval gate covers shared changes.** A base edit runs every customer's golden set, holdout included,
+  with a stated tolerance.
+- **Reversal conditions are concrete.** It names the rule count, change rate or divergence that would move
+  a customer to retrieval, separate prompts or fine-tuning.
 
 ## Why it exists
 - **The model knows the public domain, not this customer.** A frontier model has read plenty about

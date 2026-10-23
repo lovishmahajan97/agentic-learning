@@ -5,7 +5,8 @@ name: Enterprise connectors (Salesforce, SAP, ServiceNow, SharePoint, Confluence
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - enterprise-integration/incremental-synchronization-and-cdc
@@ -40,6 +41,74 @@ wrong and the agent is stale or leaky.
   customer's API quota, and the canonical document shape every source normalizes into.
 - **What you can skip.** Memorising each vendor's object model. Know the five-step contract, how each
   source models change and permissions, and the backfill arithmetic; read the vendor docs per project.
+
+## Decision case
+### Scenario
+A 6,000-employee manufacturer wants an internal help agent that answers from SharePoint, Confluence and
+Slack and opens or updates ServiceNow incidents. You must pick the connector approach for the pilot. All
+figures are illustrative planning numbers, not vendor limits.
+- **Corpus:** 1.2 million SharePoint files in 30,000 folders, 80,000 Confluence pages, 400 Slack channels.
+- **Load:** 3,000 agent questions a day, each with about 2 retrieval steps; 20% also touch ServiceNow at
+  about 3 calls each, so 3,000 x 0.2 x 3 = 1,800 ServiceNow calls a day.
+- **Permissions:** HR and legal sites use broken inheritance; security will run a restricted-user test
+  before go-live.
+- **Freshness and deletion:** Slack answers within 15 minutes of a post; legal removals gone from answers
+  within 24 hours.
+- **Residency:** content copies must stay in the customer's own Azure subscription.
+- **Team and deadline:** 2 engineers, 12 weeks (24 engineer-weeks); pilot on the top 50 sites by week 8.
+
+### Options
+| Option | How it works | Permission fidelity | Freshness and deletion | Residency | 24 engineer-weeks |
+|---|---|---|---|---|---|
+| Buy a SaaS connector platform | vendor crawls all sources into its cloud | vendor's model; broken inheritance must be proven | vendor's sync cadence | fails if the shortlisted vendor is SaaS-only | fits easily |
+| Build sync for all four | own connectors, one ACL-aware index | full control | delta cursors plus tombstones | passes | tight: ServiceNow scripted ACLs are hard to replicate |
+| Federated live search | agent queries each source's search API as the user | source enforces it natively | current | passes, no copy | fits, but 3 sources per step, no shared ranking |
+| Sync prose, live tools for records | build SharePoint, Confluence, Slack sync; ServiceNow as delegated live tools | full control on prose; ServiceNow checks itself | delta plus Events API | passes | fits |
+
+Backfill arithmetic for the build options, at an illustrative 10 requests per second for SharePoint:
+- **Per-file permissions:** 1.2M x 2 = 2.4M calls, 240,000 s, about 2.8 days; with 20% retried after 429,
+  2.88M calls, about 3.3 days.
+- **Per-folder permissions where inheritance is intact:** 1.2M + 30,000 = 1.23M calls, about 1.4 days.
+- **Confluence at an illustrative 5 requests per second:** 80,000 x 2 = 160,000 calls, about 8.9 hours.
+
+### Decision
+**Sync prose into an index in the customer's subscription, and expose ServiceNow as live tools called with
+the user's delegated identity.** It is the only option that passes residency, proves broken-inheritance
+handling to security, and fits 24 engineer-weeks.
+- **Why not buy:** the residency constraint removes the SaaS-only shortlist; a self-hosted platform would
+  flip this.
+- **Why not build all four:** replicating ServiceNow's scripted per-field ACLs is the riskiest work and buys
+  nothing, because records must be current and writes must hit the source anyway.
+- **Why not federated:** every retrieval step waits on three source APIs (about 3,000 x 2 x 3 = 18,000
+  search calls a day), and results from three engines cannot be ranked together.
+- **Order:** crawl the top 50 sites first with per-folder permissions; the full SharePoint backfill of
+  about 1.4 to 3.3 days fits well before week 8.
+
+**What would change it.** A connector vendor that deploys into the customer's subscription and passes the
+restricted-user test makes buying cheaper. A corpus small enough that source search is good enough, with
+latency budgets that allow three calls per step, makes federated search viable.
+
+### Trade-offs accepted
+- **A second copy to keep consistent.** Watch sync lag per source and the restricted-user canary's
+  permission-mismatch rate; any mismatch is a P1.
+- **Permission changes lag one cycle.** Run permission sync on its own faster job (Slack membership every
+  15 minutes) and alert on permission-sync lag.
+- **Deletions depend on tombstones.** Back delta deletes with weekly reconciliation; a non-zero count of
+  reconciliation deletes means the delta path is missing removals.
+- **ServiceNow quota shared with other integrations.** Cap calls per agent session (say 10) and alert when
+  the agent's share of the instance's API usage passes the agreed slice.
+
+### Review rubric
+- **Constraints before tools:** the write-up states corpus size, permissions, freshness, deletion SLA,
+  residency, team and deadline before naming an approach.
+- **Sync versus live per source:** each source is placed as corpus or tool with a reason (prose versus
+  records and writes).
+- **Arithmetic shown:** backfill calls and days follow from item counts, calls per item and a labelled
+  illustrative rate, including retry overhead.
+- **Permission plan testable:** names how broken inheritance, sharing links and unresolved principals are
+  handled, and the restricted-user canary that proves it.
+- **Deletion and freshness owned:** a mechanism and a metric for each stated SLA.
+- **Reversibility stated:** what evidence would switch the choice to buy or federated search.
 
 ## Why it exists
 - **Knowledge is scattered.** Enterprise knowledge lives in a dozen SaaS and on-prem systems (Salesforce,

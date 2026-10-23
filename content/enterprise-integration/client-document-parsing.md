@@ -5,7 +5,8 @@ name: Client document parsing (PDF, scans, OCR)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - rag-retrieval/document-parsing
@@ -38,6 +39,66 @@ confidence, review doubtful pages, and keep page provenance.
   in every retrieval result.
 - **What you can skip.** OCR and layout-model internals; the RAG and multimodal lessons cover them. Know
   the silent failures and the routing pattern.
+
+## Decision case
+### Scenario
+A commercial insurer wants a policy-wording agent: underwriters ask about cover and limits, and the agent
+answers with page citations through `search_policies`. All figures, including the per-page throughputs,
+are illustrative.
+
+- **Corpus:** 300,000 files, 2.4 million pages. A profiled sample shows 55% of pages with a good text
+  layer, 35% image-only scans, and 10% hard pages (dense limit tables, stamps, handwriting).
+- **Boundary:** documents must not leave the insurer's cloud region; no external document-AI service is
+  approved.
+- **Compute inside the boundary:** 64 CPU cores and 2 GPUs.
+- **Throughput:** CPU OCR about 2 seconds per page per core; a vision model about 10 seconds per page per
+  GPU; direct text extraction is negligible.
+- **Deadline and accuracy:** backfill within 3 weeks (21 days); amounts and limits at least 99% correct
+  at field level.
+
+### Options
+| Option | How it works | Time | Coverage and accuracy | Boundary |
+|---|---|---|---|---|
+| A. Text extractor only | Read every text layer | minutes | up to 45% of pages empty or garbled, silently | inside |
+| B. OCR every page | CPU OCR on all 2.4M pages | 2.4M × 2 s / 64 = 75,000 s, about 20.8 hours | degrades exact born-digital text; tables still lose headers | inside |
+| C. Vision model on every page | GPU transcription for all pages | 2.4M × 10 s / 2 = 12M s, about 139 days | best on hard pages | inside, but fails 21 days |
+| D. Tiered per page | Text layer if it passes the quality check; OCR otherwise; vision model for low-confidence pages; human review below a further threshold | OCR 1.08M pages: about 9.4 hours; vision 240,000 pages: about 13.9 days | each page on the cheapest route that passes its gate | inside |
+
+For D, OCR covers scans plus hard pages: 840,000 + 240,000 = 1.08M pages, so 1.08M × 2 s / 64 =
+33,750 s. The vision tier is 240,000 × 10 s / 2 = 1.2M s, which is 13.9 days.
+
+### Decision
+Choose **D**, because it is the only option that covers every page inside the boundary within 21 days.
+- **Time:** about 14 days of GPU work leaves about 7 days of slack in the 3 weeks, and the OCR tier
+  finishes on day one.
+- **Accuracy where it matters:** limit tables go to the vision tier, and a field-level check on amounts
+  sends doubtful values to review; at an assumed 1% of hard pages that is 2,400 pages, about 40 hours at
+  one minute each.
+- **The agent can hedge:** every chunk carries file, page, route and confidence, so `search_policies`
+  results let the agent cite a page and flag low-confidence text.
+- **The threshold is tuned on this client:** confidence against measured error on labelled pages, not a
+  default.
+
+**What would change it.**
+- **An in-region document-AI service is approved:** send the hard tier there instead of the 2 GPUs.
+- **Hard pages are 30%, not 10%:** 720,000 × 10 s / 2 is about 41.7 days, so add GPUs or prioritise
+  the templates that hold limits.
+- **A nearly all born-digital corpus:** skip the OCR and vision tiers and keep only the quality check.
+
+### Trade-offs accepted
+- **Three routes to run and evaluate.** Report CER and field accuracy per route and per template.
+- **The GPU tier is the critical path.** Track pages remaining per tier daily; at 17,280 pages per day
+  (2 GPUs × 8,640) any stall shows within a day.
+- **Confidence is a ranking, not a probability.** Re-check the threshold when a new template appears.
+- **Human review costs about 40 hours.** Review the pages behind high-value fields first.
+
+### Review rubric
+- **Routing starts from a profiled page mix,** with shares that add to 100%.
+- **Throughput and time are computed per tier** and compared with the deadline.
+- **The boundary constraint decides which services are allowed** before any tool is picked.
+- **Accuracy is measured on the fields the agent answers with,** not only average CER.
+- **Provenance reaches the agent:** file, page, route and confidence in every retrieval result.
+- **Reversal conditions are stated** with the number that would flip them.
 
 ## Why it exists
 - **Enterprise knowledge lives in messy documents.** Contracts, claims files, policies, invoices and

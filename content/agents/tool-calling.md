@@ -5,7 +5,8 @@ name: Tool calling
 kind: concept
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -149,6 +150,26 @@ sequenceDiagram
     M-->>H: final text, end_turn
     H-->>U: answer
 ```
+
+## Misconceptions
+- **"Tool calling means the model executes the function."** The model emits a `tool_use` block and
+  stops; your harness runs, modifies, refuses or escalates it. Even server-side tools are executed by
+  the provider's code, not by the model.
+- **"`strict: true` means the arguments are correct."** Constrained decoding guarantees the JSON matches
+  the schema, not that the values make sense: a well-formed date can still be the wrong date, and an id
+  can still not exist. The handler validates meaning.
+- **"The schema decides whether the model calls the tool."** Selection is driven mainly by the
+  description, so it must say when to call ("call this whenever the user asks for a current rate"), not
+  only what the tool does. The schema shapes arguments once the tool is chosen.
+- **"More tools make a more capable agent."** Every declaration costs input tokens on every request
+  (~5,000 for 50 tools at ~100 each, illustrative), and selection accuracy drops as near-duplicates pile
+  up. A small focused set plus deferred loading usually wins.
+- **"A failed tool should raise so someone notices."** A raised exception ends the loop; an `is_error`
+  result with a readable message lets the model correct its arguments or explain. Log the error for
+  humans and return it to the model.
+- **"Forcing a call with `tool_choice` always works."** Forcing is model- and mode-dependent: with
+  extended thinking the Claude API accepts only `auto` and `none`. Always check that a `tool_use` block
+  actually came back.
 
 ## Examples
 ### One tool, one call, one result, one answer

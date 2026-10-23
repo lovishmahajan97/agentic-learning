@@ -5,7 +5,8 @@ name: Multi-region architecture
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - reliability/high-availability
@@ -40,6 +41,65 @@ memory. Start multi-AZ; go multi-region for a named reason.
   region must carry both.
 - **What you can skip.** Building globally consistent databases or CRDT libraries yourself. Know
   partitioned active-active, async lag as RPO and the 50% capacity rule; buy the storage.
+
+## Decision case
+### Scenario
+A B2B agent platform runs in one region, `us-east`, across three zones. Two deals force a change within
+5 months. All figures are illustrative; load is in capacity units where today's region carries 100.
+- **EU residency:** new EU tenants (30 units of load) need transcripts, checkpoints, memory and inference
+  in the EU. US tenants (70 units) have no residency rule.
+- **Region-loss survival:** a US enterprise RFP asks for RTO 1 hour and RPO 1 minute if a region is lost.
+- **Workload:** agent runs checkpoint after every step, about 20 steps per run. A quarter of US load
+  (17.5 units) is batch summarisation that can wait.
+- **Constraints:** infrastructure may grow at most 80% over today's 100 units; 5 engineers, none with
+  globally consistent database experience; measured cross-region replica lag p99 under 2 s.
+
+### Options
+| Option | How it works | Capacity provisioned | Residency | US region loss |
+|---|---|---|---|---|
+| A. One region plus backups | stay in `us-east`, cross-region backups | about 103 (+3%) | fails: EU data in the US | restore from backup, hours of RTO |
+| B. US active-passive plus an EU stack | `us-west` warm standby sized for all 70 US units, `eu-west` serves EU | 70 + 70 + 30 = 170, plus EU backups: about +73% | met | met, but the standby idles and is rarely exercised |
+| C. Partitioned active-active | tenants homed in `us-east` or `eu-west`, US tenants replicate async to `eu-west`, EU tenants back up to a second EU region | `us-east` 70, `eu-west` 30 + (70 − 17.5) = 82.5, total 152.5, plus EU backups: about +56% | met: EU data never leaves the EU | met: RPO ≈ lag (p99 under 2 s), batch is shed |
+| D. Shared active-active | globally consistent database, any region writes | similar to C, plus database licensing | needs pinning anyway | met, but every checkpoint pays a cross-region commit: about 20 × 100 ms = 2 s per run |
+
+### Decision
+**Option C, partitioned active-active with a tenant home-region table.** It meets residency by
+construction, survives a US region loss inside the 1 minute RPO because p99 lag is under 2 s, and costs
+about +56% against the 80% ceiling.
+
+Both regions serve traffic every day, so the failover target is
+proven by daily use rather than by a rarely run drill.
+- **Why not A:** it cannot sign the EU deal.
+- **Why not B:** it meets every hard requirement but costs about 17.5 points more and leaves 70 units idle.
+- **Why not D:** the team has never run it, and 2 s added per run hurts every agent for a problem
+  partitioning already solves.
+
+**What would change it.** If US contracts forbid copies in the EU, US replicas must live in `us-west`,
+which pulls the design toward B. If the EU deal fell through, A plus a tested DR plan would be enough.
+If the product needed cross-tenant shared workspaces written from both regions, D's cost would buy
+something.
+
+### Trade-offs accepted
+- **EU tenants degrade in place on an `eu-west` loss.** They cannot fail over to the US; they go
+  read-only and restore in the second EU region, with an illustrative 4 hour RTO written into EU
+  contracts. Drill the restore each quarter and track its time.
+- **Batch is shed on US failover.** 17.5 units of summarisation queue until `us-east` returns. Alert
+  on queue age and publish the delay.
+- **Seconds of lost writes.** Writes inside the lag window are reconciled at failback; region-tagged
+  idempotency keys stop replayed agent steps acting twice. Alert on p99 lag above 30 s.
+- **Model quota must fit the survivor.** `eu-west` needs quota for 82.5 units in advance; review quota
+  headroom monthly.
+
+### Review rubric
+- **Driver named:** the write-up states which of loss survival, latency, residency or quota forces
+  multi-region before choosing a topology.
+- **Capacity arithmetic:** each option's provisioned capacity follows from per-region load and what is
+  shed on failover, compared with the budget.
+- **Residency traced end to end:** storage, replicas, backups, inference endpoints and agent memory are
+  all placed, not just the primary database.
+- **RPO tied to measurement:** data loss is stated as replica lag at p99, not "near zero".
+- **Degraded mode explicit:** says what residency-bound tenants get when their home region fails.
+- **Reversal condition:** names the contract or product change that would move the choice.
 
 ## Why it exists
 - **A region is one blast radius.** Even spread across availability zones, it shares a control plane and

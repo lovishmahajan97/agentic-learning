@@ -5,7 +5,8 @@ name: DSPy (signatures, modules, optimizers)
 kind: tool
 difficulty: advanced
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - agents/frameworks
@@ -37,6 +38,166 @@ something you measure and improve.
   structure, the metric, the training examples and the optimizer budget.
 - **What you can skip.** The research on bootstrapping internals. Know that optimizers search over
   instructions and demos using your metric, and that more budget costs more LLM calls.
+
+## Lab
+### Task
+Fix the three things that make an optimized agent step look better than it is: a metric that rewards
+hedged answers, a serving path that never loads the compiled program, and a release gate that ships
+anything. The step is a ticket router an agent calls before choosing a queue-specific tool.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** this lesson's workflow (declare, measure, compile, save and load); the eval-harness
+  lesson for why a held-out dev set matters.
+- **Runs offline:** `dspy.utils.DummyLM` replays a recorded output per ticket, so no API key is needed.
+  The recorded LM ignores demos, so compiling cannot raise the dev score here; that is on purpose.
+- **Needs:** `pip install dspy pytest`; checked with dspy 3.4.1 on Python 3.12.
+
+### Starter code
+```python
+# dspy_router.py: an honest metric, a compiled router artifact and a release gate, offline
+import dspy
+from dspy.utils import DummyLM
+
+# Recorded model outputs per ticket: a stand-in for a real LM, so the lab runs with no API key.
+RECORDED = {
+    "I was charged twice this month": {"queue": "billing"},
+    "My package has not arrived": {"queue": "shipping"},
+    "The app crashes when I upload a photo": {"queue": "technical"},
+    "Please change the email on my profile": {"queue": "account"},
+    "Refund the duplicate charge on my card": {"queue": "billing, or account if it is a card issue"},
+    "Where is my order, tracking shows nothing": {"queue": "shipping"},
+    "Login fails with error 500": {"queue": "account"},
+    "Delete my account and all my data": {"queue": "account"},
+}
+LABELS = {
+    "I was charged twice this month": "billing",
+    "Refund the duplicate charge on my card": "billing",
+    "My package has not arrived": "shipping",
+    "The app crashes when I upload a photo": "technical",
+    "Please change the email on my profile": "account",
+    "Where is my order, tracking shows nothing": "shipping",
+    "Login fails with error 500": "technical",
+    "Delete my account and all my data": "account",
+}
+EXAMPLES = [dspy.Example(ticket=t, queue=q).with_inputs("ticket") for t, q in LABELS.items()]
+TRAIN, DEV = EXAMPLES[:5], EXAMPLES[5:]
+
+class RouteTicket(dspy.Signature):
+    """Route a support ticket to exactly one queue: billing, shipping, technical or account."""
+    ticket: str = dspy.InputField()
+    queue: str = dspy.OutputField(desc="one queue name")
+
+def build_router() -> dspy.Module:
+    return dspy.Predict(RouteTicket)
+
+def metric(example, pred, trace=None) -> bool:
+    # YOUR CODE: substring matching passes verbose, hedged answers. Score True only when the
+    # predicted queue, lower-cased and stripped, equals the label exactly.
+    return example.queue in pred.queue.lower()
+
+def load_router(path: str) -> dspy.Module:
+    # YOUR CODE: production must serve the compiled artifact, not the baseline program
+    return build_router()
+
+def gate(candidate: float, current: float, min_gain: float = 5.0) -> bool:
+    # YOUR CODE: ship only when the candidate beats the current score by at least min_gain points
+    return True
+
+def score(program, devset) -> float:
+    return dspy.Evaluate(devset=devset, metric=metric, display_progress=False)(program).score
+
+def main(path="router.json"):
+    dspy.configure(lm=DummyLM(RECORDED))
+    baseline = build_router()
+    print("baseline train/dev:", score(baseline, TRAIN), score(baseline, DEV))
+    opt = dspy.BootstrapFewShot(metric=metric, max_bootstrapped_demos=4, max_labeled_demos=0)
+    compiled = opt.compile(build_router(), trainset=TRAIN)
+    compiled.save(path)
+    served = load_router(path)
+    print("demos served:", sorted(d["queue"] for d in served.demos))
+    print("dev score served:", score(served, DEV))
+    print("ship:", gate(score(served, DEV), score(baseline, DEV)))
+
+if __name__ == "__main__":
+    main()
+```
+
+As given it prints a train score of 100.0, `demos served: []` and `ship: True`: an inflated score, a
+baseline in production, and a release with no gain. DSPy's progress and INFO logs go to stderr.
+
+### Expected output
+```
+baseline train/dev: 80.0 66.67
+Bootstrapped 4 full traces after 4 examples for up to 1 rounds, amounting to 5 attempts.
+demos served: ['account', 'billing', 'shipping', 'technical']
+dev score served: 66.67
+ship: False
+```
+
+### Tests
+```python
+# test_dspy_router.py: run with `pytest -q`
+import dspy
+import pytest
+from dspy.utils import DummyLM
+import dspy_router as m
+
+QUEUES = {"billing", "shipping", "technical", "account"}
+
+@pytest.fixture(autouse=True)
+def recorded_lm():
+    dspy.configure(lm=DummyLM(m.RECORDED))
+
+def compile_router():
+    opt = dspy.BootstrapFewShot(metric=m.metric, max_bootstrapped_demos=4, max_labeled_demos=0)
+    return opt.compile(m.build_router(), trainset=m.TRAIN)
+
+def test_metric_is_exact_after_normalizing():
+    ex = dspy.Example(ticket="t", queue="billing")
+    assert m.metric(ex, dspy.Prediction(queue=" Billing\n"))
+    assert not m.metric(ex, dspy.Prediction(queue="billing, or account if it is a card issue"))
+
+def test_honest_train_score():
+    assert m.score(m.build_router(), m.TRAIN) == 80.0     # the hedged answer no longer counts
+
+def test_bootstrapped_demos_are_clean():
+    demos = compile_router().demos
+    assert len(demos) == 4
+    assert {d["queue"] for d in demos} <= QUEUES
+
+def test_load_serves_the_compiled_artifact(tmp_path):
+    path = str(tmp_path / "router.json")
+    compiled = compile_router()
+    compiled.save(path)
+    served = m.load_router(path)
+    assert [d["ticket"] for d in served.demos] == [d["ticket"] for d in compiled.demos]
+
+def test_gate_needs_a_real_gain():
+    assert not m.gate(66.67, 66.67)
+    assert not m.gate(70.0, 66.67)       # +3.33 points is below the 5-point bar
+    assert m.gate(72.0, 66.67)
+```
+
+All five fail on the starter. The demo test is the subtle one: the substring metric lets the hedged
+billing answer pass, so it becomes a few-shot demo that teaches hedging to every later call.
+
+### Failure scenarios
+- **Keep the substring metric.** Train score reads 100.0 and the compiled JSON contains a demo whose
+  queue is a sentence. Debug by opening `router.json` and reading every demo, not only the score.
+- **Load into a different program class.** A `ChainOfThought` loading state saved from `Predict` raises
+  `KeyError: 'predict'` (dspy 3.4.1), because the saved state is keyed by sub-module name. Debug by building the exact class first, then
+  logging `len(program.demos)` and the artifact version at startup.
+- **Evaluate on the train set.** The score rises with no change in behaviour. Debug by printing which
+  examples are in `TRAIN` and `DEV`; they must not overlap.
+- **Ship on a tie.** Two runs at 66.67 differ by noise; with 3 dev examples one flip is 33.33 points,
+  so grow the dev set before trusting any gate.
+
+### Submission
+- **Code:** `dspy_router.py` with the three `YOUR CODE` parts done; data, `score` and `main` unchanged.
+- **Test run:** `pytest -q` showing 5 passed.
+- **Artifact:** the saved `router.json`, with a note confirming every demo queue is one of the four names.
+- **Program output:** the five stdout lines, matching Expected output.
+- **Short note (5 lines):** why the dev score did not improve here, and what a real LM, 30+ dev examples
+  and a 5-point gate would change.
 
 ## Why it exists
 - **Prompts are brittle parameters.** A hand-tuned prompt is tied to one model and one wording; changing

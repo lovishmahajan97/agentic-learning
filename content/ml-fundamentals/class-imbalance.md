@@ -5,7 +5,8 @@ name: Class imbalance
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/confusion-matrix
@@ -176,6 +177,21 @@ flowchart TD
     R --> Z
     G --> Z
 ```
+
+## Misconceptions
+- **"99% accuracy on a 1%-positive problem means the model works."** The constant "never positive"
+  classifier also scores 99%. Report prevalence, raw confusion-matrix counts and recall on the rare class.
+- **"Imbalance must be fixed with class weights or resampling."** For a model that already ranks well, most
+  of the problem is the 0.5 default. Move the threshold first: it costs nothing and keeps probabilities
+  honest, while weights roughly relocate the threshold and inflate p (0.17 mean on 2% data in the example).
+- **"A big eval set gives a precise recall estimate."** Recall is measured on positives only, so its error
+  depends on how many positives you have: 50 positives at recall 0.80 give roughly ±0.11, whatever the
+  total size.
+- **"Precision measured on an enriched eval set holds in production."** Recall and FPR transfer; precision
+  does not, because it depends on prevalence. TPR 0.95 and FPR 0.01 give precision about 0.09 at 0.1%
+  prevalence.
+- **"A guardrail's FPR is per conversation."** It applies to every check. An agent making 10 tool calls per
+  task with FPR 0.01 per check blocks roughly one clean task in ten, so budget false blocks per task.
 
 ## Examples
 ### Unweighted vs balanced logistic regression on 2% positives

@@ -5,7 +5,8 @@ name: OWASP Top 10 for LLMs
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -134,6 +135,24 @@ flowchart TD
     C -->|"yes: LLM05 failure"| L["Data reaches attacker: LLM02"]
     C -->|"no: LLM05 control"| S["Chain broken"]
 ```
+
+## Misconceptions
+- **"The numbering is a priority order."** It reflects what is common across the industry, not your
+  exposure. A tool-less internal summariser barely has an LLM06 problem; an agent that moves money has
+  little else. Rank by blast radius in your system.
+- **"Prompt injection is fixed like SQL injection, by sanitising inputs."** SQL injection is solved by
+  separating code from data syntactically; an LLM is designed to follow instructions in text, so no
+  escaping exists. Controls limit what a hijacked model can do instead.
+- **"An incident's fix belongs in the row it was filed under."** Attacks cross rows. An LLM01 chain that
+  exfiltrates through a markdown image is broken most cheaply by not rendering remote images, an LLM05
+  control.
+- **"We can be OWASP compliant."** There is no certification and the phrase has no formal meaning. The
+  list is a threat-modelling prompt; what reviewers want is a per-item matrix with a control and evidence.
+- **"Items that do not apply can be left blank."** Reviewers read blanks as gaps. Every item gets a row,
+  and an inapplicable one gets a one-line reason.
+- **"The 2023 list is still current."** The 2025 edition folded Insecure Plugin Design into Excessive
+  Agency and Supply Chain, broadened denial of service into Unbounded Consumption, and added System
+  Prompt Leakage and Vector and Embedding Weaknesses. Version your matrix by edition.
 
 ## Examples
 ### Threat-modelling a contract-review agent

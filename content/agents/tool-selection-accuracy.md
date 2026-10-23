@@ -5,7 +5,8 @@ name: Tool selection accuracy
 kind: metric
 difficulty: core
 est_minutes: 12
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -132,6 +133,25 @@ flowchart TD
     A -->|"no"| G["Argument miss"]
     A -->|"yes"| P
 ```
+
+## Misconceptions
+- **"Task success already tells me whether tool selection works."** Task success mixes selection with
+  flaky APIs, result formats and answer quality, so a selection regression hides until many tasks fail.
+  Score the first decision on its own: call or not, which tool, which arguments.
+- **"One accuracy number is enough."** A 75% step-level score can be mostly missed calls, which need a
+  trigger condition, or one confused pair, which needs two descriptions rewritten. Recall, precision,
+  name accuracy and a confusion matrix each point at a different fix.
+- **"A higher precision means the new model is better."** Precision can rise because the model calls
+  less. If should-call recall falls on must-look-up tools, the agent is now inventing balances and
+  delivery dates; read the `(tool, None)` confusions before shipping.
+- **"88% to 91% on 200 cases is an improvement."** The standard error near 90% on 200 cases is about
+  2 points, so that gap may be noise. Count paired flips on the same cases: 14-to-3 is real
+  (p ≈ 0.013), 6-to-3 is not.
+- **"Eval cases can come from the examples in my descriptions."** That scores the model on what you
+  already told it and gives a perfect number with production failures intact. Sample real traffic, keep
+  `none` cases at their real share, and hold the set out.
+- **"Selection is fixed once descriptions are tuned."** It is learned behaviour that shifts with the
+  model family and version, so every model-id change reruns the eval.
 
 ## Examples
 ### A minimal selection eval

@@ -5,7 +5,8 @@ name: AI inventory & use-case risk classification
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - security-governance-compliance/model-governance
@@ -38,6 +39,62 @@ copy or, given tools, act on applicants.
   tools), and triggering re-classification when you add tools, data or providers.
 - **What you can skip.** Memorising every Annex III paragraph. Know that employment, credit, education and
   essential services are high-risk areas, know the exemption exists, and ask legal for the rest.
+
+## Decision case
+### Scenario
+A retailer's customer-support agent is registered as medium tier (read-only tools, customers affected).
+The product team wants it to issue refunds, which triggers re-classification. All figures are illustrative.
+- **Volume:** 3,000 refund requests a day; today staff handle each one end to end.
+- **Classification rule:** the lesson's questionnaire. A `write` tool without approval scores autonomy
+  2, so the tier becomes high; the same tool behind approval (`write_approved`) keeps it medium.
+- **Constraints:**
+  - launch in 6 weeks, a date tied to the peak season;
+  - high-tier controls (impact assessment, human oversight design, audit trails, bias testing, board
+    sign-off) take the governance team about 10 weeks to complete for one system;
+  - the support team can review at most 800 agent-proposed refunds a day at about 1 minute each;
+  - refunds are reversible only by asking the customer to pay back, so a wrong one is costly.
+
+### Options
+| Option | How it works | Tier | Fits 6 weeks? | Approvals a day vs 800 |
+|---|---|---|---|---|
+| **A. Auto-refund** | `issue_refund: write`, the agent pays out directly | high | no: controls need about 10 weeks | 0 |
+| **B. Approved refunds, all traffic** | `issue_refund: write_approved` for every request | medium | yes | 3,000: 3.75 × capacity |
+| **C. Approved refunds, pilot cohort** | `write_approved`, enabled for 25% of requests (one region); the rest stay manual | medium | yes | 3,000 × 25% = 750: fits |
+
+### Decision
+Choose **C, approved refunds for a 25% pilot cohort**, because it is the only option that meets the deadline
+and the approval capacity together.
+- **Deadline:** C stays medium tier, so it needs an evaluation, a system card and monitoring, all feasible
+  in 6 weeks; A needs about 10 weeks of high-tier controls.
+- **Capacity:** 750 approvals a day fits under 800, while B produces 3,000.
+- **Evidence:** the pilot records how often reviewers accept the agent's proposals, which is the input a
+  later high-tier case for auto-refunds needs.
+- **Inventory:** the entry records the new tool, its permission and the cohort, and the tier is
+  recomputed from the stored answers rather than asserted.
+
+**What would change it:**
+- **Approval capacity of 3,000 a day or more:** roll B out to all traffic at medium tier.
+- **A deadline 10 weeks or more away:** run high-tier controls for A in parallel, if the business wants
+  unattended refunds.
+- **A pilot acceptance rate that stays high on several thousand proposals:** start the high-tier case for
+  auto-refunds on low-value requests, with the acceptance data as evidence.
+
+### Trade-offs accepted
+- **75% of requests stay manual at launch.** The saving is a quarter of what was planned. Track the
+  cohort's handling time against the manual queue to size the next expansion.
+- **Reviewers may rubber-stamp.** At 1 minute per refund, approval can turn into a click. Sample approved
+  refunds weekly and track the rejection rate; a rate near zero needs a second look, not celebration.
+- **The 800 and 10-week figures are estimates.** Measure approvals per reviewer-hour in week one and
+  re-plan before widening the cohort.
+
+### Review rubric
+- **The tier is derived from declared answers** (tools and permissions, impact, exposure), and the
+  write-up shows how a tool change moves it.
+- **Each option's tier is costed in controls and lead time**, not just named.
+- **Human approval load is computed** from volume and cohort share and compared with reviewer capacity.
+- **A re-classification trigger is named** for the next change (wider cohort, removing approval, a new
+  tool).
+- **The plan collects the evidence** the next tier decision will need, with a threshold stated up front.
 
 ## Why it exists
 - **You cannot govern AI you do not know exists.** Model cards, evaluations, audit trails, incident response

@@ -5,7 +5,8 @@ name: Train/test leakage
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - training-adaptation/train-val-test-split
@@ -158,6 +159,22 @@ flowchart TD
     T -->|"many times"| X4["Selection leakage: freeze and log"]
     T -->|"rarely, logged"| OK["Honest estimate"]
 ```
+
+## Misconceptions
+- **"We held out a test split, so there is no leakage."** Splitting rows is not splitting information. The
+  same customer, conversation or document on both sides, or a scaler fitted before the split, still carries
+  test information into training.
+- **"Fitting a scaler or selector on all the data is harmless preprocessing."** Anything with a `fit` step
+  learns from the rows it sees. Feature selection on the full set picks columns that correlate with the
+  test labels, which is how pure noise scores ~0.87 instead of ~0.47.
+- **"A time-ordered split cannot leak."** If the label looks ahead (churn within 30 days), late training
+  labels were decided by events in the validation window. Leave a gap of at least one label horizon.
+- **"Looking at the test score is fine as long as we never train on it."** Every look-then-change is a vote:
+  tuning prompts or thresholds against the reported set turns it into a weak training set, so the number
+  becomes optimistically biased.
+- **"A higher score on an unchanged rerun means the agent got better."** For a stateful agent it usually
+  means the memory store kept answers from the first run. Identical reruns should agree within noise;
+  give each run a fresh memory namespace.
 
 ## Examples
 ### Feature-selection and row leakage on pure noise

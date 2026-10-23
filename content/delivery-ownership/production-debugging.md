@@ -5,7 +5,8 @@ name: Production debugging
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - delivery-ownership/failure-analysis
@@ -37,6 +38,204 @@ replay it with one variable changed at a time.
   whether side-effecting tools can be stubbed in replay, and whether one ID joins every span of a run.
 - **What you can skip.** Classic debugger tooling and profilers for the model itself; the leverage for
   agents is in traces, replay and bisecting the steps of a run.
+
+## Lab
+### Task
+A ticket says the order-support agent cancelled an order when the customer only asked where it was. You
+have the recorded run and a good run of the same task.
+- **Goal:** build the offline replay harness that finds the first divergent step, reproduces the bad
+  decision as a rate, and proves which single factor fixes it, without ever calling a live tool.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** tracing (one span per step) and deterministic replay and reproducibility.
+- **Runs offline:** `fake_model` stands in for the provider and decides from the transcript with a
+  seeded random draw, so results are exact and no API key is needed. `execute_live` is the real tool
+  path; a correct harness never reaches it.
+- **Needs:** `pip install pytest`; checked with pytest 8.4.2 on Python 3.9.6 (standard library only
+  otherwise).
+
+### Starter code
+```python
+# replay_lab.py: debug a recorded agent run offline (no provider, no live tools)
+import copy
+import json
+import math
+import random
+from collections import Counter
+
+LIVE_CALLS = []   # every call that reached a real tool; a correct replay leaves this empty
+
+def execute_live(tool_name, arguments):
+    """A real, side-effecting tool call. Replays must never get here."""
+    LIVE_CALLS.append(tool_name)
+    raise RuntimeError(f"live tool {tool_name} called during replay")
+
+def fake_model(messages, model, params, rng):
+    """Stand-in for the provider: returns the next tool call as a dict. One rng draw per call
+    unless temperature is 0. It cancels too eagerly when the last order record is unreadable."""
+    last = next(m for m in reversed(messages) if m["role"] == "tool")
+    try:
+        status_known = "status" in json.loads(last["content"])
+    except ValueError:
+        status_known = False
+    p_cancel = 0.0 if status_known else 0.6
+    if params.get("temperature", 1.0) == 0:
+        cancel = p_cancel > 0.5
+    else:
+        cancel = rng.random() < p_cancel
+    return {"tool_name": "cancel_order" if cancel else "final_answer"}
+
+def _step(i, name, args, result):
+    return {"call_id": f"c{i}", "tool_name": name, "arguments": args, "raw_tool_result": result,
+            "assistant_message": {"role": "assistant", "tool_calls": [
+                {"id": f"c{i}", "name": name, "arguments": args}]}}
+
+FULL = '{"order_id": "O-311", "eta": "2026-03-04", "status": "shipped"}'
+TRUNCATED = FULL[:40]   # the tool wrapper cut the record at 40 characters
+INITIAL = [{"role": "system", "content": "You are an order-support agent."},
+           {"role": "user", "content": "Where is my order O-311?"}]
+
+def recorded_run(order_result, last_tool):
+    return {"run_id": "run_4c19", "model": "fake-2026-01", "params": {"temperature": 0.7},
+            "initial_messages": INITIAL,
+            "steps": [_step(0, "lookup_customer", {"email": "a@x.com"}, '{"customer_id": "C7"}'),
+                      _step(1, "list_orders", {"customer_id": "C7"}, '{"orders": ["O-311"]}'),
+                      _step(2, "get_order", {"order_id": "O-311"}, order_result),
+                      _step(3, last_tool, {"order_id": "O-311"}, '{"ok": true}')]}
+
+BAD = recorded_run(TRUNCATED, "cancel_order")   # the run in the ticket
+GOOD = recorded_run(FULL, "final_answer")       # same task, same day, went fine
+
+def with_tool_result(run, i, raw_result):
+    """Copy of run with step i's recorded result replaced: one factor changed."""
+    out = copy.deepcopy(run)
+    out["steps"][i]["raw_tool_result"] = raw_result
+    return out
+
+def messages_before(run, k):
+    # YOUR CODE: the exact transcript the model saw before step k (0-based): the initial
+    # messages, then for each step before k its assistant_message and a tool message
+    # {"role": "tool", "tool_call_id": ..., "content": raw_tool_result}. Never execute a tool.
+    raise NotImplementedError("messages_before")
+
+def first_divergent_step(bad, good):
+    # YOUR CODE: walk both runs step by step and return (index, field) for the first step where
+    # tool_name, arguments or raw_tool_result differ, checked in that order. None if identical.
+    raise NotImplementedError("first_divergent_step")
+
+def replay_step(run, k, n=20, seed=0, **overrides):
+    # YOUR CODE: apply overrides (top-level keys such as params or model) to a copy of run,
+    # rebuild messages_before(k), then call fake_model n times with ONE random.Random(seed),
+    # and return a Counter of the tool_name picks. The input run must not be mutated.
+    raise NotImplementedError("replay_step")
+
+def zero_failure_upper_bound(n, conf=0.95):
+    return 1 - (1 - conf) ** (1 / n)
+
+def is_fix_proven(failures, n, target=0.02, conf=0.95):
+    # YOUR CODE: True only if there were no failures AND n replays bound the true failure
+    # rate below target at this confidence.
+    raise NotImplementedError("is_fix_proven")
+
+def main():
+    print("first divergent step:", first_divergent_step(BAD, GOOD))
+    base = replay_step(BAD, 3, n=20)
+    print(f"baseline step 3, n=20: {base['cancel_order']}/20 cancel_order")
+    temp0 = replay_step(BAD, 3, n=20, params={"temperature": 0})
+    print(f"temperature 0 only, n=20: {temp0['cancel_order']}/20 cancel_order")
+    fixed = replay_step(with_tool_result(BAD, 2, FULL), 3, n=300)
+    print(f"full tool result only, n=300: {fixed['cancel_order']}/300 cancel_order, "
+          f"bound {zero_failure_upper_bound(300):.1%}")
+    print("proven below 2%:", is_fix_proven(0, 20), is_fix_proven(fixed["cancel_order"], 300))
+    print("live tool calls:", len(LIVE_CALLS))
+
+if __name__ == "__main__":
+    try:
+        main()
+    except NotImplementedError as e:
+        print("not implemented yet:", e)
+```
+
+As given it prints `not implemented yet: first_divergent_step`.
+
+### Expected output
+```
+first divergent step: (2, 'raw_tool_result')
+baseline step 3, n=20: 10/20 cancel_order
+temperature 0 only, n=20: 20/20 cancel_order
+full tool result only, n=300: 0/300 cancel_order, bound 1.0%
+proven below 2%: False True
+live tool calls: 0
+```
+
+Read it as the lesson's loop: the visible bad action is at step 3, but the runs first differ at step 2's
+tool result; temperature 0 makes the failure certain rather than curing it; swapping only the tool
+result removes it, and only 300 clean replays (not 20) bound the rate below 2%.
+
+### Tests
+```python
+# test_replay_lab.py: run with `pytest -q`
+import copy
+import replay_lab as r
+
+def test_transcript_is_rebuilt_from_recorded_results():
+    msgs = r.messages_before(r.BAD, 3)
+    assert len(msgs) == len(r.INITIAL) + 2 * 3
+    assert msgs[-1] == {"role": "tool", "tool_call_id": "c2", "content": r.TRUNCATED}
+    assert msgs[-2]["tool_calls"][0]["name"] == "get_order"
+    assert r.LIVE_CALLS == []
+
+def test_divergence_starts_before_the_visible_bad_action():
+    assert r.first_divergent_step(r.BAD, r.GOOD) == (2, "raw_tool_result")   # not step 3
+    assert r.first_divergent_step(r.GOOD, copy.deepcopy(r.GOOD)) is None
+
+def test_baseline_reproduces_the_bad_decision():
+    picks = r.replay_step(r.BAD, 3, n=20)
+    assert sum(picks.values()) == 20
+    assert picks["cancel_order"] == 10
+
+def test_temperature_zero_does_not_fix_it():
+    assert r.replay_step(r.BAD, 3, n=20, params={"temperature": 0})["cancel_order"] == 20
+    assert r.BAD["params"] == {"temperature": 0.7}   # the recorded run was not mutated
+
+def test_changing_only_the_tool_result_removes_the_failure():
+    picks = r.replay_step(r.with_tool_result(r.BAD, 2, r.FULL), 3, n=300)
+    assert picks == {"final_answer": 300}
+    assert r.LIVE_CALLS == []
+
+def test_twenty_clean_replays_do_not_prove_a_fix():
+    assert not r.is_fix_proven(0, 20)
+    assert r.is_fix_proven(0, 300)
+    assert not r.is_fix_proven(1, 300)
+```
+
+On the starter all six fail with `NotImplementedError`. The exact count of 10 holds only if one
+`random.Random(seed)` is shared across the 20 calls, as the comment says.
+
+### Failure scenarios
+- **Create a fresh `random.Random(seed)` inside the loop.** The baseline shows 0/20 or 20/20 instead of
+  10/20, because every replay draws the same number. Debug by printing the first five draws; a harness
+  that cannot show a rate between 0 and n is not sampling.
+- **Re-run earlier steps through `execute_live` to "refresh" results.** `LIVE_CALLS` fills up and the
+  replay raises, the lab's version of a second refund. Debug by asserting zero live calls in every test,
+  as the record-and-stub production pattern monitors.
+- **Compare only `tool_name` in `first_divergent_step`.** It reports step 3, the visible action, and you
+  start editing the cancel tool's description. Debug by diffing raw results too: step 2's record is
+  truncated at 40 characters.
+- **Apply the override with `run.update(...)`.** The 20/20 count looks right, but the recorded run now
+  holds temperature 0, so every later replay of `BAD` silently changes two factors. The second assert in
+  the temperature test catches it; keep that check after every replay.
+
+### Submission
+- **Code:** `replay_lab.py` with the four functions implemented and no edits to the recorded runs or
+  `fake_model`.
+- **Test run:** `pytest -q` output showing 6 passed, plus the program's output matching the expected
+  block line for line.
+- **Root-cause note (5 lines max):** the first divergent step, the one factor that fixed it, why
+  temperature 0 was not the cause, and the replay count that justifies "fixed".
+- **Regression case:** the bad run saved as a test that asserts `final_answer` once the tool wrapper
+  stops truncating records, evaluated by running it against the patched wrapper.
+- **Evaluation:** tests pass, zero live calls, and the note names step 2's tool result rather than the
+  model or the prompt.
 
 ## Why it exists
 - **You cannot attach a debugger to yesterday.** In development you control the input, code version and

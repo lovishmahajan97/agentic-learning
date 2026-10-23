@@ -5,7 +5,8 @@ name: TTS (text-to-speech)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - multimodal/speech-to-text
@@ -173,6 +174,25 @@ flowchart TD
     U["User starts talking"] -.->|"barge-in: cancel"| V
     U -.->|"cancel"| L
 ```
+
+## Misconceptions
+- **"A low real-time factor means the agent answers quickly."** RTF only says synthesis outruns playback
+  once it starts; the silence users notice is sequencing. In the illustrative budget, waiting for a
+  150-token reply gives about 4.15 s to first audio versus about 1.39 s when the first clause is
+  released early.
+- **"A faster vocoder is the main latency lever."** Halving the TTS first chunk in that budget saves only
+  75 ms; when the splitter releases the first chunk saves seconds.
+- **"Mispronounced names are the neural voice's fault."** The acoustic model faithfully says whatever the
+  front end hands it, so the fix is a lexicon or SSML phoneme override, guarded by an ASR round-trip test
+  in CI.
+- **"The LLM's reply can go straight to the synthesiser."** Markdown, URLs, JSON and raw numbers get read
+  aloud or mangled. Prompt the agent to write for the ear and keep a normaliser as the safety net.
+- **"Barge-in just means stopping playback."** Generation must be cancelled too, and the agent's history
+  must keep only the clauses actually played, or the next turn assumes the user heard things they did
+  not.
+- **"Codec models generate audio tokens one at a time, like text."** Ten seconds at 75 frames per second
+  with 8 codebooks is 6,000 tokens, too slow to emit serially; VALL-E-style models predict the coarse
+  codebook autoregressively and fill the rest in parallel.
 
 ## Examples
 ### Normalise, split and stream any synthesiser

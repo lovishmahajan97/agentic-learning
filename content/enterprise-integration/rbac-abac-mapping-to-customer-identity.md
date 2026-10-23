@@ -5,7 +5,8 @@ name: RBAC / ABAC mapping to customer identity
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - enterprise-integration/sso-iam-integration
@@ -38,6 +39,69 @@ and evaluated per request.
   defaults, which tools a principal is even shown, and per-tenant mapping config keyed by immutable group IDs.
 - **What you can skip.** Formal access-control theory and building your own policy language. Pick an
   in-process function first, and Cedar, OPA or OpenFGA when rules or object graphs grow.
+
+## Decision case
+### Scenario
+A deal-assistant agent searches CRM notes and SharePoint deal rooms and can summarize or export deals.
+Three tenants are live with 12,000 users. You must choose how permissions are modelled and enforced
+before the next customer joins. Figures are illustrative.
+- **Rules customers asked for:** admins configure, others query; deals visible only within the user's
+  region unless they are in the global-deals group; confidential deals need clearance 2 or more.
+- **Shape of the directory:** 6 functions, 5 regions, 3 seniority levels; groups up to 10,000 members; one
+  such group can see 200,000 of the 2 million indexed documents; HR moves about 50 people a day between
+  large groups.
+- **Load:** about 30% of users active daily, 10 answers each, 4 permission decisions per answer
+  (retrieval filter, tool list, tool gate, resource check).
+- **Audit:** a customer admin must be able to ask "why could Ana see this?" for any answer.
+- **Team and deadline:** 2 engineers, 8 weeks; nobody has run a policy engine in production.
+
+Derived numbers: 12,000 x 0.3 x 10 = 36,000 answers a day, times 4 = 144,000 decisions a day, each on
+the agent's request path.
+
+### Options
+| Option | How it works | Regional and clearance rules | Cost of 50 big-group moves a day | Audit | Fits team and 8 weeks |
+|---|---|---|---|---|---|
+| RBAC only, index-time ACLs | one role per function x region x level; ACLs expanded to users | 90 roles per tenant, 18 more per new region | 50 x 200,000 = 10 million document rewrites | bindings reviewable, rules implicit | fits, but grows badly |
+| In-process evaluator, query-time ACLs | group-ID role bindings plus ABAC rules as per-tenant data; one policy function | 2 rules | 50 principal-set recomputes | decision log with rule name | fits |
+| Policy engine (Cedar or OPA) | same model, rules in the engine's language | 2 rules | 50 recomputes | engine decision logs | fits, plus learning the engine |
+| Relationship service (OpenFGA or SpiceDB) | every document share stored as relationship tuples | expressible | tuple writes on each change | strong | risky: 2 million documents' tuples to sync and a new service to run |
+
+### Decision
+**Use an in-process policy function with RBAC bindings keyed by group object ID, ABAC rules stored as
+versioned per-tenant data, and source ACLs resolved at query time.**
+
+It needs 2 rules instead of 90 roles
+and turns 10 million daily rewrites into 50 recomputes. It adds no network hop to 144,000 decisions a
+day, and it fits a team new to policy engines.
+- **Effective permission:** user rights intersected with the agent's scope, checked at retrieval, at the
+  tool list, at execution and on the specific resource.
+- **Fail closed:** a missing `region` or clearance denies, with an alert on the missing-attribute rate.
+- **Why not RBAC only:** the role count and index churn are the two costs that grow fastest.
+- **Why not an engine yet:** two rules do not repay a new dependency; keep the function's inputs shaped
+  like Cedar's principal, action and resource so moving later is mechanical.
+
+**What would change it.** Customers wanting to author their own policies, or more than a handful of
+rules, favour Cedar or OPA. Permissions that follow folder and share graphs across many sources favour a
+relationship service.
+
+### Trade-offs accepted
+- **Rules live in your code path.** A bug affects all tenants; run canary users per region and clearance
+  level on a schedule and alert on any wrong answer.
+- **Attribute quality decides access.** Blank `region` values lock users out; monitor missing-attribute
+  rate per tenant before each rollout.
+- **Query-time resolution needs a fast principal cache.** Invalidate on SCIM group events and monitor the
+  lag from a group change to the filter reflecting it.
+- **Decision logs grow.** 144,000 entries a day; keep inputs and rule names, sample for quarterly admin
+  review, and set retention per contract.
+
+### Review rubric
+- **Three input kinds separated:** product roles, carried source ACLs and contextual attribute rules.
+- **Growth computed:** role counts and ACL rewrite volume from the stated directory shape and churn.
+- **Enforcement points named:** retrieval before ranking, tool list, execution gate and resource check.
+- **Agent never amplifies the user:** intersection of user rights and agent scope stated and tested.
+- **Fail-closed with monitoring:** what missing attributes or unresolved principals do, and the alert.
+- **Engine choice reversible:** what rule count or requirement would trigger an engine or a
+  relationship service.
 
 ## Why it exists
 - **Nobody designed the two sides to fit.** A customer's Entra or Okta directory has groups like

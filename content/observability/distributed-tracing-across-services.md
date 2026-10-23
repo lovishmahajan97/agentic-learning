@@ -5,8 +5,9 @@ name: Distributed tracing across services
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
 agent_relevance: useful
+lesson_type: lab
 related:
   - observability/tracing
   - observability/spans
@@ -38,6 +39,183 @@ metadata), so the turn stays one tree.
   third parties.
 - **What you can skip.** Writing propagators, or collector internals beyond knowing tail sampling needs
   trace-id routing. Most of the work is verifying each hop, not code.
+
+## Lab
+### Task
+Keep one agent turn in one trace across three process boundaries: a tool server called over "HTTP",
+a queue worker that runs the next step, and the public edge.
+
+The starter simulates each service by
+running it in an empty `contextvars.Context`, so nothing ambient crosses over, exactly as between real
+processes. It produces three traces and continues a trace id chosen by a public client. Time box:
+45-75 minutes.
+- **Prerequisites:** this lesson's How it works (inject and extract, queues, the edge as a trust
+  boundary), plus tracing and spans.
+- **Setup:** Python 3.12 with `pip install opentelemetry-sdk pytest` (checked on opentelemetry-sdk 1.45,
+  pytest 9.1). Save the starter as `lab_propagation.py` and the tests as `test_lab_propagation.py`.
+- **Done:** `python lab_propagation.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: keep one agent turn in one trace across processes (checked on Python 3.12, opentelemetry-sdk 1.45)."""
+import contextvars
+from opentelemetry import trace
+from opentelemetry.propagate import extract, inject          # default propagators: tracecontext, baggage
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind
+
+EXPORTER = InMemorySpanExporter()
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(EXPORTER))
+tracer = provider.get_tracer("agent-platform")
+QUEUE: list[dict] = []                                      # stand-in for a message broker
+
+
+def in_other_process(fn, *args):
+    """Run fn with an EMPTY context, as a separate service would: nothing ambient crosses over."""
+    return contextvars.Context().run(fn, *args)
+
+
+def tool_server_handle(headers, body):
+    """LAB 1 (tool server): start the SERVER span as a child of the caller's span by extracting
+    the context from the request headers."""
+    with tracer.start_as_current_span("tool.search_tickets", kind=SpanKind.SERVER):   # BUG: headers ignored
+        with tracer.start_as_current_span("db.query"):
+            return ["T-1", "T-7"] if body["q"] else []
+
+
+def worker_drain():
+    """LAB 2b (queue worker): start each CONSUMER span from the context carried in msg["trace"]."""
+    while QUEUE:
+        msg = QUEUE.pop(0)
+        with tracer.start_as_current_span("agent.step", kind=SpanKind.CONSUMER) as span:   # BUG: no parent
+            span.set_attribute("app.tickets", msg["step"]["tickets"])
+
+
+def orchestrate(task):
+    with tracer.start_as_current_span("tool.search_tickets", kind=SpanKind.CLIENT):
+        headers = {}
+        inject(headers)                                     # adds traceparent
+        tickets = in_other_process(tool_server_handle, headers, {"q": task})   # an HTTP POST
+    with tracer.start_as_current_span("queue.publish", kind=SpanKind.PRODUCER):
+        QUEUE.append({"step": {"tickets": tickets}})        # LAB 2a: inject the context into msg["trace"]
+    return tickets
+
+
+def edge_ingress(headers, task):
+    """LAB 3 (public edge): an incoming traceparent is untrusted. Start a FRESH root span, and if
+    the incoming context is valid, attach it as a Link instead of continuing it."""
+    ctx = extract(headers)                                  # BUG: continues whatever the client sent
+    with tracer.start_as_current_span("agent.run", context=ctx, kind=SpanKind.SERVER):
+        return orchestrate(task)
+
+
+INCOMING = {"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}   # a public client
+
+
+def show(spans):
+    by_id = {s.context.span_id: s for s in spans}
+    for s in sorted(spans, key=lambda s: s.start_time):
+        p = by_id.get(s.parent.span_id) if s.parent else None
+        parent = f"{p.name}/{p.kind.name}" if p else ("remote" if s.parent else "-")
+        print(f"{s.name:<20} {s.kind.name:<9} parent={parent:<29} links={len(s.links)}")
+    print("traces:", len({s.context.trace_id for s in spans}))
+    hijacked = any(format(s.context.trace_id, "032x") == INCOMING["traceparent"][3:35] for s in spans)
+    print("continued incoming trace id:", "yes" if hijacked else "no")
+
+
+if __name__ == "__main__":
+    edge_ingress(INCOMING, "refund for T-7")
+    in_other_process(worker_drain)
+    show(EXPORTER.get_finished_spans())
+```
+
+As given, it runs and prints `agent.run ... parent=remote`, a tool `SERVER` span and the `CONSUMER` span
+with `parent=-`, then `traces: 3` and `continued incoming trace id: yes`.
+
+### Expected output
+```
+agent.run            SERVER    parent=-                             links=1
+tool.search_tickets  CLIENT    parent=agent.run/SERVER              links=0
+tool.search_tickets  SERVER    parent=tool.search_tickets/CLIENT    links=0
+db.query             INTERNAL  parent=tool.search_tickets/SERVER    links=0
+queue.publish        PRODUCER  parent=agent.run/SERVER              links=0
+agent.step           CONSUMER  parent=queue.publish/PRODUCER        links=0
+traces: 1
+continued incoming trace id: no
+```
+
+### Tests
+```python
+import pytest
+from opentelemetry.trace import SpanKind
+import lab_propagation as lab
+
+ATTACKER_TRACE = int("4bf92f3577b34da6a3ce929d0e0e4736", 16)
+
+
+def run(headers):
+    lab.EXPORTER.clear(); lab.QUEUE.clear()
+    lab.edge_ingress(headers, "refund for T-7")
+    lab.in_other_process(lab.worker_drain)
+    return lab.EXPORTER.get_finished_spans()
+
+
+def get(spans, name, kind):
+    return next(s for s in spans if s.name == name and s.kind == kind)
+
+
+def test_tool_server_span_is_a_child_of_the_client_span():
+    spans = run({})
+    client = get(spans, "tool.search_tickets", SpanKind.CLIENT)
+    server = get(spans, "tool.search_tickets", SpanKind.SERVER)
+    assert server.context.trace_id == client.context.trace_id
+    assert server.parent is not None and server.parent.span_id == client.context.span_id
+
+
+def test_queue_worker_continues_the_trace_through_the_message():
+    spans = run({})
+    producer = get(spans, "queue.publish", SpanKind.PRODUCER)
+    consumer = get(spans, "agent.step", SpanKind.CONSUMER)
+    assert consumer.parent is not None and consumer.parent.span_id == producer.context.span_id
+    assert len({s.context.trace_id for s in spans}) == 1
+
+
+def test_edge_starts_a_fresh_trace_and_links_the_untrusted_one():
+    spans = run(dict(lab.INCOMING))
+    root = get(spans, "agent.run", SpanKind.SERVER)
+    assert root.parent is None, "the public client's span became our parent"
+    assert all(s.context.trace_id != ATTACKER_TRACE for s in spans)
+    assert [l.context.trace_id for l in root.links] == [ATTACKER_TRACE]
+    plain = get(run({}), "agent.run", SpanKind.SERVER)        # no header: a root with no link
+    assert plain.parent is None and len(plain.links) == 0
+```
+
+On the starter all three fail for the intended reason: the server span has a different trace id from
+its client, the consumer has no parent, and the root's parent is the public client's remote span.
+
+### Failure scenarios
+- **Inject: copy headers into a dict with title-cased keys (`Traceparent`),** as a hand-written proxy
+  might. Observe: `extract` returns an empty context and the tool server starts its own trace again.
+  Debug: print the headers the server receives; the default dict getter is case-sensitive, and real
+  HTTP frameworks lower-case header names for you.
+- **Inject: call `inject(carrier)` before opening the `queue.publish` span.** Observe: the consumer's
+  parent is `agent.run`, not the producer. Debug: compare the consumer's parent span id with the
+  producer's; inject inside the span that should be the parent.
+- **Inject: keep the starter's edge and send flags `00` instead of `01`.** Observe: `agent.run`, the
+  tool `CLIENT` span and `queue.publish` vanish from the exporter, because the parent-based sampler
+  obeys the client. Debug: count spans per request; a public caller should never decide your sampling.
+
+### Submission
+- **Code:** your `lab_propagation.py` with LAB 1-3 done and every `# BUG` line fixed.
+- **Test run:** `pytest -q` showing 3 passed, plus your script output next to Expected output.
+- **One real hop:** a trace from your own agent where a tool server or worker span nests under the
+  orchestrator span that called it, with the provider request id on the leaf span.
+- **A short note (3-5 sentences):** why the edge links rather than continues, and which of your agent's
+  hops (gateway, MCP server, queue, sub-agent) you verified and how.
+- **Evaluation:** tests pass, one trace id per turn, and no span carries the public client's trace id.
 
 ## Why it exists
 - **One turn crosses many processes.** An API gateway, an orchestrator, a retrieval service, a model

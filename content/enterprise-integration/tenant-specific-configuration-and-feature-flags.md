@@ -5,7 +5,8 @@ name: Tenant-specific configuration & feature flags
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/tenant-isolation
@@ -37,6 +38,66 @@ never fork the agent per customer.
   at run start, and conservative defaults so a config outage removes tools rather than guardrails.
 - **What you can skip.** Comparing flag vendors in depth; a vendor-neutral interface and a typed table you
   own cover most agent teams until flags multiply.
+
+## Decision case
+### Scenario
+A support-agent product serves 40 enterprise tenants from one codebase. Today per-tenant differences
+live in `if tenant == ...` checks. Sales has just closed a regulated tenant, and product wants to ship a
+new `refund_order` tool and prompt v8 tenant by tenant. All figures are illustrative.
+
+- **Change rate:** prompt or threshold changes land about weekly per tenant, far more often than code
+  deploys.
+- **Contracts:** 3 regulated tenants may never use provider B; the new tool is an entitlement for 12
+  tenants only.
+- **Latency:** about 200,000 agent runs per day; config resolution may add at most 5 ms per run and
+  must never block on a remote call.
+- **Audit:** for one year, answer "which prompt, model and tools did run X use?".
+- **Team:** three engineers; no budget approved yet for a flag vendor.
+
+### Options
+| Option | How it works | Weekly changes | Contracts | Latency | Audit |
+|---|---|---|---|---|---|
+| A. Keep code checks | Per-tenant `if` branches, shipped by deploy | a deploy per change | enforced only by review | none added | git history, not per run |
+| B. Typed config you own plus a few flags | Versioned, schema-validated tenant config table, layered resolution, in-process cache; release and kill flags behind a vendor-neutral interface | admin save through the eval gate | validation rejects a barred provider at save time | cache read, pinned per run | config version stamped on every trace |
+| C. Everything in a flag service | Prompt version, tool list and model stored as JSON flag variants | admin save | no typed schema: a typo or barred provider fails at request time | cache read | depends on the service's change log |
+| D. Fork per tenant | A branch or deployment per tenant | per-branch deploy | per branch | none added | 40 histories |
+
+### Decision
+Choose **B**, because it is the only option that moves weekly changes off the deploy path and still
+enforces contracts before a run starts.
+- **Contracts:** the schema rejects provider B for the 3 regulated tenants, and the tool registry is
+  filtered from config, so the other 28 tenants never see `refund_order`.
+- **Latency:** resolution is an in-process cache read, refreshed by polling; 10 pods polling every 30 s
+  is 10 × 2,880 = 28,800 polls per day, against 200,000 runs that each pay only a cache read.
+- **Audit:** each run is pinned to one config version and its trace carries that version and the flag
+  decisions.
+- **Rollout:** prompt v8 goes out with a release flag in waves, each wave gated by the tenants'
+  regression suites.
+
+**What would change it.**
+- **Many live experiments:** above roughly 20 live flags or a need for experiment analytics, move flags
+  (not entitlements) to a vendor behind the same interface.
+- **A tenant demanding its own deployment** for residency: add a region layer, still one codebase.
+- **Five tenants or fewer:** code checks plus a kill switch may be enough for now.
+
+### Trade-offs accepted
+- **You own a config store and admin tool.** Monitor save-to-activation time and eval-gate failures.
+- **Resolved config is computed, not visible.** Build the provenance viewer first; track how many tenants
+  override each key.
+- **Configs change behaviour without a deploy.** Every behaviour key goes through the eval gate; break
+  quality metrics down by config version.
+- **The test matrix grows with flags.** Six booleans already give 2⁶ = 64 combinations, so CI tests the
+  40 resolved live configs instead, and every release flag gets an owner and a removal date.
+
+### Review rubric
+- **Configuration and flags are separated:** entitlements and prompt versions are typed config; release,
+  experiment and kill flags are named by kind with lifetimes.
+- **Contract rules are enforced at write time** by validation, not by prompt wording or code review.
+- **Per-run pinning is explicit,** with kill switches checked on every tool call as the stated exception.
+- **The latency claim is backed by arithmetic** (cache reads, poll volume) and a conservative coded
+  default for a config outage.
+- **Audit is traceable:** a reviewer can follow one run id to its config version and flag decisions.
+- **Reversal conditions are named** with a threshold, such as live flag count or tenant count.
 
 ## Why it exists
 - **Every customer wants something different.** The first gets the product as built. The second needs

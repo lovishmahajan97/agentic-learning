@@ -5,7 +5,8 @@ name: Eval review loops
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - evals/error-analysis
@@ -33,6 +34,73 @@ regression checks. A score says how much is wrong, not why.
   attribution step before any fix, version pinning, the judge audit sample and the holdout discipline.
 - **What you can skip.** Fancy dashboards early on. A spreadsheet of coded traces and three small scripts
   (tally, corrected pass rate, flip report) carry a pilot.
+
+## Decision case
+### Scenario
+The support agent from the worked loop has launched. It now has a `change_plan` write tool and handles
+about 6,000 conversations a week, all graded by the LLM judge. The pilot's weekly loop reviewed every
+failure; that no longer scales. All figures are illustrative.
+
+- **Judge results.** About 89% pass, so about 660 judge failures a week. Judge-to-SME agreement was 36 of
+  40 on the last audit.
+- **High-stakes stratum.** Conversations that call `change_plan` are about 3% of traffic (180 a week), and
+  about 11% of them fail the judge: about 20 a week.
+- **Change rate.** Engineers ship prompt or tool changes about twice a week, each gated by the flip report.
+
+Constraints:
+- **Expert time.** Two SMEs give 4 hours a week in total; a trace review takes about 4 minutes, so about 60
+  reviews a week.
+- **Write safety.** Every judge failure in the `change_plan` stratum must be read by an SME.
+- **Customer report.** Each month the customer receives an SME-validated quality figure and the judge's
+  agreement with SMEs.
+
+### Options
+| Option | How it works | SME reviews a week | Judge drift detection | Write-safety rule |
+|---|---|---|---|---|
+| **A. Keep reviewing every failure** | Pilot loop unchanged | About 660, or 44 hours: 11 times the budget | Strong | Met |
+| **B. Judge only** | No human review after launch | 0 | None: drift is invisible from the score | Fails |
+| **C. Fixed weekly allocation** | 20 high-stakes failures plus a 40-item random judge audit; engineers code other failures by first bad step | 60 | Weekly, pooled monthly | Met |
+| **D. Fortnightly deep review** | 120 traces every two weeks | 60 on average | Every two weeks, slower | Met, but failures wait up to two weeks |
+
+### Decision
+Choose **C**, because it is the only option inside the 60-review budget that meets both the write-safety
+rule and the monthly report:
+- **A does not fit.** 660 failures at 4 minutes each is 2,640 minutes, about 44 hours against 4.
+- **B breaks two constraints.** No SME reads `change_plan` failures, and the monthly agreement figure would
+  have no data behind it.
+- **The audit stays random.** 40 items drawn from everything the judge graded, passes included, because
+  leniency only shows in passes.
+- **Monthly pooling makes the audit usable.** At 90% agreement, 40 items carry about ±9.3 points; four
+  weeks pooled (160 items) carry about ±4.6, which is what the customer report quotes.
+- **Engineers do the bulk coding.** Other failures are coded by first bad step without SMEs; only items
+  attributed to a label or guideline gap go to the SMEs' queue.
+- **D delays high-stakes reads** by up to two weeks while write-tool failures keep happening.
+
+What would change it:
+- **A product, policy or traffic-mix change.** Agreement measured on the old mix does not transfer, so
+  double the audit for a month, using the pilot loop on the affected strata.
+- **Pooled agreement falls.** If the four-week figure drops against recent months (the team uses 85% as
+  its own trigger), recalibrate the judge before trusting any score movement.
+- **High-stakes failures exceed 20 a week.** Then ask the sponsor for more SME time rather than sampling
+  them, because the rule says every one is read.
+
+### Trade-offs accepted
+- **Non-critical failures get no SME eye.** Engineer-coded clusters may misattribute label errors as system
+  errors. Watch the attribution mix: if the label and guideline shares stop shrinking, route more to SMEs.
+- **Weekly audit numbers are noisy.** About ±9 points a week, so do not react to one week; plot the pooled
+  trend per customer.
+- **No new failure categories from SMEs outside the high-stakes stratum.** Add user-flagged traces to the
+  engineer queue and track the share of new categories found in production.
+- **The holdout ages.** Score it only at milestones and refresh it from production samples quarterly.
+
+### Review rubric
+- **Budget is converted to reviews.** SME hours become a weekly review count, and every option is costed
+  against it.
+- **Allocation follows risk.** High-stakes strata get full coverage, and the write-up says why.
+- **The audit is random and sized.** It states the sample, its interval, and how pooling tightens it.
+- **Attribution still happens.** It says who codes which failures and how label or guideline gaps reach SMEs.
+- **Scale-up triggers are stated,** tied to product, policy or traffic changes and to an agreement trend.
+- **The customer-facing number has a method.** The report says how the SME-validated figure is computed.
 
 ## Why it exists
 - **The eval is not an oracle.** The tempting workflow after a golden set and first agent prompt exist is

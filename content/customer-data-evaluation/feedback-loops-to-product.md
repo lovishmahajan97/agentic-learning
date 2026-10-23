@@ -5,7 +5,8 @@ name: Feedback loops to product
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - customer-data-evaluation/production-feedback-classification
@@ -33,6 +34,68 @@ reporter. Without it, every tenant gets its own prompt patch.
   roadmap item; the workaround registry with expiries; and which regression cases each fix adds.
 - **What you can skip.** Product-management ceremony; a weekly triage slot, written rules and a
   workaround file in CI are enough to start.
+
+## Decision case
+### Scenario
+Six FDEs run one shared agent across 14 tenants. Over a year they have added 37 per-tenant prompt
+overrides and tool wrappers, several of them for the same few problems. The platform team plans a shared
+model upgrade in 12 weeks, and every override must be ported and re-tested on the new model.
+
+Constraints (figures illustrative):
+- **Field SLA.** A blocked customer must get a fix within 2 business days. A shared product fix takes
+  2 to 3 weeks to ship.
+- **Product capacity.** Two product engineers can ship about 4 shared fixes in the 12 weeks.
+- **Upgrade cost.** Porting and re-testing an override takes about half an engineer-day, so 37 overrides
+  cost about 18.5 days. The platform team will fund at most 8 days.
+- **Field capacity.** All six FDEs are committed to customer delivery; at most a few hours a week each
+  can go to triage.
+- **Evidence.** Feedback is already classified and clustered, as in production feedback classification.
+
+### Options
+| Option | How it works | Meets field SLA? | Overrides at upgrade | Field capacity |
+|---|---|---|---|---|
+| **A. Status quo** | FDEs patch locally and file tickets | Yes | 37 or more: about 18.5 days, over the 8 funded | Unchanged |
+| **B. Upstream only, no local patches** | Every fix waits for a shared release | No: 2 to 3 weeks | Falls, but customers stay blocked | Unchanged |
+| **C. Weekly triage plus a workaround registry** | Local patches allowed only with tracking issue and expiry, checked in CI; clusters ranked by the priority formula; product ships the top 4 | Yes | 37 − 24 = 13 if the top 4 clusters cover 24 overrides: about 6.5 days | About 1 hour a week per FDE |
+| **D. Productisation squad** | Pull 2 FDEs off customers for a quarter to upstream fixes | Yes | Lower, possibly | Fails: a third of field capacity leaves delivery |
+
+### Decision
+Choose **C**, because it keeps the field SLA and brings upgrade cost under budget:
+- **Local fixes remain, but on a clock.** A blocked tenant still gets a prompt override in 2 days, and the
+  registry fails CI when it has no tracking issue or is past its expiry.
+- **The priority formula spends scarce product capacity well.** A silent acted-upon cluster on 3% of three
+  tenants' runs scores 0.9, ahead of a loud cosmetic one at 0.2.
+- **Four shared fixes retire most overrides.** Assuming the top 4 clusters, such as the date-order bug in
+  the agent scenario, account for 24 of the 37 overrides, 13 remain. At half a day each that is about
+  6.5 days, under the 8 funded.
+- **Every fix closes three things:** regression cases in each affected suite, deleted workarounds, and a
+  release note to the reporters.
+
+What would change it:
+- **Clusters that do not concentrate.** If the top 4 cover fewer than 21 overrides, more than 16 remain and
+  the upgrade exceeds 8 days, so either fund more porting or delay the upgrade.
+- **A defect-heavy backlog.** If many clusters are severe defects, not config, product capacity is the
+  limit, and a temporary squad (D) may be worth the field cost.
+- **One tenant.** Then a shared list between the FDE and the product owner is enough.
+
+### Trade-offs accepted
+- **Overrides still get written.** Watch open override count and median age in the registry every week.
+- **Lower-ranked clusters wait a quarter or more.** Watch recurrence and complaints for clusters below the
+  cut, and re-rank at each triage.
+- **Breadth weighting can starve one strategic tenant.** Give account strategy an explicit weight and log
+  when it is used.
+- **Triage takes FDE time.** Watch time from first report to decision; if it grows, automate more of the
+  cluster assembly.
+
+### Review rubric
+- **Workarounds are counted and costed.** The write-up states the number of overrides and what they cost
+  at the next shared change.
+- **Ranking is explicit.** It uses written weights on traffic share and severity, not ticket counts.
+- **Config and defects are separated.** It applies the "correct but different" test before choosing config.
+- **Fixes close the loop.** Each fix adds regression cases, retires workarounds and notifies reporters.
+- **Field speed is preserved.** It says how blocked customers get unblocked without forking the agent.
+- **Reversal conditions are concrete.** It names the concentration, capacity or tenant-count fact that
+  would change the choice.
 
 ## Why it exists
 - **Field teams see real usage first.** The date parser fails on one customer's European formats, the

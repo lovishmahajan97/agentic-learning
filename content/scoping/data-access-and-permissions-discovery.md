@@ -5,7 +5,8 @@ name: Data access & permissions discovery
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - rag-retrieval/acl-aware-retrieval
@@ -34,6 +35,65 @@ time, and export-based prototypes silently drop permissions.
   one.
 - **What you can skip.** The internals of each identity provider's protocols; know the delegated vs service
   distinction, how groups resolve and what your index can filter on.
+
+## Decision case
+### Scenario
+A 12,000-employee company wants an HR agent that answers policy questions for all staff and helps 60 HR
+partners work their cases. Week-one inventory, all figures illustrative:
+- **HR knowledge base:** 3,000 articles with coarse permissions, either "all employees" or "managers only";
+  changes are rare.
+- **HR case system:** per-case ACLs that change when an investigation is reassigned. HR requires a
+  revocation to take effect within 15 minutes. The API exposes current permissions but no change events,
+  and allows about 5 calls a second for the whole tenant.
+- **Payroll:** regulated personal data; the owner requires a privacy review of about 12 weeks.
+- **Load:** about 3,000 policy questions a day, peaking near 6 a second on Monday mornings.
+- **Constraints:** pilot in 8 weeks; registering a delegated (on-behalf-of) app needs a 4-week security
+  review.
+
+### Options
+| Option | How it works | Revocation within 15 minutes | Fits 5 calls a second | Fits 8 weeks | Leak risk |
+|---|---|---|---|---|---|
+| A. Service account, one index | Export everything into one index, no ACLs | No | Yes | Yes | High: everyone sees cases and payroll |
+| B. One ACL-tagged index, nightly ACL sync | Ingest all sources with principals, pre-filter by groups | No: lag up to 24 hours, and no change events to sync faster | Yes | Only without payroll | Medium: stale case access |
+| C. Per-source enforcement, payroll cut | Two partitioned knowledge-base indexes; a case tool calling the case API with delegated user tokens; no payroll in phase one | Yes: the source decides on every call | Yes: about 60 HR users, not 12,000 | Yes, if the security review starts in week 1 | Low |
+| D. Delegated access for everything | Every question calls each source as the user | Yes | No: 6 a second at peak exceeds 5, before any case calls | Yes | Low |
+
+### Decision
+Choose **C**: enforce permissions per source, matched to each source's permission model.
+- **The knowledge base is coarse,** so two partitions (all employees, managers) filtered by the user's
+  resolved group are simple and robust, and need no source call per question.
+- **The case system needs freshness the index cannot give:** without change events, only a live,
+  delegated call meets the 15-minute revocation rule. Its load comes from 60 HR partners, well inside 5
+  calls a second.
+- **Payroll's 12-week review would dominate an 8-week plan,** so it is cut from phase one with no payroll
+  tool at all.
+- **The 4-week security review starts in week 1,** leaving weeks 5 to 8 to test the case tool on the real
+  access path with non-admin test identities.
+
+**What would change it:**
+- **The case API adds permission-change events:** an ACL-tagged case index with incremental sync and lag
+  alerts becomes viable and faster.
+- **Rate limit rises well above peak load:** delegated access for the knowledge base too, retiring the
+  partitions.
+- **The sponsor makes payroll questions the headline:** move the payroll privacy review to day one and push
+  the payroll phase past 12 weeks.
+
+### Trade-offs accepted
+- **Two enforcement mechanisms to test:** run the permission suite with walled-off, employee, manager and
+  HR identities on every index or tool change.
+- **Case answers are slower** because each makes a live call: track p95 latency of the case tool and its
+  share of the rate limit.
+- **No payroll answers in the pilot:** count questions the agent declines as payroll and report them as
+  demand for phase two.
+- **Traces may hold case text:** restrict trace access to the HR team's rule or redact retrieved text.
+
+### Review rubric
+- Inventories every source with a named owner, permission model, change frequency and lead time.
+- Matches the enforcement method to each source's model and freshness need, with reasons.
+- Checks the chosen access path against rate limits and peak load, with the arithmetic shown.
+- Starts the slowest approvals first and cuts sources whose review dominates the timeline.
+- Takes identity from the session in the tool layer and covers derived data (traces, memory).
+- Names the source change, such as change events or limits, that would flip the choice.
 
 ## Why it exists
 - **The typical stall is access, not model quality.** It is week six of a pilot, the prototype works on a

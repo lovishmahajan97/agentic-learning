@@ -5,7 +5,8 @@ name: Pydantic AI (typed agents, dependencies, structured results)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/frameworks
@@ -38,6 +39,168 @@ functions across many model providers.
   `output_type`, output validators, usage limits and message history.
 - **What you can skip.** Graph DSLs for simple agents. Pydantic Graph exists for explicit state
   machines, but most agents need only `Agent` plus plain Python control flow.
+
+## Lab
+### Task
+Finish the refund agent from this lesson's first example so its contract holds under a hostile or
+confused model. You add the ownership check in the tool, the order-total check in the output
+validator, and a fail-closed handler for usage limits and exhausted retries.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** this lesson's run steps and validation diagram; Pydantic models.
+- **Runs offline:** `scripted()` builds a `FunctionModel` that replays recorded turns (a probe for
+  another customer's order, an over-total refund, a loop), so no provider key is needed.
+- **Needs:** `pydantic-ai-slim` and `pytest`; checked with pydantic-ai-slim 2.60.0 (pydantic 2.14.1)
+  on Python 3.12. Set `PYDANTIC_AI_NO_BANNER=1` to silence its stderr banner.
+
+### Starter code
+```python
+# refund_agent.py: ownership checks, an output validator and a fail-closed budget (Pydantic AI, offline)
+import asyncio
+from dataclasses import dataclass
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent, ModelRetry, RunContext
+from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded
+from pydantic_ai.messages import ModelResponse, ToolCallPart
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.usage import UsageLimits
+
+@dataclass
+class Deps:
+    customer_id: str               # set by your auth layer per request
+    orders: dict[str, dict]        # in production: a DB or API client
+
+class RefundDecision(BaseModel):
+    order_id: str
+    eligible: bool
+    amount_usd: float = Field(ge=0)
+    reason: str
+
+agent = Agent(deps_type=Deps, output_type=RefundDecision, retries=2,
+              instructions="Orders under 30 days old and not refunded get a full refund.")
+
+@agent.tool
+async def get_order(ctx: RunContext[Deps], order_id: str) -> dict:
+    """Fetch one of the current customer's orders by its ID."""
+    # YOUR CODE 1: if the order is missing or belongs to another customer, raise
+    # ModelRetry(f"No order {order_id} for this customer.") instead of returning it
+    return ctx.deps.orders.get(order_id, {})
+
+@agent.output_validator
+async def within_total(ctx: RunContext[Deps], out: RefundDecision) -> RefundDecision:
+    # YOUR CODE 2: raise ModelRetry("Refund amount cannot exceed the order total.")
+    # when out.amount_usd is above the order's total_usd
+    return out
+
+async def handle(model, msg: str, deps: Deps) -> RefundDecision | None:
+    """Return the decision, or None (route to a human) when the run cannot finish safely."""
+    # YOUR CODE 3: catch UsageLimitExceeded and UnexpectedModelBehavior and return None
+    r = await agent.run(msg, deps=deps, model=model, usage_limits=UsageLimits(request_limit=4))
+    return r.output
+
+def scripted(*turns):
+    """A FunctionModel that replays recorded turns: ("tool", args) or ("final", output dict).
+    It records every message list it receives, so tests can see what the model was told."""
+    seen, queue = [], list(turns)
+    def fn(messages, info: AgentInfo) -> ModelResponse:
+        seen.append(messages)
+        kind, args = queue.pop(0) if len(queue) > 1 else queue[0]  # repeat the last turn
+        name = "get_order" if kind == "tool" else info.output_tools[0].name
+        return ModelResponse(parts=[ToolCallPart(name, args)])
+    return FunctionModel(fn), seen
+
+ORDERS = {"A1": {"customer_id": "c1", "total_usd": 80.0, "days_ago": 12, "refunded": False},
+          "B7": {"customer_id": "c2", "total_usd": 950.0, "days_ago": 3, "refunded": False}}
+DEPS = Deps("c1", ORDERS)
+OK = {"order_id": "A1", "eligible": True, "amount_usd": 80.0, "reason": "12 days old"}
+
+async def main():
+    probe, _ = scripted(("tool", {"order_id": "B7"}), ("tool", {"order_id": "A1"}), ("final", OK))
+    print("probe:", await handle(probe, "Refund order B7", DEPS))
+    greedy, _ = scripted(("tool", {"order_id": "A1"}), ("final", {**OK, "amount_usd": 120.0}), ("final", OK))
+    print("greedy:", await handle(greedy, "Refund A1 plus extra", DEPS))
+    loop, _ = scripted(("tool", {"order_id": "A1"}))
+    try:
+        print("loop:", await handle(loop, "Refund A1", DEPS))
+    except Exception as e:  # what your API handler would turn into a 500
+        print("loop: crashed with", type(e).__name__)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+As given, the probe silently receives customer `c2`'s order, `greedy` returns `amount_usd=120.0` for
+an 80.0 order, and the loop ends with `crashed with UsageLimitExceeded`.
+
+### Expected output
+```
+probe: order_id='A1' eligible=True amount_usd=80.0 reason='12 days old'
+greedy: order_id='A1' eligible=True amount_usd=80.0 reason='12 days old'
+loop: None
+```
+
+### Tests
+```python
+# test_refund_agent.py: run with `pytest -q`
+import asyncio
+from pydantic_ai import models
+from pydantic_ai.messages import ToolReturnPart
+import refund_agent as m
+
+models.ALLOW_MODEL_REQUESTS = False  # any real model call fails loudly
+
+def parts(seen):
+    return [p for msgs in seen for msg in msgs for p in msg.parts]
+
+def told(seen, text):  # did the model receive this text (as a retry or tool message)?
+    return any(text in str(getattr(p, "content", "")) for p in parts(seen))
+
+def test_other_customers_order_is_never_returned():
+    model, seen = m.scripted(("tool", {"order_id": "B7"}), ("tool", {"order_id": "A1"}), ("final", m.OK))
+    out = asyncio.run(m.handle(model, "Refund order B7", m.DEPS))
+    assert out is not None and out.order_id == "A1"
+    assert not any("c2" in str(p.content) for p in parts(seen) if isinstance(p, ToolReturnPart))
+    assert told(seen, "No order B7 for this customer.")
+
+def test_amount_above_total_is_sent_back_for_retry():
+    model, seen = m.scripted(("tool", {"order_id": "A1"}),
+                             ("final", {**m.OK, "amount_usd": 120.0}), ("final", m.OK))
+    out = asyncio.run(m.handle(model, "Refund A1", m.DEPS))
+    assert out.amount_usd == 80.0
+    assert told(seen, "cannot exceed the order total")
+
+def test_looping_agent_fails_closed():
+    model, seen = m.scripted(("tool", {"order_id": "A1"}))
+    assert asyncio.run(m.handle(model, "Refund A1", m.DEPS)) is None
+    assert len(seen) <= 4
+
+def test_exhausted_retries_fail_closed():
+    model, _ = m.scripted(("tool", {"order_id": "A1"}), ("final", {**m.OK, "amount_usd": 500.0}))
+    assert asyncio.run(m.handle(model, "Refund A1", m.DEPS)) is None
+```
+
+All four fail on the starter: a leaked `c2` order, an accepted 120.0 refund, an uncaught
+`UsageLimitExceeded`, and an accepted 500.0 refund. The tests check message content, not part
+classes: in 2.60.0 a `ModelRetry` reaches the model as a `ToolReturnPart`, while older releases use
+`RetryPromptPart`.
+
+### Failure scenarios
+- **Inject a check on arguments only:** compare `order_id` against a prefix instead of
+  `ctx.deps.customer_id`. The leak test fails. Print every `ToolReturnPart` the model saw; any
+  `customer_id` other than the caller's is the bug.
+- **Inject a vague retry message:** raise `ModelRetry("invalid")`. A real model now retries blindly
+  and hits `UnexpectedModelBehavior` more often. Count retries per run in traces and make each message
+  say what to change.
+- **Inject `retries=0` on the agent:** the probe and greedy cases both return `None`. The checks work
+  but the model gets no second attempt; compare the retry budget with the retry rate on your eval set.
+
+### Submission
+- **Your `refund_agent.py`** with the three `YOUR CODE` steps done and nothing else changed.
+- **A `pytest -q` run** showing 4 passed, plus the script output matching the expected lines.
+- **The message log** for the probe run, showing the retry text the model received.
+- **A short note** on which checks belong in the type, the tool and the validator, with one example of
+  each from your code.
+- **Evaluated on:** green tests, ownership checked against `ctx.deps`, and no exception reaching the
+  caller.
 
 ## Why it exists
 - **Structured output alone is not enough.** Libraries such as Instructor validate one call's output;

@@ -5,7 +5,8 @@ name: AbortController & cancellation
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - node-ts-for-ai/promises-and-async-error-propagation
@@ -35,6 +36,198 @@ timeout real stops.
   `AbortSignal.any`, deadlines propagated across hops, and the rule that aborts are never retried.
 - **What you can skip.** DOM-spec event details. Know `AbortSignal.timeout`, `AbortSignal.any`,
   `throwIfAborted` and how to tell `AbortError` from `TimeoutError`.
+
+## Lab
+### Task
+Make a tool-calling agent run truly stoppable: a stop must end token billing and in-flight tool calls,
+a slow step must time out on the shorter of its own budget and the request deadline, and the retry layer
+must tell a cancellation from a timeout. Time box: 45-75 minutes.
+- **Prerequisites:** this lesson's composing, deadline and abort-versus-failure sections; the promises
+  lesson for `allSettled`.
+- **Setup:** an empty folder with `"type": "module"` in `package.json`, `npm i -D vitest @types/node`.
+  Checked with Node 24.21 and Vitest 5.0; Node 24 runs `lab.ts` directly by stripping types.
+- **Fakes, no provider:** `fakeModel` bills one token every 20 ms while its signal allows, and
+  `fakeTools` takes 150 ms per tool and records completions (think `create_ticket`).
+- **Save** the starter as `lab.ts` and the tests as `lab.test.ts`, then run `node lab.ts` and
+  `npx vitest run`.
+
+### Starter code
+```ts
+// Lab: make an agent run truly stoppable: stop and step timeouts end billing and tool work.
+// Run: node lab.ts   Test: npx vitest run
+import { setTimeout as sleep } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
+
+export type Stats = { tokens: number; toolsCompleted: string[] };
+export type Step = { done: boolean; tools: string[] };
+export type Model = (signal: AbortSignal) => Promise<Step>;
+export type ToolFn = (name: string, signal: AbortSignal) => Promise<string>;
+
+// Fake provider: bills one token every 20 ms for `tokensPerStep` tokens, while the signal allows.
+export function fakeModel(stats: Stats, tokensPerStep: number, script: Step[]): Model {
+  let turn = 0;
+  return async (signal) => {
+    for (let i = 0; i < tokensPerStep; i++) { await sleep(20, undefined, { signal }); stats.tokens++; }
+    return script[turn++] ?? { done: true, tools: [] };
+  };
+}
+export function fakeTools(stats: Stats, ms = 150): ToolFn {
+  return async (name, signal) => { await sleep(ms, undefined, { signal }); stats.toolsCompleted.push(name); return `${name} ok`; };
+}
+
+// LAB 1: the time left on an absolute deadline (ms since epoch), minus a safety margin, never below 0.
+export function remainingMs(deadline: number, now: number, marginMs: number): number {
+  return 30_000;                                   // a fresh timeout per hop: the bug
+}
+
+// LAB 2: a per-step signal: aborts when `run` aborts OR after min(stepTimeoutMs, remaining) ms.
+// Build it at the start of each step (AbortSignal.timeout counts from creation).
+export function stepSignal(run: AbortSignal, stepTimeoutMs: number, deadline: number, marginMs = 0): AbortSignal {
+  void run; void stepTimeoutMs; void deadline; void marginMs;
+  return new AbortController().signal;            // never aborts
+}
+
+// LAB 3: pass the step signal to the model and to every tool, and check run.throwIfAborted()
+// before each step, so stop means stop. Return "done" or "step limit reached".
+export async function runAgent(model: Model, tool: ToolFn, run: AbortSignal,
+  opts: { stepTimeoutMs: number; deadline: number; maxSteps?: number }): Promise<string> {
+  const never = new AbortController().signal;
+  for (let i = 0; i < (opts.maxSteps ?? 5); i++) {
+    const step = await model(never);
+    if (step.done) return "done";
+    await Promise.allSettled(step.tools.map((t) => tool(t, never)));
+  }
+  return "step limit reached";
+}
+
+// LAB 4: classify a rejection for the retry layer using the signal's reason, not the error:
+// "cancelled" (never retry), "timeout" (may fall back), "failure" (normal error handling).
+export function classify(e: unknown, signal: AbortSignal): "cancelled" | "timeout" | "failure" {
+  return "failure";
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  const script: Step[] = [{ done: false, tools: ["search", "create_ticket"] }, { done: true, tools: [] }];
+  const stats: Stats = { tokens: 0, toolsCompleted: [] };
+  const stop = new AbortController();
+  setTimeout(() => stop.abort(), 300);             // user hits stop while the tools run
+  const t0 = performance.now();
+  const deadline = Date.now() + 30_000;
+  const step = { stepTimeoutMs: 5_000, deadline };
+  const outcome = await runAgent(fakeModel(stats, 10, script), fakeTools(stats), stop.signal, step)
+    .catch((e: unknown) => classify(e, stop.signal));
+  const elapsed = performance.now() - t0;
+  const at = stats.tokens;
+  await sleep(500);
+  console.log(`stop: ${outcome}, tokens ${at} -> ${stats.tokens} after 500 ms, tools completed: [${stats.toolsCompleted}]`);
+  console.log(`returned within 400 ms: ${elapsed < 400}`);
+  const slow: Stats = { tokens: 0, toolsCompleted: [] };
+  const run = new AbortController().signal;
+  let sig = run;
+  const slowModel = fakeModel(slow, 50, script);
+  const timed = await runAgent(async (s) => { sig = s; return slowModel(s); }, fakeTools(slow), run,
+    { stepTimeoutMs: 200, deadline }).catch((e: unknown) => classify(e, sig));
+  console.log(`slow step: ${timed}, tokens billed: ${slow.tokens <= 10 ? "<= 10" : slow.tokens}`);
+  console.log("remaining:", remainingMs(deadline, deadline - 10_000, 500));
+}
+```
+
+### Expected output
+`node lab.ts` with a correct solution prints:
+
+```
+stop: cancelled, tokens 10 -> 10 after 500 ms, tools completed: []
+returned within 400 ms: true
+slow step: timeout, tokens billed: <= 10
+remaining: 9500
+```
+
+The starter prints `stop: done, tokens 20 -> 20`, both tools completed (the ticket was created after the
+user hit stop), `false`, `slow step: done, tokens billed: 100` and `remaining: 30000`.
+
+### Tests
+```ts
+import { expect, test } from "vitest";
+import { setTimeout as sleep } from "node:timers/promises";
+import { classify, fakeModel, fakeTools, remainingMs, runAgent, stepSignal, type Stats, type Step } from "./lab.ts";
+
+const script: Step[] = [{ done: false, tools: ["search", "create_ticket"] }, { done: true, tools: [] }];
+const fresh = (): Stats => ({ tokens: 0, toolsCompleted: [] });
+const far = () => Date.now() + 60_000;
+
+test("each hop gets the time left on the deadline, not a fresh timeout", () => {
+  expect(remainingMs(100_000, 70_000, 500)).toBe(29_500);
+  expect(remainingMs(100_000, 99_800, 500)).toBe(0);
+});
+
+test("the step signal fires on the shorter of step timeout and deadline", async () => {
+  const s = stepSignal(new AbortController().signal, 1_000, Date.now() + 60);
+  await sleep(120);
+  expect(s.aborted).toBe(true);
+  expect(s.reason).toMatchObject({ name: "TimeoutError" });
+  const stop = new AbortController();
+  const s2 = stepSignal(stop.signal, 10_000, far());
+  stop.abort();
+  expect(s2.aborted).toBe(true);
+});
+
+test("stop ends billing and tool work, and is classified as cancelled", async () => {
+  const stats = fresh();
+  const stop = new AbortController();
+  setTimeout(() => stop.abort(), 300);                     // tools are mid-flight at 300 ms
+  const err = await runAgent(fakeModel(stats, 10, script), fakeTools(stats), stop.signal,
+    { stepTimeoutMs: 5_000, deadline: far() }).then(() => null, (e: unknown) => e);
+  expect(err).not.toBeNull();
+  expect(classify(err, stop.signal)).toBe("cancelled");
+  const at = stats.tokens;
+  await sleep(300);
+  expect(stats.tokens).toBe(at);                           // no growth after stop
+  expect(at).toBe(10);                                     // step 2 never started
+  expect(stats.toolsCompleted).toEqual([]);                // no ticket created after stop
+});
+
+test("a slow step times out and stops billing", async () => {
+  const stats = fresh();
+  const run = new AbortController().signal;
+  const model = fakeModel(stats, 50, script);
+  let seen: AbortSignal = run;
+  const err = await runAgent(async (s) => { seen = s; return model(s); }, fakeTools(stats), run,
+    { stepTimeoutMs: 200, deadline: far() }).then(() => null, (e: unknown) => e);
+  expect(classify(err, seen)).toBe("timeout");
+  expect(stats.tokens).toBeLessThanOrEqual(10);
+});
+
+test("ordinary errors stay failures", () => {
+  expect(classify(new Error("503"), new AbortController().signal)).toBe("failure");
+});
+```
+
+On the starter four fail (`expected 30000 to be 29500`, `expected false to be true`,
+`expected null not to be null` because the run finished despite the stop, and `expected 'failure' to be
+'timeout'`). The last test passes trivially. A correct solution passes all five.
+
+### Failure scenarios
+- **Classify from the error's `name`.** `timers/promises` rejects with an `AbortError` whose `cause` is
+  the `TimeoutError`, so the slow-step test reads "cancelled" and the retry layer would never fall back.
+  Debug by logging `e.name`, `e.cause?.name` and `signal.reason?.name` side by side; classify from the
+  signal.
+- **Build one step signal before the loop.** `AbortSignal.timeout` counts from creation, so step 2 inherits
+  step 1's spent budget and times out early. Log the remaining budget at each step start; it should reset.
+- **Pass `run` to the tools instead of the step signal.** Stop still works, but a slow tool ignores the
+  step timeout and holds the turn open. Add a slow-tool case to your tests to see it.
+- **Skip `run.throwIfAborted()` between steps.** If the stop lands while `allSettled` is waiting, the tools
+  abort, then step 2 starts a new model call that rejects at once. Harmless here, but a real SDK may
+  already have sent the request; the `at === 10` assertion fails if step 2 bills tokens.
+
+### Submission
+- **Your `lab.ts`** with the four LAB steps done, and a passing `npx vitest run` (five tests).
+- **The `node lab.ts` output**, matching the expected output.
+- **A three-hop table** like the worked scenario above, filled in with `remainingMs` for your own deadline
+  and margin.
+- **A note** (3-5 sentences) on which tools in your own agent must not be cut off mid-call, and how you
+  would make them idempotent or let them finish.
+- **Evaluated on:** tests passing, one signal reaching every model and tool call, timeouts derived from
+  the deadline, and classification from `signal.reason`.
 
 ## Why it exists
 - **Model calls are the most expensive thing a Node service does:** seconds of latency, tokens billed as they

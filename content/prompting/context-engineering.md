@@ -5,7 +5,8 @@ name: Context engineering
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/system-prompt
@@ -150,6 +151,26 @@ flowchart TD
     C -.->|"raw log kept"| L[("Retrievable log")]
     A --> M["Request: question last"]
 ```
+
+## Misconceptions
+- **"If it fits in the window, the model will use it."** The window is a ceiling, not a target: the
+  middle of a long context is used worst and irrelevant tokens lower accuracy, so an agent can degrade
+  at step 40 without ever overflowing.
+- **"Context cost grows linearly with steps."** A loop re-sends the whole history every turn, so a
+  linearly growing context produces a quadratically growing bill unless the prefix is cached and
+  consumed tool results are cleared.
+- **"Pruning old tool results always saves money."** In a cached loop an edit mid-history re-writes
+  everything after it: stubbing a 30k result at 20k in a 100k history costs about 58k token-equivalents
+  once and saves about 3k a turn, roughly 19 turns to pay back. Prune in batches for attention and
+  headroom, near the tail.
+- **"Compaction is safe once the summary is good."** Summaries are lossy; without a fixed state note
+  (goal, decisions, ids and paths, open items), recent turns kept verbatim and a retrievable raw log, the
+  agent redoes finished work or contradicts an earlier choice.
+- **"Character counts are a fine budget proxy."** Code, tables and non-Latin text produce more tokens
+  per character than English prose; count tokens with the tokenizer or the provider's count endpoint.
+- **"Context engineering is just prompt engineering with more text."** The prompt is the instructions;
+  in agents most tokens are tool results, history and retrieved material, and choosing, ordering,
+  budgeting and expiring those is a separate design job.
 
 ## Examples
 ### A budgeted context assembler

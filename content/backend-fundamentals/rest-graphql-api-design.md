@@ -5,7 +5,8 @@ name: REST / GraphQL API design
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - backend-fundamentals/api-versioning-and-backward-compatibility
@@ -40,6 +41,66 @@ one domain, not agent tools.
   edit shared state, and job resources for long tool work.
 - **What you can skip.** HATEOAS purity and GraphQL federation. Know methods, status codes, idempotency,
   conditional requests and the `202` job pattern.
+
+## Decision case
+### Scenario
+A support-software company is replacing its order and ticket API. Three clients will use it: a new
+support agent with about 12 tools, a React agent console for human reviewers, and 30 partner
+integrations that sync tickets. Figures are illustrative but internally consistent.
+- **Agent load:** 20,000 conversations a day at about 6 tool calls each, so 120,000 tool calls a day,
+  about 1.4 per second on average and about 7 per second at a 5× peak.
+- **Side effects:** 8% of conversations issue a refund, 1,600 refund calls a day. With a 1% timeout
+  rate, 16 refund calls a day get retried; without idempotency each one can pay twice.
+- **Console:** the review screen needs 5 resources (conversation, run steps, order, customer, refund
+  history); at about 40 ms each, sequential calls cost about 200 ms.
+- **Constraints:** 4 Python (FastAPI) backend engineers with no GraphQL production experience; launch in
+  10 weeks; partners already consume REST and expect OpenAPI; tool-call p95 under 300 ms; every
+  side-effecting tool must be safe to retry.
+
+### Options
+| Option | How it works | Agent tools | Partners | Console round trips | Team and deadline | Retry safety |
+|---|---|---|---|---|---|---|
+| A. REST + OpenAPI everywhere | resource endpoints, plus one composite `GET /reviews/{id}` for the console | one tool per operation, generated from OpenAPI | what they expect | 1 call via the composite endpoint | fits current skills | by method, plus `Idempotency-Key` on `POST` |
+| B. GraphQL everywhere | one schema; the agent gets a generic `graphql_query` tool | model writes queries; schema in the prompt (~6,000 tokens vs ~1,800 for 12 narrow tools) | must learn GraphQL | 1 query | new resolvers, DataLoader and cost limits to learn | mutations need custom idempotency |
+| C. REST + OpenAPI underneath, GraphQL BFF for the console | REST as in A; a GraphQL layer only in front of the console | as in A | as in A | 1 query | two stacks to run and secure | as in A |
+
+- **The token gap in B:** about 4,200 extra prompt tokens per model call; at about 7 model calls per
+  conversation that is about 29,400 extra input tokens per conversation before prompt caching.
+
+### Decision
+Choose **A now, with C as the planned next step if its trigger fires.** The agent and the partners are
+two of three clients and both need named, typed, retry-safe operations; OpenAPI gives them generated
+tools and clients from one document.
+- **Retries decide it for the agent:** `GET`, `PUT` and `DELETE` are retry-safe by method, and the refund
+  `POST` takes an `Idempotency-Key` derived from run id plus step, closing the 16 duplicates a day.
+- **The deadline and skills rule out B and C today:** a second API stack, resolver batching and query-cost
+  limits are new work for a 4-person team with 10 weeks.
+- **The console's pain is solved cheaply:** one composite read endpoint turns 5 round trips into 1.
+- **What would change it:** a second UI team (or mobile) iterating weekly, where composite endpoints
+  multiply past a handful or screens need many shapes; then add the GraphQL BFF (option C) over the REST
+  services. The agent keeps its REST tools either way.
+
+### Trade-offs accepted
+- **Composite endpoints are UI-shaped REST.** They couple the API to one screen. Watch: the count of
+  composite endpoints and how often each changes; more than a few changing monthly is the C trigger.
+- **More tools in the agent's context.** Twelve narrow tools cost ~1,800 tokens per call and can crowd
+  the choice. Watch: per-tool argument-validation failures and wrong-tool selections in eval traces.
+- **No field-level usage telemetry.** REST will not show which fields clients read. Watch: OpenAPI diffs
+  in CI (oasdiff) and per-endpoint traffic, and deprecate with headers before removal.
+- **Idempotency storage to run.** Keys for 24 hours at 1,600 refunds a day is about 1,600 rows, cheap,
+  but every new side-effecting `POST` must opt in. Watch: replay hits and same-key-different-body `409`s.
+
+### Review rubric
+- **Constraints first:** the write-up lists the clients, load, side effects, team skills and deadline
+  before naming a style, and each option is scored against them.
+- **Agent-specific reasoning:** it addresses how tools are generated, how retries stay safe (method
+  semantics, `Idempotency-Key`) and what the model sees on errors.
+- **Numbers recomputed:** call rates, duplicate counts and token or latency figures follow from stated
+  inputs and are labelled illustrative where estimated.
+- **A falsifiable trigger:** it names a measurable condition (UI teams, composite endpoint count, round
+  trips per screen) that would change the decision, not "if needs change".
+- **Honest costs:** every rejected option gets a fair reason, and the accepted trade-offs each have a
+  metric or signal to watch.
 
 ## Why it exists
 - **A shipped interface is frozen.** Casual day-one choices cost forever: an action-style endpoint named

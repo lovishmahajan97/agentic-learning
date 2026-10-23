@@ -5,7 +5,8 @@ name: Choosing an SLM (Llama, Qwen, Phi, Gemma, Mistral small models)
 kind: decision
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -42,6 +43,63 @@ agent eval pick the winner.
   and the eval that decides.
 - **What you can skip.** Blog benchmark numbers: families ship new versions every few months, so learn the
   criteria and re-run them on current cards.
+
+## Decision case
+### Scenario
+A clinic network deploys an appointment-scheduling agent on premises in 40 clinics. Patient data may not
+leave the clinic, so every model call runs locally. All model figures below are illustrative, not
+published scores.
+- **Hardware:** one 16 GB GPU per clinic; the desktop and an OCR service leave 14 GB usable.
+- **Workload:** English and French, 12,288-token prompts (9 tool schemas plus history), 2 concurrent
+  sessions, so 24,576 tokens of KV cache.
+- **Quality bar:** at least 90% correct tool and arguments on a 150-case French golden set; failures go
+  to a human scheduler.
+- **License:** Apache 2.0 or MIT are pre-approved; a custom license needs legal review of about 4 weeks.
+- **Deadline:** pilot in 6 weeks. **Team:** three engineers, Ollama already in use.
+
+Memory per candidate at 4.5 bits per weight, fp16 KV cache, plus 10% headroom. KV bytes per token are
+2 (K and V) x layers x KV heads x head dim x 2 bytes, read from each `config.json`; all four use 8 KV
+heads of dim 128.
+
+### Options
+| Candidate | Weights | KV for 24,576 tokens | Total + 10% | License | French tool step |
+|---|---|---|---|---|---|
+| A: 14B, 48 layers, Apache 2.0 | 7.9 GB | 196,608 B x 24,576 = 4.8 GB | 14.0 GB, no margin under 14 GB | pass | 95% |
+| B: 8B, 32 layers, custom license | 4.5 GB | 131,072 B x 24,576 = 3.2 GB | 8.5 GB | 4-week review | 94% |
+| C: 8B, 32 layers, Apache 2.0 | 4.5 GB | 3.2 GB | 8.5 GB | pass | 92% |
+| D: 3B, 28 layers, MIT | 1.7 GB | 114,688 B x 24,576 = 2.8 GB | 5.0 GB | pass | 84% |
+
+### Decision
+**Candidate C, at the 4-bit build that was evaluated.** It is the smallest model that clears every hard
+filter and the 90% bar. D is smaller but fails the bar by 6 points; A fits only with zero margin; B scores
+2 points higher but its review would consume 4 of the 6 weeks.
+
+C also leaves about 5.5 GB spare, room for a third session or longer history without a new GPU.
+
+**What would change it.**
+- **Legal approves B and the gap grows:** if B leads by more than the 3-point tolerance on the final set,
+  re-open the choice.
+- **Concurrency drops to 1:** A then needs 7.9 + 2.4 = 10.3 GB, 11.3 GB with headroom, and fits.
+- **Bigger GPUs or an 8-bit KV cache:** either brings A back into range.
+- **C's French drops below 90%** after a template or engine upgrade: fall back to B or A with a size plan.
+
+### Trade-offs accepted
+- **Three points below the best score.** About 3 extra cases in 100 escalate to a human versus A. Watch
+  the escalation rate per clinic each week.
+- **Dependence on one family's release cadence.** Keep B's scores in the registry as the tested
+  fallback, so a swap is a config change.
+- **Estimate, not measurement, for memory.** Confirm with `ollama ps` at 12k context and 2 parallel
+  sessions on a pilot clinic before rollout.
+
+### Review rubric
+- **Hard filters first:** license, memory with the real context and concurrency, and tool template are
+  checked before any quality score is compared.
+- **Memory math shown:** weights and KV cache are computed from each config, with headroom, and match the
+  stated GPU budget.
+- **Evidence from the deployed build:** scores come from the quantization and engine that will ship, on
+  the team's own golden set.
+- **Smallest passing model chosen,** with the reason each runner-up lost.
+- **Re-open triggers named:** the write-up states which constraint change would flip the choice.
 
 ## Why it exists
 - **There are hundreds of candidates.** Each family ships several sizes, base and instruct variants, and

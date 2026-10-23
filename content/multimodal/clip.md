@@ -5,7 +5,8 @@ name: CLIP
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - multimodal/image-embeddings
@@ -155,6 +156,23 @@ flowchart TD
     L1 --> L["Average loss: diagonal are positives"]
     L2 --> L
 ```
+
+## Misconceptions
+- **"The zero-shot softmax is the probability that the label is right."** Softmax always sums to one
+  over the labels you offered, so an image that matches none of them still gets a confident winner. Add
+  background labels or a cosine floor tuned on labelled negatives.
+- **"A cosine of 0.3 is a weak match."** Raw values carry no absolute meaning: correct text-to-image
+  pairs typically sit around 0.2-0.35 for ViT-B/32 (illustrative), which is why a learned scale of roughly 100
+  is applied before the softmax. Judge scores only against thresholds tuned on your pairs.
+- **"One shared space means one threshold."** The modality gap puts image and text vectors in separate
+  regions, so image-to-image cosines run far higher than cross-modal ones. A floor tuned for
+  text-to-image search is meaningless for "find similar" and vice versa.
+- **"CLIP understands the whole scene."** The loss rewards only what distinguishes captions in a batch,
+  so it learns objects, scenes and styles but not counts or layout; "how many" and "left of" need a VLM
+  or a detector.
+- **"A longer, more detailed query retrieves more precisely."** The text encoder stops at 77 tokens, so
+  later constraints are silently dropped. Keep the tool's query a short visual description and move
+  dates, SKUs or prices into structured filters.
 
 ## Examples
 ### Zero-shot classification, then the same by hand

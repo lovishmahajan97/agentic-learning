@@ -5,7 +5,8 @@ name: Content moderation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
 code_tested: partial
@@ -150,6 +151,25 @@ flowchart TD
     F --> Q[("Review queue and appeals")]
     Q -.->|"labels recalibrate thresholds"| W
 ```
+
+## Misconceptions
+- **"The model refuses harmful requests, so it is our moderation."** Refusal training is one policy for
+  every customer, jailbreaks bypass it, and it gives no scores, thresholds or logs. Moderation is a
+  separate classifier whose routing you own.
+- **"About 98% precision on our test set means it will work in production."** That set was balanced.
+  At an illustrative 0.5% prevalence the same classifier's flags are only about 18% real, so tune
+  thresholds on data at real prevalence.
+- **"A flagged message should be blocked."** Self-harm intent on input needs a safe completion with
+  support resources, not a refusal, and mid-range scores usually allow and flag for review. Hard blocks
+  are for very high scores or categories where a miss is unacceptable.
+- **"An LLM classifier's score of 0.3 means a 30% chance of harm."** Probabilities an LLM writes out as
+  text are usually not calibrated. Treat them as ranks and set thresholds empirically from labelled
+  traffic.
+- **"Moderating the chat reply covers the agent."** A `post_reply` or `send_email` argument cannot be
+  retracted like a streamed sentence, and fetched pages can be quoted verbatim. Gate publishing tool
+  calls in the executor and score tool results before they enter context.
+- **"If every message passes, the conversation is fine."** Harm can be assembled across turns, each below
+  threshold. Score a sliding window and keep per-user signals.
 
 ## Examples
 ### Routing you own, whatever produces the scores

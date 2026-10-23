@@ -5,7 +5,8 @@ name: Terraform (infrastructure as code)
 kind: tool
 difficulty: core
 est_minutes: 19
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -42,6 +43,68 @@ so every environment and customer account is reproducible and reviewable.
   approval gate.
 - **What you can skip.** Writing providers and the internals of the dependency graph. Know state, plan,
   the replace hazard, `moved` blocks and how to ship into an isolated account.
+
+## Decision case
+### Scenario
+Your company runs a RAG agent platform. Its infrastructure (private model endpoint, vector store,
+memory tables, KMS key, one IAM role per tool) is Terraform, today one root for your own SaaS. Sales has
+signed customer-VPC deals. All figures are illustrative.
+- **Accounts:** 3 of your own environments (dev, staging, prod) plus 18 customer AWS accounts, so
+  3 + 18 = 21 deployments.
+- **Approval boundaries:** 5 of the 18 customers require their own change board to approve every apply,
+  and forbid your engineers from holding write access.
+- **Secrets in state:** customers' security reviews say state for their account, which holds generated
+  passwords and keys in plain text, must live in their account.
+- **Isolated accounts:** 2 customers cannot reach the public provider registry.
+- **Team:** 4 platform engineers. An internal infra agent drafts HCL changes and may run plan only.
+- **Layering:** each deployment splits into a network state and an application state, so a routine app
+  change cannot plan against the VPC: 21 x 2 = 42 states.
+
+### Options
+| Option | How it works | State in customer account | Matches approval boundaries | Isolated accounts | Load on 4 engineers |
+|---|---|---|---|---|---|
+| One configuration, CLI workspaces | one root, a workspace per deployment, state in your bucket | no | no: same credentials everywhere, one forgotten `terraform workspace select` hits the wrong customer | registry still needed | low at first, risky |
+| Versioned module, a thin root per deployment | shared `rag` module released with versions; each deployment has its own root, backend and credentials | yes: backend in each customer's account | yes: each root's plan goes to that account's approver | ship a provider mirror and module files | medium: 42 plans per module release, automated |
+| Native templates per customer | CloudFormation templates the customer deploys | yes: the service tracks state | yes | no registry needed | high: a second IaC codebase beside your Terraform |
+
+### Decision
+**A versioned module with a thin root per deployment, each with its own backend, credentials and approver.**
+- **The isolation boundary matches the approval boundary.** A plan in one root cannot touch another
+  account, and each of the 5 change boards reviews a saved plan for its own account only.
+- **State stays where the secrets belong:** in each customer's account, under their access controls and
+  locking.
+- **Isolated accounts are the same flow plus files:** a `terraform providers mirror` directory, the
+  committed `.terraform.lock.hcl` and the module as files, with an expected-plan summary.
+- **The agent fits the gate:** it opens a pull request against the module, the pipeline plans every
+  affected root, and the plan guard returns any BLOCK to the agent as a tool error.
+
+**What would change it.**
+- **All deployments inside your own organization under one approval board:** workspaces become
+  acceptable, though separate roots remain safer.
+- **A customer that mandates native templates:** ship CloudFormation for that customer only, and
+  accept the second codebase as that contract's cost.
+- **Customers outgrowing 4 engineers:** at much larger counts, buy or build a run orchestrator rather
+  than adding roots by hand.
+
+### Trade-offs accepted
+- **42 plans per module release.** Watch: pipeline time per release and roots left on old module
+  versions.
+- **Version skew across customers.** Watch: a register of module and provider versions per root, with a
+  bounded support window.
+- **Less visibility into customer-held state.** Watch: ask each customer to include the nightly
+  `terraform plan -detailed-exitcode` result (exit code 2 means drift) in their support bundle.
+- **Some duplication in thin roots.** Watch: roots contain only backend, provider and module inputs; any
+  resource block in a root is a review finding.
+
+### Review rubric
+- **Boundaries mapped first:** the write-up lists accounts, who approves applies in each and where
+  state may live, before choosing a layout.
+- **Counts recomputed:** deployments, states and plans per release follow from stated inputs.
+- **State treated as a secret:** says where it lives, who can read it, and that no agent reads it.
+- **Isolated delivery covered:** provider mirror, lock file and module files for accounts without a
+  registry.
+- **Agent gate explicit:** plan-only credentials, the plan guard, and human approval of the saved plan.
+- **Flip conditions named:** the facts that would make workspaces or native templates the better choice.
 
 ## Why it exists
 - **An AI platform is a lot of infrastructure.** A VPC with private subnets, private endpoints to the

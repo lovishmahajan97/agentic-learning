@@ -5,7 +5,8 @@ name: Backpropagation
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 related:
   - ml-fundamentals/gradient-descent
@@ -172,6 +173,21 @@ flowchart TD
     G2 --> ACC
     ACC --> OPT["Optimizer step, then zero_grad"]
 ```
+
+## Misconceptions
+- **"Backpropagation is the learning algorithm."** It only computes gradients, in one reverse sweep
+  costing about 2× the forward pass. Gradient descent or an optimizer such as AdamW decides what to do
+  with them.
+- **"LoRA freezes 99% of weights, so the step is 99% cheaper."** The backward sweep still passes through
+  frozen layers to reach the adapters, so activations are still saved and compute falls by at most about
+  a third. What disappears is gradient and optimizer-state memory for the frozen weights.
+- **"Masking tool-result tokens out of the loss saves memory."** Masked tokens still go through the
+  forward and backward pass and still cost activations, which scale with B × T × d × depth.
+- **"You can fine-tune directly on task success with a reward loss."** Sampling, tool calls and scoring
+  happen outside the graph, so a success flag has no gradient. Filter successful runs for SFT, use
+  preference pairs, or weight log-probabilities by reward (REINFORCE).
+- **"`.grad` holds this step's gradient."** Gradients are added into `.grad`, the same += rule as fan-out.
+  Without `zero_grad()` they pile up across steps, which is also what makes gradient accumulation work.
 
 ## Examples
 ### A two-layer network by hand, checked numerically

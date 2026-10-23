@@ -5,7 +5,8 @@ name: Responsible AI
 kind: concept
 difficulty: intro
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - security-governance-compliance/ai-risk-management
@@ -39,6 +40,65 @@ human oversight and contestable decisions, measured and gated.
   let people contest an agent's action.
 - **What you can skip.** Proving the impossibility theorems. Know that fairness definitions conflict when
   base rates differ, so the choice belongs to a policy owner, and know how to compute the metric they pick.
+
+## Decision case
+### Scenario
+A staffing firm wants a screening agent that reads applications, ranks them and drafts a summary for each.
+Employment is an EU AI Act high-risk area, and the firm also hires in the US. All figures are illustrative.
+- **Volume:** 20,000 applications a month.
+- **Recruiter time:** 6 recruiters with about 100 hours a month each for screening, 600 hours in all. A
+  full read takes about 4 minutes; confirming a rejection from the agent's summary about 1 minute.
+- **Labelled data:** 1,200 past applicants with hiring-manager qualification labels, about 200 qualified
+  per group for the two groups the policy names.
+- **Constraints:**
+  - legal will not accept rejections with no human involvement;
+  - every rejected applicant must be able to request human review by quoting a decision ID;
+  - HR and legal, not engineering, choose the fairness definition and threshold;
+  - launch in one quarter.
+
+### Options
+| Option | How it works | Recruiter hours a month vs 600 | Human involvement | Fairness evidence |
+|---|---|---|---|---|
+| **A. Auto-reject the bottom 75%** | recruiters read the top 25% in full; the rest get rejection emails | 5,000 × 4 min = 333 h | fails: 15,000 rejections without a person | impact ratio only, since production has no labels |
+| **B. Rank, read top 25%, confirm the rest** | recruiters read the top 25% in full and confirm each rejection from the summary | 5,000 × 4 + 15,000 × 1 = 35,000 min = 583 h | every decision has a named recruiter | equal-opportunity gap on the labelled set, impact ratio in production |
+| **C. Advisory summaries only** | no ranking; recruiters read every application with a summary | 20,000 × 4 min = 1,333 h: 2.2 × capacity | full | little to measure: the agent makes no selection |
+
+### Decision
+Choose **B, rank and confirm**, because it is the only option that keeps a person on every decision
+within 600 recruiter hours.
+- **Capacity:** 583 hours fits; C needs 1,333.
+- **Accountability:** each rejection carries a recruiter and a decision ID, which A cannot offer.
+- **Fairness gate:** HR and legal choose equal opportunity (the true-positive-rate gap) as the release
+  gate, because the lesson's shortlisting example shows precision can look identical while qualified
+  applicants in one group are missed far more often. The four-fifths impact ratio is monitored monthly in
+  production, where labels do not exist.
+- **Counterfactual suite:** name-swapped applications must not change the rank band or the summary's
+  recommendation beyond the agreed gap.
+
+**What would change it:**
+- **Recruiter capacity above about 1,333 hours:** C becomes affordable and removes the ranking risk.
+- **A labelled set four times larger:** a tighter gate becomes measurable (see below).
+- **Overturn rates on review requests that differ by group:** pause ranking for that role family and
+  re-evaluate.
+
+### Trade-offs accepted
+- **One-minute confirmations invite rubber-stamping.** Monitor time per confirmation and the share of
+  rank-band decisions recruiters change; near-zero changes at a few seconds each is automation bias.
+- **The labelled set is too small for a tight gate.** With about 200 qualified per group and a true-positive
+  rate near 0.75, the gap's standard error is about √2 × √(0.75 × 0.25 / 200) ≈ 0.043, so a 95% interval is
+  about ±0.085. Gate at 0.10 for now; at 800 per group the interval narrows to about ±0.042.
+- **Labels come from past hiring managers** and may carry their bias. Record that caveat in the system card.
+- **The 25% read share is a policy choice.** Recruiters may want more; recompute hours before changing it.
+
+### Review rubric
+- **Human time is computed** from volume, minutes per action and the share routed to each action, against
+  stated capacity.
+- **The fairness definition is chosen by named policy owners** and justified against the alternatives,
+  with the conflict between definitions acknowledged.
+- **Statistical power is checked:** the gate threshold is wider than the noise the eval set can resolve.
+- **Actions, not only text, are tested** with counterfactual pairs.
+- **Contestability is designed in:** decision IDs, a review path and a monitored overturn rate by group.
+- **Automation-bias signals** (review time, change rate) have a named owner and threshold.
 
 ## Why it exists
 - **AI fails in ways ordinary software rarely does.** It learns patterns from historical data, including

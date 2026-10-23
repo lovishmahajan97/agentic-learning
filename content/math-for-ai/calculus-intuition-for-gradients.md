@@ -5,7 +5,8 @@ name: Calculus intuition for gradients
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: understand
 code_tested: yes
@@ -111,6 +112,23 @@ flowchart TD
     CL --> U
     U -->|"next batch"| X
 ```
+
+## Misconceptions
+- **"The gradient tells you how far to move."** It gives the uphill direction and the local slope, valid
+  only near the current weights. The learning rate sets the distance, and past the largest stable step
+  the update overshoots and the loss rises.
+- **"Backprop is a clever way of nudging each weight."** That is finite differences, one pass per weight.
+  Backprop applies the chain rule once from the loss backward, getting every gradient in about one forward
+  and one backward pass.
+- **"Oscillating loss means the run is diverging."** On the bowl, lr 0.9 overshoots every step yet
+  converges, because the error factor is −0.8. Divergence is the error growing, as at lr 1.1 with factor
+  −1.2.
+- **"Gradient clipping makes any learning rate safe."** Clipping caps the occasional bad step. If it
+  fires on most steps, the learning rate is too high and every useful step is being shrunk; lower the
+  rate instead.
+- **"A NaN loss means bad data."** Check the grad-norm curve first: when it climbs steadily before the
+  NaN, the step size is the likely cause, and lowering the rate with warmup fixes it. A single bad batch
+  shows a sudden spike instead.
 
 ## Examples
 ### Check a gradient by hand, then sweep learning rates

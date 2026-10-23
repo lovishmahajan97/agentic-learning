@@ -5,7 +5,8 @@ name: Docker / CI/CD deployment
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - backend-fundamentals/docker
@@ -37,6 +38,185 @@ inside it.
   your longest allowed run, where provider keys come from, and which checks block a prompt or model change.
 - **What you can skip.** Registry internals and exotic BuildKit features; a cached `npm ci` layer, a pruned
   runtime stage and SHA tags cover almost every agent service.
+
+## Lab
+### Task
+Make an agent API survive a rolling deploy. The starter streams a five-step agent run but has no `SIGTERM`
+handler, so every rollout cuts runs mid-stream: the failure this lesson's Check yourself describes.
+
+You add the drain the deployment depends on: readiness off, a preStop-style delay, listener closed, in-flight runs
+finished or aborted at a deadline, exit 0.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** this lesson's "Signals" and "Health, readiness and config" sections and the
+  grace-period worked scenario; Graceful shutdown; AbortController and cancellation.
+- **Runs without Docker:** the tests spawn `node server.ts` as a child process and signal it directly,
+  which is exactly what exec-form `CMD` gives you (Node receives the signal itself). Checked with Node 24.21
+  (runs `.ts` directly) and Vitest 5.0.5.
+- **Setup:** `npm init -y && npm pkg set type=module && npm i -D vitest @types/node`, then save both files.
+
+### Starter code
+```ts
+// server.ts: an agent API that must survive a rolling deploy (run it with `node server.ts`)
+import http from "node:http";
+import { setTimeout as sleep } from "node:timers/promises";
+
+const env = (k: string, d: number) => Number(process.env[k] ?? d);
+const PORT = env("PORT", 8787), STEPS = env("STEPS", 5), STEP_MS = env("STEP_MS", 200);
+const PRESTOP_MS = env("PRESTOP_MS", 300);   // endpoint removal propagating, as a preStop sleep would
+const DRAIN_MS = env("DRAIN_MS", 3000);      // the longest run you allow to finish after SIGTERM
+
+let ready = true;
+const runs = new Set<AbortController>();     // one controller per in-flight agent run
+
+async function agentRun(res: http.ServerResponse, signal: AbortSignal) {
+  try {
+    for (let i = 1; i <= STEPS; i++) {
+      await sleep(STEP_MS, undefined, { signal });   // stands in for one model call plus a tool call
+      res.write(`step ${i}\n`);
+    }
+    res.end("done\n");
+  } catch {
+    res.end("aborted\n");                            // the run was cut at the drain deadline
+  }
+}
+
+const server = http.createServer((req, res) => {
+  if (req.url === "/healthz") return void res.end("ok");                 // liveness: the loop responds
+  if (req.url === "/readyz") { res.statusCode = ready ? 200 : 503; return void res.end(ready ? "ready" : "draining"); }
+  if (req.url === "/run") {
+    const ac = new AbortController();
+    runs.add(ac);
+    res.writeHead(200, { "content-type": "text/plain" });
+    agentRun(res, ac.signal).finally(() => runs.delete(ac));
+    return;
+  }
+  res.statusCode = 404; res.end();
+});
+
+server.listen(PORT, "127.0.0.1", () => {
+  const { port } = server.address() as { port: number };
+  console.log(`listening on ${port}`);
+});
+
+// YOUR CODE: handle SIGTERM (exactly once) so a rollout drains instead of cutting runs:
+//   1. set ready = false and log `SIGTERM: readiness off, ${runs.size} run(s) in flight`
+//   2. wait PRESTOP_MS (keep accepting connections meanwhile), then log "closing listener"
+//      and call server.close() so no new connections are accepted
+//   3. wait until `runs` is empty, but at most DRAIN_MS; at the deadline abort every remaining run
+//   4. log `drained, exit 0` and exit with code 0
+// Without a handler, Node's default action for SIGTERM ends the process at once, mid-stream.
+```
+
+As given, `node server.ts` serves runs, but `kill -TERM <pid>` during a `curl -N localhost:8787/run` ends
+the process at once: curl prints `step 1` and nothing more.
+
+### Expected output
+With a correct handler, `node server.ts`, then `curl -sN localhost:8787/run` and `kill -TERM <pid>` about
+0.3 s in, print (server and curl output interleaved):
+```
+listening on 8787
+step 1
+SIGTERM: readiness off, 1 run(s) in flight
+step 2
+closing listener
+step 3
+step 4
+step 5
+done
+drained, exit 0
+```
+
+### Tests
+```ts
+// server.test.ts: run with `npx vitest run` (spawns server.ts as a real child process)
+import { it, expect, afterEach } from "vitest";
+import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
+
+let child: ChildProcess | undefined;
+afterEach(() => { child?.kill("SIGKILL"); child = undefined; });
+
+async function start(extra: Record<string, string> = {}) {
+  child = spawn(process.execPath, ["server.ts"], {
+    cwd: import.meta.dirname, env: { ...process.env, PORT: "0", ...extra }, stdio: ["ignore", "pipe", "inherit"] });
+  let log = "";
+  child.stdout!.on("data", (b) => { log += b; });
+  while (!/listening on (\d+)/.test(log)) await once(child.stdout!, "data");
+  const port = Number(/listening on (\d+)/.exec(log)![1]);
+  const exited = once(child, "close") as Promise<[number | null, string | null]>;
+  return { base: `http://127.0.0.1:${port}`, exited, log: () => log };
+}
+
+async function startRun(base: string) {            // resolves once the first step has streamed
+  const res = await fetch(`${base}/run`);
+  const reader = res.body!.getReader();
+  let body = new TextDecoder().decode((await reader.read()).value);
+  const rest = (async () => {
+    for (let r = await reader.read(); !r.done; r = await reader.read()) body += new TextDecoder().decode(r.value);
+    return body;
+  })();
+  return rest;
+}
+
+it("flips readiness on SIGTERM while liveness stays green", async () => {
+  const s = await start({ PRESTOP_MS: "1000" });
+  child!.kill("SIGTERM");
+  await new Promise((r) => setTimeout(r, 200));     // inside the preStop window
+  expect((await fetch(`${s.base}/readyz`)).status).toBe(503);
+  expect((await fetch(`${s.base}/healthz`)).status).toBe(200);
+  expect(await s.exited).toEqual([0, null]);
+});
+
+it("lets an in-flight run finish, then exits 0", async () => {
+  const s = await start();
+  const body = startRun(s.base);
+  await new Promise((r) => setTimeout(r, 250));
+  child!.kill("SIGTERM");
+  expect(await body).toBe("step 1\nstep 2\nstep 3\nstep 4\nstep 5\ndone\n");
+  expect(await s.exited).toEqual([0, null]);
+  expect(s.log()).toMatch(/1 run\(s\) in flight[\s\S]*drained, exit 0/);
+});
+
+it("aborts runs that outlive the drain deadline instead of waiting for SIGKILL", async () => {
+  const s = await start({ STEPS: "100", DRAIN_MS: "500" });
+  const body = startRun(s.base);
+  await new Promise((r) => setTimeout(r, 250));
+  const t0 = Date.now();
+  child!.kill("SIGTERM");
+  expect(await body).toMatch(/aborted\n$/);
+  expect(await s.exited).toEqual([0, null]);
+  expect(Date.now() - t0).toBeLessThan(300 + 500 + 1000);   // preStop + drain + margin
+});
+```
+
+On the starter all three fail for the right reason: the first with `fetch failed` (`ECONNREFUSED`, the
+process is already gone), the other two with `TypeError: terminated` (`other side closed`) because the
+stream was cut.
+
+### Failure scenarios
+- **Inject an immediate close:** call `server.close()` the moment `SIGTERM` arrives, before the delay.
+  The readiness test fails with `ECONNREFUSED`. That is the Kubernetes endpoint race in miniature: probes
+  and late-routed requests hit a closed listener. Log timestamps for "SIGTERM" and "closing listener"; the
+  gap is your preStop window.
+- **Inject a drain with no deadline:** wait for `runs` to empty without the `DRAIN_MS` cap. The third test
+  times out, as a pod would linger until the orchestrator's `SIGKILL`. Print `runs.size` once a second
+  during the drain to see which runs hold it open.
+- **Inject a liveness probe that checks readiness:** make `/healthz` return 503 when `ready` is false.
+  The first test fails on the liveness status. In a cluster, every draining pod would now also be marked
+  dead and restarted; keep liveness to "the event loop answers" and put dependencies and draining in
+  readiness only.
+- **Inject shell form (only if you have Docker):** build an image with `CMD node server.ts && true`, start
+  a run and `docker stop` the container. `sh` is PID 1 and does not forward the signal, so the stop waits
+  out Docker's default 10 s and curl ends without `done`; exec form fixes it.
+
+### Submission
+- **Your `server.ts`** with the `YOUR CODE` handler and nothing else changed.
+- **A `npx vitest run` log** showing 3 passed, plus the manual drill output matching the expected lines.
+- **A Dockerfile** for this service in exec form, with `USER node`, and a one-line note of the
+  `terminationGracePeriodSeconds` you would set for `PRESTOP_MS` 5 s and a 120 s run cap, with the sum shown.
+- **A short note** on what changes when runs last 15 minutes, using this lesson's durable-job row.
+- **Evaluated on:** green tests, readiness flipped before the listener closes, a bounded drain that aborts
+  rather than waits, and exit code 0.
 
 ## Why it exists
 - **TypeScript does not run as written.** It must be compiled (or type-stripped), its dependency tree is

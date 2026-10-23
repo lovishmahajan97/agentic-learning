@@ -5,7 +5,8 @@ name: Feature stores (hybrid ML only)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: background
 related:
   - ml-fundamentals/train-test-leakage
@@ -38,6 +39,71 @@ to inference, preventing training/serving skew and time leakage.
   trace.
 - **What you can skip.** All of it, if your agent uses only LLMs over retrieved text. Then ingestion
   contracts and embedding versioning cover the analogous concerns.
+
+## Decision case
+### Scenario
+An online retailer's support agent proposes refunds, and a fraud model gates whether the refund tool runs.
+A router model also picks the sub-agent for each request. The fraud model scored 0.95 offline but behaves
+like 0.80 in production.
+
+A served-feature audit found the leakage and skew from the worked scenario below. The team must decide
+whether to adopt a feature store or fix the pipelines by hand.
+
+Constraints (figures illustrative):
+- **Models and features.** 2 classical models today, 18 features from 3 entities (card, customer, merchant);
+  a churn model is planned in about 6 months.
+- **Deadline.** Leakage-free retraining within one quarter, because wrong approvals are costing money now.
+- **Labels are slow.** Chargeback labels arrive up to 60 days after the refund.
+- **Latency.** The refund gate's feature lookup must stay under 20 ms at p99 inside the tool call.
+- **Data stays put.** Features must remain in the existing warehouse and the Redis cluster already in use.
+- **Budget and team.** No new vendor contract this year; one ML engineer plus the agent team.
+- **Sources.** Transactions and orders are append-only event logs, so history can be backfilled.
+
+### Options
+| Option | How it works | Fixes leakage | Fixes skew | In one quarter? | Vendor and data |
+|---|---|---|---|---|---|
+| **A. Shared library plus log-and-wait** | One Python feature library for both paths; log served values and train on them later | Yes, but only after logged history with labels accrues | Yes | No: about 60 days of label lag plus months of history | None |
+| **B. Feast on the warehouse and Redis** | Feature views in code; offline store in the warehouse; Redis online store; backfill from event logs; `get_historical_features` for training | Yes, from backfilled history now | Yes, one definition | Yes | Open source; data stays put |
+| **C. Managed feature store** | The cloud platform's store with streaming | Yes | Yes | Likely, with integration work | New contract; data moves to the platform's stores |
+| **D. Drop the fraud model, ask the LLM** | Prompt the agent to judge refund risk | Not applicable | Not applicable | Yes | None, but the gate can be talked out of its rule |
+
+### Decision
+Choose **B**, Feast over the existing warehouse and Redis:
+- **It fixes both bug classes inside the quarter.** Event-log sources allow a backfill, so the
+  point-in-time training set can be rebuilt now instead of waiting about 60 days for logged labels.
+- **One definition removes the skew structurally.** It covers refund handling, UTC event time and the
+  strict boundary on the last-hour count.
+- **It meets the constraints C breaks.** No new contract, and data stays in the warehouse and Redis.
+- **Latency fits.** The gate does one online lookup per entity, three in all, against the existing Redis.
+  Measure p99 in staging before the swap instead of assuming it.
+- **D is rejected.** A risk gate must be a threshold in code, because a prompt rule can be argued away.
+- **Served-value logging still ships** (A's good part), joined with agent traces, so future skew is
+  visible and the churn model starts with a clean history.
+
+What would change it:
+- **The sources were mutable current-state tables.** Then no backfill is possible, and A's log-and-wait
+  would be the only honest path.
+- **Many models with sub-minute streaming features.** Then C's managed streaming may justify the contract.
+- **The fraud model is retired.** Then no feature store is needed, because the agent uses LLMs over text only.
+
+### Trade-offs accepted
+- **Running Feast ourselves.** Materialization jobs and registry upkeep land on one engineer; watch
+  materialization lag against each view's TTL.
+- **Lower offline score.** The rebuilt training set will score lower offline; watch that offline and
+  production metrics converge, not that offline stays high.
+- **Fail-closed reviews.** Stale or null features send refunds to human review; watch the review rate
+  and decisions made on stale features.
+- **Streaming deferred.** Last-hour counts come from frequent materialization, not a stream; watch the
+  gap between served and batch values for that feature.
+
+### Review rubric
+- **It confirms the store is warranted:** a classical model gates an agent action, and the leakage or
+  skew is shown with evidence.
+- **Backfill feasibility is checked** against whether the sources keep history.
+- **The point-in-time boundary is specified,** strict or inclusive, matched to what serving can know.
+- **Latency and freshness are budgeted** for the tool call, with how they will be measured.
+- **The gate lives in code,** with the null or stale behaviour stated.
+- **Exit conditions are named:** what would make a managed store, or no store, the better choice.
 
 ## Why it exists
 - **Caveat: hybrid systems only.** Feature stores matter in systems that train and serve classical ML models

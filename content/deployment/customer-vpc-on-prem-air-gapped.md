@@ -5,7 +5,8 @@ name: Customer VPC / on-prem / air-gapped deployment
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -44,6 +45,67 @@ agent becomes a signed, self-contained bundle.
   allowed set.
 - **What you can skip.** Data-diode hardware and cross-domain solution internals. Know that artifacts
   cross on media or one-way links and that the customer's site sets the speed.
+
+## Decision case
+### Scenario
+Your company sells a contract-review agent as SaaS: a hosted frontier model, four tools (clause search,
+a policy lookup, a CRM lookup and a redline writer) and traces in a SaaS observability tool. A large EU
+bank wants it for its legal team. All figures are illustrative planning numbers, not benchmarks.
+- **Data custody:** contracts and agent traces may not leave the bank's AWS account in its EU region.
+  Metadata-only egress to a vendor (licence, version, health) is allowed only after a security review.
+- **Scale:** 1,500 contracts a day at about 12 model calls each, so 1,500 x 12 = 18,000 calls a day.
+  Over an 8-hour working day that is 18,000 / 480 = 37.5 calls a minute on average.
+- **Quality bar:** 88% task completion on your 200-case eval set. The hosted frontier model scores 92%;
+  the best open-weight model you can serve scores 81% (162 of 200).
+- **Customer platform:** a 6-person AWS platform team that already uses Bedrock over a private endpoint.
+  GPU instance quota needs a capacity request the bank estimates at 8 weeks.
+- **Your team and deadline:** 5 engineers and 1 FDE; pilot live in 12 weeks. A defence prospect has
+  asked about an air-gapped version next year.
+
+### Options
+| Option | How it works | Data stays in their account | 88% quality bar | 12-week pilot | Your operability |
+|---|---|---|---|---|---|
+| SaaS in an EU region plus DPA | today's stack, contractual promises | no: processing happens in your account | yes (92%) | yes | full |
+| Customer VPC, managed model | your bundle in their account; model via Bedrock over a private endpoint; optional control plane | yes | yes, if the same model scores 88%+ on Bedrock | yes: no GPUs to procure | traces in their backend, support bundle, metadata-only control plane |
+| Customer VPC, open-weight on GPUs | same bundle, vLLM on GPU instances in their VPC | yes | no (81%) without tuning work | at risk: 8-week quota plus serving work | as above, plus you own model serving |
+| Fully self-contained bundle, no control plane | air-gap-style bundle and offline licence, run in their VPC | yes | depends on the model choice | slower: offline licensing and upgrades first | lowest: per-site upgrades |
+
+### Decision
+**Customer VPC with the managed model over a private endpoint, delivered as a signed, self-contained
+bundle, with the vendor control plane off by default and offered as an opt-in.**
+- **Why not SaaS:** the rule is about where processing happens, so a DPA does not answer it.
+- **Why not open-weight now:** 81% is 7 points under the bar, and the GPU quota alone takes 8 of the 12
+  weeks. Bedrock keeps a strong tool-calling model inside the bank's account.
+- **Why a self-contained bundle anyway:** pinned images, an offline licence file, a hash manifest and
+  the offline preflight cost a few weeks now and turn the later air-gapped tier into a model swap, not a
+  rebuild. The control plane stays optional so the review is not on the critical path.
+- **Gate:** re-run the 200-case eval on the exact Bedrock model in their region before the pilot; at
+  least 176 of 200 passing (88%) is the go criterion.
+
+**What would change it.** If the Bedrock model scored under 88%, or the bank barred managed model
+services, the open-weight path returns and the pilot date moves. If the defence deal closes first, build
+the air-gapped tier now and treat this bank as its first customer-VPC install of the same bundle.
+
+### Trade-offs accepted
+- **Lost direct observability.** Traces go to the bank's OpenTelemetry backend. Watch: support-bundle
+  turnaround time and the share of incidents diagnosed from the bundle alone.
+- **Model drift outside your control.** Bedrock model versions are the bank's to pin. Watch: the eval
+  re-run on every model or bundle change, with tool-call accuracy tracked per site.
+- **Upgrades become per-site work.** Watch: bundle versions per site against a bounded support window.
+- **Up-front bundle work.** Offline licence, manifest and preflight delay feature work. Watch: the
+  offline CI gate passing on every release candidate.
+
+### Review rubric
+- **Custody rule stated precisely:** the write-up says what may not leave (data, traces) and what may
+  (metadata), before choosing a tier.
+- **Quality gate on the shipped model:** the decision depends on an eval run on the exact model and
+  endpoint the customer will use, with a numeric pass bar.
+- **Numbers recomputed:** call volume, eval pass counts and lead times follow from stated inputs and are
+  labelled illustrative.
+- **Options scored on constraints:** 2-4 tiers rated on custody, quality, deadline and operability.
+- **Future tiers considered:** the write-up says how this choice affects a stricter tier later.
+- **Signals for each trade-off:** every accepted cost has a metric, and the conditions that would flip
+  the decision are named.
 
 ## Why it exists
 - **SaaS assumes the customer sends you data.** For a bank's transaction records, a hospital's clinical

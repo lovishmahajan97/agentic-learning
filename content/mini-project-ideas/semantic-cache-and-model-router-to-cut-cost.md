@@ -5,7 +5,8 @@ name: Semantic cache and model router to cut cost
 kind: practice
 difficulty: core
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - system-design/model-routing-cascading
@@ -35,6 +36,203 @@ model by difficulty. It proves you can cut LLM spend with numbers while holding 
   classification, extraction and FAQ-style steps do not; a router per step is how teams cut cost.
 - **What you can skip.** Building your own vector database. An in-memory NumPy matrix is enough until
   the cache holds tens of thousands of entries; swap in Redis or pgvector later.
+
+## Lab
+### Task
+Fix the three bugs that make a cost gateway in front of a support agent look cheaper than it is: a cache
+key that ignores the tenant, a guessed similarity threshold, and a router that caches the small model's
+"I'm not sure" instead of escalating. Then report cost per 1,000 queries against the all-large baseline.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** model routing and cascades, response caching, and embedding models (cosine on
+  normalised vectors).
+- **Runs offline:** a bag-of-words fake stands in for `sentence-transformers` and a recorded fake stands in
+  for the two LLMs, so no API key or model download is needed. Prices are the illustrative $0.010 and
+  $0.001 per call from the cost report below.
+- **Needs:** Python 3.10+ and `pip install pytest`; checked with Python 3.12 and pytest 9.1.
+
+### Starter code
+```python
+# cache_router.py: exact + semantic cache and a small/large router, offline with fakes
+import hashlib, math, re
+from collections import Counter
+
+PRICE = {"small": 0.001, "large": 0.010}           # illustrative $ per call, as in the cost report
+STOP = {"a", "an", "the", "i", "my", "do", "how", "can", "is", "what", "your", "please", "of", "to"}
+
+def embed(text):
+    """Fake embedder: a normalised bag of words. Swap for sentence-transformers later."""
+    counts = Counter(w for w in re.findall(r"[a-z0-9]+", text.lower()) if w not in STOP)
+    norm = math.sqrt(sum(v * v for v in counts.values())) or 1.0
+    return {w: v / norm for w, v in counts.items()}
+
+def cosine(a, b):
+    return sum(v * b.get(w, 0.0) for w, v in a.items())
+
+def normalise(q):
+    return " ".join(q.lower().split())
+
+def looks_hard(q):
+    return len(q.split()) > 60 or any(w in q.lower() for w in ("compare", "plan", "why", "debug"))
+
+def fake_llm(model, q):
+    """Recorded behaviour: the small model gives up on enterprise questions."""
+    if model == "small" and "enterprise" in q.lower():
+        return "I'm not sure."
+    return f"[{model}] answer to: {q}"
+
+# Labelled pairs: (a, b, same_answer). Used to tune the threshold, never guessed.
+PAIRS = [
+    ("How do I reset my password?", "How can I reset my password please", True),
+    ("What is your refund policy?", "refund policy?", True),
+    ("Where is my order", "where is my order right now", True),
+    ("Cancel my order", "Do not cancel my order", False),
+    ("Upgrade to the pro plan", "Downgrade to the pro plan", False),
+    ("Price of the pro plan", "Price of the team plan", False),
+]
+GRID = [round(0.80 + 0.02 * i, 2) for i in range(10)]   # 0.80 ... 0.98
+
+def namespace(tenant, system, tools_version):
+    # YOUR CODE 1: everything that changes the correct answer belongs in the key (tenant is missing)
+    key = f"{system}|{tools_version}"
+    return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+def choose_threshold(pairs, max_false_hit=0.01):
+    # YOUR CODE 2: sweep GRID; return the LOWEST threshold whose false-hit rate (different-answer
+    # pairs scoring >= t, divided by the number of different-answer pairs) is <= max_false_hit
+    return 0.80
+
+class Gateway:
+    def __init__(self, threshold, llm=fake_llm):
+        self.threshold, self.llm = threshold, llm
+        self.exact, self.entries, self.log = {}, [], []    # entries: (ns, vector, answer)
+
+    def answer(self, tenant, system, q, tools_version="v1"):
+        ns = namespace(tenant, system, tools_version)
+        key = ns + "|" + normalise(q)
+        if key in self.exact:
+            self.log.append(("exact", 0.0)); return self.exact[key]
+        qv = embed(q)
+        sims = [(cosine(qv, v), a) for n, v, a in self.entries if n == ns]
+        sim, best = max(sims, default=(0.0, None))
+        if best is not None and sim >= self.threshold:
+            self.log.append(("semantic", 0.0)); return best
+        model = "large" if looks_hard(q) else "small"
+        text, route, cost = self.llm(model, q), model, PRICE[model]
+        # YOUR CODE 3: if the small model fails a check (empty text or "I'm not sure"), call the large
+        # model, set route to "small->large" and add its price, so the failure is never cached
+        self.exact[key] = text
+        self.entries.append((ns, qv, text))
+        self.log.append((route, cost))
+        return text
+
+REPLAY = [
+    ("acme", "How do I reset my password?"),
+    ("acme", "how do i reset my password?"),
+    ("acme", "How can I reset my password please"),
+    ("globex", "How do I reset my password?"),
+    ("acme", "Cancel my order"),
+    ("acme", "Do not cancel my order"),
+    ("acme", "Why was I charged twice?"),
+    ("acme", "What is the enterprise refund policy?"),
+]
+
+def cost_per_1000(log):
+    return round(1000 * sum(c for _, c in log) / len(log), 3)
+
+def main():
+    t = choose_threshold(PAIRS)
+    gw = Gateway(threshold=t)
+    for tenant, q in REPLAY:
+        gw.answer(tenant, "You are a support agent.", q)
+    print("threshold:", t)
+    print("routes:", dict(Counter(r for r, _ in gw.log)))
+    print("cost per 1000: $%.3f vs all-large $%.3f" % (cost_per_1000(gw.log), 1000 * PRICE["large"]))
+
+if __name__ == "__main__":
+    main()
+```
+
+As given it prints `cost per 1000: $1.625`, which looks like a win. It is cheap because globex gets an
+exact hit on acme's answer, "Do not cancel my order" is served the cancel answer (cosine 0.816 at a
+threshold of 0.80), and "I'm not sure." is cached.
+
+### Expected output
+```
+threshold: 0.82
+routes: {'small': 4, 'exact': 1, 'semantic': 1, 'large': 1, 'small->large': 1}
+cost per 1000: $3.125 vs all-large $10.000
+```
+
+Check the arithmetic: four small calls at $0.001, one large at $0.010 and one escalation at $0.011 make
+$0.025 over 8 queries, which is $3.125 per 1,000 and a 68.75% saving against $10.000.
+
+### Tests
+```python
+# test_cache_router.py: run with `pytest -q`
+import pytest
+import cache_router as m
+
+SYS = "You are a support agent."
+
+def test_namespace_separates_tenants():
+    assert m.namespace("acme", SYS, "v1") != m.namespace("globex", SYS, "v1")
+
+def test_no_cross_tenant_hit():
+    gw = m.Gateway(threshold=0.82)
+    gw.answer("acme", SYS, "How do I reset my password?")
+    gw.answer("globex", SYS, "How do I reset my password?")
+    assert gw.log[-1][0] not in ("exact", "semantic")
+
+def test_threshold_comes_from_labelled_pairs():
+    assert m.choose_threshold(m.PAIRS) == 0.82
+    assert m.choose_threshold(m.PAIRS, max_false_hit=0.34) == 0.80   # 1 of 3 false hits allowed
+
+def test_negation_is_not_served_from_cache():
+    gw = m.Gateway(threshold=m.choose_threshold(m.PAIRS))
+    gw.answer("acme", SYS, "Cancel my order")
+    gw.answer("acme", SYS, "Do not cancel my order")
+    assert gw.log[-1][0] == "small"
+
+def test_failed_small_answer_escalates_and_is_not_cached():
+    gw = m.Gateway(threshold=0.82)
+    text = gw.answer("acme", SYS, "What is the enterprise refund policy?")
+    assert text.startswith("[large]")
+    route, cost = gw.log[-1]
+    assert route == "small->large" and cost == pytest.approx(0.011)
+    assert all("not sure" not in a for _, _, a in gw.entries)
+
+def test_cost_report_on_replay():
+    gw = m.Gateway(threshold=m.choose_threshold(m.PAIRS))
+    for tenant, q in m.REPLAY:
+        gw.answer(tenant, SYS, q)
+    assert m.cost_per_1000(gw.log) == 3.125
+```
+
+All six fail on the starter, each on its own bug. The cost test is the point of the lab: the correct
+gateway costs more than the broken one, because the broken one saves money by serving wrong answers.
+
+### Failure scenarios
+- **Drop the tenant from the key again.** The hit rate rises and cost falls, and nothing errors. Debug by
+  replaying the same query under two tenants and asserting the second is a miss; log the namespace on
+  every hit.
+- **Set the threshold to 0.80 by hand.** "Do not cancel my order" returns the cancel answer. Debug by
+  printing the best cosine for each labelled different-answer pair; any at or above the threshold is a
+  false hit waiting for traffic.
+- **Cache before checking the small answer.** Every later paraphrase of the enterprise question gets
+  "I'm not sure." for free. Debug by grepping cached answers for refusal phrases and counting escalations
+  per route in the log.
+- **Swap the fake embedder for a real model without re-tuning.** Similarity scales differ, so the old
+  threshold hits far more or far less. Debug by re-running `choose_threshold` on the same pairs and
+  storing the model name next to the value.
+
+### Submission
+- **Repo** with `cache_router.py` and the unchanged test file; `pytest -q` shows 6 passed.
+- **Program output** matching the expected block, pasted into the README.
+- **A threshold table** of every `GRID` value with hit rate and false-hit rate on `PAIRS`.
+- **A short note** (5-8 sentences) on why the correct gateway costs more than the starter, and which
+  cached answer you would sample for review first.
+- **Evaluated on** tests passing, the tenant in the namespace, a threshold derived from data, and no
+  refusal text in the cache.
 
 ## Why it exists
 - **Cost is the first production complaint.** Agent traffic is repetitive (the same 50 support questions,

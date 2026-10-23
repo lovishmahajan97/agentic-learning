@@ -5,7 +5,8 @@ name: Input / output guardrails
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -171,6 +172,23 @@ flowchart TD
     D -.->|"verdict, score, trace id"| L[("Decision log")]
     O -.->|"verdict, score, trace id"| L
 ```
+
+## Misconceptions
+- **"Rails on the first user turn and the final answer cover the agent."** Every tool result is fresh
+  untrusted input and every tool call is an output, so a page fetched at step 6 can steer step 7 past
+  rails that never saw it. Run input rails per tool result and output rails per tool call.
+- **"A detector with 95% recall and 1% false positives is good enough to hard-block."** At 0.1%
+  prevalence only about 9% of its blocks are real attacks. Low-prevalence rails flag or route to review;
+  hard blocks go to near-zero false-positive checks such as a canary match or a schema failure.
+- **"Each rail is cheap, so another one costs nothing."** False positives compound: five 1% rails drop
+  4.9% of good traffic, and a 0.5% rail checked on 20 hops interrupts about 9.5% of tasks. Measure
+  interruptions per task, not per check.
+- **"An LLM judge is a stronger rail than regex because it understands intent."** It generalises better
+  but is non-deterministic and injectable itself. Run deterministic checks first, and give the judge only
+  the policy and delimited text with a label-only output.
+- **"Fail-closed is always the safe default."** It turns a checker outage into a product outage. Choose
+  per rail by the asymmetry of harm, and alert on checker errors, because a silent fail-open looks exactly
+  like a quiet day.
 
 ## Examples
 ### A minimal rail pipeline

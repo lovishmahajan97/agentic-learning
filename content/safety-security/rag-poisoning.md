@@ -5,7 +5,8 @@ name: RAG poisoning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -150,6 +151,24 @@ flowchart TD
     G -->|"proposed action"| X{"Executor: high-tier source cited?"}
     M["Canary queries"] -.->|"top-k shift alerts"| I
 ```
+
+## Misconceptions
+- **"We only index internal documents, so the corpus is trusted."** Insiders, compromised accounts and
+  all-staff wikis all write to it. Trust follows who can write to a source, not where it is hosted.
+- **"A large corpus dilutes one poisoned document."** The attacker only has to win the top-k for the
+  target question; opening a page with the question and its paraphrases does that, and corpus size never
+  enters the calculation.
+- **"Injection detection on prompts and documents stops poisoning."** User-prompt checks run before the
+  poison arrives in retrieved chunks, and a knowledge-corruption document contains no instructions at
+  all, only confident false content. Write-path control and trust tiers address it at the root.
+- **"A cited source is enough to justify an agent's action."** Retrieved text informs; it never
+  authorises. The executor reads limits, recipients and approvals from the system of record and requires
+  a high-tier source.
+- **"The agent's own memory is trustworthy because the agent wrote it."** It writes memory from content
+  it read, so one injection can persist into every later session. Memory writes need provenance and
+  trust tiers like any other source.
+- **"Deleting the document fixes the incident."** Its vectors and caches keep serving the answer. Remove
+  the chunks by `doc_id`, clear caches, and use lineage to find every answer that cited it.
 
 ## Examples
 ### Trust-aware ingestion and selection

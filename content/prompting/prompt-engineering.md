@@ -5,7 +5,8 @@ name: Prompt engineering
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/system-prompt
@@ -158,6 +159,24 @@ flowchart TD
     E -->|"stable style, high volume"| I["Fine-tune"]
     C -->|"metric moved"| J["Record version and score, ship"]
 ```
+
+## Misconceptions
+- **"Prompt engineering is finding the right magic words."** Personas, tips and threats rarely move a
+  measured eval. What moves it is removing ambiguity: a closed label set, a fixed format, defined edge
+  cases, and a loop that scores every change on the same cases.
+- **"If one output looks right, the prompt works."** Outputs are sampled, so one good run is one draw.
+  On 50 cases at 80% the standard error is about ±6 points; only a fixed set, several runs and a paired
+  count of flipped cases tells you a change helped.
+- **"The system prompt is where agent behaviour lives."** Tool names, tool descriptions and argument
+  descriptions are prompts too, and they decide tool selection. Rewriting one vague description often
+  fixes more than any system-prompt edit.
+- **"A slightly better step barely matters."** Errors compound across a loop: 95% per step over 10
+  steps is about 60% end to end, so a few points per step is a large gain per task.
+- **"Delimiters stop prompt injection."** Tags are a learned cue the model usually respects, not an
+  enforcement boundary. Must-hold rules and forbidden actions belong in code: validation, guardrails and
+  tool permissions.
+- **"A growing prompt means progress."** A prompt that keeps growing while the score plateaus signals a
+  knowledge or capability gap; the fix is retrieval, tools, fine-tuning or a stronger model.
 
 ## Examples
 ### Scoring two versions of an agent's triage step

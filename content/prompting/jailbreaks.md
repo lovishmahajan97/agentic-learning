@@ -5,7 +5,8 @@ name: Jailbreaks
 kind: concept
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - prompting/prompt-injection
@@ -129,6 +130,24 @@ flowchart TD
     C --> R
     RF -.-> D[("Refusal dashboard, rate limits")]
 ```
+
+## Misconceptions
+- **"Safety training removed the forbidden capability."** It adds a refusal disposition on top of
+  capability; competing objectives and mismatched generalisation (Wei et al.) steer around it, and in
+  several open models refusal is largely one removable residual-stream direction.
+- **"Jailbreaks are about harmful content, so they are the vendor's problem."** Most incidents agent
+  teams face are off-policy, not harmful: a promised discount, a leaked system prompt, a role-played
+  refund. Vendor safety does not know your policy; your tool code has to enforce it.
+- **"Checking each message with a classifier catches attacks."** Multi-turn escalation spreads the
+  request so no single message looks harmful, and many-shot attacks hide in long pasted context; cap
+  user context and judge the whole conversation.
+- **"A hardened system prompt keeps secrets."** Assume it leaks after "repeat the text above"; keys,
+  internal hostnames and unreleased names belong in tool backends.
+- **"An attack success rate of 6% beats one of 14%."** On 50 attacks both fall inside the interval of a
+  true 10% rate (standard error about 0.042), so a fixed threshold flaps; grow the suite, resample, and
+  track benign pass rate too, since refusing everything scores zero.
+- **"Last quarter's red-team results still hold."** Robustness shifts in either direction with every
+  model upgrade, so re-certify on the same cases before switching traffic.
 
 ## Examples
 ### A minimal adversarial eval gate

@@ -5,7 +5,8 @@ name: Anthropic SDK
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/openai-sdk
@@ -39,6 +40,245 @@ blocks, top-level `system`, required `max_tokens`, tool results as user blocks, 
   timeouts and retries.
 - **What you can skip.** Raw SSE parsing and hand-merging stream deltas; the streaming helper and
   `get_final_message()` do it. Learn the content-block shapes before trusting a wrapper to translate them.
+
+## Lab
+### Task
+Fix a Claude agent loop that breaks the four rules this lesson names. It drops thinking and `tool_use`
+blocks from history, splits parallel results across messages, crashes on a failing tool, and treats
+`max_tokens` and `refusal` as success. It also puts a timestamp in the cached system prompt. Time box:
+60-90 minutes.
+- **Prerequisites:** Function and tool calling, Prompt caching, and this lesson's tool loop, stop reasons
+  and caching sections.
+- **No key needed:** the real `anthropic` client talks to a local HTTP server that replays recorded
+  replies. It rejects history the way the API does, and it reports a cache read when tools and system
+  are byte-identical to an earlier request.
+- **Checked against:** Python 3.12 and `anthropic` 2.1. A local server instead of a mock transport keeps
+  the lab working whichever HTTP library the SDK ships with (2.x moved from `httpx` to `httpx2`).
+
+### Starter code
+Save as `lab.py`. Fix the lines marked `LAB 1` to `LAB 4`; keep the server and helpers unchanged.
+
+```python
+"""Lab: a stop_reason-driven Claude tool loop on the real anthropic SDK, against a recorded local server."""
+import json
+import threading
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import anthropic
+
+MODEL = "claude-fake-1"
+
+
+class FakeMessagesServer:
+    """Local HTTP server that replays recorded Messages API replies and checks history the way the real
+    API does: every tool_use answered in the NEXT user message, and assistant blocks (thinking signatures
+    included) echoed unchanged. It reports cache reads when tools + system match an earlier call."""
+
+    def __init__(self, replies):
+        self.replies, self.requests, self.sent, self.prefixes = list(replies), [], [], set()
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                status, payload = fake.handle(body)
+                data = json.dumps(payload).encode()
+                self.send_response(status)
+                for k, v in {"content-type": "application/json", "request-id": f"req_{len(fake.requests)}",
+                             "content-length": str(len(data))}.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def handle(self, body):
+        self.requests.append(body)
+        msgs = body["messages"]
+        err = lambda m: (400, {"type": "error", "error": {"type": "invalid_request_error", "message": m}})
+        shape = lambda blocks: [(b["type"], b.get("id"), b.get("signature")) for b in blocks]
+        for got, want in zip([m for m in msgs if m["role"] == "assistant"], self.sent):
+            if not isinstance(got["content"], list) or shape(got["content"]) != shape(want):
+                return err("assistant turn must echo every content block unchanged")
+        for i, m in enumerate(msgs):
+            ids = [b["id"] for b in m["content"] if b["type"] == "tool_use"] if m["role"] == "assistant" else []
+            nxt = msgs[i + 1]["content"] if ids and i + 1 < len(msgs) else []
+            got = sorted(b["tool_use_id"] for b in nxt if isinstance(b, dict) and b.get("type") == "tool_result")
+            if ids and got != sorted(ids):
+                return err("tool_result for every tool_use id must be in the next user message")
+        stop, content = self.replies.pop(0)
+        self.sent.append(content)
+        prefix = json.dumps([body.get("tools"), body.get("system")], sort_keys=True)
+        hit = prefix in self.prefixes
+        self.prefixes.add(prefix)
+        return 200, {"id": f"msg_{len(self.requests)}", "type": "message", "role": "assistant", "model": MODEL,
+                     "content": content, "stop_reason": stop, "stop_sequence": None,
+                     "usage": {"input_tokens": 50 * len(msgs), "output_tokens": 30,
+                               "cache_read_input_tokens": 2000 if hit else 0,
+                               "cache_creation_input_tokens": 0 if hit else 2000}}
+
+
+def make_client(server):
+    return anthropic.Anthropic(api_key="test", base_url=server.url, max_retries=0, timeout=10.0)
+
+
+def thinking(text, sig):
+    return {"type": "thinking", "thinking": text, "signature": sig}
+
+
+def tool_use(tid, name, inp):
+    return {"type": "tool_use", "id": tid, "name": name, "input": inp}
+
+
+def text(t):
+    return {"type": "text", "text": t}
+
+
+TOOLS = [{"name": "get_order", "description": "Look up an order by id.", "input_schema": {
+    "type": "object", "properties": {"order_id": {"type": "string"}}, "required": ["order_id"],
+    "additionalProperties": False}}]
+
+
+def get_order(order_id: str) -> str:
+    if not order_id.startswith("A-"):
+        raise KeyError(f"no order {order_id}")
+    return json.dumps({"order_id": order_id, "status": "shipped"})
+
+
+IMPL = {"get_order": get_order}
+
+
+def system_prompt() -> list[dict]:
+    now = datetime.now(timezone.utc).isoformat()       # LAB 4: volatile text inside the cached prefix
+    return [{"type": "text", "text": f"You are an order-support agent. Use tools for facts. Now: {now}",
+             "cache_control": {"type": "ephemeral"}}]
+
+
+def run_agent(client, question: str, max_iters: int = 6) -> dict:
+    """Return {"status": done|truncated|refused|step_limit, "text": str, "log": [...]}."""
+    messages, log = [{"role": "user", "content": question}], []
+    for _ in range(max_iters):
+        resp = client.messages.create(model=MODEL, max_tokens=1024, system=system_prompt(),
+                                      tools=TOOLS, messages=messages)
+        log.append({"request_id": resp._request_id, "stop_reason": resp.stop_reason,
+                    "cache_read": resp.usage.cache_read_input_tokens})
+        if resp.stop_reason != "tool_use":                      # LAB 3: max_tokens and refusal are not done
+            return {"status": "done", "text": "".join(b.text for b in resp.content if b.type == "text"), "log": log}
+        messages.append({"role": "assistant", "content": [b for b in resp.content if b.type == "text"]})  # LAB 1
+        for block in resp.content:
+            if block.type == "tool_use":
+                out = IMPL[block.name](**block.input)            # LAB 2: a failing tool -> is_error result
+                messages.append({"role": "user", "content": [   # LAB 1: all results in ONE user message
+                    {"type": "tool_result", "tool_use_id": block.id, "content": out}]})
+    return {"status": "step_limit", "text": "", "log": log}
+
+
+if __name__ == "__main__":
+    server = FakeMessagesServer([
+        ("tool_use", [thinking("Two orders: look both up.", "sig-1"),
+                      tool_use("toolu_1", "get_order", {"order_id": "A-1042"}),
+                      tool_use("toolu_2", "get_order", {"order_id": "B-7"})]),
+        ("end_turn", [text("A-1042 has shipped; I could not find B-7.")]),
+        ("end_turn", [text("Yes, A-1042 left the warehouse.")]),
+    ])
+    client = make_client(server)
+    try:
+        for q in ["Today is 2026-10-23. Where are A-1042 and B-7?", "Did A-1042 ship?"]:
+            out = run_agent(client, q)
+            for row in out["log"]:
+                print(row)
+            print(out["status"], "|", out["text"])
+        print("is_error flags:", [r.get("is_error", False) for r in server.requests[1]["messages"][-1]["content"]])
+    except Exception as e:
+        print(f"{type(e).__name__}: {e}")
+```
+
+### Expected output
+The starter stops at `KeyError: 'no order B-7'`. A correct loop prints the lines below. The date now
+travels in the user turn, so the prefix is stable and every call after the first reads the cache.
+
+```
+{'request_id': 'req_1', 'stop_reason': 'tool_use', 'cache_read': 0}
+{'request_id': 'req_2', 'stop_reason': 'end_turn', 'cache_read': 2000}
+done | A-1042 has shipped; I could not find B-7.
+{'request_id': 'req_3', 'stop_reason': 'end_turn', 'cache_read': 2000}
+done | Yes, A-1042 left the warehouse.
+is_error flags: [False, True]
+```
+
+### Tests
+Save as `test_lab.py` and run `pytest -q`. All five fail on the starter: two with the server's 400
+(blocks not echoed), plus a `KeyError`, `'done' == 'truncated'` and a cache read of 0.
+
+```python
+from lab import FakeMessagesServer, make_client, run_agent, text, thinking, tool_use
+
+TWO_CALLS = ("tool_use", [thinking("look both up", "sig-1"),
+                          tool_use("toolu_1", "get_order", {"order_id": "A-1042"}),
+                          tool_use("toolu_2", "get_order", {"order_id": "A-2001"})])
+
+
+def test_full_content_echoed_and_results_in_one_message():
+    server = FakeMessagesServer([TWO_CALLS, ("end_turn", [text("Both shipped.")])])
+    out = run_agent(make_client(server), "q")
+    assert out["status"] == "done" and out["text"] == "Both shipped."
+    last = server.requests[-1]["messages"]
+    assert [m["role"] for m in last] == ["user", "assistant", "user"]
+    assert [b["tool_use_id"] for b in last[2]["content"]] == ["toolu_1", "toolu_2"]
+
+
+def test_failing_tool_is_reported_with_is_error():
+    server = FakeMessagesServer([("tool_use", [tool_use("toolu_1", "get_order", {"order_id": "B-7"})]),
+                                 ("end_turn", [text("Not found.")])])
+    out = run_agent(make_client(server), "q")
+    result = server.requests[-1]["messages"][-1]["content"][0]
+    assert out["status"] == "done" and result["is_error"] is True and "B-7" in str(result["content"])
+
+
+def test_max_tokens_and_refusal_are_not_reported_as_done():
+    for stop in ("max_tokens", "refusal"):
+        server = FakeMessagesServer([(stop, [text("partial")])])
+        status = run_agent(make_client(server), "q")["status"]
+        assert status == {"max_tokens": "truncated", "refusal": "refused"}[stop]
+
+
+def test_iteration_cap():
+    server = FakeMessagesServer([("tool_use", [tool_use(f"t{i}", "get_order", {"order_id": "A-1"})])
+                                 for i in range(10)])
+    out = run_agent(make_client(server), "q", max_iters=3)
+    assert out["status"] == "step_limit" and len(server.requests) == 3
+
+
+def test_stable_prefix_reads_the_cache_on_the_next_task():
+    server = FakeMessagesServer([("end_turn", [text("one")]), ("end_turn", [text("two")])])
+    client = make_client(server)
+    first, second = run_agent(client, "task 1"), run_agent(client, "task 2")
+    assert first["log"][0]["cache_read"] == 0 and second["log"][0]["cache_read"] == 2000
+```
+
+### Failure scenarios
+- **Echo the blocks but drop the thinking block "to save tokens".** The server returns 400 on the second
+  call. Debug: print `[b.type for b in resp.content]` next to the types you appended; a real API also
+  verifies the `signature`.
+- **Put the results in one message but leave out the failed call.** The 400 names a missing
+  `tool_result`. Debug: compare the sorted `tool_use` ids with the sorted `tool_use_id`s you send.
+- **Build `TOOLS` by iterating over a set of tool names.** String hashing is randomised per process, so
+  tool order can differ between replicas and cache reads drop to 0. Debug: diff the `tools` list of two
+  request bodies, as in the Check-yourself answer.
+
+### Submission
+- **`lab.py` passing all five tests**, with output matching Expected output.
+- **A per-call log** (request ID, stop reason, cache read) from one real Claude run with a long system
+  prompt, showing reads rise from the second call, or a note on why they did not (minimum prefix length).
+- **A note** on where your loop would add a task deadline and an allow-list check before running a tool.
+- **Evaluation:** tests pass, history is append-only, and no stop reason other than `end_turn` is
+  reported as done.
 
 ## Why it exists
 - **The usual transport problems.** Authentication, retries on 429 and 5xx, timeouts and server-sent-event

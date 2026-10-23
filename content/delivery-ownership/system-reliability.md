@@ -5,7 +5,8 @@ name: System reliability
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - reliability/high-availability
@@ -38,6 +39,58 @@ so a fully-up agent can be unreliable.
   model.
 - **What you can skip.** Hardware redundancy theory and the MTBF versus MTTF naming debate beyond knowing
   conventions differ. The impact formula and composition arithmetic are what you use.
+
+## Decision case
+### Scenario
+You own a customer-support agent used by 40 enterprise tenants. Its quarter of incident history is the
+failure-mode table in the examples below: 180 + 60 + 15 + 12 = 267 full-outage-equivalent minutes a
+month. All figures are illustrative planning numbers.
+- **Target:** an internal SLO of 99.5 percent over a 30-day month, a 216-minute allowance. You are 51
+  minutes over it.
+- **Capacity:** two engineers for three weeks next quarter, so 6 engineer-weeks of reliability work.
+- **Pressure:** sales has promised a large tenant "multi-provider redundancy" and wants a second model
+  provider funded first.
+- **Constraint:** the plan must bring the month under 216 minutes with room to spare, and leave no
+  tenant-facing change that needs a new contract term.
+
+### Options
+| Option | How it works | Cost (eng-weeks) | Impact after (min/month) | Minutes saved per eng-week |
+|---|---|---|---|---|
+| Second provider fallback | Route to a backup model when the primary region fails | 6 | provider row 15 to about 0: 252 total | about 2.5 |
+| Prompt eval gate plus sampled quality alerts | Block failing prompt deploys; alert within 15 minutes on quality drops | 4 | prompt row 180 to 45: 132 total | about 34 |
+| Index freshness check | Alert when the retrieval index lags its source; mean stale time 600 to 60 minutes | 2 | stale row 60 to 6: 213 total | 27 |
+| Per-tenant quotas | Bulkhead batch tenants away from interactive traffic | 2 | tenant row 12 to about 0: 255 total | 6 |
+
+### Decision
+**Fund the prompt eval gate with quality alerts, plus the index freshness check.** Together they cost the
+full 6 engineer-weeks and bring the month to 45 + 6 + 15 + 12 = 78 minutes, about a third of the
+allowance. The second provider alone would cost the same 6 weeks and leave 252 minutes, still over
+the SLO.
+- **Ranked by impact, not by recency or noise:** the two chosen rows are both self-inflicted and both
+  detection problems, which is the cheapest term to cut.
+- **Sales gets a written answer:** the fallback is scheduled once its row dominates, and the impact
+  table shows why it is not first.
+
+**What would change it.** If provider region outages rise to, say, 2 a month at 60 minutes, that row
+becomes 120 minutes and the fallback moves up. If a contract signs 99.9 percent, the 43.2-minute
+allowance is mostly used by one 30-minute provider outage, so failover becomes mandatory.
+
+### Trade-offs accepted
+- **A provider outage still hits every tenant.** Track provider-row minutes monthly and revisit when they
+  pass a quarter of the remaining impact.
+- **The eval gate slows prompt releases.** Watch time from prompt merge to production and the gate's
+  false-block rate; a gate people bypass protects nothing.
+- **Batch tenants can still starve others.** Keep the per-tenant latency alert, and fund quotas next
+  quarter if that row grows.
+
+### Review rubric
+- **Impact computed per failure mode:** frequency x duration x blast radius, summed and compared to the
+  SLO allowance in minutes.
+- **Cost-normalised ranking:** options are compared by minutes saved per unit of effort.
+- **Lever named inside each row:** the write-up says which term (detect, diagnose, recover, blast radius)
+  the work shrinks, with evidence from incident timelines.
+- **Stakeholder request handled with numbers:** the popular option is answered, not ignored.
+- **Reopen triggers stated:** the frequency or contract change that would reorder the list.
 
 ## Why it exists
 - **Delivered AI systems fail differently from demos.** They fail at 3 a.m. when a provider rate-limits

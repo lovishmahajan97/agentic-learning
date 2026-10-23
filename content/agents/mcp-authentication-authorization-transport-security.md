@@ -5,7 +5,8 @@ name: MCP authentication / authorization / transport security
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -190,6 +191,25 @@ sequenceDiagram
     Note over S: check signature, issuer, audience, scope
     S-->>C: JSON-RPC result or 403 insufficient_scope
 ```
+
+## Misconceptions
+- **"A good system prompt keeps the agent off dangerous tools."** Injected text in a tool result can
+  override any instruction, so the model will eventually call whatever it can reach. Only scopes and
+  server-side checks on the validated token decide what a call may do.
+- **"A valid signature from our issuer means the token is good here."** Signature and issuer prove who
+  minted it, not for whom. Without the audience check, a token a compromised `docs` server captured
+  replays cleanly against `billing`; the server must reject any `aud` that is not its own canonical URI.
+- **"Forwarding the user's token upstream is the simplest secure option."** Token passthrough is
+  explicitly forbidden: it breaks audience binding and hides the MCP server from the upstream's audit and
+  rate limits. Use the server's own credentials or a token exchange (RFC 8693).
+- **"Once the session is established, the session ID authenticates the caller."** A session ID is a
+  routing key, not a credential. Validate the bearer token on every request and key state as
+  `subject:session_id`, so a leaked ID with another user's token resolves to nothing.
+- **"stdio servers are safe because nothing is exposed on the network."** stdio drops network risks but
+  keeps the others: you run someone's code with your own permissions, and its credentials sit in a config
+  file. Treat installing a local server like installing a package with your access.
+- **"A local HTTP server on localhost cannot be reached by outsiders."** DNS rebinding lets a web page in
+  your browser call `127.0.0.1`. Bind to `127.0.0.1`, not `0.0.0.0`, and validate the `Origin` header.
 
 ## Examples
 ### Resource-server middleware in front of a Streamable HTTP endpoint

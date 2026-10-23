@@ -5,7 +5,8 @@ name: Prompt versioning
 kind: practice
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/prompt-templates
@@ -151,6 +152,25 @@ flowchart TD
     C --> T
     T -.->|"replay and compare"| G
 ```
+
+## Misconceptions
+- **"The prompt is in git, so it is versioned."** Git versions the file, not the call. Without the
+  bundle hash on each trace you cannot say which wording produced a given response, so a complaint
+  cannot be replayed or dated.
+- **"Only the system prompt template needs a version."** The model reads tool names, descriptions and
+  schemas too, and runs on a specific model snapshot; reword one tool description and behaviour changes
+  while a template-only hash reports no change.
+- **"Pinning `gpt-4o` pins the model."** A floating alias can move to a new snapshot under an unchanged
+  bundle; pin the dated id in the bundle and treat a model change as a new version.
+- **"If the mean eval score went up, the new version is safe to promote."** A weighted mean can rise
+  while one category collapses (85.8% to 87.3% overall with refunds falling from 95% to 70%); gate on
+  every category.
+- **"Replaying the logged request reproduces the bad answer."** Replay reproduces the input; sampling
+  is not bit-identical even at temperature 0, so resend several times and judge by the rate of wrong
+  answers.
+- **"Rollback means redeploying the old prompt."** With immutable versions and aliases it is a pointer
+  move, and a long agent run should keep the version it started with rather than re-resolving the alias
+  on every step.
 
 ## Examples
 ### A minimal file-based registry

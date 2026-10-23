@@ -5,7 +5,8 @@ name: Streams & backpressure
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - node-ts-for-ai/abortcontroller-and-cancellation
@@ -36,6 +37,179 @@ bounded; `pipeline` and `pipeTo` keep errors and aborts wired.
   client close, and turning off proxy buffering for streamed routes.
 - **What you can skip.** Writing custom `Duplex` streams and the internals of `_read`. Know the
   `write()`/`'drain'` contract, `for await`, and `Readable.fromWeb`.
+
+## Lab
+### Task
+Fix the streaming path between a model provider and a slow agent UI: an SSE-to-NDJSON Transform that
+survives arbitrary chunk splits, an event writer that honours `'drain'` and stops when the client leaves,
+and a proxy whose failing client tears down the upstream. Time box: 60-90 minutes.
+- **Prerequisites:** this lesson's backpressure protocol, `pipe` versus `pipeline` and SSE framing
+  sections; the AbortController lesson for the signal.
+- **Setup:** an empty folder with `"type": "module"` in `package.json`, `npm i -D vitest @types/node`.
+  Checked with Node 24.21 and Vitest 5.0; Node 24 runs `lab.ts` directly by stripping types.
+- **No provider needed:** `sse()` builds a recorded provider stream and `slowClient()` is a Writable that
+  acknowledges one chunk per millisecond.
+- **Save** the starter as `lab.ts` and the tests as `lab.test.ts`, then run `node lab.ts` and
+  `npx vitest run`.
+
+### Starter code
+```ts
+// Lab: stream an agent run to a slow client without unbounded buffers or leaked upstreams.
+// Run: node lab.ts   Test: npx vitest run
+import { Readable, Transform, Writable, type TransformCallback } from "node:stream";
+import { once } from "node:events";
+import { pathToFileURL } from "node:url";
+
+// LAB 1: reframe provider SSE into NDJSON lines {"t": delta}. Chunks split anywhere: inside an
+// event, inside a line, inside a multi-byte UTF-8 character. Buffer partial events across chunks,
+// decode with one StringDecoder, skip [DONE], and fail in _flush if a partial event is left.
+export class SseToNdjson extends Transform {
+  override _transform(chunk: Buffer, _enc: BufferEncoding, cb: TransformCallback) {
+    for (const event of chunk.toString().split("\n\n")) {      // assumes whole events per chunk
+      const line = event.trim();
+      if (!line.startsWith("data:") || line.endsWith("[DONE]")) continue;
+      this.push(JSON.stringify({ t: JSON.parse(line.slice(5)).delta ?? "" }) + "\n");
+    }
+    cb();
+  }
+}
+
+// LAB 2: write each event as an NDJSON line and honour backpressure: when write() returns false,
+// await once(dest, "drain", { signal }) so a client that leaves mid-wait ends the loop.
+// Return the peak dest.writableLength you observed.
+export async function writeEvents(events: AsyncIterable<object>, dest: Writable, signal: AbortSignal): Promise<number> {
+  let peak = 0;
+  for await (const ev of events) {
+    dest.write(JSON.stringify(ev) + "\n");
+    peak = Math.max(peak, dest.writableLength);
+  }
+  void once; void signal;
+  return peak;
+}
+
+// LAB 3: connect upstream -> SseToNdjson -> dest so an error or close on dest destroys upstream
+// (pipeline from node:stream/promises), and resolve when the chain finishes.
+export async function proxy(upstream: Readable, dest: Writable): Promise<void> {
+  upstream.pipe(new SseToNdjson()).pipe(dest);
+  await once(dest, "finish");
+}
+
+export function sse(deltas: string[]): Buffer {
+  return Buffer.from(deltas.map((d) => `data: ${JSON.stringify({ delta: d })}\n\n`).join("") + "data: [DONE]\n\n");
+}
+
+export function slowClient(msPerChunk: number, highWaterMark = 1024) {
+  const got: string[] = [];
+  const w = new Writable({ highWaterMark, write(c, _e, cb) { got.push(String(c)); setTimeout(cb, msPerChunk); } });
+  return { w, got };
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  const bytes = sse(["Hel", "lo ", "wörld ", "🙂"]);
+  const cuts = [0, 7, bytes.indexOf("ö") + 1, bytes.indexOf("🙂") + 2, bytes.length];   // mid-character splits
+  const chunks = cuts.slice(1).map((end, i) => bytes.subarray(cuts[i], end));
+  const out: string[] = [];
+  try {
+    for await (const line of Readable.from(chunks).pipe(new SseToNdjson())) out.push(String(line));
+    console.log("ndjson:", out.join("").trim().split("\n").map((l) => JSON.parse(l).t).join(""));
+  } catch (e) { console.log("transform failed:", (e as Error).message); }
+
+  async function* run() { for (let i = 0; i < 200; i++) yield { type: "token", text: "x".repeat(80), i }; }
+  const { w } = slowClient(1);
+  console.log("peak buffered bytes:", await writeEvents(run(), w, new AbortController().signal));
+}
+```
+
+### Expected output
+`node lab.ts` with a correct solution prints:
+
+```
+ndjson: Hello wörld 🙂
+peak buffered bytes: 1130
+```
+
+The starter prints `transform failed: Expected property name or '}' in JSON at position 2 (line 1 column 3)`
+and `peak buffered bytes: 22890`: every one of the 200 lines buffered at once instead of about ten.
+
+### Tests
+```ts
+import { expect, test } from "vitest";
+import { Readable, Writable } from "node:stream";
+import { setTimeout as sleep } from "node:timers/promises";
+import { SseToNdjson, proxy, slowClient, sse, writeEvents } from "./lab.ts";
+
+async function collect(chunks: Buffer[]) {
+  let out = "";
+  for await (const c of Readable.from(chunks).pipe(new SseToNdjson())) out += String(c);
+  return out;
+}
+
+test("events split across chunks and inside characters survive", async () => {
+  const bytes = sse(["Hel", "lo ", "wörld ", "🙂"]);
+  const cuts = [0, 3, 7, bytes.indexOf("ö") + 1, bytes.indexOf("🙂") + 1, bytes.indexOf("🙂") + 3, bytes.length];
+  const out = await collect(cuts.slice(1).map((end, i) => bytes.subarray(cuts[i], end)));
+  expect(out).toBe(['{"t":"Hel"}', '{"t":"lo "}', '{"t":"wörld "}', '{"t":"🙂"}', ""].join("\n"));
+});
+
+test("upstream ending mid-event is an error, not a silent truncation", async () => {
+  const bytes = sse(["complete"]);
+  await expect(collect([bytes, Buffer.from('data: {"delta":"cut')])).rejects.toThrow("stream ended mid-event");
+});
+
+test("writes wait for drain, so the buffer stays near highWaterMark", async () => {
+  async function* run() { for (let i = 0; i < 200; i++) yield { type: "token", text: "x".repeat(80), i }; }
+  const { w, got } = slowClient(1, 1024);
+  const peak = await writeEvents(run(), w, new AbortController().signal);
+  expect(peak).toBeLessThanOrEqual(1024 + 120);       // threshold plus one line
+  await new Promise((r) => w.end(r));
+  expect(got.length).toBe(200);
+});
+
+test("a client that leaves mid-drain ends the loop instead of hanging", async () => {
+  const stuck = new Writable({ highWaterMark: 64, write() { /* never acknowledges */ } });
+  const ac = new AbortController();
+  async function* forever() { while (!ac.signal.aborted) { yield { type: "token", text: "y".repeat(50) }; await sleep(1); } }
+  setTimeout(() => ac.abort(), 20);
+  await expect(writeEvents(forever(), stuck, ac.signal)).rejects.toMatchObject({ name: "AbortError" });
+});
+
+test("a failing client destroys the upstream", async () => {
+  const upstream = Readable.from((async function* () { for (;;) { yield sse(["tok"]); await sleep(1); } })());
+  let writes = 0;
+  const client = new Writable({ write(_c, _e, cb) { cb(++writes === 3 ? new Error("client reset") : null); } });
+  await expect(proxy(upstream, client)).rejects.toThrow("client reset");
+  await sleep(5);
+  expect(upstream.destroyed).toBe(true);
+});
+```
+
+All five fail on the starter: a JSON `SyntaxError` on split events, `expected 22890 to be less than or
+equal to 1144`, `promise resolved ... instead of rejecting` for the departed client, and
+`expected false to be true` because `pipe` leaves the upstream open. A correct solution passes all five.
+
+### Failure scenarios
+- **Buffer events but decode with `chunk.toString()`.** Split JSON now parses, but the test that cuts
+  inside `ö` and `🙂` gets `�` replacement characters. Debug by logging `chunk.length` and the last
+  bytes of each chunk; a chunk ending in a lead byte (0xC3, 0xF0) is the split.
+- **Await `'drain'` without the signal.** The bounded-buffer test passes, but with a client that stops
+  acknowledging, the loop hangs forever, holding the generator and its model call. The departed-client
+  test times out; pass `{ signal }` to `once`.
+- **Keep `pipe` and add a `dest.on("error")` handler.** The proxy promise now rejects cleanly, yet
+  `upstream.destroyed` stays `false`, which in production is a provider socket still streaming billed
+  tokens. Debug by counting open upstream sockets after client resets.
+- **Forget `_flush`.** A provider cut mid-event ends the stream "successfully" with a truncated answer.
+  The mid-event test catches it; the UI would show a half sentence with no error.
+
+### Submission
+- **Your `lab.ts`** with the three LAB steps done, and a passing `npx vitest run` (five tests).
+- **The `node lab.ts` output**, with the peak you measured and a line explaining why it is
+  `highWaterMark` plus about one line.
+- **A memory estimate** for 1,000 concurrent slow clients with your settings, using stages × threshold ×
+  concurrency.
+- **A note** (3-5 sentences) on where in a real agent server you would create the `AbortController` whose
+  signal `writeEvents` receives.
+- **Evaluated on:** tests passing, `pipeline` (not `pipe`) on the proxy path, and a memory estimate whose
+  arithmetic checks out.
 
 ## Why it exists
 - **Users should not wait for the whole answer.** An 800-token answer takes on the order of ten seconds at

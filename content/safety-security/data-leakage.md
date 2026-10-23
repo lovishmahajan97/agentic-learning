@@ -5,7 +5,8 @@ name: Data leakage
 kind: concept
 difficulty: core
 est_minutes: 17
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -160,6 +161,26 @@ flowchart TD
     A -->|"no"| X["Blocked"]
     A -->|"yes"| H["Host you control"]
 ```
+
+## Misconceptions
+- **"Data leakage means train/test leakage."** In an LLM app it means information escaping a
+  boundary: to the provider, another user, the weights, a trace store, or out through a tool call or
+  rendered link. Different problem, different controls.
+- **"The provider does not train on API data, so the prompt is safe."** Retention windows,
+  subprocessors and abuse logs still exist, and your own trace store, readable by every engineer, is
+  usually the bigger copy. Minimise and tokenise before the prompt is built.
+- **"No tools enabled means no exfiltration."** A completion containing a remote markdown image makes
+  the client issue a GET with whatever the model put in the query string, with no click. Turn off
+  remote image rendering or proxy it through an allow-list.
+- **"A secret in the system prompt is protected if I tell the model to keep it."** Extraction is a
+  routine jailbreak; treat everything in the context as readable by the user. Authority and secrets
+  belong server-side.
+- **"Embeddings are just numbers, so they are anonymised."** Inversion recovers most of the original
+  text from a sentence embedding (Morris et al., 2023). Give the vector store the source data's
+  classification and access control.
+- **"Better DLP regexes will catch it."** Base64, splitting or translation beats pattern matching, and
+  most sensitive data is not PII-shaped. Rank prevention and containment (egress allow-lists) above
+  detection, which mainly catches accidents.
 
 ## Examples
 ### An output and tool-call guard for the agent loop

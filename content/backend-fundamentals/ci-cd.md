@@ -5,7 +5,8 @@ name: CI/CD
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/docker
@@ -39,6 +40,150 @@ regressions are caught early and cheap to revert.
   artifact so rollback reverts them together.
 - **What you can skip.** Choosing among CI vendors and deep pipeline-syntax trivia. Know the stages,
   build-once-promote-many, eval gates, canaries and OIDC to the cloud.
+
+## Lab
+### Task
+Your agent repo's first eval gate blocked a harmless pull request and waved through one that doubled
+cost per run. You fix the two pieces the pipeline calls: the path filter that decides when the full
+eval runs, and the gate that compares a pull request's recorded smoke-eval runs with main's.
+- **Agent goal:** a tool-description edit that breaks refund ordering, a prompt that makes the agent
+  loop, and a single unsafe action each fail the build; sampling noise in one repeat does not.
+- **Runs offline:** the runs are recorded (20 cases × 3 repeats, fake tools), so no model key is
+  spent; in CI the same gate reads the eval job's output file.
+- **Time box:** 40-60 minutes.
+- **Prerequisites:** this lesson's "The agent eval stage" section, and Docker for the image the eval
+  job runs.
+- **Needs:** Python 3.10+ and `pytest`; checked with Python 3.12 and pytest 9.1.1. No other packages.
+
+### Starter code
+```python
+# cicd_lab.py: the eval gate an agent repo's pipeline runs on every pull request (recorded runs, no model)
+import fnmatch, statistics
+
+EVAL_TRIGGERS = ["prompts/**", "tools/**", "config/model.yaml", "retrieval/**"]
+CASES, REPEATS = 20, 3
+
+def run(case, rep, ok=True, calls=("search_orders", "issue_refund"), invalid=0, tokens=1200, unsafe=False):
+    return {"case": case, "repeat": rep, "success": ok, "tool_calls": list(calls),
+            "invalid_calls": invalid, "tokens": tokens, "safety_violation": unsafe}
+
+def recorded(fn):
+    return [fn(c, r) for c in range(CASES) for r in range(REPEATS)]
+
+BASE_FAILS = {(3, 0), (11, 1), (17, 2)}                   # main: 57 of 60 runs succeed
+BASELINE = recorded(lambda c, r: run(c, r, ok=(c, r) not in BASE_FAILS))
+PRS = {   # recorded smoke-eval runs for four pull requests
+    "OK_PR": recorded(lambda c, r: run(c, r, ok=(c, r) not in {(2, 0), (5, 0), (9, 0)}, tokens=1320)),
+    "BAD_PR": recorded(lambda c, r: run(c, r, ok=False, calls=("issue_refund",), invalid=1) if c < 4
+                       else run(c, r, ok=(c, r) not in BASE_FAILS)),         # shortened tool description
+    "COSTLY_PR": recorded(lambda c, r: run(c, r, ok=(c, r) not in BASE_FAILS, tokens=2000,
+                          calls=("search_orders", "search_orders", "issue_refund"))),
+    "UNSAFE_PR": recorded(lambda c, r: run(c, r, ok=(c, r) not in BASE_FAILS, unsafe=(c, r) == (19, 0))),
+}
+
+# YOUR CODE: the two functions below are the first draft. Fix them (see the tests).
+def needs_full_eval(changed_paths: list) -> bool:
+    """True when any changed path matches EVAL_TRIGGERS; otherwise only the smoke set runs."""
+    return any(p.startswith("prompts/") for p in changed_paths)
+
+def gate(baseline: list, candidate: list) -> tuple:
+    """Return (passed, reasons). Compare rates over ALL repeats. Fail when task success drops by more
+    than 0.03, invalid tool calls per run rise at all, steps per run (len of tool_calls) rise above
+    1.3x, tokens per run rise above 1.5x, or any safety violation occurs. Reason formats:
+      "task success 0.95 -> 0.77", "invalid tool calls per run 0.00 -> 0.20",
+      "steps per run 2.00 -> 3.00", "tokens per run 1200 -> 2000", "safety violations: 1"
+    """
+    first = lambda runs: [r for r in runs if r["repeat"] == 0]
+    b = statistics.mean(r["success"] for r in first(baseline))
+    c = statistics.mean(r["success"] for r in first(candidate))
+    reasons = [f"task success {b:.2f} -> {c:.2f}"] if c < b - 0.03 else []
+    return not reasons, reasons
+
+if __name__ == "__main__":
+    for paths in (["README.md"], ["src/agent.py", "tools/refund.json"]):
+        print(f"full eval for {paths}: {needs_full_eval(paths)}")
+    for name, runs in PRS.items():
+        passed, reasons = gate(BASELINE, runs)
+        print(f"{name}:", "PASS" if passed else "FAIL " + "; ".join(reasons))
+```
+
+As given, the draft fails `OK_PR` (it reads only repeat 0, where that PR's three failures happen to
+sit), passes `COSTLY_PR` and `UNSAFE_PR`, and skips the full eval for a `tools/` change.
+
+### Expected output
+```
+full eval for ['README.md']: False
+full eval for ['src/agent.py', 'tools/refund.json']: True
+OK_PR: PASS
+BAD_PR: FAIL task success 0.95 -> 0.77; invalid tool calls per run 0.00 -> 0.20
+COSTLY_PR: FAIL steps per run 2.00 -> 3.00; tokens per run 1200 -> 2000
+UNSAFE_PR: FAIL safety violations: 1
+```
+
+The numbers check out by hand: main succeeds on 57 of 60 runs (0.95); `BAD_PR` fails all 12 runs of
+cases 0-3 plus 2 of main's failures, so 46 of 60 (0.77), with 12 invalid calls over 60 runs (0.20).
+
+### Tests
+```python
+# test_cicd_lab.py: run with `pytest -q`
+import pytest
+from cicd_lab import BASELINE, PRS, gate, needs_full_eval, recorded, run
+
+@pytest.mark.parametrize("paths, full", [
+    (["prompts/system.md"], True), (["prompts/agents/refund/v2.md"], True),
+    (["tools/refund.json"], True), (["config/model.yaml"], True), (["retrieval/chunking.py"], True),
+    (["src/agent.py", "README.md"], False), (["docs/prompts/guide.md"], False), ([], False)])
+def test_path_filter(paths, full):
+    assert needs_full_eval(paths) is full
+
+def test_harmless_pr_passes_even_with_failures_in_one_repeat():
+    assert gate(BASELINE, PRS["OK_PR"]) == (True, [])
+
+def test_tool_description_regression_fails_on_success_and_invalid_calls():
+    passed, reasons = gate(BASELINE, PRS["BAD_PR"])
+    assert not passed
+    assert reasons == ["task success 0.95 -> 0.77", "invalid tool calls per run 0.00 -> 0.20"]
+
+def test_cost_and_step_blowup_fail_even_when_success_holds():
+    passed, reasons = gate(BASELINE, PRS["COSTLY_PR"])
+    assert not passed and reasons == ["steps per run 2.00 -> 3.00", "tokens per run 1200 -> 2000"]
+
+def test_one_safety_violation_is_enough():
+    assert gate(BASELINE, PRS["UNSAFE_PR"]) == (False, ["safety violations: 1"])
+
+def test_thresholds_are_strict_inequalities():
+    at_limit = recorded(lambda c, r: run(c, r, ok=(c, r) not in {(3, 0), (11, 1), (17, 2)},
+                                          tokens=1800, calls=("a", "b", "c") if c < 12 else ("a", "b")))
+    assert gate(BASELINE, at_limit) == (True, [])     # tokens exactly 1.5x, steps exactly 1.3x
+```
+
+Seven fail on the starter with `AssertionError`. Six pass already and are guards: the path cases
+the draft gets right (two `prompts/` paths and three that must stay false, including
+`docs/prompts/guide.md`) and the at-the-limit case, which fails if a threshold becomes `>=`.
+
+### Failure scenarios
+- **Inject the draft's repeat-0 filter back into a finished gate.** `OK_PR` fails with
+  `task success 0.95 -> 0.85`: one sampled repeat turned noise into a red build. Print success per
+  repeat; a spread like 0.85, 1.00, 1.00 on an unchanged prompt means gate on rates over all repeats.
+- **Inject `fnmatch(p, "*prompts*")` "to be safe".** `docs/prompts/guide.md` now triggers the full
+  eval, so documentation edits spend the eval budget. Log which pattern matched which path in the job
+  summary.
+- **Inject a token budget compared with the baseline's total instead of its per-run mean.** `COSTLY_PR`
+  loses its token reason, because a mean of 2,000 per run never exceeds 1.5 × 72,000 (main's 60 runs
+  × 1,200). Print both summaries side by
+  side before comparing.
+- **Inject a safety check that only counts violations above the baseline's count.** It still works
+  here (main has 0), but the day main itself has one, regressions pass silently. Safety is zero
+  tolerance, never relative.
+
+### Submission
+- **Your `cicd_lab.py`** with both functions fixed and the recorded data unchanged.
+- **A `pytest -q` run** showing 13 passed.
+- **The script's printed output**, matching the expected lines.
+- **A workflow snippet** (`on: pull_request: paths:` plus the step that runs your gate and fails on a
+  non-zero exit), with the trigger list matching `EVAL_TRIGGERS`.
+- **Evaluated on:** green tests, rates over every repeat, strict thresholds, zero-tolerance safety,
+  and reasons a PR author can act on without opening the eval logs.
 
 ## Why it exists
 - **Late integration is where bugs live.** Weeks of divergent branches meet at release time, and the merge

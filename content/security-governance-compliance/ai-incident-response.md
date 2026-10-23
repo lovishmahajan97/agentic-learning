@@ -5,7 +5,8 @@ name: AI incident response
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - security-governance-compliance/audit-trails
@@ -39,6 +40,63 @@ per-tool kill switches, because they stay "up" while doing harm.
   rate over many runs.
 - **What you can skip.** Writing your own severity framework from scratch. Reuse the SRE process (severity,
   incident commander, postmortem) and add the AI-specific detection, levers, evidence and people.
+
+## Decision case
+### Scenario
+A SaaS vendor runs a support agent for 200 tenants. At 14:00 the action-signal alert fires: `send_email`
+calls to domains outside each tenant's customer list jumped from near zero to 40 in an hour, all from 3
+tenants. Traces show an instruction hidden in pasted ticket text. All figures are illustrative.
+- **Volume:** 60,000 agent runs a day; 10% call `send_email`, so 6,000 emails a day, about 250 an hour.
+- **Levers already built:** flags per tool and tenant in the tool executor, and a degraded mode that
+  answers in chat and queues follow-ups for a person.
+- **Constraints:**
+  - the emails may contain personal data, so the GDPR 72-hour clock may already be running;
+  - the human team can absorb about 1,500 extra follow-ups a day;
+  - nobody yet knows whether the same text sits in other tenants' tickets;
+  - legal wants the evidence preserved before anything changes.
+
+### Options
+| Option | How it works | Stops the harm? | Extra human load | Function lost |
+|---|---|---|---|---|
+| **A. Agent off everywhere** | global flag routes all 60,000 runs a day to people | yes | about 2,500 an hour: far over 1,500 a day | everything |
+| **B. `send_email` off for all tenants** | tool flag `("send_email", "*")`; the agent answers in chat, emails queue | yes, for every tenant | 250 an hour: 1,500 reached after 6 hours | outbound email only |
+| **C. `send_email` off for the 3 tenants** | per-tenant flags | only where the injection is already seen | if the 3 tenants carry 4% of traffic, about 240 a day | outbound email in 3 tenants |
+| **D. Tighten the injection detector** | lower the classifier threshold, keep all tools on | unknown: probabilistic against an adaptive attacker | none | none |
+
+### Decision
+Choose **B now, then narrow to C once scope is known**, because B is the narrowest lever that *certainly*
+stops the harm while the spread is unknown.
+- **Certainty:** C assumes the injection is limited to 3 tenants, which nobody has checked; D bets on a
+  detector the attacker already beat.
+- **Load:** B queues about 250 emails an hour, so the team has a 6-hour window (1,500 ÷ 250) to finish
+  scoping; A breaks the human queue in minutes.
+- **Order:** snapshot the prompt, config, tool list and model ID first, page legal and privacy at triage,
+  then flip the flag.
+- **Narrowing:** query the audit trail for runs whose retrieved ticket text contains the injected string
+  across all 200 tenants. If only the 3 tenants match, re-enable `send_email` for the other 197 and keep
+  it off for the 3.
+
+**What would change it:**
+- **The scope query takes longer than 6 hours:** the queue overruns; add staff or auto-send a holding
+  reply in chat.
+- **Matches in many tenants:** keep B and fix before re-enabling anywhere.
+- **The injected text also drives `issue_refund`:** disable that tool too; money moves faster than email.
+
+### Trade-offs accepted
+- **197 tenants lose email for hours** that may turn out to be unaffected. Track the time from flag flip
+  to narrowing as an incident metric.
+- **Re-enabling needs evidence, not one clean run.** Before the 3 tenants get email back, re-run the
+  injected tickets: 300 clean runs bound the rate below about 1% (rule of three).
+- **Notification depends on the 40 emails' content.** Read the logged bodies to count the people whose data
+  left; legal decides on the 72-hour report from that number, not from the scope estimate.
+
+### Review rubric
+- **Containment comes before diagnosis**, and evidence is snapshotted before the first change.
+- **The chosen lever is justified by certainty under unknown scope**, not only by how little it breaks.
+- **Human load from the degraded mode is computed** against capacity, with a time window stated.
+- **A concrete query narrows scope** from the audit trail, with the condition that triggers narrowing.
+- **Legal clocks are started at triage**, and notification is tied to counted affected people.
+- **Re-enabling has a verification bar** sized as a failure rate over many runs.
 
 ## Why it exists
 - **Many AI incidents trip no standard alert.** A support assistant quoting a wrong refund policy returns

@@ -5,7 +5,8 @@ name: Data profiling & quality assessment
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - enterprise-integration/data-onboarding
@@ -37,6 +38,61 @@ blocking, and findings become checks on every load.
   real missing values, near-duplicate collapse before indexing, and load-time expectations that stop a bad
   batch reaching the agent.
 - **What you can skip.** Full data-quality frameworks for fields no tool, filter or prompt ever reads.
+
+## Decision case
+### Scenario
+A claims agent for an insurer will read 4 million claim rows across 8 regions through `get_claim`, and
+search their free-text adjuster notes. You have one week to profile before mapping starts. All figures
+are illustrative.
+
+- **Detection bar:** any defect affecting at least 0.1% of a region's rows must be found with at least
+  95% probability, because the agent serves each region separately.
+- **Access:** read-only queries on a replica, allowed at night; full-table aggregates are fine there.
+- **Privacy:** free-text notes may hold undeclared identifiers; nothing leaves the customer's region.
+- **People:** the claims operations lead can give 6 hours to check accuracy.
+- **Expensive checks:** the identifier scan and near-duplicate detection on notes run on a sample only.
+
+### Options
+| Option | How it works | Per-region detection at 0.1% | Accuracy evidence | Fits the week |
+|---|---|---|---|---|
+| A. One random sample | 2,000 rows overall, every metric on the sample | about 250 rows per region: 1 − 0.999^250 ≈ 22% | none | yes |
+| B. Big stratified sample for everything | 5,000 rows per region (40,000), every metric on the sample | 1 − 0.999^5000 ≈ 99.3% | none | no: expensive checks on 40,000 notes |
+| C. Hybrid | Cheap metrics on the full table per region; 3,000 rows per region for expensive checks; 100 records for SME accuracy | full table: every defect seen; sample: 1 − 0.999^3000 ≈ 95.0% | 100 records checked | yes |
+| D. Skip profiling, use agent evals | Load everything and read failures off the eval scores | depends on eval coverage | indirect | yes, but failures look like model problems |
+
+### Decision
+Choose **C**, because it meets the 95% bar for every region at the lowest sample size and spends the
+SME's time only on accuracy, which no query can measure.
+- **Cheap metrics see everything.** Null and placeholder rates, top values, format patterns and key
+  uniqueness run as SQL aggregates over all 4 million rows at night, so there is no sampling risk for
+  them.
+- **The sample meets the bar exactly.** 3,000 rows per region gives about 95.0% detection at 0.1%, and a
+  clean slice puts the 95% upper bound at 3 / 3,000 = 0.1% (rule of three).
+- **SME time fits:** 100 records at about 3 minutes each is 300 minutes, 5 of the 6 hours.
+- **Findings feed the agent:** placeholders become explicit nulls in `get_claim` results, and the eval
+  set mirrors the 8 regions.
+
+**What would change it.**
+- **No replica access:** move every metric onto the sample and raise it to 5,000 per region (99.3%).
+- **Defects that matter at 0.01%:** no practical sample finds them reliably, so they need full-table
+  checks or a source-side fix.
+- **One region in scope:** profile that region only, at the same per-slice size.
+
+### Trade-offs accepted
+- **Two code paths for profiling** (SQL aggregates and sample checks). Both write one report, sliced by
+  region.
+- **Rare text defects can slip through.** A defect at 0.05% is found only about 78% of the time
+  (1 − 0.9995^3000); watch quarantine and null-rate checks on every load.
+- **100 records is a small accuracy check.** It catches systematic errors, not rare ones; the golden set
+  grows during the pilot.
+- **Night-only queries slow iteration.** Batch the queries and run them as one job per night.
+
+### Review rubric
+- **The sample size is derived from a stated defect rate and probability,** per slice, not overall.
+- **Cheap and expensive checks are separated,** with full-table metrics where access allows.
+- **Accuracy has a human check** with a budget in hours.
+- **Each finding gets a class and an owner:** acceptable, pipeline fix, source fix or blocking.
+- **Findings become load-time expectations** that stop a bad batch reaching the agent's index.
 
 ## Why it exists
 - **Schemas and documentation hide the quirks.** A column called `resolution_notes` is a text field; the

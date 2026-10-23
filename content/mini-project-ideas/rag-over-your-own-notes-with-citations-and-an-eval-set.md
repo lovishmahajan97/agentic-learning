@@ -5,7 +5,8 @@ name: RAG over your own notes with citations and an eval set
 kind: practice
 difficulty: core
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - rag-retrieval/chunking-strategies
@@ -34,6 +35,156 @@ the system with a 30-50 question eval set. It proves you can measure retrieval a
 - **Why it matters for agents.** A retrieval tool is the most common tool an agent calls; if you cannot tell
   whether it returned the right chunk, you cannot debug the agent above it.
 - **What you can skip.** A hosted vector database and a web UI. NumPy over a few thousand chunks is enough.
+
+## Lab
+### Task
+Build the measurement layer of the notes RAG: reciprocal rank fusion, recall@k and MRR at note level, a
+citation validator and refusal scoring, then show on a small golden set that hybrid search fixes misses that
+dense and BM25 each make alone. Time box: 45-60 min.
+- **Prerequisites:** Hybrid search; Retrieval evaluation; Citation correctness; Golden datasets.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.12, pytest 9.1). Save the starter
+  as `lab.py` and the tests as `test_lab.py`.
+- **Recorded rankings:** `DENSE` and `SPARSE` hold top-5 chunk ids as a dense retriever and BM25 returned
+  them, so no embedding model download is needed. Swap in the `search` function from Examples later.
+
+### Starter code
+```python
+"""Lab: hybrid fusion, retrieval metrics and citation checks for notes RAG. Run: python lab.py"""
+import re
+
+# Recorded top-5 rankings (chunk ids) from a dense retriever and from BM25 for each golden question,
+# so the lab runs without downloading an embedding model. Chunk ids are "<note path>#<heading slug>".
+DENSE = {
+    "When do we ship?": ["deploy.md#deploys", "deploy.md#rollback", "oncall.md#rotation", "db.md#backups", "db.md#restore"],
+    "How do I undo a bad deploy?": ["db.md#restore", "oncall.md#rotation", "db.md#backups", "deploy.md#rollback", "deploy.md#deploys"],
+    "What time do postgres backups run?": ["oncall.md#rotation", "deploy.md#deploys", "deploy.md#rollback", "db.md#backups", "db.md#restore"],
+    "When does the pager rotate?": ["oncall.md#rotation", "deploy.md#deploys", "db.md#backups", "deploy.md#rollback", "db.md#restore"],
+    "What is our vacation policy?": ["oncall.md#rotation", "deploy.md#deploys", "db.md#backups", "db.md#restore", "deploy.md#rollback"],
+}
+SPARSE = {
+    "When do we ship?": ["oncall.md#rotation", "db.md#backups", "db.md#restore", "deploy.md#rollback", "deploy.md#deploys"],
+    "How do I undo a bad deploy?": ["deploy.md#rollback", "deploy.md#deploys", "db.md#restore", "db.md#backups", "oncall.md#rotation"],
+    "What time do postgres backups run?": ["db.md#backups", "db.md#restore", "deploy.md#deploys", "oncall.md#rotation", "deploy.md#rollback"],
+    "When does the pager rotate?": ["db.md#backups", "deploy.md#deploys", "deploy.md#rollback", "oncall.md#rotation", "db.md#restore"],
+    "What is our vacation policy?": ["db.md#restore", "db.md#backups", "deploy.md#deploys", "deploy.md#rollback", "oncall.md#rotation"],
+}
+GOLD = [
+    {"question": "When do we ship?", "expected_sources": ["deploy.md"]},
+    {"question": "How do I undo a bad deploy?", "expected_sources": ["deploy.md"]},
+    {"question": "What time do postgres backups run?", "expected_sources": ["db.md"]},
+    {"question": "When does the pager rotate?", "expected_sources": ["oncall.md"]},
+    {"question": "What is our vacation policy?", "expected_sources": []},       # unanswerable
+]
+REFUSAL = "Not in my notes."
+
+def rrf_fuse(rankings: list[list[str]], k: int = 60, top: int = 5) -> list[str]:
+    # YOUR CODE HERE: reciprocal rank fusion. Each id scores sum(1 / (k + rank + 1)) over the
+    # rankings it appears in (rank is 0-based). Return the `top` ids by score, ties broken by id.
+    raise NotImplementedError
+
+def recall_at_k(ranked: list[str], expected_sources: list[str], k: int) -> float:
+    # YOUR CODE HERE: 1.0 if any of the first k chunk ids comes from an expected note path, else 0.0
+    raise NotImplementedError
+
+def reciprocal_rank(ranked: list[str], expected_sources: list[str]) -> float:
+    # YOUR CODE HERE: 1 / (1-based rank of the first chunk from an expected note), 0.0 if none
+    raise NotImplementedError
+
+def citations_valid(answer: str, n_hits: int) -> bool:
+    # YOUR CODE HERE: True only if the answer cites at least one [n] and every n is in 1..n_hits
+    raise NotImplementedError
+
+def refusal_correct(answer: str, answerable: bool) -> bool:
+    # YOUR CODE HERE: an unanswerable question must get REFUSAL; an answerable one must not
+    raise NotImplementedError
+
+def report(k: int = 3) -> dict:
+    answerable = [g for g in GOLD if g["expected_sources"]]
+    out = {}
+    for name, ranks in (("dense", lambda q: DENSE[q]), ("bm25", lambda q: SPARSE[q]),
+                        ("hybrid", lambda q: rrf_fuse([DENSE[q], SPARSE[q]]))):
+        rec = sum(recall_at_k(ranks(g["question"]), g["expected_sources"], k) for g in answerable)
+        mrr = sum(reciprocal_rank(ranks(g["question"]), g["expected_sources"]) for g in answerable)
+        out[name] = (round(rec / len(answerable), 2), round(mrr / len(answerable), 2))
+    return out
+
+if __name__ == "__main__":
+    for name, (rec, mrr) in report(k=3).items():
+        print(f"{name:<7} recall@3={rec:.2f} mrr={mrr:.2f}")
+    print(rrf_fuse([DENSE["How do I undo a bad deploy?"], SPARSE["How do I undo a bad deploy?"]], top=3))
+    print(citations_valid("Deploys run on Fridays [1]. Roll back within 10 minutes [2].", 3),
+          citations_valid("Deploys run on Fridays [4].", 3), refusal_correct(REFUSAL, answerable=False))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly the lines below. Hybrid lifts recall@3 from 0.50 to
+1.00 but its MRR is lower than either retriever alone: fusion pulls each hit into the top 3 without always
+putting it first. Recall and rank quality are separate numbers, so report both.
+
+```
+dense   recall@3=0.50 mrr=0.62
+bm25    recall@3=0.50 mrr=0.62
+hybrid  recall@3=1.00 mrr=0.58
+['db.md#restore', 'deploy.md#rollback', 'deploy.md#deploys']
+True False True
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution passes
+all 5.
+
+```python
+import pytest
+from lab import (REFUSAL, citations_valid, recall_at_k, reciprocal_rank, refusal_correct, report,
+                 rrf_fuse)
+
+def test_rrf_rewards_agreement_and_breaks_ties_by_id():
+    assert rrf_fuse([["a", "b", "c"], ["b", "c", "a"]], top=3) == ["b", "a", "c"]
+    assert rrf_fuse([["x"], ["y"]], top=2) == ["x", "y"]                    # equal scores: by id
+    assert rrf_fuse([["a", "b"], ["c"]], k=60, top=1) == ["a"]
+
+def test_recall_and_rr_match_on_note_path_not_chunk():
+    ranked = ["db.md#restore", "deploy.md#rollback", "deploy.md#deploys"]
+    assert recall_at_k(ranked, ["deploy.md"], k=1) == 0.0
+    assert recall_at_k(ranked, ["deploy.md"], k=2) == 1.0
+    assert reciprocal_rank(ranked, ["deploy.md"]) == pytest.approx(0.5)
+    assert reciprocal_rank(ranked, ["oncall.md"]) == 0.0
+
+def test_citation_validator_rejects_out_of_range_and_uncited():
+    assert citations_valid("Fridays [1]. Ten minutes [2].", 2)
+    assert not citations_valid("Fridays [3].", 2)
+    assert not citations_valid("Fridays [0].", 2)
+    assert not citations_valid("Fridays, trust me.", 2)
+
+def test_refusal_scoring_both_ways():
+    assert refusal_correct(REFUSAL, answerable=False)
+    assert not refusal_correct(REFUSAL, answerable=True)
+    assert not refusal_correct("We get 25 days [1].", answerable=False)
+
+def test_report_shows_hybrid_fixes_recall():
+    r = report(k=3)
+    assert r["dense"] == (0.5, 0.62) and r["bm25"] == (0.5, 0.62)
+    assert r["hybrid"] == (1.0, 0.58)
+```
+
+### Failure scenarios
+- **Drop the `+ 1` in RRF** (`1 / (k + rank)` with a 0-based rank). The order barely moves, so these tests
+  can still pass; add a test on a hand-computed score: the top item at `k=60` must score `1/61`.
+- **Compare full chunk ids with note paths.** Every recall is 0.0 because `deploy.md#rollback` never equals
+  `deploy.md`. Print one ranked id beside its expected source; split on `#` before matching.
+- **Count the unanswerable question in recall.** The denominator becomes 5 and every recall drops by a fifth.
+  Score unanswerable questions only with `refusal_correct`, and report the two subsets separately.
+- **Accept `[0]` or uncited answers as valid.** A model that cites nothing or an off-by-one index looks
+  grounded. Log the parsed citation set per answer and fail on empty sets.
+
+### Submission
+- **`lab.py`** with every `YOUR CODE HERE` part implemented and the recorded rankings unchanged.
+- **A green test run** (5 passed) and the output of `python lab.py`.
+- **A rerun on your own notes:** replace `DENSE` and `SPARSE` with live `search` results on 10 questions and
+  paste the three-row table.
+- **A short note:** one question where hybrid hurt rank and why, in two or three sentences.
+- **Evaluated on:** tests passing, note-level matching, refusals scored apart from recall, and both recall
+  and MRR reported.
 
 ## Why it exists
 - **Demos hide retrieval failures.** A RAG demo answers the five questions its author tried. An eval set of

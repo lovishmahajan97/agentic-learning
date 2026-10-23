@@ -5,7 +5,8 @@ name: Feature-request triage
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - customer-data-evaluation/feedback-loops-to-product
@@ -33,6 +34,60 @@ score, route, and tell the requester.
   trial before calling anything a product gap, and keeping ARR out of the score.
 - **What you can skip.** Roadmap-planning frameworks beyond RICE; the scoring is a ranking aid, and the
   routing is where agent teams win or lose time.
+
+## Decision case
+### Scenario
+A vendor runs one claims-agent platform for 14 customers with about $8,000k ARR. MegaCorp ($2,000k, 25%
+of ARR) says its renewal in 12 weeks depends on a multi-level approval chain: payouts above a threshold
+need two approvers from named departments. All figures are illustrative.
+- **Triage so far:** a product gap (approval chains are common in the segment), but only MegaCorp has
+  asked. With the team's estimates it scores RICE 1 × 2 × 0.8 ÷ 3 ≈ 0.53, against 1.60 for page-level
+  citations, which three accounts want.
+- **Product capacity:** 3 unallocated engineer-weeks this quarter, enough for one of the two.
+- **Platform rule:** one codebase with weekly releases; no customer forks.
+- **Extension point:** the approval gate can call a customer-hosted approval tool through the supported
+  tool interface.
+- **Field team:** 2 FDEs; neither can promise roadmap dates.
+
+### Options
+| Option | How it works | Renewal in 12 weeks | Platform rule | Roadmap fairness |
+|---|---|---|---|---|
+| Field fork | FDEs patch the gate for MegaCorp, about 3 FDE-weeks | yes | breaks it: an upgrade tax every weekly release | unaffected now, costly later |
+| Extension-point build | MegaCorp's chain runs in their workflow system; the gate calls it as an approval tool, about 2 FDE-weeks | yes | keeps it | citations keep the product slot |
+| Product commitment now | build general approval chains in core, 3 engineer-weeks | yes, if started now | keeps it | displaces a 1.60 cluster for a 0.53 one |
+| Decline with workaround | approvers forward cases by hand | at risk | keeps it | fair, but churn risk on 25% of ARR |
+
+### Decision
+**Build on the extension point now, and log approval chains as a product gap with ARR in its own
+column.** It meets the renewal date without a fork and without letting one account take the only product
+slot by arithmetic nobody chose.
+- **Product owner decides openly:** the backlog shows RICE 0.53 next to $2,000k and RICE 1.60 next to
+  $770k, so favouring MegaCorp, if chosen, is a written decision.
+- **Recurrence rule:** the build goes in the extension register. If two more accounts ask, reach becomes
+  3 and RICE rises to 3 × 2 × 0.8 ÷ 3 = 1.60, a tie with citations, which triggers a productization
+  proposal.
+- **What MegaCorp hears:** what will ship, when, and that core support is under review, with no date.
+
+**What would change it.** If the gate had no supported hook, the real choice is fork or product slot,
+and the product owner must make it with ARR visible. If MegaCorp's chain needs agent reasoning, not just
+a routing rule, trial it on real payouts first; it may be a capability limit.
+
+### Trade-offs accepted
+- **A customer-specific tool to maintain.** Track it in the extension register with an owner, and test
+  it in MegaCorp's suite on every release.
+- **Two approval paths in the field.** Watch approval latency and rejection rate per path, so the
+  external chain does not hide a slow or failing step.
+- **MegaCorp may still want it in core.** Log every further ask from any account into the same cluster,
+  so reach grows from evidence.
+- **Some goodwill lost by not promising a date.** Close the loop in writing within a week of the request.
+
+### Review rubric
+- **Ask classified before solutioning,** with the trace or trial evidence for the type.
+- **RICE recomputed and ARR kept separate,** with both shown for every competing cluster.
+- **Every option checked against the platform rule,** including the upgrade cost of a fork.
+- **Extension point named,** or its absence stated as the reason the decision escalates.
+- **Requester reply drafted:** what ships, when, and what is not promised.
+- **Flip conditions named:** the reach or capability evidence that would change the route.
 
 ## Why it exists
 - **Asks arrive constantly.** In workshops, in Slack, from the sponsor, and from end users during

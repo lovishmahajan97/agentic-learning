@@ -5,7 +5,8 @@ name: Multi-agent patterns (orchestrator-worker, handoffs)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -171,6 +172,26 @@ flowchart TD
     W2 -->|"structured findings"| O
     O -->|"synthesis"| TE
 ```
+
+## Misconceptions
+- **"Several smaller agents are cheaper than one big one, since each context is smaller."** Parallelism
+  improves, not the token count: each worker re-reads its own growing context, and the system does more
+  work. One vendor's research write-up reports about 15x the tokens of a chat turn for its multi-agent
+  system versus about 4x for a single agent.
+- **"Multi-agent is the more advanced, therefore better, architecture."** Split only when one loop's
+  context, tool list or permissions break. Every boundary loses context and adds coordination bugs, so one
+  good agent is the default.
+- **"Workers should send back their full transcript so nothing is lost."** That floods the orchestrator
+  with search noise. Return a structured result, with a reference plus summary for bulky artifacts, and
+  keep the orchestrator's context small.
+- **"Agents can coordinate by chatting as peers."** Without one owner of the plan, budget and stopping
+  rule, peer systems loop, duplicate work and never finish. An orchestrator, or a capped handoff chain,
+  owns termination.
+- **"A handoff and an agent-as-tool are interchangeable."** They differ in who owns the next user-facing
+  turn: an agent-as-tool returns a result and the caller continues; a handoff gives the specialist the
+  conversation and does not come back unless it transfers again.
+- **"Splitting agents is only about quality."** It is also a security boundary: if `issue_refund` is not
+  in the tech agent's tool list, an injection during a bug investigation cannot trigger a refund.
 
 ## Examples
 ### Minimal handoff runtime

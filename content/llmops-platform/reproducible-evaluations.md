@@ -5,7 +5,8 @@ name: Reproducible evaluations
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - llmops-platform/experiment-tracking
@@ -38,6 +39,72 @@ unpinned comparisons across weeks compare two different agents.
   runs.
 - **What you can skip.** Chasing bit-exact agent runs through a hosted API. Aim for statistical
   reproduction and a re-derivable manifest.
+
+## Decision case
+### Scenario
+A consultancy sells a research agent to regulated clients. The agent calls a live web-search tool, keeps
+long-term memory, and runs on a hosted model at temperature 0.7. Each month the team decides whether to
+adopt a new model snapshot. Clients' auditors now ask for evidence they could re-derive.
+
+Facts and constraints, with illustrative figures:
+- **Task set.** 200 labelled tasks; no labelling capacity for more this quarter.
+- **Resolution.** The product owner's threshold is a 7-point change in task success; smaller moves are
+  not acted on.
+- **Budget.** 1,500 agent task runs a month for evaluation (about 10 model calls each).
+- **Measured noise.** Five repeats of the champion on 60 tasks spread 8 points with nothing changed
+  (the noise-floor scenario below).
+- **Flip rate.** About 25% of tasks change verdict between two single runs of different snapshots.
+  With the paired rule, one run per arm on 200 tasks gives a half-width of
+  1.96 × √(0.25 / 200) ≈ ±6.9 points.
+- **Evidence.** Each upgrade decision must be re-derivable from a stored manifest for the client's
+  retention period.
+
+### Options
+| Option | How it works | Runs a month | Resolves 7 points? | Re-derivable? |
+|---|---|---|---|---|
+| **A. Single run vs last month's baseline** | Temperature 0, live tools, cached, baseline from a month ago | 200 | No: two systems a month apart, at a temperature production does not use | No: live tools and an old baseline |
+| **B. Fresh paired single runs** | Champion and candidate re-run now on identical tasks, replayed tools, production temperature | 400 + 200 sentinel = 600 | Barely: ±6.9, and no measured floor | Yes, with a manifest |
+| **C. Paired, 3 repeats, frozen world, sentinel** | B plus 3 repeats per task, fixed clock, fresh memory per task, a complete manifest, and a weekly cache-off sentinel on 50 tasks | 1,200 + 200 = 1,400 | Yes: averaging repeats per task makes the interval no wider than B's and usually narrower; the bootstrap computes it from the runs | Yes |
+| **D. Bit-exact on self-hosted weights** | Deterministic kernels on an open-weight model | Varies | Measures a model that is not shipped | Yes, for the wrong system |
+
+The sentinel is 50 tasks × 4 weeks = 200 runs a month.
+
+### Decision
+Choose **C**:
+- **A and D measure the wrong thing.** A compares two systems a month apart, at a temperature production does
+  not use; D is bit-exact for a model clients never get.
+- **B is at the edge.** Its ±6.9-point half-width is just inside the 7-point threshold, with no margin
+  and no measured noise floor to check it against.
+- **C fits the budget:** 1,400 of 1,500 runs. Repeats tame generation noise, and the 8-point spread on
+  single runs is exactly what they address.
+- **The frozen world is what makes it re-derivable.** Replayed search results, a fixed clock and fresh
+  memory per task, with their hashes in the manifest, let an auditor re-run the decision.
+- **The sentinel separates provider drift from candidate effects** before a snapshot is blamed.
+
+What would change it:
+- **A smaller threshold.** Resolving 3 points needs more tasks, not repeats: about
+  1.96² × 0.25 / 0.03² ≈ 1,067 tasks. Repeats cannot shrink item-sampling noise.
+- **A measured floor near zero.** If repeats show almost no spread (say, a locally pinned model with
+  deterministic scorers), drop to one run and spend the budget on more tasks.
+- **Search freshness becomes the product.** Add a live-tool check outside the gate, because replay
+  cannot see it.
+
+### Trade-offs accepted
+- **Three times the cost of B.** Watch the per-metric noise floor; when it narrows, cut repeats.
+- **Replay freezes the web.** Watch replay misses per run, which mean the agent asked something new.
+- **Re-baselining on every deprecation.** Watch days left on the pinned snapshot.
+- **The sentinel cannot use the cache,** so it is the one run that stays expensive. Watch sentinel drift
+  events per quarter.
+
+### Review rubric
+- **The reproducibility level is chosen deliberately** (bit-exact, statistical or re-derivable) and tied
+  to what the evidence is for.
+- **Generation noise and item-sampling noise are separated,** with the remedy for each named.
+- **Interval widths are computed** from task count and flip rate and compared with the decision
+  threshold.
+- **Every runtime input is frozen or recorded:** tools, clock and memory, with hashes in the manifest.
+- **Drift outside the manifest has a detector,** such as a cache-off sentinel with a cadence.
+- **Reversal conditions are quantified,** such as the task count a smaller threshold would need.
 
 ## Why it exists
 - **Almost nothing holds still by default.** "Did the prompt change help?" needs everything else fixed. The

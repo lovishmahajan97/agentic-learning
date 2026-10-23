@@ -5,7 +5,8 @@ name: Knowledge management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - data-architecture/document-processing-pipelines
@@ -35,6 +36,76 @@ among correct candidates; many "hallucination" reports trace here, not to the mo
   tools instead of the index, and where failures get routed.
 - **What you can skip.** Library-science taxonomy theory and full enterprise content-management
   programmes. A small required metadata schema, a glossary and an owner per source cover most of it.
+
+## Decision case
+### Scenario
+You are the FDE on an internal IT and HR helpdesk agent for a 3,000-person company. It searches policy and
+how-to content and can open tickets. Three sources (figures illustrative):
+
+| Source | Size | Owner | Lifecycle signal |
+|---|---|---|---|
+| Service-desk knowledge base | 1,500 articles | IT service desk | draft, published, retired states |
+| Confluence spaces | 8,000 pages, 7 years old | 12 teams, many unowned | none today |
+| SharePoint HR site | 2,000 pages | HR | none; strict access groups |
+
+A first prototype that indexes everything scores 61% (122 of 200) on the eval set the helpdesk leads wrote.
+
+Constraints:
+- **Deadline.** A pilot for 400 staff in 6 weeks, gated at 80% (160 of 200) correct.
+- **Owner time.** Five content teams can give 4 hours each, 20 hours in total.
+- **Labelling rate.** About 250 pages per hour for a quick "current, deprecated or archive" pass.
+- **Access.** HR pages must never reach a user outside their access groups.
+- **Team.** Two engineers; no model change is budgeted.
+- **Coverage.** The knowledge base alone answers 110 of the 200 eval questions (55%).
+
+### Options
+| Option | How it works | Meets 80% gate? | Owner hours | Deadline | HR access |
+|---|---|---|---|---|---|
+| **A. Index everything, tune the reranker** | All 11,500 documents, no lifecycle or authority | Unlikely: the prototype is at 61% and failures are content-caused | 0 | Yes | Only if ACLs are added anyway |
+| **B. Canonical-only corpus** | Index only the 1,500 knowledge-base articles | No: ceiling of 55% coverage | 0 | Yes | Safe, HR content absent |
+| **C. Full governance first** | Owners, cadence and labels on all 10,000 Confluence and SharePoint pages | Possibly | 10,000 / 250 = 40 h | No: 2x the available hours | Safe |
+| **D. Tiered corpus** | KB `authority=1`; others `authority=2`; owners label the most-retrieved pages; unlabelled pages demoted | Plausible; checked by the eval | 20 h covers 5,000 pages | Yes | ACLs required at ingestion |
+
+### Decision
+Choose **D**, the tiered corpus:
+- **It is the only option inside both the owner budget and the deadline that can clear the ceiling.**
+  B cannot pass 55%, and C needs 40 hours against 20.
+- **Owner time goes where retrieval goes.** Rank Confluence and SharePoint pages by how often the prototype
+  retrieved them on eval and shadow queries, and spend the 20 hours on the top 5,000. The long tail rarely
+  reaches the top five.
+- **The knowledge base wins conflicts.** It already has owners and lifecycle states, so ingestion reads
+  them and gives it `authority=1`.
+- **Values become tools.** Ticket status and laptop entitlements come from the service-desk API, not chunks.
+- **HR access is a required field.** Documents without an ACL are rejected, and the search tool filters on
+  the calling user's groups.
+- **Failure triage first.** Before labelling, classify the 78 prototype failures by cause, so the eval
+  shows which bucket each fix should move.
+
+What would change it:
+- **Failure analysis shows mostly retrieval or generation errors.** Then content work will not reach 80%,
+  and a retriever or model change comes first.
+- **The pilot moves out by a month.** Then C becomes affordable over two cycles and removes the demoted tail.
+- **The knowledge base covers 80% or more of questions.** Then B is simpler and safer.
+
+### Trade-offs accepted
+- **An unlabelled tail of about 5,000 pages.** Some stale pages stay searchable at `authority=2`; watch
+  deprecated or unlabelled pages that appear in cited chunks, and route them to owners weekly.
+- **Secondary context loses on conflict.** A thin KB article can beat a richer Confluence page; watch eval
+  misses where the right answer was ranked second.
+- **Rejected documents.** Strict required metadata keeps some useful pages out; watch rejection rate per
+  source and fix connectors rather than defaulting fields.
+- **A standing cost.** Owners must keep reviewing; watch median `last_verified_at` of cited chunks.
+
+### Review rubric
+- **Failures are classified before fixes.** The write-up breaks prototype failures into missing, stale,
+  duplicate, access, retrieval and generation, with counts.
+- **Canonical sources are named per class of question,** with an `authority` field the reranker uses.
+- **Owner time is budgeted with arithmetic.** It computes hours from pages and labelling rate and shows the
+  plan fits.
+- **Volatile values are routed to live tools,** each named, with an eval case checking the tool was called.
+- **Access is enforced on the user's identity,** with a test that a non-HR user never sees an HR chunk.
+- **The gate and reversal conditions are explicit:** the eval threshold and the finding that would change
+  the option.
 
 ## Why it exists
 - **Similarity is not correctness.** Point a crawler at a wiki, a ticketing system and a shared drive, and

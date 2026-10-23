@@ -5,7 +5,8 @@ name: Workflows vs agents
 kind: decision
 difficulty: intro
 est_minutes: 12
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -40,6 +41,65 @@ are workflows with small agentic islands where the path is unforeseeable.
   and gates, the per-run cost cap, and when trace data moves the boundary.
 - **What you can skip.** Debating what counts as a "real" agent; only who chooses the next step
   matters.
+
+## Decision case
+### Scenario
+A B2B SaaS company wants to automate first-line support. All figures are illustrative.
+- **Volume:** 12,000 tickets a day, about 360,000 a month (30 days).
+- **Traffic shape:** 80% fall into six known categories (password reset, billing question, plan change,
+  how-to, bug report, cancellation); 20% are anomalous and need several account lookups whose order
+  depends on what the previous one shows.
+- **Constraints:**
+  - model spend at most $4,000 a month;
+  - a first reply within 60 seconds at the p95;
+  - the human support team handles at most 1,000 tickets a day;
+  - refunds over $100 need a person's approval (company policy);
+  - three Python engineers and eight weeks to ship.
+- **Cost model:** about $0.002 per model call and 2 seconds per serial call. A workflow path makes 3
+  calls. An agent run makes a mean of 10 calls (median 6, p95 30).
+
+### Options
+| Option | How it works | Model cost a month | p95 first reply | Human queue a day | Team and deadline |
+|---|---|---|---|---|---|
+| **A. Pure workflow** | classify, retrieve policy, draft; anything unclassifiable goes to a person | 360,000 × 3 × $0.002 = $2,160 | 3 × 2 s = 6 s | 20% × 12,000 = 2,400: over capacity | easy: plain code, unit tests |
+| **B. Pure agent** | one prompt with all tools handles every ticket | 360,000 × 10 × $0.002 = $7,200: over budget | 30 × 2 s = 60 s at the p95, with the tail beyond it over the limit | low, but unmeasured until a golden set exists | fast demo, slow to make reliable |
+| **C. Hybrid** | the workflow from A for every ticket; anomalous tickets go to an agent with read-only tools and a 15-step budget | $2,160 + 72,000 × 10 × $0.002 = $3,600 | exceptions are capped at 6 s + 15 × 2 s = 36 s | if the agent resolves 70% of 2,400, 720 remain | two test suites; the workflow ships first |
+
+### Decision
+Choose **C, the hybrid**, because it is the only option that meets every constraint at once.
+- **Budget:** $3,600 fits under $4,000, while B costs $7,200.
+- **Latency:** a 15-step cap bounds the exception path at 36 seconds, while B's p95 already sits at the
+  60-second limit.
+- **Human capacity:** 720 tickets a day fits the team of 1,000, while A sends them 2,400.
+- **Policy:** refunds over $100 are proposals that go through an approval gate, not agent actions.
+- **Delivery:** the workflow ships in the first weeks and is useful alone; the agent island follows,
+  behind a golden ticket set.
+
+**What would change it:**
+- **Human capacity of 2,400 a day or more:** A becomes cheaper and simpler.
+- **Anomalous share near 50% with a budget above about $7,200:** most traffic needs investigation, and
+  B's single design may be worth it.
+- **Trace mining showing two or three repeated tool sequences:** codify them, and the agent's share shrinks.
+
+### Trade-offs accepted
+- **Two test strategies.** Unit tests for the workflow and a trajectory eval for the agent. Watch both in
+  CI; a green unit suite says nothing about the agent.
+- **The 70% resolution rate is a guess.** If the agent resolves only 50%, the queue is 1,200 and over
+  capacity. Measure it on a golden set before launch and track it weekly.
+- **Budget headroom of only $400.** A rise in the anomalous share eats it first. Alert on the exception
+  rate and on agent cost per route.
+- **Classifier errors cost twice.** A misrouted anomalous ticket gets a wrong canned answer. Sample
+  workflow replies for audit, and route low-confidence classifications to the agent.
+
+### Review rubric
+- **Constraints are explicit numbers**, and every option is scored against each of them in a table.
+- **Costs and queues are recomputed from stated assumptions**, with the mean (not the median) used for
+  totals and the p95 or the step cap used for latency.
+- **The chosen option names the constraint each rival fails**, not just the strengths of the winner.
+- **Agentic steps carry a step budget, restricted tools and gates** for consequential actions, and a
+  route for budget-exhausted runs.
+- **At least two conditions that would change the decision are stated**, each tied to a measurable signal.
+- **Guessed figures are flagged** with a plan to measure them before or soon after launch.
 
 ## Why it exists
 - **"Agent" hides the real decision.** The word covers everything from a prompt template to a fully

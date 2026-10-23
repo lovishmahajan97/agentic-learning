@@ -5,7 +5,8 @@ name: Retry / deduplication / reconciliation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - enterprise-integration/webhooks
@@ -38,6 +39,71 @@ events that never arrived. Each covers a failure the other two cannot see.
   you derive per tool call, the dedupe key on inbound events, and the reconciliation window and alert.
 - **What you can skip.** Proofs about distributed consensus. Know the two-generals ambiguity, the inbox
   and ledger patterns and the three-class diff; that is enough to build and debug agent integrations.
+
+## Decision case
+### Scenario
+An accounts-payable agent reads supplier invoices and posts them as vendor bills into a mid-size
+customer's ERP through its REST API. Volume is 12,000 postings per day. The API has no idempotency-key
+header, but the customer's admin can add a custom external-id field on bills. All figures are
+illustrative.
+
+- **Correctness:** zero duplicate bills, because a duplicate bill becomes a duplicate payment.
+- **Latency:** a bill must appear in the ERP within 15 minutes (p95) of the invoice arriving, so
+  approvers see it the same day.
+- **Quota:** the ERP's daily API quota is shared with the customer's own staff; your integration may
+  use at most 18,000 calls per day.
+- **Ambiguity rate:** about 0.5% of writes time out with an unknown outcome, so 60 per day.
+- **People:** two engineers, six weeks; the AP team will hand-check at most 10 cases per day.
+
+### Options
+| Option | How it works | Duplicates | Latency | Calls per day | Manual work |
+|---|---|---|---|---|---|
+| A. Read before write | Search the ERP by invoice number before each post, retry on timeout | race window between read and write remains | fine | 12,000 writes + 12,000 searches + 1,200 retries + 1,264 reconciliation = 26,464, over 18,000 | low |
+| B. Ledger, upsert by external id, reconciliation | Claim op id as `unknown`, upsert with op id in the external-id field, hourly reconciliation resolves unknowns | none: repeats become updates | fine | 12,000 + 1,200 + 1,264 + 60 lookups = 14,524 | none |
+| C. Nightly batch import | Queue bills and load one file per night, deduped on external id | none | fails: up to 24 hours | a few | none |
+| D. At-most-once | Never retry a write; the AP team re-posts failures | none from retries, but lost bills | fine for most | about 12,000 | 60 cases, over 10 |
+
+Reconciliation reads are an hourly 3-day window of about 36,000 changed bills at 1,000 per page (36
+pages, 24 runs: 864 calls) plus a nightly full-id sweep of 400,000 bills (400 calls), so 1,264 calls.
+Retries are capped by a 10% retry budget: 1,200 calls.
+
+### Decision
+Choose **B**. It is the only option that meets all four hard constraints at once.
+- **Duplicates:** the external-id upsert makes every retry layer (adapter, model, resume) a repeat the
+  ERP itself recognises, so no race window remains for reconciliation to tidy up.
+- **Quota:** 14,524 calls is about 81% of the 18,000 allowance, leaving room for a bad retry day.
+- **Latency and people:** writes are immediate and no case reaches the AP team, against 60 per day
+  under D and up to 24 hours under C.
+- **Agent behaviour:** the op id is built from run id, `post_bill` and the invoice number, and the tool
+  returns "outcome unknown, do not retry" so the model stops calling.
+
+**What would change it.**
+- **No external-id field:** keep the ledger but resolve each `unknown` by invoice-number lookup before
+  any re-issue (60 extra reads, still under quota).
+- **An idempotency key appears:** send it and keep the ledger only for resumes.
+- **Three times the volume** (36,000 postings): no per-record option fits 18,000 calls, so move to the
+  ERP's bulk API.
+
+### Trade-offs accepted
+- **A database write before every call.** 12,000 extra ledger writes per day; watch ledger write
+  latency in the adapter's trace span.
+- **Unknown outcomes can wait up to an hour.** The user sees "pending confirmation"; alert when the
+  oldest `unknown` entry is older than two reconciliation runs.
+- **Reconciliation costs reads.** 1,264 calls is about 7% of the allowance; widen the window only if
+  repair counts show the event path leaking.
+- **A schema change at the customer.** The external-id field is one more thing their admin owns;
+  reconciliation flags bills missing it.
+
+### Review rubric
+- **Constraints are explicit and numeric:** volume, timeout rate, quota and latency are stated, and each
+  option is scored against every one.
+- **Arithmetic is recomputed:** call counts per option add up and are compared with the quota.
+- **Every retry layer is covered:** adapter, model re-plan and checkpoint resume all map to one
+  operation id derived from intent, not argument bytes.
+- **Silent loss is handled:** a reconciliation cadence, a delete sweep and an alert on repair count or
+  oldest `unknown` entry are named.
+- **Reversal conditions are concrete:** the write-up says which change (no external id, an idempotency
+  key, 3x volume) flips the choice and to what.
 
 ## Why it exists
 Take a concrete integration: your assistant ingests ServiceNow incidents into a retrieval index through

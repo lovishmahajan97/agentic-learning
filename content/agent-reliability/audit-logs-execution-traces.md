@@ -5,7 +5,8 @@ name: Audit logs / execution traces
 kind: practice
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -43,6 +44,248 @@ and mutability, so build both on purpose.
   chaining and retention.
 - **What you can skip.** Building your own trace viewer or log-management platform. Emit spans and
   audit rows from the event stream and let existing backends store and render them.
+
+## Lab
+### Task
+Wrap a support agent's tools in a two-phase audit: an `authorized` row before the effect and a
+`completed` row after, hash-chained, with keyed argument hashes and fail-closed behaviour for side
+effects. Add a tail-sampling rule for traces and a reconciliation query that finds effects which
+bypassed the runtime. Time box: 60-90 min.
+- **Prerequisites:** Tracing; Structured event streams; the wrapper and chain examples in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13 and pytest 9.1; stdlib
+  `hashlib` and `hmac` only). Save the starter as `lab.py` and the tests as `test_lab.py`.
+- **No services:** `AuditStore` is an in-memory insert-only store whose `down` flag simulates an
+  outage; the fake `refund` writes to a ledger that plays the target system.
+- **You implement four functions:** `AuditLog.write`, `audited_call`, `keep_trace` and
+  `unaudited_effects`. `verify` is given.
+
+### Starter code
+```python
+"""Lab: a two-phase, fail-closed, hash-chained audit log plus a tail-sampling rule. Run: python lab.py"""
+import hashlib
+import hmac
+import json
+
+ARGS_KEY = b"lab-only-key"                     # production: from a secret store, never beside the log
+GENESIS = "0" * 64
+SIDE_EFFECTS = {"refund", "send_email"}
+
+def canon(obj) -> bytes:
+    return json.dumps(obj, sort_keys=True, default=str).encode()
+
+def chain_hash(rec: dict) -> str:              # plain SHA-256 is fine for the chain
+    return hashlib.sha256(canon(rec)).hexdigest()
+
+def args_hash(args: dict) -> str:              # keyed, so low-entropy arguments cannot be enumerated
+    return hmac.new(ARGS_KEY, canon(args), hashlib.sha256).hexdigest()
+
+class AuditUnavailable(Exception):
+    pass
+
+class AuditStore:
+    """Fake insert-only store (the real one: a table whose writer role has INSERT and SELECT only)."""
+    def __init__(self):
+        self.rows, self.down = [], False
+    def insert(self, rec: dict):
+        if self.down:
+            raise AuditUnavailable("audit store unreachable")
+        self.rows.append(dict(rec))
+    def last_hash(self):
+        return self.rows[-1]["hash"] if self.rows else None
+
+def verify(rows: list[dict], anchored_head: str) -> str:
+    prev = GENESIS
+    for i, rec in enumerate(rows):
+        body = {k: v for k, v in rec.items() if k != "hash"}
+        if rec["prev_hash"] != prev or chain_hash(body) != rec["hash"]:
+            return f"broken at row {i}"
+        prev = rec["hash"]
+    return "ok" if prev == anchored_head else "head does not match anchor"
+
+class AuditLog:
+    def __init__(self, store: AuditStore):
+        self.store, self.prev = store, store.last_hash() or GENESIS   # resume the chain on restart
+
+    def write(self, **rec) -> dict:
+        """Set rec["prev_hash"] = self.prev and rec["hash"] = chain_hash(rec without "hash"), insert it,
+        and advance self.prev ONLY after the insert succeeded (a failed insert must not fork the chain).
+        Let AuditUnavailable propagate. Return the record."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+def audited_call(name: str, args: dict, *, ctx: dict, decision: str, tools: dict,
+                 audit: AuditLog, buffer: list) -> dict:
+    """Two-phase, fail-closed audit around one tool call.
+    - base fields: run_id, step_id, actor (from ctx), action=name, target=args.get("order_id"),
+      args_hash=args_hash(args), policy_version (from ctx), decision
+    - write phase="authorized" BEFORE running. If it raises AuditUnavailable: a tool in SIDE_EFFECTS
+      returns {"ok": False, "error": "audit_unavailable"} without running; any other tool appends the
+      record (base + phase) to `buffer` and continues
+    - only decision == "allow" runs the tool; otherwise the result is {"ok": False, "error": decision}
+    - write phase="completed" with outcome "ok" or the result's error; if that write raises, append the
+      record to `buffer` (the effect already happened)
+    - return the result"""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def keep_trace(spans: list[dict], percent: int = 10) -> bool:
+    """Tail-based sampling, decided after the run ends. Keep every run with a span whose "ok" is False
+    or whose "permission" is "deny" or "ask". Otherwise keep it when
+    int(hashlib.sha256(run_id.encode()).hexdigest(), 16) % 100 < percent (run_id from spans[0])."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def unaudited_effects(ledger: list[dict], rows: list[dict]) -> list[str]:
+    """Reconciliation: sorted target ids in the target system's ledger with no "authorized" audit row
+    for the same target. These are effects that bypassed the runtime."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def make_tools():
+    ledger = []
+    def lookup_order(order_id):
+        return {"ok": True, "order_id": order_id, "total": 40}
+    def refund(order_id, amount):
+        ledger.append({"order_id": order_id, "amount": amount}); return {"ok": True}
+    return {"lookup_order": lookup_order, "refund": refund}, ledger
+
+if __name__ == "__main__":
+    store, buffer = AuditStore(), []
+    audit, (tools, ledger) = AuditLog(store), make_tools()
+    ctx = {"run_id": "r9", "step_id": 3, "actor": "u-17", "policy_version": "support-v3"}
+    call = lambda name, args, decision: audited_call(name, args, ctx=ctx, decision=decision,
+                                                     tools=tools, audit=audit, buffer=buffer)
+    print(call("lookup_order", {"order_id": "o-77"}, "allow"))
+    print(call("refund", {"order_id": "o-77", "amount": 40}, "allow"))
+    print(call("refund", {"order_id": "o-77", "amount": 4000}, "deny"))
+    store.down = True
+    print(call("refund", {"order_id": "o-78", "amount": 40}, "allow"))
+    print(call("lookup_order", {"order_id": "o-78"}, "allow"))
+    store.down = False
+    anchor = store.last_hash()                                 # copied to a WORM bucket in production
+    print("rows:", len(store.rows), "buffered:", len(buffer), "ledger:", [e["order_id"] for e in ledger])
+    print("verify:", verify(store.rows, anchor))
+    ledger.append({"order_id": "o-99", "amount": 900})       # a script that bypassed the runtime
+    print("unaudited:", unaudited_effects(ledger, store.rows))
+    store.rows[1]["decision"] = "ask"                         # someone edits a row
+    print("after edit:", verify(store.rows, anchor))
+    runs = {"run-a": [{"ok": True}], "run-b": [{"ok": True}, {"ok": False}],
+            "run-c": [{"ok": True, "permission": "ask"}], "run-d": [{"ok": True}]}
+    print("kept:", [r for r, spans in runs.items() if keep_trace([{"run_id": r}] + spans)])
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+{'ok': True, 'order_id': 'o-77', 'total': 40}
+{'ok': True}
+{'ok': False, 'error': 'deny'}
+{'ok': False, 'error': 'audit_unavailable'}
+{'ok': True, 'order_id': 'o-78', 'total': 40}
+rows: 6 buffered: 2 ledger: ['o-77']
+verify: ok
+unaudited: ['o-99']
+after edit: broken at row 1
+kept: ['run-b', 'run-c', 'run-d']
+```
+
+`run-d` is kept by the 10% hash bucket (its bucket is 4); `run-a` lands in bucket 76 and is dropped.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (Python 3.13, pytest 9.1).
+
+```python
+import pytest
+from lab import (GENESIS, AuditLog, AuditStore, AuditUnavailable, args_hash, audited_call, keep_trace,
+                 make_tools, unaudited_effects, verify)
+
+CTX = {"run_id": "r1", "step_id": 1, "actor": "u-1", "policy_version": "p-2"}
+
+def setup():
+    store, buffer = AuditStore(), []
+    tools, ledger = make_tools()
+    def call(name, args, decision="allow"):
+        return audited_call(name, args, ctx=CTX, decision=decision, tools=tools,
+                            audit=AuditLog(store), buffer=buffer)
+    return store, buffer, ledger, call
+
+def test_write_chains_and_a_failed_insert_does_not_fork_the_chain():
+    store = AuditStore()
+    log = AuditLog(store)
+    first = log.write(action="a")
+    assert first["prev_hash"] == GENESIS and len(first["hash"]) == 64
+    store.down = True
+    with pytest.raises(AuditUnavailable):
+        log.write(action="b")
+    store.down = False
+    second = log.write(action="c")
+    assert second["prev_hash"] == first["hash"] and verify(store.rows, second["hash"]) == "ok"
+
+def test_authorized_row_is_written_before_the_effect():
+    store, _, ledger, call = setup()
+    tools, seen = make_tools()[0], []
+    def spy_refund(order_id, amount):
+        seen.append([r["phase"] for r in store.rows]); return {"ok": True}
+    tools["refund"] = spy_refund
+    audited_call("refund", {"order_id": "o1", "amount": 5}, ctx=CTX, decision="allow", tools=tools,
+                 audit=AuditLog(store), buffer=[])
+    assert seen == [["authorized"]]
+    assert [r["phase"] for r in store.rows] == ["authorized", "completed"]
+    row = store.rows[0]
+    assert row["actor"] == "u-1" and row["policy_version"] == "p-2" and row["target"] == "o1"
+    assert row["args_hash"] == args_hash({"order_id": "o1", "amount": 5}) and "amount" not in row
+
+def test_side_effects_fail_closed_and_reads_buffer():
+    store, buffer, ledger, call = setup()
+    store.down = True
+    assert call("refund", {"order_id": "o1", "amount": 5}) == {"ok": False, "error": "audit_unavailable"}
+    assert ledger == [] and buffer == []
+    assert call("lookup_order", {"order_id": "o1"})["ok"] is True
+    assert [b["phase"] for b in buffer] == ["authorized", "completed"]
+
+def test_denied_calls_do_not_run_but_are_audited():
+    store, _, ledger, call = setup()
+    assert call("refund", {"order_id": "o1", "amount": 4000}, "deny") == {"ok": False, "error": "deny"}
+    assert ledger == [] and [r.get("outcome") for r in store.rows] == [None, "deny"]
+
+def test_tail_sampling_keeps_every_failure_and_escalation():
+    assert keep_trace([{"run_id": "run-a"}, {"ok": False}]) is True
+    assert keep_trace([{"run_id": "run-a"}, {"ok": True, "permission": "deny"}]) is True
+    assert keep_trace([{"run_id": "run-a"}, {"ok": True}]) is False         # bucket 76
+    assert keep_trace([{"run_id": "run-d"}, {"ok": True}]) is True          # bucket 4
+    kept = sum(keep_trace([{"run_id": f"r-{i}"}, {"ok": True}]) for i in range(1000))
+    assert 50 < kept < 150
+
+def test_reconciliation_finds_effects_that_bypassed_the_runtime():
+    store, _, ledger, call = setup()
+    call("refund", {"order_id": "o1", "amount": 5})
+    ledger.append({"order_id": "o9", "amount": 900})
+    assert unaudited_effects(ledger, store.rows) == ["o9"]
+```
+
+### Failure scenarios
+- **Advance `self.prev` before the insert.** After an outage the next row points at a hash that was
+  never stored, and the first test fails. In production nightly verification reports a broken chain
+  that nobody tampered with; log the insert result next to the hash you chained.
+- **Write only the `completed` row.** The ordering test sees no `authorized` row while the refund runs,
+  which is exactly the record a crashed worker loses. Reconcile the ledger against `authorized` rows by
+  target id to find such gaps.
+- **Treat every tool the same during an outage.** Either reads stop working while the audit store is
+  down, or refunds run unrecorded. Count tool runs refused with `audit_unavailable` per tool class.
+- **Sample with `random.random() < 0.1` at the root span.** Failures disappear at the same rate as
+  successes and the tests stop being deterministic. Compare the backend's failure count with the
+  runtime's own counter: coverage of failed runs should be 100%.
+
+### Submission
+- **`lab.py`** with the four functions implemented; `verify`, `AuditStore` and the tools unchanged.
+- **A green test run** (6 passed) and the printed output of `python lab.py`.
+- **One extra test** of your own: restart the `AuditLog` mid-run (a new instance on the same store)
+  and show the chain still verifies.
+- **A short note** answering the incident question "did refund o-78 run?" from the rows and buffer alone.
+- **Evaluated on:** authority recorded before every effect, fail-closed side effects, an unforked chain,
+  no raw arguments in audit rows, and 100% retention of failed or escalated traces.
 
 ## Why it exists
 - **Incidents ask a fixed set of questions.** An agent refunds a customer 4,000 instead of 40. Which user

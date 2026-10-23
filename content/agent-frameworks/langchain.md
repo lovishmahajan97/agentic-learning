@@ -5,7 +5,8 @@ name: LangChain (LCEL, chat models, tools, retrievers)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/frameworks
@@ -36,6 +37,170 @@ LangGraph underneath when you need custom control flow.
   agent loop, and retries and fallbacks on each Runnable.
 - **What you can skip.** Legacy chains and the old `AgentExecutor`, which LangChain 1.0 moved to the
   `langchain-classic` package. New agent code uses `create_agent` or LangGraph directly.
+
+## Lab
+### Task
+Build the retrieval layer of a support agent in LangChain: an LCEL chain that puts cited context into the
+prompt, falls back to a backup model only on rate limits, and a `search_help` tool the agent can call for
+agentic RAG. Time box: 45-60 min.
+- **Prerequisites:** Tool calling; Choosing an agent framework; the Examples in this lesson.
+- **Setup:** Python 3.10+, `pip install langchain-core pytest` (checked with langchain-core 1.7.0, Python
+  3.13). Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **No keys and no network:** embeddings are a toy bag of words and both models are `RunnableLambda` fakes
+  that record the prompt they receive.
+
+### Starter code
+```python
+"""Lab: a cited retrieval chain and search tool for a support agent. Run: python lab.py"""
+import re
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_core.messages import AIMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnableLambda, RunnablePassthrough
+from langchain_core.tools import tool
+from langchain_core.vectorstores import InMemoryVectorStore
+
+class ToyEmbeddings(Embeddings):                 # bag of words; a real embedding model in practice
+    VOCAB = ["refund", "return", "days", "shipping", "eu", "delivery", "password", "reset"]
+    def embed_query(self, text):
+        return [float(w in text.lower()) for w in self.VOCAB]
+    def embed_documents(self, texts):
+        return [self.embed_query(t) for t in texts]
+
+store = InMemoryVectorStore(embedding=ToyEmbeddings())
+store.add_documents([
+    Document("Refunds: return items within 30 days of delivery.", metadata={"src": "policy.md"}),
+    Document("Shipping to the EU takes 5-7 business days.", metadata={"src": "shipping.md"}),
+    Document("Reset your password from Settings, then Security.", metadata={"src": "account.md"}),
+])
+retriever = store.as_retriever(search_kwargs={"k": 1})
+
+class RateLimited(Exception):                    # what a provider adapter raises on HTTP 429
+    pass
+
+PROMPT = ChatPromptTemplate.from_messages([
+    ("system", "Answer only from the context and cite the [source].\n\nContext:\n{context}"),
+    ("human", "{question}"),
+])
+
+def fake_model(name: str, seen: list, fail_with: Exception | None = None) -> Runnable:
+    """A chat-model stand-in: records the prompt it receives, then replies or raises."""
+    def call(prompt_value):
+        seen.append((name, prompt_value.to_string()))
+        if fail_with is not None:
+            raise fail_with
+        cited = re.findall(r"\[(\w+\.md)\]", prompt_value.to_string())
+        return AIMessage(f"{name}: see {cited}")
+    return RunnableLambda(call)
+
+def format_docs(docs: list[Document]) -> str:
+    # YOUR CODE HERE: one line per document, "[<src>] <page_content>", joined with "\n"
+    raise NotImplementedError
+
+def build_chain(retriever: Runnable, primary: Runnable, backup: Runnable) -> Runnable:
+    # YOUR CODE HERE: an LCEL chain from a question string to an answer string:
+    # - a dict step that fills "context" (retriever | format_docs) and "question" (the raw input)
+    # - PROMPT, then the primary model with a fallback to backup ONLY on RateLimited
+    # - StrOutputParser at the end
+    raise NotImplementedError
+
+@tool
+def search_help(query: str) -> str:
+    """Placeholder description."""
+    # YOUR CODE HERE: write a docstring that says when the agent should call this tool and
+    # gives an example query, then return format_docs(retriever.invoke(query))
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    seen: list = []
+    chain = build_chain(retriever,
+                        primary=fake_model("primary", seen, fail_with=RateLimited("429")),
+                        backup=fake_model("backup", seen))
+    print(chain.invoke("Can I return it after 20 days?"))
+    print("models called:", [name for name, _ in seen])
+    print("[policy.md]" in seen[-1][1])
+    print(search_help.invoke({"query": "how do I reset my password"}))
+    print(sorted(search_help.args))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+backup: see ['policy.md']
+models called: ['primary', 'backup']
+True
+[account.md] Reset your password from Settings, then Security.
+['query']
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail: four with `NotImplementedError`, and the tool test
+with an `AssertionError` on the placeholder description. A correct solution passes all 5 (langchain-core
+1.7.0, pytest 9.1).
+
+```python
+import pytest
+from langchain_core.documents import Document
+from lab import RateLimited, build_chain, fake_model, format_docs, retriever, search_help
+
+def test_format_docs_cites_sources():
+    docs = [Document("a", metadata={"src": "x.md"}), Document("b", metadata={"src": "y.md"})]
+    assert format_docs(docs) == "[x.md] a\n[y.md] b"
+
+def test_prompt_gets_cited_context_and_question():
+    seen = []
+    chain = build_chain(retriever, fake_model("primary", seen), fake_model("backup", seen))
+    assert chain.invoke("Can I return it after 20 days?") == "primary: see ['policy.md']"
+    name, prompt = seen[0]
+    assert "[policy.md] Refunds: return items within 30 days" in prompt
+    assert "Can I return it after 20 days?" in prompt
+
+def test_fallback_only_on_rate_limit():
+    seen = []
+    chain = build_chain(retriever, fake_model("primary", seen, RateLimited("429")), fake_model("backup", seen))
+    assert chain.invoke("shipping to the EU?").startswith("backup:")
+    assert [n for n, _ in seen] == ["primary", "backup"]
+    broken = build_chain(retriever, fake_model("primary", [], ValueError("bad prompt")), fake_model("backup", []))
+    with pytest.raises(ValueError):                 # a bug must surface, not hide behind the backup
+        broken.invoke("shipping to the EU?")
+
+def test_batch_runs_every_question():
+    chain = build_chain(retriever, fake_model("primary", []), fake_model("backup", []))
+    out = chain.batch(["refund?", "password reset?"], config={"max_concurrency": 2})
+    assert len(out) == 2 and all(o.startswith("primary:") for o in out)
+
+def test_search_help_is_a_described_tool():
+    assert search_help.name == "search_help"
+    assert list(search_help.args) == ["query"]
+    desc = search_help.description.lower()
+    assert "placeholder" not in desc and len(desc.split()) >= 8
+    assert search_help.invoke({"query": "reset my password"}).startswith("[account.md]")
+```
+
+### Failure scenarios
+- **Call `with_fallbacks([backup])` without `exceptions_to_handle`.** The default catches every
+  `Exception`, so the `ValueError` case silently answers from the backup. In production a prompt bug looks
+  like a healthy fallback rate; log which model answered and alert when fallbacks rise.
+- **Pipe the retriever straight into the prompt** (no `format_docs`). The prompt shows a list of
+  `Document(...)` reprs and the `[policy.md]` assertion fails. Print `seen[0][1]` to read the exact prompt
+  the model got.
+- **Use `retriever` for both dict branches.** The question slot receives documents instead of the user's
+  text; the prompt test fails on the missing question. `RunnablePassthrough()` forwards the raw input.
+- **Leave the docstring vague.** The tool test fails; with a real model, vague descriptions show up as
+  the agent skipping `search_help` or calling it for order lookups. Read `search_help.description` and
+  the tool schema in a trace.
+
+### Submission
+- **`lab.py`** with `format_docs`, `build_chain` and `search_help` implemented as one LCEL pipeline, no
+  hand-written loops.
+- **A green test run** (5 passed) and the output of `python lab.py`.
+- **One extra test** that the chain's `with_config({"run_name": ...})` name appears in a callback or trace.
+- **A short note:** when you would expose `search_help` as an agent tool instead of always retrieving.
+- **Evaluated on:** tests passing, cited context in the prompt, fallbacks limited to rate limits, and a
+  tool description a model can act on.
 
 ## Why it exists
 - **Every provider speaks a slightly different dialect.** Message roles, tool-call formats and streaming

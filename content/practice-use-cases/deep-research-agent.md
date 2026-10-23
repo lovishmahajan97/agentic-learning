@@ -5,7 +5,8 @@ name: deep research agent (search, read, cite, synthesise)
 kind: practice
 difficulty: advanced
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - rag-retrieval/agentic-rag
@@ -37,6 +38,62 @@ done in minutes, checkable by a reader.
   an orchestrator that fans out sub-questions, and a verifier pass before the report ships.
 - **What you can skip at first.** Live web crawling. A local corpus such as a Wikipedia subset gives the
   same loop with reproducible results.
+
+## Decision case
+### Scenario
+A market-intelligence team of 6 analysts wants cited vendor-comparison reports from a research agent.
+Each question splits into 3-6 sub-questions. The team ran four designs over a 40-question pilot set with
+gold answers on a frozen corpus; the results below are illustrative numbers of the kind such a pilot
+produces, not benchmarks.
+- **Volume:** 120 reports a month.
+- **Budget:** 2,000 dollars a month in model and search spend, so 2,000 / 120 = about 16.67 dollars per
+  report.
+- **Latency:** a report within 15 minutes, because analysts queue questions during calls.
+- **Quality bar:** at least 75% answer correctness on the pilot set, and 95%+ citation precision after
+  the verifier pass, which every design below includes.
+- **Tools:** read-only search and fetch, so the main injection risk is a polluted report.
+
+### Options
+| Option | How it works | Cost per report, per month | Latency | Correctness | Fits? |
+|---|---|---|---|---|---|
+| Fixed pipeline | Plan once, one search per sub-question, write, verify | 2 dollars, 240 | 6 min | 55% | no: quality |
+| Single agent loop | One context searches, reflects and writes | 4 dollars, 480 | 22 min | 68% | no: latency and quality |
+| Orchestrator, 4 workers | Planner fans sub-questions out to 4 parallel workers that return notes | 14 dollars, 1,680 | 8 min | 79% | yes |
+| Orchestrator, 8 workers | Same, 8 workers and more sources each | 26 dollars, 3,120 | 7 min | 81% | no: over budget |
+
+### Decision
+**Orchestrator with at most 4 parallel workers, run as a background job with the verifier gate.** It is
+the only design that clears the 75% correctness bar inside both the 15-minute and 2,000-dollar limits.
+Going to 8 workers buys 2 points of correctness for 12 more dollars per report and breaks the budget.
+- **Budgets in code:** maximum workers, searches per worker and total tokens per job, with the job
+  stopping and reporting gaps when a budget is spent.
+- **Workers return notes, not pages:** the orchestrator only sees verbatim quotes with source ids,
+  which keeps its context small.
+- **Cost tracked per job:** tokens summed across all workers, alerting on reports above 20 dollars.
+
+**What would change it.**
+- **Volume rises:** at 150 reports a month the cost is 150 x 14 = 2,100 dollars, over budget. Route
+  narrow one-hop questions to the single agent first, since fan-out adds little there.
+- **Latency relaxed:** even with no deadline, the single agent's 68% misses the quality bar, so it
+  stays out unless its correctness improves.
+- **Budget doubles:** 8 workers would cost 3,120 dollars and fit, but only if 2 points matter to analysts.
+
+### Trade-offs accepted
+- **3.5 times the single agent's cost per report** (14 versus 4 dollars). Track dollars per correct
+  answer on the pilot set after every prompt or model change.
+- **More moving parts.** Worker failures and partial jobs become possible; monitor job failure by step
+  and make jobs resumable.
+- **Frozen-corpus scores may not hold on the live web.** Spot-check 10 live reports a month against the
+  same rubric and compare citation precision.
+
+### Review rubric
+- **Pilot evidence, not intuition:** options are compared on a fixed question set with gold answers.
+- **Per-report and monthly cost both shown,** recomputed from volume and checked against the budget.
+- **Quality bar fixed in advance:** the threshold is set before results are seen, and every option is
+  judged against it.
+- **Marginal value argued:** the write-up says what the next increment of breadth buys and costs.
+- **Budgets enforced in code:** worker, search and token limits stop a runaway job.
+- **Change triggers explicit:** the volume, latency or budget figures that would flip the choice.
 
 ## Why it exists
 - **The user problem.** Analysts, product managers and engineers spend hours searching, opening tabs,

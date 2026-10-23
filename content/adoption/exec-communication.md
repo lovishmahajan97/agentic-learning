@@ -5,7 +5,8 @@ name: Exec communication
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - adoption/stakeholder-management
@@ -34,6 +35,72 @@ healthy agent project cancelled.
   results, the colour rules you agree with the sponsor, and how early you report an agent failure.
 - **What you can skip.** Presentation craft and slide design. BLUF, one value number with its arithmetic
   and an honest error statement do most of the work.
+
+## Decision case
+### Scenario
+An IT service-desk agent has finished its pilot: it resets access and handles software-install
+requests, with a person reviewing every action. The CIO wants to expand it company-wide and drop human
+review on access resets to save reviewer time.
+
+You write the go/no-go memo for a steering meeting in 5
+days, where the CIO has 10 minutes. All figures are illustrative.
+- **Expanded volume:** about 15,000 resets and 10,000 install requests a month.
+- **Pilot quality:** 0 wrong resets in 300 cases; 8 wrong installs in 400 (2%); review catches about 95%
+  of wrong actions.
+- **CIO's stated tolerance:** no more than 25 wrong actions a month reaching employees.
+- **Review capacity:** 2 reviewers, about 280 hours a month; a review takes about 0.6 minutes.
+
+The arithmetic the memo rests on:
+- **Zero failures is not zero.** By the rule of three, 0 in 300 allows a true rate up to 3/300 = 1%.
+- **Installs with review:** 10,000 x 0.02 x 0.05 = 10 escaped a month.
+- **Resets with review, worst plausible:** 15,000 x 0.01 x 0.05 = 7.5.
+
+### Options
+| Option | How it works | Wrong actions reaching staff a month | Review hours | Within tolerance? |
+|---|---|---|---|---|
+| Recommend autonomy on resets now | The memo agrees with the CIO | up to 15,000 x 1% = 150, plus 10 = 160 | 10,000 x 0.6 min = 100 | No, at the plausible upper bound |
+| Expand with review on everything | Safe recommendation, no further ask | up to 7.5 + 10, about 18 | 25,000 x 0.6 min = 250 of 280 | Yes, but no route to the saving and little spare capacity |
+| Expand with review, plus a written autonomy gate | Review everything now; resets go autonomous once enough failure-free cases bring their bound down | about 18 now, then up to 15 + 10 = 25 | 250, falling to 100 | Yes, at the edge once the gate opens |
+| Send the dashboard, let the CIO choose | Full metrics, no recommendation | Unknown | Unknown | No ask, so the decision slips |
+
+### Decision
+**Expand with review, plus a written autonomy gate for resets.** It meets the 25-a-month tolerance from
+day one and gives the CIO the saving she wants on a date she can plan for, instead of a "not yet".
+- **The gate is arithmetic:** resets may drop review when 3/n x 15,000 is 15 or less, that is n of at
+  least 3,000 failure-free cases. That leaves 15 + 10 = 25 at the bound. With 300 already seen, 2,700 more
+  take under a week at about 3,500 resets a week.
+- **The memo leads with the bottom line:** "Expand now with review; resets can go unreviewed in about a
+  week if no reset fails. Decision needed: approve both today." Value, the error lines in volume terms
+  and review hours follow; eval detail goes to the appendix.
+- **Pre-wire the CIO one-to-one,** because the memo turns down her preferred option, and she should not
+  hear that first in front of peers.
+
+**What would change it.**
+- **Any wrong reset during the gate:** the zero-failure bound no longer applies. Recompute with the
+  observed rate and keep review on until the projection fits.
+- **A lower catch rate:** at 90% catch, installs alone send 10,000 x 0.02 x 0.1 = 20 a month to staff, so
+  the gate needs a tighter reset bound or better install checks first.
+
+### Trade-offs accepted
+- **The saving arrives a week later than the CIO asked.** Report gate progress (failure-free resets so
+  far) in each update so the date stays credible.
+- **The plan sits exactly at the tolerance once the gate opens.** Watch escaped errors from employee
+  reports weekly. One month above 25 puts resets back under review, and the memo says so in advance.
+- **Review capacity is tight during the first week.** Watch reviewer backlog; if it grows, slow the
+  expansion rather than skim reviews.
+
+### Review rubric
+- **Bottom line and ask in the first two lines,** with a decision date.
+- **Error rates in volume terms with containment:** monthly escaped actions computed per option, not a
+  single accuracy figure.
+- **Small samples stated honestly:** zero-failure results carry the rule-of-three bound, and it is used in
+  the projection.
+- **Recommendation tied to the executive's own constraint:** the stated tolerance and capacity decide the
+  option, shown with arithmetic.
+- **Bad news pre-wired:** the write-up plans a one-to-one before the meeting when it disagrees with the
+  executive.
+- **Reversal triggers named:** which observed failure or measured catch rate would change the
+  recommendation.
 
 ## Why it exists
 - **Executive attention is the bottleneck, not your work.** Executives allocate money, people and

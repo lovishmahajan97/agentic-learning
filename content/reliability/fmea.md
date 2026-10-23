@@ -5,7 +5,8 @@ name: FMEA (Failure Mode and Effects Analysis)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - reliability/chaos-engineering-and-resilience-testing
@@ -37,6 +38,72 @@ launch, aimed at silent failures such as a wrong tool call.
   gets: prevention, containment or detection.
 - **What you can skip.** The automotive handbook's full Action Priority tables. Severity first, then RPN,
   is enough for agent work.
+
+## Decision case
+### Scenario
+A team launches the refund-capable support agent from the Examples below in three weeks. A two-hour FMEA
+workshop produced seven rows. All scores and costs are the team's illustrative estimates.
+
+| # | Row | S | O | D | RPN | Control | Days | After |
+|---|---|---|---|---|---|---|---|---|
+| 1 | stale policy docs | 7 | 4 | 9 | 252 | freshness SLI and alert (D to 3) | 1 | 84 |
+| 2 | refund against the wrong order | 10 | 3 | 8 | 240 | id from the structured field plus a confirmation step (O to 1, D to 2) | 3 | 20 |
+| 3 | another tenant's documents retrieved | 10 | 2 | 9 | 180 | mandatory tenant filter plus an hourly canary (D to 2) | 2 | 40 |
+| 4 | prompt edit ships without an eval (process row) | 8 | 5 | 7 | 280 | eval gate in CI (D to 3) | 4 | 120 |
+| 5 | agent loops on a failing tool | 4 | 6 | 6 | 144 | per-run step budget (S to 2) | 1 | 72 |
+| 6 | provider timeout or 5xx | 4 | 5 | 2 | 40 | already alerted | 0 | 40 |
+| 7 | output violates the JSON schema | 3 | 4 | 3 | 36 | already counted and alerted | 0 | 36 |
+
+- **Total RPN today:** 1,172.
+- **Constraints:**
+  - two engineers can spend 8 engineer-days on controls before launch;
+  - the launch date is fixed by a customer commitment;
+  - the risk owner's launch gate: no severity 9 or 10 row may ship without a control.
+
+### Options
+| Option | Rows funded | Days | Total RPN after | S10 rows uncontrolled | Meets the gate and the date? |
+|---|---|---|---|---|---|
+| **A. Pure RPN order** | 4, 1, 2 | 4 + 1 + 3 = 8 | 120 + 84 + 20 + 180 + 144 + 40 + 36 = 624 | row 3, the cross-tenant leak | fails the gate |
+| **B. Severity first, then RPN** | 2, 3, then 1 and 5 (row 4's 4 days no longer fit) | 3 + 2 + 1 + 1 = 7 | 84 + 20 + 40 + 280 + 72 + 40 + 36 = 572 | none | yes |
+| **C. Every row with S of 7 or more** | 1, 2, 3, 4 | 1 + 3 + 2 + 4 = 10 | 84 + 20 + 40 + 120 + 144 + 40 + 36 = 484 | none | slips launch by 2 days: fails the date |
+| **D. Ship with monitoring, fix after incidents** | none | 0 | 1,172 | rows 2 and 3 | fails the gate |
+
+### Decision
+Choose **B**, because it is the only option that meets both the gate and the date.
+- **The gate:** B controls both severity-10 rows. A spends its budget on the highest RPN, the process row,
+  and leaves the cross-tenant leak open, because 10 × 2 × 9 = 180 ranks below 280.
+- **Residual risk:** B also ends with a lower total than A, 572 against 624, because the two cheap
+  controls on rows 1 and 5 remove a lot of RPN per day.
+- **The date:** C is the most thorough but needs 10 days against 8.
+- **The deferred row is contained by process:** row 4 stays at 280, so prompt and model changes are
+  frozen from launch until the eval gate ships, in the spare day plus the first week after launch.
+
+**What would change it:**
+- **Two more engineer-days:** C becomes affordable and is better.
+- **Trace data that moves an occurrence score:** for example, row 2's wrong-order rate measured at 0.1% of
+  runs, not "3". Re-score and re-rank before funding.
+- **A product team that cannot accept a change freeze:** row 4 must be funded, and row 1 or 5 drops out.
+
+### Trade-offs accepted
+- **Row 4 carries the highest RPN into launch.** The freeze is the control. Watch prompt and model
+  changes merged during the freeze, which should be zero.
+- **Row 5 keeps occurrence 6.** The step budget limits harm, not frequency. Watch the share of runs ending
+  on the budget per release.
+- **The scores are judgment.** Have two raters score the severity-10 rows independently against the
+  anchored scale, and re-score every row from traces 30 days after launch.
+- **Single-failure blind spot.** Rows 2 and 3 each get a small fault tree, so that no single control
+  failure, or common pair, reaches the severity-10 effect.
+
+### Review rubric
+- **Severity 9 and 10 rows are handled before RPN sorting,** with a named control for each.
+- **Every funded control states which factor it lowers** (prevention O, containment S, detection D) and
+  the re-scored RPN, recomputed.
+- **Costs are summed against the stated budget,** and the option that breaks the budget or the date is
+  identified.
+- **Process rows** (prompt edits, model upgrades, index rebuilds) appear in the table, not only design
+  rows.
+- **Every deferred row has an interim control** and a signal that shows whether it holds.
+- **Occurrence guesses are flagged** with a date to re-score them from traces or eval runs.
 
 ## Why it exists
 - **Teams discover failure modes one incident at a time.** Postmortems are reactive by definition, and

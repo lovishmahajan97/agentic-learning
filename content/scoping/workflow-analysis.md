@@ -5,7 +5,8 @@ name: Workflow analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/customer-discovery
@@ -34,6 +35,61 @@ ten-minute task inside a three-day process changes almost nothing.
   the size of the review step you create, and the baseline you record before launch.
 - **What you can skip.** Full lean certification and process-mining tooling; a swimlane sketch, an event-log
   export and Little's law are enough to place an agent.
+
+## Decision case
+### Scenario
+A company's IT team gets 120 access requests a day and the CIO wants the average time to access under 2
+days this quarter. An event-log export of 3,000 recent requests (figures illustrative) shows:
+- **Backlog:** 480 open requests and throughput of 110 a day, so average time in system is 480 ÷ 110 ≈
+  4.4 days, and the queue grows by 10 a day.
+- **Manager approval is the constraint:** managers spend about 440 minutes a day in total, at 4 minutes per
+  request, so capacity is 110 a day. Provisioning engineers can do 150 a day.
+- **Rework loop:** 35% of requests go back to the requester for missing details, waiting about 1.5 days.
+- **Touch time:** provisioning research takes 12 minutes per request.
+- **Constraints:** security policy keeps a human approval on every request; two engineers for 10 weeks;
+  each agent is estimated at 4 to 5 weeks.
+
+### Options
+| Option | How it works | Effect on the constraint | Effect on time in system | Fits 10 weeks |
+|---|---|---|---|---|
+| A. Research agent for engineers | Drafts the entitlement plan, 12 → 4 minutes | None: provisioning is not the constraint | Barely moves; saves 120 × 8 = 960 minutes, 16 engineer-hours a day | Yes |
+| B. Intake completeness agent | Checks requests at submission and asks for missing details at once | None: approval still caps at 110 | Removes most of the rework wait, but the queue still grows 10 a day | Yes |
+| C. Approval-pack agent | Summarises the request, peers' access and the policy match for the manager | Same 440 minutes at 2 minutes each: capacity 220 a day | Throughput rises to all 120 arrivals; the backlog drains | Yes |
+| D. C first, then B | C in weeks 1-5, B in weeks 6-10 | As C | As C, then the rework wait shrinks too | Yes, just |
+
+### Decision
+Choose **D**: build the approval-pack agent first, then the intake completeness agent.
+- **Only C touches the constraint.** Halving approval minutes doubles approval capacity to 220, so
+  throughput reaches the 120 arrivals and the queue stops growing.
+- **The constraint moves to provisioning at 150 a day,** so the backlog drains at up to 150 − 120 = 30 a
+  day. By Little's law, under 2 days at 120 a day means fewer than 240 open requests; draining from 480 to
+  240 takes about 240 ÷ 30 = 8 working days.
+- **B then cuts the rework WIP:** about 120 × 0.35 × 1.5 = 63 requests sit waiting for details at any time;
+  catching 80% at intake removes about 50.
+- **The approval stays human,** as security requires; the agent pre-packages evidence and decides nothing.
+- **A saves real engineer time but not the CIO's outcome,** so it goes on the backlog.
+
+**What would change it:**
+- **Managers will not change how they approve** (for example they approve from email without opening the
+  pack): C's capacity gain vanishes; pilot it with two managers and measure minutes per approval first.
+- **Policy allows auto-approval of low-risk roles:** routing them past managers raises capacity more than C.
+- **Arrivals grow past 150 a day:** provisioning becomes the constraint and A moves up.
+
+### Trade-offs accepted
+- **Engineers keep spending 12 minutes on research:** track provisioning queue length daily, since it is
+  now the next-slowest step.
+- **Managers may rubber-stamp a good pack:** sample approved requests weekly and track minutes per approval
+  and reversal rate.
+- **B ships late in the quarter:** report the rework-loop share and its wait separately so its effect is
+  visible.
+
+### Review rubric
+- Computes time in system with Little's law from WIP and throughput, with the arithmetic shown.
+- Names the constraint from capacities against arrivals, not from the task the customer named.
+- Shows where the constraint moves after the proposed agent ships and checks that step's capacity.
+- Respects controls (here the human approval) by pre-packaging evidence rather than removing them.
+- Sequences agents by effect on the outcome and states the baseline the pilot is measured against.
+- Lists measurable conditions, such as minutes per approval, that would flip the choice.
 
 ## Why it exists
 - **AI is pitched at tasks; customers buy outcomes.** "Summarise the ticket" or "extract the fields" is a

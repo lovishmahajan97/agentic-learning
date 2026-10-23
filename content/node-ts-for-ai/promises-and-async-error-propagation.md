@@ -5,7 +5,8 @@ name: Promises & async error propagation
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - node-ts-for-ai/event-loop-and-microtask-queue
@@ -35,6 +36,207 @@ causes make agents crash or retry the wrong thing.
   `cause`, lint for floating promises, and which errors go back to the model versus end the run.
 - **What you can skip.** The spec's job-queue internals; know that handlers run as microtasks and that a
   rejection needs a handler attached before it happens.
+
+## Lab
+### Task
+Make an agent's parallel tool step survive any mix of failures: classify transport errors without losing
+their cause, retry only what is retryable, settle the batch so each tool call gets one result, and make a
+fire-and-forget trace write unable to crash the process. Time box: 45-75 minutes.
+- **Prerequisites:** this lesson's combinator, unhandled-rejection and cause sections; the AbortController
+  lesson for the cancelled-run case.
+- **Setup:** an empty folder with `"type": "module"` in `package.json`, `npm i -D vitest @types/node`.
+  Checked with Node 24.21 and Vitest 5.0; Node 24 runs `lab.ts` directly by stripping types.
+- **Fakes, no network:** `fakeExec` stands in for five tools. `lookup` returns a permanent 400, `crm` a 503
+  once, `docs` a transport failure once (Node's `fetch` rejects with `TypeError("fetch failed")` and a
+  `cause`), and `buggy` has a bug in our own code.
+- **Save** the starter as `lab.ts` and the tests as `lab.test.ts`, then run `node lab.ts` and
+  `npx vitest run`.
+
+### Starter code
+```ts
+// Lab: a crash-proof tool batch for an agent loop. Run: node lab.ts   Test: npx vitest run
+import { pathToFileURL } from "node:url";
+import { setTimeout as sleep } from "node:timers/promises";
+
+export class ProviderError extends Error {
+  readonly status: number;
+  readonly retryable: boolean;
+  constructor(msg: string, status: number, retryable: boolean, opts?: { cause?: unknown }) {
+    super(msg, opts);
+    this.name = "ProviderError"; this.status = status; this.retryable = retryable;
+  }
+}
+
+export type ToolCall = { id: string; name: string; args: unknown };
+export type ToolResult = { toolCallId: string; content: string; isError: boolean };
+export type Exec = (c: ToolCall, signal: AbortSignal) => Promise<string>;
+
+// LAB 1: Node's fetch rejects with TypeError("fetch failed") on a transport failure. Wrap that as
+// ProviderError("<tool> transport failure", 0, retryable true) keeping the original as `cause`.
+// Return ProviderErrors, aborts (signal.aborted) and anything else (our own bugs) unchanged.
+export function classify(e: unknown, tool: string, signal: AbortSignal): unknown {
+  return new Error("tool call failed");             // loses the status, the cause and retryability
+}
+
+// LAB 2: retry `fn` only for retryable ProviderErrors, at most `retries` extra times, waiting
+// `delayMs` between attempts with an abortable sleep. Never retry once the signal has aborted.
+export async function withRetry<T>(fn: () => Promise<T>, signal: AbortSignal, retries = 1, delayMs = 10): Promise<T> {
+  void sleep;
+  return fn();
+}
+
+// LAB 3: settle every call (not Promise.all) and return one result per call, in order:
+// fulfilled -> content; non-retryable ProviderError -> `error <status>: <message>`;
+// retryable ProviderError -> "temporary failure after retries"; anything else -> "internal tool error".
+// If the run was aborted, rethrow instead of returning results.
+export async function runToolBatch(calls: ToolCall[], exec: Exec, signal: AbortSignal): Promise<ToolResult[]> {
+  const attempt = (c: ToolCall) => exec(c, signal).catch((e: unknown) => { throw classify(e, c.name, signal); });
+  const values = await Promise.all(calls.map((c) => withRetry(() => attempt(c), signal)));
+  return values.map((v, i) => ({ toolCallId: calls[i]!.id, content: v, isError: false }));
+}
+
+// LAB 4: fire-and-forget that can never become an unhandled rejection: attach a handler that
+// passes the error to onError. Return nothing.
+export function fireAndForget(p: Promise<unknown>, onError: (e: unknown) => void): void {
+  void p;
+}
+
+// Fake tools: search is slow, lookup gets a permanent 400, crm a 503 once, docs a transport
+// failure once, and buggy has a bug in our own code.
+export function fakeExec(attempts: Map<string, number>): Exec {
+  return async (c, signal) => {
+    const n = (attempts.get(c.name) ?? 0) + 1;
+    attempts.set(c.name, n);
+    await sleep(c.name === "search" ? 50 : 5, undefined, { signal });
+    if (c.name === "lookup") throw new ProviderError("order not found", 400, false);
+    if (c.name === "crm" && n === 1) throw new ProviderError("crm unavailable", 503, true);
+    if (c.name === "docs" && n === 1) throw new TypeError("fetch failed", { cause: new Error("ECONNRESET") });
+    if (c.name === "buggy") throw new TypeError("Cannot read properties of undefined (reading 'id')");
+    return `${c.name} ok`;
+  };
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  const attempts = new Map<string, number>();
+  const calls = ["search", "lookup", "crm", "docs", "buggy"].map((name, i) => ({ id: `c${i + 1}`, name, args: {} }));
+  try {
+    const results = await runToolBatch(calls, fakeExec(attempts), new AbortController().signal);
+    for (const r of results) console.log(r.toolCallId, r.isError ? "error" : "ok", r.content);
+  } catch (e) {
+    console.log("batch threw:", (e as Error).message);
+  }
+  console.log("attempts:", JSON.stringify(Object.fromEntries(attempts)));
+  fireAndForget(Promise.reject(new Error("trace sink down")), (e) => console.log("trace write failed:", (e as Error).message));
+}
+```
+
+### Expected output
+`node lab.ts` with a correct solution prints:
+
+```
+c1 ok search ok
+c2 error error 400: order not found
+c3 ok crm ok
+c4 ok docs ok
+c5 error internal tool error
+attempts: {"search":1,"lookup":1,"crm":2,"docs":2,"buggy":1}
+trace write failed: trace sink down
+```
+
+The starter prints `batch threw: tool call failed`, one attempt per tool, and then the process exits with
+code 1 on the unhandled `trace sink down` rejection: the two failures this lab removes.
+
+### Tests
+```ts
+import { expect, test } from "vitest";
+import { ProviderError, classify, fakeExec, fireAndForget, runToolBatch, withRetry } from "./lab.ts";
+
+const live = () => new AbortController().signal;
+const calls = (...names: string[]) => names.map((name, i) => ({ id: `c${i + 1}`, name, args: {} }));
+
+test("transport failures are wrapped with their cause; bugs are not", () => {
+  const net = new TypeError("fetch failed");
+  const wrapped = classify(net, "docs", live());
+  expect(wrapped).toBeInstanceOf(ProviderError);
+  expect(wrapped).toMatchObject({ status: 0, retryable: true, cause: net });
+  const bug = new TypeError("Cannot read properties of undefined");
+  expect(classify(bug, "x", live())).toBe(bug);
+  const p400 = new ProviderError("bad", 400, false);
+  expect(classify(p400, "x", live())).toBe(p400);
+});
+
+test("only retryable errors are retried", async () => {
+  let n = 0;
+  await expect(withRetry(async () => { n++; throw new ProviderError("bad", 400, false); }, live(), 3, 1)).rejects.toThrow("bad");
+  expect(n).toBe(1);
+  n = 0;
+  expect(await withRetry(async () => { if (++n < 3) throw new ProviderError("busy", 503, true); return "ok"; }, live(), 3, 1)).toBe("ok");
+  expect(n).toBe(3);
+});
+
+test("an aborted run is never retried", async () => {
+  const ac = new AbortController();
+  let n = 0;
+  const p = withRetry(async () => { n++; ac.abort(); throw new ProviderError("busy", 503, true); }, ac.signal, 3, 1);
+  await expect(p).rejects.toBeDefined();
+  expect(n).toBe(1);
+});
+
+test("one result per call, in order, whatever fails", async () => {
+  const attempts = new Map<string, number>();
+  const out = await runToolBatch(calls("search", "lookup", "crm", "docs", "buggy"), fakeExec(attempts), live());
+  expect(out).toEqual([
+    { toolCallId: "c1", content: "search ok", isError: false },
+    { toolCallId: "c2", content: "error 400: order not found", isError: true },
+    { toolCallId: "c3", content: "crm ok", isError: false },
+    { toolCallId: "c4", content: "docs ok", isError: false },
+    { toolCallId: "c5", content: "internal tool error", isError: true },
+  ]);
+  expect(Object.fromEntries(attempts)).toEqual({ search: 1, lookup: 1, crm: 2, docs: 2, buggy: 1 });
+});
+
+test("a cancelled run rethrows instead of reporting tool errors", async () => {
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 10);
+  await expect(runToolBatch(calls("search"), fakeExec(new Map()), ac.signal)).rejects.toMatchObject({ name: "AbortError" });
+});
+
+test("fire-and-forget failures reach onError, not the process", async () => {
+  const seen: unknown[] = [];
+  fireAndForget(Promise.reject(new Error("trace sink down")), (e) => seen.push(e));
+  await new Promise((r) => setTimeout(r, 5));
+  expect(seen).toHaveLength(1);
+});
+```
+
+Five of the six fail on the starter; the last one also shows up in Vitest's "Unhandled Rejection" report.
+The abort-retry test passes trivially, since the starter never retries. A correct solution passes all six
+with no unhandled errors.
+
+### Failure scenarios
+- **Wrap every unknown error as retryable** (the `callProvider` habit from the first example). The `buggy`
+  call is retried and reported as `temporary failure after retries`, hiding a bug in your code behind a
+  transient-looking message. Debug by logging `err.cause` chains: a `TypeError` that is not `fetch failed`
+  is yours.
+- **Keep `Promise.all` and retry the whole batch on failure.** `search` and `crm` run twice, and in a real
+  agent a sent email is sent twice. The attempts assertion (`search: 1`) catches it; fix with
+  `allSettled` and per-call retry.
+- **Await the calls one by one after starting them all.** If `lookup` rejects while you are still awaiting
+  `search`, nobody is listening yet: Node reports an unhandled rejection. Debug by running with
+  `--unhandled-rejections=strict` in tests so the window cannot hide.
+- **Retry inside the abort.** Without the `signal.aborted` check, a cancelled run retries the 503 and bills
+  another call for a user who left. The abort-retry test counts attempts.
+
+### Submission
+- **Your `lab.ts`** with the four LAB steps done, and a passing `npx vitest run` (six tests, no unhandled
+  errors).
+- **The `node lab.ts` output**, matching the expected output.
+- **One log line** for the `docs` failure that prints the `cause` chain (`fetch failed` then the
+  `ECONNRESET` cause).
+- **A note** (3-5 sentences) on which of the five results the model should see as errors, which ones it
+  should not see at all, and why.
+- **Evaluated on:** tests passing, no `Promise.all` left on the tool path, causes kept, and retries limited
+  to retryable, non-aborted errors.
 
 ## Why it exists
 - **Callbacks made errors easy to forget.** Callback-style Node passed errors as the first argument, so a

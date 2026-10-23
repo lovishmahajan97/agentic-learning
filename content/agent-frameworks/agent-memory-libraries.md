@@ -5,7 +5,8 @@ name: agent memory libraries (Mem0, Letta)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/agent-memory
@@ -37,6 +38,157 @@ user, while Letta (formerly MemGPT) runs stateful agents that edit their own mem
   session), retrieval count, update and deletion policy, and which store backs it.
 - **What you can skip.** Building your own extraction and deduplication pipeline unless you have unusual
   needs; the concepts are in the agent-memory lesson, and these tools implement them.
+
+## Lab
+### Task
+Fix the four memory bugs from this lesson's Pitfalls in a small memory layer shaped like Mem0's add,
+search, delete and history calls: stale facts that pile up, memories that leak across users, card
+numbers that get stored, and a "forget me" that forgets nothing.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** this lesson's Mem0 flow (add, search, manage) and the cross-tenant leakage lesson.
+- **Runs offline:** `extract_facts` is a recorded extractor standing in for Mem0's LLM extraction step,
+  so behaviour is deterministic and needs no API key or vector store.
+- **Needs:** Python 3.10+ and `pytest`; checked with Python 3.12 and pytest 9.1.1. The agent loop calls `search` before a turn and `add` after it, as in the Mem0 example.
+
+### Starter code
+```python
+# memory_layer.py: the parts of agent memory you own (scope, update, redact, forget), offline
+import itertools
+import re
+
+def extract_facts(message: str) -> list[tuple[str, str]]:
+    """Recorded extractor: a stand-in for Mem0's LLM extraction step. Returns (slot, fact) pairs."""
+    rules = [
+        (r"\bi(?:'m| am) vegetarian\b", "diet", lambda m: "is vegetarian"),
+        (r"\bi eat meat\b", "diet", lambda m: "eats meat"),
+        (r"\bi (?:live in|moved to) (\w+)", "city", lambda m: f"lives in {m.group(1).title()}"),
+        (r"\bremember (.+)", "note", lambda m: m.group(1).rstrip(".")),
+    ]
+    return [(slot, fact(m)) for pat, slot, fact in rules
+            if (m := re.search(pat, message, re.IGNORECASE))]
+
+CARD = re.compile(r"\b\d(?:[ -]?\d){12,15}\b")
+
+class MemoryStore:
+    def __init__(self):
+        self.rows: dict[int, dict] = {}       # id -> {"user_id", "slot", "memory"}
+        self.history: list[dict] = []         # audit log: {"id", "user_id", "event", "old", "new"}
+        self._ids = itertools.count(1)
+
+    def add(self, user_id: str, message: str) -> list[dict]:
+        ops = []
+        for slot, fact in extract_facts(message):
+            # YOUR CODE: redact card numbers from the fact before it is stored; when this user
+            # already has a memory in the same slot (except "note"), UPDATE it and log old and new
+            # in history instead of adding a second, contradictory memory
+            mid = next(self._ids)
+            self.rows[mid] = {"user_id": user_id, "slot": slot, "memory": fact}
+            self.history.append({"id": mid, "user_id": user_id, "event": "ADD", "old": None, "new": fact})
+            ops.append({"id": mid, "event": "ADD", "memory": fact})
+        return ops
+
+    def search(self, query: str, user_id: str | None = None, limit: int = 5) -> list[str]:
+        # YOUR CODE: a search without user_id must raise ValueError, and results must only come
+        # from that user's memories
+        words = set(re.findall(r"\w+", query.lower()))
+        scored = sorted(self.rows.items(), key=lambda kv: (
+            -len(words & set(re.findall(r"\w+", kv[1]["memory"].lower()))), -kv[0]))
+        return [r["memory"] for _, r in scored[:limit]]
+
+    def forget(self, user_id: str) -> int:
+        # YOUR CODE: delete every memory of this user, log a DELETE per memory, return the count
+        return 0
+
+def system_prompt(store: MemoryStore, user_id: str, message: str) -> str:
+    facts = store.search(message, user_id=user_id, limit=3)
+    return "Known facts about the user:\n" + "\n".join(f"- {f}" for f in facts or ["none"])
+
+if __name__ == "__main__":
+    m = MemoryStore()
+    m.add("u-7", "I'm vegetarian and I live in Pune.")
+    m.add("u-9", "I eat meat. Remember my card 4111 1111 1111 1111 for bookings.")
+    print(m.add("u-7", "Update: I moved to Delhi last month."))
+    print(system_prompt(m, "u-7", "Suggest a dinner place near me"))
+    print("u-9:", m.search("card bookings", user_id="u-9"))
+    print("forgot:", m.forget("u-7"), "| left for u-7:", m.search("Delhi", user_id="u-7"))
+    print("history:", [(h["event"], h["old"], h["new"]) for h in m.history if h["user_id"] == "u-7"])
+```
+
+As given, user u-7's prompt includes u-9's card number and "eats meat", Pune and Delhi both survive,
+and `forget` returns 0 while every memory stays searchable.
+
+### Expected output
+```
+[{'id': 2, 'event': 'UPDATE', 'memory': 'lives in Delhi'}]
+Known facts about the user:
+- lives in Delhi
+- is vegetarian
+u-9: ['my card [REDACTED] for bookings', 'eats meat']
+forgot: 2 | left for u-7: []
+history: [('ADD', None, 'is vegetarian'), ('ADD', None, 'lives in Pune'), ('UPDATE', 'lives in Pune', 'lives in Delhi'), ('DELETE', 'is vegetarian', None), ('DELETE', 'lives in Delhi', None)]
+```
+
+### Tests
+```python
+# test_memory_layer.py: run with `pytest -q`
+import pytest
+from memory_layer import MemoryStore, system_prompt
+
+@pytest.fixture
+def m():
+    s = MemoryStore()
+    s.add("u-7", "I'm vegetarian and I live in Pune.")
+    s.add("u-9", "I eat meat. Remember my card 4111 1111 1111 1111 for bookings.")
+    return s
+
+def test_changed_fact_updates_instead_of_appending(m):
+    ops = m.add("u-7", "I moved to Delhi last month.")
+    assert [o["event"] for o in ops] == ["UPDATE"]
+    facts = m.search("where do I live", user_id="u-7")
+    assert "lives in Delhi" in facts and "lives in Pune" not in facts
+    assert ("UPDATE", "lives in Pune", "lives in Delhi") in [
+        (h["event"], h["old"], h["new"]) for h in m.history]
+
+def test_users_never_see_each_other(m):
+    assert "eats meat" not in m.search("what do I eat", user_id="u-7")
+    assert "eats meat" not in system_prompt(m, "u-7", "Suggest a dinner place near me")
+
+def test_unscoped_search_is_refused(m):
+    with pytest.raises(ValueError):
+        m.search("card")
+
+def test_card_numbers_are_redacted_before_storage(m):
+    stored = " ".join(r["memory"] for r in m.rows.values())
+    assert "4111" not in stored and "[REDACTED]" in stored
+    assert "4111" not in str(m.history)
+
+def test_forget_removes_only_that_user_and_is_audited(m):
+    assert m.forget("u-7") == 2
+    assert m.search("vegetarian Pune", user_id="u-7") == []
+    assert m.search("meat", user_id="u-9") != []
+    assert [h["event"] for h in m.history if h["user_id"] == "u-7"].count("DELETE") == 2
+```
+
+All five fail on the starter, each on the bug it names. The history test also checks that the audit
+log itself never holds the raw card number.
+
+### Failure scenarios
+- **Redact after storing.** The rows look clean but `history` still holds `4111 ...`. Debug by
+  grepping every copy (rows, history, logs, traces), because memory is never the only copy.
+- **Update across users.** Matching on slot alone lets u-9's "eats meat" overwrite u-7's diet. Debug
+  with a test where two users share a slot; the update filter needs both user and slot.
+- **Default `user_id` to a constant.** A shared fallback such as `"anonymous"` turns into a global
+  memory. Debug by counting searches per distinct user id; the fix is to raise, never to default.
+- **Delete rows but return a stale prompt.** A cached system prompt keeps a forgotten fact alive. Debug
+  by running the forget check against the full agent turn, not only the store.
+
+### Submission
+- **Code:** `memory_layer.py` with the three `YOUR CODE` parts done; `extract_facts` and `CARD` unchanged.
+- **Test run:** `pytest -q` showing 5 passed.
+- **Program output:** the six stdout lines from `python memory_layer.py`, matching Expected output.
+- **Mapping note:** for each fix, the Mem0 call or setting you would use instead (update path, `user_id`
+  scoping, redaction before `add`, `delete_all` plus `history`).
+- **One extra test** for a scenario this lab misses, such as a fact that is retracted rather than changed.
 
 ## Why it exists
 - **Context windows are not memory.** Long histories cost tokens on every call and degrade attention;

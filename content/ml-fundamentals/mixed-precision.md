@@ -5,7 +5,8 @@ name: Mixed precision
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/gradient-clipping
@@ -172,7 +173,57 @@ flowchart TD
     H --> M
 ```
 
+## Misconceptions
+- **"Mixed precision halves training memory."** It halves activation memory, not model state. Full
+  fine-tuning a 7B model with Adam still needs about 16 bytes per parameter (about 112 GB). LoRA, sharding
+  or 8-bit optimizers cut that.
+- **"bf16 is strictly better than fp16."** bf16 has fp32's range, so it needs no loss scaling, but it keeps
+  only 8 significant bits to fp16's 11. Long sums and the weight update are where it rounds harder, which
+  is why reductions stay fp32 and master weights stay fp32.
+- **"`model.half()` is the simple way to train in 16 bits."** With no fp32 master, updates below the
+  rounding unit vanish: 1,000 steps of 1e-4 leave an fp16 weight at exactly 1.0. Use autocast and keep
+  trainable weights (including LoRA adapters) in fp32.
+- **"Loss scaling also protects bf16 runs."** It fixes fp16's narrow exponent range. A `GradScaler` on
+  bf16 does nothing useful, and a scale that keeps halving on fp16 means the forward overflows, which
+  scaling cannot fix.
+- **"An eval that flips after moving to bf16 serving is a regression."** Flips on near-tie tool choices
+  are expected, because bf16 logits differ from fp32 in the third digit. Run evals in the serving dtype
+  and report run-to-run variance.
+
 ## Examples
+### Why master weights matter, in pure Python
+No GPU needed: Python's `struct` module packs IEEE half precision with the `"e"` format, so you can watch
+an fp16 weight ignore 1,000 updates of 1e-4 that an fp32 master absorbs.
+
+```python
+import struct
+
+def fp16(x):                      # round a Python float to the nearest fp16 value
+    return struct.unpack("e", struct.pack("e", x))[0]
+
+def fp32(x):
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+lr, grad, steps = 1e-4, 1.0, 1000         # each update is 1e-4, the weight is 1.0
+w16, w32 = fp16(1.0), fp32(1.0)
+for _ in range(steps):
+    w16 = fp16(w16 - lr * grad)           # weights stored in fp16: update rounded away
+    w32 = fp32(w32 - lr * grad)           # fp32 master copy: updates accumulate
+print(f"fp16 weights after {steps} steps: {w16}")     # 1.0   (spacing just below 1.0 is 2^-11)
+print(f"fp32 master after {steps} steps:  {w32:.4f}")  # 0.9000
+print(f"forward copy cast from master:   {fp16(w32)}") # 0.89990234375
+
+try:
+    fp16(70_000.0)                        # above fp16 max of 65,504
+except OverflowError as e:
+    print("fp16(70000):", e)              # float too large to pack with e format
+```
+
+| Weight storage | After 1,000 updates of 1e-4 | What training sees |
+|---|---|---|
+| fp16 only (`model.half()`) | 1.0 | loss plateaus: the optimizer steps and nothing moves |
+| fp32 master, fp16 cast for forward | 0.9000 master, 0.8999 cast | the full update is applied |
+
 ### Worked scenario: fitting a tool-calling fine-tune of a 7B model
 Model-state arithmetic for adapting a 7B model to an agent's tool-call format. The adapter size is
 illustrative (tens of millions of parameters is typical for LoRA).
@@ -236,39 +287,6 @@ def train_step(model, opt, x, y, dtype, scaler=None, max_norm=1.0):
 # bf16: train_step(model, opt, x, y, torch.bfloat16)
 # fp16: scaler = torch.amp.GradScaler("cuda"); train_step(model, opt, x, y, torch.float16, scaler)
 ```
-
-### Why master weights matter, in pure Python
-No GPU needed: Python's `struct` module packs IEEE half precision with the `"e"` format, so you can watch
-an fp16 weight ignore 1,000 updates of 1e-4 that an fp32 master absorbs.
-
-```python
-import struct
-
-def fp16(x):                      # round a Python float to the nearest fp16 value
-    return struct.unpack("e", struct.pack("e", x))[0]
-
-def fp32(x):
-    return struct.unpack("f", struct.pack("f", x))[0]
-
-lr, grad, steps = 1e-4, 1.0, 1000         # each update is 1e-4, the weight is 1.0
-w16, w32 = fp16(1.0), fp32(1.0)
-for _ in range(steps):
-    w16 = fp16(w16 - lr * grad)           # weights stored in fp16: update rounded away
-    w32 = fp32(w32 - lr * grad)           # fp32 master copy: updates accumulate
-print(f"fp16 weights after {steps} steps: {w16}")     # 1.0   (spacing just below 1.0 is 2^-11)
-print(f"fp32 master after {steps} steps:  {w32:.4f}")  # 0.9000
-print(f"forward copy cast from master:   {fp16(w32)}") # 0.89990234375
-
-try:
-    fp16(70_000.0)                        # above fp16 max of 65,504
-except OverflowError as e:
-    print("fp16(70000):", e)              # float too large to pack with e format
-```
-
-| Weight storage | After 1,000 updates of 1e-4 | What training sees |
-|---|---|---|
-| fp16 only (`model.half()`) | 1.0 | loss plateaus: the optimizer steps and nothing moves |
-| fp32 master, fp16 cast for forward | 0.9000 master, 0.8999 cast | the full update is applied |
 
 ## Production patterns
 - **bf16 autocast by default for agent fine-tunes.** On Ampere-class or newer GPUs and TPUs set

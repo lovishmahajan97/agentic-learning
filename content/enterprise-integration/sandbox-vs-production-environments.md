@@ -5,7 +5,8 @@ name: Sandbox vs production environments
 kind: practice
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - enterprise-integration/enterprise-connectors
@@ -38,6 +39,70 @@ deliberately, prove quality in shadow mode, and hard-guard tools so the two neve
   but its write tools are disabled.
 - **What you can skip.** The details of each vendor's sandbox types and refresh rules beyond what your
   customer uses; learn the matrix, the guards and the promotion path, and look up the platform specifics.
+
+## Decision case
+### Scenario
+Your team is shipping a case-triage agent for a customer's support organisation: it reads new cases,
+sets the category and priority with `update_case`, and drafts a first reply. Volume is 3,000 cases per
+day across 6 queues. All figures are illustrative.
+
+- **Data:** the customer grants only a partial-copy sandbox with masked names and emails; no full-copy
+  sandbox is available this quarter.
+- **Data agreement:** your service may read production cases, but unmasked text may not be copied out
+  of the customer's tenant.
+- **Safety:** no write to a real case before the customer's support lead signs off.
+- **Quality bar:** category agreement with human agents of at least 88% on real text.
+- **Deadline:** go-live in 6 weeks; two engineers.
+
+### Options
+| Option | How it works | Real-text quality evidence | Writes before sign-off | Fits 6 weeks |
+|---|---|---|---|---|
+| A. Sandbox UAT only | Functional and quality evals on the masked partial copy, then full rollout | none: masked text, as in the 91% vs 84% gap above | none | yes |
+| B. Wait for a full copy | Request a full-copy sandbox and evaluate there | good, if unmasked | none | no: not available this quarter |
+| C. Sandbox, then shadow, then canary | Sandbox for correctness; production shadow with write tools returning dry runs; canary on one queue | direct: proposals compared with human decisions | none until canary sign-off | yes |
+| D. Test account in production | Run the live agent against production using a test user | partial: test cases are not real traffic | yes: real writes, test data in prod | yes |
+
+### Decision
+Choose **C**, because it is the only option that measures quality on real text without a write before
+sign-off and still fits the deadline.
+
+| Phase | Weeks | What it proves |
+|---|---|---|
+| Sandbox | 2 | tool schemas, field mapping, permissions with seeded users, the host guard |
+| Shadow | 2 | category agreement on live inputs: 10 working days × 3,000 cases = 30,000 compared proposals |
+| Canary | 1 | one queue of 6, so 3,000 / 6 = 500 cases per day with real writes |
+| Buffer | 1 | fixes found in shadow |
+
+- **The sample is large enough.** To estimate 88% agreement within ±1 point at 95% confidence needs
+  about 1.96² × 0.88 × 0.12 / 0.01² ≈ 4,057 cases, so even the first two shadow days (6,000) suffice.
+- **Rollback criteria are agreed before the canary:** agreement below 85% or a write-error rate above
+  1% on the canary queue returns it to shadow.
+
+**What would change it.**
+- **A full-copy sandbox with unmasked data appears:** run quality evals there and shorten shadow.
+- **No production read access at all:** replace shadow with a canary where every write needs human
+  approval.
+- **A feature with no free text** (a plain field sync): sandbox plus read-only smoke tests are enough.
+
+### Trade-offs accepted
+- **Two weeks of production reads without value delivered.** Watch the read calls per case against the
+  customer's API quota during shadow.
+- **Shadow trajectories can drift from live ones.** Dry-run results are success-shaped; compare tool-call
+  counts per run between shadow and canary to spot a model reacting to them.
+- **A production read credential exists before go-live.** It lives only in the production binding and
+  its secret store, with writes disabled until the canary.
+- **The masked sandbox still misleads.** Its accuracy is reported but never used as the quality gate.
+
+### Review rubric
+- **Each constraint is named and tested:** data masking, the data agreement, no writes before sign-off,
+  the quality bar and the deadline each appear in the options table.
+- **What the sandbox can and cannot prove is explicit:** correctness, schema and permissions there;
+  real-text quality only from production-safe methods.
+- **The shadow design is concrete:** write tools return dry runs, the comparison target (human decisions)
+  is named, and the sample size is computed.
+- **Canary rollback criteria are numeric** and agreed before the canary starts.
+- **Cross-wiring guards are part of the plan:** one binding per environment, a host allow-list and
+  per-environment webhook secrets.
 
 ## Why it exists
 - **The customer has its own environments.** Software teams separate development, staging and

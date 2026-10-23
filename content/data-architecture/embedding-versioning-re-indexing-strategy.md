@@ -5,7 +5,8 @@ name: Embedding versioning / re-indexing strategy
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - rag-retrieval/embedding-models
@@ -39,6 +40,73 @@ and hash content to re-embed only changed chunks.
   cache that keeps routine runs cheap.
 - **What you can skip.** The internals of HNSW and IVF training. Know which parameters are fixed at build
   time and which are query-time knobs; that is enough to decide re-embed versus re-index.
+
+## Decision case
+### Scenario
+A SaaS company runs a support agent whose `search_docs` tool searches 6 million chunks (about 500 tokens
+each, 3 billion tokens) in a single pgvector cluster. The vendor is retiring the 1536-dimension embedding
+model, so the team must move to a newer 1024-dimension model.
+
+Constraints (figures illustrative):
+- **Deadline.** The old model stops answering in 6 weeks; after that no new chunk can be embedded under v6.
+- **No mixed-space window.** The agent serves about 40,000 searches a day and must never search two spaces.
+- **Throughput.** A shared rate limit of 1 million tokens per minute, so a full re-embed takes 3,000 minutes,
+  about 50 hours.
+- **Change rate.** About 2% of chunks (120,000, 60 million tokens) change per day.
+- **Memory.** Nodes have 96 GB of RAM. Raw vectors are 6M × 1536 × 4 bytes ≈ 36.9 GB today and
+  6M × 1024 × 4 bytes ≈ 24.6 GB after, plus under 1 GB of HNSW links per index at `m = 16`.
+- **Team.** Two engineers own retrieval; the ingestion service belongs to another team with a 3-week
+  release queue. Source tables carry a reliable `updated_at` and a deletes log.
+
+### Options
+| Option | How it works | Mixed-space window | Deadline | Memory peak | Ingestion change |
+|---|---|---|---|---|---|
+| **A. Re-embed in place** | Overwrite vectors as the job runs | About 50 h, no rollback | Yes | One copy | None, but the column changes dimension |
+| **B. Blue-green with dual-write** | Build `docs_v7` beside `docs_v6`; ingestion embeds new chunks under both | None | Tight: waits for the 3-week release queue | ≈ 63 GB, fits | Yes, owned by another team |
+| **C. Blue-green with watermark replay** | Build `docs_v7` beside; record a start watermark; replay changes since | None | Yes: about 2 days build plus catch-up | ≈ 63 GB, fits | None |
+| **D. Adapter now, rebuild later** | Map new-model queries into the v6 space with a learned adapter | None, but lower quality | Fails: new chunks cannot be embedded under v6 after retirement | One copy | None |
+
+### Decision
+Choose **C**, blue-green with watermark replay, gated on evals:
+- **It is the only option with no mixed window that the retrieval team can ship alone.** A searches two
+  spaces for about 50 hours, and B depends on another team's release queue.
+- **Memory fits.** 36.9 + 24.6 GB of vectors plus two graphs is about 63 GB on a 96 GB node, leaving
+  headroom for the HNSW build.
+- **The catch-up is small.** 50 hours of edits is about 250,000 chunks, 125 million tokens, so roughly
+  2 hours of replay, then a short second pass to close the gap right before the swap. Documents edited
+  several times are embedded once in their final state.
+- **D does not solve the problem.** After retirement, new documents still need old-space vectors.
+- **The swap is gated.** Swap only if recall@5 and MRR on the 400-question eval set are at least as good,
+  and 100 replayed agent tasks hold task success and tool calls per task.
+
+What would change it:
+- **No trustworthy watermark or deletes log.** Then replay can miss edits, so take B and wait for the
+  ingestion release.
+- **Less memory headroom** (for example 48 GB nodes). Then add a node for the build window, or build on a
+  separate cluster and move the agent's connection string instead of a view.
+- **The new model loses the eval.** Keep v6 live, test another model or chunker before the deadline, and use
+  an adapter only as a short bridge that passes the same gate.
+
+### Trade-offs accepted
+- **Double storage for the soak week.** Watch node memory and disk; delete `docs_v6` once the week is clean.
+- **A short lag before the swap.** The new collection trails live edits until the final pass; watch the
+  count of rows with `updated_at` after the watermark and swap only when it is near zero.
+- **Rate limit shared with nightly ingestion.** The 50-hour job slows routine runs; watch nightly job
+  duration and pause the backfill if it would overrun.
+- **Query-side cutover risk.** The tool must switch embedder and cache key with the alias; watch
+  `embedding_version_mismatch` errors, which should stay at zero.
+
+### Review rubric
+- **The recipe change is a new version.** The write-up hashes model, revision, dimension and chunker into a
+  new `embedding_version` and says the query side switches with the alias.
+- **Duration and memory are computed.** It derives build time from tokens and throughput, and peak memory
+  from both copies, with the arithmetic shown.
+- **Catch-up is explicit.** It picks dual-write or replay with a reason and closes the gap before the swap.
+- **The swap is gated on evals.** It names retrieval metrics and agent task metrics with a pass threshold.
+- **Rollback and retirement are planned.** It keeps the old collection for a stated soak and names the
+  signal that triggers a rollback.
+- **Reversal conditions are concrete.** It names the fact (watermark, memory, eval result) that would change
+  the option.
 
 ## Why it exists
 - **The index silently depends on three things.** Which model turned text into vectors; how it was called

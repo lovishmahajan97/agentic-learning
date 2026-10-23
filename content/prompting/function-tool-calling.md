@@ -5,7 +5,8 @@ name: Function / tool calling
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/structured-outputs-json-mode
@@ -138,6 +139,23 @@ sequenceDiagram
     A->>M: history + tool_result
     M-->>A: text answer, stop_reason end_turn
 ```
+
+## Misconceptions
+- **"The model calls the function."** It emits a `tool_use` block with an id, a name and JSON arguments
+  and stops; nothing runs until your code validates and executes it (server-side tools are declared
+  separately). An agent that says "I have sent the email" may have run nothing.
+- **"A rule in the system prompt or tool description is enforced."** Prompt text guides; injection or a
+  jailbreak can override it. A limit like "never refund more than $50" must be checked in the executor.
+- **"If the model has a tool, it will use it when it needs a fact."** Selection is a generation decision;
+  a model that believes it knows the answer answers from weights, so descriptions must state the trigger
+  condition, and the should-have-called rate is measured separately.
+- **"A strict schema means the arguments are right."** `strict: true` guarantees the input validates,
+  not that the order id exists or was ever mentioned; plausible invented ids like `ORD-00001` still need
+  a check against the conversation.
+- **"A tool error should raise and stop the run."** Returned as a `tool_result` with `is_error: true`,
+  it lets the model adapt or explain; only a step budget and per-tool retry cap should end the loop.
+- **"Tool definitions are free metadata."** They are rendered into the prompt and paid on every request
+  of the loop: three times in a three-request task, which is why they belong in the cached prefix.
 
 ## Examples
 ### A support agent loop

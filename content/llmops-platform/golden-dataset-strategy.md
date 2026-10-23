@@ -5,7 +5,8 @@ name: Golden dataset strategy
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - evals/golden-dataset
@@ -39,6 +40,73 @@ goes stale, leaks and is mis-sized.
   contamination check against prompts and fine-tuning data.
 - **What you can skip.** Exotic sampling theory. The half-width formula, per-slice quotas and pairing are
   enough to size agent task sets.
+
+## Decision case
+### Scenario
+The support agent from the sizing scenario below has four tools and a 350-item task set: 200
+`search_orders` items and 50 each for `issue_refund`, `update_address` and `escalate_to_human`.
+
+Last quarter a prompt edit cut refund success by about 8 points and passed the gate, because the refund slice
+was too small to see it. There were also 30 production incidents with no regression item.
+
+Facts and constraints, with illustrative figures:
+- **Labelling budget.** 400 new items this quarter. Each needs a label and a second review at about
+  6 minutes each: 400 × 12 = 4,800 minutes, 80 hours of the two domain reviewers' time.
+- **Gate target.** Bound the refund slice's candidate-minus-champion delta to ±5 points with a paired
+  comparison.
+- **Flip rate.** The measured flip rate between recent candidates is f = 10%. With the paired rule the
+  refund slice needs n ≈ 1.96² × 0.10 / 0.05² ≈ 154 items.
+- **Overfitting.** Prompt authors iterate daily against the full set, and nobody can tell whether gains
+  are real.
+
+### Options
+For each option, the refund half-width is 1.96 × √(0.10 / n) in points.
+
+| Option | How the 400 items are spent | Refund items | Refund paired half-width | Incidents covered | Overfitting check |
+|---|---|---|---|---|---|
+| **A. Uniform from traffic** | 400 traces sampled by traffic share; refunds get 20%, 80 items | 130 | ±5.4: misses the target | No | No |
+| **B. Equal quota** | 100 more per slice | 150 | ±5.1: just misses | No | No |
+| **C. Risk-weighted portfolio** | 30 regression items from incidents, 110 refund, 100 address, 60 escalation (adversarial and safety), 100 sealed holdout | 160 | ±4.9: meets it | All 30 | 100-item holdout |
+| **D. Synthetic refund items** | Generate refund cases, then label and review them | Up to 400 | Meets it on paper | No | No |
+
+### Decision
+Choose **C**:
+- **It is the only option that meets the gate target.** A and B spread labels by traffic or evenly, and
+  neither reaches 154 refund items.
+- **D buys count, not coverage.** Generated items still need the same label and review, so the budget
+  is the same, and a generator writes easier cases than users do.
+- **The 30 regression items are the cheapest coverage on the list.** Each one is a failure that already
+  happened, and the regression tier must pass at 100%.
+- **The holdout answers the overfitting question.** It is readable only by the release job's service
+  account.
+- **The arithmetic adds up:** 30 + 110 + 100 + 60 + 100 = 400.
+
+What would change it:
+- **A higher flip rate.** At f = 20% the refund slice needs about 307 items, and at 160 the half-width is
+  ±6.9. Either buy more labelling time or gate refunds on ±7 points and say so.
+- **A refund policy change.** Relabelling the refund slice comes first, because a stale expected state
+  makes every new item worthless. That is a new version, never an edit in place.
+- **No capacity for two sets.** Rotate items into the holdout each version instead of sealing 100 now.
+
+### Trade-offs accepted
+- **`search_orders` gets no new items.** Its 200 items stay at ±5.5 unpaired. Watch its share of
+  production failures, and re-weight next quarter if it rises.
+- **The holdout is coarse.** At 100 items and p = 0.8 its half-width is ±7.8 points, so only a large
+  full-versus-holdout gap is visible. Watch the gap at each release, not on each PR.
+- **The aggregate no longer matches traffic.** Report a traffic-weighted score next to the per-slice
+  floors.
+- **Reviewer time is the binding resource.** Watch inter-annotator agreement per slice; persistent
+  disagreement means the task definition needs work before more items.
+
+### Review rubric
+- **Item counts come from the smallest regression to detect,** using the paired or unpaired rule with
+  the measured flip rate, not round numbers.
+- **The budget is allocated explicitly** and sums to the stated total.
+- **Risk outranks traffic share:** the slice with money or safety at stake gets items first, with the
+  reason stated.
+- **Incidents become regression items,** and the plan says how new incidents keep flowing in.
+- **Overfitting and contamination are addressed** with a sealed holdout or rotation and access control.
+- **Reversal conditions are quantified,** such as the flip rate at which the plan stops meeting its target.
 
 ## Why it exists
 - **The single file fails four ways.** Most teams start with fifty examples the first engineer wrote in an

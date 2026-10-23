@@ -5,7 +5,8 @@ name: Technical due diligence
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: background
 related:
   - strategy/vendor-evaluation
@@ -33,6 +34,66 @@ true will cost, before the price is fixed.
   and trace-to-invoice reconciliation, so your own agent would pass the same scrutiny.
 - **What you can skip.** Deal instruments (escrow, warranties, earn-out mechanics) and legal process;
   recognise the three finding classes and leave the rest to the deal team.
+
+## Decision case
+### Scenario
+An ERP vendor is in week 5 of a 6-week diligence on a startup whose accounts-payable agent reads invoices,
+matches them to purchase orders and posts them through ERP tools. The startup claims "85% touchless
+invoices" and "60% gross margin". All figures are illustrative.
+- **Thesis floor:** the deal beats building in-house (estimated at 18 months) only if touchless stays at
+  or above 70% on the acquirer's own customers' invoices.
+- **Clean-room replay:** 400 acquirer invoices through the agent with sandboxed ERP tools, end state
+  checked. Measured touchless rate: 76%, interval ±1.96 × √(0.76 × 0.24 / 400) ≈ ±4.2 points, so 71.8% to
+  80.2%. The gap to 85% is real; the floor is still cleared.
+- **Steps:** about 8 per invoice on the acquirer's mix against 5 in the startup's traces, so inference
+  rises by 8 / 5 = 1.6×, from $0.12 to $0.192 per invoice.
+- **Margin:** price $0.80 per invoice and other costs $0.20. Claimed (0.80 − 0.12 − 0.20) / 0.80 = 60%; on
+  the acquirer's mix (0.80 − 0.192 − 0.20) / 0.80 = 51%.
+- **Tool scopes:** the agent's ERP credential can create suppliers and change bank details, so one
+  injected instruction in an invoice could redirect a payment. The acquirer's security policy forbids any
+  agent holding payee-change rights.
+- **Constraints:** the board wants signing this quarter; the security policy is not negotiable.
+
+### Options
+| Option | How it works | Thesis floor | Margin gap | Payee-change red line |
+|---|---|---|---|---|
+| Walk away | Build in-house instead | Not used | Avoided | Avoided |
+| Sign at headline terms, fix after close | Price on 85% and 60%; budget remediation later | Cleared | Paid at full price | Breached from day one of ownership |
+| Condition, adjust and earn-out | Pre-close condition to remove payee rights; price on 51% margin; earn-out on touchless rate | Cleared, with the gap priced | Priced in | Fixed before close |
+
+### Decision
+**Condition, adjust and earn-out.** The measured 76% has a lower bound of 71.8%, above the 70% floor, so
+the thesis holds; walking away would trade a working product for 18 months of building.
+- **Payee rights are a pre-close condition,** not remediation, because the policy is a red line and the
+  fix (a read-only supplier tool plus a human step for bank changes) takes weeks, not quarters.
+- **Price on the acquirer-mix margin of 51%,** not 60%, because those are the invoices the product will see.
+- **Earn-out on 80% touchless,** measured on a fresh acquirer held-out set 12 months after close, with
+  end state checked, so the startup is paid for closing the gap it claimed.
+
+**What would change it.**
+- **The lower bound falls below 70%,** for example if a re-run on more invoices lands near 72% (lower bound
+  about 67.6% at 400): renegotiate as a partnership or walk away.
+- **The startup refuses the scope fix before signing:** walk away, since the red line would be breached
+  from the first day of ownership.
+- **Pricing passes inference through to customers:** the margin adjustment shrinks.
+
+### Trade-offs accepted
+- **A slower close.** The condition may push signing by weeks; watch the scope fix's delivery date
+  against the board's quarter.
+- **Earn-out disputes.** The touchless definition must be fixed in the agreement as a checked end state,
+  or both sides will measure differently.
+- **The clean-room replay used sandboxed tools.** Real ERP latency and data quirks may differ; plan a
+  supervised read-only run in the first month after close.
+
+### Review rubric
+- **Claims turned into tests:** each headline number is matched by an independent measurement on the
+  acquirer's data.
+- **Intervals reported:** the measured rate has its interval, compared with both the claim and the thesis
+  floor.
+- **Margin rebuilt from traces:** steps and cost per task are recomputed for the acquirer's mix.
+- **Findings classified:** each finding is a deal-breaker, an adjustment or remediation, with a reason.
+- **Red lines treated as conditions:** policy breaches are fixed before close, not budgeted after.
+- **Walk-away triggers stated:** which re-measured value or refusal ends the deal.
 
 ## Why it exists
 - **Deals are priced on claims:** "proprietary model", "95% accuracy", "data moat", "70% gross margin",

@@ -5,7 +5,8 @@ name: code-execution sandboxes for agents (E2B, Modal, Docker)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/sandboxing
@@ -38,6 +39,186 @@ before they are safe.
   time limits, mounted files, installed packages, sandbox lifetime and what output flows back.
 - **What you can skip.** Writing your own hypervisor integration. Pick a product or a hardened container
   runtime; the threat model is covered in the sandboxing lesson.
+
+## Lab
+### Task
+Build the agent side of a `run_python` tool: the part you own whichever sandbox product sits behind
+it. You add one sandbox per session, an environment allowlist so no host secret enters, a kill after
+timeouts, tail-preserving output truncation, and an idle reaper. These are the five steps of the
+agent-side contract in How it works.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** this lesson's contract and hardening checklist; the sandboxing lesson's threat model.
+- **Runs anywhere:** `FakeBackend` stands in for E2B, Modal or the Docker tool in Examples. It is
+  **not** an isolation boundary; swap in a real backend before running anything a model wrote.
+- **Needs:** Python 3.10+ and `pytest`; checked with Python 3.12 and pytest 9.1.1.
+
+### Starter code
+```python
+# code_tool.py: the agent-side run_python tool (session reuse, no secrets, bounded output, reaping)
+import contextlib, io, itertools, os, time
+from dataclasses import dataclass
+
+MAX_CHARS = 200        # what may flow back into the model's context per call
+IDLE_S = 300           # kill a session's sandbox after this many idle seconds
+SAFE_ENV = {"PYTHONUNBUFFERED": "1", "MPLBACKEND": "Agg"}
+
+@dataclass(frozen=True)
+class Limits:
+    network: bool = False
+    mem_mb: int = 256
+    timeout_s: int = 10
+
+class FakeBackend:
+    """Stand-in for E2B, Modal or the Docker tool in Examples, so the lab runs anywhere.
+    NOT an isolation boundary: it exec()s in-process and is only safe for these test inputs.
+    Each sandbox keeps its own globals (like a live interpreter) and sees only the env it was given.
+    A run containing 'while True' simulates the backend killing it at the timeout."""
+    def __init__(self):
+        self.live: dict[str, dict] = {}
+        self.created = 0
+        self._ids = itertools.count(1)
+    def create(self, limits: Limits, env: dict) -> str:
+        sid = f"sbx-{next(self._ids)}"
+        self.live[sid] = {"limits": limits, "env": dict(env), "ns": {"ENV": dict(env)}}
+        self.created += 1
+        return sid
+    def exec(self, sid: str, code: str) -> dict:
+        box = self.live[sid]
+        if "while True" in code:
+            raise TimeoutError(f"killed after {box['limits'].timeout_s}s")
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                exec(code, box["ns"])
+            return {"exit_code": 0, "output": buf.getvalue()}
+        except Exception as e:
+            return {"exit_code": 1, "output": buf.getvalue() + f"{type(e).__name__}: {e}"}
+    def kill(self, sid: str) -> None:
+        self.live.pop(sid, None)
+
+class CodeTool:
+    def __init__(self, backend, limits: Limits = Limits(), clock=time.monotonic):
+        self.backend, self.limits, self.clock = backend, limits, clock
+        self.sessions: dict[str, tuple[str, float]] = {}    # session_id -> (sandbox_id, last_used)
+
+    def run_python(self, session_id: str, code: str) -> dict:
+        """Tool the model calls. Returns a bounded {"exit_code", "output"} dict."""
+        # YOUR CODE (1): reuse this session's sandbox if it has one, else create it and remember it
+        # YOUR CODE (2): create sandboxes with SAFE_ENV only, never the agent's own environment
+        sid = self.backend.create(self.limits, dict(os.environ))
+        try:
+            res = self.backend.exec(sid, code)
+        except TimeoutError as e:
+            res = {"exit_code": None, "output": f"timeout: {e}"}
+            # YOUR CODE (3): a timed-out interpreter may still be spinning: kill it and forget it
+        # YOUR CODE (4): keep at most MAX_CHARS, the TAIL of the output (errors print last), and
+        # prefix "[truncated N chars]\n" when you cut N characters
+        return res
+
+    def reap(self) -> list[str]:
+        """Called by a periodic job: kill sandboxes idle longer than IDLE_S, return session ids."""
+        # YOUR CODE (5)
+        return []
+
+if __name__ == "__main__":
+    os.environ["DB_PASSWORD"] = "s3cret"                 # the agent host holds a credential
+    now = [0.0]
+    backend = FakeBackend()
+    tool = CodeTool(backend, clock=lambda: now[0])
+    print(tool.run_python("s1", "import math\nrows = [math.sqrt(i) for i in range(5)]"))
+    print(tool.run_python("s1", "print(round(sum(rows), 3))"))
+    print(tool.run_python("s1", "print(ENV.get('DB_PASSWORD'))"))
+    print(tool.run_python("s1", "print('x' * 1000)")["output"][:40])
+    print(tool.run_python("s2", "while True: pass"))
+    now[0] = 400.0
+    print("reaped:", tool.reap(), "| live:", len(backend.live), "| created:", backend.created)
+```
+
+As given, the second call fails with `NameError` (state lost), the third prints `s3cret`, 1,000
+characters flow back, and the run ends with 5 sandboxes created and 5 still live.
+
+### Expected output
+```
+{'exit_code': 0, 'output': ''}
+{'exit_code': 0, 'output': '6.146\n'}
+{'exit_code': 0, 'output': 'None\n'}
+[truncated 801 chars]
+xxxxxxxxxxxxxxxxxx
+{'exit_code': None, 'output': 'timeout: killed after 10s'}
+reaped: ['s1'] | live: 0 | created: 2
+```
+
+### Tests
+```python
+# test_code_tool.py: run with `pytest -q`
+import pytest
+from code_tool import MAX_CHARS, SAFE_ENV, CodeTool, FakeBackend
+
+@pytest.fixture
+def env():
+    now = [0.0]
+    backend = FakeBackend()
+    return backend, CodeTool(backend, clock=lambda: now[0]), now
+
+def test_session_keeps_interpreter_state(env):
+    backend, tool, _ = env
+    tool.run_python("s1", "df = [3, 4]")
+    assert tool.run_python("s1", "print(sum(df))")["output"] == "7\n"
+    tool.run_python("s2", "print(1)")
+    assert backend.created == 2                       # one sandbox per session, not per call
+
+def test_no_agent_secrets_inside(env, monkeypatch):
+    backend, tool, _ = env
+    monkeypatch.setenv("DB_PASSWORD", "s3cret")
+    assert tool.run_python("s1", "print(ENV.get('DB_PASSWORD'))")["output"] == "None\n"
+    for box in backend.live.values():
+        assert box["env"] == SAFE_ENV                 # an allowlist, not a copy of os.environ
+        assert box["limits"].network is False
+
+def test_output_is_bounded_and_keeps_the_tail(env):
+    _, tool, _ = env
+    out = tool.run_python("s1", "print('a' * 500)\nraise ValueError('the real error')")["output"]
+    assert out.startswith("[truncated ") and out.endswith("ValueError: the real error")
+    assert len(out.split("\n", 1)[1]) == MAX_CHARS
+
+def test_timeout_kills_the_sandbox(env):
+    backend, tool, _ = env
+    res = tool.run_python("s1", "while True: pass")
+    assert res["exit_code"] is None and "timeout" in res["output"]
+    assert backend.live == {}
+    tool.run_python("s1", "print(1)")
+    assert backend.created == 2                       # a fresh sandbox after the kill
+
+def test_idle_sandboxes_are_reaped(env):
+    backend, tool, now = env
+    tool.run_python("old", "x = 1")
+    now[0] = 250.0
+    tool.run_python("busy", "x = 1")
+    now[0] = 400.0
+    assert tool.reap() == ["old"]
+    assert list(tool.sessions) == ["busy"] and len(backend.live) == 1
+```
+
+All five fail on the starter. The reaper test uses an injected clock, so idle time is exact and the
+test never sleeps.
+
+### Failure scenarios
+- **Truncate from the head.** The model sees 200 characters of data and never the traceback, then
+  retries the same broken code. Debug by logging the last line of every truncated result.
+- **Copy `os.environ` and delete known keys.** The next secret someone adds leaks. Debug by diffing
+  the sandbox env against `SAFE_ENV`; only an allowlist survives new variables.
+- **Refresh `last_used` only on create.** Busy sessions get reaped mid-analysis and lose their data
+  frames. Debug by logging sandbox age and idle time at each reap.
+- **Reuse a sandbox after a timeout.** The next call queues behind a spinning loop and also times out.
+  Debug by counting consecutive timeouts per sandbox id.
+
+### Submission
+- **Code:** `code_tool.py` with the five `YOUR CODE` parts done; `FakeBackend` unchanged.
+- **Test run:** `pytest -q` showing 5 passed.
+- **Program output:** the seven stdout lines from `python code_tool.py`, matching Expected output.
+- **Real backend:** a short `DockerBackend` (built from the Examples tool) or E2B adapter with the same
+  `create`, `exec` and `kill` methods, plus the run showing no containers left afterwards.
+- **Short note (5 lines):** which backend you would ship for your data residency rules, and why.
 
 ## Why it exists
 - **Generated code is untrusted code.** It comes from a model that read user input, web pages and tool

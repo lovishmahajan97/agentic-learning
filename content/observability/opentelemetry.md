@@ -40,6 +40,177 @@ your APM is then just an OTLP endpoint.
 - **What you can skip.** OTLP protobuf details and Collector internals beyond receivers, processors and
   exporters. Know the API/SDK split, propagation and head versus tail sampling.
 
+## Lab
+### Task
+Repair the tracing of a tool-calling agent whose run shows up as four unrelated traces. Tools run in a
+thread pool, the search tool calls a remote server, and a failing tool looks healthy. Time box: 45-60
+minutes. Prerequisites: Tracing and Spans, plus the agent-loop example in this lesson.
+- **One trace per run:** tool spans parent to their `agent.turn` span although they run in threads.
+- **Joined across the hop:** the search tool injects W3C `traceparent`, and the server span is its child.
+- **Failures visible:** a failed tool is an ERROR span with an `exception` event; the run still answers.
+
+### Starter code
+Save as `lab_otel.py`. Needs `pip install opentelemetry-sdk pytest` (checked with opentelemetry-sdk
+1.45.1, pytest 9.1.1, Python 3.12). `InMemorySpanExporter` stands in for OTLP and a backend, and
+`tool_server` stands in for a remote search or MCP server, so nothing leaves the process.
+
+```python
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from opentelemetry import propagate, trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind, Status, StatusCode
+
+EXPORTER = InMemorySpanExporter()                      # stands in for OTLP + a backend
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(EXPORTER))
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer("research-agent")
+POOL = ThreadPoolExecutor(max_workers=4)               # tools use blocking clients
+LAST_HEADERS: dict = {}                                 # what the tool server received
+
+def tool_server(headers: dict, query: str) -> dict:
+    """Stands in for a remote search or MCP server: it continues whatever trace the headers carry."""
+    LAST_HEADERS.clear(); LAST_HEADERS.update(headers)
+    ctx = propagate.extract(headers)
+    with tracer.start_as_current_span("server search", context=ctx, kind=SpanKind.SERVER):
+        return {"hits": [f"doc about {query}"]}
+
+def search(query: str) -> dict:
+    headers: dict = {}
+    # YOUR CODE 2: inject the current context into `headers` so the server joins this trace.
+    return tool_server(headers, query)
+
+def lookup_order(order_id: str) -> dict:
+    raise ConnectionError("orders DB unreachable")
+
+TOOLS = {"search": search, "lookup_order": lookup_order}
+SCRIPT = [[("search", {"query": "refund policy"}), ("lookup_order", {"order_id": "1182"})], []]
+
+def traced_tool(name: str, args: dict) -> dict:
+    with tracer.start_as_current_span(f"tool {name}") as span:
+        span.set_attribute("app.tool.name", name)
+        try:
+            return TOOLS[name](**args)
+        except Exception as e:
+            # YOUR CODE 3: the error goes back to the model as a result, but the span must say so:
+            #              record the exception and set an ERROR status before returning.
+            return {"error": str(e)}
+
+async def run_tool(name: str, args: dict) -> dict:
+    loop = asyncio.get_running_loop()
+    # BUG: run_in_executor does not copy contextvars, so each tool span starts a new trace.
+    # YOUR CODE 1: run traced_tool in the pool with the current context.
+    return await loop.run_in_executor(POOL, traced_tool, name, args)
+
+async def run_agent(task: str, max_steps: int = 4) -> str:
+    with tracer.start_as_current_span("agent.run") as root:
+        root.set_attribute("app.agent.task_chars", len(task))
+        for step in range(max_steps):
+            with tracer.start_as_current_span(f"agent.turn {step}"):
+                calls = SCRIPT[step]                    # a fake model: tool calls, then an answer
+                if not calls:
+                    root.set_attribute("app.agent.steps", step + 1)
+                    return f"answered after {step + 1} turns"
+                await asyncio.gather(*(run_tool(n, a) for n, a in calls))
+        root.set_status(Status(StatusCode.ERROR, "max_steps reached"))
+        return "gave up"
+
+def print_tree(spans) -> None:
+    by_id = {s.context.span_id: s for s in spans}
+    kids: dict = {}
+    for s in spans:
+        parent = s.parent.span_id if s.parent and s.parent.span_id in by_id else None
+        kids.setdefault(parent, []).append(s)
+    def walk(parent, depth):
+        for s in sorted(kids.get(parent, []), key=lambda s: s.name):
+            print(f"{'  ' * depth}{s.name} [{s.status.status_code.name}]")
+            walk(s.context.span_id, depth + 1)
+    print("traces:", len({s.context.trace_id for s in spans}))
+    walk(None, 0)
+
+if __name__ == "__main__":
+    print(asyncio.run(run_agent("Refund order 1182 if our policy allows it")))
+    print_tree(EXPORTER.get_finished_spans())
+```
+
+The starter prints `traces: 4`: the agent tree, then `server search`, `tool lookup_order` and
+`tool search` as separate roots, all `[UNSET]`.
+
+### Expected output
+With a correct solution, `python lab_otel.py` prints:
+
+```
+answered after 2 turns
+traces: 1
+agent.run [UNSET]
+  agent.turn 0 [UNSET]
+    tool lookup_order [ERROR]
+    tool search [UNSET]
+      server search [UNSET]
+  agent.turn 1 [UNSET]
+```
+
+### Tests
+Save as `test_lab_otel.py` and run `pytest -q`. On the starter all four fail: four trace ids, a tool span
+with no parent (`AttributeError` on `None`), no `traceparent` header (`KeyError`), and an `UNSET` status.
+
+```python
+import asyncio
+import pytest
+from opentelemetry.trace import StatusCode
+from lab_otel import EXPORTER, LAST_HEADERS, run_agent
+
+@pytest.fixture
+def spans():
+    EXPORTER.clear()
+    assert asyncio.run(run_agent("Refund order 1182")) == "answered after 2 turns"
+    return {s.name: s for s in EXPORTER.get_finished_spans()}
+
+def test_the_whole_run_is_one_trace(spans):
+    assert len({s.context.trace_id for s in spans.values()}) == 1
+
+def test_tool_spans_are_children_of_their_turn(spans):
+    turn = spans["agent.turn 0"].context.span_id
+    assert spans["tool search"].parent.span_id == turn
+    assert spans["tool lookup_order"].parent.span_id == turn
+
+def test_tool_server_joins_through_traceparent(spans):
+    tool = spans["tool search"].context
+    version, trace_id, parent_id, flags = LAST_HEADERS["traceparent"].split("-")
+    assert (version, trace_id, parent_id) == ("00", f"{tool.trace_id:032x}", f"{tool.span_id:016x}")
+    assert int(flags, 16) & 0x01                          # the sampled bit
+    assert spans["server search"].parent.span_id == tool.span_id
+
+def test_failed_tool_is_an_error_span_not_a_crash(spans):
+    failed = spans["tool lookup_order"]
+    assert failed.status.status_code == StatusCode.ERROR
+    assert [e.name for e in failed.events] == ["exception"]
+    assert spans["agent.run"].status.status_code == StatusCode.UNSET
+```
+
+The test checks the sampled bit, not the whole flags byte: opentelemetry-sdk 1.45.1 sends flags `03`,
+because it also sets the W3C level 2 random-trace-id bit.
+
+### Failure scenarios
+- **Fix the executor but not the header.** The test run shows two traces: the agent tree and a root
+  `server search`. Debug: print `LAST_HEADERS`; an empty dict means nothing called `propagate.inject`.
+- **Inject before opening the tool span.** The server joins the trace but parents to `agent.turn 0`, so
+  server time is not attributed to the tool. Debug: compare the `traceparent` parent id with the tool span id.
+- **Re-raise the tool error.** `asyncio.gather` fails the whole run and every test errors with `ConnectionError`.
+  Debug: the model should see `{"error": ...}` as a tool result; only the span records the failure.
+- **Swap `SimpleSpanProcessor` for `BatchSpanProcessor`.** `get_finished_spans()` can come back empty, as
+  in a Lambda without a flush. Debug: call `provider.force_flush()` before reading spans.
+
+### Submission
+- `lab_otel.py` and a `pytest -q` run showing 4 passed.
+- The printed tree, matching the expected output exactly.
+- One sentence on why `asyncio.create_task` keeps context and `run_in_executor` does not.
+- One captured `traceparent` value with its four fields labelled.
+- A reviewer checks that the fix copies context rather than passing parent spans around by hand.
+
 ## Why it exists
 - **Every vendor had its own agent.** A library author who wanted to emit spans had to pick a vendor or
   write adapters, and switching backends meant re-instrumenting every service.

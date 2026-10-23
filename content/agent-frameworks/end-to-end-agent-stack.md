@@ -5,7 +5,8 @@ name: end-to-end agent stack (framework, LLM gateway, vector store, tracing, eva
 kind: decision
 difficulty: advanced
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agent-frameworks/choosing-an-agent-framework
@@ -41,6 +42,71 @@ Choose each for a reason, and connect them through ids.
   and which layer owns retries, budgets and approvals.
 - **What you can skip.** Buying a platform for every layer on day one. Start with one service, Postgres
   with pgvector, a gateway and traces, then add pieces when a measured need appears.
+
+## Decision case
+### Scenario
+A mid-size EU health insurer wants a claims agent: members ask about claim status, upload documents,
+and file simple claims. Claims over €2,000 need a human adjuster, who can take up to 3 days to decide.
+All figures below are illustrative.
+- **Team:** 6 engineers, 4 Python backend and 2 TypeScript frontend; they run managed Postgres 16
+  today and no other stateful service.
+- **Scale:** 400k members, about 60k conversations a month, about 8 model calls per conversation, so
+  480k model calls a month; a policy knowledge base of 150k chunks.
+- **Data residency:** member data, including prompts and traces, must stay in an EU region inside
+  the insurer's own cloud account.
+- **Latency:** first token in under 2 s at p95 per turn.
+- **Budget:** a model spend cap of €12,000 a month.
+- **Deadline:** production pilot in 12 weeks.
+
+### Options
+| Option | How it works | Residency | Cost vs €12k cap | Team and ops | 3-day approvals |
+|---|---|---|---|---|---|
+| A. Managed agent platform | a cloud vendor's hosted runtime, memory, tracing and evals | only if the vendor runs it in the insurer's EU account; must be verified | model spend plus platform fees; budgets set in the vendor console | least ops; new platform to learn | vendor-specific pause and resume |
+| B. Reference stack, self-hosted | LangGraph, LiteLLM proxy, pgvector, OTel to self-hosted Langfuse, CI evals, containers plus Postgres checkpoints | everything runs in the insurer's EU account | gateway virtual keys enforce the cap | two new services to run (proxy, Langfuse); Postgres already known | checkpoint the run, resume on the adjuster's decision |
+| C. B plus a workflow engine | as B, with Temporal owning the claim lifecycle | as B | as B | a third new stateful system and a new programming model | strongest durability, timers and visibility |
+| D. Hosted SaaS per layer | managed gateway, managed vector database, SaaS tracing | prompts and traces leave the account | per-vendor bills, harder to cap in one place | least ops | depends on the chosen framework |
+
+### Decision
+Choose **B**, the reference stack, self-hosted in the insurer's EU account.
+- **Residency decides first.** D sends traces and prompts to third parties, so it fails outright. A
+  passes only if verified per service, which is a procurement risk inside 12 weeks.
+- **The budget needs a hard cap.** At an illustrative 3,000 input and 300 output tokens per call, 480k
+  calls are 1,440M input and 144M output tokens. At illustrative large-model prices of €3 and €15 per
+  million, that is €4,320 + €2,160 = €6,480 a month.
+- **Why the cap matters.** That is 54% of the cap, but a loop bug that doubles calls makes it €12,960,
+  over the limit. LiteLLM virtual-key budgets plus a step cap in LangGraph stop that.
+- **The team fits.** Four Python engineers make LangGraph a better fit than Mastra, and Postgres
+  already holds sessions, checkpoints and pgvector, so the only new services are the proxy and Langfuse.
+- **Approvals fit checkpoints.** A paused run is a row in Postgres, not a waiting process, so a 3-day
+  wait costs nothing. One `interrupt`, then resume on the adjuster's decision, covers it without
+  Temporal.
+- **Latency is measurable, not assumed.** The proxy adds a network hop; measure it in week 2 against
+  the 2 s first-token budget.
+
+**What would change it:** switch to A if the vendor confirms EU in-account hosting and OTel export
+before week 2. Move to C when a claim must coordinate several systems with timers, escalations or
+compensation. Swap pgvector for a dedicated store when filtered retrieval p95 or recall degrades.
+
+### Trade-offs accepted
+- **Two more services on call.** The team now runs the LiteLLM proxy and Langfuse; watch proxy error
+  rate and added latency, and Langfuse ingestion lag, with alerts on both.
+- **Weaker lifecycle tooling than an engine.** No built-in timers or escalation; a daily job lists
+  runs suspended for more than 48 hours. Watch suspended-run age and resume success rate.
+- **Evals are built, not bought.** A 200-case dataset in CI plus sampled online judging takes about a
+  week; watch eval score per release and grow the set from production failures.
+- **pgvector shares Postgres.** Retrieval load competes with sessions; watch retrieval p95 and
+  database CPU at peak.
+
+### Review rubric
+- **Constraints first.** The write-up lists residency, latency, budget, team and deadline as explicit
+  constraints before naming any tool.
+- **Every option scored on every constraint.** The table shows at least one option rejected for a
+  stated, constraint-based reason.
+- **Numbers recomputed.** Cost or volume figures show the multiplication, are labelled illustrative,
+  and are compared with the stated cap.
+- **Long waits placed deliberately.** It says where a multi-day pause lives (checkpoint, engine) and why.
+- **Revisit triggers.** At least two measurable conditions that would change the choice.
+- **Watched trade-offs.** Each accepted cost names the metric or alert that would reveal it.
 
 ## Why it exists
 - **Framework demos hide production needs.** A notebook agent has no auth, no persistence, no cost limits

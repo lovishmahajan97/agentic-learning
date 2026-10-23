@@ -5,7 +5,8 @@ name: When an SLM is enough (task fit, cost, latency, privacy)
 kind: decision
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -42,6 +43,66 @@ privacy, never per agent.
 - **What you control.** Which steps go small, the acceptance threshold per step, the fallback when the SLM
   fails validation, and the eval set that proves it.
 - **What you can skip.** Leaderboard debates; your traces and golden set decide.
+
+## Decision case
+### Scenario
+An insurer's claims-intake agent handles about 4,000 claims a day. Each claim makes 7 model calls: 1
+intent router, 2 field extractions, 2 `create_claim` argument fills, 1 damage summary and 1 coverage
+reasoning step. All prices and latencies are illustrative planning figures, not vendor quotes.
+- **Budget:** model spend under $250 a day.
+- **Latency:** the acknowledgement path (router, then extraction) must finish under 2 s at p95.
+- **Privacy:** claim text may go to an in-region hosted provider under the existing data agreement.
+- **Prices:** a large hosted call costs about $0.01, a small hosted call about $0.001, and one
+  self-hosted GPU server about $48 a day ($2 an hour).
+- **Latency per short call:** about 1.2 s large, 0.4 s small, at p95.
+- **Golden-set results (small vs large):** router 97% vs 98%, extraction 98% vs 99%, argument fill 94% vs
+  97%, summary 90% vs 96%, coverage reasoning 71% vs 93%. The team's tolerance is 3 points.
+- **Team:** two backend engineers, no one on GPU on-call.
+
+### Options
+Escalation rates from a shadow run: router 2%, extraction 3%, argument fill 8%. Escalated calls per day:
+4,000 x (1 x 0.02 + 2 x 0.03 + 2 x 0.08) = 960 large calls.
+
+| Option | How it works | Spend per day | Acknowledgement p95 | Quality |
+|---|---|---|---|---|
+| All large, hosted | Every call to the frontier model | 28,000 x $0.01 = $280, over budget | 2 x 1.2 = 2.4 s, fails | Best |
+| All small, self-hosted | Every call to one GPU server | about $48 | 0.8 s | Fails: coverage reasoning 22 points behind |
+| Per step, self-hosted small | 5 calls small on own GPU, 2 large, validator escalates | $48 + (8,000 + 960) x $0.01 = $137.60 | 0.8 s | Within 3 points on routed steps |
+| Per step, hosted small | Same split, small model behind an in-region API | 20,000 x $0.001 + 8,960 x $0.01 = $109.60 | 0.8 s | Same as above |
+
+### Decision
+**Per step, with a hosted small model.** Router, extraction and argument fill pass within the 3-point
+tolerance and have validators, so they go small; the summary (6 points behind) and coverage reasoning (22
+points behind) stay large.
+
+This meets the $250 budget with margin, cuts the acknowledgement path to about
+0.8 s, and saves about 61% against all-large ($280 to $109.60).
+
+Hosting the small model ourselves costs $28 a day more and adds GPU on-call that a two-person team
+cannot staff. Privacy does not force self-hosting here, because the data agreement covers in-region text.
+
+**What would change it.** Self-hosting breaks even when small calls reach $48 / $0.001 = 48,000 a day,
+about 9,600 claims at 5 small calls each. A rule that claim text must stay on our network forces the
+self-hosted option at any volume, with the large steps moved to the largest model we can host.
+
+### Trade-offs accepted
+- **Two models to version and evaluate.** Each prompt or model change re-runs all five golden sets in CI;
+  a drop beyond 3 points blocks the merge.
+- **Escalations pay twice.** At 8%, argument fill already sends 640 calls a day to both models. Alert per
+  step when escalation passes the shadow-run rate by half, and sample those inputs into the golden set.
+- **Less headroom on odd claims.** New claim types may fail the small router before anyone notices. Track
+  pass rate on a weekly labelled sample, not only escalations.
+- **Provider dependence for both tiers.** An outage stops intake; keep the large model as the small
+  model's fallback so one provider failing degrades cost, not service.
+
+### Review rubric
+- **Per-step evidence:** each step has its own golden-set result against the large model and a stated
+  tolerance; no step moves on benchmark scores.
+- **Cost includes escalation and fixed cost:** escalated calls are counted twice, and self-hosting is priced
+  as server time, not tokens.
+- **Constraints checked one by one:** budget, latency path and privacy each get a pass or fail per option.
+- **Break-even named:** the write-up states the volume or rule at which another option wins.
+- **Fallback and monitoring designed:** validators, escalation alerts and a drift sample are specified.
 
 ## Why it exists
 - **Agents multiply calls.** A 10-step agent with a planner, tool calls and a summariser can make 15-30 model

@@ -5,7 +5,8 @@ name: Vector database architecture
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - rag-retrieval/vector-databases
@@ -38,6 +39,58 @@ across many users.
   multi-tenancy pattern, quantization and `ef`, and compaction after deletes.
 - **What you can skip.** HNSW construction details and DiskANN internals. Know that the graph must be in
   RAM, deletes are tombstones, and filtered search needs a planner.
+
+## Decision case
+### Scenario
+A project-management SaaS is adding an assistant agent with two retrieval tools: `search_docs` over each
+customer organisation's documents and `recall_memory` over each user's saved memories. All figures are illustrative.
+
+- **Knowledge.** 2,000 organisations, 8 million chunks; the 5 largest hold 40% (3.2 million), the median holds about 1,500.
+- **Memory.** 100,000 users with about 200 memories each: 20 million points, about 500,000 writes a day.
+- **Vectors.** 1,024 dimensions. Stored as float32 that is 4 KB each, so 8 million chunks are about 33 GB and 20 million memories about 82 GB.
+
+Constraints:
+- **Latency.** p99 tool latency under 150 ms, with recall@10 of at least 0.95 against exact search at every tenant size.
+- **Write-then-read.** A memory saved in one step must be recallable two steps later, within 2 seconds; "forget this" must stop retrieval at once.
+- **Isolation.** A security review requires tenant and user scoping enforced below the application code.
+- **Team.** Strong Postgres skills, two SREs, no experience running a dedicated vector engine.
+- **Platform rule.** The DBA will not add vector workloads to the OLTP primary.
+
+### Options
+| Option | How it works | Filtered recall across tenant sizes | Write visibility and deletes | Isolation | Ops load |
+|---|---|---|---|---|---|
+| **A. pgvector on the OLTP primary** | Vector columns beside the app tables | Plausible with iterative scans | Transactional: visible at commit | Row-level security | Low, but breaks the platform rule |
+| **B. Dedicated pgvector instance** | Separate Postgres; knowledge list-partitioned with the 5 largest orgs in their own partitions, HNSW plus iterative scans; memory searched exactly through a B-tree on `user_id` | Whales and the long tail are fine; mid-sized orgs must be benchmarked | Transactional: visible at commit | Row-level security | Low: known tooling |
+| **C. Existing OpenSearch log cluster** | k-NN fields beside the log indices | Filtered k-NN supported; mid range must be benchmarked | Visible after a refresh interval | Index or filter per tenant, in application code | Medium; competes with log ingestion |
+| **D. Dedicated vector engine** | For example Qdrant with tenant-marked payload indexes, int8 quantization with rescoring, whales on their own shards | Strongest planner for every selectivity | Eventual: visible after the write lands in a segment | Filter applied in a retrieval service | High: new system plus sync from Postgres |
+
+### Decision
+Choose **B**, because the team's binding constraints are write visibility, isolation and operating skill, and B meets them without a new system:
+- **Memory needs no ANN index.** One user is about 200 of 20 million points (0.001%). A B-tree on `user_id`
+  returns their rows, and an exact distance sort over about 400 KB (2 KB each at half precision) is cheap.
+- **Commits give write-then-read and forget for free.** A saved memory is visible at commit, and a deleted one disappears in the same transaction.
+- **Whales and minnows are separated.** The 5 largest organisations get their own partitions and HNSW indexes; the long tail shares one with iterative scans.
+- **It fits one machine.** At half precision the knowledge vectors are about 16 GB, and only they need an HNSW index in RAM, so a mid-sized instance has headroom.
+- **Isolation sits in the database.** Row-level security scopes every query by organisation and user from the session.
+
+What would change it:
+- **The benchmark fails for mid-sized organisations.** If recall@10 falls below 0.95 or p99 exceeds 150 ms for orgs in the 10,000 to 100,000 chunk range, move knowledge search to D and keep memory in Postgres.
+- **Growth beyond one node.** At several times today's chunks, the HNSW index no longer fits comfortably and D's quantization and sharding pay for its operating cost.
+- **Hybrid search becomes a requirement.** If BM25 plus vectors in one query matters most, C or D gains weight.
+
+### Trade-offs accepted
+- **Half precision costs some recall.** Check recall@10 weekly against exact search on a sample of real queries with their real filters.
+- **No per-tenant graphs for the long tail.** Watch tool calls returning fewer than k results by organisation size bucket.
+- **Vacuum carries the delete load.** Watch dead tuples and index bloat on the memory table, which churns daily.
+- **A second database to run.** Replication, backups and failover for the vector instance are new duties for the SREs.
+
+### Review rubric
+- **Workloads are separated.** The write-up treats document search and per-user memory as different selectivity problems.
+- **Selectivity is computed.** It derives the share of points per tenant or user and says which filter strategy each needs.
+- **Memory fit is calculated.** Bytes per vector, precision and which data must be RAM-resident are worked out.
+- **Write and delete semantics are matched to the agent loop.** Visibility after a write and after "forget" are stated.
+- **Isolation is enforced below the model.** It says where tenant and user scope come from and what enforces it.
+- **A benchmark decides the boundary.** Recall@k and p99 at small, mid and large tenant sizes, with the threshold that flips the choice.
 
 ## Why it exists
 - **Exact search does not scale.** It is a dot product per stored vector. A million 1,536-dimensional float32

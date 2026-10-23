@@ -5,7 +5,8 @@ name: OpenTelemetry instrumentation
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/structured-logging
@@ -40,6 +41,206 @@ tokens and failures went, in any OTLP backend.
   provider is initialised (per worker).
 - **What you can skip.** Writing exporters or processors, and most of the SDK configuration surface. Use
   the standard environment variables, the batch processor and a collector.
+
+## Lab
+### Task
+A support agent's traces are useless: each run is split into three traces (the run and one per tool
+server request), the run span's name contains the run id, and model and tool calls have no spans at all.
+
+Instrument the loop so one run is one trace, with GenAI attributes on model spans and `traceparent`
+carrying the trace into the tool server.
+
+Time box: 45-75 minutes.
+- **Prerequisites:** Structured logging, Shared httpx AsyncClient, and this lesson's Data model and
+  Propagation sections.
+- **Setup:** Python 3.12 with `pip install opentelemetry-sdk pytest` (checked on opentelemetry-sdk
+  1.45). Spans go to an in-memory exporter, so no collector or backend is needed; the "tool server" is a
+  local function that only sees headers. Save the starter as `lab_otel.py`, the tests as
+  `test_lab_otel.py`.
+- **Constraint:** keep the two tool calls parallel (`asyncio.gather`).
+
+### Starter code
+```python
+"""Lab: one trace per agent run, across a tool server (opentelemetry-sdk 1.45, Python 3.12)."""
+import asyncio
+from opentelemetry import trace
+from opentelemetry.propagate import extract, inject
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import SpanKind, Status, StatusCode
+
+exporter = InMemorySpanExporter()                    # tests only; production uses BatchSpanProcessor + OTLP
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(exporter))
+tracer = provider.get_tracer("agent-lab")
+
+
+class ToolError(Exception):
+    pass
+
+
+async def tool_server(name: str, args: dict, headers: dict) -> str:
+    """Another service: it continues whatever trace arrives in the headers."""
+    with tracer.start_as_current_span(f"POST /tools/{name}", context=extract(headers), kind=SpanKind.SERVER):
+        await asyncio.sleep(0.01)
+        if args.get("fail"):
+            raise ToolError(f"{name} failed")
+        return f"{name} ok"
+
+
+class FakeLLM:
+    def __init__(self, script):
+        self.script = iter(script)
+
+    async def complete(self):
+        return next(self.script)
+
+
+SCRIPT = [
+    {"usage": (812, 40), "tool_calls": [{"name": "search_orders", "args": {}},
+                                        {"name": "send_reply", "args": {"fail": True}}]},
+    {"usage": (1020, 85), "text": "Done."},
+]
+
+
+async def call_tool(call: dict) -> str:
+    # LAB 3: wrap in an "execute_tool <name>" span (gen_ai.operation.name, gen_ai.tool.name) and
+    #        inject the current context into headers so the tool server's span becomes its child.
+    headers = {}
+    try:
+        return await tool_server(call["name"], call["args"], headers)
+    except ToolError as e:
+        return f"error: {e}"
+
+
+async def run_agent(run_id: str, llm, max_steps: int = 3):
+    # LAB 1: low-cardinality run span name "invoke_agent support-agent"; run_id as app.run_id.
+    with tracer.start_as_current_span(f"invoke_agent {run_id}") as run_span:
+        for step in range(1, max_steps + 1):
+            # LAB 2: a "chat model-a" span per model call with gen_ai.request.model,
+            #        gen_ai.usage.input_tokens, gen_ai.usage.output_tokens and app.agent.step.
+            reply = await llm.complete()
+            if "text" in reply:
+                return reply["text"]
+            await asyncio.gather(*(call_tool(c) for c in reply["tool_calls"]))   # parallel tool calls
+        # LAB 4: mark the run span as an error with the description "max_steps reached".
+
+
+def print_tree():
+    spans = sorted(exporter.get_finished_spans(), key=lambda s: s.start_time)
+    ids = {s.context.span_id for s in spans}
+
+    def show(span, depth):
+        flag = "  [ERROR]" if span.status.status_code is StatusCode.ERROR else ""
+        print("  " * depth + span.name + flag)
+        for child in spans:
+            if child.parent is not None and child.parent.span_id == span.context.span_id:
+                show(child, depth + 1)
+
+    for root in spans:
+        if root.parent is None or root.parent.span_id not in ids:
+            show(root, 0)
+
+
+if __name__ == "__main__":
+    asyncio.run(run_agent("r-123", FakeLLM(SCRIPT)))
+    print_tree()
+    print("traces:", len({s.context.trace_id for s in exporter.get_finished_spans()}))
+```
+
+As given, it prints three roots (`invoke_agent r-123`, `POST /tools/search_orders`,
+`POST /tools/send_reply  [ERROR]`) and `traces: 3`: empty headers make the tool server start new traces.
+
+### Expected output
+```
+invoke_agent support-agent
+  chat model-a
+  execute_tool search_orders
+    POST /tools/search_orders
+  execute_tool send_reply  [ERROR]
+    POST /tools/send_reply  [ERROR]
+  chat model-a
+traces: 1
+```
+
+### Tests
+```python
+import asyncio
+from opentelemetry.trace import StatusCode
+import lab_otel as lab
+
+
+def run(script, max_steps=3):
+    lab.exporter.clear()
+    asyncio.run(lab.run_agent("r-123", lab.FakeLLM(script), max_steps=max_steps))
+    return {s.name: s for s in lab.exporter.get_finished_spans()}, lab.exporter.get_finished_spans()
+
+
+def test_one_trace_with_low_cardinality_names():
+    by_name, spans = run(lab.SCRIPT)
+    assert len({s.context.trace_id for s in spans}) == 1
+    root = by_name["invoke_agent support-agent"]
+    assert root.attributes["app.run_id"] == "r-123"
+    assert not any("r-123" in s.name for s in spans)
+
+
+def test_tree_shape_across_the_tool_server():
+    by_name, spans = run(lab.SCRIPT)
+    root = by_name["invoke_agent support-agent"]
+    chats = [s for s in spans if s.name == "chat model-a"]
+    assert len(chats) == 2 and all(c.parent.span_id == root.context.span_id for c in chats)
+    for tool in ("search_orders", "send_reply"):
+        ex, srv = by_name[f"execute_tool {tool}"], by_name[f"POST /tools/{tool}"]
+        assert ex.parent.span_id == root.context.span_id       # parallel calls keep the run as parent
+        assert srv.parent.span_id == ex.context.span_id        # traceparent crossed the "network"
+        assert ex.attributes["gen_ai.tool.name"] == tool
+
+
+def test_genai_attributes_on_model_spans():
+    _, spans = run(lab.SCRIPT)
+    first = min((s for s in spans if s.name == "chat model-a"), key=lambda s: s.start_time)
+    assert first.attributes["gen_ai.request.model"] == "model-a"
+    assert first.attributes["gen_ai.usage.input_tokens"] == 812
+    assert first.attributes["gen_ai.usage.output_tokens"] == 40
+    assert first.attributes["app.agent.step"] == 1
+
+
+def test_failed_tool_is_red_but_the_run_is_not():
+    by_name, _ = run(lab.SCRIPT)
+    assert by_name["execute_tool send_reply"].status.status_code is StatusCode.ERROR
+    assert by_name["execute_tool search_orders"].status.status_code is not StatusCode.ERROR
+    assert by_name["invoke_agent support-agent"].status.status_code is not StatusCode.ERROR
+
+
+def test_max_steps_marks_the_run_red():
+    loop = [{"usage": (10, 1), "tool_calls": [{"name": "search_orders", "args": {}}]}] * 2
+    by_name, _ = run(loop, max_steps=2)
+    root = by_name["invoke_agent support-agent"]
+    assert root.status.status_code is StatusCode.ERROR
+    assert root.status.description == "max_steps reached"
+```
+
+All five fail on the starter: `3 == 1` traces, then `KeyError` for spans that do not exist yet.
+
+### Failure scenarios
+- **Inject: call `inject(headers)` before entering the `execute_tool` span.** Observe: one trace, but
+  the tool server's span hangs off the run span, so the tree test fails. Debug: print each span's
+  parent id; inject must run while the span whose child you want is current.
+- **Inject: catch `ToolError` inside the `execute_tool` span.** Observe: the tool span is no longer red
+  and the failure is invisible in the trace. Debug: let the exception leave the span (it records the
+  exception event and the error status), or set the status yourself before handling it.
+- **Inject: start the tool span with `tracer.start_span(...)` and never end it.** Observe: the span is
+  missing from the exporter and the server span's parent id points at nothing. Debug: count started
+  vs finished spans; use `start_as_current_span` as a context manager.
+
+### Submission
+- The fixed `lab_otel.py` and a `pytest -q` run showing 5 passed.
+- Your output of `python lab_otel.py`, matching the expected output.
+- The three-line change that swaps the in-memory exporter for `BatchSpanProcessor` and OTLP in a
+  real service, and where it runs under Gunicorn (per worker, not in the master).
+- A short note: which attribute you would add for cost per run, and why totals must still come from
+  metrics, not these spans.
 
 ## Why it exists
 - **Slow requests hide their cause.** A 9-second chat request might spend it in the provider, a vector

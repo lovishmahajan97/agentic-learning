@@ -5,7 +5,8 @@ name: Webhooks
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - enterprise-integration/incremental-synchronization-and-cdc
@@ -39,6 +40,65 @@ idempotently, re-fetch state and reconcile.
   (re-fetch instead), and the reconciliation interval.
 - **What you can skip.** Each vendor's full event catalogue and HMAC theory. Know raw-body verification,
   fast ack, idempotent consumers, re-fetch and reconciliation.
+
+## Decision case
+### Scenario
+A support-automation product runs a triage agent that drafts a reply when a ticket enters the "AI queue",
+and keeps a RAG index of tickets and Slack threads fresh. You must choose how changes reach it. Figures
+are illustrative.
+- **Tenants:** 200, each with about 50 watched containers; 170 use sources with signed webhooks, 30 use a
+  ticket system with no webhooks but an `updated since` query.
+- **Volume:** about 20,000 real changes a day, spread evenly, so about 17,000 from the webhook tenants.
+- **Agent latency:** the agent run starts within 30 seconds of assignment at p95.
+- **Correctness:** at most one reply per assignment; a missed change stays wrong for at most 1 hour.
+- **Security:** event payload text must never reach the model unverified.
+- **Team:** 3 engineers already running a durable queue.
+
+### Options
+| Option | How it works | API calls per day | Agent start at p95 | Missed-change bound |
+|---|---|---|---|---|
+| Poll everything every 30 s | watermark query per container | 200 x 50 x 2,880 = 28.8 million | about 28.5 s of wait alone, no headroom | 30 s |
+| Webhooks only | verify, enqueue, re-fetch per change | about 17,000 | seconds, but none for the 30 no-webhook tenants | unbounded |
+| Webhooks plus reconciliation, polling only where needed | webhooks and hourly reconciliation for 170 tenants; 20-s polling of the AI queue plus hourly sync for the 30 | about 386,600 | seconds; about 19 s for the 30 | 1 hour |
+
+Call count for the third option: 17,000 re-fetches + 170 x 50 x 24 = 204,000 reconciliation queries +
+30 x 4,320 = 129,600 AI-queue polls + 30 x 50 x 24 = 36,000 hourly syncs, so 386,600 a day, about 75
+times fewer than 30-second polling.
+
+### Decision
+**Webhooks with fast ack and re-fetch for the 170 tenants, 20-second polling of only the AI-queue container
+for the 30 tenants without webhooks, and hourly reconciliation everywhere.** It is the only option that
+meets the 30-second start for every tenant and bounds missed changes to 1 hour.
+- **Receiver:** verify the signature on raw bytes, take the tenant from the secret that verified it,
+  enqueue durably by event ID, return 2xx; no LLM work inline.
+- **Once per assignment:** the run ID derives from the event ID (or ticket ID plus updated version for
+  polled tenants), and the reply is claimed with an atomic insert before posting.
+- **Untrusted input:** the worker re-fetches the ticket and passes its text to the model as data.
+- **Why not 30-second polling:** 28.8 million calls a day and almost no latency headroom.
+- **Why not webhooks alone:** no answer for 30 tenants and no bound on lost events.
+
+**What would change it.** If the no-webhook vendor ships webhooks, those tenants join the main path. A
+tighter freshness bound means more frequent reconciliation: each extra run per day across the 170
+tenants costs 170 x 50 = 8,500 calls.
+
+### Trade-offs accepted
+- **A public endpoint and secrets to rotate.** Accept current and previous secrets during rotation and
+  monitor signature failures per tenant.
+- **Subscription lifecycle.** Renew expiring subscriptions on a schedule; alert when a tenant's expiry
+  horizon drops below one renewal interval.
+- **Reconciliation is the safety net, not the path.** Monitor how many changes it catches; a rising count
+  means a broken subscription.
+- **Two code paths for intake.** Webhook and polled tenants share the worker, run keys and claims; monitor
+  side effects per assignment, which must stay at one.
+
+### Review rubric
+- **Delivery semantics named:** at-least-once, unordered and lossy, and how each is handled.
+- **Calls and latency computed:** for polling and for push, from stated tenants, containers and change
+  rate.
+- **Exactly-once side effects:** run keyed by event and an atomic claim before the reply.
+- **Payloads as hints:** re-fetch through the source and treat text as untrusted model input.
+- **Missed-event bound:** a reconciliation interval chosen from the freshness requirement.
+- **Sources without webhooks handled:** a stated fallback, not silence.
 
 ## Why it exists
 - **Freshness is the product.** An AI assistant indexed over Jira, Slack or SharePoint is only as fresh as

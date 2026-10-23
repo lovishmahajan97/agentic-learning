@@ -5,7 +5,8 @@ name: Message queues (Kafka, SQS, RabbitMQ)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - backend-fundamentals/background-jobs-durable-workers
@@ -39,6 +40,218 @@ replayable log, SQS a managed queue, RabbitMQ a routing broker.
   deadline versus real model latency, the DLQ and its owner, outbox publishing, and autoscaling on lag.
 - **What you can skip.** Broker internals such as Raft details and Kafka rebalancing protocols. Know
   at-least-once, the outbox, partitions and the λ/μ drain arithmetic.
+
+## Lab
+### Task
+An agent hands its slow `charge` tool to queue workers, and three incidents came in: a worker crash lost
+a charge, a redelivery charged the customer twice, and a poison message left its agent run "waiting on
+tool" forever.
+
+You will fix the consumer so it is at-least-once with effectively-once side effects, and wire the DLQ
+back to the run. An in-memory SQS-like fake with a fake clock replaces the broker, so the visibility
+timeout, receive count and redrive behave deterministically. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's core loop, Backpressure and retries, and Queues in an agent system
+  sections, and the long-tool-call scenario under Examples.
+- **Setup:** Python 3.11+, standard library only, `pip install pytest` (checked against pytest 9.1.1).
+  Save the starter as `tool_worker.py` and the tests as `test_tool_worker.py` in one directory.
+- **Goal:** a crash at any of the three injected points ends with exactly one ledger entry and one
+  stored result, and a message that always fails reaches the DLQ and marks its run `failed`.
+
+### Starter code
+```python
+"""tool_worker.py: an agent's slow tool calls run on queue workers. A crash lost a charge, a redelivery
+charged twice, and a poison message left its run waiting forever. In-memory SQS-like fake, fake clock."""
+import itertools
+import json
+
+
+class FakeQueue:
+    """SQS-like: a received message is hidden for visibility_s and reappears unless deleted; once it
+    has been received max_receives times without a delete, the next receive moves it to the DLQ."""
+
+    def __init__(self, visibility_s=60, max_receives=3):
+        self.visibility_s, self.max_receives = visibility_s, max_receives
+        self.messages, self.dlq, self._ids = {}, [], itertools.count(1)
+
+    def send(self, body):
+        self.messages[next(self._ids)] = {"body": json.dumps(body), "visible_at": 0, "receives": 0}
+
+    def receive(self, now):
+        for mid, m in sorted(self.messages.items()):
+            if m["visible_at"] > now:
+                continue
+            if m["receives"] >= self.max_receives:
+                self.dlq.append(json.loads(self.messages.pop(mid)["body"]))
+                continue
+            m["receives"] += 1
+            m["visible_at"] = now + self.visibility_s
+            return mid, json.loads(m["body"])
+        return None
+
+    def delete(self, mid):
+        self.messages.pop(mid, None)
+
+
+class FakeLedger:
+    """A payment API: charge() books an entry; a repeated idempotency key returns the first entry."""
+
+    def __init__(self):
+        self.entries, self.by_key, self.calls = [], {}, 0
+
+    def charge(self, args, idempotency_key=None):
+        self.calls += 1
+        if args["amount"] <= 0:
+            raise ValueError("amount must be positive")
+        if idempotency_key in self.by_key:
+            return self.by_key[idempotency_key]
+        entry = {"n": len(self.entries) + 1, "amount": args["amount"]}
+        self.entries.append(entry)
+        if idempotency_key is not None:
+            self.by_key[idempotency_key] = entry
+        return entry
+
+
+class WorkerCrash(Exception):
+    pass
+
+
+def handle_one(queue, now, tool, results, crash=lambda point: None):
+    """Receive one tool-call message and run it. Keep the three crash() calls: tests inject faults there."""
+    got = queue.receive(now)
+    if got is None:
+        return None
+    mid, call = got
+    queue.delete(mid)                            # EXERCISE 1: acknowledge only after the work
+    crash("before_tool")
+    output = tool(call["args"])                  # EXERCISE 2: a redelivery must not charge twice
+    crash("after_tool")
+    results[call["tool_call_id"]] = output
+    crash("after_result")
+    return call["tool_call_id"]
+
+
+def fail_dead_letters(queue, runs):
+    """Mark the agent run of every dead-lettered tool call as failed, so it stops waiting.
+    Leave the messages in the DLQ: they are evidence, and the redrive path after a fix."""
+    pass                                         # EXERCISE 3
+
+
+def drain(queue, tool, results, runs, crash=lambda point: None, rounds=10, step_s=61):
+    now = 0
+    for _ in range(rounds):
+        try:
+            handle_one(queue, now, tool, results, crash)
+        except WorkerCrash:
+            pass                                 # the worker died; another one picks up later
+        except ValueError:
+            pass                                 # the tool failed; no delete, so it comes back
+        fail_dead_letters(queue, runs)
+        now += step_s
+
+
+def crash_once_at(point):
+    fired = []
+
+    def crash(p):
+        if p == point and not fired:
+            fired.append(p)
+            raise WorkerCrash(p)
+    return crash
+
+
+if __name__ == "__main__":
+    ledger, q = FakeLedger(), FakeQueue(visibility_s=60, max_receives=3)
+    results, runs = {}, {"r1": "waiting_on_tool", "r2": "waiting_on_tool"}
+    q.send({"tool_call_id": "tc-1", "run_id": "r1", "args": {"amount": 40}})
+    drain(q, ledger.charge, results, runs, crash_once_at("after_tool"))
+    print("ledger entries:", len(ledger.entries), "| results:", sorted(results))
+    q.send({"tool_call_id": "tc-2", "run_id": "r2", "args": {"amount": -1}})   # poison: always fails
+    drain(q, ledger.charge, results, runs)
+    print("dlq:", len(q.dlq), "| run r2:", runs["r2"])
+```
+
+### Expected output
+The starter prints `ledger entries: 1 | results: []` (charged, but the agent never gets the result)
+and `dlq: 0 | run r2: waiting_on_tool`. After the fix, `python tool_worker.py` prints:
+
+```text
+ledger entries: 1 | results: ['tc-1']
+dlq: 1 | run r2: failed
+```
+
+### Tests
+On the starter 3 of 4 fail: both crash tests with `assert [] == ['tc-1']` (the message was deleted
+before the work), and the poison test with `assert (0 == 1)` on the DLQ.
+
+The `after_result` test passes
+on the starter and guards the fix: moving the delete to the end without a results check makes it fail
+with `assert 2 == 1` on `ledger.calls`.
+
+```python
+from tool_worker import FakeLedger, FakeQueue, crash_once_at, drain
+
+CALL = {"tool_call_id": "tc-1", "run_id": "r1", "args": {"amount": 40}}
+
+
+def setup():
+    return FakeLedger(), FakeQueue(visibility_s=60, max_receives=3), {}, {"r1": "waiting_on_tool"}
+
+
+def test_crash_before_tool_is_redelivered():
+    ledger, q, results, runs = setup()
+    q.send(CALL)
+    drain(q, ledger.charge, results, runs, crash_once_at("before_tool"))
+    assert sorted(results) == ["tc-1"]
+    assert len(ledger.entries) == 1
+
+
+def test_crash_after_tool_charges_once():
+    ledger, q, results, runs = setup()
+    q.send(CALL)
+    drain(q, ledger.charge, results, runs, crash_once_at("after_tool"))
+    assert sorted(results) == ["tc-1"]
+    assert len(ledger.entries) == 1
+
+
+def test_crash_after_result_does_not_rerun_tool():
+    ledger, q, results, runs = setup()
+    q.send(CALL)
+    drain(q, ledger.charge, results, runs, crash_once_at("after_result"))
+    assert ledger.calls == 1
+    assert q.messages == {}
+
+
+def test_poison_message_fails_the_run():
+    ledger, q, results, runs = setup()
+    q.send({**CALL, "args": {"amount": -1}})
+    drain(q, ledger.charge, results, runs)
+    assert len(q.dlq) == 1 and ledger.calls == 3
+    assert runs["r1"] == "failed"
+```
+
+### Failure scenarios
+- **Inject: move the delete to the end but keep `tool(call["args"])`.** The `after_tool` test fails with
+  2 ledger entries: the crash came after the charge and before the result was stored. Debug: print the
+  ledger; only the downstream idempotency key (the tool-call id) covers that window.
+- **Inject: `drain(..., step_s=30)` with `visibility_s=60`.** The second receive happens before the
+  message is visible again, so the retry takes two rounds. Debug: log `visible_at` per receive; in SQS
+  the same symptom is a visibility timeout tuned against the wrong duration.
+- **Inject: catch `Exception` instead of `ValueError` in `drain`.** `WorkerCrash` is still handled first,
+  but a real bug in your handler now retries silently until the DLQ. Debug: count DLQ inflow by error
+  type; a new error class on deploy day is your bug, not the tool's.
+- **Inject: `fail_dead_letters` pops the DLQ.** The run is marked failed but the message is gone, so
+  after fixing the tool there is nothing to redrive. Debug: the poison test's `len(q.dlq) == 1` fails.
+
+### Submission
+- **Your fixed `tool_worker.py`**, with the given tests unchanged and the three `crash()` calls kept.
+- **A `pytest -v` log** with all 4 passing, plus the starter's failing run for comparison.
+- **The `python tool_worker.py` output** after the fix.
+- **One extra test** of your own, for example two different tool calls in one queue with a crash on
+  only one of them.
+- **A three-line note** mapping each fix to SQS: delete after success, the tool-call id as the
+  idempotency key, and the redrive policy's `maxReceiveCount` plus a DLQ consumer.
+- **Evaluated by:** the given tests pass unmodified, your test fails on the starter, and no crash point
+  produces a second ledger entry.
 
 ## Why it exists
 - **Inline fan-out fails.** A request triggering five actions (store the upload, extract text, embed

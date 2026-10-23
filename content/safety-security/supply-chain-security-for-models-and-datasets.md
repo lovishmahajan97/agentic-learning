@@ -5,7 +5,8 @@ name: Supply-chain security for models & datasets
 kind: practice
 difficulty: core
 est_minutes: 17
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -130,6 +131,25 @@ flowchart TD
     R --> V["Serving and training clusters"]
     V -.->|"egress to hub blocked"| H
 ```
+
+## Misconceptions
+- **"Loading a model file is reading data."** A PyTorch `.bin` or `.pt` is a pickle, and unpickling runs
+  whatever `__reduce__` returns. Only formats like `safetensors`, with no code path, make loading
+  data-only; otherwise pass `weights_only=True`.
+- **"Pinning the repository name pins the model."** Names, branches and `main` move, and namespaces
+  get squatted. Pin a commit with `revision=` and check the hash and the set of every file.
+- **"Only the weights matter; configs are inert."** The chat template in `tokenizer_config.json` is a
+  Jinja program rendered on every request. A swapped template can rewrite every prompt, including how
+  tool calls are framed, without touching a weight.
+- **"A clean scan means a safe model."** Scanners such as picklescan find dangerous opcodes, not
+  backdoors. A trigger hidden in reviewed `model.safetensors` passes every byte-level check; only
+  behavioural evals (tool calls, refusals) and blast-radius limits address it.
+- **"Popular models from well-known organisations are safe by default."** Accounts get compromised and
+  look-alike names get downloads. Download counts say nothing about poisoning, so ingest everything
+  through the same quarantine, scan, evaluate and promote pipeline.
+- **"A dataset is fixed once curated."** Many web-scale sets are lists of URLs; expired domains let an
+  attacker control what future downloaders get (about US$60 for 0.01% of LAION-400M). Snapshot content
+  and verify per-item hashes.
 
 ## Examples
 ### A pinned, hash-checked, safe loader

@@ -5,7 +5,8 @@ name: Productizing repeated customer solutions
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - customer-data-evaluation/feedback-loops-to-product
@@ -34,6 +35,61 @@ too late leaves N diverging forks.
   versus extension code (a proprietary connector tool), the upgrade window, and the release gate.
 - **What you can skip.** Platform-strategy theory and pricing models. The rule of three, the difference
   buckets and the break-even arithmetic are what you use.
+
+## Decision case
+### Scenario
+Your field team has built a claims-intake agent four times, as four forks. Three more customers are
+signed to start next quarter. The effort figures reuse the illustrative ones from the break-even example
+and are planning numbers, not benchmarks.
+- **Recurring changes over the next 12 months:** 4 model upgrades (40 hours per fork; on a core, 50 hours
+  plus 4 per tenant) and 8 shared fixes (6 hours per fork; on a core, 8 hours plus 1 per tenant).
+- **Onboarding:** a new fork takes about 120 hours; on a core, a config file plus a connector about 30.
+- **Extraction:** about 600 hours to build the core and migrate all four forks; about 350 to build it
+  without migrating anyone.
+- **Diff result:** most differences are prompt slots, tool allowlists and output sinks; one customer has a
+  proprietary claims-system connector.
+- **Constraints:** 3 field engineers; no customer may lose regression-suite parity during a move; the
+  current model snapshot is deprecated in about 5 months, so one upgrade is forced.
+
+### Options
+| Option | How it works | 12-month hours at 7 customers | Risk |
+|---|---|---|---|
+| Keep forking | Copy the repo for each new customer | upgrades 4 x 280 + fixes 8 x 42 + onboarding 3 x 120 = 1,816 | seven prompts to re-tune before the deprecation date |
+| Extract and migrate all | Core with slots, tool allowlists and a connector seam; move forks least-divergent first, gated by each suite | 600 + 4 x 78 + 8 x 15 + 3 x 30 = 1,122 | build overlaps the forced upgrade |
+| Core for new customers only | Build the core, onboard the three new ones on it, leave the four forks | 350 + 4 x 222 + 8 x 35 + 3 x 30 = 1,608 | the halfway state: a product and forks |
+
+### Decision
+**Extract and migrate all seven onto one core, least-divergent fork first.** It saves about 1,816 −
+1,122 = 694 engineer-hours over the year, and it turns the forced model upgrade into one tuning pass on
+one template instead of seven.
+- **Sequence it around the deprecation:** build the core and migrate the two least-divergent forks first,
+  then do the forced upgrade on the core, so it is done once.
+- **The connector becomes an extension** behind the connector interface, not a reason to keep that
+  customer on a fork.
+- **Parity is the gate:** each move ships only when that tenant's regression suite matches the fork's.
+
+**What would change it.** If the three new deals slip, the year at four customers is 832 hours for forks
+against 960 for extraction, so forking is cheaper for now; record differences and extract when the
+pipeline is real.
+
+**If the diff showed mostly one-offs** rather than configuration, the core would carry
+logic nobody shares, so keep those as paid services work.
+
+### Trade-offs accepted
+- **Field engineers lose some freedom.** A tenant change is now a reviewed config change gated by a suite.
+  Track time from customer request to production; if it grows, the config schema is missing a slot.
+- **Migration risk is concentrated.** Moving forks can break a customer quietly. Watch per-tenant suite
+  pass rates and complaint volume for two weeks after each move.
+- **Upgrade windows bind every tenant.** Some customers will want to pin a version. Allow a stated window,
+  then move them, and watch how many tenants sit on the oldest supported release.
+
+### Review rubric
+- **All recurring changes counted:** upgrades, fixes and onboarding enter the comparison, not one upgrade.
+- **Arithmetic per option shown:** hours over a stated horizon at a stated customer count, recomputed.
+- **Differences classified:** configuration, extension, accident and one-off, with where each goes.
+- **Halfway state rejected or justified:** the plan finishes the migration or explains why not.
+- **Parity gate named:** each move is gated by that tenant's regression suite.
+- **Sensitivity stated:** the customer count or diff result at which the answer flips.
 
 ## Why it exists
 - **The first build is bespoke on purpose.** A forward-deployed engineer is paid to make one customer

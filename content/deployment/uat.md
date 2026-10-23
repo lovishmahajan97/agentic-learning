@@ -5,7 +5,8 @@ name: UAT (user acceptance testing)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -41,6 +42,65 @@ model defects from tool and integration bugs.
   model/prompt or requirement.
 - **What you can skip.** Deep statistics. One sample-size formula and a Wilson interval are enough to
   tell "clears the bar" from "might not".
+
+## Decision case
+### Scenario
+The insurer's claims-triage agent from the worked scenario below has finished its first UAT round:
+176 of 200 stratified cases pass (88%) against a bar of 85%, with a 95% Wilson interval of about
+82.8% to 91.8%. Hard gates are clean. Go-live is in 3 weeks. Adjuster time and scoring cost are
+illustrative planning figures.
+- **The slices:** typed forms pass 151 of 160 (about 94.4%); handwritten forms pass 25 of 40 (62.5%),
+  and 11 of their 15 failures are OCR-quality problems in the document parser. Handwritten forms are
+  about 20% of claim volume, matching their share of the sample.
+- **Adjuster time:** the claims department can release 30 adjuster-hours before go-live. Scoring one
+  case (reading the traces of its 3 runs and the end state) takes about 6 minutes, so 30 hours buys
+  about 300 scored cases.
+- **The sponsor wants a full go-live** and a signed acceptance, recorded by a named claims manager.
+
+### Options
+| Option | How it works | Adjuster hours | Lower bound vs 85% bar | Handwritten slice |
+|---|---|---|---|---|
+| Sign off on the point estimate | Record an explicit decision to judge on 88% rather than the interval | 0 | 82.8%: the bar is not shown to be met | ships at 62.5% |
+| Score about 400 more cases | Grow to about 600 cases so the aggregate interval clears the bar | 400 x 6 min = 40: over the 30 available | about 85.2% if the rate holds at 88% | still hidden in the aggregate |
+| Scope by slice, fix and re-test | Launch for typed forms; handwritten forms stay with adjusters until the parser fix passes its own re-test | 100 fresh handwritten cases (10) plus re-running the 40 known ones as regressions (4) = 14 | typed slice alone: about 89.7% from 151 of 160 | released only when its own lower bound clears 85% |
+
+### Decision
+**Scope by slice: go live for typed forms now, fix the parser, and release handwritten forms only when
+a fresh re-test clears the bar on its own.**
+- **The typed slice already proves itself.** 151 of 160 gives a Wilson lower bound of about 89.7%,
+  above 85%, with no extra scoring.
+- **It fits the adjuster budget.** The re-test costs about 14 of the 30 hours, leaving about 16 hours
+  for a second round if the first fix falls short.
+- **The re-test is sized in advance.** If the fix lifts the slice to about 92%, 100 fresh cases give a
+  lower bound of about 85.0%; at 90% it would need about 196 cases, which still fits one more round.
+- **Why not the alternatives:** signing on the point estimate ships a slice that fails more than a
+  third of the time, and scoring 400 more cases costs more than the budget while still averaging the
+  bad slice away.
+
+**What would change it.**
+- **Handwritten forms being most of the volume:** a typed-only launch would deliver too little value,
+  so delay go-live for the parser fix instead.
+- **The sponsor accepting point-estimate judging in writing:** a full launch becomes defensible only
+  with per-slice criteria added, so the handwritten slice still cannot pass at 62.5%.
+- **Much more adjuster time:** scoring enough cases to judge the aggregate becomes affordable.
+
+### Trade-offs accepted
+- **Partial value at go-live.** About 20% of claims get no agent recommendation at first. Watch: the
+  share of claims routed to adjusters without a recommendation, and adjuster queue times.
+- **Routing must be right.** A handwritten form misdetected as typed reaches the agent untested. Watch:
+  a weekly sample of routed forms checked for form type, and the agent's pass rate on any misrouted ones.
+- **Re-test fatigue.** Cases used to debug the parser are no longer fair evidence. Watch: the re-test
+  uses only fresh cases, and the 40 known ones go into the regression suite.
+
+### Review rubric
+- **Interval, not point estimate:** the write-up judges every rate threshold by its lower bound and
+  shows the arithmetic.
+- **Slices judged separately:** each slice that matters has its own pass rate, interval and verdict.
+- **Expert time budgeted:** cases scored per option follow from hours available and minutes per case.
+- **Defect cause used:** the fix follows from triage (here, integration) and only the affected slice is
+  re-tested.
+- **Fresh evidence:** the re-test sample is sized in advance and excludes cases used for debugging.
+- **Sign-off recorded:** a named customer owner signs the scope actually being accepted.
 
 ## Why it exists
 - **"Passes our tests" is not "does the job".** Engineering tests check the builders' understanding of

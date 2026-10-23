@@ -5,7 +5,8 @@ name: Excessive agency
 kind: concept
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -142,6 +143,22 @@ flowchart TD
     E --> L[("Audit log")]
     D --> L
 ```
+
+## Misconceptions
+- **"A capable model with a careful prompt can safely hold broad tools."** Every tool call is a sampled
+  output that a hallucination, a loop or an injected email can steer. The worst day is bounded by tools,
+  credentials and budgets, so size the blast radius instead of trusting the prompt.
+- **"Asking the model are you sure before destructive actions is a safeguard."** The same model is then
+  actor and reviewer, and it says yes. The check belongs in a deterministic executor or with a human.
+- **"Any human approval gate makes an action safe."** Only if it shows the exact arguments and fires
+  rarely. Approving the model's summary of "send the update to the team" can mail four hundred people, and
+  a 99% acceptance rate usually means rubber-stamping.
+- **"One service account is fine if the prompt says which tenant to use."** That is a confused deputy:
+  the agent can reach everything the service can. Use delegated, short-lived per-user tokens and enforce
+  tenant scope in the resource layer, for example with row-level security.
+- **"Step and spend budgets are an ops detail, not a safety control."** They set the count factor of the
+  blast radius: one send per second for eight hours is 28,800 emails, while a daily cap of 200 bounds it
+  at 200 whatever the model does.
 
 ## Examples
 ### Tool registry and policy-enforcing executor

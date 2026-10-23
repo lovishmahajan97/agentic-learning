@@ -5,7 +5,8 @@ name: Health checks
 kind: practice
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: implement
 code_tested: yes

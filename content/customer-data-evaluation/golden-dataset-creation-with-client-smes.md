@@ -5,7 +5,8 @@ name: Golden dataset creation with client SMEs
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - evals/golden-dataset
@@ -33,6 +34,73 @@ sampling, disagreement, data governance and formal sign-off.
   on every eval result.
 - **What you can skip.** Building a custom labelling UI on day one. A spreadsheet or a self-hosted
   open-source tool inside the customer's tenant is enough until volume demands more.
+
+## Decision case
+### Scenario
+A health insurer pilots a prior-authorisation triage agent. It reads a request, calls `get_member_policy`
+and `get_clinical_history`, then routes to auto-approve, nurse review or medical director. The golden set
+must be frozen and signed as the go-live acceptance standard in 6 weeks. Figures are illustrative.
+
+- **Segments with their own bar.** Three: routine imaging, specialty drugs, and urgent inpatient. Each needs
+  90% routing accuracy with a ±5 point half-width, so n ≈ 1.96² · 0.9 · 0.1 / 0.05² ≈ 139, rounded to 140
+  per segment and 420 in all.
+- **Expert time.** Two utilisation-review nurses for 3 hours a week each: 6 hours a week, 36 in total.
+- **Labelling cost.** About 4 minutes per item from scratch; reviewing an agent pre-label is assumed to take
+  about 2 minutes on routine items. 20% of items are double-labelled, plus a 30-item calibration batch both
+  nurses label (60 labels, 4 hours).
+
+Constraints:
+- **Data residency.** Member records are protected health information and cannot leave the insurer's
+  tenant, so labelling and fixtures stay inside it.
+- **Ownership.** The medical director must sign the set as the acceptance standard.
+- **Safety.** Urgent inpatient items carry the costliest errors: a wrong auto-approve or a delayed urgent case.
+
+### Options
+| Option | How it works | Nurse hours (of 36) | Anchoring and label quality | Governance and sign-off |
+|---|---|---|---|---|
+| **A. Nurses label all from scratch** | 420 items, 20% double-labelled | 420 × 1.2 × 4 / 60 = 33.6, plus 4 calibration = 37.6: over budget | Best: no draft to anchor on | Fits, in tenant |
+| **B. Agent pre-labels everything** | Nurses correct drafts | 420 × 1.2 × 2 / 60 = 16.8, plus 4 = 20.8 | Highest risk, worst on hard urgent items | Fits, but the set partly inherits the agent's errors |
+| **C. Engineers label, nurses spot-check** | Vendor writes references | Near 0 | Measures agreement with the vendor's guesses | Fails: nothing the director can sign as the customer's standard |
+| **D. Hybrid by segment** | Pre-label the two routine segments; urgent inpatient from scratch; a from-scratch control set | 11.2 + 11.2 + 4 + 1.9 = 28.3 | Anchoring measured, and avoided where errors cost most | Fits, in tenant |
+
+### Decision
+Choose **D**, because nurse hours are the binding constraint and the risk is concentrated in one segment:
+- **A does not fit.** 37.6 hours exceeds the 36 offered, with no slack for relabelling after a guideline change.
+- **Urgent inpatient is labelled from scratch.** 140 items × 1.2 × 4 minutes is 11.2 hours, spent where an
+  anchored label would hide the most dangerous agent errors.
+- **Routine segments use pre-labels.** 280 items × 1.2 × 2 minutes is another 11.2 hours.
+- **A control measures anchoring.** 28 routine items (10%) are also labelled from scratch by the other nurse,
+  about 1.9 hours, so the change rate on drafts can be compared with an unanchored label.
+- **Everything runs in the tenant.** The labelling tool, the masked records and the replayed tool fixtures
+  stay inside the insurer's environment.
+
+That leaves about 7.7 of the 36 hours for adjudication follow-ups and relabelling.
+
+What would change it:
+- **Rubber-stamping.** If nurses change near zero drafts on hard routine items, or the control disagrees with
+  accepted drafts more than the double-labelled pairs disagree with each other, label those items from scratch.
+- **More time.** If a third nurse joins, A fits and removes anchoring entirely.
+- **Fewer bars.** If the director accepts one overall bar instead of three, 140 items total would do.
+
+### Trade-offs accepted
+- **Routine labels may lean toward the agent.** Watch the weekly change rate per stratum and the control
+  comparison, and report both to the director before sign-off.
+- **Little slack.** About 7.7 spare hours absorbs one guideline revision, not two. Freeze guideline changes
+  after the calibration batch unless the policy owner rules.
+- **The pre-labelling agent is an early version.** Its errors may cluster on cases the final agent also
+  fails. Score the final agent on the from-scratch urgent segment and the control set separately.
+- **No labelling vendor.** Residency rules out external annotators, so the schedule depends on two people;
+  agree a backup reviewer with the sponsor now.
+
+### Review rubric
+- **Size is derived from the decision.** The write-up computes items per segment from the bar and
+  half-width, and multiplies out to a total.
+- **Hours are budgeted line by line.** Calibration, double-labelling, pre-label review and controls are
+  each converted to expert-hours and compared with what the customer offered.
+- **Anchoring is measured, not hoped away.** It names a change-rate metric and a from-scratch control.
+- **Effort follows risk.** The costliest segment gets the most careful labelling, with a stated reason.
+- **Governance is settled first.** Where labelling and fixtures run is stated before any labels are made.
+- **Sign-off and reversal are explicit.** It names who signs, and which observed numbers would change the plan.
 
 ## Why it exists
 - **Only the customer's experts can define the standard,** and they define it case by case. The project

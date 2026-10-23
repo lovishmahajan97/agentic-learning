@@ -5,7 +5,8 @@ name: Document processing pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - rag-retrieval/document-parsing
@@ -38,6 +39,59 @@ parsing. Route each page to the cheapest extractor that preserves structure, sco
   citations), what the tool returns for pages that failed, and the per-session latency and cost budget.
 - **What you can skip.** OCR and layout-model internals. Treat extractors as tiers with a cost, a latency and a
   quality score.
+
+## Decision case
+### Scenario
+A lender is building an underwriting assistant agent. Applicants upload packets (payslips, bank statements,
+IDs, signed forms), and the agent answers underwriter questions with page citations. All figures are illustrative.
+
+- **Volume.** 50,000 packets a month at about 40 pages each: 2 million pages a month.
+- **Mix.** About 70% born-digital, 25% scans or phone photos, and 5% that defeat OCR and layout models
+  (handwriting, stamped forms, skewed photos of tables).
+
+Constraints:
+- **Residency.** Documents may not leave the company's cloud region; any model endpoint must be in-region.
+- **Budget.** At most $5,000 a month for model-based extraction.
+- **Accuracy.** Bank-statement table cell accuracy of at least 98% on a gold set of 60 statements.
+- **Latency.** When an underwriter uploads a packet mid-conversation, the agent must answer from the readable pages within 15 seconds.
+- **Team.** Three engineers; no one has run GPU inference in production.
+
+### Options
+| Option | How it works | Budget (at an illustrative 1 cent per vision page) | Table accuracy | Inline latency | Residency |
+|---|---|---|---|---|---|
+| **A. Native extraction only** | One library for every page | About $0 | Fails: 25% of pages are scans and come back empty | Pass | Pass |
+| **B. Vision LLM on every page** | Every page to an in-region vision model | Fails: 2 million × $0.01 = $20,000 a month | Likely good, but re-runs differ | Fails for 40 pages inside one tool call | Pass only with an in-region endpoint |
+| **C. Layout model on every page** | Self-hosted Docling-style layout extraction for all pages | No per-page fee, but a GPU fleet for 2 million pages a month | Good on born-digital tables; weak on handwriting | Borderline for 40 pages | Pass |
+| **D. Per-page tier ladder** | Native, then OCR, then layout, then vision, each gated by a quality score; cheap tiers inline, the rest in the background | 5% of pages reach vision: 100,000 × $0.01 = $1,000 a month | Pass if the gold-set gate holds per tier | Pass: native and OCR inline, `pending_pages` for the rest | Pass with an in-region vision endpoint |
+
+### Decision
+Choose **D**, because it is the only option that meets budget, latency and accuracy together:
+- **Budget.** Vision spend tracks the 5% residue, $1,000 a month, leaving $4,000 of headroom for re-runs after
+  a parser change and for growth.
+- **Latency.** Native extraction and OCR run inline on the packet, so the agent answers from readable pages
+  in one tool call and names the pages still pending.
+- **Accuracy.** Table-heavy statements escalate to the layout tier, and the gold set of 60 statements gates every parser change.
+- **Team.** Only the layout tier needs a GPU, and it serves the minority of pages that fail OCR or carry
+  tables, which is a smaller fleet to learn on than option C's.
+
+What would change it:
+- **No in-region vision endpoint.** The residue goes to human review: about 100,000 pages a month, roughly 3,300 a day, which needs staffing or a self-hosted vision model.
+- **The mix shifts to scans.** If most packets become phone photos, start the ladder at OCR for those sources and recompute the vision share.
+- **Vision prices fall tenfold.** At 0.1 cent a page, option B costs about $2,000 a month and the case turns on latency and determinism alone.
+
+### Trade-offs accepted
+- **Two passes for escalated pages.** Scoring adds work and latency. Watch the share of pages reaching each tier per source per day.
+- **Crude quality scores.** A word-ratio gate can pass a page with a wrong table. Keep the separate table checks and track cell accuracy per document class.
+- **Vision output is non-deterministic.** Cache it by page hash, model and prompt version, and watch the cache hit rate after changes.
+- **Some answers arrive in two turns.** The agent says which pages are pending. Watch the share of answers given while pages were pending.
+
+### Review rubric
+- **The page mix is quantified.** The write-up estimates the share of born-digital, scanned and hard pages and where each goes.
+- **Cost is computed per tier.** Pages per tier times an illustrative unit price, checked against the budget.
+- **Accuracy has a gate.** A gold set with a named metric blocks parser changes.
+- **The agent's view is designed.** Inline versus background tiers and how pending or failed pages appear in the tool result.
+- **Data policy shapes the options.** Residency or privacy limits on model endpoints are applied to each option.
+- **Reversal conditions are concrete.** It names the price, mix or endpoint change that flips the choice.
 
 ## Why it exists
 - **The single library call breaks on the real corpus.** Scanned PDFs have no text layer, so it returns empty

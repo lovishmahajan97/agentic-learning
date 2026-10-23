@@ -165,8 +165,8 @@ flowchart TD
 
 ## Misconceptions
 - **"Batching always trades per-user latency for throughput."** Decode is bandwidth-bound, so up to the
-  knee extra sequences reuse the same weight read almost for free: 64 short sequences take 7.3 ms per step
-  versus 4.8 ms for one. Latency climbs only past the knee.
+  knee extra sequences reuse the same weight read: 64 short sequences take 7.3 ms per step versus 4.8 ms
+  for one, about 1.5× the latency for about 42× the throughput. Latency climbs steeply only past the knee.
 - **"The safe concurrency limit is a request count."** Each sequence adds its own KV reads, which do not
   amortise. The same 64 sequences at 6,144 tokens take about 20 ms per step, so the knee moves with
   context length and limits belong in tokens.

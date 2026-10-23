@@ -169,8 +169,9 @@ flowchart TD
   changes wherever the adapter is active; a high-rank adapter trained hard regresses like a full
   fine-tune. LoRA reduces forgetting and also learns less of the target.
 - **"Forgetting is just overfitting."** Overfitting is a held-out gap on the task; forgetting is losing
-  behaviours absent from the training data. Regularisation does not bring them back; replay gives the
-  loss a term for them.
+  behaviours absent from the training data. Overfitting cures (dropout, weight decay toward zero) do
+  not protect them; replay, or a penalty toward the base weights (EWC, L2-SP, a KL term), gives the loss
+  a term for them.
 - **"Fine-tuning is how you teach the agent new facts."** Facts that change belong in retrieval, which
   moves no weights and forgets nothing; fine-tune for behaviour and format.
 - **"Chaining each release from the last model is cheaper and equivalent."** Each hop forgets a little of

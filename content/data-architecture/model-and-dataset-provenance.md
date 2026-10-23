@@ -5,7 +5,8 @@ name: Model & dataset provenance
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - data-architecture/data-lineage
@@ -40,6 +41,74 @@ hashes, manifests and signatures you can diff when the agent regresses.
   whether the agent release itself has a manifest.
 - **What you can skip.** Choosing between attestation and bill-of-materials formats. Completeness of the
   manifest matters far more than its format.
+
+## Decision case
+### Scenario
+A startup sells a support agent to 25 business customers. A small fine-tuned router picks the tool or
+sub-agent for each request. It is retrained twice a month on about 130,000 rows: opted-in traces from 20
+customers, synthetic tool-use data and a pinned open-weight base model. Five customers forbid any use of
+their traces.
+
+The next enterprise security review asks three questions:
+1. Can you prove a given customer's traces never trained a shared model?
+2. Was the base model taken from the official repository, and is the deployed checkpoint the one you built?
+3. Can you show your agent benchmark is not contaminated?
+
+Constraints (figures illustrative):
+- **Deadline.** Answers with evidence are due in 8 weeks.
+- **Team.** One ML engineer and one platform engineer; MLflow is already the model registry.
+- **On-premises deploy.** A regulated customer runs the router in its own VPC and wants to verify, at deploy
+  time, that the checkpoint came from your pipeline.
+- **Retention.** Keeping each snapshot (about 130,000 rows × 4 KB ≈ 520 MB) for 24 runs a year is about
+  12.5 GB a year; that is acceptable.
+- **Benchmark.** 1,200 agent eval tasks, some drawn from production traces.
+
+### Options
+| Option | How it works | Q1 isolation proof | Q2 integrity | Q3 contamination | Effort |
+|---|---|---|---|---|---|
+| **A. Model cards and registry names** | Prose written after training | No: describes belief, not bytes | No | No | Days |
+| **B. Job-written manifests and gates** | Digests of snapshot, base revision, code and params; promotion blocked without a manifest; isolation, licence and overlap gates | Yes: no restricted digests among inputs | Partial: digests, but no proof of who built it | Yes: example digests plus n-grams | About 3 weeks |
+| **C. B plus signing and deploy verification** | Sign manifest and checkpoint at promotion; deploy verifies signature and digest | Yes | Yes | Yes | About 5 weeks |
+| **D. C plus standard attestation and BOM formats** | Emit in-toto or SLSA-style provenance and a CycloneDX ML-BOM | Yes | Yes | Yes | Over 8 weeks with this team |
+
+### Decision
+Choose **C**:
+- **Only C answers all three questions within 8 weeks.** A answers none with evidence. B cannot show the
+  VPC customer who built the checkpoint. D's format work does not fit the deadline.
+- **Isolation is a gate, not a promise.** Each customer's traces are their own snapshot digest with an
+  allow-list flag. The promotion step rejects any manifest whose inputs include a restricted digest, which
+  is the evidence for Q1.
+- **The base model is pinned by commit** and its file digests are in the manifest. Loading uses
+  `safetensors`, so a tampered file cannot execute code.
+- **Contamination is checked before training.** Normalized example digests and 8-token n-grams between the
+  training snapshot and the 1,200 eval tasks; overlaps are removed from training, not from the benchmark.
+- **The agent release manifest ships too,** so a regression is a diff of router digest, prompt, tool schemas
+  and index version.
+
+What would change it:
+- **A customer's scanner requires a standard format.** Then export the same manifest as an attestation or
+  ML-BOM, which is D's extra step.
+- **No on-premises deploys.** Then signing can wait, and B answers the review.
+- **Traces stop being used for training.** Then Q1 becomes trivially true, and the isolation gate guards
+  only the eval and synthetic sets.
+
+### Trade-offs accepted
+- **Custom JSON instead of a standard format.** Watch questionnaires that ask for a specific format.
+- **Promotion can block a release.** A missing digest or restricted input stops promotion; watch blocked
+  promotions and fix the job, never the gate.
+- **Snapshot storage.** About 12.5 GB a year; watch growth if training volume rises.
+- **Near-duplicate checks are approximate.** n-grams miss heavy paraphrase; watch suspiciously large
+  eval gains between router versions and add embedding-similarity checks if they appear.
+
+### Review rubric
+- **Each stakeholder question maps to evidence,** naming the manifest field or gate that answers it.
+- **Inputs are content-addressed:** snapshot digests, pinned base revision, code commit, container digest,
+  params and seed.
+- **Gates run before promotion,** covering customer isolation, licence and contamination, with what happens
+  on failure.
+- **Integrity is verified at deploy,** not only recorded at build.
+- **The agent release is covered,** not just the checkpoint.
+- **Format is chosen by reader,** with the condition that would force a standard format.
 
 ## Why it exists
 - **The questions arrive months later.** A fine-tune lands in the registry as `router-v4.safetensors`.

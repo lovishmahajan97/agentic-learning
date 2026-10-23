@@ -5,7 +5,8 @@ name: Data retention & deletion architecture
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - data-architecture/data-lineage
@@ -39,6 +40,76 @@ executes deletion across all of them with proof, designed in from the start.
   personal data ever enters fine-tuning.
 - **What you can skip.** Machine unlearning research and the fine print of every privacy regime. Know the
   one-month GDPR deadline, legal holds, and that weights cannot be edited; design around those.
+
+## Decision case
+### Scenario
+A consumer finance app in the EU runs an assistant agent with long-term memory, durable checkpoints for
+paused runs, a semantic cache, full traces, and a router model fine-tuned monthly on conversations.
+Erasure requests arrive at about 300 a month. Today only the application database row is deleted, so the
+team must redesign before an external audit.
+
+Constraints (figures illustrative):
+- **Deadline.** One month per request, by GDPR; the audit wants a receipt for each.
+- **Fan-out.** Nine stores hold personal data, so 300 requests mean about 2,700 store-level deletes a month.
+- **Backups.** Rotated every 35 days, which is longer than the deadline.
+- **Fine-tuning.** One retrain takes about 2 days, plus 2 days for eval and sign-off. The monthly schedule
+  means a request arriving just after a run waits up to about 34 days for a clean model.
+- **Product.** Memory is the main feature and cannot be dropped.
+- **Legal.** A hold register exists for disputes, and audit logs of payments the agent initiated have a
+  retention floor.
+- **Team.** Three engineers for one quarter.
+
+### Options
+| Option | How it works | Meets one month? | Weights | Backups | Cost |
+|---|---|---|---|---|---|
+| **A. Delete primary, let TTLs expire** | Status quo plus TTLs where they exist | No: memory, vectors, eval and training sets never expire | Untouched | 35 days, late | Lowest |
+| **B. Deletion job plus retrain-as-deletion** | Propagated job with receipts; retrain every 3 weeks on the cleaned snapshot; backups cut to 21 days | Yes: 21 + 4 = 25 days worst case | Clean within 25 days | 21 days, with deletion replay on restore | About 17 retrains a year instead of 12 |
+| **C. Deletion job plus personal data kept out of training** | Same job; fine-tune snapshot built only from redacted traces; backups cut to 21 days | Yes, for every store | Hold no deletable data by design | 21 days, with deletion replay on restore | Redaction pipeline; 12 retrains a year |
+| **D. Retain nothing** | No memory, traces or fine-tuning | Trivially | Nothing to clean | Nothing personal | Kills the product |
+
+### Decision
+Choose **C**:
+- **It meets the deadline in every store** without making the retrain schedule the deletion mechanism.
+- **The weights problem is removed, not managed.** If redaction runs before the snapshot is built, a router
+  that learns which tool to call needs no names, IBANs or addresses, and erasure never reaches the weights.
+- **The job does the rest.** It checks the hold register first, resolves derived artifacts through
+  lineage, deletes memory by `subject_id` (regenerating shared memories), purges paused checkpoints,
+  deletes vectors by filter, verifies, and writes a keyed tombstone and receipt.
+- **Backups fit once rotation is 21 days.** Restores replay the deletion log before data goes live.
+- **Payment audit logs are kept** under their legal floor, and the receipt reports them as retained under
+  an exception rather than deleted.
+- **B is the fallback,** not the plan. It works, but adds about 5 retrains a year and ties the legal
+  deadline to the GPU schedule.
+
+What would change it:
+- **Redaction recall cannot be shown to be high on sampled data.** Then use B's 3-week retrain as a
+  backstop as well.
+- **The DR policy needs backups kept for 90 days.** Then per-subject or per-tenant crypto-shredding
+  replaces short rotation.
+- **The model must learn personal attributes** (for example a personalised model per user). Then
+  retrain-as-deletion or per-user adapters that can be dropped become required.
+
+### Trade-offs accepted
+- **Redaction misses.** Some personal data may reach the snapshot; sample snapshots for detector misses
+  every run, and remove found rows before the next training.
+- **Less useful training data.** Redacted traces lose some signal; watch router accuracy against the
+  previous unredacted baseline.
+- **Shorter backups.** Point-in-time recovery reaches back 21 days, not 35; watch restore requests that
+  needed older data.
+- **Regenerated shared memories.** These can lose context other users relied on; watch complaints about
+  memories that changed.
+- **Operational load.** About 2,700 store deletes a month must succeed; watch `complete = false` receipts
+  and the age of the oldest open request.
+
+### Review rubric
+- **The inventory is complete,** with every store holding personal data, agent memory, checkpoints and
+  vendor logs included, each with a TTL or an explicit action.
+- **Deadline arithmetic is shown** for the slowest copies (backups, weights) and meets one month.
+- **Weights have a stated strategy:** keep data out, time-box and retrain, or both, with the condition that
+  switches between them.
+- **Holds and retention floors come first,** and are reported as such in receipts.
+- **Deletion is verified:** re-queries per store, keyed tombstones, and a complete flag an auditor can read.
+- **Derived artifacts are found through lineage,** including shared memories and eval rows.
 
 ## Why it exists
 - **Law and contracts bound retention.** GDPR's right to erasure, similar rights under CCPA and other

@@ -6,7 +6,8 @@ kind: concept
 difficulty: core
 est_minutes: 15
 agent_relevance: core
-status: mastery-verified
+status: typed
+lesson_type: concept
 mastery: evaluate
 code_tested: partial
 prerequisites:
@@ -110,7 +111,39 @@ flowchart TD
     A2 -.->|"log for retraining"| D[("Escalation dataset")]
 ```
 
+## Misconceptions
+- **"Trying the cheap model first always saves money."** Escalated calls pay for both tiers, so cost is
+  about `c_small + e × c_large` and the cascade only wins while `e < 1 − c_small / c_large`. Count verifier
+  calls, retries and idle GPU in `c_small`: at 3 units against 10 the break-even is 70% escalation, not 100%.
+- **"Schema validation catches the SLM's mistakes."** It catches malformed calls and unknown tools, not a
+  valid call to the wrong tool. In the scenario below schema-only escalation reaches 88% accuracy against
+  95% once a verifier also rejects valid-but-wrong choices.
+- **"The SLM's confidence tells you when to escalate."** Small-model log-probabilities and self-reported
+  confidence are often poorly calibrated, so a confidently wrong call never escalates. Bin labelled calls by
+  confidence and compare accuracy per bin before trusting any threshold.
+- **"A router and a cascade are the same thing."** A router predicts the model up front and pays for one
+  call; a cascade answers, checks and escalates, so escalated calls pay both costs and both latencies. Pick
+  by whether outputs are checkable and how tight the tail latency budget is.
+- **"Once tuned, the threshold stays right."** The cost-quality curve moves with every model, prompt or
+  traffic change, so rerun the threshold sweep on each one and alert on escalation-rate drift.
+
 ## Examples
+### Worked scenario: choosing the threshold for an agent's routing step
+Illustrative eval on 1,000 labelled requests, cost in relative units (SLM call = 1, large call = 20,
+verifier cost left out for simplicity).
+
+| Policy | Escalation rate | Routing accuracy | Cost per 1,000 |
+|---|---|---|---|
+| Large model only | 100% | 96% | 20,000 |
+| SLM only | 0% | 84% | 1,000 |
+| Cascade on schema failure only | 6% | 88% | 2,200 |
+| Cascade on schema failure or verifier reject | 18% | 95% | 4,600 |
+| Same, plus escalate on any tool error | 21% | 96% | 5,200 |
+
+- **Read the table:** schema checks alone miss wrong-but-valid tool choices; a verifier catches most of them
+  at about a quarter of the large-only cost.
+- **Decision:** ship the last row, alert if escalation rate drifts above 30%, and fine-tune on escalations.
+
 ### A validate-then-escalate cascade for one tool-calling step
 The SLM runs locally through Ollama's OpenAI-compatible endpoint; the large model through any compatible
 provider. Pydantic validation is the escalation signal.
@@ -151,22 +184,6 @@ def route(text):
 for q in ["Where is order A17?", "I want my money back for B22", "Your app is awful, get me a person"]:
     print(route(q))
 ```
-
-### Worked scenario: choosing the threshold for an agent's routing step
-Illustrative eval on 1,000 labelled requests, cost in relative units (SLM call = 1, large call = 20,
-verifier cost left out for simplicity).
-
-| Policy | Escalation rate | Routing accuracy | Cost per 1,000 |
-|---|---|---|---|
-| Large model only | 100% | 96% | 20,000 |
-| SLM only | 0% | 84% | 1,000 |
-| Cascade on schema failure only | 6% | 88% | 2,200 |
-| Cascade on schema failure or verifier reject | 18% | 95% | 4,600 |
-| Same, plus escalate on any tool error | 21% | 96% | 5,200 |
-
-- **Read the table:** schema checks alone miss wrong-but-valid tool choices; a verifier catches most of them
-  at about a quarter of the large-only cost.
-- **Decision:** ship the last row, alert if escalation rate drifts above 30%, and fine-tune on escalations.
 
 ## Production patterns
 - **Put routing in one place.** Implement tiers in a gateway or a LiteLLM Router with fallbacks, not per

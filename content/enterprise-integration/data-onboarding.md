@@ -5,7 +5,8 @@ name: Data onboarding
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/data-access-and-permissions-discovery
@@ -34,6 +35,71 @@ sync. The data, not the model, is usually slowest and riskiest.
   run through the agent itself, and the acceptance criteria that include agent eval scores.
 - **What you can skip.** Building a general data platform first; onboard the slice the pilot agent needs
   and turn each stage into a reusable job as you go.
+
+## Decision case
+### Scenario
+A manufacturer wants a field-service agent: technicians ask how to fix a machine, and the agent answers
+from past work orders and equipment manuals through `search_manuals` and `get_work_orders`. All figures
+are illustrative.
+
+- **Data:** a work-order system with 1.2 million records across 5 regions and 10 years, plus 150,000
+  manuals and service bulletins in a document library.
+- **Deadline:** a pilot for one region's 60 technicians in 8 weeks.
+- **Residency:** data must stay in the customer's EU cloud region.
+- **Source load:** the work-order system is production for the service desk; bulk reads are allowed only
+  off-peak, about 50,000 records per night.
+- **People:** two senior technicians as SMEs, 3 hours each per week (6 hours in total).
+- **Permissions:** work orders are visible by site, and the agent must respect that.
+
+### Options
+| Option | How it works | First real feedback | Source load | Fits 8 weeks |
+|---|---|---|---|---|
+| A. Big-bang export | DBA produces a full dump of all regions and years; load it all, then evaluate | after export approval (est. 3 weeks) and a full load | 1.2M / 50,000 = 24 nights | no: about 6.5 weeks before the first review |
+| B. Staged pilot slice | Inventory, stratified sample, profile, map, SME pilot on one region's last 2 years, then backfill and change feed | week 2, on a sample | slice of 180,000 records: 4 nights | yes |
+| C. Federated tools, no ingestion | Agent tools query the source API at question time | week 1 | live calls at peak hours, which the source forbids; no semantic search over manuals | no |
+| D. Staged, full scope | Same gates as B, but all regions and years | week 2 | 24 nights plus 150,000 manuals | tight: SMEs cannot review 5 regions |
+
+For A, about 3 weeks of approval plus 24 nights (3.5 weeks) of loading is roughly 6.5 weeks before
+anyone reviews an answer. For B, 180,000 / 50,000 = 3.6, so 4 nights.
+
+### Decision
+Choose **B**, because it gets the first defects in front of SMEs in week 2 and keeps the backfill at
+4 nights of off-peak load.
+- **SME time fits:** reviewing 40 pilot questions at about 10 minutes each is 400 minutes, about 6.7
+  hours, just over one week's 6 SME hours, so the review spans two weeks.
+- **Residency is fixed first:** inventory confirms the EU region before any code is deployed.
+- **Permissions are ingested from the first load:** site visibility goes into the ACL metadata the
+  tools filter on, and seeded users from two sites check it through the agent.
+- **The hand-over is safe:** the change-feed position is recorded before the backfill, then replayed
+  with a version check.
+
+**What would change it.**
+- **A clean, documented warehouse replica** with site ACLs: widen the pilot scope early, since source
+  load and mapping risk drop.
+- **A few thousand documents in total:** a single pass with a sample review is enough.
+- **Legal forbids copying data out of the source:** use federated tools with caching and accept no
+  semantic search.
+
+### Trade-offs accepted
+- **Other regions wait.** Expansion to 4 more regions is a later project; track pilot usage to justify
+  it.
+- **The slice can hide regional quirks.** Each new region gets its own sample and profile; watch the
+  quarantine rate per region.
+- **SMEs are the bottleneck.** Questions are prioritised by frequency, and the golden set grows over
+  time.
+- **Two paths keep running:** change feed plus nightly reconciliation; alert on sync lag and repair
+  count.
+
+### Review rubric
+- **The slice is justified by the pilot use case,** with record counts and the load it puts on the
+  source.
+- **Gates have exit criteria** the customer can verify, such as SME acceptance and per-batch count
+  reconciliation.
+- **SME time is budgeted in hours** and matches the review plan.
+- **Permissions and residency are decided before loading,** not retrofitted.
+- **The backfill-to-sync hand-over** records the change-feed position first.
+- **Acceptance includes agent evidence:** eval scores on the golden set and sync freshness, not only
+  table counts.
 
 ## Why it exists
 - **The data is the per-customer cost.** An AI product is only as good as the data it retrieves or learns

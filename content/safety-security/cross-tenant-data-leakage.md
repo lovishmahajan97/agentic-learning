@@ -5,7 +5,8 @@ name: Cross-tenant data leakage
 kind: concept
 difficulty: core
 est_minutes: 17
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -137,6 +138,27 @@ flowchart TD
     L --> O[("Traces, classified like source")]
     J["Background job"] -->|"tenant missing: fail closed"| X["Refuse to run"]
 ```
+
+## Misconceptions
+- **"Row-level security in the database means the agent is tenant-safe."** RLS guards only the
+  relational store. The vector index, semantic cache, memory, traces and fine-tuned weights are
+  copies outside it, and each needs its own tenant key or pre-filter.
+- **"Filtering retrieved chunks by tenant afterwards is equivalent to filtering in the search."**
+  Post-filtering is safe only if nobody touches it, and it destroys recall for small tenants: in the
+  simulation the 300-chunk tenant gets 0.15 of 8 hits, which tempts someone to raise k or drop the
+  filter. Filter inside the ANN search.
+- **"Telling the model to use only this customer's documents is a second line of defence."** Once a
+  foreign chunk is in the prompt the leak has happened, and it is already in the trace store. The
+  model cannot verify ownership; isolation belongs to the data layer.
+- **"The tenant ID in the request body or tool arguments is fine to filter on."** The body, the
+  model's output and retrieved documents are all attacker-influenceable. Derive `tenant_id` once from
+  the verified token and pass it in an immutable context.
+- **"Isolating by tenant is enough."** Inside a tenant, documents carry their own ACLs, so a cache
+  shared across a tenant's users must key on the permission set too, or the CFO's answer reaches the
+  intern.
+- **"A missing filter fails loudly."** On most vector clients a `None` filter means no filter, so a
+  background job without a tenant silently searches everyone. Make jobs fail closed and prove it with
+  canary tests.
 
 ## Examples
 ### A scoped store with a canary test

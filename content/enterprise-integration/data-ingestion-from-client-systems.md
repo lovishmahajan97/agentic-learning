@@ -5,7 +5,8 @@ name: Data ingestion from client systems
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - data-architecture/ingestion-pipelines
@@ -37,6 +38,69 @@ source, and reconcile for deletes.
   permission fields are landed, and a freshness target the agent's answers depend on.
 - **What you can skip.** Building a general streaming platform. A watermark poll with overlap, a raw zone
   and an ID reconciliation cover most agent knowledge bases.
+
+## Decision case
+### Scenario
+An IT-helpdesk agent for a bank answers employees from past tickets and knowledge articles, and checks a
+ticket's live status before replying. The ticketing system runs on-premises. All figures are
+illustrative.
+
+- **Volume:** 2 million historical tickets; about 6,000 created or changed per day.
+- **Freshness:** a changed ticket must be searchable within 30 minutes; a deleted or erased ticket
+  must leave the index within 24 hours.
+- **Network:** security approves outbound connections from inside the bank only; no inbound path.
+- **Quota:** the ticketing API allows your integration 40 requests per minute, shared between sync jobs
+  and the agent's live `get_ticket_status` tool.
+- **People:** the bank's DBA team has no capacity this quarter for replicas or CDC.
+
+### Options
+| Option | How it works | Freshness | Deletes | Network and people |
+|---|---|---|---|---|
+| A. API pull from an in-network connector | Connector inside the bank polls every 15 minutes from watermark minus overlap, lands raw records, pushes outbound; nightly ID reconciliation | within 15 minutes | nightly ID diff | outbound only; no DBA work |
+| B. Read-replica views | SQL over replica views from your cloud | minutes | SQL anti-join | needs an inbound path and DBA work: fails |
+| C. Nightly SFTP file drop | Full or delta export once a night | up to 24 hours: fails 30 minutes | full snapshot diff | outbound push; little DBA work |
+| D. CDC from the database log | Connector reads the change log | seconds | native | needs DBA work: fails this quarter |
+
+### Decision
+Choose **A**, because it is the only option that meets the 30-minute freshness target over an
+outbound-only path without DBA work. The quota arithmetic, at 200 records per page:
+
+| Job | Calls | At 40 per minute |
+|---|---|---|
+| Backfill | 2,000,000 / 200 = 10,000 | 250 minutes, about 4.2 hours off-peak |
+| Incremental, every 15 minutes | 96 polls per day; about 6,000 / 96 = 62.5 changes each, so 1 page | 96 calls per day |
+| Nightly ID reconciliation | 10,000 id pages | 250 minutes of an 8-hour (480-minute) night |
+
+- **Agent calls get priority.** In business hours the live tool may use up to 20 per minute, so sync
+  runs at the remaining 20; the incremental job's 1 page per poll fits easily.
+- **Deletes meet 24 hours** because the ID diff runs nightly and tombstones go through the same index
+  path.
+- **Raw landing keeps ACLs** with content, so the index can enforce them and be rebuilt without asking
+  the bank again.
+
+**What would change it.**
+- **DBA capacity appears:** move to CDC for ordered deletes and lower source load.
+- **Freshness relaxes to next-day:** a nightly file drop is simpler to approve and operate.
+- **The id listing is too slow:** if 250 minutes grows past the night, partition the diff by count
+  first and compare ids only where counts disagree.
+
+### Trade-offs accepted
+- **You run software inside the bank.** The connector needs patching and monitoring; alert on its
+  heartbeat and last successful poll.
+- **Deletes lag up to a day.** Erasure requests that must be faster are handled by a targeted delete
+  call; track time from request to removal.
+- **Overlap re-reads cost calls.** Content-hash keys make them no-ops; watch the duplicate-skip rate.
+- **Sync and agent share 40 per minute.** Track 429s by caller; agent 429s mean the split is wrong.
+
+### Review rubric
+- **The channel is chosen from what the client can approve,** with network direction and team capacity
+  stated.
+- **Quota arithmetic is shown** for backfill, incremental and reconciliation, and adds up against the
+  limit.
+- **The watermark is safe:** overlap, dedupe key and advance-after-durable-write are all named.
+- **Deletes and permissions have a mechanism,** not an assumption that polling catches them.
+- **Ingest versus live tool is decided per field:** searchable history is ingested, current status is
+  called live, and both share one budget.
 
 ## Why it exists
 - **Ingestion at a client is a negotiation.** The data sits in their CRM, ERP, ticketing system or file

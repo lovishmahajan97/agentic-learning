@@ -5,7 +5,8 @@ name: LiteLLM
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/openai-sdk
@@ -38,6 +39,178 @@ lag provider-specific features agents rely on.
   attribution, and callbacks to tracing backends.
 - **What you can skip.** The internals of each provider translation. Test the parts your agent depends on
   (tool calls, streaming usage, caching) on every provider in the route instead.
+
+## Lab
+### Task
+Fix an agent's model layer that stacks retries, never fails over, records zero cost, and has no
+task-level failure budget. Deployments use LiteLLM's `mock_response`, so the real `Router` runs its
+retries and fallbacks with no keys or spend. A callback counts every upstream attempt. Time box: 60-90
+minutes.
+- **Prerequisites:** OpenAI SDK, Model fallback strategies, and this lesson's Router, cost and stacked
+  retries sections.
+- **Targets:** at most 2 primary attempts plus 1 backup per step when the primary is rate-limited, at
+  most 4 attempts per step in a full outage, cost and `metadata` (tenant, step) on every call, and a task
+  that stops after `max_failed_steps` failed steps.
+- **Checked against:** Python 3.12, `litellm` 1.106. `mock_response` naming a litellm exception and
+  `log_pre_api_call` are test hooks that have changed before; re-run the tests after any upgrade.
+
+### Starter code
+Save as `lab.py`. Fix `LAB 1` to `LAB 4` and implement `run_task` (`LAB 5`).
+
+```python
+"""Lab: an agent's model layer on a LiteLLM Router: retries in one layer, counted failover, real cost."""
+import logging
+import os
+
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")   # bundled price map, no network fetch
+import litellm
+from litellm import Router
+from litellm.integrations.custom_logger import CustomLogger
+
+PRIMARY, BACKUP = "anthropic/claude-haiku-4-5", "openai/gpt-4o-mini"
+logging.getLogger("LiteLLM Router").setLevel(logging.CRITICAL)  # keep the lab output readable
+
+
+class Attempts(CustomLogger):
+    """Counts every upstream attempt and keeps the metadata each attempt carried."""
+
+    def __init__(self):
+        self.models, self.metadata = [], []
+
+    def log_pre_api_call(self, model, messages, kwargs):
+        self.models.append(model)
+        self.metadata.append((kwargs.get("litellm_params") or {}).get("metadata") or {})
+
+
+def deployments(primary_mock: str, backup_mock: str) -> list[dict]:
+    """Recorded deployments: mock_response is the reply text, or the name of a litellm exception to raise."""
+    return [
+        {"model_name": "worker", "litellm_params": {"model": PRIMARY, "api_key": "test", "mock_response": primary_mock}},
+        {"model_name": "worker-backup", "litellm_params": {"model": BACKUP, "api_key": "test", "mock_response": backup_mock}},
+    ]
+
+
+def build_router(model_list: list[dict]) -> Router:
+    # LAB 1: retries live in the router only (at most 1 per group), and "worker" falls back to "worker-backup".
+    return Router(model_list=model_list, num_retries=1)
+
+
+def agent_step(router: Router, messages: list[dict], *, tenant: str, step: int, ledger: list) -> str:
+    """One call for the agent's worker role. Appends {step, model, fallback, cost} to ledger."""
+    for attempt in range(3):                   # LAB 2: no retry loop here; the router owns retries
+        try:
+            resp = router.completion(model="worker", messages=messages)   # LAB 3: metadata tenant + step
+            break
+        except litellm.RateLimitError:
+            if attempt == 2:
+                raise
+    ledger.append({"step": step, "model": resp.model, "fallback": False, "cost": 0.0})   # LAB 4
+    return resp.choices[0].message.content
+
+
+def run_task(router: Router, n_steps: int, *, tenant: str, ledger: list, max_failed_steps: int = 2) -> dict:
+    """Run up to n_steps; stop early once max_failed_steps steps have failed. Return {status, steps_run}."""
+    raise NotImplementedError("LAB 5")
+
+
+if __name__ == "__main__":
+    for title, primary, backup in [("primary rate-limited", "litellm.RateLimitError", "backup ok"),
+                                   ("full outage", "litellm.RateLimitError", "litellm.RateLimitError")]:
+        counter, ledger = Attempts(), []
+        litellm.callbacks = [counter]
+        try:
+            out = run_task(build_router(deployments(primary, backup)), 3, tenant="acme", ledger=ledger)
+            print(title, "->", out, "| upstream attempts:", len(counter.models))
+            for row in ledger:
+                print("  ", {**row, "cost": f"{row['cost']:.2e}"})
+        except Exception as e:
+            print(title, "->", f"{type(e).__name__}: {str(e)[:60]}", "| upstream attempts:", len(counter.models))
+```
+
+### Expected output
+The starter prints `NotImplementedError: LAB 5` twice. A correct layer prints:
+
+```
+primary rate-limited -> {'status': 'ok', 'steps_run': 3} | upstream attempts: 9
+   {'step': 0, 'model': 'gpt-4o-mini', 'fallback': True, 'cost': '1.35e-05'}
+   {'step': 1, 'model': 'gpt-4o-mini', 'fallback': True, 'cost': '1.35e-05'}
+   {'step': 2, 'model': 'gpt-4o-mini', 'fallback': True, 'cost': '1.35e-05'}
+full outage -> {'status': 'failed', 'steps_run': 2} | upstream attempts: 8
+```
+
+- **Read the numbers:** 9 = 3 steps × (2 primary + 1 backup). 8 = 2 failed steps × (2 + 2), because
+  `num_retries` also applies inside the fallback group. The task then stops instead of trying step 3.
+- **The cost** comes from the bundled price map and the mock's fixed usage (10 prompt and 20 completion
+  tokens); treat it as illustrative, not a current price.
+
+### Tests
+Save as `test_lab.py` and run `pytest -q` (about 15 seconds, because the router backs off between
+retries). On the starter, all four fail: "No fallback was attempted", a cost of 0.0, and `LAB 5`.
+
+```python
+import litellm
+import pytest
+from lab import Attempts, agent_step, build_router, deployments, run_task
+
+MSG = [{"role": "user", "content": "Where is order A1?"}]
+
+
+@pytest.fixture
+def counter():
+    c = Attempts()
+    litellm.callbacks = [c]
+    yield c
+    litellm.callbacks = []
+
+
+def test_primary_outage_fails_over_with_bounded_attempts(counter):
+    router, ledger = build_router(deployments("litellm.RateLimitError", "backup ok")), []
+    assert agent_step(router, MSG, tenant="acme", step=0, ledger=ledger) == "backup ok"
+    assert len(counter.models) <= 3                      # at most 2 primary attempts + 1 backup
+    assert ledger[0]["fallback"] is True and ledger[0]["model"] == "gpt-4o-mini"
+
+
+def test_cost_and_metadata_are_recorded(counter):
+    router, ledger = build_router(deployments("primary ok", "backup ok")), []
+    agent_step(router, MSG, tenant="acme", step=4, ledger=ledger)
+    assert ledger[0]["fallback"] is False and ledger[0]["cost"] > 0
+    assert counter.metadata and counter.metadata[0].get("tenant") == "acme" and counter.metadata[0].get("step") == 4
+
+
+def test_healthy_task_runs_every_step(counter):
+    ledger = []
+    out = run_task(build_router(deployments("primary ok", "backup ok")), 3, tenant="acme", ledger=ledger)
+    assert out == {"status": "ok", "steps_run": 3} and [r["step"] for r in ledger] == [0, 1, 2]
+
+
+def test_full_outage_stops_at_the_failure_budget(counter):
+    ledger = []
+    out = run_task(build_router(deployments("litellm.RateLimitError", "litellm.RateLimitError")), 8,
+                   tenant="acme", ledger=ledger, max_failed_steps=2)
+    assert out == {"status": "failed", "steps_run": 2} and ledger == []
+    assert len(counter.models) <= 2 * 4                  # 2 failed steps, at most 2 + 2 attempts each
+```
+
+### Failure scenarios
+- **Keep the app-level loop after adding fallbacks.** A full outage costs up to 3 × 4 = 12 attempts per
+  step instead of 4. Debug: compare `len(counter.models)` per step with the product of every retry layer,
+  as in the stacked-retries table.
+- **Leave `num_retries` at the library default** (2 in the version checked). A rate-limited step makes 3
+  primary attempts plus 1 backup, and the first test fails. Debug: print `router.num_retries`, then set
+  it explicitly in one place.
+- **Compute `fallback` from a hard-coded "gpt" substring.** It breaks when the backup changes provider.
+  Debug: compare `resp.model` with the primary deployment's model name from config instead.
+- **Catch `Exception` in `run_task`.** A `BadRequestError` (bad tool schema) now burns the failure budget
+  silently. Debug: let 400-class errors raise, and count only transient ones.
+
+### Submission
+- **`lab.py` passing all four tests**, and the script output matching Expected output.
+- **A table** of upstream attempts per user request for your final config versus the starter, in a full
+  outage, with the arithmetic shown.
+- **A note** on whether this agent should pin a task to one model group after the first fallback, and
+  which eval would justify mid-run fallback.
+- **Evaluation:** tests pass, retries are configured in exactly one place, and every ledger row has a
+  non-zero cost.
 
 ## Why it exists
 - **Teams rarely stay on one model.** A cheap model for classification, a strong one for reasoning, a

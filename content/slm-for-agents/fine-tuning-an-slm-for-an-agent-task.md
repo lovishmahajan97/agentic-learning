@@ -6,7 +6,8 @@ kind: concept
 difficulty: advanced
 est_minutes: 18
 agent_relevance: useful
-status: mastery-verified
+status: typed
+lesson_type: concept
 mastery: implement
 code_tested: partial
 prerequisites:
@@ -122,7 +123,38 @@ flowchart TD
     M --> P["Canary in agent with fallback"]
 ```
 
+## Misconceptions
+- **"Fine-tuning teaches the model my domain facts."** A LoRA run on a few thousand examples mostly changes
+  behaviour and format; facts picked up this way are patchy, slow to update and stated confidently when
+  wrong. Fine-tune the call pattern and put the facts in retrieval.
+- **"When accuracy stalls, add epochs or rank."** More epochs on small data memorise phrasing, and more rank
+  overfits sooner. In the triage scenario below the big jump came from adding "no tool" and
+  missing-argument cases; fix coverage first, then check with a learning curve.
+- **"QLoRA trains a 4-bit model."** Only the frozen base is stored in 4-bit (NF4); the LoRA adapters train
+  in higher precision with bf16 compute, and what you ship is that small adapter.
+- **"Low validation loss means the agent is ready."** Loss measures token fit on the training format, not
+  whether served calls parse or pick the right tool. A template mismatch, test leakage or missing negatives
+  all hide behind a good curve, so gate on the held-out agent eval through the serving engine.
+- **"An adapter carries over to a newer base model."** LoRA deltas are learned against one set of base
+  weights; a base revision bump silently invalidates them. Version base, data, template and adapter
+  together and retrain on any base change.
+
 ## Examples
+### Worked scenario: a ticket-triage agent step
+A support agent's first step picks one of 6 tools (or none) and fills arguments. A large hosted model does
+it well but costs too much at high volume. Illustrative figures:
+
+| Run | Data | Tool + args exact match | Schema-valid |
+|---|---|---|---|
+| 3B instruct, prompted with few-shot | none | ~70% | ~90% |
+| 3B + LoRA, 800 examples | real traces only | ~86% | ~99% |
+| 3B + LoRA, 2,500 examples | traces + synthetic "no tool" and missing-argument cases | ~94% | ~99% |
+| Large hosted model (reference) | prompted | ~95% | ~99% |
+
+- **What moved the number:** adding negatives and "ask a clarifying question" examples, not more epochs.
+- **Ship decision:** the fine-tuned SLM takes the step; low-confidence or invalid outputs escalate to the
+  large model (see slm-llm-cascades-and-routing).
+
 ### QLoRA fine-tune of a small model on tool-call traces
 A minimal TRL plus PEFT run. `train.jsonl` holds one `{"messages": [...]}` conversation per line, rendered
 with your real system prompt and tool schemas.
@@ -158,21 +190,6 @@ trainer.save_model("out/router-lora")   # adapter weights (a few MB to tens of M
 ```
 
 Drop `quantization_config` for plain bf16 LoRA when memory allows (see Trade-offs).
-
-### Worked scenario: a ticket-triage agent step
-A support agent's first step picks one of 6 tools (or none) and fills arguments. A large hosted model does
-it well but costs too much at high volume. Illustrative figures:
-
-| Run | Data | Tool + args exact match | Schema-valid |
-|---|---|---|---|
-| 3B instruct, prompted with few-shot | none | ~70% | ~90% |
-| 3B + LoRA, 800 examples | real traces only | ~86% | ~99% |
-| 3B + LoRA, 2,500 examples | traces + synthetic "no tool" and missing-argument cases | ~94% | ~99% |
-| Large hosted model (reference) | prompted | ~95% | ~99% |
-
-- **What moved the number:** adding negatives and "ask a clarifying question" examples, not more epochs.
-- **Ship decision:** the fine-tuned SLM takes the step; low-confidence or invalid outputs escalate to the
-  large model (see slm-llm-cascades-and-routing).
 
 ## Production patterns
 - **Version data, base and adapter together.** Record the base model revision, dataset hash, chat template

@@ -5,7 +5,8 @@ name: Fault tolerance
 kind: concept
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - reliability/high-availability
@@ -40,6 +41,63 @@ so a 429 or lost reply never sends an email twice.
   rung of the degradation ladder serves the answer.
 - **What you can skip.** Byzantine agreement protocols. Know the 3f + 1 versus 2f + 1 fact, then treat
   wrong-but-valid model output with validation and approval gates instead.
+
+## Decision case
+### Scenario
+A manufacturer's procurement agent turns approved requests into purchase orders through a
+`create_purchase_order` tool on a legacy ERP. Last month the orchestrator blindly retried timeouts and
+finance found duplicate orders. All figures are illustrative.
+- **Volume:** 8,000 orders a day. 0.6% of calls hit the 30 s timeout, which is 48 a day.
+- **Ambiguity:** reconciliation showed 70% of timed-out calls had actually created the order, about 34 a
+  day. The other 14 never landed.
+- **ERP limits:** no idempotency key support, and the vendor will not change the API for 6 months. Orders
+  accept a free-text `external_ref` field that becomes searchable within 60 s.
+- **Constraints:** zero duplicate orders, an operations team with 1 hour a day for exceptions at about 5
+  minutes each, 2 engineers and 3 weeks.
+
+### Options
+| Option | How it works | Duplicates a day | Ops time a day | Fits ERP and team |
+|---|---|---|---|---|
+| A. Blind retry | retry every timeout | about 34 | none, until finance unwinds them | yes, but breaks the zero-duplicate rule |
+| B. Never retry writes | each timeout becomes `unknown_outcome` for a human | 0 | 48 × 5 min = 240 min | breaks the 1 hour ops budget 4 times over |
+| C. Adapter-level idempotency | mint a key per intended order, write it into `external_ref`, on timeout wait 60 s and search by it; found returns the order, not found retries with the same key | 0 if the window holds | only lookups that stay ambiguous (illustrative 2%, about 1 a day, 5 min) | yes: no ERP change, small adapter |
+| D. Approve every write | a human confirms each order before and after | 0 | 8,000 approvals, impossible | no |
+
+### Decision
+**Option C, with B as its last rung.** The adapter makes the ERP behave as if it deduplicated: the key
+is minted once per intended order and stored with the agent step before the first attempt, and a
+timeout triggers read-after-timeout instead of a blind retry.
+
+Lookups that cannot decide fall back to
+`unknown_outcome`, which the agent reports and the ops queue resolves.
+- **Why not A:** it is the failure that started this, and 34 duplicates a day is far from zero.
+- **Why not B alone:** correct, but 240 minutes a day against a 60-minute budget.
+- **Why not D:** it is the right gate for high-value orders, not for every order.
+
+**What would change it.** If the ERP ships native idempotency keys, drop the search and send the key.
+If `external_ref` search lags past 60 s often, raise the wait or move to B with more ops staff. If
+volume fell to a few hundred orders a day, B's human queue alone would fit the budget.
+
+### Trade-offs accepted
+- **A minute of latency on timed-out steps.** 48 steps a day wait 60 s before deciding. Track p95 step
+  latency for this tool separately so it does not mask other regressions.
+- **A late landing can still duplicate.** If the first call lands after the search says "not found", the
+  retry creates a second order. Run a daily report that groups orders by `external_ref` and alert on any
+  count above 1.
+- **The adapter owns correctness.** Every caller must go through it; alert on any order created without
+  an `external_ref`.
+- **Ops still sees about one case a day.** Track queue size against the 1 hour budget.
+
+### Review rubric
+- **Ambiguity named:** the write-up treats a timeout on a write as an unknown outcome and quantifies how
+  often the first attempt actually landed.
+- **Arithmetic shown:** duplicates and human minutes a day follow from volume, timeout rate and landing
+  share.
+- **Key lifecycle correct:** the key is minted before the first attempt and persisted with the step, so
+  a retry or a resumed run sends the same key.
+- **Residual path defined:** what the agent tells the user and who resolves cases the lookup cannot.
+- **Detection of escapes:** a reconciliation check proves duplicates are zero rather than assuming it.
+- **Reversal condition:** names the ERP change, lag or volume that would move the decision.
 
 ## Why it exists
 - **Components fail at rates you cannot engineer away.** A fleet of 1,000 disks with a 1% annual failure

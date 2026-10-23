@@ -5,7 +5,8 @@ name: Confusion matrix
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - ml-fundamentals/classification
@@ -152,6 +153,23 @@ flowchart TD
     D -->|"yes"| SHIP["Ship at this operating point"]
     D -->|"no"| T
 ```
+
+## Misconceptions
+- **"Higher accuracy means the better model."** Accuracy discards the direction of the errors. The fraud
+  screen scores 0.977, below the 0.99 of never flagging, yet costs $17,000 against $50,000 when a miss costs
+  $500 and a false decline $10. Price the cells.
+- **"Everyone lays the matrix out the same way."** scikit-learn puts actual classes in rows; many textbooks
+  put predictions in rows. A swapped reading exchanges FP and FN, and so precision and recall. Label both
+  axes and pass `labels=` explicitly.
+- **"A confusion matrix describes the model."** It describes one operating point. Lowering the threshold
+  moves counts from FN to TP and from TN to FP at once, so two matrices at the default 0.5 compare
+  arbitrary points.
+- **"Fix the heaviest off-diagonal cell first."** Count is not cost. In the tool-selection matrix the
+  heaviest cell (no tool needed, search called: 10) costs seconds, while the second (ticket needed, refund
+  called: 6) pays out money.
+- **"An LLM judge with high agreement with humans is fine."** Agreement hides direction: with "pass" as the
+  positive class, a lenient judge piles errors in the FP cell (failures passed). Track the FP and FN cells
+  per release.
 
 ## Examples
 ### Worked scenario: a fraud screen read and priced

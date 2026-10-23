@@ -5,7 +5,8 @@ name: Vector store sizing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - data-architecture/vector-database-architecture
@@ -39,6 +40,63 @@ turn. Do the arithmetic before picking a vendor.
   memories per user you keep, and how many retrieval calls the agent may make per turn.
 - **What you can skip.** Product-quantization theory. The eight-step checklist and the calculator below are
   what you need.
+
+## Decision case
+### Scenario
+A law firm is launching a legal-research agent for 2,000 lawyers over 1 million documents (opinions,
+briefs, internal memos) averaging 3,000 tokens. All figures are illustrative.
+
+- **Chunking.** 500-token chunks with 100 overlap: ceil(3,000 / 400) = 8 per document, so 8 million vectors.
+- **Embedding.** 1,536 dimensions; float32 is 6,144 B per vector, and a chunk's text is about 2 KB plus 300 B of ids and filter fields.
+- **Traffic.** At peak, 50 agent turns a second with up to 5 retrieval calls each: 250 QPS. Staging measured about
+  400 QPS per node with production-shaped filters.
+
+Constraints:
+- **Budget.** At most 4 nodes of 64 GB RAM, including during migrations.
+- **Quality.** Recall@10 of at least 0.95 against exact float32 search; p99 under 100 ms per tool call.
+- **Availability.** Two replicas, each on its own node.
+- **Migration.** An embedding-model upgrade (same dimension) is planned within 6 months and must fit without new nodes.
+- **Text.** Chunk text already lives in the firm's Postgres chunk table, keyed by `chunk_id`.
+
+### Options
+Per-replica RAM is (vectors + HNSW links at `M = 16` + payload) × 1.5 headroom; nodes = 2 replicas × ceil(per-replica RAM / 64 GB).
+
+| Option | Vectors + links + payload | Per replica | Nodes | Nodes during migration (×2) | Recall risk |
+|---|---|---|---|---|---|
+| **A. float32, text in engine** | 49.2 + 1.0 + 18.4 GB | ≈ 103 GB | 4 | 8: fails the budget | None |
+| **B. int8 in RAM, float32 on disk, text in engine** | 12.3 + 1.0 + 18.4 GB | ≈ 48 GB | 2 | 4: at the budget limit | Low, with rescoring |
+| **C. int8 in RAM, float32 on disk, text in Postgres** | 12.3 + 1.0 + 1.6 GB | ≈ 22 GB | 2 | 2 | Low, with rescoring |
+| **D. Binary in RAM, text in Postgres** | 1.5 + 1.0 + 1.6 GB | ≈ 6 GB | 2 | 2 | Higher: needs heavy oversampling |
+
+The QPS bound is ceil(250 / 400) = 1 node per replica, so memory binds in every option.
+
+### Decision
+Choose **C**, because it is the cheapest option that keeps the migration inside the budget at low recall risk:
+- **The migration decides it.** A doubles to 8 nodes and B to the full budget of 4; C holds both model versions
+  at about 45 GB per replica, still one 64 GB node each.
+- **Text was the biggest line after quantization.** In B, 18.4 GB of payload outweighs the 12.3 GB of int8 vectors.
+  The text already sits in Postgres, so moving it costs one keyed fetch for the final k per call.
+- **D saves RAM but no nodes.** Two replicas need two nodes either way, so binary codes would buy recall risk for nothing.
+- **Disk is sized separately.** Full-precision vectors for rescoring are about 49 GB per replica on SSD, plus WAL and snapshots.
+
+What would change it:
+- **Recall misses 0.95 at int8.** Fall back to B, accept the 4-node migration, and migrate tenant by tenant to bound the overlap.
+- **Traffic grows.** If peak exceeds 400 QPS per replica (for example a planner making 10 calls a turn at 50 turns a second, which is 500 QPS), the QPS bound adds nodes before RAM does.
+- **A larger model.** Moving to 3,072 dimensions doubles the vector line, about 24.6 GB at int8, and the arithmetic must be redone.
+
+### Trade-offs accepted
+- **An extra hop for text.** Each tool call fetches k chunk texts from Postgres. Watch p99 per tool call against the 100 ms budget.
+- **Quantization error.** Measure recall@10 against exact float32 search on a labelled query set before launch and after each model change.
+- **Thin headroom during migration.** About 45 of 64 GB per node. Alarm when steady-state RAM crosses about two thirds of node memory.
+- **Two copies on disk.** Quantized and full-precision vectors both persist; track disk per replica with snapshots included.
+
+### Review rubric
+- **Vectors come from chunks.** The write-up derives the vector count from tokens, chunk size and overlap, not documents.
+- **Every RAM term is itemized.** Vectors, links, payload, headroom and replicas each appear with arithmetic.
+- **Both bounds are checked.** Node count is the larger of the RAM and QPS bounds, with QPS derived from agent turns times calls per turn.
+- **The migration window is budgeted.** It shows the doubled footprint fits, or how the overlap is bounded.
+- **Recall is gated by measurement.** Quantization is accepted only against a stated recall target.
+- **Reversal conditions are concrete.** It names the recall, traffic or model change that flips the choice.
 
 ## Why it exists
 - **Teams size vector stores by feel.** They pick a managed tier that "looks big enough" or the instance with

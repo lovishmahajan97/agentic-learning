@@ -6,7 +6,8 @@ kind: concept
 difficulty: advanced
 est_minutes: 16
 agent_relevance: useful
-status: mastery-verified
+status: typed
+lesson_type: concept
 mastery: implement
 code_tested: yes
 prerequisites:
@@ -111,6 +112,24 @@ flowchart TD
     C --> A
     A -.->|"offline actions queued"| Q[("Sync queue")]
 ```
+
+## Misconceptions
+- **"If the weights fit, the model fits."** The KV cache grows with context. In the calculator below a
+  3.2B model at 4.8 bits per weight totals 2.45 GB at 2k tokens but 3.16 GB at 8k, past a 3 GB budget, with
+  identical weights.
+- **"A 4-bit 3B model is a 1.5 GB file."** That is the formula's floor; GGUF types such as Q4_K_M keep some
+  tensors at higher precision, so the file is closer to 2 GB before cache, runtime and app memory.
+- **"My laptop benchmark predicts the phone."** Phones cap per-app memory, kill processes under pressure
+  and throttle when hot. Measure time to first token, tokens per second and peak memory on the slowest
+  target device, again after 10 minutes of use.
+- **"A bigger model is the main reliability lever."** On narrow device tasks, constrained decoding, fewer
+  and shorter tool schemas and a LoRA fine-tune usually fix more failures than moving up a size, which may
+  not fit anyway.
+- **"Constrained decoding makes tool calls correct."** A grammar or JSON schema guarantees the call
+  parses, not that the tool or arguments are right, so still validate in code; offline there is no stronger
+  model to retry on.
+- **"Cloud fallback is a harmless safety net."** A silent fallback sends data off the device and breaks the
+  privacy guarantee the design exists for. Make escalation explicit, consented, redacted and logged.
 
 ## Examples
 ### Runnable: will it fit, and at what context length?

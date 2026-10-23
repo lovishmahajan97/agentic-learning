@@ -5,7 +5,8 @@ name: Structured outputs / JSON mode
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/function-tool-calling
@@ -151,6 +152,22 @@ flowchart TD
     R -->|"yes"| V["Parse, then semantic checks"]
     V --> E["Golden-set eval for correctness"]
 ```
+
+## Misconceptions
+- **"Schema-valid output is correct output."** The mask decides form; the model still picks content
+  among allowed tokens, so a well-formed but invented email or wrong label passes every check. Accuracy
+  is measured by the golden-set eval and semantic checks in your code.
+- **"JSON mode and structured outputs are the same guarantee."** JSON mode only promises the output
+  parses; keys, types and required fields are enforced only when a schema is compiled into the mask.
+- **"A constrained model will leave a field empty when it does not know."** A required field cannot be
+  skipped, so the mask forces some value; abstention needs a nullable field or an `unknown` enum value,
+  and an agent action enum needs `ask_user` and `finish`.
+- **"With constrained decoding the response always parses."** A `max_tokens` stop truncates the object
+  mid-way and a refusal may not match the schema, so check the stop reason before parsing.
+- **"Field order in the schema is cosmetic."** Generation is left to right, so a label written before
+  `reasoning` or `evidence` is a commitment followed by a rationalisation; put evidence first.
+- **"Every JSON Schema keyword is enforced server-side."** Providers accept a subset; bounds like
+  `minimum` or `maxLength` are often stripped and must be validated client-side.
 
 ## Examples
 ### Ticket triage with a Pydantic schema

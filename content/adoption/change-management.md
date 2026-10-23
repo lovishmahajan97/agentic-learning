@@ -5,7 +5,8 @@ name: Change management
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - adoption/user-training
@@ -38,6 +39,68 @@ broken model or tool loop.
   for what users report.
 - **What you can skip.** The organizational-psychology literature. Treat ADKAR as a debugging checklist for
   low usage, and keep the break-even arithmetic; that covers most agent rollouts.
+
+## Decision case
+### Scenario
+A retailer's customer-support operation is rolling out a refund-reply agent: it reads the ticket and
+order history, drafts the reply and proposes a refund through a refund tool that a rep must approve. All
+figures are illustrative planning numbers, not benchmarks.
+- **People:** 300 reps in 6 teams of 50, each handling about 40 tickets a day; about 60% of tickets are
+  eligible (refund and delivery questions), so 24 eligible tickets per rep per day.
+- **Timings from a two-week shadow test:** an eligible ticket takes about 8 minutes by hand and about 5
+  minutes on the agent path including verification, a 3/8 = 37.5% saving per ticket done the new way.
+- **Sponsor's target:** a 15% drop in handling time on eligible tickets at the week-12 review. That needs
+  at least 0.15 / 0.375 = 40% of eligible tickets in the measured group to go through the agent.
+- **Error rate not yet established:** 2 wrong refund amounts in 200 pilot drafts (1%), each caught by the
+  approving rep.
+- **Constraints:** the works council needs 4 weeks' notice before any KPI changes, so new scorecards can
+  apply from week 5 at the earliest; the agent team is 2 engineers, who can triage feedback from about
+  100 users at a time; reps are scored on tickets closed per day.
+
+### Options
+| Option | How it works | Week-12 target | Error exposure | Fits council and team limits? |
+|---|---|---|---|---|
+| Big-bang mandate | All 300 reps must use the agent from week 1 | At risk: KPIs unchanged until week 5, so usage turns into compliance theatre | 300 x 24 = 7,200 eligible tickets a day; at 50% usage, about 36 wrong drafts a day | No: 300 users' feedback swamps 2 engineers |
+| Opt-in for everyone | Agent available to all, no KPI or SOP change | Unlikely: tickets-closed scoring rewards the familiar path during the dip | Low and spread out | Yes, but nothing changes |
+| Phased pilot with gating | 2 teams (100 reps) in weeks 1-6 with protected targets, router sends only eligible tickets, KPIs updated after notice; other 4 teams join in weeks 7-12 | Reachable on the pilot cohort, which is past its learning period by week 12 | 100 x 24 = 2,400 a day; at 50%, about 12 wrong drafts a day | Yes: 100 users matches triage capacity, KPI change lands at week 5 |
+
+### Decision
+**Phased pilot with eligibility gating.** It is the only option that meets all three hard limits: the
+KPI change lands after the council's notice, feedback volume matches what 2 engineers can triage, and
+error exposure stays at about a third of the big-bang figure while the 1% rate is still being measured.
+- **The week-12 number is agreed in writing now:** handling time on the pilot cohort's eligible tickets,
+  against the shadow-test baseline. Teams that joined in week 7 are still in their J-curve and are
+  reported as a trend, not judged.
+- **Mandate nothing.** The pilot teams' scorecards count "agent draft verified" as a valid handling step,
+  which is what turns usage into the measured way of working.
+
+**What would change it.**
+- **A smaller saving:** if the agent saves under about 1 minute per eligible ticket once real
+  verification time is measured (1/8 = 12.5%), the 15% target needs more than 100% adoption, so the plan
+  narrows eligibility instead of expanding.
+- **A proven error rate:** if the wrong-refund rate stays at or below 1 in 200 for six weeks and
+overrides are stable, the remaining teams can join together rather than in sequence.
+
+### Trade-offs accepted
+- **Slower org-wide value.** Four teams wait 6 weeks. Watch the pilot's eligible-task share weekly; if it
+  passes 40% before week 6, bring the next teams in early.
+- **Protected targets cost output during the dip.** Track pilot tickets closed per day against the other
+  teams so the sponsor sees the dip's real size.
+- **Two skeptical leads may sit outside the pilot.** Watch team-by-team usage after week 7; a team with no
+  technical difference and low usage gets its lead into the pilot review.
+
+### Review rubric
+- **Target turned into an adoption number:** the write-up derives the adoption share needed from the
+  per-task saving and the sponsor's target, and shows it.
+- **Hard constraints checked per option:** notice periods, team capacity and error exposure are computed,
+  not asserted.
+- **Measured population named:** the review compares a cohort past its learning period with a stated
+  baseline, not a company-wide average.
+- **Incentives changed before usage is expected:** scorecard or SOP changes are scheduled, not assumed.
+- **Error rate treated as unknown:** a human approval stays on the side-effecting tool until the rate is
+  measured.
+- **Reversal triggers stated:** the write-up names which measured saving or error rate would narrow or
+  speed up the rollout.
 
 ## Why it exists
 - **Shipping is not adoption.** A typical internal agent launch shows a burst of curious usage in the first

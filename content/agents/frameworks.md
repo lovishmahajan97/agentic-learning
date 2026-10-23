@@ -5,7 +5,8 @@ name: Frameworks (LangGraph, LangChain, LlamaIndex, Pydantic AI, DSPy)
 kind: tool
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -46,6 +47,167 @@ Each trades speed for abstraction you must understand, so pick the thinnest laye
 - **What you can skip.** Memorising every class name. Each framework gets its own deep-dive lesson in
   the Agent frameworks & tooling module (LangChain, LangGraph, LangSmith, LlamaIndex, OpenAI Agents SDK,
   Claude Agent SDK, Pydantic AI, CrewAI, AutoGen, ADK, DSPy, Mastra); this lesson is the map.
+
+## Lab
+### Task
+Fix a LangGraph refund agent that pauses for human approval, so it behaves correctly when resumed by a
+different app instance. Most teams learn this framework behaviour from an incident: resume re-runs the
+interrupted node from its first line.
+- **Time box:** 45-60 minutes. No model or API key is needed; the graph is deterministic and the side
+  effects are a fake ledger.
+- **Prerequisites:** the agent-loop and state-machines lessons, plus the LangGraph example below.
+- **Fix three things:** refunds of $100 or less skip approval (YOUR CODE 1), the approver is notified
+  exactly once even though the approval node re-runs on resume (YOUR CODE 2), and a rejection pays
+  nothing and keeps the reason (YOUR CODE 3).
+- **Keep:** the `Ledger` class framework-neutral, and `start` and `resume` unchanged.
+- **Setup:** Python 3.10+ and `pip install langgraph pytest`. Checked on Python 3.12 with langgraph
+  1.2.16 and langgraph-checkpoint 4.3.0.
+
+### Starter code
+```python
+# refund_graph.py: run with `python refund_graph.py`, test with `pytest -q test_refund_graph.py`
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import interrupt, Command
+
+ORDERS = {"A1": 40, "B2": 900, "C3": 500}
+AUTO_LIMIT = 100                                   # refunds above this need a person's approval
+
+class Ledger:
+    """Framework-neutral fake side effects: stands in for the refund API and the mailer."""
+    def __init__(self):
+        self.refunds, self.notifications = {}, []
+    def refund(self, order_id, amount, key):
+        self.refunds.setdefault(key, (order_id, amount))   # idempotent: one refund per key
+    def notify(self, text):
+        self.notifications.append(text)                    # NOT idempotent, like a real email
+
+class Refund(TypedDict, total=False):
+    order_id: str
+    amount: int
+    approved: bool
+    reason: str
+
+def build_app(ledger, saver):
+    def lookup(s: Refund) -> dict:
+        return {"amount": ORDERS[s["order_id"]]}
+
+    def approval(s: Refund) -> dict:
+        # YOUR CODE 2: this node re-runs from its first line on resume, so this email goes out twice
+        ledger.notify(f"approve refund of ${s['amount']} on {s['order_id']}?")
+        answer = interrupt({"order_id": s["order_id"], "amount": s["amount"]})
+        approved = answer == "approve"
+        return {"approved": approved, "reason": "" if approved else answer.removeprefix("reject: ")}
+
+    def pay(s: Refund) -> dict:
+        ledger.refund(s["order_id"], s["amount"], key=f"refund:{s['order_id']}")
+        return {}
+
+    def after_lookup(s: Refund) -> str:
+        return "approval"        # YOUR CODE 1: refunds of AUTO_LIMIT or less go straight to "pay"
+
+    def after_approval(s: Refund) -> str:
+        return "pay"             # YOUR CODE 3: a rejected refund must end without paying
+
+    g = StateGraph(Refund)
+    g.add_node("lookup", lookup); g.add_node("approval", approval); g.add_node("pay", pay)
+    g.add_edge(START, "lookup")
+    g.add_conditional_edges("lookup", after_lookup, ["approval", "pay"])
+    g.add_conditional_edges("approval", after_approval, ["pay", END])
+    g.add_edge("pay", END)
+    return g.compile(checkpointer=saver)
+
+def start(app, order_id) -> bool:
+    cfg = {"configurable": {"thread_id": order_id}}
+    app.invoke({"order_id": order_id}, cfg)
+    return bool(app.get_state(cfg).next)           # True while the run is parked at an interrupt
+
+def resume(app, order_id, answer) -> dict:
+    return app.invoke(Command(resume=answer), {"configurable": {"thread_id": order_id}})
+
+if __name__ == "__main__":
+    for oid, answer in (("A1", "approve"), ("B2", "approve"), ("C3", "reject: not eligible")):
+        ledger, saver = Ledger(), InMemorySaver()  # a Postgres or SQLite saver in production
+        paused = start(build_app(ledger, saver), oid)
+        line = f"{oid} ${ORDERS[oid]}: paused={paused}"
+        if paused:                                 # a second app on the same saver: the "new process"
+            final = resume(build_app(ledger, saver), oid, answer)
+            line += f" -> {answer}, reason={final.get('reason') or '-'}"
+        print(line, f"refunds={len(ledger.refunds)} notifications={len(ledger.notifications)}")
+```
+
+### Expected output
+The starter prints `paused=True` and `notifications=2` on every line, and `refunds=1` for the rejected
+C3. A correct solution prints:
+
+```
+A1 $40: paused=False refunds=1 notifications=0
+B2 $900: paused=True -> approve, reason=- refunds=1 notifications=1
+C3 $500: paused=True -> reject: not eligible, reason=not eligible refunds=0 notifications=1
+```
+
+### Tests
+On the starter, three tests fail: the $40 refund pauses, the approver is notified twice, and the rejected
+refund is paid. The pause-without-paying test already passes and must keep passing.
+
+```python
+# test_refund_graph.py
+from langgraph.checkpoint.memory import InMemorySaver
+from refund_graph import Ledger, build_app, start, resume
+
+def fresh():
+    return Ledger(), InMemorySaver()
+
+def test_small_refund_needs_no_approval():
+    ledger, saver = fresh()
+    assert start(build_app(ledger, saver), "A1") is False, "a $40 refund should not pause"
+    assert len(ledger.refunds) == 1 and ledger.notifications == []
+
+def test_large_refund_pauses_without_paying():
+    ledger, saver = fresh()
+    assert start(build_app(ledger, saver), "B2") is True
+    assert ledger.refunds == {} and len(ledger.notifications) == 1
+
+def test_resume_in_new_app_notifies_once_and_pays_once():
+    ledger, saver = fresh()
+    start(build_app(ledger, saver), "B2")
+    resume(build_app(ledger, saver), "B2", "approve")
+    assert len(ledger.refunds) == 1
+    assert len(ledger.notifications) == 1, "the approver was notified again on resume"
+
+def test_rejection_pays_nothing_and_keeps_reason():
+    ledger, saver = fresh()
+    start(build_app(ledger, saver), "C3")
+    final = resume(build_app(ledger, saver), "C3", "reject: not eligible")
+    assert ledger.refunds == {}, "a rejected refund was paid"
+    assert final["reason"] == "not eligible" and final["approved"] is False
+```
+
+### Failure scenarios
+- **Compile without a checkpointer.** `start` on B2 raises `ValueError: No checkpointer set` when the
+  graph reaches `interrupt()`, because there is nowhere to save the paused state. Debug by reading the
+  error, then confirm `compile(checkpointer=...)` is set and that every call passes a `thread_id`.
+- **Resume with a different `thread_id`.** The resume starts a new run from START with no input, so
+  `lookup` raises `KeyError: 'order_id'`, and B2 never pays. Debug with `app.get_state(cfg).next` for
+  both ids: the parked thread still shows `('approval',)`.
+- **Make `pay` crash right after the refund call, and give it a per-attempt key.** The resume raises,
+  `get_state(cfg).next` shows `('pay',)`, and `app.invoke(None, cfg)` re-runs `pay`, so B2 is refunded
+  twice. Debug by counting ledger entries per order after each invocation, and restore a stable key
+  derived from the order or run.
+- **Put the email after `interrupt()` in the same node.** It is sent once, but only after the decision,
+  so the approver never hears about the request and the pause-without-paying test fails with
+  `notifications == []` right after `start`. Debug by listing which nodes ran before the pause.
+
+### Submission
+- **The fixed `refund_graph.py`**, with `Ledger`, `start` and `resume` unchanged.
+- **A `pytest -q` run** showing 4 passed, and the script's output matching the expected output exactly.
+- **A trace or log** of B2's two invocations showing which nodes ran in each; the approval node appears
+  in both.
+- **A three-sentence note** explaining why the email moved and what production would add (a durable
+  Postgres or SQLite checkpointer, an idempotency key on the mailer).
+- **Evaluation:** tests pass, no side effect remains before `interrupt()` in any node, and the note names
+  the re-run behaviour correctly.
 
 ## Why it exists
 - **A production agent is mostly not model calls.** It is the loop, tool schemas and dispatch, argument

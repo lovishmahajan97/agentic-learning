@@ -5,7 +5,8 @@ name: Deployment readiness reviews
 kind: practice
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -40,6 +41,64 @@ ends proven, waived with an expiry, or blocking.
   max-step and cost ceilings, and which agent changes count as a new launch.
 - **What you can skip.** Heavyweight governance boards for a read-only internal agent behind a flag; an
   automated eval gate plus a pull-request checklist is enough there.
+
+## Decision case
+### Scenario
+A vendor team of 6 engineers runs one claims and support agent for 3 enterprise customers. Each
+customer gets about 4 releases a month (prompt tweaks, retrieval tuning, the odd model or tool change),
+so the team ships about 12 releases a month. The team must decide how much review each release gets.
+All hours below are illustrative planning figures.
+- **Review cost:** a full readiness meeting takes 6 people for 1.5 hours (9 person-hours) plus about
+  4 hours of evidence preparation, so about 13 person-hours per review.
+- **Capacity budget:** the team has about 6 x 140 = 840 engineering hours a month, and leadership caps
+  release governance at 10% (84 hours).
+- **Contract rule:** one customer, a regional bank, requires its operations lead to sign off any change
+  that adds or widens a write-capable tool, with the sign-off recorded.
+- **Release history:** over the last quarter about 2 of every 12 releases were material (a new model,
+  a new tool or a widened tool scope); the rest were prompt or retrieval tuning behind a flag.
+
+### Options
+| Option | How it works | Governance hours a month | Bank sign-off on write tools | Catches stale evidence and tool drift |
+|---|---|---|---|---|
+| Full meeting every release | Every release gets the complete checklist walk-through | 12 x 13 = 156 (about 19% of 840): over the cap | yes | yes, if prep is thorough |
+| CI gate only | Checklist file, fingerprint match and tool-manifest diff in CI; no meeting | about 8 for upkeep (about 1%) | no: nobody from the bank is in the loop | yes, mechanically |
+| Risk-tiered | CI gate on every release; full meeting only when written tier rules mark a release material | 2 x 13 + 8 = 34 (about 4%) | yes, for the releases that need it | yes, mechanically on every release |
+
+### Decision
+**Risk-tiered reviews, with the tier rules written as mechanical triggers in the gate itself.**
+- **It fits the budget.** About 34 hours a month is well under the 84-hour cap, where reviewing every
+  release would cost 156 hours and push the team toward rubber-stamping.
+- **It meets the contract.** The tool-manifest diff flags any new or widened write tool, and that flag
+  is what promotes a release to the full meeting with the bank's operations lead.
+- **It keeps the seams covered.** The fingerprint check and manifest diff run on every release, so the
+  "eval on last month's index" and "tool security never saw" failures are caught without a meeting.
+- **Why not CI only:** it cannot produce the bank's recorded sign-off, and the people who carry the
+  consequences never get a say in what risk is accepted.
+
+**What would change it.**
+- **Most releases becoming material** (for example, a new tool every sprint): the tiered cost
+  approaches the full-meeting cost, so batch material changes into fewer, larger reviews.
+- **A regulator requiring human sign-off on every release:** a short meeting on every release returns,
+  and prep must be automated to stay within the cap.
+- **Tier rules being gamed:** if incidents trace back to releases marked non-material, tighten the rules.
+
+### Trade-offs accepted
+- **Minor releases get no human eyes.** A prompt tweak that changes behaviour badly passes on evals
+  alone. Watch: incidents per release tier; any incident from a minor release triggers a rule review.
+- **Tier rules can lag reality.** A new kind of change (a new data source) may not match any trigger.
+  Watch: a quarterly review of the trigger list against the change log.
+- **Gate upkeep is real work.** The checklist file and manifest diff need an owner. Watch: green items
+  with no evidence link (target zero) and gate failures caused by the gate itself.
+
+### Review rubric
+- **Cost recomputed:** review hours per option follow from releases x hours per review, compared with
+  a stated cap.
+- **Tier rules are mechanical:** the write-up names the exact triggers (new model, new or widened write
+  tool, new data source) and where they are checked, not "big changes get reviewed".
+- **Contract and veto mapped:** every external sign-off requirement is tied to the trigger that invokes it.
+- **Every-release checks named:** fingerprint and tool-manifest checks run regardless of tier.
+- **Failure signal defined:** how the team would notice the tiering letting a bad release through.
+- **Flip conditions stated:** the share of material releases or the rule at which another option wins.
 
 ## Why it exists
 - **Launch risk is spread across many owners.** Builders of the prompt and retrieval pipeline, the

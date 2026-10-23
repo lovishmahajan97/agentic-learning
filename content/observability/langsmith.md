@@ -39,6 +39,158 @@ code can use `@traceable`; for LangGraph agents tracing is an environment-variab
 - **What you can skip.** The deployment side of the LangSmith brand and the transport internals. Know that
   runs post on start and end, and that `dotted_order` rebuilds the tree.
 
+## Lab
+### Task
+Turn a recorded LangSmith trace of a looping refund agent into evidence, then build the release gate that
+would have stopped it. The run posts arrive out of order, the process was killed mid-refund, and the
+current gate ships any candidate whose pass rate did not drop. Time box: 60 minutes. Prerequisites:
+Golden dataset and Agent trajectory evaluation.
+- **Trajectory:** tool calls in execution order, rebuilt from `dotted_order`, never from arrival order.
+- **Crash signal:** runs with a start record and no end record.
+- **Gate:** fixed and broken examples by id; no ship when a critical example breaks.
+
+### Starter code
+Save as `lab_langsmith.py`. Plain Python 3.12 plus `pip install pytest` (checked with pytest 9.1.1). No
+API key is needed: `POSTS` is a recorded trace in a simplified form of LangSmith's start (post) and end
+(patch) records, with run ids shortened from UUIDs.
+
+```python
+import json
+
+def seg(t: str, run_id: str) -> str:
+    return f"20251020T1015{t}Z{run_id}"                 # start time (SSffffff) + run id; ids shortened
+
+ROOT = seg("00000000", "r1")
+def child(t, run_id, parent=ROOT):
+    return f"{parent}.{seg(t, run_id)}"
+
+ORDER = "1182"
+# Recorded run posts for one production trace, in ARRIVAL order: background batches interleave,
+# children end (and are patched) before their parent, and the process was killed during the refund.
+POSTS = [
+    {"op": "post", "id": "r1", "trace_id": "r1", "name": "refund_agent", "run_type": "chain", "dotted_order": ROOT},
+    {"op": "post", "id": "r2", "trace_id": "r1", "name": "decide", "run_type": "llm", "dotted_order": child("00100000", "r2")},
+    {"op": "patch", "id": "r2", "outputs": {"tool": "lookup_order"}},
+    {"op": "post", "id": "r3", "trace_id": "r1", "name": "lookup_order", "run_type": "tool",
+     "dotted_order": child("01000000", "r3"), "inputs": {"order_id": ORDER}},
+    {"op": "post", "id": "r4", "trace_id": "r1", "name": "decide", "run_type": "llm", "dotted_order": child("01300000", "r4")},
+    {"op": "patch", "id": "r3", "outputs": {"status": "shipped", "days_late": 3}},
+    {"op": "post", "id": "r6", "trace_id": "r1", "name": "decide", "run_type": "llm", "dotted_order": child("02400000", "r6")},
+    {"op": "post", "id": "r7", "trace_id": "r1", "name": "issue_refund", "run_type": "tool",
+     "dotted_order": child("03100000", "r7"), "inputs": {"order_id": ORDER}},
+    {"op": "post", "id": "r5", "trace_id": "r1", "name": "lookup_order", "run_type": "tool",
+     "dotted_order": child("02100000", "r5"), "inputs": {"order_id": ORDER}},
+    {"op": "patch", "id": "r4", "outputs": {"tool": "lookup_order"}},
+    {"op": "patch", "id": "r5", "outputs": {"status": "shipped", "days_late": 3}},
+    {"op": "patch", "id": "r6", "outputs": {"tool": "issue_refund"}},
+]
+# Per-example results of the refund_decision_correct evaluator in two experiments.
+BASELINE = {"e1": True, "e2": False, "e3": True, "e4": False, "e5": True}
+CANDIDATE = {"e1": True, "e2": True, "e3": False, "e4": True, "e5": True}
+CRITICAL = {"e3"}                                         # tagged examples that must never regress
+
+def merge_runs(posts: list) -> dict:
+    """Start records create a run; end records (patches) add outputs and mark it ended."""
+    runs: dict = {}
+    for p in posts:
+        if p["op"] == "post":
+            runs[p["id"]] = {**p, "ended": False}
+        else:
+            runs[p["id"]].update(outputs=p["outputs"], ended=True)
+    return runs
+
+def tool_calls(runs: dict, trace_id: str) -> list:
+    # BUG: arrival order is not execution order, so the trajectory is scrambled.
+    # YOUR CODE 1: return "name:json-args" for the trace's tool runs in execution order (dotted_order).
+    return [f'{r["name"]}:{json.dumps(r["inputs"])}' for r in runs.values()
+            if r["run_type"] == "tool" and r["trace_id"] == trace_id]
+
+def pending_runs(runs: dict) -> list:
+    # BUG: assumes every run that started also ended.
+    # YOUR CODE 2: names of runs with a start record but no end record, in dotted_order.
+    return []
+
+def no_repeated_calls(outputs: dict) -> bool:             # trajectory evaluator, as in this lesson
+    return len(outputs["tool_calls"]) == len(set(outputs["tool_calls"]))
+
+def gate(baseline: dict, candidate: dict, critical: set) -> dict:
+    # BUG: ships whenever the pass rate does not drop, hiding a critical regression.
+    # YOUR CODE 3: line results up by example id; return fixed (fail -> pass) and broken (pass -> fail)
+    #              as sorted lists, and ship=False if any critical example broke or the pass rate fell.
+    ship = sum(candidate.values()) >= sum(baseline.values())
+    return {"fixed": [], "broken": [], "ship": ship}
+
+if __name__ == "__main__":
+    runs = merge_runs(POSTS)
+    calls = tool_calls(runs, "r1")
+    print("tool calls:", calls)
+    print("no_repeated_calls:", no_repeated_calls({"tool_calls": calls}))
+    print("pending:", pending_runs(runs))
+    g = gate(BASELINE, CANDIDATE, CRITICAL)
+    print(f"gate: fixed={g['fixed']} broken={g['broken']} ship={g['ship']}")
+```
+
+The starter lists the refund before the second lookup, reports `pending: []`, and prints
+`gate: fixed=[] broken=[] ship=True` although the candidate broke the critical example `e3`.
+
+### Expected output
+With a correct solution, `python lab_langsmith.py` prints:
+
+```
+tool calls: ['lookup_order:{"order_id": "1182"}', 'lookup_order:{"order_id": "1182"}', 'issue_refund:{"order_id": "1182"}']
+no_repeated_calls: False
+pending: ['refund_agent', 'issue_refund']
+gate: fixed=['e2', 'e4'] broken=['e3'] ship=False
+```
+
+### Tests
+Save as `test_lab_langsmith.py` and run `pytest -q`. On the starter all five fail: the trajectory is in
+arrival order, nothing is pending, and the gate returns empty lists and ships.
+
+```python
+import random
+from lab_langsmith import BASELINE, CANDIDATE, CRITICAL, POSTS, gate, merge_runs, pending_runs, tool_calls
+
+LOOKUP, REFUND = 'lookup_order:{"order_id": "1182"}', 'issue_refund:{"order_id": "1182"}'
+
+def test_tool_calls_follow_execution_order():
+    assert tool_calls(merge_runs(POSTS), "r1") == [LOOKUP, LOOKUP, REFUND]
+
+def test_order_does_not_depend_on_arrival():
+    starts = [p for p in POSTS if p["op"] == "post"]
+    random.Random(7).shuffle(starts)                      # any arrival order of start records
+    assert tool_calls(merge_runs(starts), "r1") == [LOOKUP, LOOKUP, REFUND]
+
+def test_killed_process_leaves_pending_runs():
+    assert pending_runs(merge_runs(POSTS)) == ["refund_agent", "issue_refund"]
+
+def test_gate_blocks_a_critical_regression_despite_a_better_average():
+    assert gate(BASELINE, CANDIDATE, CRITICAL) == {"fixed": ["e2", "e4"], "broken": ["e3"], "ship": False}
+
+def test_gate_without_critical_tags_still_reports_regressions():
+    assert gate(BASELINE, CANDIDATE, set()) == {"fixed": ["e2", "e4"], "broken": ["e3"], "ship": True}
+    assert gate({"e1": True, "e2": True}, {"e1": False, "e2": False}, set())["ship"] is False
+```
+
+The candidate's pass rate rises from 3 of 5 to 4 of 5, which is exactly why an average-only gate ships it.
+
+### Failure scenarios
+- **Sort by end time.** The killed `issue_refund` run has no end and either crashes the sort or drops out,
+  so the trajectory hides the step that was in flight. Debug: sort on `dotted_order`, which every start record has.
+- **Drop runs without outputs.** `pending_runs` can never fire, and a crash looks like a short, clean run.
+  Debug: count start records against end records per trace.
+- **Compare pass rates only.** The gate ships `e3`'s regression. Debug: print fixed and broken ids, then open
+  the broken run trees before shipping.
+- **Treat the repeated lookup as harmless.** The answer can still be right while each loop costs a model
+  call. Debug: chart tool runs per trace in the project dashboard.
+
+### Submission
+- `lab_langsmith.py` and a `pytest -q` run showing 5 passed.
+- The four printed lines, matching the expected output exactly.
+- A short note on what the pending `issue_refund` run means for the customer (was the refund issued?).
+- The CI command you would run to apply `gate` to two real `evaluate` experiments.
+- A reviewer checks that nothing in the solution depends on the arrival order of `POSTS`.
+
 ## Why it exists
 - **Abstractions hid the model input.** A LangChain chain composed prompt templates, retrievers and parsers;
   when the answer was wrong you could not tell which piece produced the bad input.

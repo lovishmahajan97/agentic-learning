@@ -5,7 +5,8 @@ name: Zero-shot prompting
 kind: pattern
 difficulty: intro
 est_minutes: 10
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/few-shot
@@ -146,6 +147,22 @@ flowchart TD
     F -->|"still split after rule"| H["Few-shot examples for those cases"]
     C -->|"knowledge or capability gap"| I["Retrieval or fine-tuning"]
 ```
+
+## Misconceptions
+- **"Zero-shot means the model has never seen anything like the task."** It means no demonstrations in
+  the prompt. It works because instruction tuning on many described tasks taught the model to treat your
+  description as a conditioning signal close to tasks it was tuned on.
+- **"Zero-shot is the naive version; few-shot is always better."** Most agent steps (tool selection,
+  routing, stop checks) run zero-shot. A precise spec is shorter and free of example bias; add
+  demonstrations only for the cases that still split after the description is precise.
+- **"A structured-output enum makes the classifier correct."** It guarantees the label is in the set,
+  not that it is the right one. Definitions, edge rules and a consistency probe still decide correctness.
+- **"A closed label set is always safer."** With no exit, every off-topic input is forced into some
+  label. An escape label such as `other`, with its rate tracked, turns drift into a visible signal.
+- **"Label and tool names are just identifiers."** With no examples the model reads names as words:
+  `get_order_status` carries meaning, `tool_7` or "tier_b" carries none until you define it.
+- **"Adding 'think step by step' always helps."** It adds reasoning tokens, which helps multi-step
+  problems; on lookups, classification or reasoning models that already think, the gain must be measured.
 
 ## Examples
 ### Consistency probe

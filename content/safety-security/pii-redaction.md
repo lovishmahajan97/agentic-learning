@@ -5,7 +5,8 @@ name: PII redaction
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -163,6 +164,22 @@ flowchart TD
     AZ -->|"yes, re-hydrate"| U["User sees originals"]
     AZ -->|"no"| UP["User sees placeholders"]
 ```
+
+## Misconceptions
+- **"Our vendor has zero retention, so PII is handled."** That covers the vendor only. Your traces, logs,
+  vector index, eval sets and other users' screens are each a retention point with its own policy.
+- **"Redacting the user turn covers the agent."** In an agent the main PII source is tool results (a CRM
+  lookup, an email fetch), so the redactor sits between every data-returning tool and the context.
+- **"Blanket `[REDACTED]` is the right transformation for the model call."** It destroys type and
+  coreference, so the model cannot reason or act. Typed, numbered placeholders with a short-lived vault
+  keep both, and the executor re-hydrates only the tool argument that needs the real value.
+- **"Redacted text is anonymous."** Quasi-identifiers in combination, plus the model's world knowledge,
+  can single out a person. Treat redacted text as pseudonymised personal data.
+- **"Hashing a phone number pseudonymises it."** The number space is small enough to enumerate, so a
+  plain hash reverses by lookup. Use a keyed HMAC, with the key in a secrets manager.
+- **"99% recall means the logs are clean."** At an illustrative 10,000 identifiers a day, about 100 still
+  land in the logs, around 3,000 over 30 days of retention. Redaction reduces exposure; the stores still
+  need access control, retention limits and an after-the-fact audit.
 
 ## Examples
 ### A self-contained redactor

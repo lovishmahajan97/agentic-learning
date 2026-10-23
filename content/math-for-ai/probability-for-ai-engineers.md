@@ -5,7 +5,8 @@ name: Probability for AI engineers
 kind: concept
 difficulty: intro
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -102,6 +103,22 @@ flowchart TD
     R -->|"no"| E["Retry or escalate"]
     E -.->|"correlated attempts"| D
 ```
+
+## Misconceptions
+- **"Temperature 0 makes the agent reliable."** It makes sampling greedy, so the same wrong tool can be
+  picked every time; and hosted APIs do not promise identical outputs even at 0. Determinism is not
+  correctness: measure accuracy at the setting you ship.
+- **"Each retry multiplies the failure rate away."** `1 − (1−p)^k` assumes independent attempts, but a
+  retry with the same prompt shares the same blind spot. Use the measured P(success | earlier failure),
+  which in the refund example drops the 3-attempt rate from 0.973 to 0.808.
+- **"A detector that catches 90% of hallucinations is right 90% of the time it fires."** That is
+  sensitivity, not precision. Precision depends on the base rate: at 5% prevalence and a 10% false-positive
+  rate, only about 32% of flags are real.
+- **"Top-p 0.9 keeps 90% of the vocabulary."** It keeps the smallest set of top tokens whose mass reaches
+  0.9, which is one token on a peaked distribution and hundreds on a flat one.
+- **"A logprob or self-reported confidence is the probability of being right."** It is a score until a
+  reliability diagram on held-out data shows that stated 0.8 means about 80% correct; model updates can
+  break that mapping.
 
 ## Examples
 ### Temperature, sampling, chained steps and Bayes in one script

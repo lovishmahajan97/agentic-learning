@@ -5,7 +5,8 @@ name: Baseline measurement before deployment
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/success-metrics-kpis
@@ -35,6 +36,70 @@ agent's rubric, and freeze the definitions.
   actions, and making post-launch telemetry use exactly the baseline's definitions.
 - **What you can skip.** Deriving the sample-size formulas. Know `n ≈ z²·p(1−p)/e²`, the two-arm version
   and difference-in-differences, and use them.
+
+## Decision case
+### Scenario
+A manufacturer will pilot an agent that resolves accounts-payable invoice exceptions: it reads the
+purchase order and goods receipt with `lookup_po` and `lookup_receipt`, then proposes an adjustment that
+`post_adjustment` writes to the ERP. Four regional AP teams each handle about 600 exceptions a week.
+
+Constraints (figures illustrative):
+- **Deadline.** The go or no-go is in week 10 from today.
+- **Seasonality.** Quarter-end close falls in week 7, with higher volume and a harder case mix.
+- **Access to the agent.** The CFO will not keep any team off the agent for more than 4 weeks after the
+  first team goes live.
+- **Write approval.** Security approves `post_adjustment` only in week 5; until then the agent is read-only.
+- **No quality history.** Nobody has ever audited human error. SMEs can give 50 audit hours in total.
+- **Known spread.** Handle time has a median of 18 minutes and a standard deviation of 12; the sponsor
+  wants to detect a 3-minute drop.
+
+### Options
+| Option | How it works | Handles quarter-end? | Fits the 4-week rule? | Quality baseline? |
+|---|---|---|---|---|
+| **A. Before/after** | Baseline weeks 1-4, launch all teams in week 5, compare | No: week 7 lands only in the "after" | Yes | Only if audited separately |
+| **B. Concurrent holdout** | One team stays on the old flow for weeks 5-10, difference-in-differences | Yes | No: 6 weeks without the agent | Only if audited separately |
+| **C. Shadow only** | Agent runs read-only on all live cases; drafts graded against human outputs | Yes, same cases | Yes | Yes, paired, but no behavioural effect |
+| **D. Shadow, audit, then staggered rollout** | Weeks 1-4 shadow plus a blind audit of past human work; teams go live in weeks 5, 6, 7 and 8 | Yes: each week compares live with not-yet-live teams | Yes: the last team waits 3 weeks | Yes, from the audit and shadow |
+
+### Decision
+Choose **D**, because it is the only option that meets every constraint:
+- **The read-only weeks are not wasted.** Shadow needs only the read tools, so weeks 1-4 produce paired,
+  per-segment agent-versus-human error while `post_adjustment` waits for approval.
+- **The audit fits the budget.** To pin a human error rate near 6% to within ±2 points, n ≈ 1.96² × 0.06 ×
+  0.94 / 0.02² ≈ 542 audited exceptions. At 5 minutes each that is about 45 hours, inside the 50.
+- **Quarter-end cancels within a week.** In week 7, three teams are live and one is not, so the shared
+  close-period effect hits both groups.
+- **Volume is enough per week.** Detecting 3 minutes with a standard deviation of 12 needs about 251
+  exceptions per arm, and one team-week is 600.
+
+Before trusting the staggered estimate, check that the four teams' weekly medians moved in parallel over
+the last 8 weeks of history.
+
+What would change it:
+- **Early write approval.** If `post_adjustment` were approved now, shorten shadow to 2 weeks and start
+  the stagger in week 3.
+- **A longer holdout allowed.** If the CFO accepted 6 weeks, option B gives a cleaner causal read.
+- **Low volume.** Under about 251 exceptions per team-week, pool two weeks per comparison.
+
+### Trade-offs accepted
+- **The last team gets the agent 3 weeks later.** Watch its handle time; it is the comparison group, so
+  do not let its manager adopt agent-like shortcuts informally.
+- **Staggered order can carry team effects.** Randomise the rollout order of the four teams rather than
+  starting with the keenest or the worst-performing one, which invites regression to the mean.
+- **Shadow doubles inference spend for 4 weeks.** Cap it with a step budget per run and stop at week 4.
+- **A ±2-point audit is not per-segment precise.** Enlarge the audit only for the segment where the agent
+  is closest to the human interval.
+
+### Review rubric
+- **Definitions frozen before launch.** The write-up shows the metric spec, query and snapshot that the
+  after-reading will reuse.
+- **Quality is baselined, not only speed.** It sizes a blind human audit on the agent's rubric and costs
+  it in SME hours.
+- **Volume is computed.** It states cases per arm for the smallest effect and checks the window delivers
+  them.
+- **Seasonality is designed out.** Each known peak falls inside a comparison, not only in the "after".
+- **Constraints map to the design.** Approval dates and access limits are visible in the timeline.
+- **Reversal conditions are concrete.** It names the approval, volume or holdout change that flips it.
 
 ## Why it exists
 - **Every impact claim is a difference.** Handle time fell, errors dropped, throughput rose: a difference

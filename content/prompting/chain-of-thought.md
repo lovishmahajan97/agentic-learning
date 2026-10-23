@@ -5,7 +5,8 @@ name: Chain-of-thought prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/zero-shot
@@ -151,6 +152,26 @@ flowchart TD
     M -->|"yes"| OK["Return answer"]
     M -->|"no"| H["Route to a person"]
 ```
+
+## Misconceptions
+- **"CoT works because the model explains itself."** It works because each emitted token is another
+  full forward pass, so a chain buys serial compute that one fixed-depth pass cannot supply. The text is
+  the only scratchpad.
+- **"Answer first, then explain, is equivalent."** Generation is left to right: the answer token is
+  sampled before any reasoning exists, so the explanation is post-hoc. Put the `reasoning` field before
+  the answer or the tool call.
+- **"The chain shows why the agent did what it did."** Chains can be unfaithful: with biased
+  demonstrations, models follow the bias without mentioning it. Treat the chain as evidence to inspect;
+  log inputs and the actual call for audits.
+- **"Reasoning on every agent step is the safe default."** Lookups, routing and formatting gain nothing,
+  yet each reasoning step adds output tokens and latency across the whole run. Route reasoning to plan
+  and constraint-checking steps.
+- **"Self-consistency always improves accuracy."** Voting helps when wrong answers scatter; with one
+  systematic error more likely than the truth, five chains do worse than one (about 0.32 against 0.40
+  in the simulation below).
+- **"Reasoning models still need 'think step by step'."** They already produce an internal chain; the
+  trigger is usually redundant and can add a visible duplicate. Tune the effort or budget setting and
+  measure.
 
 ## Examples
 ### Direct vs CoT with self-consistency

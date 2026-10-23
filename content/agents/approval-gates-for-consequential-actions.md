@@ -5,7 +5,8 @@ name: Approval gates for consequential actions
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -153,6 +154,21 @@ sequenceDiagram
     E->>T: run with idempotency key
     E-->>M: result enters transcript
 ```
+
+## Misconceptions
+- **"Telling the model to ask before deleting is an approval gate."** A prompt rule is weighed against
+  the rest of the context, and an injected instruction can outweigh it. To the executor, a model that
+  says "I will ask" and then calls the tool has simply called the tool; the gate must live in the executor.
+- **"Risk is a property of the tool."** It depends on the arguments and context: `run_sql` with a SELECT
+  is safe and with a DELETE is not, a $5 refund is bounded and a $5,000 one is not. Classify (tool,
+  arguments, environment), and give every route to the same effect the same class.
+- **"Once approved, the call can run whenever it resumes."** The approval covers the effect the approver
+  saw. If the dry run now shows 12,000 rows instead of 12, the approval no longer applies and a fresh one
+  is needed.
+- **"An `await` on the approver's reply is a pause."** Approvals take hours or days, and the worker will be
+  redeployed meanwhile. A real pause is a pending row plus a checkpoint any worker can resume from.
+- **"Approval plus retries is safe by default."** Without an atomic claim and an idempotency key, two
+  workers resuming the same run, or one retry after a timeout, can refund twice on a single approval.
 
 ## Examples
 ### Executor with argument-aware gating and an exactly-once resume

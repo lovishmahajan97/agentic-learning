@@ -5,7 +5,8 @@ name: Docker
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - backend-fundamentals/kubernetes
@@ -40,6 +41,169 @@ in CI is byte-for-byte what serves users.
 - **What you can skip.** Overlay filesystem internals and runtime plumbing (containerd, runc). Know layers
   and the cache, namespaces versus cgroups, PID 1, and that plain containers are not a strong enough
   boundary for hostile code.
+
+## Lab
+### Task
+You write the container checks an agent repository runs in CI: a Dockerfile review that catches the
+five mistakes from this lesson's Pitfalls, and the `docker run` command line for the agent's
+code-execution tool. Both are plain Python over text and argv, so the tests run without a Docker
+daemon.
+- **Agent goal:** the agent API image drains on SIGTERM, runs as non-root and holds no secret, and
+  model-written code runs in a container with no network, no secrets and capped resources.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** this lesson's build-cache, PID 1 and code-execution sandbox sections; secrets
+  management for why `ENV` keys leak.
+- **Needs:** Python 3.10+ and `pytest`; checked with Python 3.12 and pytest 9.1.1. Optional: Docker
+  (checked with 29.7.2) to run your sandbox argv for real.
+
+### Starter code
+```python
+# docker_lab.py: a Dockerfile review check and a sandbox command builder for an agent repo's CI
+import re
+
+BAD = """\
+FROM python:latest
+WORKDIR /app
+ENV OPENAI_API_KEY=sk-placeholder
+COPY . .
+RUN pip install -r requirements.txt
+CMD uvicorn app:app --host 0.0.0.0
+"""
+
+GOOD = """\
+# syntax=docker/dockerfile:1
+FROM python:3.12-slim AS builder
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+COPY src/ ./src/
+FROM python:3.12-slim@sha256:0000000000000000000000000000000000000000000000000000000000000000
+COPY --from=builder /app /app
+USER app
+CMD ["uvicorn", "src.app:app", "--host", "0.0.0.0", "--port", "8000"]
+"""
+
+RULES = {
+    "DF001": "CMD or ENTRYPOINT in shell form: PID 1 is /bin/sh and SIGTERM is not forwarded",
+    "DF002": "final stage runs as root: no USER, or USER root/0",
+    "DF003": "secret-looking ENV or ARG (KEY, TOKEN, SECRET, PASSWORD): it is stored in the image",
+    "DF004": "base image not pinned: no tag, or the mutable latest tag",
+    "DF005": "source copied before dependencies are installed: every commit reinstalls them",
+}
+
+def lint(dockerfile: str) -> list:
+    """Return sorted (line_number, rule_id) findings; line numbers start at 1. Ignore comments and
+    blank lines. DF002 looks at the final stage only and is reported on its FROM line. DF005 is
+    reported on a `COPY .` or `COPY src...` that comes before an install step (pip install, uv sync,
+    npm ci) in the same stage. DF004 skips `FROM` lines that name an earlier stage."""
+    # YOUR CODE: implement the five rules
+    return []
+
+def sandbox_argv(name: str, image: str = "python:3.12-slim") -> list:
+    """argv for `docker run` that executes model-written Python from stdin in a throwaway container."""
+    # YOUR CODE: lock this down (network, filesystem, capabilities, user, memory, CPU, PIDs)
+    return ["docker", "run", "--rm", "--name", name, "-i", image, "python", "-"]
+
+if __name__ == "__main__":
+    for code_line, rule in lint(BAD):
+        print(f"BAD line {code_line}: {rule} {RULES[rule].split(':')[0]}")
+    print("GOOD findings:", lint(GOOD))
+    argv = sandbox_argv("sbx-1")
+    print("sandbox no network:", "--network" in argv and argv[argv.index("--network") + 1] == "none")
+    print("sandbox env passed in:", any(a in ("-e", "--env", "--env-file") for a in argv))
+```
+
+As given, `lint` finds nothing in `BAD` and the sandbox has full network access.
+
+### Expected output
+```
+BAD line 1: DF002 final stage runs as root
+BAD line 1: DF004 base image not pinned
+BAD line 3: DF003 secret-looking ENV or ARG (KEY, TOKEN, SECRET, PASSWORD)
+BAD line 4: DF005 source copied before dependencies are installed
+BAD line 6: DF001 CMD or ENTRYPOINT in shell form
+GOOD findings: []
+sandbox no network: True
+sandbox env passed in: False
+```
+
+### Tests
+```python
+# test_docker_lab.py: run with `pytest -q`
+from docker_lab import BAD, GOOD, lint, sandbox_argv
+
+def rules(dockerfile):
+    return [r for _, r in lint(dockerfile)]
+
+def test_bad_dockerfile_findings_are_exact():
+    assert lint(BAD) == [(1, "DF002"), (1, "DF004"), (3, "DF003"), (4, "DF005"), (6, "DF001")]
+
+def test_good_dockerfile_is_clean():
+    assert lint(GOOD) == []
+
+def test_shell_form_entrypoint_and_exec_form():
+    assert rules("FROM python:3.12-slim\nUSER app\nENTRYPOINT python -m app\n") == ["DF001"]
+    assert rules('FROM python:3.12-slim\nUSER app\nENTRYPOINT ["python", "-m", "app"]\n') == []
+
+def test_user_is_judged_on_the_final_stage_only():
+    two_stage = "FROM python:3.12-slim AS b\nUSER app\nFROM python:3.12-slim\nCMD [\"python\"]\n"
+    assert lint(two_stage) == [(3, "DF002")]
+    assert rules("FROM python:3.12-slim\nUSER app\nUSER root\nCMD [\"python\"]\n") == ["DF002"]
+
+def test_secret_names_in_env_and_arg_but_not_ordinary_env():
+    df = "FROM python:3.12-slim\nARG GITHUB_TOKEN\nENV DB_PASSWORD=x PYTHONUNBUFFERED=1\nUSER app\n"
+    assert lint(df) == [(2, "DF003"), (3, "DF003")]
+    assert rules("FROM python:3.12-slim\nENV PYTHONUNBUFFERED=1\nUSER app\n") == []
+
+def test_unpinned_bases_but_not_stage_references():
+    assert rules("FROM ubuntu\nUSER app\n") == ["DF004"]
+    df = "FROM python:3.12-slim AS builder\nRUN true\nFROM builder\nUSER app\n"
+    assert rules(df) == []
+
+def test_copy_after_install_is_fine():
+    df = "FROM python:3.12-slim\nCOPY requirements.txt .\nRUN pip install -r requirements.txt\nCOPY . .\nUSER app\n"
+    assert rules(df) == []
+
+def test_sandbox_argv_is_locked_down():
+    argv = sandbox_argv("sbx-1")
+    def val(flag):
+        return argv[argv.index(flag) + 1] if flag in argv else None
+    assert argv[:2] == ["docker", "run"] and "--rm" in argv and argv[-3:] == ["python:3.12-slim", "python", "-"]
+    assert val("--network") == "none" and "--read-only" in argv and val("--cap-drop") == "ALL"
+    assert val("--security-opt") == "no-new-privileges"
+    assert val("--user") not in (None, "0", "root") and not str(val("--user")).startswith("0:")
+    assert val("--memory") and val("--cpus") and val("--pids-limit")
+    assert not any(a in ("-e", "--env", "--env-file", "--privileged") for a in argv)
+    assert not any("docker.sock" in a for a in argv)
+```
+
+Six fail on the starter with `AssertionError`. Two pass already and are guards against false
+positives: the clean multi-stage file and a `COPY . .` placed after the install step.
+
+### Failure scenarios
+- **Inject a DF002 check over every stage instead of the final one.** The two-stage test reports the
+  builder stage's `USER app` as if it covered the runtime image. Only the last `FROM` decides what user
+  the shipped container runs as; confirm on a real image with `docker inspect --format '{{.Config.User}}'`.
+- **Inject a DF003 match on the whole line instead of the variable names.** `ENV PYTHONUNBUFFERED=1`
+  stays clean, but a value such as a URL containing "token" now trips it. Split `ENV` and `ARG`
+  arguments on spaces and `=` and test names only.
+- **Inject `-e LLM_API_KEY=...` "so generated code can call the model".** The sandbox test fails, and
+  with Docker installed, generated code running `print(os.environ)` shows the key. Run the argv for
+  real: the image's own variables (such as `GPG_KEY` in the official Python image, a public signing
+  key id) appear, your secrets must not.
+- **Inject `-v /var/run/docker.sock:/var/run/docker.sock`.** The test fails; in real use the
+  sandboxed code could start a privileged container and own the host.
+
+### Submission
+- **Your `docker_lab.py`** with both functions implemented and `BAD` and `GOOD` unchanged.
+- **A `pytest -q` run** showing 8 passed.
+- **The script's printed output**, matching the expected lines.
+- **Optional, with Docker:** the output of your argv running `import os; print(os.getuid())` and a
+  failed `urlopen`, showing a non-root uid and no network.
+- **A note of 3-5 sentences** on why these container flags are defence in depth and not a boundary for
+  hostile multi-tenant code, and what you would use instead.
+- **Evaluated on:** green tests, exact line numbers, no false positives on the clean file, and every
+  sandbox flag justified in a comment.
 
 ## Why it exists
 - **A service depends on far more than `requirements.txt`.** The interpreter version, system libraries such

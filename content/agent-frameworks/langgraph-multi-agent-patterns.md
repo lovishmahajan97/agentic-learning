@@ -5,7 +5,8 @@ name: LangGraph multi-agent patterns (supervisor, handoffs, subgraphs)
 kind: tool
 difficulty: advanced
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/multi-agent-patterns
@@ -37,6 +38,190 @@ when one agent with good tools measurably fails.
   holds, and the global step and cost budget.
 - **What you can skip.** Agent "personalities". Roles matter only through the tools, context and
   instructions each agent gets.
+
+## Lab
+### Task
+Build swarm-style handoffs between triage, billing and tech agents, where tech is a subgraph owned by
+another team with private scratch state. Each handoff must carry a matching tool call and tool result, and
+a handoff budget must send ping-pong conversations to a human. Time box: 60-90 min.
+- **Prerequisites:** LangGraph fundamentals; LangGraph persistence, streaming and human-in-the-loop;
+  Multi-agent patterns.
+- **Setup:** Python 3.10+, `pip install langgraph pytest` (checked with langgraph 1.2.16, langchain-core
+  1.7.0, Python 3.13). Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **No model calls:** `decide` is a keyword stand-in for each agent's model, and `check_tool_pairs` mimics
+  the provider check that rejects a tool result without its call.
+
+### Starter code
+```python
+"""Lab: handoffs between support agents, with a handoff budget and a private-state subgraph.
+Run: python lab.py"""
+from typing import Annotated, TypedDict
+from langchain_core.messages import AIMessage, ToolMessage
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.types import Command
+
+MAX_HANDOFFS = 3
+AGENTS = ("triage", "billing", "tech")
+
+class Support(MessagesState):
+    handoffs: int
+    visited: Annotated[list[str], lambda a, b: a + b]
+
+def decide(agent: str, text: str) -> tuple[str, str]:
+    """Stand-in for each agent's model: ("handoff", target) or ("answer", reply)."""
+    t = text.lower()
+    if agent == "triage":
+        return ("handoff", "billing") if "charge" in t else ("handoff", "tech")
+    if agent == "billing":
+        return ("handoff", "tech") if "app" in t else ("answer", "Refunded the duplicate charge.")
+    return ("handoff", "billing") if "charge" in t else ("answer", "Clear the cache and retry.")
+
+def check_tool_pairs(messages: list) -> None:
+    """What a provider enforces: every ToolMessage answers a tool call in an earlier AI message."""
+    open_ids = set()
+    for m in messages:
+        if isinstance(m, AIMessage):
+            open_ids |= {c["id"] for c in m.tool_calls}
+        if isinstance(m, ToolMessage):
+            if m.tool_call_id not in open_ids:
+                raise ValueError(f"tool result {m.tool_call_id} has no matching tool call")
+            open_ids.discard(m.tool_call_id)
+
+def handoff(agent: str, target: str, state: dict) -> Command:
+    """Build the Command that transfers control from `agent` to `target` (or to a human)."""
+    # YOUR CODE HERE:
+    # - if state["handoffs"] (default 0) has reached MAX_HANDOFFS, goto "human" with
+    #   update visited = ["human"]
+    # - otherwise goto target with update: messages = [an AIMessage from `agent` with one tool call
+    #   named f"transfer_to_{target}" and a unique id, plus the ToolMessage answering that id],
+    #   handoffs + 1, and visited = [target]
+    raise NotImplementedError
+
+def agent_node(name: str):
+    def node(state: Support) -> Command:
+        kind, value = decide(name, state["messages"][0].content)
+        if kind == "handoff":
+            return handoff(name, value, state)
+        return Command(goto=END, update={"messages": [AIMessage(value, name=name)]})
+    return node
+
+# --- tech is a subgraph owned by another team, with private scratch state ---
+class TechState(TypedDict, total=False):
+    messages: Annotated[list, add_messages]   # shared with the parent by name
+    handoffs: int
+    diagnostics: list[str]                    # private: must never reach the parent
+
+def run_diagnostics(s: TechState) -> dict:
+    return {"diagnostics": ["cache: stale", "version: 4.2"]}
+
+def tech_agent(s: TechState) -> Command:
+    kind, value = decide("tech", s["messages"][0].content)
+    if kind == "handoff":
+        # YOUR CODE HERE: the same handoff, but applied in the PARENT graph
+        raise NotImplementedError
+    return Command(goto=END, update={"messages": [AIMessage(value, name="tech")]})
+
+def build_tech():
+    t = StateGraph(TechState)
+    t.add_node("run_diagnostics", run_diagnostics)
+    t.add_node("tech_agent", tech_agent, destinations=(END,))
+    t.add_edge(START, "run_diagnostics"); t.add_edge("run_diagnostics", "tech_agent")
+    return t.compile()
+
+def build_app():
+    g = StateGraph(Support)
+    g.add_node("triage", agent_node("triage"), destinations=("billing", "tech", "human"))
+    g.add_node("billing", agent_node("billing"), destinations=("tech", "human", END))
+    g.add_node("tech", build_tech())
+    g.add_node("human", lambda s: {"messages": [AIMessage("A person will take over.", name="human")]})
+    g.add_edge(START, "triage"); g.add_edge("human", END)
+    return g.compile()
+
+def run(text: str) -> dict:
+    return build_app().invoke({"messages": [("user", text)], "handoffs": 0, "visited": ["triage"]},
+                              {"recursion_limit": 25})
+
+if __name__ == "__main__":
+    for text in ["I was charged twice", "The app crashes on login", "The app charged me twice"]:
+        out = run(text)
+        check_tool_pairs(out["messages"])
+        print(f"{text!r}: {' > '.join(out['visited'])} | {out['messages'][-1].content}"
+              f" | handoffs={out['handoffs']} | private leaked={'diagnostics' in out}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+'I was charged twice': triage > billing | Refunded the duplicate charge. | handoffs=1 | private leaked=False
+'The app crashes on login': triage > tech | Clear the cache and retry. | handoffs=1 | private leaked=False
+'The app charged me twice': triage > billing > tech > billing > human | A person will take over. | handoffs=3 | private leaked=False
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution
+passes all 5 (langgraph 1.2.16, pytest 9.1).
+
+```python
+import pytest
+from lab import MAX_HANDOFFS, check_tool_pairs, handoff, run
+
+def test_handoff_carries_call_and_result():
+    cmd = handoff("triage", "billing", {"handoffs": 0})
+    assert cmd.goto == "billing" and cmd.update["handoffs"] == 1 and cmd.update["visited"] == ["billing"]
+    ai, tool_msg = cmd.update["messages"]
+    assert ai.tool_calls[0]["name"] == "transfer_to_billing"
+    assert tool_msg.tool_call_id == ai.tool_calls[0]["id"]
+
+def test_budget_sends_to_human():
+    cmd = handoff("billing", "tech", {"handoffs": MAX_HANDOFFS})
+    assert cmd.goto == "human" and cmd.update == {"visited": ["human"]}
+
+def test_billing_answers_after_one_handoff():
+    out = run("I was charged twice")
+    assert out["visited"] == ["triage", "billing"] and out["handoffs"] == 1
+    assert out["messages"][-1].content == "Refunded the duplicate charge."
+    check_tool_pairs(out["messages"])
+
+def test_tech_subgraph_answers_and_keeps_scratch_private():
+    out = run("The app crashes on login")
+    assert out["visited"] == ["triage", "tech"]
+    assert out["messages"][-1].content == "Clear the cache and retry."
+    assert "diagnostics" not in out
+
+def test_ping_pong_stops_at_the_budget():
+    out = run("The app charged me twice")
+    assert out["visited"] == ["triage", "billing", "tech", "billing", "human"]
+    assert out["handoffs"] == MAX_HANDOFFS
+    assert out["messages"][-1].content == "A person will take over."
+    check_tool_pairs(out["messages"])
+    ids = [m.tool_call_id for m in out["messages"] if m.type == "tool"]
+    assert len(ids) == len(set(ids)) == MAX_HANDOFFS
+```
+
+### Failure scenarios
+- **Leave out `graph=Command.PARENT` in `tech_agent`.** LangGraph logs a warning that `tech_agent` wrote
+  to an unknown channel `branch:to:billing` and ignores it, so the run silently ends inside tech. Search
+  logs for that warning and stream with `subgraphs=True` to see which graph each update came from.
+- **Send only the `ToolMessage` in the handoff.** `check_tool_pairs` raises `tool result ... has no
+  matching tool call`, the same class of error a provider returns. Print the message types and tool call
+  ids around each transfer.
+- **Skip the budget check.** The ping-pong ticket bounces between billing and tech until
+  `GraphRecursionError` at limit 25. Count handoffs in state and alert on runs that reach the budget.
+- **Use a constant tool call id such as `"handoff"`.** `check_tool_pairs` still passes, but the
+  ids-unique assertion fails, and in a real transcript repeated ids make results ambiguous to the
+  provider and to your traces. Build the id from the agent, target and handoff count.
+
+### Submission
+- **`lab.py`** with `handoff` and the parent-graph handoff in `tech_agent` implemented.
+- **A green test run** (5 passed) and the output of `python lab.py`.
+- **A streamed trace** of the ping-pong case with `stream_mode="updates", subgraphs=True`, showing the
+  `tech` namespace and each handoff.
+- **A short note:** what you would change to make billing and tech one agent, and the eval that would
+  justify keeping them split.
+- **Evaluated on:** tests passing, paired tool messages, the private key never reaching the parent, and a
+  budget that ends every conversation.
 
 ## Why it exists
 - **One agent with 40 tools picks the wrong one.** Tool-selection accuracy drops as the tool list and

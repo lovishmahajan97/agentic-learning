@@ -5,7 +5,8 @@ name: System prompt
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/prompt-engineering
@@ -143,6 +144,25 @@ sequenceDiagram
     A->>A: Output check in code
     A-->>U: Answer or safe fallback
 ```
+
+## Misconceptions
+- **"The system prompt is enforced by the model."** It is a learned prior from post-training, not a
+  rule engine. Adherence is a rate that falls with context length and user pressure, so must-hold rules
+  need an output check, a permission check or an approval gate in code.
+- **"System tokens are architecturally special."** Mechanically they are just the earliest tokens,
+  wrapped in role markers by the chat template. The priority comes from training on transcripts where
+  good responses complied with that block.
+- **"Pasting the rules at the top of the first user message is the same thing."** The model was never
+  trained to privilege the first paragraph of a user turn, so those rules compete with the user on equal
+  terms.
+- **"The system prompt is private, so it can hold secrets."** A determined user can extract it. Assume
+  it is public and keep keys, internal URLs and customer data out of it.
+- **"Adding the date or user name to line 1 is harmless."** Any byte that changes per request breaks the
+  cached prefix: every call becomes a cache write and can cost more than no caching at all. Put dynamic
+  values after the static block.
+- **"Telling the agent to ignore instructions in tool results makes it safe."** The instruction
+  hierarchy makes injection less likely, not impossible; consequential tools like `send_email` still
+  need a gate that holds when the prior fails.
 
 ## Examples
 ### Probing adherence with adversarial inputs

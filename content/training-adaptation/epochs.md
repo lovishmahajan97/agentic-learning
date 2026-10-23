@@ -161,8 +161,8 @@ flowchart TD
   way to memorisation. Only held-out loss and agent metrics (tool-call accuracy, task success) can say a
   later epoch is better; in a small agent fine-tune they often peak at epoch 2 or 3.
 - **"Running 6 epochs instead of 3 is the same run, just longer."** Schedulers run on optimizer steps, so
-  doubling epochs stretches warmup and decay; the learning rate at a given step differs and the runs are
-  not comparable.
+  doubling epochs stretches the decay (and a warmup set as a ratio); the learning rate at a given step
+  differs and the runs are not comparable.
 - **"Steps per epoch is rows divided by batch size."** With packing it is total tokens divided by tokens
   per batch. 1,500 long trajectories packed at 8,192 tokens give 68 steps per epoch, so three epochs are
   only 204 steps.

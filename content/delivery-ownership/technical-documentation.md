@@ -5,7 +5,8 @@ name: Technical documentation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/adrs
@@ -37,6 +38,58 @@ tool descriptions are docs the model itself reads.
   request as the prompt or tool, versions pulled from the manifest, and drills that test runbooks.
 - **What you can skip.** Documentation-tool debates and style guides beyond the four Diátaxis types. The
   mechanism that forces updates at the moment of change is what matters.
+
+## Decision case
+### Scenario
+You are the forward-deployed engineer on an invoice agent like the one in the examples. In three weeks the
+customer's operations team takes it over and you rotate to another account. Figures are illustrative.
+- **The system:** 9 tools (3 of them write to the ERP, 1 without approval today), 6 alerts, one prompt
+  and one model snapshot in a registry, a retrieval index rebuilt weekly.
+- **The readers:** 4 operators in a time zone 8 hours from yours, so they cannot page you during their
+  night; and the customer's security team, which will not sign go-live without an architecture overview
+  and a statement of what the agent can do on its own.
+- **Budget:** 6 person-days for documentation inside the three weeks.
+- **Constraint:** after handoff, any prompt or tool change made by the customer must not silently
+  invalidate the runbooks.
+
+### Options
+| Option | How it works | Days | Security review | Survives the next change? |
+|---|---|---|---|---|
+| One wiki at the end | Write everything in the last week on a wiki page | 6 | likely passes | no: nothing ties it to code, it drifts from the first edit |
+| Runbooks plus a recorded walkthrough | 6 runbooks and a screen recording of the system | 2.5 | fails: no data flow or system card | runbooks only, unchecked |
+| Generate only | OpenAPI reference and a system card rendered from the registry | 1.5 | partial: what, never why | yes for reference, no runbooks at all |
+| Minimum set as code, drilled | Generated card and reference, overview plus ADRs, runbooks, ops guide, CI freshness check, two drills | 6 | passes | yes: CI and the PR question force updates |
+
+### Decision
+**The minimum delivery set, kept in the repository and drilled before handoff.** The 6 days split as:
+generated system card and reference 1, architecture overview and 3 ADRs 1.5, six runbooks at a quarter
+day each 1.5, operations guide 0.5, CI freshness check 0.5, tabletop and handoff drill 1.
+- **Each reader gets a document:** security reads the overview and the card; operators read runbooks and
+  the ops guide; the model reads the tool descriptions.
+- **The card flags the unapproved write tool,** so security sees it before go-live, not in an incident.
+- **Drills are the acceptance test:** the operators run a rollback from the ops guide and a tabletop
+  using only the runbooks, and every stall is fixed before you leave.
+
+**What would change it.** If your team keeps operating the agent, cut the ops guide and drill and spend
+the time on ADRs. If the customer runs several releases at once, add per-version publishing, because a
+runbook for 2.5 misleads a team on 2.3.
+
+### Trade-offs accepted
+- **No tutorial for new joiners.** The operators are competent; track the questions new staff ask in the
+  first month and write one if the same question repeats.
+- **The freshness check is a nudge.** A trivial edit silences it; keep the pull-request question and
+  sample a few merged changes each month for missed doc updates.
+- **Six runbooks cover today's alerts only.** Each new alert must ship with its runbook; check the alert
+  list against the runbook list in CI.
+
+### Review rubric
+- **Readers named per document:** each document has one reader and one job, including the model as reader
+  of tool descriptions.
+- **Budget arithmetic shown:** the effort per document adds up to the time available.
+- **Drift mechanism present:** docs live with the code, with a CI check and a PR question.
+- **Generated where possible:** versions and tool lists are pulled from the registry, not typed.
+- **Verified by a reader other than the author:** a drill or tabletop is planned with stalls fed back.
+- **Reopen conditions stated:** who operates and how many releases run would change the set.
 
 ## Why it exists
 - **Systems outlive their builders' attention.** The forward-deployed engineer rotates to the next

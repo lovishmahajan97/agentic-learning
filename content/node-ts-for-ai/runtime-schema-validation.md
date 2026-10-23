@@ -5,7 +5,8 @@ name: Runtime schema validation (Zod)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - node-ts-for-ai/typescript-strict-mode-and-advanced-types
@@ -36,6 +37,174 @@ model follows the contract you enforce.
   schema sent to the model, the repair bound, and per-tool failure metrics.
 - **What you can skip.** Comparing every validation library in depth. Pick one (Zod here), keep one schema
   per boundary, and never cast model output with `as`.
+
+## Lab
+### Task
+Turn a cast-and-hope tool into a schema-first one: tighten the `schedule_event` argument schema, send the
+model the input-side JSON Schema, replace the `as` cast with `safeParse` plus a bounded repair loop, and fix
+the boot-config flag that reads `"false"` as `true`. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's input-versus-output, strict-versus-strip and round-trip sections; the
+  TypeScript strict-mode lesson for why the cast is unsafe.
+- **Setup:** an empty folder with `"type": "module"` in `package.json`, `npm i -D vitest @types/node` and
+  `npm i zod`. Checked with Node 24.21, Zod 4.6 and Vitest 5.0; Node 24 runs `lab.ts` directly by
+  stripping types.
+- **No model needed:** `recordedModel` replays fixed replies, one per repair request, and records the
+  prompts it was sent, so you can assert on the issues the model sees.
+- **Save** the starter as `lab.ts` and the tests as `lab.test.ts`, then run `node lab.ts` and
+  `npx vitest run`.
+
+### Starter code
+```ts
+// Lab: one Zod schema as type, parser and tool contract, plus a bounded repair loop.
+// Run: node lab.ts   Test: npx vitest run   (zod 4)
+import { z } from "zod";
+import { pathToFileURL } from "node:url";
+
+// LAB 1: tighten the tool schema: reject unknown keys; title 1-120 chars; start an ISO datetime
+// WITH offset (z.iso.datetime({ offset: true })); durationMinutes an int 5-480 defaulting to 30;
+// attendees an array of at most 20 emails defaulting to []. Add .describe() text for the model.
+export const ScheduleArgs = z.object({
+  title: z.string(),
+  start: z.string(),
+  durationMinutes: z.number().optional(),
+  attendees: z.array(z.string()).optional(),
+});
+export type ScheduleArgs = z.output<typeof ScheduleArgs>;
+
+// LAB 2: the JSON Schema sent to the model must describe what the MODEL may send: io "input",
+// so defaulted fields are optional for it.
+export function toolDefinition() {
+  return { name: "schedule_event", description: "Create a calendar event", parameters: z.toJSONSchema(ScheduleArgs) };
+}
+
+export type ModelCall = (messages: Array<{ role: "system" | "user"; content: string }>) => Promise<string>;
+export type Outcome = { ok: true; args: ScheduleArgs; repairs: number } | { ok: false; issues: string; repairs: number };
+
+// LAB 3: JSON.parse then safeParse. On failure, format issues as "path: message" lines
+// ("(root)" for an empty path, "(root): not valid JSON" for a syntax error), send them to `model`
+// with the previous arguments, and try again, at most `maxRepairs` times. Never throw.
+export async function parseWithRepair(raw: string, model: ModelCall, maxRepairs = 2): Promise<Outcome> {
+  return { ok: true, args: JSON.parse(raw) as ScheduleArgs, repairs: 0 };   // the cast is the bug
+}
+
+// LAB 4: boot-time config. ENABLE_TOOLS="false" must be false (z.coerce.boolean() says true).
+export const Env = z.object({
+  PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+  ENABLE_TOOLS: z.coerce.boolean().default(false),
+});
+
+// A recorded model: replays fixed replies, one per repair request, and logs the prompts it got.
+export function recordedModel(replies: string[]) {
+  const prompts: string[] = [];
+  const call: ModelCall = async (messages) => { prompts.push(messages.map((m) => m.content).join("\n")); return replies.shift() ?? "{}"; };
+  return { call, prompts };
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  const params = toolDefinition().parameters as { required?: string[]; additionalProperties?: unknown };
+  console.log("required:", JSON.stringify(params.required), "additionalProperties:", params.additionalProperties);
+  const bad = JSON.stringify({ title: "Sync", start: "tomorrow 10am", room: "4B" });
+  const fixed = JSON.stringify({ title: "Sync", start: "2026-11-02T10:00:00+01:00" });
+  const m = recordedModel([fixed]);
+  const out = await parseWithRepair(bad, m.call);
+  console.log("outcome:", out.ok, "repairs:", out.repairs, out.ok ? `duration ${out.args.durationMinutes}` : out.issues);
+  console.log("issues sent to the model:\n" + (m.prompts[0]?.split("Problems:\n")[1] ?? "(none)"));
+  console.log("env:", JSON.stringify(Env.parse({ PORT: "8080", ENABLE_TOOLS: "false" })));
+}
+```
+
+### Expected output
+`node lab.ts` with a correct solution prints:
+
+```
+required: ["title","start"] additionalProperties: false
+outcome: true repairs: 1 duration 30
+issues sent to the model:
+start: Invalid ISO datetime
+(root): Unrecognized key: "room"
+env: {"PORT":8080,"ENABLE_TOOLS":false}
+```
+
+The starter prints `outcome: true repairs: 0 duration undefined` (the cast accepted `"tomorrow 10am"` and
+the unknown `room` key), `(none)` for the issues, and `"ENABLE_TOOLS":true`. Its first line matches only by
+accident, because every optional field is optional on both sides.
+
+For the repair prompt, the solution sends the previous arguments and the issues under a `Problems:`
+heading, as `callToolWithRepair` in the first example does.
+
+### Tests
+```ts
+import { expect, test } from "vitest";
+import { Env, ScheduleArgs, parseWithRepair, recordedModel, toolDefinition } from "./lab.ts";
+
+const good = { title: "Sync", start: "2026-11-02T10:00:00+01:00" };
+
+test("the schema rejects what a tool must not act on", () => {
+  expect(ScheduleArgs.safeParse({ ...good, room: "4B" }).success).toBe(false);          // unknown key
+  expect(ScheduleArgs.safeParse({ ...good, start: "2026-11-02T10:00:00" }).success).toBe(false); // no offset
+  expect(ScheduleArgs.safeParse({ ...good, durationMinutes: 2.5 }).success).toBe(false);
+  expect(ScheduleArgs.safeParse({ ...good, attendees: ["not-an-email"] }).success).toBe(false);
+  expect(ScheduleArgs.parse(good)).toEqual({ ...good, durationMinutes: 30, attendees: [] });
+});
+
+test("the model is told the input contract", () => {
+  const p = toolDefinition().parameters as Record<string, any>;
+  expect(p.required).toEqual(["title", "start"]);            // defaulted fields optional for the model
+  expect(p.additionalProperties).toBe(false);
+  expect(p.properties.durationMinutes.default).toBe(30);
+  expect(p.properties.start.format).toBe("date-time");
+  expect(p.properties.title.description).toBeTruthy();
+});
+
+test("issues go back to the model and the repaired call parses", async () => {
+  const m = recordedModel([JSON.stringify(good)]);
+  const out = await parseWithRepair(JSON.stringify({ title: "Sync", start: "tomorrow", room: "4B" }), m.call);
+  expect(out).toEqual({ ok: true, args: { ...good, durationMinutes: 30, attendees: [] }, repairs: 1 });
+  expect(m.prompts[0]).toContain("start: Invalid ISO datetime");
+  expect(m.prompts[0]).toContain('Unrecognized key: "room"');
+});
+
+test("repairs are bounded and failure is explicit", async () => {
+  const m = recordedModel(["not json", "{}"]);
+  const out = await parseWithRepair("{", m.call, 2);
+  expect(out.ok).toBe(false);
+  expect(out.repairs).toBe(2);
+  expect(m.prompts).toHaveLength(2);
+  expect(m.prompts[0]).toContain("(root): not valid JSON");
+});
+
+test("env flags parse like a human reads them", () => {
+  expect(Env.parse({ PORT: "8080", ENABLE_TOOLS: "false" })).toEqual({ PORT: 8080, ENABLE_TOOLS: false });
+  expect(Env.parse({ ENABLE_TOOLS: "true" })).toEqual({ PORT: 3000, ENABLE_TOOLS: true });
+});
+```
+
+All five fail on the starter: the loose schema accepts the extra key, the JSON Schema has no `default`,
+the cast skips repair, `JSON.parse("{")` throws a `SyntaxError`, and `"false"` coerces to `true`. A correct
+solution passes all five.
+
+### Failure scenarios
+- **Do LAB 1 but not LAB 2.** With defaults in the schema, the output-side JSON Schema lists
+  `durationMinutes` and `attendees` as required, so the model is forced to invent them. The input-contract
+  test shows `required` with four entries; debug by printing `parameters` for both `io` settings.
+- **Use `z.object` without `.strict()`.** `room` is silently stripped, the call "succeeds", and the event is
+  booked without the room the model asked for. The schema test catches it; in production, log raw and
+  parsed arguments side by side.
+- **Unbounded repair.** A `while (true)` loop with a model that never fixes the call burns a model call per
+  turn forever; the bounded test times out on the endless `"{}"` replies. Cap attempts and return an explicit failure the
+  agent loop can report.
+- **Feed the raw `ZodError` back.** The model gets a large JSON dump and internal details; `path: message`
+  lines are shorter and are what the repair test asserts on.
+
+### Submission
+- **Your `lab.ts`** with the four LAB steps done, and a passing `npx vitest run` (five tests).
+- **The `node lab.ts` output**, matching the expected output.
+- **The generated `parameters` JSON** for `schedule_event`, with a note on which keywords your provider's
+  strict mode would reject or ignore.
+- **A repair metric:** run 20 recorded bad argument sets through `parseWithRepair` and report failure rate,
+  repairs used and final failures.
+- **Evaluated on:** tests passing, no `as` on model output, `.strict()` on tool arguments, and a bounded
+  repair loop with explicit failure.
 
 ## Why it exists
 - **Every interesting input is untrusted.** A request body can be anything the client sent. A model's "JSON"

@@ -39,6 +39,156 @@ a tested fix.
 - **What you can skip.** The server internals (ClickHouse, Redis, object storage) unless you self-host.
   Know the data model and that the SDK ships events in background batches.
 
+## Lab
+### Task
+Build the cost-per-customer report an agent product needs from a recorded Langfuse export, and make the
+unmatched-model trap impossible to miss. Today an Azure deployment name and a dated model snapshot both
+cost $0, and the "matched cost" panel still reads 100%.
+
+Time box: 45-60 minutes. Prerequisites: Token and
+cost tracking, plus the cost examples in this lesson.
+- **Pattern matching:** a model definition prices a generation when its regex fully matches the name.
+- **Unmatched is `None`, not $0:** the matched share counts only priced generations.
+- **Custom definition:** cover the deployment alias without matching any other model.
+- **Sampled export:** scale the total by the inverse of the 25% sample rate.
+
+### Starter code
+Save as `lab_langfuse.py`. Plain Python 3.12 plus `pip install pytest` (checked with pytest 9.1.1). No
+Langfuse server or SDK is needed: the data is a recorded export trimmed to the fields used here, and the
+prices are this lesson's illustrative ones.
+
+The definition table mirrors Langfuse's custom model
+definitions, which match model names by pattern.
+
+```python
+import re
+
+# A recorded export of three agent traces (sampled at 25%), trimmed to the fields this lab needs.
+TRACES = [
+    {"id": "t1", "user_id": "u_42", "session_id": "s_9", "scores": {"steps_used": 3}},
+    {"id": "t2", "user_id": "u_42", "session_id": "s_9", "scores": {"hit_step_budget": 1}},
+    {"id": "t3", "user_id": "u_7", "session_id": "s_3", "scores": {"steps_used": 1}},
+]
+def gen(trace_id, model, inp, out):
+    return {"trace_id": trace_id, "type": "GENERATION", "model": model, "usage": {"input": inp, "output": out}}
+OBSERVATIONS = [
+    gen("t1", "gpt-4o-mini", 2400, 80), {"trace_id": "t1", "type": "TOOL", "name": "lookup_order"},
+    gen("t1", "gpt-4o-mini", 3100, 60), {"trace_id": "t1", "type": "TOOL", "name": "issue_refund"},
+    gen("t1", "gpt-4o-mini", 3700, 150),
+    *[gen("t2", "support-gpt4o-mini-eu", 4000, 50) for _ in range(4)],   # Azure deployment name
+    gen("t3", "gpt-4o-mini-2024-07-18", 1850, 120),                    # dated model snapshot
+]
+# Model definitions: a regex match pattern plus per-token prices (illustrative, USD).
+PRICES = [{"model": "gpt-4o-mini", "match": r"(?i)gpt-4o-mini(-\d{4}-\d{2}-\d{2})?",
+           "input": 0.15e-6, "output": 0.60e-6}]
+
+# YOUR CODE 2: a custom model definition whose pattern covers the Azure deployment name, at the
+#              same prices, without matching any other model.
+CUSTOM_MODELS: list = []
+
+def price(obs: dict, prices: list):
+    # BUG: exact-name lookup, and an unmatched model silently costs $0.
+    # YOUR CODE 1: the first definition whose pattern fully matches obs["model"] prices the usage
+    #              (input and output separately); return None when nothing matches.
+    for p in prices:
+        if p["model"] == obs["model"]:
+            return obs["usage"]["input"] * p["input"] + obs["usage"]["output"] * p["output"]
+    return 0.0
+
+def report(traces: list, observations: list, prices: list, sample_rate: float = 1.0) -> dict:
+    user_of = {t["id"]: t["user_id"] for t in traces}
+    cost_by_user: dict = {}
+    generations = matched = 0
+    for o in observations:
+        if o["type"] != "GENERATION":
+            continue                                # only generations carry usage and cost
+        generations += 1
+        cost = price(o, prices)
+        # BUG: every generation counts as matched, so the alert on matched share never fires.
+        # YOUR CODE 3: count only priced generations, and scale the total by the sample rate.
+        matched += 1
+        user = user_of[o["trace_id"]]
+        cost_by_user[user] = cost_by_user.get(user, 0.0) + (cost or 0.0)
+    return {"generations": generations, "matched_share": matched / generations,
+            "cost_by_user": cost_by_user,
+            "budget_hit": sorted(t["id"] for t in traces if t["scores"].get("hit_step_budget")),
+            "estimated_total": sum(cost_by_user.values())}
+
+if __name__ == "__main__":
+    r = report(TRACES, OBSERVATIONS, PRICES + CUSTOM_MODELS, sample_rate=0.25)
+    print(f"matched cost: {r['matched_share']:.1%} of {r['generations']} generations")
+    for user, cost in sorted(r["cost_by_user"].items()):
+        print(f"{user:5} ${cost:.5f}")
+    print("step-budget traces:", r["budget_hit"])
+    print(f"estimated total at 25% sampling: ${r['estimated_total']:.5f}")
+```
+
+The starter prints `matched cost: 100.0%` next to `u_7   $0.00000` and `u_42  $0.00155`: only trace `t1`
+was priced, and the panel says everything is fine.
+
+### Expected output
+With a correct solution, `python lab_langfuse.py` prints:
+
+```
+matched cost: 100.0% of 8 generations
+u_42  $0.00407
+u_7   $0.00035
+step-budget traces: ['t2']
+estimated total at 25% sampling: $0.01769
+```
+
+### Tests
+Save as `test_lab_langfuse.py` and run `pytest -q`. On the starter all five fail: the snapshot and the
+alias cost `0.0`, the matched share reads 1.0 instead of 0.5 without the custom definition, and the
+totals miss trace `t2` and the scaling.
+
+```python
+import pytest
+from lab_langfuse import CUSTOM_MODELS, OBSERVATIONS, PRICES, TRACES, gen, price, report
+
+def test_dated_snapshot_matches_the_pattern():
+    assert price(gen("t3", "gpt-4o-mini-2024-07-18", 1850, 120), PRICES) == pytest.approx(0.0003495)
+
+def test_unmatched_alias_is_none_not_zero():
+    assert price(gen("t2", "support-gpt4o-mini-eu", 4000, 50), PRICES) is None
+
+def test_custom_definition_covers_the_alias_only():
+    prices = PRICES + CUSTOM_MODELS
+    assert price(gen("t2", "support-gpt4o-mini-eu", 4000, 50), prices) == pytest.approx(0.00063)
+    assert price(gen("t9", "gpt-4o", 1000, 100), prices) is None          # a different, pricier model
+
+def test_matched_share_exposes_the_gap():
+    assert report(TRACES, OBSERVATIONS, PRICES)["matched_share"] == pytest.approx(4 / 8)
+
+def test_report_with_all_definitions():
+    r = report(TRACES, OBSERVATIONS, PRICES + CUSTOM_MODELS, sample_rate=0.25)
+    assert r["matched_share"] == 1.0
+    assert r["cost_by_user"]["u_42"] == pytest.approx(0.004074)
+    assert r["cost_by_user"]["u_7"] == pytest.approx(0.0003495)
+    assert r["budget_hit"] == ["t2"]
+    assert r["estimated_total"] == pytest.approx(0.0044235 / 0.25)
+```
+
+The arithmetic: `t1` is the three-turn task from this lesson ($0.001554), `t2` is four turns of 4,000
+input and 50 output tokens ($0.00063 each, $0.00252), and `t3` is the $0.0003495 turn.
+
+### Failure scenarios
+- **Write the custom pattern as `.*gpt.*`.** The alias is priced, but so is `gpt-4o`, at mini prices.
+  Debug: the `gpt-4o` assertion catches over-broad patterns; anchor names exactly.
+- **Use `re.search` instead of `re.fullmatch`.** `my-gpt-4o-mini-ft` is priced as the base model, although a
+  fine-tune is billed differently. Debug: list distinct model names per definition and read them.
+- **Forget the sample rate.** The monthly cost estimate is four times too low. Debug: compare the trace
+  count in the export with the request count in your gateway logs.
+- **Count matched share over all observations.** `TOOL` observations dilute it. Debug: only generations
+  carry usage, so filter on type first.
+
+### Submission
+- `lab_langfuse.py` and a `pytest -q` run showing 5 passed.
+- The printed report, matching the expected output exactly.
+- The alert rule you would set on matched share (threshold and window), with one sentence of reasoning.
+- A note on which trace you would open first and why (hint: the step budget).
+- A reviewer checks that an unmatched name can never read as $0 again.
+
 ## Why it exists
 - **APM sees the wrong thing.** A generic APM sees a model call as a three-second `POST` to a provider that
   returned 200. Debugging needs what was inside: the rendered prompt, the completion, tool calls, retrieved

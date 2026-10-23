@@ -5,7 +5,8 @@ name: Dependency injection
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - node-ts-for-ai/vitest-jest-and-integration-testing
@@ -37,6 +38,192 @@ with scripted models, swap providers and isolate tenants.
   remaining token budget).
 - **What you can skip.** Deep container theory. A hand-written root plus a `Deps` type covers most agent
   services; learn NestJS or Awilix scopes only if your team already uses them.
+
+## Lab
+### Task
+A first composition root for a multi-tenant support agent "optimises" by building its deps once, so
+tenant `acme` (Azure, read-only tools) gets whatever the first tenant got, including `refund`.
+
+You fix the root so each run gets its own provider, tool set and fallback policy, and you write
+the fallback decorator the root wraps around providers.
+- **Agent goal:** the loop never changes; every tenant difference lives in the root.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** this lesson's "Composing behaviour at the root" and "Scopes" sections, and the
+  Vitest lesson if you have not run a TypeScript test before.
+- **Needs:** Node 20+ with `npm i -D tsx vitest`; checked with Node 24.21, tsx 4.23 and vitest 5.0.5.
+  Save the starter as `di-lab.ts` and the tests next to it as `di-lab.test.ts`.
+
+### Starter code
+```ts
+// di-lab.ts: wire one agent loop for many tenants through a composition root
+export type ToolCall = { name: string; args: Record<string, unknown> };
+export type Turn = { text?: string; toolCalls: ToolCall[] };
+export type Msg = { role: string; content: string };
+export interface AgentLLM { name: string; next(messages: Msg[]): Promise<Turn> }
+export interface Tool { name: string; run(args: Record<string, unknown>): Promise<string> }
+export interface AgentDeps { llm: AgentLLM; tools: Map<string, Tool>; now: () => Date; maxSteps: number }
+export type TenantConfig = { provider: "openai" | "azure"; tools: string[]; fallback: boolean };
+
+export const TENANTS: Record<string, TenantConfig> = {
+  acme: { provider: "azure", tools: ["lookup_order"], fallback: false },
+  globex: { provider: "openai", tools: ["lookup_order", "refund"], fallback: true },
+};
+
+// The loop is finished: it sees only interfaces. Do not change it.
+export async function runAgent({ llm, tools, now, maxSteps }: AgentDeps, task: string) {
+  const messages: Msg[] = [{ role: "system", content: `Today is ${now().toISOString().slice(0, 10)}` },
+                           { role: "user", content: task }];
+  for (let step = 0; step < maxSteps; step++) {
+    const turn = await llm.next(messages);
+    if (turn.toolCalls.length === 0) return { answer: turn.text ?? "", steps: step + 1 };
+    for (const c of turn.toolCalls) {
+      const tool = tools.get(c.name);
+      messages.push({ role: "tool", content: tool ? await tool.run(c.args) : `unknown tool ${c.name}` });
+    }
+  }
+  throw new Error("step budget exhausted");
+}
+
+// Offline stand-ins for vendor adapters: call `wants` first, then answer with the last tool result.
+export function scriptedProvider(name: string, wants = "lookup_order", failStatus?: number): AgentLLM {
+  return {
+    name,
+    async next(messages) {
+      if (failStatus) throw Object.assign(new Error(`${name} failed`), { status: failStatus });
+      const last = messages[messages.length - 1];
+      if (last.role !== "tool") return { toolCalls: [{ name: wants, args: { id: "A1" } }] };
+      return { text: `[${name}] ${last.content}`, toolCalls: [] };
+    },
+  };
+}
+
+export const TOOLS: Tool[] = [
+  { name: "lookup_order", run: async (a) => `order ${a.id} shipped` },
+  { name: "refund", run: async (a) => `order ${a.id} refunded` },
+];
+
+// YOUR CODE 1: return an AgentLLM that calls primary and, only on a 429 or a 5xx, calls secondary.
+// Anything else (400, 401, an error with no status) must surface unchanged.
+export function withFallback(primary: AgentLLM, secondary: AgentLLM): AgentLLM {
+  throw new Error("not implemented: withFallback");
+}
+
+// YOUR CODE 2: this first draft "optimises" by building deps once. Make depsFor build per-run deps:
+// the tenant's provider (wrapped with withFallback to providers.anthropic when fallback is on),
+// a fresh tool map holding only the tenant's tools, and an error for an unknown tenant.
+export function createRoot(providers: Record<string, AgentLLM>, tools: Tool[], now: () => Date) {
+  let cached: AgentDeps | undefined;
+  return {
+    depsFor(tenant: string): AgentDeps {
+      const cfg = TENANTS[tenant];
+      if (!cached) {
+        cached = { llm: providers[cfg.provider], tools: new Map(tools.map((t) => [t.name, t])), now, maxSteps: 5 };
+      }
+      return cached;
+    },
+  };
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const root = createRoot({ openai: scriptedProvider("openai", "lookup_order", 429),
+                            azure: scriptedProvider("azure", "refund"),
+                            anthropic: scriptedProvider("anthropic") }, TOOLS, () => new Date("2026-01-01"));
+  for (const tenant of ["acme", "globex"]) {
+    try { console.log(tenant, (await runAgent(root.depsFor(tenant), "where is A1?")).answer); }
+    catch (e) { console.log(tenant, "error:", (e as Error).message); }
+  }
+}
+```
+
+Run it with `npx tsx di-lab.ts`. As given it prints `[azure] order A1 refunded` for both tenants: the
+cached deps leaked acme's provider into globex and globex's `refund` tool into acme.
+
+### Expected output
+```
+acme [azure] unknown tool refund
+globex [anthropic] order A1 shipped
+```
+
+### Tests
+```ts
+// di-lab.test.ts: run with `npx vitest run`
+import { describe, expect, it } from "vitest";
+import { createRoot, runAgent, scriptedProvider, withFallback, TOOLS, type AgentLLM } from "./di-lab";
+
+const failing = (status?: number): AgentLLM => ({
+  name: "bad", next: async () => { throw Object.assign(new Error(`status ${status}`), { status }); },
+});
+const providers = () => ({ openai: scriptedProvider("openai"), azure: scriptedProvider("azure"),
+                           anthropic: scriptedProvider("anthropic") });
+const now = () => new Date("2026-01-01T00:00:00Z");
+
+describe("withFallback", () => {
+  it("falls back on 429 and 5xx", async () => {
+    for (const s of [429, 500, 503]) {
+      const deps = { llm: withFallback(failing(s), scriptedProvider("backup")),
+                     tools: new Map(TOOLS.map((t) => [t.name, t])), now, maxSteps: 5 };
+      expect((await runAgent(deps, "where is A1?")).answer).toBe("[backup] order A1 shipped");
+    }
+  });
+  it("surfaces 400, 401 and status-less errors", async () => {
+    for (const s of [400, 401, undefined]) {
+      await expect(withFallback(failing(s), scriptedProvider("backup")).next([])).rejects.toThrow(`status ${s}`);
+    }
+  });
+});
+
+describe("composition root", () => {
+  it("gives each tenant its own provider and tool set", () => {
+    const root = createRoot(providers(), TOOLS, now);
+    const acme = root.depsFor("acme");
+    const globex = root.depsFor("globex");
+    expect(acme.llm.name).toBe("azure");
+    expect([...acme.tools.keys()]).toEqual(["lookup_order"]);
+    expect([...globex.tools.keys()]).toEqual(["lookup_order", "refund"]);
+  });
+  it("builds a fresh tool map per run", () => {
+    const root = createRoot(providers(), TOOLS, now);
+    root.depsFor("globex").tools.delete("refund");
+    expect(root.depsFor("globex").tools.has("refund")).toBe(true);
+  });
+  it("hides tools a tenant was not given, even when the model asks", async () => {
+    const root = createRoot({ ...providers(), azure: scriptedProvider("azure", "refund") }, TOOLS, now);
+    expect((await runAgent(root.depsFor("acme"), "refund A1")).answer).toBe("[azure] unknown tool refund");
+  });
+  it("routes a fallback tenant to anthropic when openai rate-limits", async () => {
+    const root = createRoot({ ...providers(), openai: scriptedProvider("openai", "lookup_order", 429) }, TOOLS, now);
+    expect((await runAgent(root.depsFor("globex"), "where is A1?")).answer).toBe("[anthropic] order A1 shipped");
+  });
+  it("rejects an unknown tenant", () => {
+    expect(() => createRoot(providers(), TOOLS, now).depsFor("initech")).toThrow(/initech/);
+  });
+});
+```
+
+All 7 fail on the starter: the two `withFallback` tests with `Error: not implemented: withFallback`, the root
+tests with `AssertionError` (the cached deps), the rate-limit test with `openai failed` (no fallback
+wired), and the unknown tenant with a `TypeError` instead of an error naming `initech`.
+
+### Failure scenarios
+- **Inject `if (!cached || cached.llm.name !== cfg.provider)`,** a "smarter" cache keyed on provider.
+  The provider test passes and the tool-set test still fails, because acme and a future Azure tenant
+  with refunds would share one map. Debug by logging tenant id next to the identity of the tool map
+  per run; anything shared across tenants must be immutable.
+- **Inject a fallback predicate of `e instanceof Error`.** The 400 test fails: a malformed request is
+  silently retried on a second paid provider and the bug hides. Print the status each fallback fired
+  on; only 429 and 5xx belong there.
+- **Inject the breaker or fallback inside `runAgent`** instead of at the root. Every tenant now gets
+  fallback, and acme's answer changes provider. Grep the loop for provider names; it should contain
+  none.
+
+### Submission
+- **Your `di-lab.ts`** with only `withFallback` and `createRoot` changed; the loop is untouched.
+- **A `npx vitest run` log** showing 7 passed.
+- **The `npx tsx di-lab.ts` output**, matching the expected lines.
+- **A note of 3-5 sentences:** which objects in your root are singletons, which are per run, and why
+  the draft's cache was a scope mismatch.
+- **Evaluated on:** green tests, no tenant `if` outside the root, a fresh tool map per run, and
+  fallback limited to 429 and 5xx.
 
 ## Why it exists
 - **Agent handlers are glue around external calls.** A typical agent step does five things: load a

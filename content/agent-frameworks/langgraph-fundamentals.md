@@ -5,7 +5,8 @@ name: LangGraph fundamentals (StateGraph, nodes, edges, conditional routing)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/frameworks
@@ -36,6 +37,169 @@ add branches, parallel work and limits deliberately.
   and where models, tools and humans sit in the flow.
 - **What you can skip.** The Pregel internals. Know that execution runs in supersteps and that parallel
   writes to one key need a reducer.
+
+## Lab
+### Task
+Wire a ticket-triage agent as a `StateGraph`: a deterministic router after the classifier, a billing node
+that retries a flaky order lookup inside a 3-attempt budget, and a bug branch that fans out to three
+sources with `Send` and fans back in.
+
+The agent goal is a loop with an explicit exit instead of a hidden `while`. Time box: 45-75 min.
+- **Prerequisites:** The agent loop; LangChain (this module); the Examples in this lesson.
+- **Setup:** Python 3.10+, `pip install langgraph pytest` (checked with langgraph 1.2.16, Python 3.13).
+  Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **No model calls:** `classify` is a keyword stand-in for a structured-output model, and the order lookup
+  is a scripted fake that fails a set number of times.
+
+### Starter code
+```python
+"""Lab: a ticket-triage agent graph with routing, fan-out and a retry budget. Run: python lab.py"""
+import operator
+from typing import Annotated, Callable, Literal, TypedDict
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
+
+MAX_ATTEMPTS = 3
+SOURCES = ("logs", "docs", "issues")
+
+class Triage(TypedDict, total=False):
+    ticket: str
+    category: str
+    attempts: int
+    order: str
+    findings: Annotated[list[str], operator.add]   # parallel writes are concatenated
+    reply: str
+
+def classify(state: Triage) -> dict:                # a model with structured output in production
+    t = state["ticket"].lower()
+    return {"category": "billing" if "charge" in t else "bug" if "error" in t else "other"}
+
+def make_billing(lookup: Callable[[str], str | None]):
+    """billing node: one order lookup per visit; lookup returns None on a transient failure."""
+    def billing(state: Triage) -> dict:
+        order = lookup(state["ticket"])
+        update = {"attempts": state.get("attempts", 0) + 1}
+        if order is not None:
+            update.update(order=order, reply=f"Refund queued for {order}.")
+        return update
+    return billing
+
+def search(task: dict) -> dict:                     # one parallel task per source
+    return {"findings": [f"{task['source']}: hit for {task['ticket'][:9]!r}"]}
+
+def summarize(state: Triage) -> dict:
+    return {"reply": f"{len(state['findings'])} findings: " + "; ".join(sorted(state["findings"]))}
+
+def escalate(state: Triage) -> dict:
+    return {"reply": "Sent to a human."}
+
+def route(state: Triage) -> Literal["billing", "investigate", "escalate"]:
+    # YOUR CODE HERE: billing -> "billing", bug -> "investigate", anything else -> "escalate"
+    raise NotImplementedError
+
+def after_billing(state: Triage) -> Literal["billing", "escalate", "__end__"]:
+    # YOUR CODE HERE: END once an order was found; retry "billing" while attempts < MAX_ATTEMPTS;
+    # otherwise "escalate"
+    raise NotImplementedError
+
+def fan_out(state: Triage) -> list[Send]:
+    # YOUR CODE HERE: one Send("search", {"source": s, "ticket": ...}) per source in SOURCES
+    raise NotImplementedError
+
+def build_graph(lookup: Callable[[str], str | None]):
+    # YOUR CODE HERE: nodes classify, billing (make_billing(lookup)), investigate (a no-op hub),
+    # search, summarize, escalate; START -> classify -> route; billing -> after_billing;
+    # investigate -> fan_out; search -> summarize; summarize and escalate -> END. Return compile().
+    raise NotImplementedError
+
+def flaky(failures: int):
+    """A lookup that fails `failures` times, then finds order A-17."""
+    calls = {"n": 0}
+    def lookup(ticket: str) -> str | None:
+        calls["n"] += 1
+        return None if calls["n"] <= failures else "A-17"
+    return lookup
+
+if __name__ == "__main__":
+    cfg = {"recursion_limit": 20}                    # the run's step budget
+    for ticket, fails in [("Double charge on my card", 2), ("Double charge again", 9),
+                          ("Error 500 on checkout", 0), ("Where is your office?", 0)]:
+        out = build_graph(flaky(fails)).invoke({"ticket": ticket}, cfg)
+        print(f"{out['category']:>7} attempts={out.get('attempts', 0)} | {out['reply']}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+billing attempts=3 | Refund queued for A-17.
+billing attempts=3 | Sent to a human.
+    bug attempts=0 | 3 findings: docs: hit for 'Error 500'; issues: hit for 'Error 500'; logs: hit for 'Error 500'
+  other attempts=0 | Sent to a human.
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (langgraph 1.2.16, pytest 9.1).
+
+```python
+import pytest
+from lab import MAX_ATTEMPTS, after_billing, build_graph, fan_out, flaky, route
+
+CFG = {"recursion_limit": 20}
+
+def test_router_targets():
+    assert route({"category": "billing"}) == "billing"
+    assert route({"category": "bug"}) == "investigate"
+    assert route({"category": "other"}) == "escalate"
+
+def test_after_billing_exits_retries_and_gives_up():
+    assert after_billing({"attempts": 1, "order": "A-17"}) == "__end__"
+    assert after_billing({"attempts": 1}) == "billing"
+    assert after_billing({"attempts": MAX_ATTEMPTS}) == "escalate"
+
+def test_billing_retries_until_lookup_succeeds():
+    out = build_graph(flaky(2)).invoke({"ticket": "Double charge on my card"}, CFG)
+    assert out["attempts"] == 3 and out["reply"] == "Refund queued for A-17."
+
+def test_billing_escalates_after_budget():
+    out = build_graph(flaky(99)).invoke({"ticket": "Double charge again"}, CFG)
+    assert out["attempts"] == MAX_ATTEMPTS and out["reply"] == "Sent to a human."
+
+def test_bug_fans_out_to_three_sources():
+    sends = fan_out({"ticket": "Error 500 on checkout"})
+    assert sorted(s.arg["source"] for s in sends) == ["docs", "issues", "logs"]
+    out = build_graph(flaky(0)).invoke({"ticket": "Error 500 on checkout"}, CFG)
+    assert len(out["findings"]) == 3 and out["reply"].startswith("3 findings: docs:")
+
+def test_unknown_ticket_escalates():
+    out = build_graph(flaky(0)).invoke({"ticket": "Where is your office?"}, CFG)
+    assert out["reply"] == "Sent to a human." and "attempts" not in out
+```
+
+### Failure scenarios
+- **Drop the `operator.add` reducer on `findings`.** The bug ticket raises `InvalidUpdateError`
+  (`INVALID_CONCURRENT_GRAPH_UPDATE`): three `search` tasks wrote one key in the same superstep. Read the
+  key named in the error and annotate it with a reducer.
+- **Make `after_billing` retry forever** (return `"billing"` instead of `"escalate"`). The 99-failure
+  ticket ends in `GraphRecursionError` at `recursion_limit` 20 instead of a graceful hand-off. Stream with
+  `stream_mode="updates"` to watch `billing` repeat, then add the attempt cap in state.
+- **Add an extra edge from `investigate` to `summarize`.** `summarize` runs twice: once beside the
+  searches with `0 findings`, then again with 3, so a real agent pays for two synthesis calls and streams a
+  premature reply. Stream `updates` to see both, render `get_graph().draw_mermaid()`, and keep `search` as
+  the only edge into `summarize`.
+- **Return a node name that is not registered** (a typo such as `"investigat"`). Compile succeeds, but
+  the first bug ticket fails at run time with a `KeyError` from the `classify` task. Keep the `Literal`
+  return type in sync with the `add_node` names and test every branch.
+
+### Submission
+- **`lab.py`** with `route`, `after_billing`, `fan_out` and `build_graph` implemented.
+- **A green test run** (6 passed) and the output of `python lab.py`.
+- **The rendered Mermaid** from `build_graph(flaky(0)).get_graph().draw_mermaid()`, committed with the code.
+- **A short note:** how you would replace `classify` with a structured-output model call while keeping
+  `route` deterministic.
+- **Evaluated on:** tests passing, a loop that always exits, merged parallel findings, and routing that a
+  reviewer can read from the graph.
 
 ## Why it exists
 - **Agents are state machines with an LLM inside.** Real agents need "classify, then branch", "retry this

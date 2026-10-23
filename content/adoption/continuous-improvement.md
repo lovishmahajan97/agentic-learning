@@ -5,7 +5,8 @@ name: Continuous improvement
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - evals/error-analysis
@@ -34,6 +35,62 @@ the release and confirm online that the bucket shrank.
   layer you fix at, the gate's noise rules, and when vendor model or data changes count as releases.
 - **What you can skip.** Statistics beyond McNemar's paired test and a rate per 1,000 runs; that pair
   covers most agent release decisions.
+
+## Decision case
+### Scenario
+A support agent runs about 20,000 times a week. Weekly triage puts "loop: same tool repeated" at the top:
+18 per 1,000 runs, about 360 runs a week that hit the step budget and get taken over. All figures are
+illustrative planning numbers.
+- **Cost of the bucket:** at about 6 minutes of human time per takeover, 360 × 6 = 2,160 minutes, or 36
+  hours a week, plus the tokens of every wasted step.
+- **Deadline:** the customer's quarterly review is in 4 weeks and expects the bucket below 8 per 1,000.
+- **Team:** 2 engineers; a weekly release train; a 600-case frozen suite with trajectory checks.
+- **History:** a "do not repeat tool calls" prompt line cut loops for a week last quarter, then they came
+  back in another tool.
+- **Root cause from traces:** the order-search tool returns an empty list with no message, so the agent
+  retries.
+
+### Options
+| Option | How it works | Fixes the root cause | Risk to other slices | Ready in 4 weeks |
+|---|---|---|---|---|
+| Prompt patch | add an instruction against repeated calls | no: the empty result still invites retries | high: shared prompt affects every slice | yes, day 1 |
+| Tool result plus loop detector | the tool says "no orders found for this email"; orchestration stops after 3 identical calls | yes, at layers 4 and orchestration | low: touches one tool and the loop | yes: about 3 days plus gate and canary |
+| Newer model snapshot | move to a newer pinned snapshot | maybe | high: tool choice and stopping shift everywhere, attribution lost | tight: full suite on every slice |
+| Fine-tune on trajectories | train on corrected runs | partly | medium | no: data and training take longer |
+
+### Decision
+**Fix the tool's empty result and add a loop detector in orchestration, encode the failing runs first,
+gate, then canary.** It is the cheapest layer that owns the failure, and it leaves the shared prompt and
+the model untouched, so the gate result is attributable.
+- **Week 1:** add 40 de-identified loop runs to the suite, confirm they fail, ship the fix, and run the
+  paired gate on all 600 cases.
+- **Weeks 2-3:** canary on 10% of traffic, 2,000 runs a week, so 4,000 runs in 2 weeks. At a fixed rate
+  of 6 per 1,000 that is about 24 loop runs, a Poisson error of `sqrt(24) ≈ 4.9` runs, or 6.0 ± 1.2 per
+  1,000.
+- **Baseline over the same weeks:** 36,000 runs at 18 per 1,000 is 648 loop runs, about 18 ± 0.7.
+- **Week 4:** full rollout and the review number.
+
+**What would change it.** If traces showed loops spread over many tools with good results, the cause is
+planning, and a model or prompt change moves up. If the provider retires the current snapshot within the
+quarter, the model move becomes its own gated release, never bundled with this fix.
+
+### Trade-offs accepted
+- **Two loop defences instead of one.** The detector can stop a legitimate long search; track runs
+  stopped by the detector that later complete on retry.
+- **The prompt patch's day-1 relief is given up.** About 3 weeks of the bucket continue on 90% of traffic;
+  report the canary rate weekly so the customer sees the trend.
+- **A larger, slower suite.** 40 more cases add gate time; tier the suite and prune duplicates quarterly.
+- **Other tools may hide the same empty-result pattern.** Audit every tool's empty and error results, and
+  watch the loop bucket per tool.
+
+### Review rubric
+- **Layer diagnosed from traces** before any option is chosen, with the evidence quoted.
+- **Bucket cost quantified** as runs, human hours and rate per 1,000, all recomputed.
+- **Encode-first step present:** failing cases enter the suite and are shown to fail before the fix.
+- **Verification sized:** canary volume and duration give an error band that separates the target from
+  the baseline.
+- **Attribution protected:** one change per release, with model or prompt moves kept separate.
+- **Flip conditions named:** what trace evidence or vendor change would make another option right.
 
 ## Why it exists
 - **Quality does not stay where acceptance left it.** New users phrase things differently, the knowledge

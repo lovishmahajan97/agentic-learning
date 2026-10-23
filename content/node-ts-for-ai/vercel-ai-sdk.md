@@ -5,7 +5,8 @@ name: Vercel AI SDK
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - node-ts-for-ai/openai-anthropic-node-sdks
@@ -38,6 +39,168 @@ an escape hatch.
   and telemetry per step.
 - **What you can skip.** The UI stream protocol's wire format and the provider packages' internals; know
   only that client and server versions must match.
+
+## Lab
+### Task
+Turn a broken AI SDK support agent into a budgeted, validated, approval-gated tool loop. As given, it looks
+an order up and then says nothing, runs tools on malformed ids, and issues refunds with no confirmation:
+three of this lesson's pitfalls in one file.
+
+A scripted `MockLanguageModelV2` stands in for the provider,
+so the loop, validation and usage accounting are the real SDK code.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** this lesson's "One request through the tool loop" and the step-budget worked
+  scenario; Runtime schema validation; Vitest / Jest & integration testing.
+- **Version:** checked with `ai` 5.0.280 (AI SDK 5 naming, as in this lesson), `zod` 4.6.7, Vitest 5.0.5
+  and Node 24.21. The mock class is `MockLanguageModelV2` from `ai/test` in v5; later majors renamed it and
+  the loop options, so pin `ai@5` for this lab.
+- **Setup:** `npm init -y && npm pkg set type=module && npm i ai@5 zod && npm i -D vitest`.
+
+### Starter code
+```ts
+// support.ts: a support agent on the AI SDK's tool loop, driven by a scripted mock model (no key needed)
+import { generateText, tool, stepCountIs, type LanguageModel } from "ai";
+import { MockLanguageModelV2 } from "ai/test";
+import { z } from "zod";
+import { fileURLToPath } from "node:url";
+
+export const orders = new Map([["ord_42", { status: "shipped", total: 30 }]]);
+export const refunds: string[] = [];   // side effects of the refund tool; must stay empty without approval
+export const lookups: string[] = [];   // every orderId the lookup tool actually ran with
+
+export const tools = {
+  lookupOrder: tool({
+    description: "Fetch an order by its id (ids look like ord_42)",
+    // YOUR CODE 1: reject ids that do not match /^ord_\w+$/ before execute runs
+    inputSchema: z.object({ orderId: z.string() }),
+    execute: async ({ orderId }) => { lookups.push(orderId); return orders.get(orderId) ?? { error: "not found" }; },
+  }),
+  refundOrder: tool({
+    description: "Refund an order. Needs the user's confirmation in the UI.",
+    inputSchema: z.object({ orderId: z.string().regex(/^ord_\w+$/) }),
+    // YOUR CODE 2: this is a write tool. Make the loop hand the call back to the app for approval
+    // instead of running it (hint: a tool without `execute`).
+    execute: async ({ orderId }) => { refunds.push(orderId); return { refunded: orderId }; },
+  }),
+};
+
+export async function answer(model: LanguageModel, prompt: string) {
+  const result = await generateText({
+    model, prompt, tools,
+    // YOUR CODE 3: let the loop send tool results back to the model, at most 4 model calls per request
+  });
+  const last = result.steps.at(-1)!;
+  return {
+    text: result.text,
+    steps: result.steps.length,
+    inputTokens: result.totalUsage.inputTokens,   // summed over every step: the request's real cost
+    awaitingApproval: last.toolCalls.filter((c) => !last.toolResults.some((r) => r.toolCallId === c.toolCallId))
+      .map((c) => c.toolName),
+  };
+}
+
+// A scripted model: each doGenerate call returns the next turn. inputTokens grows like a resent history.
+type Turn = { text: string } | { call: string; input: object };
+export function scriptedModel(...turns: Turn[]) {
+  let n = 0;
+  return new MockLanguageModelV2({
+    doGenerate: async () => {
+      const t = turns[n++] ?? { text: "(script exhausted)" };
+      const usage = { inputTokens: 3000 + 1000 * (n - 1), outputTokens: 50, totalTokens: 3050 + 1000 * (n - 1) };
+      if ("text" in t) return { content: [{ type: "text", text: t.text }], finishReason: "stop", usage, warnings: [] };
+      return { content: [{ type: "tool-call", toolCallId: `call_${n}`, toolName: t.call, input: JSON.stringify(t.input) }],
+               finishReason: "tool-calls", usage, warnings: [] };
+    },
+  });
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  console.log(await answer(scriptedModel({ call: "lookupOrder", input: { orderId: "ord_42" } },
+                                         { text: "Order ord_42 has shipped." }), "Where is ord_42?"));
+  console.log(await answer(scriptedModel({ call: "refundOrder", input: { orderId: "ord_42" } }), "Refund ord_42"));
+  console.log({ refunds, lookups });
+}
+```
+
+As given, `node support.ts` prints `{ text: '', steps: 1, ... }` twice and `refunds: [ 'ord_42' ]`.
+
+### Expected output
+```
+{
+  text: 'Order ord_42 has shipped.',
+  steps: 2,
+  inputTokens: 7000,
+  awaitingApproval: []
+}
+{
+  text: '',
+  steps: 1,
+  inputTokens: 3000,
+  awaitingApproval: [ 'refundOrder' ]
+}
+{ refunds: [], lookups: [ 'ord_42' ] }
+```
+
+### Tests
+```ts
+// support.test.ts: run with `npx vitest run`
+import { it, expect, beforeEach } from "vitest";
+import { answer, scriptedModel, refunds, lookups } from "./support";
+
+beforeEach(() => { refunds.length = 0; lookups.length = 0; });
+
+it("sends the tool result back so the model can answer", async () => {
+  const out = await answer(scriptedModel({ call: "lookupOrder", input: { orderId: "ord_42" } },
+                                         { text: "Order ord_42 has shipped." }), "Where is ord_42?");
+  expect(out).toMatchObject({ text: "Order ord_42 has shipped.", steps: 2, awaitingApproval: [] });
+  expect(out.inputTokens).toBe(3000 + 4000);       // the second request resent the history
+});
+
+it("rejects a malformed id before the tool runs", async () => {
+  await answer(scriptedModel({ call: "lookupOrder", input: { orderId: "42" } }, { text: "Which order?" }), "Where is 42?");
+  expect(lookups).toEqual([]);
+});
+
+it("pauses a refund for approval instead of executing it", async () => {
+  const out = await answer(scriptedModel({ call: "refundOrder", input: { orderId: "ord_42" } }), "Refund ord_42");
+  expect(refunds).toEqual([]);
+  expect(out).toMatchObject({ steps: 1, awaitingApproval: ["refundOrder"] });
+});
+
+it("caps a looping model at 4 model calls", async () => {
+  const loop = Array.from({ length: 10 }, () => ({ call: "lookupOrder", input: { orderId: "ord_42" } }));
+  const out = await answer(scriptedModel(...loop), "Where is ord_42?");
+  expect(out.steps).toBe(4);
+  expect(out.inputTokens).toBe(3000 + 4000 + 5000 + 6000);   // 18,000: the budget is the cost ceiling
+});
+```
+
+On the starter all four fail on behaviour, not setup: `steps` is 1 and `text` is empty (no `stopWhen`),
+`lookups` contains `"42"` (no regex), `refunds` contains `"ord_42"` (no gate), and the looping model stops
+after 1 step instead of 4.
+
+### Failure scenarios
+- **Inject a generous budget:** use `stepCountIs(10)`. The cap test sees 10 steps and `inputTokens` of
+  75,000 instead of 18,000, the worked scenario's third row. Log `steps.length` and `totalUsage` per
+  request; a tail of requests at the budget means the model is looping, not finishing.
+- **Inject `usage` instead of `totalUsage`:** the first test reports 4,000, the last step only. Compare
+  each step's `usage` in `result.steps` with the total to see which number your cost dashboard reads.
+- **Inject validation inside `execute`:** check the id with an `if` in the handler and return an error
+  object. The tool now runs (it pushes to `lookups`) for bad input. Keep the contract in `inputSchema`, so
+  the SDK rejects input before `execute` and sends the error back to the model for a second try.
+- **Inject a gate in the prompt only:** keep `execute` and add "ask before refunding" to the prompt. The
+  scripted model ignores it, as a real one sometimes will, and `refunds` fills up. Approval has to be
+  structural: no `execute` (or v6's `needsApproval`), with the app running the refund after a click.
+
+### Submission
+- **Your `support.ts`** with the three `YOUR CODE` changes and nothing else edited.
+- **A `npx vitest run` log** showing 4 passed, and the `node support.ts` output matching the expected lines.
+- **A per-step trace** for the looping case (step number, tool calls, `usage.inputTokens`) printed from
+  `result.steps` or `onStepFinish`.
+- **A short note** on how the app resumes after approval: what it appends to the messages and why the next
+  request then continues the loop.
+- **Evaluated on:** green tests, validation in the schema, the refund impossible without an app-side
+  decision, and the budget expressed as `stopWhen`.
 
 ## Why it exists
 - **Every provider has its own shape.** OpenAI returns `choices[0].message.content` and tool calls with

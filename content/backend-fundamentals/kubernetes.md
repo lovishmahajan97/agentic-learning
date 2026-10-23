@@ -5,7 +5,8 @@ name: Kubernetes
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - backend-fundamentals/docker
@@ -39,6 +40,185 @@ streaming agent runs survive deploys and scale on queue depth.
   pods the agent's tools may reach.
 - **What you can skip.** etcd, CNI internals and writing controllers. Know reconciliation, the core
   objects, requests and limits, the three probes, termination and why GPU Pods sit Pending.
+
+## Lab
+### Task
+Every deploy of your streaming agent API produces a burst of 5xx and cut-off answers. You write the
+pre-deploy check your pipeline runs on the Deployment manifest, then fix the manifest it rejects. The
+check is plain Python over YAML, so it runs without a cluster.
+- **Agent goal:** a model that loads in 240 s and agent steps of up to 60 s survive startup, rollouts
+  and node drains: no liveness kill mid-load, no capacity dip, no SIGKILL mid-step.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** Docker (PID 1 and SIGTERM), and this lesson's probes, termination, scheduling
+  and "Mapping an agent system onto objects" sections.
+- **Needs:** `pyyaml` and `pytest`; checked with PyYAML 6.0.3 and pytest 9.1.1 on Python 3.12. No
+  cluster; optionally `kubectl apply --dry-run=server` on kind to confirm the fixed manifest is valid.
+
+### Starter code
+```python
+# k8s_lab.py: a pre-deploy check for an agent API Deployment, plus fixing the manifest it rejects
+import yaml                                           # pip install pyyaml
+
+BAD = """
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: agent-api}
+spec:
+  replicas: 3
+  strategy: {rollingUpdate: {maxSurge: 1, maxUnavailable: 1}}
+  selector: {matchLabels: {app: agent-api}}
+  template:
+    metadata: {labels: {app: agent-api}}
+    spec:
+      containers:
+      - name: api
+        image: registry.example.com/agent-api:latest
+        resources:
+          limits: {nvidia.com/gpu: 1}
+        readinessProbe: {httpGet: {path: /ready, port: 8000}, periodSeconds: 5}
+        livenessProbe: {httpGet: {path: /ready, port: 8000}, periodSeconds: 10}
+"""
+
+# YOUR CODE (part 2): edit FIXED until check(FIXED, ...) returns [] for this service.
+FIXED = BAD
+
+RULES = {
+    "K001": "image not pinned by digest",
+    "K002": "missing cpu or memory request, or memory limit",
+    "K003": "GPU request differs from limit, or no toleration for the nvidia.com/gpu taint",
+    "K004": "no startupProbe, or its budget (periodSeconds x failureThreshold) is below model load time",
+    "K005": "grace period below longest agent step plus preStop sleep",
+    "K006": "rollout may drop below desired replicas (maxUnavailable is not 0)",
+    "K007": "liveness probe reuses the readiness path, so a dependency outage restarts Pods",
+}
+
+def check(manifest: str, model_load_s: int, longest_step_s: int) -> list:
+    """Return the sorted rule ids that the Deployment in `manifest` violates.
+
+    Kubernetes defaults apply when a field is absent: terminationGracePeriodSeconds 30,
+    periodSeconds 10, failureThreshold 3, maxUnavailable 25% (anything but 0 counts as K006).
+    The preStop sleep is the N in `preStop: {exec: {command: ["sleep", "N"]}}`, else 0.
+    K003 applies only to containers that ask for nvidia.com/gpu.
+    """
+    # YOUR CODE (part 1): implement K001-K007
+    return []
+
+if __name__ == "__main__":
+    print("BAD:", check(BAD, model_load_s=240, longest_step_s=60))
+    print("FIXED:", check(FIXED, model_load_s=240, longest_step_s=60))
+    spec = yaml.safe_load(FIXED)["spec"]["template"]["spec"]
+    print("FIXED keeps 3 replicas and 1 GPU:", yaml.safe_load(FIXED)["spec"]["replicas"] == 3,
+          spec["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == 1)
+```
+
+As given, `check` finds nothing and `FIXED` is still the broken manifest. Checking a GPU limit alone
+is enough here because Kubernetes copies an extended-resource limit into the request when the
+request is omitted; the rule asks for both so the manifest states its intent.
+
+### Expected output
+```
+BAD: ['K001', 'K002', 'K003', 'K004', 'K005', 'K006', 'K007']
+FIXED: []
+FIXED keeps 3 replicas and 1 GPU: True True
+```
+
+### Tests
+```python
+# test_k8s_lab.py: run with `pytest -q`
+import copy
+import yaml
+from k8s_lab import BAD, FIXED, check
+
+def doc(fixed_yaml=FIXED):
+    return yaml.safe_load(fixed_yaml)
+
+def run(d, load=240, step=60):
+    return check(yaml.safe_dump(d), model_load_s=load, longest_step_s=step)
+
+def pod(d):
+    return d["spec"]["template"]["spec"]
+
+def test_bad_manifest_breaks_every_rule():
+    assert check(BAD, 240, 60) == ["K001", "K002", "K003", "K004", "K005", "K006", "K007"]
+
+def test_fixed_manifest_passes_and_is_still_the_same_service():
+    assert check(FIXED, 240, 60) == []
+    d = doc(); c = pod(d)["containers"][0]
+    assert d["spec"]["replicas"] == 3 and c["image"].startswith("registry.example.com/agent-api@sha256:")
+    assert c["resources"]["limits"]["nvidia.com/gpu"] == 1
+    assert c["readinessProbe"]["httpGet"]["path"] == "/ready"
+
+def test_grace_period_defaults_and_counts_prestop():
+    d = doc(); p = pod(d)
+    p.pop("terminationGracePeriodSeconds", None)
+    assert "K005" in run(d)                                   # default 30 < 60
+    p["terminationGracePeriodSeconds"] = 64
+    p["containers"][0]["lifecycle"] = {"preStop": {"exec": {"command": ["sleep", "5"]}}}
+    assert "K005" in run(d)                                   # 64 < 60 + 5
+    p["terminationGracePeriodSeconds"] = 65
+    assert "K005" not in run(d)
+
+def test_startup_budget_uses_period_times_threshold():
+    d = doc(); c = pod(d)["containers"][0]
+    c["startupProbe"] = {"httpGet": {"path": "/health", "port": 8000}, "periodSeconds": 10, "failureThreshold": 20}
+    assert "K004" in run(d)                                   # 200 s < 240 s
+    c["startupProbe"]["failureThreshold"] = 24
+    assert "K004" not in run(d)                               # 240 s covers it
+    c["startupProbe"] = {"httpGet": {"path": "/health", "port": 8000}}
+    assert "K004" in run(d)                                   # defaults: 10 x 3 = 30 s
+
+def test_max_unavailable_default_is_not_zero():
+    d = doc(); d["spec"].pop("strategy", None)
+    assert "K006" in run(d)
+
+def test_gpu_rules_only_for_gpu_containers():
+    d = doc(); p = pod(d); c = p["containers"][0]
+    c["resources"]["requests"].pop("nvidia.com/gpu", None)
+    assert "K003" in run(d)                                   # limit without matching request
+    d = doc(); p = pod(d); p.pop("tolerations", None)
+    assert "K003" in run(d)
+    d = doc(); p = pod(d); c = p["containers"][0]; p.pop("tolerations", None)
+    for k in ("requests", "limits"):
+        c["resources"][k].pop("nvidia.com/gpu", None)
+    assert "K003" not in run(d)                               # CPU-only container
+
+def test_requests_and_memory_limit_are_required():
+    d = doc(); c = pod(d)["containers"][0]
+    c["resources"]["limits"].pop("memory", None)
+    assert run(d) == ["K002"]
+
+def test_liveness_must_not_reuse_readiness():
+    d = doc(); c = pod(d)["containers"][0]
+    c["livenessProbe"] = copy.deepcopy(c["readinessProbe"])
+    assert run(d) == ["K007"]
+```
+
+All 8 fail on the starter: most with `AssertionError`, and the ones that mutate `FIXED` with a
+`KeyError` until part 2 gives the manifest a `requests` block. Several tests start from your `FIXED`
+manifest, so it must pass every rule before they can isolate one.
+
+### Failure scenarios
+- **Inject a grace check that ignores `preStop`.** The check accepts the 64-second case and the grace
+  test fails: `preStop` eats 5 of those seconds, because the grace clock starts before the hook. On a real cluster you would see
+  the last step of a run killed with exit code 137 during `kubectl rollout restart`; compare the
+  worker's "step finished" log time with the Pod's deletion timestamp.
+- **Inject a K004 check for presence only.** A startup probe with defaults (30 s) passes the check,
+  and on a cluster the 240-second load ends in CrashLoopBackOff. `kubectl describe pod` shows
+  "Startup probe failed" events before any app log.
+- **Inject `maxUnavailable` read with a default of 0.** A manifest without `strategy` passes, but the
+  real default is 25%, which rounds down to 0 Pods at 3 replicas; it bites at 4 or more replicas. Rely
+  on documented defaults, not the value you would like.
+- **Inject a fix that sets `livenessProbe` to `/ready`** "because it checks more". K007 fires; in a
+  real incident a model-endpoint outage would restart every replica at once.
+
+### Submission
+- **Your `k8s_lab.py`** with `check` implemented and `FIXED` edited, `BAD` unchanged.
+- **A `pytest -q` run** showing 8 passed.
+- **The script's printed output**, matching the expected lines.
+- **A diff of `BAD` versus `FIXED`** with one line per change saying which rule and which failure it
+  prevents (5xx after deploy, cut-off stream, CrashLoopBackOff, Pending GPU Pod).
+- **Evaluated on:** green tests, Kubernetes defaults applied when fields are absent, the grace budget
+  computed as step plus `preStop`, and a fixed manifest that is still the same service.
 
 ## Why it exists
 - **Docker answers "what to run", not "where and how".** Which machine fits its CPU, memory and GPU needs;

@@ -5,7 +5,8 @@ name: SLAs
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - reliability/slas-slos
@@ -38,6 +39,65 @@ only to what the model-tool chain and on-call can back.
   prompt change.
 - **What you can skip.** Contract law and credit negotiation tactics. Know the allowance table, the
   dependency-ceiling product and why quality stays out of the uptime percentage.
+
+## Decision case
+### Scenario
+An insurer wants to route first-notice-of-loss claims through your triage agent and procurement sends a
+draft SLA. All figures are illustrative planning numbers, not vendor terms.
+- **Their ask:** 99.9 percent monthly run-level availability, p95 run latency under 20 seconds, and a
+  30-minute Sev1 response around the clock.
+- **Fee:** $40,000 a month; credit of 10 percent of the fee for any month below the signed target.
+- **Path per run:** 4 model calls, 2 calls to the insurer's claims API, 1 vector-store query, in series.
+  Contract terms behind it: provider 99.9 percent, vector store 99.95 percent, your own service measured
+  at about 99.9 percent.
+- **Loop:** step cap 8; a step averages about 1.5 seconds of model time plus 0.5 seconds of tool time.
+- **Team:** 5 engineers in one time zone; no secondary provider integrated yet.
+- **Deadline:** signature in 4 weeks; a cross-provider fallback needs about 6 weeks to build and drill.
+
+### Options
+| Option | How it works | Ceiling vs signed number | Credit exposure | Fits deadline and team? |
+|---|---|---|---|---|
+| Sign 99.9 as asked | One provider, ship as is | 0.999 x 0.9995 x 0.999 ≈ 99.75 percent, below 99.9 | an ordinary month breaches: about $4,000 a month, $48,000 a year | yes on paper, no in practice |
+| Sign 99.5 on the run | Run-level SLI from traces, one retry per failed call, step and wall-clock caps | 99.75 percent ceiling, internal SLO 99.6, SLA 99.5 | only in a bad month | yes: 5-person rotation is one week in five |
+| Build fallback, then sign 99.9 | Secondary provider and vector replica before go-live | provider and vector terms near 1, but own 99.9 leaves 0.999, exactly the SLA with zero margin | still breaches whenever your own service has an average month | no: 6 weeks of work against 4 |
+| Sign 99.5 with a step-up clause | Option 2 now; contract moves to 99.9 at a higher fee once conditions are met | as option 2 today | as option 2 | yes |
+
+### Decision
+**Sign 99.5 percent on the run, with a written step-up to 99.9.** The contract-backed ceiling is about
+99.75 percent, so 99.5 leaves 0.25 percent, about 108 minutes a month, for detection and repair inside
+a 216-minute allowance.
+- **Why not 99.9:** that promise allows 43.2 minutes, which the provider's own SLA could consume
+alone.
+- **Latency fits the loop:** 8 steps x 2 seconds is 16 seconds, leaving about 4 seconds of the
+  20-second bound for retries; the wall-clock cap returns a partial triage plus a human handoff instead.
+- **Support is staffable:** a 30-minute Sev1 response 24/7 on a five-person rotation, with resolution
+  stated as a target and a status-update cadence.
+- **Step-up conditions:** a drilled cross-provider fallback, and three consecutive months of measured
+  run-level availability at or above 99.95 percent. Note that the fallback alone is not enough: your own
+  service at 99.9 percent caps the ceiling at 99.9.
+
+**What would change it.** If the insurer mandates the model provider, push for a provider-outage
+exclusion and the 99.9 target becomes defensible sooner. If measured own-service availability stays
+under 99.75 percent, even 99.5 gets thin, so fix your own reliability before selling the step-up.
+
+### Trade-offs accepted
+- **A weaker headline number in the deal.** Procurement may push back. Answer with the allowance table
+  and the step-up path; track whether the step-up conditions are met each month.
+- **Retries spend latency budget.** Watch p95 run latency and the share of runs ending in handoff; if
+  handoffs pass an agreed share, retries are eating the bound.
+- **Correlated provider outages defeat retries.** Until the fallback exists, a regional outage burns the
+  budget directly. Watch month-to-date budget and freeze risky changes when it runs low.
+
+### Review rubric
+- **Ceiling computed from the run path:** the write-up multiplies the contract terms of every serial
+  dependency and its own service, not the model provider's number alone.
+- **Ordering stated:** the signed SLA sits below an internal SLO, which sits below the ceiling, with the
+  margin converted to minutes.
+- **Latency tied to loop caps:** step cap, per-step time and retry room add up to the promised bound.
+- **Support backed by a rotation:** the response commitment names the staffing that meets it and keeps
+  resolution as a target.
+- **Exposure priced:** credit cost of each option per month and year is shown.
+- **Change triggers named:** the measured numbers or contract facts that would move the target.
 
 ## Why it exists
 - **The buyer needs a written promise.** An enterprise is about to route a business process through your

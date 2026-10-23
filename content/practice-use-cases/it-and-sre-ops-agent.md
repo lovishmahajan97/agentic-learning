@@ -5,7 +5,8 @@ name: IT and SRE ops agent (alerts, runbooks, safe remediation)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/approval-gates-for-consequential-actions
@@ -39,6 +40,67 @@ fewer 3 a.m. pages.
   for every step.
 - **What you can skip.** Full autonomous remediation. A read-only triage agent that posts a good note is
   already valuable and is the right first slice.
+
+## Decision case
+### Scenario
+A payments company's SRE team (8 engineers, one primary on-call) runs about 60 services on Kubernetes.
+The triage agent above has run read-only for a month, and leadership asks whether it may now fix things
+itself. All figures are illustrative planning numbers from the team's own alert history.
+- **Volume:** about 600 alert fires a week, which dedup on the group key into 120 incidents, or about
+  520 a month (120 x 52 / 12).
+- **Mix:** 70 incidents a week are pod-level (crash loop, OOM, stuck worker) that on-call fixes with one
+  restart; 30 follow a deploy and end in a rollback; 20 need real investigation.
+- **Statefulness:** 50 of the 70 pod-level incidents hit stateless services; 20 hit services that own a
+  queue or a database.
+- **Shadow evidence:** on those 50, the restart on-call performed resolved the symptom 80% of the time,
+  but a night page takes a median 18 minutes to mitigate, mostly waking up and logging in.
+- **Constraints:** change policy needs a named approver for production changes unless the action is a
+  registered standard change; zero tolerance for an agent write that worsens a stateful service; model
+  budget $500 a month; one engineer for 6 weeks.
+
+### Options
+| Option | How it works | Night pages avoided a week | Change policy | Stateful risk | Cost and effort |
+|---|---|---|---|---|---|
+| A. Read-only triage (today) | Note plus shadow-logged proposals | 0; triage faster, mitigation unchanged | met: no writes | none | about 520 x $0.50 = $260 a month; done |
+| B. Approve every write in Slack | Agent proposes, on-call taps approve | 0: on-call still wakes to tap, but mitigates in minutes | met: named approver each time | low: human sees evidence | same model cost; about 2 weeks |
+| C. Tiered: auto-restart on a stateless allowlist, B for the rest | `restart_pod` registered as a standard change for allowlisted services only | 50 x 80% = 40 | met, once registered | none by design: stateful services are off the list | $260 a month; about 5 weeks with the shadow gate |
+| D. Full autonomy | Agent also runs rollbacks | up to 100 (70 + 30) | violated: rollbacks need an approver | high | not permitted |
+
+### Decision
+**Option C, gated on shadow evidence, with B for everything off the allowlist.** It is the only option
+that removes night pages without breaking the change policy or touching stateful services: 40 of 70
+pod-level pages a week (57%), inside the $500 budget and the 6-week staffing.
+- **Promotion gate:** `restart_pod` goes live only after the agent's proposal matched on-call's action
+  in at least 95% of at least 100 allowlisted incidents, about 2 weeks at 50 a week.
+- **Guards from the examples stay:** idempotency on the group key, at most 3 restarts an hour, a re-check
+  of the symptom metric within 5 minutes, and a page with the triage note when it has not recovered.
+- **One kill switch** turns every write back into a proposal.
+
+**What would change it.** Agreement under 95% keeps restarts on B. Any auto-restart that worsens an
+incident demotes `restart_pod` to Tier 2 pending review. If the change board refuses the standard change,
+B is the ceiling. If stateless pod incidents fall under about 10 a week, B alone is the better use of
+the engineer.
+
+### Trade-offs accepted
+- **Restarts can hide real bugs.** A leak that a restart clears keeps coming back. Watch auto-restarts per
+  service per week; more than 5 opens a ticket for the owning team.
+- **Failed restarts page later.** About 10 of 50 still page, now 5 minutes late. Compare their time to
+  mitigate with the 18-minute night median from before.
+- **Deploy incidents still wake a human.** The 30 rollbacks a week get faster evidence through B, not
+  autonomy. Revisit after 3 months of approval data.
+- **Allowlist drift.** A service adds a database and stays listed. A CI check flags any allowlisted
+  service whose manifest gains a volume claim or a database credential.
+
+### Review rubric
+- **Incident mix quantified:** the write-up splits incidents by action and statefulness, and computes the
+  pages avoided per option from those counts.
+- **Constraints checked per option:** change policy, stateful risk, budget and staffing each get a stated
+  pass or fail.
+- **Autonomy earned by threshold:** promotion names an agreement rate and a sample size from shadow mode.
+- **Failure path specified:** every auto-run action has a verification window, an escalation and a kill
+  switch.
+- **Accepted risks monitored:** each trade-off has a metric and a threshold that triggers review.
+- **Reversal conditions stated:** the write-up says which evidence would demote or widen autonomy.
 
 ## Why it exists
 - **On-call engineers drown in context gathering.** The first 10-20 minutes of most incidents go on

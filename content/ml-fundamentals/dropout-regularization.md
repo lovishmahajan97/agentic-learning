@@ -5,7 +5,8 @@ name: Dropout / regularization
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/optimizers
@@ -164,6 +165,23 @@ flowchart TD
     P --> M
     M --> E["Ship best checkpoint on agent eval"]
 ```
+
+## Misconceptions
+- **"Regularization always helps, so turn every knob up."** It trades fit for generalization and only pays
+  when the model can overfit. If train and validation loss are both high and close, more dropout or decay
+  deepens the under-fit; remove regularization or add capacity instead.
+- **"Inference must scale activations by (1−p) to undo dropout."** Modern frameworks use inverted dropout:
+  survivors are scaled by 1/(1−p) during training, so the expectation already matches and `model.eval()`
+  simply runs the full network unchanged.
+- **"Passing `weight_decay` to Adam is the same as AdamW."** Adam folds the penalty into the gradient and then
+  divides it by each parameter's gradient magnitude, so heavily updated weights escape it. AdamW applies the
+  shrinkage outside the adaptive step, which is what decoupled means.
+- **"Validation loss below training loss means something leaked."** Early in a run it is usually just
+  dropout: the logged train loss is measured with units dropped, val loss in eval mode. Compare eval-mode
+  losses on both splits before suspecting a leak.
+- **"Falling loss means the agent fine-tune is getting better."** Loss can keep dropping while the adapter
+  memorizes argument values and tool order from its traces. Pick the checkpoint on held-out task success
+  and a verbatim-copy check, because those expose memorization that loss hides.
 
 ## Examples
 ### Inverted dropout, train/eval switch and AdamW groups

@@ -5,7 +5,8 @@ name: Linear algebra intuition
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -101,6 +102,22 @@ flowchart TD
     K --> A["Context for the agent"]
     ED -.->|"skip normalize"| R["Long chunks dominate"]
 ```
+
+## Misconceptions
+- **"Cosine, dot product and L2 distance are interchangeable index settings."** They agree only on unit
+  vectors. On raw vectors the dot product rewards length, which is how the long generic chunk d1 beats
+  the on-topic d0 in the example below.
+- **"Normalizing embeddings always helps."** Some models are trained for dot product and put useful
+  signal in the norm; normalizing those throws it away. Follow the model card, then confirm with a
+  retrieval eval.
+- **"Two embedding models with the same dimension can share an index."** Same shape does not mean same
+  space: each model learns its own axes, so cross-model scores are meaningless. Re-embed everything with
+  one version.
+- **"A cosine of 0.8 means the chunk is relevant."** Scores are only comparable within one model and
+  corpus; many models give unrelated texts clearly positive cosines. Calibrate any cut-off on labeled
+  queries instead of reusing a number from another setup.
+- **"A million vectors is a small index."** At 1,536 dimensions in float32 that is 6.144 GB raw, before
+  HNSW links; dimension and dtype choices decide the bill.
 
 ## Examples
 ### Dot product versus cosine on a toy index

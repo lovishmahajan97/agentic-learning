@@ -5,7 +5,8 @@ name: Requirements traceability
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/statement-of-work
@@ -37,6 +38,69 @@ a prompt, tool or model change can silently break untested requirements.
   controls such as tool permissions.
 - **What you can skip.** Dedicated requirements-management tools, unless a regulated customer mandates
   one. Repo files plus tagged eval data cover most agent projects.
+
+## Decision case
+### Scenario
+An insurer runs an internal claims-handler assistant: it retrieves policy wording, summarises claim files
+and can call `flag_fraud_review` and `draft_settlement_letter`. Three teams edit its prompts and tools,
+releases go out every 2 weeks, and the model is upgraded each quarter. Internal audit now wants
+per-requirement evidence for every release. All figures are illustrative.
+
+Constraints:
+- **Scope.** 42 requirements, 8 of them critical with a 100% threshold, such as "never disclose another
+  claimant's data" and "always flag listed fraud indicators".
+- **Existing evals.** 1,100 eval cases, none tagged with requirements.
+- **Deadline.** The first audit review is in 8 weeks.
+- **Procurement.** A requirements-management tool needs about 12 weeks to buy.
+- **SME time.** Claims SMEs can label for 20 hours in total before the audit.
+
+### Options
+| Option | How it works | Ready in 8 weeks? | Stays current with 3 teams? | Evidence for the 8 critical requirements? |
+|---|---|---|---|---|
+| **A. Global score plus evidence memo** | Report the suite average and write a memo per release | Yes | Yes, nothing to maintain | No: a small critical slice can fail unseen |
+| **B. Spreadsheet matrix** | QA lead maps requirements to case IDs by hand | Yes | No: drifts within weeks | Only as current as the last edit |
+| **C. Requirements-management tool** | Buy a tool with approval workflows | No: about 12 weeks | Only if synced with the repo | Yes, once populated |
+| **D. Repo-native trace with deterministic controls** | `requirements.yaml`, a `reqs` tag on every case, a generated CI report that blocks critical slices, and a tested control per critical requirement | Yes | Yes: generated from artefacts | Control tests plus a 30-case eval slice each |
+
+### Decision
+Choose **D**, because the SME budget and the deadline decide it:
+- **Eval cases alone cannot carry "never".** Showing a critical failure rate below about 1% needs 300 clean
+  cases per requirement, 2,400 for all eight. At 4 minutes each that is 160 SME hours, eight times the
+  budget.
+- **30-case slices fit the budget.** Eight slices of 30 cases is 240 cases, or 16 SME hours. Each clean
+  slice only bounds its rate below about 10% (3/30), so the "never" traces to a deterministic control:
+  the claimant-level access filter, a fraud-indicator rule that calls `flag_fraud_review`, and their unit
+  tests.
+- **Tagging is engineer work.** Tagging the existing 1,100 cases at about 1 minute each is roughly 18
+  engineer hours, spread over the three teams.
+- **Generated, so it stays current.** CI builds the matrix from the tags on every merge, so a third team's
+  tool-description edit re-runs exactly the slices linked to that tool.
+
+What would change it:
+- **Audit mandates a tool.** Export the generated report into that tool rather than maintaining two
+  sources.
+- **More SME time.** With 160 hours, the eval slices could carry a 1% bound themselves, as a second line
+  behind the controls.
+- **Smaller project.** One team and fewer than about ten prompts would justify a short requirement-to-test
+  list instead.
+
+### Trade-offs accepted
+- **Small slices block releases on one failure.** One miss in 30 is 96.7%, below a 100% bar. Accept that
+  for critical requirements, and require a review of the failing trace before a re-run counts.
+- **Auditors cannot read a repository.** Generate a per-release HTML or PDF report with run ID, model,
+  prompt and tool-schema versions.
+- **Every new case needs a tag.** CI fails untagged cases; watch the orphan count each sprint.
+- **34 non-critical requirements get thinner evidence.** They use their existing tagged cases and the
+  30-case minimum is flagged, not enforced, until SME time allows.
+
+### Review rubric
+- **Critical requirements are named with thresholds** and separated from the rest.
+- **The statistical bound is stated.** It says what a clean slice of n cases proves (about 3/n) and
+  costs the labelling needed for tighter bounds.
+- **"Never" traces to a control,** such as a filter, permission or validator with its own tests.
+- **The matrix is generated, not hand-kept,** and CI fails on orphans and untested critical requirements.
+- **Change impact is concrete.** It shows which slices re-run for a prompt, tool and model change.
+- **Reversal conditions are concrete.** It names the audit rule, SME budget or team size that changes it.
 
 ## Why it exists
 - **Requirements scatter by mid-project.** They live in the SOW, a few Slack threads, and the heads of two

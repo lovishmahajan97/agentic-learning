@@ -5,7 +5,8 @@ name: Approval & authorization boundaries
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/human-in-the-loop
@@ -38,6 +39,71 @@ authority and approvals bound to exact arguments.
   TTL on each approval, single-use consumption, and re-authorization when a parked run resumes.
 - **What you can skip.** Designing a full policy language on day one. A reviewed tier table, delegated
   tokens and fingerprint-bound approvals cover most agents; generalise later.
+
+## Decision case
+### Scenario
+An online retailer gives its 200 support reps a refund agent. Each rep drives runs from a ticket, and
+the ticket text is written by the customer, so prompt injection is a live risk. All figures are
+illustrative planning numbers.
+- **Volume:** about 12,000 refunds a day: 90% at or under $50, 9% between $50 and $500, 1% above $500.
+- **Compliance:** finance policy already requires a second person for any refund above $500 when a human
+  issues it, so the agent must meet the same separation of duties.
+- **Reviewers:** 6 finance reviewers with about 4 hours a day each for approvals (24 reviewer-hours).
+- **Service level:** customers are promised a refund decision within 4 hours.
+- **Observed timing:** a rep confirms in about 30 seconds; a finance review takes about 2 minutes, with a
+  median wait of 45 minutes and a 95th percentile of 3 hours.
+
+### Options
+| Option | How it works | Injection | Separation of duties | Reviewer load per day | 4-hour promise |
+|---|---|---|---|---|---|
+| Approve every refund | every call parks for finance | stopped | met | 12,000 × 2 min = 400 h, far over 24 h | missed |
+| Authorization only | intersected scopes; the payments service caps per-user totals; sample afterwards | an injected refund executes up to the cap | not met above $500 | none | met |
+| Plan-level approval | the rep approves a plan of refunds at the start of a run | partly: deviations must re-trigger the gate | not met above $500 | none for finance | met |
+| Tiered by amount | ≤ $50 `log`; $50-500 rep confirmation; > $500 independent finance approval, all fingerprint-bound | stopped above $50; capped below | met | 120 × 2 min = 4 h | met at the 95th percentile |
+
+### Decision
+**Tiered by amount, with intersected scopes underneath every tier.** It is the only option that meets
+the compliance rule and the reviewer budget together.
+- **Authorization first:** `payments:refund` must be in both the rep's delegated token and the agent's
+  scopes, and the payments service enforces its own per-user daily cap on that token.
+- **Rep confirmation for $50-500 (1,080 a day):** it defeats injection because the rep sees the real
+  arguments and never typed the injected instruction; at 30 seconds each this is about 9 rep-hours a
+  day, spread across 200 reps.
+- **Finance approval above $500 (120 a day):** 4 reviewer-hours against 24 available, and the runtime
+  rejects an approver who is also the requester.
+- **TTL of 4 hours:** it covers the 3-hour 95th percentile and matches the customer promise; an expired
+  request re-asks.
+- **Re-authorize on resume:** scopes are re-read when a parked run continues, so an offboarded rep's run
+  is denied.
+
+**What would change it.**
+- **Rep reject rate near zero after a month:** move the $50-500 band to `log` with sampling.
+- **A rise in refund fraud by customers:** lower the finance threshold and re-run the load sum.
+- **Background runs with no rep present:** use a tightly scoped workload identity and send the
+  $50-500 band to finance.
+
+### Trade-offs accepted
+- **Small refunds can be injected.** A refund at or under $50 executes without a human; the per-user
+  cap bounds the loss, and we sample `log`-tier refunds and alert on refunds whose ticket contains
+  instructions.
+- **Rep fatigue.** 1,080 confirmations a day can become a rubber stamp; we chart rep reject rate and
+  time-to-confirm per rep.
+- **Fresh approval on any change.** Exact fingerprints mean a corrected amount re-asks; we accept the
+  extra prompts and count them.
+- **Expired requests.** About 5% of finance approvals may exceed 3 hours; we track expiries as a share of
+  requests and the refunds that missed the promise.
+
+### Review rubric
+- **Authorization and approval kept separate:** the write-up says who may refund at all before deciding
+  who must confirm each refund.
+- **Load is computed per option:** request counts times review minutes, compared with stated reviewer
+  hours.
+- **Each control is matched to the threat it defeats:** user confirmation for injection, independent
+  approval for a single bad actor.
+- **Approval mechanics are specified:** fingerprint, TTL derived from observed waits, single-use
+  consumption and re-authorization on resume.
+- **Residual risk is named and bounded:** what executes without a human and the cap that limits it.
+- **Re-tier conditions are measurable:** reject rate, fraud rate or time-to-approve thresholds.
 
 ## Why it exists
 - **Whoever influences the model influences the actions.** The user, a web page the agent read or a document

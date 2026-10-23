@@ -5,7 +5,8 @@ name: Typed tool contracts
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -135,6 +136,25 @@ flowchart TD
     O -->|"yes"| J["Stable JSON result"]
     R -->|"ToolError"| T["Typed error with kind, retryable"]
 ```
+
+## Misconceptions
+- **"A typed contract is just the input schema."** The input type is one of four parts. Output type,
+  error taxonomy and harness metadata (side-effect class, parallel safety) are what keep results stable,
+  make recovery correct and let the harness gate calls without parsing descriptions.
+- **"If a schema drifts, the model will error and we will notice."** The model adapts instead of
+  crashing: it sends the old parameter name or reports nulls after an upstream rename, and nobody sees it
+  for days. Validating outputs and snapshot-testing schemas turn silent drift into a failing check.
+- **"Renaming a parameter is a small refactor."** Prompts, few-shot examples, evals and cached
+  conversations all encode the old name, so a rename or type change is breaking. Ship a new tool name or
+  accept both shapes for a transition period.
+- **"Any error string is fine; the model will figure it out."** The correct recovery differs by kind:
+  fix the argument, ask the user, give up, or wait and retry. Without a typed `kind` and `retryable`
+  flag the model retries permission errors and abandons transient ones.
+- **"MCP annotations tell me which tools are safe."** `readOnlyHint` and `destructiveHint` from a server
+  you do not control are claims, not guarantees. Gate on your own side-effect class.
+- **"Retrying a write after a timeout is safe if the tool is typed."** Types do not show whether the
+  downstream commit already happened. An idempotency key derived from the `tool_use` id is what makes
+  the retry a no-op.
 
 ## Examples
 ### A registry entry derived from types

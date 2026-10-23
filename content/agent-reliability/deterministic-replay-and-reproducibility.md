@@ -5,7 +5,8 @@ name: Deterministic replay & reproducibility
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -44,6 +45,218 @@ replay always available.
   and the N you budget for statistical checks.
 - **What you can skip.** Chasing bit-exact model outputs across providers. Exact replay from recordings
   plus statistical reproduction answers the questions that matter.
+
+## Lab
+### Task
+Turn the sequential `Effects` sketch from this lesson into one that handles a real incident: a support
+agent with three parallel tool calls refunded 400 instead of 40. Time box: 60-90 min.
+- **The goal:** record the run, replay it offline under a different completion order, refuse replays on
+  changed input or code, and fork at step 1 to test the fix with a sandboxed refund tool.
+- **Prerequisites:** Structured event streams; Sampling strategies; the recorder example in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13 and pytest 9.1). Save the
+  starter as `lab.py` and the tests as `test_lab.py`.
+- **No model and no network:** `make_llm` is a scripted fake model and `make_tools` writes refunds to a
+  ledger list, so you can see whether a real refund happened.
+- **You implement three things:** the code-version check in `Effects.__init__`, `Effects.do` for the
+  three modes, and `merge`. Do not edit `agent`.
+
+### Starter code
+```python
+"""Lab: record, replay and fork an agent run with parallel tool calls. Run: python lab.py"""
+import hashlib
+import json
+import random
+
+def _h(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+class NonDeterminismError(RuntimeError):
+    pass
+
+class VersionMismatch(RuntimeError):
+    pass
+
+class Effects:
+    """The one interface for every non-deterministic call. Effects are keyed by logical identity,
+    f"{step}:{call_id}", never by arrival position.
+    recording = {"code_version": str, "effects": {key: {"kind", "hash", "output"}}}
+    modes: "record" (call live, store), "replay" (serve from recording, call nothing),
+           "fork" (replay steps <= fork_after, then go live with sandbox overrides)."""
+    def __init__(self, mode, recording, live, *, code_version, fork_after=None, sandbox=None):
+        self.mode, self.rec, self.live = mode, recording, live
+        self.fork_after, self.sandbox = fork_after, sandbox or {}
+        self.live_calls = []                                    # (key, kind) of every live call made
+        # In "record" mode set recording["code_version"] = code_version. In "replay" or "fork" mode
+        # raise VersionMismatch when recording["code_version"] != code_version.
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+    def do(self, step: int, call_id: str, kind: str, **inputs):
+        """key = f"{step}:{call_id}", hash = _h({"kind": kind, **inputs}).
+        record: out = self.live[kind](**inputs); store {"kind", "hash", "output"} under key; return out
+        replay: missing key -> NonDeterminismError(f"{key} not in recording");
+                hash differs -> NonDeterminismError(f"{key}: request changed"); else the recorded output
+        fork:   steps <= fork_after behave like replay; later steps call
+                self.sandbox.get(kind, self.live[kind])(**inputs) and are not recorded
+        Every live call (record mode, or fork after fork_after) appends (key, kind) to self.live_calls."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+def merge(results: list[tuple[str, object]]) -> list[tuple[str, object]]:
+    """Parallel tool results arrive in completion order. Return them in a fixed order (by call_id)."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def agent(task: str, fx: Effects, arrival_seed: int = 0, max_steps: int = 6) -> str:
+    """Orchestration: a pure function of the recorded history. Do not edit."""
+    messages = [{"role": "user", "content": f"{task} (today is {fx.do(0, 'clock', 'clock')})"}]
+    for step in range(1, max_steps + 1):
+        resp = fx.do(step, "llm", "llm", messages=messages)
+        messages.append({"role": "assistant", "content": resp.get("text", ""), "calls": resp.get("tool_calls", [])})
+        if not resp.get("tool_calls"):
+            return resp["text"]
+        calls = list(resp["tool_calls"])
+        random.Random(arrival_seed + step).shuffle(calls)      # stands in for real completion order
+        done = [(c["id"], fx.do(step, c["id"], "tool", name=c["name"], arguments=c["arguments"])) for c in calls]
+        for call_id, result in merge(done):
+            messages.append({"role": "tool", "call_id": call_id, "content": result})
+    return "step budget exhausted"
+
+def make_llm(refund_amount):
+    def llm(messages):
+        turns = sum(m["role"] == "assistant" for m in messages)
+        if turns == 0:
+            return {"tool_calls": [{"id": "c1", "name": "lookup_order", "arguments": {"id": "o-7"}},
+                                   {"id": "c2", "name": "refund_policy", "arguments": {}},
+                                   {"id": "c3", "name": "customer_tier", "arguments": {"id": "u-17"}}]}
+        if turns == 1:
+            return {"tool_calls": [{"id": "c4", "name": "refund", "arguments": {"id": "o-7", "amount": refund_amount}}]}
+        return {"text": f"Refunded {messages[-1]['content']['amount']} on o-7."}
+    return llm
+
+def make_tools(ledger):
+    def tool(name, arguments):
+        if name == "refund":
+            ledger.append(arguments["amount"])
+            return {"ok": True, "amount": arguments["amount"]}
+        return {"lookup_order": {"total": 40, "status": "damaged"}, "refund_policy": {"max": 40},
+                "customer_tier": {"tier": "gold"}}[name]
+    return tool
+
+if __name__ == "__main__":
+    prod = []                                                  # the real refund ledger
+    live = {"clock": lambda: "2026-10-19T03:00", "llm": make_llm(400), "tool": make_tools(prod)}  # bug: 400
+    rec = {"code_version": None, "effects": {}}
+    print("record:", agent("Refund o-7 if eligible", Effects("record", rec, live, code_version="abc123")))
+    print("keys:", sorted(rec["effects"]))
+    fx = Effects("replay", rec, {}, code_version="abc123")
+    print("replay:", agent("Refund o-7 if eligible", fx, arrival_seed=99), "live calls:", fx.live_calls)
+    for label, make in [("changed input", lambda: agent("Refund o-8 if eligible", Effects("replay", rec, {}, code_version="abc123"))),
+                        ("new code", lambda: Effects("replay", rec, {}, code_version="def456"))]:
+        try:
+            make()
+        except (NonDeterminismError, VersionMismatch) as e:
+            print(f"{label}: {type(e).__name__}: {e}")
+    sandbox_ledger = []
+    fixed = dict(live, llm=make_llm(40))                      # the fix under test
+    fx = Effects("fork", rec, fixed, code_version="abc123", fork_after=1, sandbox={"tool": make_tools(sandbox_ledger)})
+    print("fork:", agent("Refund o-7 if eligible", fx), "live calls:", fx.live_calls)
+    print("prod ledger:", prod, "sandbox ledger:", sandbox_ledger)
+```
+
+### Expected output
+`python lab.py` with a correct solution prints the following (the `VersionMismatch` message text is
+yours to choose; the tests check only the type):
+
+```
+record: Refunded 400 on o-7.
+keys: ['0:clock', '1:c1', '1:c2', '1:c3', '1:llm', '2:c4', '2:llm', '3:llm']
+replay: Refunded 400 on o-7. live calls: []
+changed input: NonDeterminismError: 1:llm: request changed
+new code: VersionMismatch: recorded on abc123, running def456
+fork: Refunded 40 on o-7. live calls: [('2:llm', 'llm'), ('2:c4', 'tool'), ('3:llm', 'llm')]
+prod ledger: [400] sandbox ledger: [40]
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 8 fail with `NotImplementedError`; a correct solution
+passes all 8 (Python 3.13, pytest 9.1).
+
+```python
+import pytest
+from lab import Effects, NonDeterminismError, VersionMismatch, agent, make_llm, make_tools, merge
+
+TASK = "Refund o-7 if eligible"
+
+def recorded(amount=400):
+    prod = []
+    live = {"clock": lambda: "2026-10-19T03:00", "llm": make_llm(amount), "tool": make_tools(prod)}
+    rec = {"code_version": None, "effects": {}}
+    fx = Effects("record", rec, live, code_version="v1")
+    answer = agent(TASK, fx)
+    return rec, live, prod, fx, answer
+
+def test_record_keys_effects_by_step_and_call_id():
+    rec, _, prod, fx, answer = recorded()
+    assert answer == "Refunded 400 on o-7." and prod == [400] and rec["code_version"] == "v1"
+    assert set(rec["effects"]) == {"0:clock", "1:llm", "1:c1", "1:c2", "1:c3", "2:llm", "2:c4", "3:llm"}
+    assert len(fx.live_calls) == 8 and rec["effects"]["2:c4"]["kind"] == "tool"
+
+def test_merge_is_independent_of_arrival_order():
+    assert merge([("c3", 3), ("c1", 1), ("c2", 2)]) == [("c1", 1), ("c2", 2), ("c3", 3)]
+
+@pytest.mark.parametrize("seed", [1, 7, 99])
+def test_replay_calls_nothing_and_survives_any_arrival_order(seed):
+    rec, _, prod, _, answer = recorded()
+    fx = Effects("replay", rec, {}, code_version="v1")
+    assert agent(TASK, fx, arrival_seed=seed) == answer
+    assert fx.live_calls == [] and prod == [400]
+
+def test_replay_refuses_changed_or_missing_requests():
+    rec, *_ = recorded()
+    with pytest.raises(NonDeterminismError, match="1:llm: request changed"):
+        agent("Refund o-8 if eligible", Effects("replay", rec, {}, code_version="v1"))
+    del rec["effects"]["2:c4"]
+    with pytest.raises(NonDeterminismError, match="2:c4 not in recording"):
+        agent(TASK, Effects("replay", rec, {}, code_version="v1"))
+
+def test_replay_and_fork_check_the_code_version():
+    rec, *_ = recorded()
+    for mode in ("replay", "fork"):
+        with pytest.raises(VersionMismatch):
+            Effects(mode, rec, {}, code_version="v2", fork_after=1)
+
+def test_fork_replays_the_prefix_and_sandboxes_side_effects():
+    rec, live, prod, _, _ = recorded()
+    sandbox_ledger = []
+    fixed = dict(live, llm=make_llm(40))
+    fx = Effects("fork", rec, fixed, code_version="v1", fork_after=1, sandbox={"tool": make_tools(sandbox_ledger)})
+    assert agent(TASK, fx, arrival_seed=5) == "Refunded 40 on o-7."
+    assert [k for k, _ in fx.live_calls] == ["2:llm", "2:c4", "3:llm"]
+    assert prod == [400] and sandbox_ledger == [40]
+```
+
+### Failure scenarios
+- **Return `results` unsorted from `merge`.** Replays with seeds 7 and 99 fail with
+  `2:llm: request changed`: the tool messages reached the model in a new order, so the step-2 prompt hash
+  differs. When a non-determinism error names an `llm` key, diff the recorded and replayed prompts.
+- **Match effects by position (a counter) instead of by key.** Replay raises a non-determinism error on
+  the first shuffled step, or, without the hash check, silently serves `c2`'s result to `c1`. Log each
+  served key next to the requested one; they must be equal.
+- **Forget the sandbox in fork mode.** The fork test sees `prod == [400, 40]`: debugging refunded a real
+  customer again. Assert in CI that no fork ever touches the production ledger or endpoint.
+- **Skip the version check.** Old recordings replay against changed code and either crash deep in a run
+  or, worse, serve outputs to requests they were never recorded for. Store the commit SHA with each run.
+
+### Submission
+- **`lab.py`** with `Effects.__init__`, `Effects.do` and `merge` implemented; `agent` unchanged.
+- **A green test run** (8 passed) and the printed output of `python lab.py`.
+- **One extra test** of your own: route a `uuid4()` request id through `fx.do` and show that replay
+  reproduces the same id.
+- **A short note** on what the fork proves and what it does not (one fork is one sample; a rate claim
+  needs the N from the sample-size example).
+- **Evaluated on:** zero live calls on replay, keyed effects that survive any arrival order, loud
+  refusals on changed input or code, and forks that never reach production tools.
 
 ## Why it exists
 - **The failure you cannot see.** A run fails at 03:00: the agent called the wrong tool at step 7 and

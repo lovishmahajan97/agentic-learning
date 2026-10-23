@@ -5,7 +5,8 @@ name: PostgreSQL transactions & migrations
 kind: practice
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - backend-fundamentals/postgresql-transactions-and-isolation-levels
@@ -38,6 +39,261 @@ as ordered, forward-only scripts that avoid locking live tables.
   on a step id, charge budgets with an atomic predicate update, and review each migration's lock footprint.
 - **What you can skip.** MVCC internals and every isolation anomaly. Know READ COMMITTED, the predicate
   update, the `40001` retry and expand/contract; that covers almost all agent bookkeeping.
+
+## Lab
+### Task
+Fix the bookkeeping layer of an agent worker: the transaction helper, the step recorder and a small
+migration runner. The first drafts pass a happy-path demo, then a redelivered job leaks a pooled
+client and every later step hangs on `connect()`.
+- **Agent goal:** a step's row, its budget charge and its outbox row commit together or not at all,
+  and a redelivered step is a no-op.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** this lesson's "Transactions on one client", "Idempotency and the outbox" and
+  "Migrations" sections; the idempotency key idea from BullMQ & durable jobs helps.
+- **Needs:** Node 20+ with `npm i @electric-sql/pglite` and `npm i -D tsx vitest`. PGlite is real
+  Postgres compiled to WebAssembly, so no server or Docker is needed and SQLSTATE codes are real.
+  Checked with Node 24.21, PGlite 0.5.11, tsx 4.23 and vitest 5.0.5.
+
+### Starter code
+```ts
+// pg-lab.ts: checkpoint agent steps atomically, and migrate the schema that holds them
+// PGlite is real Postgres compiled to WebAssembly: no server, same SQL, same error codes.
+import { PGlite } from "@electric-sql/pglite";
+
+export type Result = { rows: any[]; rowCount: number };
+export interface Client { query(text: string, params?: unknown[]): Promise<Result>; release(): void }
+export interface Pool { connect(): Promise<Client>; stats(): { checkedOut: number; waiting: number }; log: string[] }
+
+// A pg-shaped pool with max = 1 around one PGlite session. A leaked client makes the next connect() wait forever.
+export function createPool(db = new PGlite()): Pool {
+  let busy = false;
+  const waiters: (() => void)[] = [];
+  const log: string[] = [];
+  const pool: Pool = {
+    log,
+    stats: () => ({ checkedOut: busy ? 1 : 0, waiting: waiters.length }),
+    async connect() {
+      while (busy) await new Promise<void>((r) => waiters.push(r));
+      busy = true;
+      let released = false;
+      return {
+        async query(text, params) {
+          if (released) throw new Error("query on a released client");
+          log.push(text.trim().split(/\s+/).slice(0, 3).join(" "));
+          const r = await db.query(text, params);
+          return { rows: r.rows, rowCount: r.affectedRows || r.rows.length };   // like pg: rows changed or returned
+        },
+        release() {
+          if (released) throw new Error("client released twice");
+          released = true; busy = false; waiters.shift()?.();
+        },
+      };
+    },
+  };
+  return pool;
+}
+
+export const MIGRATIONS = [
+  { name: "0001_runs.sql", sql: `CREATE TABLE run_steps (run_id text NOT NULL, step_id text PRIMARY KEY, content text NOT NULL);
+     CREATE TABLE budgets (tenant text PRIMARY KEY, remaining int NOT NULL);
+     CREATE TABLE outbox (id serial PRIMARY KEY, topic text NOT NULL, payload jsonb NOT NULL);` },
+  { name: "0002_seed.sql", sql: `INSERT INTO budgets VALUES ('acme', 1200);` },
+  { name: "0003_index.sql", sql: `-- no-transaction
+     CREATE INDEX CONCURRENTLY run_steps_run_idx ON run_steps (run_id);` },
+];
+
+// YOUR CODE 1: the first draft. Make it pin one client, ROLLBACK when fn throws, release the client
+// on every path, and retry the whole transaction (up to `retries` more times) only on SQLSTATE
+// 40001 (serialization failure) or 40P01 (deadlock). Any other error is rethrown after rollback.
+export async function withTransaction<T>(pool: Pool, fn: (tx: Client) => Promise<T>, retries = 3): Promise<T> {
+  const client = await pool.connect();
+  await client.query("BEGIN");
+  const result = await fn(client);
+  await client.query("COMMIT");
+  client.release();
+  return result;
+}
+
+// YOUR CODE 2: the first draft. Make it idempotent on step_id (a redelivered job returns "duplicate"
+// and charges nothing), charge the budget with one atomic predicate UPDATE, throw "budget exhausted"
+// so the step insert rolls back with it, and write a 'step.completed' outbox row in the same transaction.
+export function recordStep(pool: Pool, tenant: string, runId: string, stepId: string, tokens: number) {
+  return withTransaction(pool, async (tx) => {
+    await tx.query("INSERT INTO run_steps (run_id, step_id, content) VALUES ($1, $2, 'ok')", [runId, stepId]);
+    const { rows } = await tx.query("SELECT remaining FROM budgets WHERE tenant = $1", [tenant]);
+    if (rows[0].remaining < tokens) throw new Error("budget exhausted");
+    await tx.query("UPDATE budgets SET remaining = $1 WHERE tenant = $2", [rows[0].remaining - tokens, tenant]);
+    return "recorded";
+  });
+}
+
+// YOUR CODE 3: apply the migrations not yet listed in a schema_migrations(name text PRIMARY KEY) table,
+// in order, each file plus its schema_migrations row in one transaction, except files whose first
+// line is "-- no-transaction", which run outside a transaction block. Return the names applied.
+// Client.query runs one statement at a time, so split each file on ";".
+export async function migrate(pool: Pool, files = MIGRATIONS): Promise<string[]> {
+  throw new Error("not implemented: migrate");
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const pool = createPool();
+  try { console.log("applied", await migrate(pool)); }
+  catch (e) {                                           // until migrate works, create the tables directly
+    console.log("migrate:", (e as Error).message);
+    const c = await pool.connect();
+    for (const s of MIGRATIONS.slice(0, 2).flatMap((m) => m.sql.split(";")).filter((s) => s.trim())) await c.query(s);
+    c.release();
+  }
+  for (const [step, tokens] of [["run1-s1", 400], ["run1-s1", 400], ["run1-s2", 1000]] as const) {
+    try { console.log(step, await recordStep(pool, "acme", "run1", step, tokens)); }
+    catch (e) { console.log(step, "error:", (e as Error).message); }
+    if (pool.stats().checkedOut) { console.log("leaked a client: the next connect() would wait forever"); process.exit(1); }
+  }
+  const one = await pool.connect();
+  const q = async (sql: string) => (await one.query(sql)).rows[0];
+  console.log("remaining", (await q("SELECT remaining FROM budgets")).remaining,
+              "steps", (await q("SELECT count(*)::int AS n FROM run_steps")).n,
+              "outbox", (await q("SELECT count(*)::int AS n FROM outbox")).n);
+  one.release();
+}
+```
+
+Run it with `npx tsx pg-lab.ts`. As given, the redelivered `run1-s1` hits a unique-key error
+(SQLSTATE `23505`), the draft never releases its client, and the script stops on the leak.
+
+### Expected output
+```
+applied [ '0001_runs.sql', '0002_seed.sql', '0003_index.sql' ]
+run1-s1 recorded
+run1-s1 duplicate
+run1-s2 error: budget exhausted
+remaining 800 steps 1 outbox 1
+```
+
+### Tests
+```ts
+// pg-lab.test.ts: run with `npx vitest run`
+import { describe, expect, it } from "vitest";
+import { createPool, migrate, recordStep, withTransaction, MIGRATIONS, type Pool } from "./pg-lab";
+
+async function setup(): Promise<Pool> {                 // schema without relying on migrate()
+  const pool = createPool();
+  const c = await pool.connect();
+  for (const s of MIGRATIONS.slice(0, 2).flatMap((m) => m.sql.split(";")).filter((s) => s.trim())) await c.query(s);
+  c.release();
+  pool.log.length = 0;
+  return pool;
+}
+async function one(pool: Pool, sql: string) {
+  const c = await pool.connect();
+  try { return (await c.query(sql)).rows[0]; } finally { c.release(); }
+}
+const sqlError = (code: string) => Object.assign(new Error(`sqlstate ${code}`), { code });
+
+describe("withTransaction", () => {
+  it("rolls back and releases the client when fn throws", async () => {
+    const pool = await setup();
+    await expect(withTransaction(pool, async (tx) => {
+      await tx.query("INSERT INTO outbox (topic, payload) VALUES ('x', '{}')");
+      throw new Error("tool failed");
+    })).rejects.toThrow("tool failed");
+    expect(pool.stats().checkedOut).toBe(0);
+    expect((await one(pool, "SELECT count(*)::int AS n FROM outbox")).n).toBe(0);
+  });
+  it("retries serialization failures and deadlocks only", async () => {
+    const pool = await setup();
+    let attempts = 0;
+    const out = await withTransaction(pool, async () => {
+      attempts++;
+      if (attempts === 1) throw sqlError("40001");
+      if (attempts === 2) throw sqlError("40P01");
+      return "done";
+    });
+    expect([out, attempts, pool.stats().checkedOut]).toEqual(["done", 3, 0]);
+    attempts = 0;
+    await expect(withTransaction(pool, async () => { attempts++; throw sqlError("23505"); })).rejects.toThrow("23505");
+    expect(attempts).toBe(1);
+  });
+  it("gives up after the retry budget", async () => {
+    const pool = await setup();
+    let attempts = 0;
+    await expect(withTransaction(pool, async () => { attempts++; throw sqlError("40001"); }, 2)).rejects.toThrow("40001");
+    expect([attempts, pool.stats().checkedOut]).toEqual([3, 0]);
+  });
+});
+
+describe("recordStep", () => {
+  it("is idempotent on step_id: a redelivery charges nothing", async () => {
+    const pool = await setup();
+    expect(await recordStep(pool, "acme", "run1", "run1-s1", 400)).toBe("recorded");
+    expect(await recordStep(pool, "acme", "run1", "run1-s1", 400)).toBe("duplicate");
+    expect((await one(pool, "SELECT remaining FROM budgets")).remaining).toBe(800);
+    expect((await one(pool, "SELECT count(*)::int AS n FROM outbox WHERE topic = 'step.completed'")).n).toBe(1);
+  });
+  it("rolls the step back when the budget is exhausted", async () => {
+    const pool = await setup();
+    await expect(recordStep(pool, "acme", "run1", "run1-s1", 1300)).rejects.toThrow("budget exhausted");
+    expect((await one(pool, "SELECT count(*)::int AS n FROM run_steps")).n).toBe(0);
+    expect((await one(pool, "SELECT count(*)::int AS n FROM outbox")).n).toBe(0);
+    expect((await one(pool, "SELECT remaining FROM budgets")).remaining).toBe(1200);
+  });
+  it("charges with one predicate UPDATE, never read-then-write", async () => {
+    const pool = await setup();
+    await recordStep(pool, "acme", "run1", "run1-s1", 400);
+    expect(pool.log.filter((s) => /budgets|remaining/.test(s))).toEqual(["UPDATE budgets SET"]);
+  });
+});
+
+describe("migrate", () => {
+  it("applies pending files in order, once", async () => {
+    const pool = createPool();
+    expect(await migrate(pool)).toEqual(["0001_runs.sql", "0002_seed.sql", "0003_index.sql"]);
+    expect(await migrate(pool)).toEqual([]);
+    expect((await one(pool, "SELECT count(*)::int AS n FROM pg_indexes WHERE indexname = 'run_steps_run_idx'")).n).toBe(1);
+  });
+  it("rolls back a failing file and does not record it", async () => {
+    const pool = createPool();
+    const bad = { name: "0004_bad.sql", sql: "ALTER TABLE run_steps ADD COLUMN model text; SELECT no_such_fn();" };
+    await expect(migrate(pool, [...MIGRATIONS, bad])).rejects.toThrow(/no_such_fn/);
+    expect(pool.stats().checkedOut).toBe(0);
+    expect((await one(pool, "SELECT count(*)::int AS n FROM schema_migrations")).n).toBe(3);
+    expect((await one(pool, `SELECT count(*)::int AS n FROM information_schema.columns
+                             WHERE table_name = 'run_steps' AND column_name = 'model'`)).n).toBe(0);
+  });
+});
+```
+
+All 8 fail on the starter. The helper tests fail with `AssertionError` (a client still checked out,
+one attempt instead of three) or the raw `40001`.
+
+The budget test times out after 5 s, the leaked client in action: `one()` waits on `connect()`
+forever. The read-then-write test sees
+`SELECT remaining FROM`, and both migration tests stop on `not implemented: migrate`.
+
+### Failure scenarios
+- **Inject `client.release()` only after `COMMIT`,** not in `finally`. The budget test times out
+  instead of failing. Debug with `pool.stats()`: `checkedOut` stuck at 1 and `waiting` growing is the
+  same signature as `pool.waitingCount` at `max` in production.
+- **Inject `BEGIN` inside the 0003 file's transaction.** Postgres refuses with SQLSTATE `25001`
+  ("CREATE INDEX CONCURRENTLY cannot run inside a transaction block"). Check the opt-out marker is
+  read before the runner opens `BEGIN`.
+- **Inject a retry on every error code.** The `23505` test sees several attempts; on a real pool a
+  constraint violation retried in a loop hammers the database. Log `err.code` per attempt; only
+  `40001` and `40P01` belong in the loop.
+- **Inject the draft's read-then-write charge on a real `pg.Pool` with two workers.** This pool has
+  one connection, so it cannot show the race. Against a real database, two concurrent 1,000-token
+  charges on 1,200 both pass the check, as in the worked scenario; the predicate update prevents it.
+
+### Submission
+- **Your `pg-lab.ts`** with the three `YOUR CODE` parts done and `createPool` and `MIGRATIONS`
+  unchanged.
+- **A `npx vitest run` log** showing 8 passed in a few seconds (no timeout).
+- **The `npx tsx pg-lab.ts` output**, matching the expected lines.
+- **A note of 3-5 sentences:** why the model call stays outside `recordStep`, and what a redelivered
+  step costs with your code.
+- **Evaluated on:** release in `finally`, retry limited to `40001`/`40P01`, `ON CONFLICT DO NOTHING`
+  plus a predicate update, the outbox row in the same transaction, and a runner that records each file
+  atomically with its effects.
 
 ## Why it exists
 - **Agent bookkeeping changes in groups.** Finishing one step means: insert the tool result, append the

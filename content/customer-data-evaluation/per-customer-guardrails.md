@@ -5,7 +5,8 @@ name: Per-customer guardrails
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - safety-security/input-output-guardrails
@@ -34,6 +35,73 @@ and tested on the customer's labelled data.
   thresholds, fail-open or fail-closed per guard, and what the agent is told when a call is denied.
 - **What you can skip.** Building your own classifiers early; start with deterministic tool-argument
   checks and a short policy schema, which catch the consequential failures.
+
+## Decision case
+### Scenario
+Your support agent serves 25 tenants on one shared prompt, toolset and model. A bank is signing next
+month.
+
+Its compliance team hands over a written policy: no investment advice, refunds capped at 50, IBANs
+redacted, and every block explainable to its auditors. A pharma tenant, already live, needs dosage
+discussed freely. The bank expects about 4,000 answers a day, about 2% of them advice-like.
+
+Constraints (figures illustrative):
+- **Latency.** Guardrails may add at most 300 ms to p95 response time. The shared classifier service
+  takes about 80 ms per check.
+- **Recall.** The bank wants at least 95% of real investment-advice answers caught, and accepts up to 15%
+  of legitimate answers blocked during the pilot.
+- **Audit.** Each block must log tenant, rule id and policy version.
+- **Data residency.** The bank's traffic stays in its EU region, so nothing may leave it for a check.
+- **Team.** Four engineers; 25 tenants must not become 25 codebases.
+
+### Options
+| Option | How it works | Holds against persuasion? | Latency | Audit | Maintenance |
+|---|---|---|---|---|---|
+| **A. Rules in each tenant's system prompt** | Append the bank's policy to its prompt | No: a user or poisoned document can talk the model round | None added | No record of when a rule fired | Low |
+| **B. Fork code per tenant** | A bank branch with hard-coded checks | Yes | Low | Ad hoc | 25 branches, every platform fix merged N times |
+| **C. Config-driven policy, enforced in code** | Versioned tighten-only layers, approval registry, tool filtering and argument checks in adapters, per-tenant classifier thresholds | Yes, at the tool adapter | Input plus output classifier = 2 × 80 = 160 ms; adapter checks negligible | Rule id and version on every block | One engine, 25 policy files |
+| **D. Third-party guardrail gateway** | Proxy all model traffic through an external service | Partly: sees text, not your tool limits | Extra network hop | Vendor logs | Low, but fails residency if it runs outside the EU |
+
+### Decision
+Choose **C**, because it is the only option that enforces the bank's rules without breaking residency or
+multiplying codebases:
+- **The refund cap holds in code.** `issue_refund` above 50 is denied in the adapter with a structured
+  hint to escalate, whatever the model was persuaded to try.
+- **Latency fits.** Two classifier checks add about 160 ms, under the 300 ms budget, and both run in the
+  EU region.
+- **The threshold is calibrated for this bank.** On its labelled sample, the threshold that meets 95%
+  recall blocks about 10.8% of legitimate answers, inside the 15% pilot tolerance. At 3,920 legitimate
+  answers a day that is about 423 blocked, which the bank accepts for the pilot.
+- **Pharma keeps dosage only via the approval registry**, so the bank's tighter policy never leaks into
+  pharma and pharma's exception never leaks into the bank.
+- **The output check fails closed for the bank**, returning a safe refusal when the classifier times out.
+
+What would change it:
+- **Fewer than about 3 tenants with distinct rules.** Then hand-written checks in one codebase are simpler.
+- **A classifier slower than about 150 ms.** Two checks would exceed 300 ms, so run the input check only on
+  risky deployments, or buffer output only for the bank.
+- **An EU-hosted gateway that can see tool calls.** Then D becomes viable for text checks, with tool limits
+  still in your adapters.
+
+### Trade-offs accepted
+- **About 1 in 9 legitimate answers blocked in the pilot.** Watch false blocks on SME-reviewed samples
+  weekly, and enrich the 20-positive sample, since 20 positives give 5 points of recall per case and 100
+  would give 1.
+- **Buffered output delays the first visible token.** Watch time to first token for the bank separately.
+- **Fail-closed means refusals during classifier outages.** Watch guard timeout rate and alert on it.
+- **Another policy file to maintain.** Watch policy rollouts against the bank's guardrail cases in its
+  regression suite.
+
+### Review rubric
+- **Enforcement sits outside the prompt.** The write-up places each must-hold rule at an enforcement
+  point (input, retrieval, tool adapter, output) and says why.
+- **Merging only tightens.** It states the merge rules and how a relaxation is approved and audited.
+- **Thresholds come from the customer's data.** It reports the recall target, the implied false-block
+  rate and the sample size behind them.
+- **Latency is budgeted.** It adds up the cost of each check against the stated budget.
+- **Failure modes are chosen per tenant.** It says fail-open or fail-closed for each guard, with a reason.
+- **Reversal conditions are concrete.** It names the tenant count, latency or residency fact that would
+  change the choice.
 
 ## Why it exists
 - **Customers legitimately disagree.** A bank forbids anything that reads like investment advice. A

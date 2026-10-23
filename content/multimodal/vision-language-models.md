@@ -5,7 +5,8 @@ name: Vision-language models
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - multimodal/clip
@@ -170,7 +171,43 @@ flowchart TD
     O -.->|"rescale boxes to original"| R
 ```
 
+## Misconceptions
+- **"Image cost depends on file size or JPEG quality."** Cost follows the patch grid, not bytes: tokens
+  grow with the square of the side length, so with 14-pixel patches and a 2×2 merge a 1024-pixel image
+  is about 1,340 tokens and a 512-pixel one about 335, whatever the compression.
+- **"A VLM reads text in an image the way OCR does."** It predicts the next token from downsampled
+  patches, so a digit smaller than a patch comes back as a plausible value with no confidence score.
+  Crop, tile or supply OCR text, then validate read-out numbers.
+- **"The coordinates it returns are screen pixels."** Boxes are text in the frame the model saw, often on
+  a normalised grid such as 0–1000. After any resize, padding or display scale factor, map them back
+  before your click tool uses them.
+- **"Images are a safe channel; prompt injection arrives as text."** Text rendered in a screenshot or
+  scan becomes tokens like any user message, so tool permissions and approval gates must never depend on
+  what an image says.
+- **"A VLM is a new kind of model with its own reasoning."** It is the parent LLM's decoder fed extra
+  tokens through a connector, so it inherits that LLM's tool calling and weaknesses almost unchanged;
+  counting and exact spatial relations stay weak.
+- **"Keeping every screenshot gives the agent memory at linear cost."** Each kept image is re-sent every
+  step, so cost grows quadratically: about 281,000 image tokens over 20 steps at 1,024 pixels, versus
+  about 26,800 when only the latest screenshot stays.
+
 ## Examples
+### Worked scenario: screenshot agent bill
+An agent sends one full-resolution screenshot per step; illustrative numbers using the merge-2 formula.
+
+| Choice | Tokens per screenshot | 20-step task |
+|---|---|---|
+| 2048 × 2048 sent as-is | ~5,350 | ~107,000 image tokens |
+| Resized to 1024 × 1024 | ~1,340 | ~26,800 |
+| Resized to 768 × 768, crop to active window | ~750 or fewer | ~15,000 |
+
+Accuracy on button clicks did not change between the first two rows because the UI text was already
+legible at 1024; the fix was a resize plus rescaling the returned coordinates back to screen pixels.
+
+- **History multiplies it.** If every past screenshot stays in context, step *n* re-sends *n* images:
+  at ~1,340 tokens each, a 20-step run bills 1,340 × (1 + 2 + … + 20) = 1,340 × 210 ≈ 281,000 image
+  input tokens, versus ~26,800 when only the latest screenshot is kept.
+
 ### Asking a served VLM a question a caption could not answer
 Any VLM served behind an OpenAI-compatible chat API (vLLM does this for open models; hosted vendors use
 the same shape) accepts an image as a base64 data URL inside the message content.
@@ -227,22 +264,6 @@ for side in (512, 768, 1024, 2048):
 # Projector VLM, no merge, 336px tiles of 24x24 = 576 tokens: a 2x2 grid plus a global view
 print(image_tokens(336, 336, patch=14, merge=1, tiles=4, global_view=True))   # 2880
 ```
-
-### Worked scenario: screenshot agent bill
-An agent sends one full-resolution screenshot per step; illustrative numbers using the merge-2 formula.
-
-| Choice | Tokens per screenshot | 20-step task |
-|---|---|---|
-| 2048 × 2048 sent as-is | ~5,350 | ~107,000 image tokens |
-| Resized to 1024 × 1024 | ~1,340 | ~26,800 |
-| Resized to 768 × 768, crop to active window | ~750 or fewer | ~15,000 |
-
-Accuracy on button clicks did not change between the first two rows because the UI text was already
-legible at 1024; the fix was a resize plus rescaling the returned coordinates back to screen pixels.
-
-- **History multiplies it.** If every past screenshot stays in context, step *n* re-sends *n* images:
-  at ~1,340 tokens each, a 20-step run bills 1,340 × (1 + 2 + … + 20) = 1,340 × 210 ≈ 281,000 image
-  input tokens, versus ~26,800 when only the latest screenshot is kept.
 
 ### Agent tool: screenshot in, validated click out
 A sketch of the act step in a computer-use loop. The model sees a resized screenshot and must answer

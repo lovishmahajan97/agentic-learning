@@ -5,7 +5,8 @@ name: Choosing an agent framework (build on SDKs vs frameworks)
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/frameworks
@@ -39,6 +40,67 @@ a hosted harness, not by feature lists.
   tools, prompts and eval set should not depend on it.
 - **What you can skip.** Ranking frameworks by GitHub stars or demo count. Run the same 20-case eval on two
   candidates instead.
+
+## Decision case
+### Scenario
+An EU insurer wants a claims-intake agent: it reads a claim, checks the policy, asks for missing
+documents, and proposes a payout. Payouts over 2,000 EUR need an adjuster's approval. The team must pick
+the agent framework this week. All figures below are illustrative planning numbers, not benchmarks.
+- **Team:** 4 Python engineers; one also writes the TypeScript review UI. Nobody has operated a durable
+  workflow engine such as Temporal.
+- **Scale:** 4,000 claims a day at about 8 supersteps each, so 4,000 x 8 = 32,000 checkpoints a day.
+- **Approvals:** 30% of claims (1,200 a day) pause for an adjuster with a 24 h SLA and a 6 h median wait.
+  By Little's law about 1,200 x 6 / 24 = 300 runs sit paused at any moment, across deploys.
+- **Data residency:** state and traces stay in the EU VPC; no SaaS tracing.
+- **Providers:** one model provider today; procurement wants a second within 12 months.
+- **Latency and deadline:** first streamed update within 2 s at p95; pilot live in 10 weeks.
+
+### Options
+| Option | How it works | Durable 24 h approval | Second provider | EU-only traces | 10 weeks with this team |
+|---|---|---|---|---|---|
+| Raw SDK loop | your loop, a Postgres run table, LiteLLM | you build pause, resume and payloads | yes, via LiteLLM | any OTel backend | tight: resume and streaming eat weeks |
+| LangGraph | `StateGraph`, `interrupt()`, `PostgresSaver`, LiteLLM under it | built in, resumes by `thread_id` | yes | self-hosted LangSmith or Langfuse | fits: Python, durable pause is a library call |
+| OpenAI Agents SDK | `Runner`, tools with `needs_approval`, saved `RunState` | you store and reload the serialized state | partial | custom trace processor | workable, more glue around state |
+| Raw loop in Temporal | loop steps as activities in a durable workflow | strongest: retries, timers, history | yes | self-hosted | risky: new cluster to learn and run |
+
+### Decision
+**LangGraph with a Postgres checkpointer, LiteLLM under the model calls, and traces in a self-hosted EU
+backend.** It is the only option that covers the 24 h approval, provider neutrality and EU-only traces
+without new infrastructure or weeks of state code, in the team's language.
+- **Why not the raw loop:** the loop is easy, but durable pause, resume after deploys and streaming are
+  most of a 10-week budget.
+- **Why not Temporal:** it is the more robust engine, but a new cluster plus learning it does not fit 10
+  weeks for a team without that experience.
+- **Why not the vendor SDK:** state reload and a second provider both need glue the team would own.
+- **Exit plan:** tools stay plain typed functions, prompts live in the repo, and the 50-case eval set is
+  framework-neutral, so a later move costs days, not a rewrite.
+
+**What would change it.** If the company already runs Temporal for other workflows, put the raw loop
+inside it. If approvals were dropped and runs took seconds, a raw loop is enough. If the bake-off showed
+LangGraph losing on the eval set or needing more glue than the raw loop, the evidence wins.
+
+### Trade-offs accepted
+- **A framework dependency with frequent releases.** Pin exact versions, upgrade on a branch, and gate
+  upgrades on the eval set passing.
+- **Checkpoint storage growth.** At an illustrative 20 KB per checkpoint, 32,000 a day is 640 MB a day,
+  about 19.2 GB over a 30-day retention. Run a retention job for closed claims and alert on table size.
+- **Nodes re-run on resume.** The approval node runs again when the adjuster answers. Payout calls live
+  in a later node with an idempotency key per claim; alert on any duplicate payout attempt.
+- **A database write per superstep.** Adds latency to each step. Track p95 checkpoint write time and the
+  2 s first-update target, and stream `updates` so users see progress before the run ends.
+
+### Review rubric
+- **Constraints first:** the write-up lists run length, approvals, residency, providers, team skills and
+  deadline before naming any framework.
+- **Numbers recomputed:** paused-run count, checkpoint volume and storage follow from stated inputs, and
+  rough figures are labelled illustrative.
+- **Options scored on the constraints:** 2-4 real alternatives, including a raw SDK baseline, each rated
+  on every hard constraint, not on feature lists.
+- **Evidence named:** a thin-slice bake-off (one tool, one approval, one killed-process resume) and the
+  eval metrics compared: pass rate, tokens per task, p95 latency.
+- **Reversibility:** an explicit exit plan for tools, prompts, evals and model calls.
+- **Risks monitored:** each accepted trade-off has a metric or alert, and the write-up says what evidence
+  would change the decision.
 
 ## Why it exists
 - **The loop is small; the rest is not.** A tool-calling loop is about 30 lines. Checkpointing, resume

@@ -5,7 +5,8 @@ name: Data mapping & canonical schemas (schema mapping)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - data-architecture/data-contracts
@@ -36,6 +37,65 @@ tool schema serves every customer.
   crosswalk for write tools, and quarantine of values the mapping does not know.
 - **What you can skip.** Enterprise-wide data modelling. Model only the concepts your agent reasons about
   and keep the rest in extensions.
+
+## Decision case
+### Scenario
+A support-agent product serves 12 customers whose tickets live in Zendesk, ServiceNow or Jira Service
+Management. The agent searches tickets, summarises them and calls `update_ticket_status`. All figures
+are illustrative.
+
+- **Consumers:** 4 read the data: the agent's tools, the retrieval filter, analytics and the eval
+  harness.
+- **Growth:** about one new customer per month, mostly on the same three systems.
+- **Write safety:** a status write-back must never put a wrong code into a customer's system, because
+  their workflows and SLAs trigger on it.
+- **Data owners:** each customer's admin can give about one hour to review code meanings.
+- **Team:** two engineers who also run onboarding.
+
+### Options
+| Option | How it works | Mappings to maintain | New customer | Write safety |
+|---|---|---|---|---|
+| A. Raw JSON to the model | Tools return source records; the prompt explains each system | none, but filters and analytics still need fields | a prompt edit per system | model may emit a source code it guessed |
+| B. Point-to-point code | Each consumer reads each customer's source shape | 12 × 4 = 48 | touch all 4 consumers | per-consumer code, untested round trips |
+| C. Canonical schema, declarative mappings | One canonical ticket shape; a base mapping per system plus tenant overrides; quarantine unknown codes; reverse crosswalk for writes | 3 base + 12 overrides, against 4 consumers that read one shape | one override, reviewed in the admin's hour | closed enum in the tool schema; reverse crosswalk tested as a fixture |
+| D. LLM maps at runtime | The model translates each record's codes on the fly | none | none | inconsistent across records and model versions |
+
+The N + M count for C is 12 + 4 = 16 translation points against 48 for B, and the 12 overrides are
+small because they sit on 3 shared base mappings.
+
+### Decision
+Choose **C**, because it is the only option where the write path is checkable before any write.
+- **Write safety:** `status` is a closed canonical enum in the tool schema, so argument validation
+  rejects anything else, and the adapter writes the kept source value or the agreed reverse code.
+- **Growth:** customer 13 on ServiceNow is one override on the ServiceNow base, not four consumer
+  changes.
+- **Data-owner time fits:** the admin's hour reviews the crosswalk an LLM drafted from profiled samples,
+  then it is frozen as config.
+- **Unknown codes are visible:** they go to quarantine with a reason rather than defaulting to `other`.
+
+**What would change it.**
+- **One customer, one system, read-only:** mapping inside a single adapter is enough for now.
+- **An industry standard the customers already use** (for example a healthcare exchange format): adopt it
+  as the canonical model instead of designing one.
+- **Consumers that never filter, write or aggregate:** a thin mapping of only the fields shown to the
+  model may do.
+
+### Trade-offs accepted
+- **A canonical model to govern.** Every field is a promise; changes go through versioning. Track how
+  many tenants put the same field in extensions, a sign it should be promoted.
+- **Quarantine delays some records.** Watch quarantine rate per source after each load; a jump usually
+  means a source-side change.
+- **Mapping is lossy for meaning,** even with extensions: many-to-one crosswalks need the kept source
+  value. Run the round-trip fixture on every mapping version.
+- **Onboarding is slower at first.** The first tenant per system pays for the base mapping.
+
+### Review rubric
+- **The mapping count is computed** for each option (N × M versus N + M) with the scenario's numbers.
+- **The tool contract is canonical:** enums in tool schemas, canonical results, and a stated write-back
+  rule for many-to-one codes.
+- **Unknown values have a defined path** (quarantine and data-owner question), never a default.
+- **The LLM's role is bounded:** it proposes mappings for review, it is not the runtime mapper.
+- **Reversal conditions are concrete,** such as a single read-only customer or an existing standard.
 
 ## Why it exists
 - **Every client represents the same concepts differently.** One CRM's "Account" is another's

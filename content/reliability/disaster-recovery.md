@@ -5,7 +5,8 @@ name: Disaster recovery (RPO / RTO)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - reliability/business-continuity
@@ -40,6 +41,63 @@ checkpoints all count, and an unrehearsed plan is a hypothesis.
   system.
 - **What you can skip.** Writing backup tooling; use the database's managed PITR or tools like
   pgBackRest or WAL-G. Know the RPO/RTO arithmetic and the restore-or-rebuild table.
+
+## Decision case
+### Scenario
+A legal-research agent SaaS runs in one region. Its largest customer's contract now requires
+**RPO 5 minutes and RTO 2 hours** for a region loss, and the security team wants recovery from
+ransomware or a bad migration too. All figures are illustrative orders of magnitude.
+- **State:** a 1 TB Postgres database (transcripts, run checkpoints, long-term memory, audit log) and a
+  vector index of 10 million chunks at 400 tokens each. Prompts and tool schemas live in git.
+- **Rebuild cost:** re-embedding is 10M × 400 = 4 billion tokens; at 4 million tokens a minute that is
+  1,000 minutes, about 16.7 hours, so the index must be restored, not rebuilt.
+- **Budget:** DR may cost at most 25% of production infrastructure.
+- **Agents act:** runs file court-deadline reminders and send emails, so a restore must not repeat them.
+
+### Options
+RTO is the sum of detect and decide (30 min), provision, restore, index, verify with the eval set (20
+min).
+
+| Option | How it works | RPO | RTO estimate | Cost vs prod | Logical disasters |
+|---|---|---|---|---|---|
+| A. Backup and restore | WAL archived every minute, nightly base backup, index snapshot every 6 h, all rebuilt from IaC | about 1 min | 30 + 45 provision + 90 restore + 20 replay + 40 index + 20 = 245 min | about 5% | yes, by PITR |
+| B. Pilot light | async DB replica and a one-node vector replica in the DR region, images and secrets present, app tier created on failover | seconds | 30 + 5 promote + 30 app tier + 10 index catch-up + 20 = 95 min | about 15% | no: the replica copies the corruption |
+| C. Warm standby | scaled-down full stack, scaled up on failover | seconds | 30 + 5 + 10 scale-up + 10 + 20 = 75 min | about 35% | no, same reason |
+
+### Decision
+**Option B plus A's immutable backups in a separate account.** Pilot light is the cheapest option that
+fits RTO 2 hours, at 95 minutes with 25 minutes of margin. The replica gives an RPO of seconds against
+the 5 minute target.
+
+Pilot light cannot undo a `DROP TABLE` or ransomware, because the replica applies it within seconds, so
+keep A's WAL archive and object-locked base backups (35-day retention) in another account. Together
+they cost about 15% + 4% = 19%, inside the 25% ceiling.
+- **Why not A alone:** 245 minutes is more than double the 2 hour RTO.
+- **Why not C:** 35% breaks the budget to save 20 minutes the contract does not ask for.
+
+**What would change it.** An RTO relaxed to 6 hours makes A sufficient. An RTO of 30 minutes needs C or
+active-active and a bigger budget. A drill where creating the app tier takes over 55 minutes (cloud
+APIs are congested in a regional event) uses up the margin and moves the choice to C.
+
+### Trade-offs accepted
+- **The app tier is created during the disaster.** That is the riskiest 30 minutes. Pre-pull images and
+  pre-grant quota in the DR region, and time this step in every quarterly drill.
+- **The index replica trails by up to 6 hours of documents.** New documents re-embed in the background
+  after failover. Track the catch-up backlog in the drill.
+- **Restored checkpoints replay recent steps.** Reminders and emails carry idempotency keys the target
+  systems honour, plus an action log in another account. Alert on duplicate keys after any restore.
+- **Estimates are not actuals.** Until a timed drill records RTA and RPA, the 95 minutes is a hypothesis.
+
+### Review rubric
+- **RTO as a sum:** the write-up adds detect, decide, provision, restore, index and verify, not just the
+  restore step.
+- **Rebuild costed:** it computes re-embedding time from chunk count, tokens and throughput and decides
+  restore versus rebuild per store.
+- **Logical disasters covered:** it explains why replicas do not help against corruption and keeps
+  point-in-time, isolated backups.
+- **Budget checked:** every option has a cost against the ceiling.
+- **Agent side effects:** it names where deduplication lives so a restore does not repeat actions.
+- **Drill and reversal:** it names the drill measurement that would move the decision.
 
 ## Why it exists
 - **HA redundancy is in the same place and real time,** which makes it useless for a whole class of

@@ -5,7 +5,8 @@ name: ReAct (reason + act)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 related:
   - prompting/chain-of-thought
@@ -136,6 +137,23 @@ sequenceDiagram
     M-->>H: Final answer, no tool call
     Note over H: log trajectory, stop
 ```
+
+## Misconceptions
+- **"Native tool calling replaced ReAct."** It is ReAct with the parsing moved into the API. The loop,
+  stop conditions, step budget, error handling, observation truncation and trust boundary are still
+  your harness's job.
+- **"The model runs the tools."** The model only emits a tool name and arguments; the harness executes
+  the call, checks permissions and budgets, and decides what goes back as the observation.
+- **"Interleaving reasoning and acting always beats chain-of-thought."** In the original study plain
+  ReAct trailed CoT slightly on HotpotQA, due to uninformative searches and loops; the best results
+  combined the two. The lesson is complementarity.
+- **"A tool exception should end the run."** Returned as an error-flagged observation, it lets the model
+  retry differently; swallowed or fatal, the agent loses its main recovery path.
+- **"Each step costs about the same."** Every call re-sends the whole trajectory, so total input grows
+  quadratically with steps, and one untruncated 10,000-token observation makes an 8-step run about 7×
+  more expensive.
+- **"Observations are just data, so they are safe."** A fetched page can contain text addressed to the
+  agent. Treat results as untrusted and gate consequential actions with permissions outside the model.
 
 ## Examples
 ### A minimal ReAct harness over native tool calling

@@ -5,7 +5,8 @@ name: MCP TypeScript SDK
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/model-context-protocol
@@ -39,6 +40,210 @@ over stdio or Streamable HTTP. It never calls a model.
   slow tools, and transport plus auth.
 - **What you can skip.** Hand-writing JSON-RPC framing, the handshake and SSE parsing; the SDK owns them.
   The low-level `Server` matters only for custom capabilities or fully dynamic tool lists.
+
+## Lab
+### Task
+Harden two MCP servers and the host-side router your agent loop calls for every `tool_use` block.
+
+You put
+the id contract into the Zod shape, return a model-facing `isError` instead of leaking a database error,
+and write `callPrefixed`: prefix routing, an approval gate for the write tool, and a request timeout that
+becomes an error result instead of ending the run.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** this lesson's "Two kinds of failure" table and the two-server agent-loop example;
+  Runtime schema validation; Model Context Protocol (agents module).
+- **Runs offline:** `InMemoryTransport.createLinkedPair()` connects a real `Client` to a real `McpServer`
+  in one process, so the handshake, `tools/list` schemas and `tools/call` validation are the SDK's own. No
+  model is involved: the agent loop would pass each `tool_use` block to `callPrefixed`.
+- **Version:** checked with `@modelcontextprotocol/sdk` 1.32.1 (1.x import paths), `zod` 4.6.7, Vitest
+  5.0.5 and Node 24.21. In 1.32.1 an unknown tool name and an input validation failure come back as
+  `isError` results, while a request timeout still rejects; check this on your version.
+- **Setup:** `npm init -y && npm pkg set type=module && npm i @modelcontextprotocol/sdk zod && npm i -D vitest`.
+
+### Starter code
+```ts
+// tools.ts: two MCP servers and the host-side router an agent loop calls (in-memory transport, no model)
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { z } from "zod";
+import { setTimeout as sleep } from "node:timers/promises";
+import { fileURLToPath } from "node:url";
+
+const ORDERS = new Map([["ord_42", { status: "shipped", total: 30 }]]);
+export const lookups: string[] = [];   // ids the lookup handler actually ran with
+export const refunds: string[] = [];   // side effects of the write tool
+
+export function ordersServer() {
+  const server = new McpServer({ name: "orders", version: "1.0.0" });
+  server.registerTool("lookup_order", {
+    description: "Fetch an order by id. Ids look like ord_42.",
+    inputSchema: { orderId: z.string() },   // YOUR CODE 1: reject ids not matching /^ord_\w+$/ before the handler
+  }, async ({ orderId }) => {
+    lookups.push(orderId);
+    const order = ORDERS.get(orderId);
+    // YOUR CODE 2: an unknown order is an expected failure. Return an isError result written for the
+    // model (say which id was missing and what to do next) instead of throwing internal detail.
+    if (!order) throw new Error(`pg: no row in orders for ${orderId} (host=db-internal-7.prod)`);
+    return { content: [{ type: "text", text: JSON.stringify({ orderId, ...order }) }] };
+  });
+  server.registerTool("refund_order", {
+    description: "Refund an order in full. Changes money; the host must get approval first.",
+    inputSchema: { orderId: z.string().regex(/^ord_\w+$/) },
+  }, async ({ orderId }) => { refunds.push(orderId); return { content: [{ type: "text", text: `refunded ${orderId}` }] }; });
+  return server;
+}
+
+export function docsServer(delayMs = 0) {
+  const server = new McpServer({ name: "docs", version: "1.0.0" });
+  server.registerTool("search", { description: "Search the policy docs", inputSchema: { query: z.string() } },
+    async ({ query }) => { await sleep(delayMs); return { content: [{ type: "text", text: `refund policy: 30 days (${query})` }] }; });
+  return server;
+}
+
+export async function connect(server: McpServer) {
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverSide);
+  const client = new Client({ name: "support-agent", version: "1.0.0" });
+  await client.connect(clientSide);              // initialize, reply, notifications/initialized
+  return client;
+}
+
+export type ToolDef = { name: string; description: string; input_schema: unknown };   // provider-ready
+export async function toolTable(clients: Record<string, Client>): Promise<ToolDef[]> {
+  const table: ToolDef[] = [];
+  for (const [prefix, c] of Object.entries(clients))
+    for (const t of (await c.listTools()).tools)
+      table.push({ name: `${prefix}_${t.name}`, description: t.description ?? "", input_schema: t.inputSchema });
+  return table;
+}
+
+export const NEEDS_APPROVAL = new Set(["orders_refund_order"]);
+export type Approve = (tool: string, args: unknown) => Promise<boolean>;
+
+// What the agent loop calls for every tool_use block; the return value becomes the tool_result.
+export async function callPrefixed(clients: Record<string, Client>, name: string, args: Record<string, unknown>,
+                                   approve: Approve, timeoutMs = 60_000): Promise<{ isError: boolean; text: string }> {
+  // YOUR CODE 3: route `${prefix}_${tool}` to clients[prefix] (split at the FIRST underscore); refuse an
+  // unknown prefix; for NEEDS_APPROVAL tools forward only if approve() resolves true, else return
+  // { isError: true, text: "Denied by the user." }; pass { timeout: timeoutMs } as the request options;
+  // join the text items of the result; and turn a rejected call (a request timeout) into an isError result.
+  throw new Error("not implemented: callPrefixed");
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  const clients = { orders: await connect(ordersServer()), docs: await connect(docsServer()) };
+  console.log((await toolTable(clients)).map((t) => t.name));
+  const deny: Approve = async () => false;
+  for (const [name, args] of [["orders_lookup_order", { orderId: "ord_42" }], ["orders_lookup_order", { orderId: "ord_9" }],
+                              ["orders_refund_order", { orderId: "ord_42" }], ["docs_search", { query: "refund" }]] as const)
+    console.log(name, await callPrefixed(clients, name, args, deny));
+  console.log({ lookups, refunds });
+  await Promise.all(Object.values(clients).map((c) => c.close()));
+}
+```
+
+As given, `node tools.ts` prints the three prefixed tool names, then stops with
+`Error: not implemented: callPrefixed`.
+
+### Expected output
+```
+[ 'orders_lookup_order', 'orders_refund_order', 'docs_search' ]
+orders_lookup_order {
+  isError: false,
+  text: '{"orderId":"ord_42","status":"shipped","total":30}'
+}
+orders_lookup_order {
+  isError: true,
+  text: 'No order ord_9. Ask the user to check the id.'
+}
+orders_refund_order { isError: true, text: 'Denied by the user.' }
+docs_search { isError: false, text: 'refund policy: 30 days (refund)' }
+{ lookups: [ 'ord_42', 'ord_9' ], refunds: [] }
+```
+
+The `ord_9` message is yours to word; it must name the id and must not contain internal detail.
+
+### Tests
+```ts
+// tools.test.ts: run with `npx vitest run`
+import { it, expect, beforeEach, afterEach } from "vitest";
+import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { ordersServer, docsServer, connect, toolTable, callPrefixed, lookups, refunds } from "./tools";
+
+let clients: Record<string, Client>;
+const text = (r: any) => r.content.map((c: any) => c.text).join("\n");
+beforeEach(async () => {
+  lookups.length = 0; refunds.length = 0;
+  clients = { orders: await connect(ordersServer()), docs: await connect(docsServer(300)) };
+});
+afterEach(async () => { await Promise.all(Object.values(clients).map((c) => c.close())); });
+
+it("advertises prefixed tools whose schema carries the id pattern", async () => {
+  const table = await toolTable(clients);
+  expect(table.map((t) => t.name)).toEqual(["orders_lookup_order", "orders_refund_order", "docs_search"]);
+  expect(JSON.stringify(table[0].input_schema)).toContain("ord_");
+});
+
+it("rejects a malformed id before the handler runs", async () => {
+  const r = await clients.orders.callTool({ name: "lookup_order", arguments: { orderId: "42" } });
+  expect(r.isError).toBe(true);
+  expect(lookups).toEqual([]);
+});
+
+it("returns a model-facing isError for a missing order, with no internal detail", async () => {
+  const r = await clients.orders.callTool({ name: "lookup_order", arguments: { orderId: "ord_9" } });
+  expect(r.isError).toBe(true);
+  expect(text(r)).toContain("ord_9");
+  expect(text(r)).not.toMatch(/pg:|db-internal/);
+});
+
+it("routes by prefix and gates the write tool behind approval", async () => {
+  const deny = async () => false, allow = async () => true;
+  expect(await callPrefixed(clients, "orders_lookup_order", { orderId: "ord_42" }, deny))
+    .toEqual({ isError: false, text: '{"orderId":"ord_42","status":"shipped","total":30}' });
+  expect(await callPrefixed(clients, "orders_refund_order", { orderId: "ord_42" }, deny))
+    .toEqual({ isError: true, text: "Denied by the user." });
+  expect(refunds).toEqual([]);
+  expect((await callPrefixed(clients, "orders_refund_order", { orderId: "ord_42" }, allow)).isError).toBe(false);
+  expect(refunds).toEqual(["ord_42"]);
+  expect((await callPrefixed(clients, "crm_lookup", {}, allow)).isError).toBe(true);
+});
+
+it("turns a request timeout into an isError result instead of crashing the run", async () => {
+  const r = await callPrefixed(clients, "docs_search", { query: "refund" }, async () => true, 50);
+  expect(r.isError).toBe(true);
+  expect(r.text).toMatch(/timed out/i);
+});
+```
+
+On the starter all five fail on behaviour: the advertised schema has no pattern, `lookups` records
+`"42"`, the not-found text contains `pg:` and the internal hostname (the SDK forwarded the thrown
+message), and the last two throw `not implemented: callPrefixed`.
+
+### Failure scenarios
+- **Inject a `console.log` into a handler:** harmless here, because the in-memory transport does not use
+  stdout. Now run the orders server over `StdioServerTransport` from a host: the host hangs or reports a
+  parse error. Run the server by hand and look for non-JSON lines on stdout, as in this lesson's
+  interview question.
+- **Inject a split at the last underscore:** use `lastIndexOf("_")`. `orders_lookup_order` routes to a
+  client named `orders_lookup` that does not exist, and the routing test fails. Log the prefix and the
+  bare tool name for every call; names with underscores are why the prefix itself must not contain one.
+- **Inject the gate in the server:** move the approval check into `refund_order`'s handler. The server
+  cannot see the user or the run, so it either always refuses or always runs. Keep `NEEDS_APPROVAL` in the
+  host, where the per-call decision and its log line belong.
+- **Inject a missing `catch`:** let `callTool` reject. The timeout test fails with `McpError` and
+  `Request timed out`, which in a real loop ends the whole run on one slow tool. Track p95 tool latency
+  against `timeoutMs`, or have the server send progress and pass `resetTimeoutOnProgress: true`.
+
+### Submission
+- **Your `tools.ts`** with the three `YOUR CODE` parts done and the exports unchanged.
+- **A `npx vitest run` log** showing 5 passed, and the `node tools.ts` output matching the expected lines.
+- **The `tools/list` entry** for `orders_lookup_order` as JSON, showing the `pattern` the model now sees.
+- **A short note** listing which failures your router returns as `isError` and which (if any) still
+  throw, and why that split is right for the model and for the host.
+- **Evaluated on:** green tests, validation in the Zod shape, no internal detail in model-facing text,
+  approval enforced in the host, and no single tool call able to crash the run.
 
 ## Why it exists
 - **MCP is a real wire protocol.** JSON-RPC 2.0 messages with an `initialize` handshake, capability

@@ -5,7 +5,8 @@ name: CrewAI (crews, roles, tasks, flows)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - agents/frameworks
@@ -38,6 +39,154 @@ Flows when you need deterministic control around them.
   iteration and rate limits.
 - **What you can skip.** Agent "personalities" beyond what improves outputs. Backstory text is prompt
   tokens on every call; keep what measurably helps.
+
+## Lab
+### Task
+Fix a support Flow that runs the billing crew on every ticket and issues refunds nobody approved. You
+add a router so the crew runs only on the billing branch, record the crew's token usage and typed
+proposal in Flow state, and gate the refund behind a human approval flag.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** this lesson's Flows section and the routing example; human-in-the-loop basics.
+- **Runs offline:** `RecordedCrew` replays one recorded `CrewOutput`-shaped result (`.raw`,
+  `.pydantic`, `.token_usage.total_tokens`), so no LLM or key is needed. The Flow itself is real.
+- **Needs:** `crewai` and `pytest`; checked with crewai 1.15.28 on Python 3.12, run with
+  `OTEL_SDK_DISABLED=true` to keep telemetry off.
+
+### Starter code
+```python
+# support_flow.py: route in code, run the crew only when needed, gate side effects (CrewAI Flow, offline)
+import contextlib, io
+from types import SimpleNamespace
+from pydantic import BaseModel
+from crewai.flow.flow import Flow, listen, router, start
+
+class RefundProposal(BaseModel):
+    order_id: str
+    amount_usd: float
+    reason: str
+
+class TicketState(BaseModel):
+    text: str = ""
+    approved: bool = False          # set by a human reviewer's decision, never by the crew
+    category: str = ""
+    reply: str = ""
+    proposal: RefundProposal | None = None
+    refunds_issued: list[str] = []
+    crew_calls: int = 0
+    tokens: int = 0
+
+class RecordedCrew:
+    """Stand-in for a billing Crew: replays one recorded CrewOutput-shaped result
+    (.raw, .pydantic, .token_usage.total_tokens), so the flow runs without an LLM."""
+    def __init__(self, raw: str, pydantic: BaseModel, total_tokens: int):
+        self.result = SimpleNamespace(raw=raw, pydantic=pydantic,
+                                      token_usage=SimpleNamespace(total_tokens=total_tokens))
+    def kickoff(self, inputs: dict):
+        return self.result
+
+billing_crew = RecordedCrew("Duplicate charge on order A1; propose a refund.",
+                            RefundProposal(order_id="A1", amount_usd=29.0, reason="charged twice"),
+                            total_tokens=1840)
+
+class SupportFlow(Flow[TicketState]):
+    @start()
+    def classify(self):
+        t = self.state.text.lower()
+        self.state.category = "billing" if ("charge" in t or "invoice" in t) else "general"
+
+    # YOUR CODE 1: both steps below listen to classify, so the crew runs on every ticket.
+    # Add a @router(classify) that returns the category, and make the crew step listen to
+    # "billing" and general_reply listen to "general".
+    @listen(classify)
+    def run_billing_crew(self):
+        out = billing_crew.kickoff(inputs={"ticket": self.state.text})
+        self.state.crew_calls += 1
+        self.state.reply = out.raw
+        # YOUR CODE 2: add out.token_usage.total_tokens to state.tokens and keep the typed
+        # out.pydantic in state.proposal
+
+    @listen(run_billing_crew)
+    def issue_refund(self):
+        # YOUR CODE 3: the refund is a side effect. Issue it only when there is a proposal AND
+        # state.approved is True; otherwise set reply to "Refund proposal sent for approval."
+        if self.state.proposal is not None:
+            self.state.refunds_issued.append(self.state.proposal.order_id)
+
+    @listen(classify)
+    def general_reply(self):
+        self.state.reply = "Thanks, routed to the general queue."
+
+def run(text: str, approved: bool = False) -> TicketState:
+    flow = SupportFlow()
+    with contextlib.redirect_stdout(io.StringIO()):  # hide CrewAI's console panels
+        flow.kickoff(inputs={"text": text, "approved": approved})
+    return flow.state
+
+if __name__ == "__main__":
+    for text, ok in [("Where is your office?", False), ("I was charged twice", False),
+                     ("I was charged twice", True)]:
+        s = run(text, ok)
+        print(f"{s.category}: calls={s.crew_calls} tokens={s.tokens} "
+              f"refunds={s.refunds_issued} reply={s.reply!r}")
+```
+
+As given, every line shows `calls=1 tokens=0`: the crew runs even for the general ticket, its usage is
+lost, and both listeners write `reply`, so billing tickets end with the general-queue text.
+
+### Expected output
+```
+general: calls=0 tokens=0 refunds=[] reply='Thanks, routed to the general queue.'
+billing: calls=1 tokens=1840 refunds=[] reply='Refund proposal sent for approval.'
+billing: calls=1 tokens=1840 refunds=['A1'] reply='Duplicate charge on order A1; propose a refund.'
+```
+
+### Tests
+```python
+# test_support_flow.py: run with `pytest -q`
+import support_flow as m
+
+def test_general_ticket_never_calls_the_crew():
+    s = m.run("Where is your office?")
+    assert (s.category, s.crew_calls, s.tokens) == ("general", 0, 0)
+    assert s.reply == "Thanks, routed to the general queue."
+
+def test_billing_ticket_calls_crew_once_and_logs_tokens():
+    s = m.run("I was charged twice")
+    assert (s.category, s.crew_calls, s.tokens) == ("billing", 1, 1840)
+    assert s.proposal == m.RefundProposal(order_id="A1", amount_usd=29.0, reason="charged twice")
+
+def test_unapproved_refund_is_not_issued():
+    s = m.run("I was charged twice", approved=False)
+    assert s.refunds_issued == []
+    assert s.reply == "Refund proposal sent for approval."
+
+def test_approved_refund_is_issued_once():
+    s = m.run("I was charged twice", approved=True)
+    assert s.refunds_issued == ["A1"]
+```
+
+All four fail on the starter: a crew call on a general ticket, zero logged tokens, the wrong reply,
+and no refund even when approved (the proposal was never stored).
+
+### Failure scenarios
+- **Inject an LLM classifier:** replace the keyword rule with a crew call in `classify`. Every ticket
+  now costs a crew call, which `crew_calls` shows at once. Put deterministic routing back in code and
+  compare calls per 1,000 tickets.
+- **Inject `approved` from the crew:** set `state.approved` from a field in the crew's output. The
+  model can now approve its own refund. Trace where each state field is written; approval must come
+  from your reviewer system's input only.
+- **Inject a router label typo:** return `"Billing"` instead of `"billing"`. No listener runs and
+  `reply` stays empty with no error. Assert on `category` and `reply` per branch, and log the label
+  each router returns.
+
+### Submission
+- **Your `support_flow.py`** with the three `YOUR CODE` steps done and nothing else changed.
+- **A `pytest -q` run** showing 4 passed, plus the script output matching the expected lines.
+- **A cost table** for a mix of 100 tickets (say 30 billing): crew calls and tokens before and after
+  routing, using the recorded 1840 tokens per call.
+- **A short note** on where a real approval step would sit (a persisted Flow state, a review queue)
+  and what is logged.
+- **Evaluated on:** green tests, routing in code, and no side effect without `approved`.
 
 ## Why it exists
 - **Some work decomposes like a team.** Research, then analyse, then write, then review: each step has a

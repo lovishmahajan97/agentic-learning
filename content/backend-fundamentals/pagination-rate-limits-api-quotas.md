@@ -5,7 +5,8 @@ name: Pagination, rate limits & API quotas
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/rest-graphql-api-design
@@ -40,6 +41,261 @@ binds first.
   run and reconciled after.
 - **What you can skip.** Proving limiter algorithms correct. Know token bucket versus fixed window,
   keyset versus offset, Little's law and reserve-then-reconcile.
+
+## Lab
+### Task
+Build the three bounds an agent gateway needs, using only the standard library: a keyset-paginated
+`list_tickets` tool, a token bucket that meters provider tokens per minute, and a tenant quota that
+reserves a run's tokens before it starts and reconciles after.
+
+The starter uses offset pages, a fixed-window limiter and a quota that only counts finished runs.
+Time box: 90-120 minutes.
+- **Prerequisites:** this lesson's How it works (pagination, cursor rules, rate limiting algorithms,
+  quotas) and the two worked scenarios, whose numbers the tests reuse.
+- **Setup:** Python 3.12, `pip install pytest` (checked on pytest 9.1; `sqlite3` ships with Python).
+  The clock is injected, so tests need no sleeping. Save the starter as `lab_bounds.py` and the tests as
+  `test_lab_bounds.py`.
+- **Done:** `python lab_bounds.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: bound an agent's tools and spend: keyset pages, a token bucket, a run quota
+(checked on Python 3.12, standard library only)."""
+import base64, json, sqlite3
+
+MAX_PAGE = 50
+
+
+def make_db(n: int = 120) -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE tickets (id INTEGER PRIMARY KEY, created_at INTEGER NOT NULL, title TEXT)")
+    conn.execute("CREATE INDEX ix_tickets_created_id ON tickets (created_at, id)")
+    # three tickets per second, so created_at values collide at page boundaries
+    conn.executemany("INSERT INTO tickets (id, created_at, title) VALUES (?, ?, ?)",
+                     [(i, 1_000 + i // 3, f"ticket {i}") for i in range(1, n + 1)])
+    return conn
+
+
+def list_tickets(conn: sqlite3.Connection, limit: int = 20, cursor: str | None = None) -> dict:
+    """LAB 1: newest first (created_at DESC, id DESC) with keyset pagination. The cursor is an opaque
+    base64 token of the last row's (created_at, id). Fetch limit + 1 rows to set has_more (no COUNT).
+    Clamp limit to 1..MAX_PAGE. Raise ValueError("invalid cursor") for a token you did not issue.
+    Return {"ids": [...], "next_cursor": str | None, "has_more": bool}."""
+    offset = int(cursor or 0)                                  # BUG: offset drifts under inserts
+    rows = conn.execute("SELECT id FROM tickets ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                        (limit, offset)).fetchall()            # BUG: no page-size cap
+    total = conn.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]   # BUG: a full count per page
+    has_more = offset + limit < total
+    return {"ids": [r[0] for r in rows], "next_cursor": str(offset + limit) if has_more else None,
+            "has_more": has_more}
+
+
+class TokenBucket:
+    """LAB 2: capacity `capacity`, refilled at `rate` tokens per second, read from the injected clock.
+    try_acquire(n) debits n and returns 0.0 when the tokens are there; otherwise it debits nothing and
+    returns the seconds until n tokens will be available. n > capacity raises ValueError."""
+    def __init__(self, rate: float, capacity: float, clock):
+        self.rate, self.capacity, self.clock = rate, capacity, clock
+        self.window, self.used = None, 0.0
+
+    def try_acquire(self, n: float = 1.0) -> float:
+        w = int(self.clock() // 60)                            # BUG: a fixed window per minute
+        if w != self.window:
+            self.window, self.used = w, 0.0
+        if self.used + n <= self.capacity:
+            self.used += n
+            return 0.0
+        return 60 - self.clock() % 60
+
+
+class QuotaExceeded(Exception): ...
+
+
+class RunQuota:
+    """LAB 3: a tenant's token quota for the period, reserve then reconcile.
+    reserve(run_id, estimate) admits a run only if used + outstanding reservations + estimate <= limit,
+    else raises QuotaExceeded. reconcile(run_id, actual) drops that reservation and charges `actual`.
+    remaining() = limit - used - outstanding reservations."""
+    def __init__(self, limit: int):
+        self.limit, self.used, self.reserved = limit, 0, {}
+
+    def reserve(self, run_id: str, estimate: int) -> None:
+        if self.used > self.limit:                             # BUG: ignores runs still in flight
+            raise QuotaExceeded(run_id)
+
+    def reconcile(self, run_id: str, actual: int) -> None:
+        self.used += actual
+
+    def remaining(self) -> int:
+        return self.limit - self.used
+
+
+def span(ids: list[int]) -> str:
+    return f"{ids[0]}..{ids[-1]}" if ids else "-"
+
+
+if __name__ == "__main__":
+    db = make_db()
+    p1 = list_tickets(db, 20)
+    print(f"page 1: {span(p1['ids'])} has_more={p1['has_more']}")
+    db.execute("INSERT INTO tickets VALUES (121, 2000, 'new urgent ticket')")   # arrives mid-walk
+    p2 = list_tickets(db, 20, p1["next_cursor"])
+    print(f"after an insert, page 2: {span(p2['ids'])}, overlap with page 1: {sorted(set(p1['ids']) & set(p2['ids']))}")
+    print(f"limit=1000 -> {len(list_tickets(make_db(), 1000)['ids'])} rows")
+
+    t = [0.0]
+    b = TokenBucket(rate=2, capacity=10, clock=lambda: t[0])
+    waits = [b.try_acquire() for _ in range(15)]
+    print(f"bucket b=10 r=2: t=0 admitted {waits.count(0.0)} of 15, next wait {waits[-1]:.1f}s")
+    t[0] = 59.5
+    edge = TokenBucket(rate=10 / 60, capacity=10, clock=lambda: t[0])
+    first = sum(edge.try_acquire() == 0.0 for _ in range(10))
+    t[0] = 60.0
+    print(f"boundary: {first} admitted at t=59.5, then {sum(edge.try_acquire() == 0.0 for _ in range(10))} at t=60.0")
+    t[0] = 0.0
+    tpm = TokenBucket(rate=360_000 / 60, capacity=360_000, clock=lambda: t[0])
+    runs = [tpm.try_acquire(112_000) for _ in range(4)]
+    print(f"TPM: {runs.count(0.0)} runs admitted at t=0, 4th waits {runs[-1]:.1f}s")
+
+    q = RunQuota(300_000)
+    q.reserve("r1", 112_000); q.reserve("r2", 112_000)
+    try:
+        q.reserve("r3", 112_000); r3 = "admitted"
+    except QuotaExceeded:
+        r3 = "rejected"
+    q.reconcile("r1", 72_000)
+    print(f"quota: r3 {r3}; after reconciling r1 at 72000, remaining {q.remaining()}")
+```
+
+As given, page 2 starts at `101..82` with `overlap with page 1: [101]`, `limit=1000` returns 120 rows,
+the boundary line admits `10 at t=60.0`, and the quota admits r3 with `remaining 228000`, although
+three runs of 112,000 tokens cannot fit in 300,000.
+
+### Expected output
+```
+page 1: 120..101 has_more=True
+after an insert, page 2: 100..81, overlap with page 1: []
+limit=1000 -> 50 rows
+bucket b=10 r=2: t=0 admitted 10 of 15, next wait 0.5s
+boundary: 10 admitted at t=59.5, then 0 at t=60.0
+TPM: 3 runs admitted at t=0, 4th waits 14.7s
+quota: r3 rejected; after reconciling r1 at 72000, remaining 116000
+```
+
+The numbers follow the worked scenario: 112,000 tokens per run against a bucket of 360,000 (90% of a
+400,000 TPM limit). Three runs leave 24,000 tokens, so the fourth waits (112,000 − 24,000) / 6,000 per
+second ≈ 14.7 s. After r1 reconciles at 72,000: 300,000 − 72,000 − 112,000 = 116,000.
+
+### Tests
+```python
+import base64
+import pytest
+import lab_bounds as lab
+
+
+def walk(conn, limit=20):
+    ids, cursor, pages = [], None, 0
+    while True:
+        page = lab.list_tickets(conn, limit, cursor)
+        ids += page["ids"]; pages += 1
+        if not page["has_more"]:
+            return ids, pages
+        cursor = page["next_cursor"]
+
+
+def test_walk_returns_every_ticket_once_despite_timestamp_ties():
+    ids, pages = walk(lab.make_db())
+    assert ids == list(range(120, 0, -1)) and pages == 6
+
+
+def test_insert_mid_walk_does_not_duplicate_or_skip():
+    db = lab.make_db()
+    p1 = lab.list_tickets(db, 20)
+    db.execute("INSERT INTO tickets VALUES (121, 2000, 'new')")
+    p2 = lab.list_tickets(db, 20, p1["next_cursor"])
+    assert p2["ids"] == list(range(100, 80, -1))
+
+
+def test_page_size_is_capped_and_cursor_is_checked():
+    db = lab.make_db()
+    assert len(lab.list_tickets(db, 1000)["ids"]) == lab.MAX_PAGE
+    for bad in ("40", base64.urlsafe_b64encode(b"hello").decode()):
+        with pytest.raises(ValueError, match="invalid cursor"):
+            lab.list_tickets(db, 20, bad)
+
+
+def test_no_count_query_per_page():
+    db = lab.make_db()
+    seen = []
+    db.set_trace_callback(seen.append)
+    lab.list_tickets(db, 20)
+    assert not any("COUNT" in s.upper() for s in seen)
+
+
+def bucket(rate, cap, t):
+    return lab.TokenBucket(rate=rate, capacity=cap, clock=lambda: t[0])
+
+
+def test_bucket_allows_a_burst_then_the_refill_rate():
+    t = [0.0]; b = bucket(2, 10, t)
+    waits = [b.try_acquire() for _ in range(15)]
+    assert waits.count(0.0) == 10 and waits[-1] == pytest.approx(0.5)
+    t[0] = 1.0
+    assert [b.try_acquire() for _ in range(3)][:2] == [0.0, 0.0]
+
+
+def test_bucket_has_no_window_edge_burst():
+    t = [59.5]; b = bucket(10 / 60, 10, t)
+    assert sum(b.try_acquire() == 0.0 for _ in range(10)) == 10
+    t[0] = 60.0
+    assert sum(b.try_acquire() == 0.0 for _ in range(10)) == 0
+
+
+def test_bucket_meters_tokens_and_rejects_impossible_requests():
+    t = [0.0]; b = bucket(360_000 / 60, 360_000, t)
+    waits = [b.try_acquire(112_000) for _ in range(4)]
+    assert waits[:3] == [0.0] * 3 and waits[3] == pytest.approx(88_000 / 6_000)
+    with pytest.raises(ValueError):
+        b.try_acquire(400_000)
+
+
+def test_quota_counts_runs_in_flight_and_reconciles():
+    q = lab.RunQuota(300_000)
+    q.reserve("r1", 112_000); q.reserve("r2", 112_000)
+    with pytest.raises(lab.QuotaExceeded):
+        q.reserve("r3", 112_000)
+    q.reconcile("r1", 72_000)
+    assert q.remaining() == 300_000 - 72_000 - 112_000
+    q.reserve("r3", 112_000)
+    assert q.remaining() == 4_000
+```
+
+On the starter, 7 of 8 fail: page 2 repeats ticket 101, the page is not capped, `"40"` is accepted as
+a cursor, and a `COUNT(*)` runs per page. The limiter waits for the next minute instead of the refill
+time and admits a second burst at the window edge, and the quota admits r3.
+
+The full-walk test passes on the starter and guards the tie-breaker once you switch to keyset.
+
+### Failure scenarios
+- **Inject: put only `created_at` in the cursor** (`WHERE created_at < ?`). Observe: the full walk
+  returns 114 of 120 tickets; the 6 missing ones shared a timestamp with a page's last row. Debug: diff
+  the walked ids against `SELECT id`, then look at the `created_at` of the rows around each gap.
+- **Inject: let a bucket accept `n` larger than capacity.** Observe: `try_acquire(400_000)` returns a
+  wait it can never satisfy, so a step with an oversized prompt queues forever. Debug: log the requested
+  tokens next to bucket capacity, and fail fast or trim the prompt instead.
+- **Inject: reconcile without popping the reservation.** Observe: `remaining()` drops by estimate plus
+  actual and the tenant hits its quota well before its real usage does. Debug: alert when outstanding
+  reservations exceed the number of runs actually in flight.
+
+### Submission
+- **Code:** `lab_bounds.py` with LAB 1-3 done; the cursor stays opaque and the clock injectable.
+- **Test run:** `pytest -q` showing 8 passed, plus the script output matching Expected output.
+- **A paginated tool definition:** the JSON Schema you would hand the model for `list_tickets`, with
+  `limit` bounded and `cursor` described as opaque.
+- **A short note (3-5 sentences):** where each of the three bounds lives with several workers (Redis
+  for the bucket and quota, the database index for keyset) and which error body each one returns.
+- **Evaluation:** tests pass, numbers match the worked scenario, and no bound can be bypassed by a
+  caller-supplied value.
 
 ## Why it exists
 - **The unbounded list is a bomb.** `GET /documents` for a tenant with two million rows: the database

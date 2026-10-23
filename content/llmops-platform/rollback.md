@@ -5,7 +5,8 @@ name: Rollback
 kind: practice
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - llmops-platform/canary-shadow-deployments
@@ -36,6 +37,65 @@ changes destroy their own undo path and agent side effects never roll back.
   the previous version can still read, and which runs in flight finish on which version.
 - **What you can skip.** Deep GitOps tooling; a pointer, a history list and a rehearsed drill cover most
   agent teams.
+
+## Decision case
+### Scenario
+An insurer runs a claims-triage agent on a self-hosted 70B model inside its own VPC (data residency rules
+out a provider API). The team must decide how to keep rollback fast for its weekly releases. All figures
+are illustrative.
+- **Serving:** two replicas of 4 GPUs each (8 GPUs); peak load needs both replicas, 09:00-17:00.
+- **Releases:** 4 a month, promoted at 09:00, each with a 48 h bake window.
+- **Constraints:**
+  - restore a validated manifest within 15 minutes of a guard breach (the MTTR target);
+  - no drop below full capacity during the peak shift;
+  - rollback-readiness spend at most $1,500 a month, at an assumed $2.50 per GPU-hour;
+  - each node has spare local NVMe for one extra 140 GB set of weights.
+- **Drill timings:** guard detection takes 5 min; reloading one replica takes 22 min from object storage
+  and 4 min from local disk; flipping to a warm pool takes 1 min.
+- **Fixed in every option:** pinned manifests, blue/green indexes, caches keyed by manifest id.
+
+### Options
+| Option | How it works | Extra spend a month | Time to restore | Capacity during rollback |
+|---|---|---|---|---|
+| **A. Cold from object storage** | `kubectl rollout undo`; nodes pull old weights | $0 | 5 + 2 × 22 = 49 min: fails | half for 44 min: fails at peak |
+| **B. Warm pool for the whole bake** | second 8-GPU pool serves the previous manifest for 48 h | 8 × 48 × $2.50 × 4 = $3,840: fails | 5 + 1 = 6 min | full |
+| **C. Previous weights on local disk** | rolling undo, one replica at a time, from NVMe | $0 | 5 + 2 × 4 = 13 min | half for 8 min: fails at peak |
+| **D. Warm pool for the first 8 h, then C** | pool covers the peak shift after promotion, then is released | 8 × 8 × $2.50 × 4 = $640 | 6 min in the first 8 h, 13 min after | full at peak, half for 8 min off-peak |
+
+### Decision
+Choose **D**, because it is the only option that meets the MTTR, capacity and budget constraints together.
+- **MTTR:** 6 minutes during the first shift and 13 after, both under 15. A's 49 minutes is the whole
+  incident.
+- **Capacity:** the warm pool covers 09:00-17:00 on release day, when C's half-capacity reload would queue
+  claims. After that, rollbacks happen off-peak or on the next day, inside the 48 h window.
+- **Budget:** $640 fits under $1,500. B buys the same 6 minutes for the remaining 40 hours at $3,200 more.
+- **Risk shape:** breaches caused by a release tend to appear in its first hours of real traffic (the
+  lesson's incident fired at T+3 h), which is where D spends its money.
+
+**What would change it:**
+- **Releases promoted off-peak** (for example 20:00): C alone meets every constraint at $0.
+- **An MTTR target under 13 minutes for the whole bake window:** B, with a budget raise.
+- **Breaches seen late in the bake window in your release history:** extend the warm pool, at $80 a
+  month per extra hour.
+
+### Trade-offs accepted
+- **Hours 9-48 recover in 13 minutes, not 6.** Track every rollback's measured restore time against
+  the 15-minute target; two misses in a quarter reopen the decision.
+- **Local disk is a single copy of the previous weights.** Verify its checksum in the pre-release
+  readiness check, and fail promotion if it is missing.
+- **The warm pool adds $640 a month of mostly idle GPUs.** Report its cost next to the incidents it
+  shortened.
+- **Rollback restores behaviour, not actions.** In-flight runs restart by manifest id, and claims notes
+  written by the bad version are found through the audit log. That reconciliation is outside the MTTR.
+
+### Review rubric
+- **Restore time is a sum of measured parts** (detection plus reload per replica), not a single guess.
+- **Capacity during the rollback is stated**, and checked against the traffic at the time it happens.
+- **Costs are recomputed** from GPUs × hours × rate × releases, with the rate labelled as assumed.
+- **The write-up names what a pointer flip cannot undo** (caches, in-flight runs, side effects) and who
+  reconciles each.
+- **A drill proves the chosen path**, with the measured time recorded against the target.
+- **At least two conditions that would change the choice** are stated, each tied to a measurable fact.
 
 ## Why it exists
 - **Container rollback does not transfer.** For a stateless service you redeploy the previous image. AI

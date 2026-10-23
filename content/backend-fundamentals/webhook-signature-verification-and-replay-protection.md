@@ -5,7 +5,8 @@ name: Webhook signature verification & replay protection
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/api-and-sdk-integration
@@ -40,6 +41,222 @@ start each run idempotently: providers retry.
   the signature checks out.
 - **What you can skip.** HMAC internals and timing-attack theory. Know the verification order, why raw
   bytes, why constant time, and why signing does not stop replay.
+
+## Lab
+### Task
+Harden the receiver that turns ticket webhooks into agent runs. It uses the Standard Webhooks scheme
+(`"{id}.{timestamp}.{body}"`, base64 signatures, `whsec_` secrets), unlike the Stripe-style example
+below. The starter verifies re-serialised JSON with `==`, knows only one secret, skips the timestamp,
+and starts a new run on every retry. Time box: 60-90 minutes.
+- **Prerequisites:** this lesson's Verifying, in order and Replay protection sections; the Python
+  lesson's lab for the agent-run framing.
+- **Setup:** Python 3.12, `pip install pytest` (checked on pytest 9.1); everything else is standard
+  library, with SQLite standing in for your database. Save the starter as `lab_webhooks.py` and the
+  tests as `test_lab_webhooks.py`.
+- **Done:** `python lab_webhooks.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: verify Standard Webhooks deliveries and start each agent run exactly once
+(checked on Python 3.12, standard library only)."""
+import base64, hashlib, hmac, json, sqlite3, uuid
+
+TOLERANCE_S = 300
+
+
+class WebhookError(Exception): ...
+
+
+def secret_bytes(whsec: str) -> bytes:
+    return base64.b64decode(whsec.removeprefix("whsec_"))
+
+
+def sign(whsec: str, msg_id: str, ts: int, raw: bytes) -> str:
+    """What the provider does: base64 HMAC-SHA256 over "{id}.{timestamp}.{raw body}"."""
+    mac = hmac.new(secret_bytes(whsec), f"{msg_id}.{ts}.".encode() + raw, hashlib.sha256).digest()
+    return "v1," + base64.b64encode(mac).decode()
+
+
+def verify(headers: dict, raw: bytes, secrets: list[str], now: float) -> str:
+    """LAB 1: return the webhook-id of a genuine delivery, else raise WebhookError with one of:
+    "malformed headers"  (webhook-id, webhook-timestamp or webhook-signature missing or unparsable)
+    "timestamp outside tolerance"  (|now - timestamp| > TOLERANCE_S)
+    "bad signature"  (no "v1,<sig>" entry in the space-separated header matches ANY active secret)
+    Sign the raw bytes exactly as received and compare in constant time."""
+    msg_id, ts = headers["webhook-id"], headers["webhook-timestamp"]
+    body = json.dumps(json.loads(raw)).encode()         # BUG: re-serialised, not the signed bytes
+    expected = sign(secrets[0], msg_id, int(ts), body)  # BUG: only the first secret
+    for part in headers["webhook-signature"].split():
+        if part == expected:                            # BUG: == leaks timing; no timestamp check
+            return msg_id
+    raise WebhookError("bad signature")
+
+
+def make_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE processed_events (event_id TEXT PRIMARY KEY)")
+    conn.execute("CREATE TABLE agent_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, source_event TEXT)")
+    return conn
+
+
+def accept(conn: sqlite3.Connection, msg_id: str) -> str:
+    """LAB 2: in ONE transaction, record msg_id in processed_events and create the agent run with the
+    deterministic id f"run_{msg_id}" and status 'queued'. Return "queued", or "duplicate" (changing
+    nothing) when msg_id was already processed. If creating the run fails, the event must not stay
+    marked as processed, so the provider's retry can succeed."""
+    conn.execute("INSERT INTO agent_runs VALUES (?, 'queued', ?)",
+                 (f"run_{uuid.uuid4().hex[:8]}", msg_id))   # BUG: random id, no dedupe
+    conn.commit()
+    return "queued"
+
+
+def receive(conn, headers: dict, raw: bytes, secrets: list[str], now: float) -> str:
+    try:
+        msg_id = verify(headers, raw, secrets, now)
+    except WebhookError as e:
+        return f"rejected: {e}"
+    return accept(conn, msg_id)
+
+
+OLD, NEW = "whsec_" + base64.b64encode(b"old-secret-for-tests").decode(), \
+           "whsec_" + base64.b64encode(b"new-secret-for-tests").decode()
+
+
+def delivery(msg_id: str, raw: bytes, ts: int, *secrets: str) -> dict:
+    return {"webhook-id": msg_id, "webhook-timestamp": str(ts),
+            "webhook-signature": " ".join(sign(s, msg_id, ts, raw) for s in secrets)}
+
+
+if __name__ == "__main__":
+    db, now = make_db(), 1_767_225_600
+    body = b'{"id": "evt_1", "type": "ticket.created", "text": "Refund order ord_42, please"}'
+    pretty = b'{\n  "id": "evt_2",\n  "type": "ticket.created",\n  "text": "Where is my order?"\n}'
+    cases = [
+        ("good delivery", delivery("msg_1", body, now, OLD), body, now),
+        ("same delivery retried", delivery("msg_1", body, now, OLD), body, now + 60),
+        ("tampered body", delivery("msg_1", body, now, OLD), body.replace(b"ord_42", b"ord_99"), now),
+        ("replayed a week later", delivery("msg_1", body, now, OLD), body, now + 7 * 86_400),
+        ("signed with the new secret during rotation", delivery("msg_3", body, now, NEW), body, now),
+        ("pretty-printed body", delivery("msg_2", pretty, now, OLD), pretty, now),
+        ("missing headers", {"webhook-id": "msg_4"}, body, now),
+    ]
+    for name, headers, raw, at in cases:
+        try:
+            out = receive(db, headers, raw, [OLD, NEW], at)
+        except Exception as e:
+            out = f"crashed: {type(e).__name__}"
+        runs = db.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0]
+        print(f"{name} -> {out} (runs: {runs})")
+```
+
+As given: the retry prints `queued (runs: 2)`, the week-old replay `queued (runs: 3)`, the rotation and
+pretty-printed deliveries are rejected as `bad signature`, and missing headers print `crashed: KeyError`.
+The compact good delivery passes only because `json.dumps` happens to reproduce its bytes.
+
+### Expected output
+```
+good delivery -> queued (runs: 1)
+same delivery retried -> duplicate (runs: 1)
+tampered body -> rejected: bad signature (runs: 1)
+replayed a week later -> rejected: timestamp outside tolerance (runs: 1)
+signed with the new secret during rotation -> queued (runs: 2)
+pretty-printed body -> queued (runs: 3)
+missing headers -> rejected: malformed headers (runs: 3)
+```
+
+### Tests
+```python
+import sqlite3
+import pytest
+import lab_webhooks as lab
+
+NOW = 1_767_225_600
+BODY = b'{"id": "evt_1", "text": "Refund order ord_42"}'
+PRETTY = b'{\n  "id": "evt_2",\n  "text": "hi"\n}'
+SECRETS = [lab.OLD, lab.NEW]
+
+
+def check(headers, raw=BODY, now=NOW):
+    return lab.verify(headers, raw, SECRETS, now)
+
+
+def test_raw_bytes_are_verified_not_reserialised_json():
+    assert check(lab.delivery("msg_2", PRETTY, NOW, lab.OLD), PRETTY) == "msg_2"
+
+
+def test_any_active_secret_is_accepted_during_rotation():
+    assert check(lab.delivery("msg_3", BODY, NOW, lab.NEW)) == "msg_3"
+    with pytest.raises(lab.WebhookError, match="bad signature"):
+        check(lab.delivery("msg_3", BODY, NOW, "whsec_" + "c3RvbGVu"))   # a secret we never issued
+
+
+@pytest.mark.parametrize("skew", [301, -301, 7 * 86_400])
+def test_old_or_future_timestamps_are_rejected(skew):
+    with pytest.raises(lab.WebhookError, match="timestamp outside tolerance"):
+        check(lab.delivery("msg_1", BODY, NOW, lab.OLD), now=NOW + skew)
+
+
+def test_tampering_and_malformed_headers_are_rejected_cleanly():
+    with pytest.raises(lab.WebhookError, match="bad signature"):
+        check(lab.delivery("msg_1", BODY, NOW, lab.OLD), BODY.replace(b"42", b"99"))
+    for h in ({"webhook-id": "m"}, {"webhook-id": "m", "webhook-timestamp": "soon", "webhook-signature": "v1,x"}):
+        with pytest.raises(lab.WebhookError, match="malformed headers"):
+            check(h)
+
+
+def test_constant_time_compare_is_used(monkeypatch):
+    calls = []
+    real = lab.hmac.compare_digest
+    monkeypatch.setattr(lab.hmac, "compare_digest", lambda a, b: calls.append(1) or real(a, b))
+    check(lab.delivery("msg_1", BODY, NOW, lab.OLD))
+    assert calls
+
+
+def test_each_event_starts_exactly_one_run():
+    db = lab.make_db()
+    assert lab.accept(db, "msg_1") == "queued"
+    assert lab.accept(db, "msg_1") == "duplicate"
+    assert db.execute("SELECT id FROM agent_runs").fetchall() == [("run_msg_1",)]
+
+
+def test_failed_run_creation_does_not_mark_the_event_seen():
+    db = lab.make_db()
+    db.execute("CREATE TRIGGER boom BEFORE INSERT ON agent_runs WHEN NEW.source_event = 'msg_9' "
+               "BEGIN SELECT RAISE(ABORT, 'disk full'); END")
+    with pytest.raises(sqlite3.Error):
+        lab.accept(db, "msg_9")
+    assert db.execute("SELECT COUNT(*) FROM processed_events").fetchone()[0] == 0
+    db.execute("DROP TRIGGER boom")
+    assert lab.accept(db, "msg_9") == "queued"                     # the provider's retry now succeeds
+```
+
+On the starter, 8 of 9 fail for the intended reasons: re-serialised and single-secret verification
+reject genuine deliveries, no timestamp is checked, malformed headers raise `KeyError`,
+`compare_digest` is never called, and a retry creates a second run.
+
+The crash-safety test passes on the starter (it never marks events); it catches a fix that marks the
+event outside the run's transaction.
+
+### Failure scenarios
+- **Inject: insert into `processed_events` and commit before creating the run.** Observe: the
+  crash-safety test fails with the event marked and no run, so the provider's retry is answered
+  `duplicate` and the ticket never reaches the agent. Debug: list processed events with no matching run.
+- **Inject: dedupe with a module-level `set()`.** Observe: tests pass, but in production a retry
+  landing on a second worker, or after a deploy, starts a second run. Debug: count runs per
+  `source_event`; any count above 1 means the dedupe is not shared and durable.
+- **Inject: compare signatures with `==` again.** Observe: every functional test still passes and only
+  the constant-time test fails, which is why it exists: the timing leak is invisible in behaviour.
+  Debug: add a lint or review rule that flags `==` on digests, and keep that test in CI.
+
+### Submission
+- **Code:** `lab_webhooks.py` with LAB 1 and LAB 2 done; no `json.loads` before verification succeeds.
+- **Test run:** `pytest -q` showing 9 passed, plus the script output matching Expected output.
+- **A rejection log:** one structured line per rejected delivery with reason, webhook-id and timestamp
+  skew, never the secret or the full body.
+- **A short note (3-5 sentences):** how the worker then treats the ticket text as untrusted data, and
+  how long `processed_events` rows must be kept given the provider's retry horizon.
+- **Evaluation:** tests pass, every genuine delivery starts exactly one run, and every forged, stale
+  or malformed one is rejected with a clear reason.
 
 ## Why it exists
 - **The endpoint is public.** `POST /webhooks/payments` is reachable from every machine on the internet.

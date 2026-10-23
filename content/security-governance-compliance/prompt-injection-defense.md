@@ -5,7 +5,8 @@ name: Prompt injection defense
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - safety-security/prompt-injection
@@ -39,6 +40,64 @@ alarm, and a per-workflow regression suite and risk owner.
   whether the planner ever sees untrusted text (plan then execute, dual LLM), and when a human approves.
 - **What you can skip.** Chasing the cleverest jailbreak phrasing. Wording-based defences move with every
   model upgrade; spend the time on the gate and the suite, which do not.
+
+## Decision case
+### Scenario
+An energy retailer wants an email-triage agent that answers customer emails automatically. Every email
+is untrusted, the agent reads account data, and a reply is an outbound channel: all three legs at once.
+All figures are illustrative planning numbers, not benchmarks.
+- **Volume:** 18,000 inbound emails a day; 60% (10,800) are routine: payment dates, meter readings,
+  address changes, direct-debit questions.
+- **Business goal:** resolve at least 50% of all email (9,000 a day) without a human.
+- **People:** 25 support staff; leadership will not fund more.
+- **Security gate:** zero attack success on a 300-case injection suite for this workflow, and utility under
+  attack no more than 5 points below the clean pass rate.
+- **Deadline:** pilot in 8 weeks, with 2 engineers who already run the company's AI gateway.
+
+### Options
+| Option | How it works | Breaks a leg in code? | Human load | Meets 50% auto? |
+|---|---|---|---|---|
+| Hardened prompt plus classifier | One agent drafts and sends free-text replies; a classifier screens emails | No | low | yes, but cannot pass the zero-success gate reliably |
+| Session taint plus approval of every send | Every reply waits for a human who sees the exact text | Yes, via a human | 10,800 / 25 = 432 approvals per person a day | no: nothing is automatic |
+| Dual LLM with templated replies | A quarantined model with no tools turns the email into typed fields (intent from a fixed list, meter reading, date); the planner never sees the email text and picks a template; the recipient is the verified address on the account | Yes: no attacker text reaches the planner or the reply body | only non-template cases | yes, if templates cover enough |
+| Drafts only | The agent drafts, staff send | Yes, via a human | every email | no |
+
+### Decision
+**Dual LLM with templated replies, routed through the existing gateway.** Control flow comes only from
+the typed intent; the email can change values, not which tools run or who receives the reply.
+- **Coverage math:** if 85% of routine emails fit a template, 0.85 x 10,800 = 9,180 a day are automatic,
+  51% of 18,000, above the goal.
+- **Human load:** the other 1,620 routine emails plus all 7,200 non-routine ones go to staff as today;
+  the 1,620 add about 65 an agent a day.
+- **Values are validated:** a meter reading must be numeric and within a plausible range for that meter,
+  a date must be in the billing window, and an address change triggers a confirmation to the old
+  address.
+- **Why not the others:** the prompt option cannot meet a deterministic gate; approve-everything and
+  drafts-only miss the automation goal.
+
+**What would change it.** If the pilot's template coverage lands under 9,000 / 10,800, about 83.3%,
+automatic volume misses the goal (at 83% it is 8,964); add templates before relaxing isolation. If the business wants
+free-text replies, the planner must see untrusted text, so add approval with provenance for replies
+that quote account data.
+
+### Trade-offs accepted
+- **Stiff, templated replies.** Watch customer satisfaction on automatic replies and the reopen rate.
+- **The quarantined model can be fooled into a wrong field,** such as a fake meter reading. Validation
+  bounds it and the reading is visible on the next bill; alert on readings that move more than a set
+  percentage from the forecast.
+- **Misrouted intents.** A steered extractor may label a complaint as routine. Sample 1% of automatic
+  replies for review and track the misroute rate per intent.
+
+### Review rubric
+- **Legs identified:** the write-up names the untrusted input, sensitive data and outbound channel, and
+  which one each option breaks, enforced where.
+- **Control flow separated:** it states what decides which tools run and who receives output, and shows
+  untrusted text cannot influence it.
+- **Numbers recomputed:** automatic volume, human load and the coverage threshold follow from stated
+  volumes and are labelled illustrative.
+- **Gate defined:** attack success and utility under attack are both measured on a per-workflow suite,
+  with the pass thresholds written down.
+- **Residual risk owned:** what a steered extractor can still do, how it is detected, and who accepts it.
 
 ## Why it exists
 - **This lesson is the defence as a program.** The attack itself (untrusted text interpreted as

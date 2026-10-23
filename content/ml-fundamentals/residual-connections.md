@@ -5,7 +5,8 @@ name: Residual connections
 kind: concept
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: background
 related:
   - ml-fundamentals/normalization
@@ -153,23 +154,23 @@ flowchart TD
     XL -.->|"gradient via J terms, shorter paths"| F1
 ```
 
+## Misconceptions
+- **"Residual connections solved vanishing gradients."** He et al.'s deeper plain nets already used batch
+  normalization and sound init, and their gradients were not zero. The problem was optimization: layers
+  could not learn the identity. Learning `F(x) = H(x) − x` makes "do nothing" the easy starting point.
+- **"The stream at layer k is what layer k computed."** It is the sum of the embedding and every earlier
+  write. Hook the branch output when you want one layer's contribution for steering or interpretability.
+- **"A gated or learned skip scale is a harmless generalization."** Any factor on the skip path compounds
+  across depth: `α = 0.95` over 48 layers shrinks the direct gradient path to 0.085, and `α = 1.05` grows
+  it to 10.4. Keep the skip an identity and put dropout or scaling on the branch.
+- **"A residual network is one deep pipeline, so every layer is essential."** Most gradient flows through
+  short paths, and any prefix of the sum is a usable output. That is why dropping a late block often costs
+  little, though only your agent eval says how little, per tool.
+- **"Adding layers to the stream is free."** Every write grows the stream's norm, so deep Pre-LN models
+  scale branch output init (GPT-2: by `√(2 × n_layers)`) and need a final norm. The stream also costs
+  `batch × seq × d_model` stored activations per block.
+
 ## Examples
-### Worked scenario: pruning layers from an agent's tool router
-A team serves a 32-layer open model as the first-step tool router of an agent and wants lower latency.
-Because the output is a sum of layer increments, they test dropping late blocks one at a time against a
-500-case routing eval. Accuracy figures are illustrative; the method is the point.
-
-| Blocks removed | Share of layer compute saved | Routing accuracy | Decision |
-|---|---|---|---|
-| 0 | 0% | baseline | reference |
-| 2 (late layers) | ~6% | within noise of baseline | keep |
-| 4 (late layers) | 12.5% | small drop on rare tools | keep only after a short LoRA heal |
-| 4 (early layers) | 12.5% | large drop | reject: cost varies by layer |
-
-- **Why it is possible at all:** any prefix of the residual sum is a usable output, and short paths
-  dominate, so single blocks matter less than in a plain network.
-- **Why you still measure:** the cost depends on which layer goes, and on rare tools more than common ones.
-
 ### Gradient at layer 1 of a 64-layer stack, with and without skips
 A 64-layer stack of `tanh(Linear)` blocks with and without the skip connection, comparing the gradient
 norm at the first layer with the last. The loss has a random target, so the output gradient is of order
@@ -205,6 +206,22 @@ for residual in (False, True):
 # Residual stack: the two are within a small factor of each other, because the identity term in every
 #   (I + J_l) carries dL/dx_64 straight back to layer 1 regardless of depth.
 ```
+
+### Worked scenario: pruning layers from an agent's tool router
+A team serves a 32-layer open model as the first-step tool router of an agent and wants lower latency.
+Because the output is a sum of layer increments, they test dropping late blocks one at a time against a
+500-case routing eval. Accuracy figures are illustrative; the method is the point.
+
+| Blocks removed | Share of layer compute saved | Routing accuracy | Decision |
+|---|---|---|---|
+| 0 | 0% | baseline | reference |
+| 2 (late layers) | ~6% | within noise of baseline | keep |
+| 4 (late layers) | 12.5% | small drop on rare tools | keep only after a short LoRA heal |
+| 4 (early layers) | 12.5% | large drop | reject: cost varies by layer |
+
+- **Why it is possible at all:** any prefix of the residual sum is a usable output, and short paths
+  dominate, so single blocks matter less than in a plain network.
+- **Why you still measure:** the cost depends on which layer goes, and on rare tools more than common ones.
 
 ### Stream growth, scaled init, and why a learned skip scale hurts
 Pure Python, no dependencies. It adds 96 random branch outputs (48 blocks × attention and MLP) to a

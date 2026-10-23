@@ -5,7 +5,8 @@ name: Usage analytics
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - adoption/adoption-and-value-realization-measurement
@@ -38,6 +39,65 @@ analytics shows what people did with it.
   content never leaves the tracing store.
 - **What you can skip.** Heavy experimentation theory. The two standard-error formulas below are enough to
   tell a real agent regression from noise in a pilot.
+
+## Decision case
+### Scenario
+An FDE team pilots a refund agent inside a German retailer's helpdesk. The agent drafts replies, looks up
+orders and proposes refunds behind an approval gate. The sponsor review is in week 8 and must say whether
+agent v2 (staged in at week 4) beats v1. All figures are illustrative planning numbers.
+- **Population:** 400 eligible support staff in 3 teams, about 1,500 agent runs a week.
+- **Signal needed:** detect a 5-point change in takeover rate (baseline near 0.20) between v1 and v2.
+- **Works council:** no per-employee reports; pseudonymous IDs may be kept 90 days for aggregates, and no
+  slice under 10 people is shown.
+- **Security:** customer text and order data must not reach the vendor's product analytics tool.
+- **UI access:** the team ships a helpdesk sidebar app, so it can emit client events; 2 engineers, 3 weeks
+  before go-live.
+
+### Options
+| Option | How it works | Detects a 5-point takeover change | Works council | Security | Fits 3 weeks |
+|---|---|---|---|---|---|
+| Thumbs plus request counts | rating button, server request log | no: few, self-selected ratings, no takeover or denominator | yes | yes | easily |
+| Run-level dispositions, team aggregates | `run_finished`, `action_decision`, `human_takeover` with run ID; hashed IDs; team-level views | yes, with noise bands | yes, with a minimum slice of 10 | yes: content stays in traces | yes: sidebar plus collector |
+| Per-user events with content in analytics | full prompts and replies logged next to events | yes | no: per-employee views by default | no | yes |
+| Traces only | derive outcomes from the tracing store | partly: no exposure, no takeover outside the agent | yes | analysts get broad content access | yes |
+
+### Decision
+**Run-level disposition events with hashed user IDs, team-level dashboards and content kept in the
+tracing store, joined by run ID.** It is the only option that measures takeover with a denominator while
+meeting both the works-council and the security constraint.
+- **Noise check before committing:** the standard error of a difference at p ≈ 0.20 is
+  `sqrt(0.32/n)` with *n* runs per version. Two standard errors under 0.05 needs *n* ≥ 0.32 ÷ 0.025²
+  = 512 runs per version.
+- **What that means here:** a 50/50 split of 1,500 runs gives 750 per version a week, so one week settles
+  the total. A team slice gets about 250 per version a week, so 2 weeks gives 500, just short; read team
+  slices after 3 weeks. Weeks 4-8 leave room for both.
+- **Edit size** is computed in the sidebar and only the bucket is emitted.
+
+**What would change it.**
+- **No sidebar access:** thumbs plus traces become the fallback, reported as directional only.
+- **No pseudonymous IDs allowed:** cohort retention goes and the dashboard keeps team-level weekly rates.
+- **Lower volume:** at about 300 runs a week, 150 per version a week needs 4 weeks to pass 512, the
+  whole v2 window, and a team slice would reach only about 200 by week 8. The total could be read just in
+  time; team slices, and so the mix check, would stay "unproven".
+
+### Trade-offs accepted
+- **No individual funnels or coaching views.** Watch breadth by team and the share of slices greyed out
+  under the 10-person minimum.
+- **Front-end work in a customer UI.** Monitor the rejected-event rate and the run-ID join rate to traces
+  after every sidebar release.
+- **Proxies, not quality.** Takeover and approval rates are calibrated against a weekly labelled sample of
+  runs; track agreement between "completed unaided" and "labelled good".
+- **Mix risk with uneven teams.** Every version comparison is sliced by team before anyone reads the total.
+
+### Review rubric
+- **Population and unit first:** eligible users and the unit of work (a run) are named before any event.
+- **Sample size recomputed:** runs per version needed for the stated effect follow from the formula, and
+  are checked against expected weekly volume and per-slice volume.
+- **Constraints scored:** each option is rated against privacy, works-council and UI-access limits, not
+  just on what it can measure.
+- **Content boundary explicit:** what lives in traces versus analytics, and the join key, are stated.
+- **Agent events present:** takeover, approval decision per tool and tool calls per completed task appear.
+- **Change triggers named:** the write-up says what volume or constraint change would flip the choice.
 
 ## Why it exists
 - **A healthy system can still go unused.** A deployed assistant can be technically fine while nobody

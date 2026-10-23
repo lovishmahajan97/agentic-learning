@@ -5,7 +5,8 @@ name: CI/CD for prompts and models
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - backend-fundamentals/ci-cd
@@ -38,6 +39,77 @@ immutable bundle.
   tool fixtures so CI never hits live systems, and which stage runs how many tasks.
 - **What you can skip.** Building a bespoke CI platform. Your existing pipeline plus one eval job, a
   baseline file and pointer-based promotion covers most agent teams.
+
+## Decision case
+### Scenario
+A SaaS company runs a tool-calling support agent. Four engineers change code and tool schemas; two
+product managers tune the system prompt and tool descriptions. Last quarter a PM moved a prompt label
+from the registry UI and refund answers broke overnight with a green code pipeline.
+
+The workload, with illustrative figures:
+- **About 15 PRs a week touch the bundle,** and each triggers about 2 eval runs (initial push plus a fix).
+- **About 10 prompt edits a week** come from the PMs.
+- **The golden set has 600 tasks.** Each task makes about 6 agent model calls plus 1 judge call, so a full
+  run is 600 × 7 = 4,200 calls. At an illustrative $0.01 per call that is $42 a run.
+- **Throughput.** At an illustrative 3 seconds per call and 10 concurrent calls, a full run takes
+  4,200 × 3 / 10 = 1,260 seconds, about 21 minutes.
+
+Constraints:
+- **Budget.** Eval spend must stay under $800 a month.
+- **Speed.** The required PR check must finish in under 10 minutes, or engineers will route around it.
+- **Autonomy.** PMs must ship prompt edits without waiting for an engineer's PR.
+- **Evidence.** No production change, prompt or code, without a linked eval run (the incident rule).
+
+### Options
+| Option | How it works | Monthly eval spend (4 weeks) | PR check time | PM autonomy | Evidence for every change |
+|---|---|---|---|---|---|
+| **A. Full eval on every PR, prompts in repo** | 600 tasks per run, no cache | 30 runs × $42 × 4 = $5,040 | about 21 min | Blocked behind engineer PRs | Yes |
+| **B. Cached smoke per PR, full on release candidates, prompts in repo** | 100-task smoke via the content-addressed cache; full run on 2 candidates a week | $252 + $336 = $588 | 3.5 min cold, about 1 min warm | Blocked | Yes |
+| **C. Registry with UI label moves** | Smoke on code PRs; PMs move `production` themselves | $588 or less | Same as B | Full | No: this is the incident path |
+| **D. Hybrid: registry plus pipeline-only labels** | B, plus a registry webhook runs the same smoke per prompt edit; only the CI account moves `production` | $588 + $84 = $672 | Same as B | Full, gated | Yes |
+
+How the B and D figures come out:
+- **Smoke run.** 100 tasks × 7 calls = 700 calls, $7 cold and 700 × 3 / 10 = 210 seconds.
+- **Warm cache.** A typical PR changes the requests of about 30 tasks: 30 × 7 = 210 calls, $2.10.
+  30 runs × $2.10 × 4 weeks = $252.
+- **Release candidates.** 2 full runs × $42 × 4 weeks = $336 (counted cold to stay conservative).
+- **PM edits in D.** 10 webhook smokes × $2.10 × 4 weeks = $84.
+
+### Decision
+Choose **D**:
+- **It is the only option that meets all four constraints.** A breaks the budget about six times over
+  and the 10-minute limit twice over. B blocks the PMs. C is the deploy path that caused the incident.
+- **The cache does the cost work.** Keying on model, params and the rendered request is what turns $7 smoke
+  runs into $2.10 ones, and a model snapshot bump still pays the full price, as it should.
+- **The label permission does the safety work.** PMs keep their editor; the pipeline alone moves
+  `production`, after the smoke and the next release-candidate full eval pass.
+
+What would change it:
+- **No PM edits.** If every prompt change came through engineers, B is simpler and costs $84 less.
+- **Smoke misses.** If release-candidate evals keep catching regressions the smoke passed, grow the
+  smoke set to 200 tasks ($14 cold) before adding stages.
+- **More concurrency.** At 30 concurrent calls a full run drops to 7 minutes. A would then fit the time
+  limit but still not the budget.
+
+### Trade-offs accepted
+- **The smoke set cannot see small regressions.** At an 85% success rate, the standard error on 100
+  tasks is sqrt(0.85 × 0.15 / 100) ≈ 3.6 points, so a 95% interval is about ±7 points. Watch for it with
+  the release-candidate full eval and the canary.
+- **PM edits wait for the next release candidate** to reach production, up to half a week. Watch the
+  queue age of approved prompt versions.
+- **Cached replays freeze one sample per request.** Watch the full-run variance on release candidates,
+  which run cold.
+- **A second deploy path still exists.** Alert on any `production` label move without a linked eval run.
+
+### Review rubric
+- **Costs are derived, not asserted.** The write-up shows calls per run, runs per week and the monthly
+  total for each option, with prices labelled illustrative.
+- **Every constraint is scored per option,** including the check-time limit and who can deploy prompts.
+- **The cache key is specified** (model, params, rendered request) and its effect on cost is shown.
+- **The bypass is closed by permission,** not by policy: a named account alone moves production labels.
+- **The smoke set's blind spot is quantified** and assigned to a later stage that can see it.
+- **Reversal conditions are concrete,** naming the fact (no PM edits, smoke miss rate, concurrency) that
+  would flip the choice.
 
 ## Why it exists
 - **Classic CI/CD assumptions break.** A conventional pipeline assumes behaviour is determined by code,

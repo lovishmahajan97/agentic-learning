@@ -5,7 +5,8 @@ name: Stopping conditions / termination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -42,6 +43,185 @@ limits, and every exit records a labelled reason.
   emits.
 - **What you can skip.** Clever prompt wording that asks the model to "know when it is done". A
   structured submit plus an external check beats any instruction to self-assess.
+
+## Lab
+### Task
+Build the fail-closed `decide()` that the first example leaves as a note: every provider stop reason goes
+through `normalise()`, only a verified `submit_result` ends as success, and no tool runs after the
+terminal decision. Time box: 45-60 min.
+- **Prerequisites:** The agent loop and Tool calling; the two examples in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13 and pytest 9.1). Save the
+  starter as `lab.py` and the tests as `test_lab.py`.
+- **No model calls:** each scenario is a scripted fake model that returns one response per step.
+
+### Starter code
+```python
+"""Lab: fail-closed termination for a tool-calling loop. Run: python lab.py"""
+from dataclasses import dataclass
+from types import SimpleNamespace as NS
+
+@dataclass
+class Outcome:
+    status: str                       # succeeded | partial | aborted | failed
+    reason: str
+    result: dict | None = None
+
+STOP_MAP = {"tool_use": "tools", "end_turn": "ended", "stop_sequence": "ended",
+            "max_tokens": "truncated", "pause_turn": "resend", "refusal": "refused",
+            "tool_calls": "tools", "stop": "ended", "length": "truncated",
+            "content_filter": "refused"}
+
+def normalise(raw: str | None) -> str:
+    # YOUR CODE HERE: look raw up in STOP_MAP; None or any unmapped value -> "unknown"
+    raise NotImplementedError
+
+class State:
+    def __init__(self, max_steps=6):
+        self.messages, self.executed, self.steps = [], [], 0
+        self.max_steps, self.cancelled, self.nudged = max_steps, False, False
+    def push_tool_result(self, call, out): self.messages.append(("tool", call.name, out))
+    def push_user(self, text): self.messages.append(("user", text))
+    def wrap_up(self): return {"summary": f"stopped after {self.steps} steps"}
+
+def decide(state: State, resp, verify) -> Outcome | None:
+    """Return an Outcome to stop or None to continue. Checks, in this order:
+    1. state.cancelled -> aborted/user_cancelled
+    2. normalise(resp.stop_reason): truncated -> failed/output_truncated,
+       refused -> failed/refused, unknown -> failed/unknown_stop_reason
+    3. a submit_result call whose args pass verify(args) -> succeeded/verified (even on the last step)
+    4. state.steps >= state.max_steps -> partial/budget_exhausted with result=state.wrap_up()
+    5. a rejected submit -> push_tool_result(call, "rejected: <detail>"), continue
+    6. "ended" with no tool calls -> nudge once (push_user), then failed/ended_without_submit
+    7. anything else ("tools", "resend") -> continue
+    """
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def run(state: State, model, tools: dict, verify) -> Outcome:
+    while True:
+        resp = model(state.messages)
+        state.steps += 1
+        out = decide(state, resp, verify)
+        if out:
+            return out                         # decided on the whole response: nothing else runs
+        for call in resp.tool_calls:
+            if call.name != "submit_result":
+                state.executed.append(call.name)
+                state.push_tool_result(call, tools[call.name](**call.args))
+
+def call(name, **args): return NS(name=name, args=args)
+def resp(stop, *calls): return NS(stop_reason=stop, tool_calls=list(calls))
+def script(*resps):
+    it = iter(resps)
+    return lambda messages: next(it)
+
+verify = lambda a: (a.get("failing") == 0, f"{a.get('failing')} tests failing")
+TOOLS = {"run_tests": lambda: "2 failed", "send_email": lambda: "sent"}
+
+SCENARIOS = {
+    "reject_then_accept": script(resp("tool_use", call("submit_result", failing=2)),
+                                 resp("tool_use", call("run_tests")),
+                                 resp("tool_use", call("submit_result", failing=0))),
+    "truncated": script(resp("max_tokens")),
+    "refused": script(resp("refusal")),
+    "unmapped_value": script(resp("model_context_window_exceeded")),
+    "narrated_twice": script(resp("end_turn"), resp("end_turn")),
+    "submit_with_parallel_call": script(resp("tool_use", call("send_email"),
+                                             call("submit_result", failing=0))),
+    "stuck": script(*[resp("tool_use", call("run_tests"))] * 6),
+}
+
+if __name__ == "__main__":
+    for name, model in SCENARIOS.items():
+        st = State()
+        out = run(st, model, TOOLS, verify)
+        print(f"{name:<26} {out.status}/{out.reason} steps={st.steps} tools_run={len(st.executed)}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+reject_then_accept         succeeded/verified steps=3 tools_run=1
+truncated                  failed/output_truncated steps=1 tools_run=0
+refused                    failed/refused steps=1 tools_run=0
+unmapped_value             failed/unknown_stop_reason steps=1 tools_run=0
+narrated_twice             failed/ended_without_submit steps=2 tools_run=0
+submit_with_parallel_call  succeeded/verified steps=1 tools_run=0
+stuck                      partial/budget_exhausted steps=6 tools_run=5
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 7 fail with `NotImplementedError`; a correct solution
+passes all 7 (Python 3.13, pytest 9.1).
+
+```python
+from lab import SCENARIOS, State, TOOLS, call, normalise, resp, run, script, verify
+
+def outcome(name, **kw):
+    st = State(**kw)
+    return run(st, SCENARIOS[name], TOOLS, verify), st
+
+def test_normalise_fails_closed():
+    assert normalise("length") == "truncated" and normalise("end_turn") == "ended"
+    assert normalise(None) == "unknown" and normalise("model_context_window_exceeded") == "unknown"
+
+def test_rejected_submit_gets_a_result_then_verified_success():
+    out, st = outcome("reject_then_accept")
+    assert (out.status, out.reason, st.steps) == ("succeeded", "verified", 3)
+    assert ("tool", "submit_result", "rejected: 2 tests failing") in st.messages
+
+def test_truncated_refused_and_unknown_never_succeed():
+    for name, reason in [("truncated", "output_truncated"), ("refused", "refused"),
+                         ("unmapped_value", "unknown_stop_reason")]:
+        out, _ = outcome(name)
+        assert (out.status, out.reason) == ("failed", reason)
+
+def test_one_nudge_then_fail():
+    out, st = outcome("narrated_twice")
+    assert (out.status, out.reason) == ("failed", "ended_without_submit")
+    assert sum(1 for m in st.messages if m[0] == "user") == 1
+
+def test_no_tool_runs_after_the_terminal_event():
+    out, st = outcome("submit_with_parallel_call")
+    assert out.status == "succeeded" and st.executed == []
+
+def test_budget_gives_partial_with_wrap_up():
+    out, st = outcome("stuck")
+    assert (out.status, out.reason) == ("partial", "budget_exhausted")
+    assert out.result == {"summary": "stopped after 6 steps"} and len(st.executed) == 5
+
+def test_verified_submit_on_last_step_wins_and_cancel_wins_over_all():
+    last = script(resp("tool_use", call("submit_result", failing=0)))
+    assert run(State(max_steps=1), last, TOOLS, verify).status == "succeeded"
+    st = State(); st.cancelled = True
+    out = run(st, script(resp("tool_use", call("submit_result", failing=0))), TOOLS, verify)
+    assert (out.status, out.reason) == ("aborted", "user_cancelled")
+```
+
+### Failure scenarios
+- **Map unknown values to `"ended"` instead of `"unknown"`.** `unmapped_value` no longer fails at step 1:
+  it is nudged, the scripted model has nothing left and raises `StopIteration`. In production the run
+  idles or is shown as finished. Log the raw stop reason per response and alert on unmapped values.
+- **Check the budget before the verifier.** The last-step test returns `partial` for a submit that
+  passed, so a correct answer is counted as not done. Print the order in which `decide()` evaluates each
+  check for that one response.
+- **Return `None` for a rejected submit without pushing its result.** The test for the rejected submit
+  fails, and against a real API the next request is rejected because a tool call has no result. Diff the
+  tool call names in the response against the tool results in `messages`.
+- **Execute tool calls before deciding.** `submit_with_parallel_call` reports `tools_run=1`: the email
+  went out in the response that ended the run. Compare tool timestamps with the terminal event in the
+  trace.
+
+### Submission
+- **`lab.py`** with `normalise()` and `decide()` implemented; `run()` and the scenarios unchanged.
+- **A green run** of `pytest -q test_lab.py` (7 passed) and the output of `python lab.py`.
+- **One new scenario** of your own (for example `pause_turn` followed by a verified submit) with its
+  expected status.
+- **A short note:** which line of `decide()` you would change to make a child agent's `partial` reach its
+  parent as a tool result instead of an answer.
+- **Evaluated on:** no truncated, refused or unknown response ever yields `succeeded`, one nudge at
+  most, and no tool executed after the terminal decision.
 
 ## Why it exists
 - **The loop has no natural exit.** An agent loop is `while True: call model; run tools`. Prompt the

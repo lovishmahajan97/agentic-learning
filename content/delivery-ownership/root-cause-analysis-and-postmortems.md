@@ -5,7 +5,8 @@ name: Root-cause analysis & postmortems
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - delivery-ownership/production-debugging
@@ -37,6 +38,62 @@ detection and mitigation, blamelessly. "The model hallucinated" is a symptom, ne
 - **What you can skip.** Formal reliability methods beyond five whys, a fishbone and a simple fault tree;
   those three are usually enough for agent incidents, with heavier methods kept for safety-critical
   domains.
+
+## Decision case
+### Scenario
+The order-support agent from the worked postmortem cancelled 23 orders in 50 minutes after a
+tool-description edit. The review must now choose which action set to commit to. All figures are
+illustrative planning numbers.
+- **Detection today:** a customer call; there is no alert on cancellations per hour.
+- **Baseline:** about 4 legitimate cancellations an hour, so about 1 per 15 minutes.
+- **Incident rate:** 23 / 50 ≈ 0.46 bad cancellations a minute.
+- **Product constraint:** cancellation in chat is a contracted feature for this customer, so it cannot
+  simply be removed.
+- **Team and deadline:** 2 engineers, peak season in 3 weeks, and the customer expects the postmortem
+  within 5 business days.
+
+### Options
+| Option | How it works | Layers it changes | Fits 3 weeks and the contract? |
+|---|---|---|---|
+| Prompt and description rewrite | Reword `cancel_order` and the system prompt; ship in a day | Tool design only, through the model | Yes, but no detection or mitigation; the next wording change can repeat it |
+| Process controls | A checklist and second sign-off for description edits; weekly manual audit of cancellations | Change process; detection becomes weekly | Yes, but relies on people remembering |
+| Remove `cancel_order` | Cancellation moves to a self-service form | Removes the tool | Breaks the contracted feature |
+| Layered actions from the postmortem | Kill switch (week 1); narrow tool plus user confirmation (week 2); 40 "question only, no action" trajectory evals and a cancellations alert (week 2); descriptions under review with an eval run (week 3) | Tool design, approval gate, evals, detection, mitigation, change process | Yes, matches the action table's due dates |
+
+### Decision
+**Layered actions, ordered cheapest-mitigation first.** Each layer that failed gets its own change, so a
+different trigger next time still meets a defence.
+- **Detection has a number:** an alert at more than 3 times baseline in a rolling 15-minute window fires
+  at the 4th cancellation. At 0.46 + 0.07 ≈ 0.53 a minute that is about 4 / 0.53 ≈ 8 minutes in.
+- **Blast radius shrinks:** with the kill switch flipped about 5 minutes after the page, roughly 0.46 x
+  13 ≈ 6 orders are cancelled instead of 23, before the gate even exists.
+- **Prevention does not depend on the model:** the confirmation gate stops the irreversible step even
+  when the model picks the wrong tool.
+- **The prompt rewrite stays,** as one item among the others, never the only one.
+
+**What would change it.** If the contract allowed it and chat cancellations were rare, removing the tool
+would be the cheapest complete prevention. If the alert proves noisy at peak volume, tune its threshold
+against the shadow data rather than dropping it.
+
+### Trade-offs accepted
+- **A confirmation turn for real cancellations.** Watch completion rate and abandonment for genuine
+  cancel requests.
+- **Slower description edits.** Review plus an eval run adds time to every tool-description change;
+  track lead time for those changes.
+- **A peak-season alert may page on real demand spikes.** Track the alert's precision and tune against
+  ticket volume.
+
+### Review rubric
+- **No model-as-cause:** the write-up never ends a chain at "the model misunderstood"; it asks why each
+  defence layer let the decision become harm.
+- **Every chain covered:** the defect, why it reached production, why detection was slow and why
+  mitigation was slow each produce at least one factor.
+- **Actions span categories:** at least one prevent, one detect and one mitigate action, each with an
+  owner, a date and a ticket, and each a system change rather than a reminder.
+- **Numbers recomputed:** detection time and blast radius under the new controls follow from the stated
+  rates and are labelled illustrative.
+- **Constraints respected:** options that break a contract or the deadline are rejected for that stated
+  reason, and the change triggers are named.
 
 ## Why it exists
 - **Mitigation ends the incident, not the next one.** Roll back, close the ticket and move on, and the

@@ -5,7 +5,8 @@ name: Problem decomposition
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - scoping/workflow-analysis
@@ -32,6 +33,64 @@ checks go, because errors in chained probabilistic steps multiply.
   says, and which node you spike first.
 - **What you can skip.** Formal consulting frameworks beyond the MECE check; a node table with contracts
   and an end-to-end multiplication is enough to design and debug an agent.
+
+## Decision case
+### Scenario
+An insurer wants an agent that turns 1,000 claim-intake emails a day into claim records with an
+acknowledgement sent to the customer. All rates are illustrative estimates from a one-week spike on 200
+labelled emails.
+- **Risk:** the claims director accepts at most 7% silent errors in the pilot, because an adjuster touches
+  every claim within 5 days and an audit samples them.
+- **Capacity:** three intake staff can clear about 150 escalated emails a day.
+- **Deadline and team:** 8 weeks to pilot, two engineers.
+- **Spike results per node:** classify intent 96%, extract policy number and loss details 90%, policy
+  lookup 99%, coverage rules 99%; a free-text acknowledgement drafted by the model 97%, a template fill 99%.
+
+### Options
+| Option | How it works | Automated-correct | Silent errors | Escalated per day | Fits risk and capacity |
+|---|---|---|---|---|---|
+| A. One agent, generic tools | `read_email`, `sql`, `send_email`; about 10 model-decided steps at 95% | 0.95¹⁰ ≈ 60% | About 40% | 0 | No: far above 7% |
+| B. Decomposed pipeline, no checks | Five nodes as above, model-drafted acknowledgement | 82.1% | 17.9% | 0 | No: silent errors 2.5 times the limit |
+| C. Decomposed agent with guards | Node-shaped tools, extraction validator catching 80%, intent threshold catching 50%, template acknowledgement | 83.8% | 6.3% | 98 | Yes: under 7% and under 150 |
+| D. Human reviews every record | Model drafts, staff approve all | n/a | Lowest | 1,000 | No: 6.7 times capacity |
+
+- **C's arithmetic:** correct = 0.96 × 0.90 × 0.99 × 0.99 × 0.99 ≈ 83.8%. Escalated = 1 − (1 − 0.04 ×
+  0.5)(1 − 0.10 × 0.8)(0.99)³ ≈ 9.8%, so 98 emails a day. Silent errors are the remaining 6.3%.
+
+### Decision
+Choose **C**, the decomposed agent with a validator after extraction, a confidence threshold on intent and
+a template acknowledgement.
+- **It is the only option inside both limits:** 6.3% silent errors against 7%, and 98 escalations a day
+  against capacity for 150.
+- **Extraction dominates the loss,** so the validator goes there: a policy-number check digit plus "the
+  policy exists in the lookup tool" turns most of its errors into escalations.
+- **The acknowledgement moved up the technique list,** from model generation to a template, because its
+  content is fixed; that cut its error rate from 3% to 1%.
+- **Spike the extraction node first** on the ugliest emails (forwarded chains, photographed forms),
+  because if it cannot reach 90% the design and the escalation load change.
+
+**What would change it:**
+- **The silent-error limit drops to 3%:** C fails; add a second extraction check or review low-confidence
+  extractions, and re-check queue capacity.
+- **Intake staff cut to one person (about 50 a day):** C's 98 escalations overflow; lower the intent catch
+  fraction only if silent errors stay under 7%.
+- **Email types become open-ended** (new products, multi-claim threads): let the agent plan over the same
+  typed tools rather than a fixed order.
+
+### Trade-offs accepted
+- **About 10% of emails still need a person:** track escalations per day against the 150 capacity and the
+  share of flagged items that were actually correct.
+- **Template acknowledgements are less personal:** track customer replies asking for clarification.
+- **Rates assume independent failures:** audit a weekly sample end to end, because bad scans can break
+  intent and extraction together.
+
+### Review rubric
+- States the goal as an observable output and splits at data-flow seams, each node with a technique.
+- Moves every deterministic step into a typed tool or template and says why.
+- Multiplies per-node rates and reports automated-correct and silent-error shares separately.
+- Places validators or thresholds on the node that dominates the loss, with catch fractions stated.
+- Checks escalation volume against real reviewer capacity, with the arithmetic shown.
+- Names the riskiest node to spike first and the limits that would flip the design.
 
 ## Why it exists
 - **One big prompt cannot be debugged.** "Automate invoice exception handling" as a single prompt or a

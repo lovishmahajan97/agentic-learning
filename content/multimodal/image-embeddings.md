@@ -5,7 +5,8 @@ name: Image embeddings
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - multimodal/clip
@@ -142,6 +143,24 @@ flowchart TD
     T -->|"yes"| R["Match, duplicate or result"]
     T -->|"no"| F["Rerank, VLM or human review"]
 ```
+
+## Misconceptions
+- **"Similarity is a property of the images."** It is a property of the encoder: a CLIP space groups by
+  meaning, DINOv2 by visual appearance, a classifier backbone by the labels it was trained on. Pick the
+  family that rewards your notion of "similar", or no threshold will rescue the neighbours.
+- **"More dimensions means better embeddings."** Dimension is only what the model was trained to emit;
+  it sets storage (10 million 768-d float32 vectors are about 31 GB) but not quality. Compare encoders
+  by recall@k on your own labelled pairs.
+- **"Upgrading the encoder improves the existing index."** Vectors from two checkpoints, or two
+  preprocessing versions, are not comparable; mixing them degrades retrieval with no error raised. An
+  upgrade is a full re-embed into a new index and an alias swap.
+- **"A good semantic encoder is a good duplicate detector."** It scores two different photos of a similar
+  scene above a cropped copy of the same image. Near-duplicate detection needs a perceptual hash or a
+  copy-detection encoder with its own threshold.
+- **"Embeddings are anonymised, so the index is not sensitive."** Vectors can be matched back to images
+  and partly inverted, so they need the same access control, retention and deletion as the originals.
+- **"When the agent answers wrongly, the LLM is to blame."** Retrieval recall caps the agent: an image
+  missing from the top-k is one the VLM never saw. Score recall@k on its own before tuning prompts.
 
 ## Examples
 ### One CLIP matrix for image and text queries

@@ -5,7 +5,8 @@ name: Context compaction / summarization
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -160,6 +161,22 @@ flowchart TD
     H --> G
     E -.->|"merge new span in code"| S[("Anchored summary")]
 ```
+
+## Misconceptions
+- **"A bigger context window removes the need for compaction."** It only moves the wall. Every step
+  still re-sends the whole transcript, so cost stays quadratic, and facts in the middle of a long prompt
+  are still used less reliably than those near the start or end.
+- **"Prompt caching makes a long transcript free."** Caching discounts re-reading an unchanged prefix;
+  it does nothing for the window limit, attention dilution or stale observations that distract the model.
+- **"Compaction means summarizing the conversation."** Summarizing is the expensive, lossy last resort.
+  Most tokens are old tool outputs, and capping or stubbing them is nearly lossless when the tool is
+  cheap and idempotent, so prune first and summarize only if that is not enough.
+- **"Dropping the oldest messages is a safe default."** The oldest messages hold the system prompt, task
+  and constraints, the tokens that matter most. Pin them and compact the history between the head and
+  the recent tail.
+- **"Re-summarizing the previous summary is fine."** Each pass is another lossy step, so IDs and
+  decisions drift and vanish by the third compaction. Summarize only the new span and merge it into a
+  harness-owned summary in code, so each fact is paraphrased at most once.
 
 ## Examples
 ### Compaction step that runs before each model call

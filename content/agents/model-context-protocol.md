@@ -5,7 +5,8 @@ name: Model Context Protocol (MCP)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -44,6 +45,188 @@ remove authentication, trust decisions or tool-set curation.
   server dies mid-run.
 - **What you can skip.** The full specification. Know the handshake, `tools/list`, `tools/call`, the two
   error channels and the transports; the SDKs handle the rest.
+
+## Lab
+### Task
+Build the host-side adapter that sits between your agent loop and an MCP server: it decides which
+server tools the model sees and turns every `tools/call` outcome into a `tool_result` the model can
+read. Time box: 60-90 minutes. Do [Tool calling](tool-calling) and [Agent loop](agent-loop) first.
+- **Implement `to_provider_tools`:** allow-list per server, prefix names `<server>__<tool>`, map
+  `inputSchema` to `input_schema`.
+- **Implement `call_as_tool_result`:** route by prefix, refuse non-allow-listed tools without calling
+  the server, set `is_error` from `isError` (channel 1), and turn any exception from `call_tool` into an
+  error result (channel 2).
+- **No API key or network needed:** the file is both host and server, talking over stdio. Checked with
+  `mcp` 1.30.0 on Python 3.12; install with `pip install "mcp<2" pytest` in a fresh venv.
+
+### Starter code
+```python
+# lab.py - an MCP host adapter. Checked with mcp 1.30.0 (pip install "mcp<2") on Python 3.12.
+# Run: python lab.py   (the same file is also the server, started as: python lab.py serve)
+import asyncio, json, sys
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.server.fastmcp import FastMCP
+
+server = FastMCP("orders", log_level="WARNING")
+ORDERS = {"A100": "shipped", "A200": "open"}
+
+@server.tool()
+def get_order(order_id: str) -> str:
+    """Look up one order by id. Call before answering any question about an order."""
+    if order_id not in ORDERS:
+        raise ValueError(f"no order with id {order_id}; ids look like A100")
+    return json.dumps({"order_id": order_id, "status": ORDERS[order_id]})
+
+@server.tool()
+def cancel_order(order_id: str) -> str:
+    """Cancel an open order. Only after the user confirms."""
+    ORDERS[order_id] = "cancelled"
+    return json.dumps({"order_id": order_id, "status": "cancelled"})
+
+@server.tool()
+def export_all_customers() -> str:
+    """Dump every customer record."""            # exists on the server, never allow-listed
+    return "every customer record"
+
+ALLOW = {"orders": {"get_order", "cancel_order"}}   # per server: tools the model may see
+
+class DeadSession:
+    """Stands in for a server process that died mid-run (failure channel 2)."""
+    async def call_tool(self, name, arguments=None):
+        raise ConnectionError("server process exited")
+
+def to_provider_tools(server_name: str, listed: list, allow: set) -> list[dict]:
+    """Convert MCP tools to Claude tool definitions.
+    YOUR CODE: keep only allow-listed tools, name them '<server>__<tool>', copy the description
+    (empty string if None) and inputSchema into 'input_schema'. Sort by name."""
+    raise NotImplementedError("to_provider_tools")
+
+async def call_as_tool_result(sessions: dict, allow: dict, tool_use_id: str,
+                              name: str, arguments: dict) -> dict:
+    """Route one model tool_use to MCP and always return a Claude tool_result dict.
+    YOUR CODE: split the prefix; unknown server or non-allow-listed tool -> is_error without calling
+    the server; join text content blocks; is_error from isError (channel 1); any exception
+    from call_tool -> is_error result, never raise (channel 2)."""
+    raise NotImplementedError("call_as_tool_result")
+
+async def main():
+    params = StdioServerParameters(command=sys.executable, args=[__file__, "serve"])
+    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+        await session.initialize()
+        listed = (await session.list_tools()).tools
+        print("server offers:", sorted(t.name for t in listed))
+        print("model sees:", [t["name"] for t in to_provider_tools("orders", listed, ALLOW["orders"])])
+        sessions = {"orders": session}
+        for i, (name, args) in enumerate([("orders__get_order", {"order_id": "A100"}),
+                                          ("orders__get_order", {"order_id": "Z9"}),
+                                          ("orders__export_all_customers", {})]):
+            r = await call_as_tool_result(sessions, ALLOW, f"t{i}", name, args)
+            print(r["tool_use_id"], r["is_error"], r["content"])
+        r = await call_as_tool_result({"orders": DeadSession()}, ALLOW, "t3",
+                                      "orders__get_order", {"order_id": "A100"})
+        print(r["tool_use_id"], r["is_error"], r["content"])
+
+if __name__ == "__main__":
+    server.run() if sys.argv[1:] == ["serve"] else asyncio.run(main())
+```
+
+### Expected output
+The starter prints the first line, then stops with `NotImplementedError: to_provider_tools`. A correct
+solution prints the following (the `t1` wording is FastMCP's in 1.30.0; your own messages for `t2` and
+`t3` may differ as long as they name the problem):
+
+```text
+server offers: ['cancel_order', 'export_all_customers', 'get_order']
+model sees: ['orders__cancel_order', 'orders__get_order']
+t0 False {"order_id": "A100", "status": "shipped"}
+t1 True Error executing tool get_order: no order with id Z9; ids look like A100
+t2 True unknown tool orders__export_all_customers
+t3 True server error: server process exited
+```
+
+### Tests
+```python
+# test_lab.py - run: python -m pytest -q test_lab.py   (lab.py in the same directory)
+import asyncio, sys
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.types import Tool
+import lab
+
+def with_session(fn):
+    async def go():
+        params = StdioServerParameters(command=sys.executable, args=[lab.__file__, "serve"])
+        async with stdio_client(params) as (r, w), ClientSession(r, w) as s:
+            await s.initialize()
+            return await fn(s)
+    return asyncio.run(go())
+
+class Recorder:
+    def __init__(self): self.calls = []
+    async def call_tool(self, name, arguments=None): self.calls.append(name)
+
+SCHEMA = {"type": "object", "properties": {"order_id": {"type": "string"}}}
+
+def test_allow_list_prefix_and_format():
+    listed = [Tool(name="get_order", description="Look up", inputSchema=SCHEMA),
+              Tool(name="export_all_customers", description=None, inputSchema={"type": "object"}),
+              Tool(name="cancel_order", description=None, inputSchema=SCHEMA)]
+    tools = lab.to_provider_tools("orders", listed, {"get_order", "cancel_order"})
+    assert [t["name"] for t in tools] == ["orders__cancel_order", "orders__get_order"]
+    assert tools[0] == {"name": "orders__cancel_order", "description": "", "input_schema": SCHEMA}
+
+def test_success_result():
+    r = with_session(lambda s: lab.call_as_tool_result({"orders": s}, lab.ALLOW, "t0",
+                                                       "orders__get_order", {"order_id": "A100"}))
+    assert r == {"type": "tool_result", "tool_use_id": "t0", "is_error": False,
+                 "content": '{"order_id": "A100", "status": "shipped"}'}
+
+def test_tool_failure_is_channel_one():
+    r = with_session(lambda s: lab.call_as_tool_result({"orders": s}, lab.ALLOW, "t1",
+                                                       "orders__get_order", {"order_id": "Z9"}))
+    assert r["is_error"] is True and "no order with id Z9" in r["content"]
+
+def test_not_allow_listed_never_reaches_server():
+    rec = Recorder()
+    r = asyncio.run(lab.call_as_tool_result({"orders": rec}, lab.ALLOW, "t2",
+                                            "orders__export_all_customers", {}))
+    assert r["is_error"] is True and rec.calls == []
+
+def test_unknown_server_is_an_error_result():
+    r = asyncio.run(lab.call_as_tool_result({"orders": Recorder()}, lab.ALLOW, "t5",
+                                            "crm__search", {}))
+    assert r["is_error"] is True and r["tool_use_id"] == "t5"
+
+def test_dead_server_is_channel_two_not_a_crash():
+    r = asyncio.run(lab.call_as_tool_result({"orders": lab.DeadSession()}, lab.ALLOW, "t3",
+                                            "orders__get_order", {"order_id": "A100"}))
+    assert r["is_error"] is True and "server process exited" in r["content"]
+```
+
+On the starter all six fail with `NotImplementedError`; a correct solution passes all six.
+
+### Failure scenarios
+- **Remove the `try`/`except` around `call_tool`.** `test_dead_server_is_channel_two_not_a_crash` fails
+  and `python lab.py` ends in an exception group traceback instead of the `t3` line. Debug by reading
+  which call raised: a dead server never produces `isError`, so only the host can answer the model.
+- **Make `cancel_order` call `os._exit(1)`, then call it over the real session.** The first call fails
+  with `Connection closed` and every later call on that session fails with an empty message (seen with
+  1.30.0). Put the exception's type name into the result content so the trace shows what died.
+- **Hard-code `is_error: False`.** `test_tool_failure_is_channel_one` fails, and a model would read
+  "Error executing tool..." as order data. Diagnose by counting `isError: true` from the server against
+  `is_error` results sent.
+- **Check only the server prefix, not the allow-list.** `Recorder.calls` becomes
+  `['export_all_customers']`: a tool you never showed the model still executes if the model guesses or
+  is injected with its name.
+
+### Submission
+- **`lab.py` with both YOUR CODE stubs implemented** and no other change to the server tools or `main`.
+- **A pytest run** showing 6 passed, plus the output of `python lab.py` matching the expected lines.
+- **One failure scenario reproduced:** the traceback or result line before and after your fix.
+- **A short note (5-8 lines)** on how you would extend the adapter for a second server, a size cap and
+  `structuredContent`. Evaluated on: every `tool_use` gets exactly one result, nothing outside the
+  allow-list reaches a server, and no exception escapes `call_as_tool_result`.
 
 ## Why it exists
 - **Every framework had its own plugin format.** A vendor wanting its database, ticketing system or document

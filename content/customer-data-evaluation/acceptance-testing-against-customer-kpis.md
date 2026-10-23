@@ -5,7 +5,8 @@ name: Acceptance testing against customer KPIs
 kind: practice
 difficulty: advanced
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/success-metrics-kpis
@@ -35,6 +36,76 @@ baseline. "Scores 91%" does not answer "did invoice cost fall without more error
   untestable segments to humans.
 - **What you can skip.** Deriving the interval formulas; use Wilson intervals and the power formula here,
   and know that halving the gap quadruples the sample.
+
+## Decision case
+### Scenario
+The accounts-payable customer from the Examples has not yet signed its acceptance annex. The first draft
+(the three criteria scored in the Examples) failed the feasibility check: 400 invoices cannot show the
+error guardrail, and the 80-invoice segment floor is unpassable. You must propose the annex the sponsor
+signs. Figures are illustrative.
+
+- **Baseline.** 2.0% critical-field errors (10 in 500, Wilson interval roughly 1.1% to 3.6%); every
+  invoice is touched by a human.
+- **Expected agent performance.** About 1.5% critical-field errors and 73% straight-through on the
+  invoices it handles, from the offline holdout.
+- **Pilot traffic.** About 1,200 invoices a week; high-value invoices are about 5% of them.
+
+Constraints:
+- **Deadline.** A go/no-go in 4 weeks: 1 week of shadow mode, then a 3-week pilot (about 3,600 invoices).
+- **Write risk.** The agent posts to the ERP, so unauthorised postings must be near zero.
+- **Ownership.** Any degradation margin δ is the AP manager's to sign, not the vendor's.
+- **Short list.** All signed criteria must pass, so each must be powered well.
+
+### Options
+| Option | Error guardrail | Sample it needs (true rate 1.5%) | Fits 3,600 pilot invoices? | High-value segment |
+|---|---|---|---|---|
+| **A. Draft as written** | Upper bound ≤ 2.0% on 400 offline invoices | About 7,400 for a 90% pass chance | Already failed: about an 8% pass chance at 400 | Floor of 3% on 80 items: unpassable |
+| **B. Superiority on pilot volume** | Upper bound ≤ 2.0% | About 7,400, or 6.2 weeks of traffic | No: about a 56% pass chance on 3,420 | As A |
+| **C. Non-inferiority plus routing** | Upper bound ≤ 2.5% (δ = 0.5 points) | About 2,133, or 1.8 weeks of traffic | Yes: about a 99% pass chance on 3,420 | Always escalated, out of automated scope |
+| **D. Point estimates plus rollback** | Point estimate ≤ 2.0% | Any size | Yes | Point estimate floor |
+
+Pass chances use the normal-approximation power formula from the Examples.
+
+### Decision
+Choose **C**, because it is the only option that can be proved inside the 4-week window without asking the
+sponsor to accept lucky samples:
+- **Non-inferiority matches the real question.** The baseline's own interval (about 1.1% to 3.6%) is wider
+  than the gap, so proving the agent beats 2.0% asks for more than "no worse than today".
+- **It fits the traffic.** About 2,133 invoices give a 90% pass chance; the pilot's 3,420 in-scope invoices
+  (3,600 minus the 5% routed) give about 99%.
+- **Routing removes an unpassable floor.** High-value invoices always take the `escalate` path, so the agent
+  never posts them, and a human checks every one, as today.
+- **Three signed criteria, each powered high.** The error guardrail, straight-through rate (lower bound ≥ 65%)
+  and zero unauthorised postings. Zero observed in 3,420 bounds the rate near 3 / 3,420 ≈ 0.09% by the rule of three.
+- **D was rejected** because a point estimate on a few thousand invoices protects nobody from a lucky run.
+
+What would change it:
+- **The AP manager will not sign δ = 0.5.** Then keep superiority and extend the pilot to about 7,400 invoices
+  (over 6 weeks), or accept B's coin-flip odds knowingly.
+- **Pilot volume falls below about 2,100 in-scope invoices.** The guardrail is underpowered again; extend
+  the pilot rather than stopping early.
+- **Shadow-mode override rate is high.** If humans override many proposals, straight-through will not reach
+  65%; fix the agent before the pilot starts.
+
+### Trade-offs accepted
+- **A system up to 0.5 points worse could pass.** The sponsor signs that margin; after launch the same
+  guardrail runs on sampled production traffic with a rollback flag that turns off write tools.
+- **Routing costs straight-through rate.** Excluding 5% of invoices lowers the overall rate by about 3.7
+  points (73% × 5%), to about 69%, still above the 65% floor; report both figures.
+- **A fixed stopping point.** The decision is taken at 3 weeks, not when an interval first crosses; the
+  running dashboard is for visibility only.
+- **The baseline is noisy.** 500 invoices is a small reference; measure more of the human process during the
+  pilot as a concurrent check.
+
+### Review rubric
+- **Feasibility is checked before signature.** Every criterion is sized with the power formula or the rule
+  of three, and unpassable ones are flagged.
+- **The margin has an owner.** δ is named, justified against the baseline's uncertainty, and signed by the
+  business owner.
+- **Traffic is turned into weeks.** Required n is converted to pilot weeks and compared with the deadline.
+- **Untestable segments get a route.** Small high-stakes segments are routed to humans, not given a floor.
+- **The signed list is short.** The write-up counts criteria and shows the combined pass chance stays high.
+- **Post-launch guardrails and stopping rules are stated,** including the rollback trigger.
 
 ## Why it exists
 - **A customer buys an outcome, not an accuracy number.** The sponsor's success statement is in business

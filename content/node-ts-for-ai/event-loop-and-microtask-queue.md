@@ -5,7 +5,8 @@ name: Event loop & microtask queue
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - node-ts-for-ai/promises-and-async-error-propagation
@@ -35,6 +36,165 @@ synchronous step stalls them all.
   accept, chunking with `setImmediate`, and a loop-lag gauge with load shedding.
 - **What you can skip.** libuv internals and the pending/close phases in depth. Know the ordering rule
   (sync, `nextTick`, promises, macrotasks) and how to measure lag.
+
+## Lab
+### Task
+Fix an agent's reranking step that freezes every other session: make `topK` yield to the loop between
+slices, stop at a safe point when the run is aborted, and build the loop-lag gauge that would have caught
+it. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's microtask, chunking and lag sections; the AbortController lesson helps
+  for step 2.
+- **Setup:** an empty folder with `"type": "module"` in `package.json`, `npm i -D vitest @types/node`
+  (add `typescript` for `tsc`). Checked with Node 24.21 and Vitest 5.0; Node 24 runs `lab.ts` directly
+  by stripping types.
+- **Save** the starter as `lab.ts` and the tests as `lab.test.ts`, then run `node lab.ts` and
+  `npx vitest run`.
+- **The probe:** `otherSession()` stands in for another user's token stream. It counts how many loop turns
+  it gets while your step runs; inline compute gives it zero.
+
+### Starter code
+```ts
+// Lab: make an agent's reranking step share the event loop, stop on abort, and show up in a lag gauge.
+// Run: node lab.ts   Test: npx vitest run
+import { monitorEventLoopDelay } from "node:perf_hooks";
+import { pathToFileURL } from "node:url";
+
+export type Hit = { index: number; score: number };
+export type Opts = { slice?: number; signal?: AbortSignal };
+
+// LAB 1: yield to the event loop after every `slice` vectors with a MACROTASK
+// (setImmediate from node:timers/promises), so other sessions' callbacks run between slices.
+// `await Promise.resolve()` does not count: microtasks drain before the poll phase.
+// LAB 2: after each yield, stop at the safe point with signal?.throwIfAborted().
+export async function topK(query: Float32Array, vectors: Float32Array[], k: number, opts: Opts = {}): Promise<Hit[]> {
+  const hits: Hit[] = [];
+  for (let i = 0; i < vectors.length; i++) {
+    const v = vectors[i]!;
+    let dot = 0;
+    for (let d = 0; d < query.length; d++) dot += query[d]! * v[d]!;
+    hits.push({ index: i, score: dot });
+  }
+  return hits.sort((a, b) => b.score - a.score).slice(0, k);
+}
+
+// LAB 3: start a monitorEventLoopDelay histogram (resolution 10 ms) and return stop(), which
+// disables it and reports { p99Ms, maxMs } (the histogram is in nanoseconds).
+export function lagGauge(): { stop: () => { p99Ms: number; maxMs: number } } {
+  void monitorEventLoopDelay;
+  throw new Error("not implemented: lab step 3 (lagGauge)");
+}
+
+// Another session on the same process: counts how many loop turns it got.
+export function otherSession() {
+  let ticks = 0, on = true;
+  const tick = () => { if (on) { ticks++; setImmediate(tick); } };
+  setImmediate(tick);
+  return { stop: () => { on = false; return ticks; } };
+}
+
+export function randomVectors(n: number, dim: number, seed = 1): Float32Array[] {
+  let s = seed;
+  const rnd = () => ((s = (s * 1103515245 + 12345) % 2147483648) / 2147483648) - 0.5;
+  return Array.from({ length: n }, () => Float32Array.from({ length: dim }, rnd));
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
+  const vectors = randomVectors(10_000, 256);
+  const query = vectors[42]!;
+  for (const slice of [Infinity, 500]) {
+    const other = otherSession();
+    const hits = await topK(query, vectors, 3, { slice });
+    console.log(`slice ${slice}: top hit ${hits[0]?.index}, other session got ${other.stop()} turns`);
+  }
+  const ac = new AbortController();
+  setImmediate(() => ac.abort());                 // the stop button lands after the first slice
+  await topK(query, vectors, 3, { slice: 500, signal: ac.signal })
+    .then(() => console.log("cancel: ran to completion"), (e: Error) => console.log("cancel:", e.name));
+  try {
+    const gauge = lagGauge();
+    setTimeout(() => { const end = performance.now() + 150; while (performance.now() < end) {} }, 20);
+    await new Promise((r) => setTimeout(r, 300));
+    const { maxMs } = gauge.stop();
+    console.log("150 ms block visible in gauge:", maxMs >= 100);
+  } catch (e) { console.log((e as Error).message); }
+}
+```
+
+### Expected output
+`node lab.ts` with a correct solution prints:
+
+```
+slice Infinity: top hit 42, other session got 0 turns
+slice 500: top hit 42, other session got 20 turns
+cancel: AbortError
+150 ms block visible in gauge: true
+```
+
+The starter prints `0 turns` for both slice sizes, `cancel: ran to completion`, and
+`not implemented: lab step 3 (lagGauge)`.
+
+### Tests
+```ts
+import { expect, test } from "vitest";
+import { lagGauge, otherSession, randomVectors, topK } from "./lab.ts";
+
+const vectors = randomVectors(10_000, 64);
+const query = vectors[7]!;
+
+test("results are unchanged by slicing", async () => {
+  const whole = await topK(query, vectors, 5, { slice: Infinity });
+  expect(whole[0]?.index).toBe(7);
+  expect(await topK(query, vectors, 5, { slice: 500 })).toEqual(whole);
+});
+
+test("another session gets a loop turn between slices", async () => {
+  const other = otherSession();
+  await topK(query, vectors, 5, { slice: 500 });        // 20 slices
+  expect(other.stop()).toBeGreaterThanOrEqual(19);
+});
+
+test("abort stops the step at the next safe point", async () => {
+  const ac = new AbortController();
+  setImmediate(() => ac.abort());                        // runs after the first slice yields
+  await expect(topK(query, vectors, 5, { slice: 500, signal: ac.signal }))
+    .rejects.toMatchObject({ name: "AbortError" });
+});
+
+test("the gauge sees a 150 ms synchronous block", async () => {
+  const gauge = lagGauge();
+  setTimeout(() => { const end = performance.now() + 150; while (performance.now() < end) {} }, 20);
+  await new Promise((r) => setTimeout(r, 300));
+  const { p99Ms, maxMs } = gauge.stop();
+  expect(maxMs).toBeGreaterThanOrEqual(100);
+  expect(p99Ms).toBeGreaterThan(0);
+});
+```
+
+On the starter three tests fail: `expected 0 to be greater than or equal to 19`, `promise resolved ...
+instead of rejecting`, and `not implemented`. The slicing test already passes, since the starter's ranking
+is correct; a correct solution passes all four.
+
+### Failure scenarios
+- **Yield with `await Promise.resolve()` instead of `setImmediate`.** Ranking stays correct, but the probe
+  still gets 0 turns and the abort test resolves, because microtasks drain before the loop reaches poll
+  or check. Debug by logging the probe's turn count per slice: zero means you never left the microtask
+  queue.
+- **Check `throwIfAborted()` before the yield, not after.** The abort lands during the yield, so one extra
+  slice runs. That is harmless here and costly when a slice is a paid call. Put the check right after each
+  `await`, where new information can arrive.
+- **Read `h.max` without dividing by `1e6`.** The gauge reports 150,000,000 "ms": the histogram is in
+  nanoseconds. A unit test with a known 150 ms block catches it.
+- **Slice too large.** With `slice: 5000` the probe gets 2 turns and each stall is 10 times longer. Time one
+  slice on production CPU and size it to the stall budget (for example under 10 ms).
+
+### Submission
+- **Your `lab.ts`** with the three LAB steps done, and a passing `npx vitest run` (four tests).
+- **A table** of probe turns and gauge `maxMs` for `slice` values `Infinity`, 5000, 500 and 50, from your
+  machine.
+- **A note** (3-5 sentences) saying which slice size you would ship for an agent server with a 10 ms stall
+  budget and when you would move the step to a worker thread instead.
+- **Evaluated on:** tests passing, a macrotask yield (not a microtask), an abort check at the safe point,
+  and a slice choice justified by measured numbers.
 
 ## Why it exists
 - **LLM services mostly wait.** A model request might take 2–30 seconds, during which the CPU does nothing

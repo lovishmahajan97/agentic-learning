@@ -5,7 +5,8 @@ name: Parallel tool calls
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -140,6 +141,24 @@ sequenceDiagram
     W-->>H: C new state
     H->>M: one message: results A, B is_error, C
 ```
+
+## Misconceptions
+- **"If the model batched the calls, they are safe to run together."** The model only signals that the
+  calls do not depend on each other; it does not know which ones race. Only the harness, reading
+  contract metadata, decides what overlaps, and writes run one at a time by default.
+- **"Idempotent writes can run in parallel."** Idempotency removes duplicates, not ordering races: "set
+  shipped" and "set cancelled" are each idempotent, yet concurrently they race on which lands last.
+- **"`asyncio.gather` handles it."** Without per-call isolation one exception propagates out of the
+  `gather` and the turn has no results, and without a timeout the turn waits for the slowest upstream.
+  Every `tool_use` still needs exactly one `tool_result`, an error one if need be.
+- **"Results can go back one message at a time as they finish."** On the Claude API every result for a
+  turn goes in one user message. Split results also teach the model, in context, to stop batching, and
+  calls per turn quietly drops back to one.
+- **"Parallel calls only save tool time."** The bigger saving is model round trips: four independent
+  reads at 3 s per model call and 1 s per tool take 19 s sequentially and 7 s batched (illustrative),
+  and the transcript gains one assistant turn instead of four.
+- **"A timed-out write should just be retried."** The timeout ended your wait, not necessarily the
+  downstream operation. Return "outcome unknown, check first" and carry an idempotency key.
 
 ## Examples
 ### A harness function for one turn

@@ -5,7 +5,8 @@ name: Audit trails
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - security-governance-compliance/compliance-architecture
@@ -38,6 +39,67 @@ and retrieved context, because runs cannot be replayed.
   personal content out of the chain itself.
 - **What you can skip.** Building your own transparency-log service on day one. A per-partition hash chain,
   an anchored head in a separate account and a WORM bucket cover most agent deployments.
+
+## Decision case
+### Scenario
+An e-commerce company runs a refund agent for EU and UK customers and must choose how to record what it
+does. All figures are illustrative.
+- **Volume:** 50,000 agent runs a day, a mean of 8 tool calls each, so 400,000 tool-call events a day.
+- **Event size:** about 20 KB with the full prompt, retrieved text and tool results; about 1 KB with
+  references and hashes only.
+- **Constraints:**
+  - legal sets retention at 2 years (730 days) for refund decisions and 180 days for raw payloads;
+  - erasure requests must be honoured within a month, and payloads hold names, addresses and order notes;
+  - the audit path may add at most 10 ms to an agent step;
+  - every refund must have an event, because disputes reach the payments regulator;
+  - the agent's own role must not be able to delete anything (it reads untrusted emails).
+
+### Options
+| Option | How it works | Completeness | Erasure | Storage over 2 years | Latency |
+|---|---|---|---|---|---|
+| **A. Full payloads in WORM** | every event with full content in a compliance-mode bucket for 730 days | complete | fails: locked personal data cannot be deleted | 400,000 × 20 KB = 8 GB a day, × 730 = 5.84 TB | outbox insert, small |
+| **B. Reuse the trace pipeline** | agent traces sampled at 5%, 30-day retention | fails: 95% of runs missing, gone after 30 days | easy | small | none |
+| **C. Reference events in WORM, payloads apart** | 1 KB events chained per partition, written through an outbox in the refund transaction; payloads in an encrypted store with per-customer keys | complete, reconciled nightly | crypto-shred the customer's key | events: 0.4 GB a day × 730 = 292 GB; payloads: 8 GB × 180 = 1.44 TB, mutable | outbox insert, small |
+
+### Decision
+Choose **C, reference events in WORM with separate payloads**, because it is the only option that meets
+completeness and erasure at once.
+- **Completeness:** the outbox row commits with the refund, so a refund without an event cannot exist; B
+  misses 95% of runs.
+- **Erasure:** destroying one customer's key makes their payloads unreadable while the chain of
+  pseudonymous events stays intact; A locks personal data for 2 years.
+- **Latency:** an insert into an outbox table inside the existing transaction fits 10 ms, unlike a
+  synchronous call to a remote audit service.
+- **Prompt injection:** the agent role has `s3:PutObject` only, and the anchor job runs in another account.
+
+**What would change it:**
+- **No personal data in prompts or tool results** (an internal agent over product data): A becomes
+  simpler, since erasure no longer applies.
+- **A dispute window beyond 180 days that needs the exact retrieved text:** payload retention must grow to
+  match, roughly 8 GB × 730 = 5.84 TB, still outside WORM.
+- **A regulator demanding payloads under WORM:** split payloads so personal fields stay in the mutable
+  store and the rest is locked.
+
+### Trade-offs accepted
+- **Reconstruction needs two stores.** A query that cannot resolve a payload reference is a gap. Run the
+  quarterly reconstruction drill and track unresolved references.
+- **After 180 days only hashes remain.** You can prove which text was used only while the versioned
+  document store keeps it. Align the policy store's retention to 2 years.
+- **Outbox lag.** Events reach the audit writer seconds to minutes later. Alert on outbox rows older than
+  five minutes and on nightly count mismatches.
+- **The 20 KB and 1 KB sizes are estimates.** Measure them in the first week and recompute storage.
+
+### Review rubric
+- **Event volume and storage are computed** from runs, tool calls per run, event size and retention per
+  record type.
+- **The write path is tied to the side effect** (same transaction or outbox), with a named check for
+  missing events.
+- **Personal data and erasure are resolved explicitly** (references, separate payloads, crypto-shredding),
+  not ignored.
+- **Delete rights are denied to the agent and application roles**, and the head anchor sits outside the
+  writer's account.
+- **Sampled observability is rejected as evidence** with the reason stated.
+- **Conditions that would change the choice** are listed, each tied to a requirement or number.
 
 ## Why it exists
 - **Someone will ask "why did the system do that?"** A customer disputing a denied refund, a regulator

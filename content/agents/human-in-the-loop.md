@@ -5,7 +5,8 @@ name: Human-in-the-loop
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -154,6 +155,23 @@ flowchart TD
     D --> L
     L -.->|"agreement per class"| P["Widen or tighten autonomy"]
 ```
+
+## Misconceptions
+- **"Reviewing every action is the safest setting."** Past reviewer capacity it is the least safe: a
+  person approving 400 proposals a day, 399 of them fine, stops reading, so the catch rate drops toward
+  zero while the control still looks real on paper.
+- **"The model can decide when it needs a human."** Self-reported confidence is poorly calibrated: it
+  rarely asks on the injected or adversarial case that most needs a person. Triggers belong in the
+  harness, on stakes, novelty, policy, ambiguity and observable uncertainty signals.
+- **"A high approval rate means the agent is good."** Near-100% approval with a median decision time of a
+  few seconds is the signature of nobody looking. Only canaries, known-bad proposals inserted into the
+  queue, show the real catch rate.
+- **"A reviewer needs the full transcript to decide."** Nobody reads 80 tool calls. A good review shows
+  the effect (the diff, the rows, the email as sent), the evidence and the alternatives, so a genuine
+  decision takes seconds.
+- **"Human review is a fixed tax on the agent."** Each decision is a label. Agreement per action class
+  tells you which classes can graduate to audit-only and when to tighten them back, so review shrinks
+  where it has stopped paying for itself.
 
 ## Examples
 ### Worked scenario: graduating a refund agent (all figures illustrative)

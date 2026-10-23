@@ -5,7 +5,8 @@ name: AI use-case discovery
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/customer-discovery
@@ -33,6 +34,66 @@ a prompt or workflow, and which no model.
   break-even maths, and choosing the technique last.
 - **What you can skip.** Elaborate weighted scoring matrices; an order-of-magnitude value estimate and the
   break-even formulas are enough to pick a first agent.
+
+## Decision case
+### Scenario
+A freight forwarder's COO funds one first agent and wants a measured result at the quarterly review in
+12 weeks. The team is two engineers and one FDE. Workshops produced four candidates; all figures are
+illustrative, with time valued at a loaded $50 an hour.
+- **Customs-document extraction:** 40,000 scanned documents a year, w = 10 minutes by hand, e = 3 minutes
+  to check a good draft, r = 1 minute lost on a bad one. A broker reviews every result. A two-day probe
+  scored 32 of 40 drafts usable (80%).
+- **Autonomous rebooking on vessel delays:** 6,000 events a year, saves about $15 of handling each, writes
+  to carrier bookings with no review; a wrong rebooking costs about $600.
+- **Quote-pricing agent:** the largest claimed value, about $400,000 a year, but the pricing data needs a
+  commercial-team approval expected to take 6 months.
+- **Delay-notification emails:** "email the customer when the ETA moves by more than 24 hours".
+
+### Options
+| Option (first agent) | How it works | Value a year | AI fit | Feasible in 12 weeks | Risk if wrong |
+|---|---|---|---|---|---|
+| A. Customs extraction, assisted | Agent drafts fields, broker confirms | 3,600 h × $50 = $180,000 | Strong: unstructured scans, verification asymmetry | Yes: data reachable, probe done | Low: reviewed |
+| B. Autonomous rebooking | Agent reads delays and rebooks on its own | 6,000 × $15 = $90,000 | Yes, paths vary per case | Partly: no labelled outcomes | High: error budget only 2.5% |
+| C. Quote pricing | Agent proposes prices from history | About $400,000 (claimed) | Plausible | No: data blocked 6 months | Moderate: margin errors |
+| D. Delay emails | Send on an ETA change | Small | None: it is a rule | Yes | Low |
+
+- **A's numbers:** expected time at p = 0.8 is 0.8 × 3 + 0.2 × (1 + 10) = 4.6 minutes, saving 5.4 minutes
+  on each of 40,000 documents, which is 216,000 minutes or 3,600 hours. Break-even is
+  `p* = r / (w − e + r)` = 1 / 8, about 12.5%, far below the probe's 80%.
+- **B's error budget:** `value saved per item ÷ C` = $15 / $600 = 2.5%, so it needs above 97.5%
+  accuracy just to break even, with no labelled history to prove it.
+
+### Decision
+Choose **A** as the first agent, and route the others instead of dropping them.
+- **A is the only candidate that passes all four gates now:** strong AI fit, $180,000 of value, data and a
+  probe in hand, and errors caught by brokers. It also builds the document connectors and eval harness
+  later agents reuse.
+- **B becomes the strategic bet in assist mode:** the agent proposes a rebooking a planner confirms, which
+  logs labelled outcomes toward the 97.5% bar. Its risk review starts this week.
+- **C gets its access request filed today**, so it can be re-screened when the data arrives.
+- **D goes to a scheduled script**; it needs no model.
+
+**What would change it:**
+- **A's probe below about 50% on the ugly scans,** or the brokers' review step unavailable: re-probe B in
+  assist mode as the first agent instead.
+- **Pricing data approved within 4 weeks:** run C's probe and compare it with A on the same table.
+- **Rebookings made free to cancel within an hour:** errors become reversible, the effective `C` falls and
+  B's error budget grows.
+
+### Trade-offs accepted
+- **Half of the headline value is left for later:** C's claimed $400,000 waits on access; track the
+  approval's days in review and report them to the COO.
+- **Assisted, not autonomous, value:** brokers still spend 4.6 minutes a document; track median handling
+  time against the 10-minute baseline.
+- **Dependence on reviewers really checking:** run seeded-error audits and alert when catch rate falls.
+
+### Review rubric
+- Writes every candidate as role, task, input and output, and gates out rule-solvable ones first.
+- Computes value per candidate with the volume formula, showing the arithmetic.
+- Uses the assist break-even for reviewed candidates and the automate error budget for unreviewed ones.
+- Treats blocked data as a feasibility failure and starts the access request in parallel.
+- Picks a first use case plus a strategic bet, each with a next step and an owner.
+- Names the probe score, access date or error-cost change that would flip the choice.
 
 ## Why it exists
 - **Ideas outrun evaluation.** Once an organisation decides to "do AI", every team has a list, vendors

@@ -5,7 +5,8 @@ name: Durable execution & checkpointing
 kind: concept
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -42,6 +43,204 @@ so checkpointing is inseparable from idempotent tools.
   per-call timeouts and retries, and checkpoint schema versions.
 - **What you can skip.** Saving partial model output. A model call can be repeated safely; only side
   effects need the intent record.
+
+## Lab
+### Task
+Make a three-ticket agent run crash-safe on SQLite: a lease claimed with one conditional `UPDATE` that
+bumps a fencing epoch, checkpoint writes that refuse a stale epoch, and the intent-execute-record step
+that re-runs only calls without a result, with their recorded keys. Then crash it at every boundary.
+Time box: 60-90 min.
+- **Prerequisites:** The agent loop; Background jobs and durable workers; the save-before-execute loop
+  in this lesson's Examples.
+- **Setup:** Python 3.10+ with SQLite 3.35 or newer (for `UPDATE ... RETURNING`; check
+  `sqlite3.sqlite_version`) and `pip install pytest`. Checked with Python 3.13 (SQLite 3.53) and pytest
+  9.1. Save the starter as `lab.py` and the tests as `test_lab.py`.
+- **No model calls:** the "model" is a fixed plan of two parallel calls at step 0 and one at step 1;
+  time is passed in as `now` so lease expiry is deterministic.
+
+### Starter code
+```python
+"""Lab: crash-safe agent steps on SQLite: a fenced lease plus intent-execute-record. Run: python lab.py"""
+import json, sqlite3
+
+class LeaseLost(Exception): pass
+class Crash(Exception): pass
+
+class Store:
+    def __init__(self, path=":memory:"):
+        self.db = sqlite3.connect(path, isolation_level=None)      # autocommit: one statement each
+        self.db.execute("""create table if not exists runs (run_id text primary key, owner text,
+                           epoch integer not null default 0, lease_until real, cp text)""")
+
+    def create(self, run_id):
+        self.db.execute("insert or ignore into runs (run_id) values (?)", (run_id,))
+
+    def load(self, run_id):
+        row = self.db.execute("select cp from runs where run_id = ?", (run_id,)).fetchone()
+        return json.loads(row[0]) if row and row[0] else None
+
+    def claim(self, run_id, worker, now, ttl=30):
+        """Take the lease if it is free or expired: set owner, lease_until = now + ttl and
+        epoch = epoch + 1 in ONE conditional UPDATE. Return the new epoch, or None if held."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+    def save(self, run_id, cp, epoch):
+        """Write cp only while this epoch still holds the run; otherwise raise LeaseLost."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+def key_for(run_id, step, idx):                     # deterministic: identical on resume
+    return f"{run_id}:{step}:{idx}"
+
+def execute_pending(cp, api, save, boundary):
+    """For each pending call WITHOUT a result: execute it with its recorded key, call
+    boundary("after_execute", step, idx), store the result in the call, save(), then call
+    boundary("after_result_saved", step, idx). Finally move all results to cp["results"],
+    clear cp["pending"] and save(). The step of a pending call is cp["step"] - 1."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def run(store, run_id, worker, model, api, now, boundary=lambda *a: None):
+    store.create(run_id)
+    epoch = store.claim(run_id, worker, now)
+    if epoch is None:
+        return "busy"
+    cp = store.load(run_id) or {"step": 0, "pending": [], "results": [], "done": False}
+    save = lambda: store.save(run_id, cp, epoch)
+    while not cp["done"]:
+        execute_pending(cp, api, save, boundary)
+        calls = model(cp["step"])                    # lost on a crash before the save: re-asked
+        if not calls:
+            cp["done"] = True
+            save()
+            break
+        cp["pending"] = [{"args": a, "key": key_for(run_id, cp["step"], i)} for i, a in enumerate(calls)]
+        cp["step"] += 1
+        save()                                       # intent recorded BEFORE execution
+        boundary("after_intent_saved", cp["step"] - 1, None)
+    return "done"
+
+class TicketAPI:                                     # honours idempotency keys
+    def __init__(self): self.tickets, self.by_key, self.calls = [], {}, 0
+    def create(self, title, idempotency_key):
+        self.calls += 1
+        if idempotency_key not in self.by_key:
+            self.tickets.append(title)
+            self.by_key[idempotency_key] = f"T-{len(self.tickets)}"
+        return self.by_key[idempotency_key]
+
+PLAN = {0: [{"title": "fix login"}, {"title": "rotate keys"}], 1: [{"title": "notify on-call"}]}
+model = lambda step: PLAN.get(step, [])
+
+def crash_at(point):
+    def boundary(name, step, idx):
+        if (name, step, idx) == point:
+            raise Crash(point)
+    return boundary
+
+POINTS = [("after_intent_saved", 0, None), ("after_execute", 0, 0), ("after_execute", 0, 1),
+          ("after_result_saved", 0, 1), ("after_intent_saved", 1, None), ("after_execute", 1, 0)]
+
+if __name__ == "__main__":
+    for point in POINTS:
+        store, api = Store(), TicketAPI()
+        try:
+            run(store, "run_9", "w1", model, api, now=0, boundary=crash_at(point))
+        except Crash:
+            pass
+        busy = run(store, "run_9", "w2", model, api, now=10)          # lease still held by w1
+        run(store, "run_9", "w2", model, api, now=31)                 # w1's lease expired
+        print(f"{point[0]:<18} step={point[1]} idx={point[2]!s:<4} w2 at t=10: {busy:<4}"
+              f" api_calls={api.calls} tickets={len(api.tickets)}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+after_intent_saved step=0 idx=None w2 at t=10: busy api_calls=3 tickets=3
+after_execute      step=0 idx=0    w2 at t=10: busy api_calls=4 tickets=3
+after_execute      step=0 idx=1    w2 at t=10: busy api_calls=4 tickets=3
+after_result_saved step=0 idx=1    w2 at t=10: busy api_calls=3 tickets=3
+after_intent_saved step=1 idx=None w2 at t=10: busy api_calls=3 tickets=3
+after_execute      step=1 idx=0    w2 at t=10: busy api_calls=4 tickets=3
+```
+
+- **Read it:** a crash between execute and record costs one extra API call (`api_calls=4`), which the
+  key turns into a replay, so every line still ends with 3 tickets. A crash after the result was saved
+  re-executes nothing.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 11 fail with `NotImplementedError`; a correct solution
+passes all 11 (Python 3.13, pytest 9.1).
+
+```python
+import pytest
+from lab import Crash, LeaseLost, Store, TicketAPI, crash_at, model, run
+
+def boundaries():
+    seen = []
+    run(Store(), "r", "w1", model, TicketAPI(), now=0, boundary=lambda *b: seen.append(b))
+    return seen
+
+def test_clean_run_hits_every_boundary_and_makes_three_tickets():
+    store, api = Store(), TicketAPI()
+    assert run(store, "r", "w1", model, api, now=0) == "done"
+    assert api.tickets == ["fix login", "rotate keys", "notify on-call"]
+    assert store.load("r")["results"] == ["T-1", "T-2", "T-3"]
+    assert boundaries() == ALL
+
+ALL = [("after_intent_saved", 0, None), ("after_execute", 0, 0), ("after_result_saved", 0, 0),
+       ("after_execute", 0, 1), ("after_result_saved", 0, 1), ("after_intent_saved", 1, None),
+       ("after_execute", 1, 0), ("after_result_saved", 1, 0)]
+
+@pytest.mark.parametrize("point", ALL)
+def test_crash_at_any_boundary_then_resume_gives_one_effect_per_call(point):
+    store, api = Store(), TicketAPI()
+    with pytest.raises(Crash):
+        run(store, "r", "w1", model, api, now=0, boundary=crash_at(point))
+    assert run(store, "r", "w2", model, api, now=31) == "done"
+    assert len(api.tickets) == 3 and store.load("r")["results"] == ["T-1", "T-2", "T-3"]
+
+def test_lease_blocks_a_second_worker_until_it_expires():
+    store = Store(); store.create("r")
+    assert store.claim("r", "w1", now=0) == 1
+    assert store.claim("r", "w2", now=10) is None
+    assert store.claim("r", "w2", now=31) == 2
+
+def test_stale_epoch_cannot_write():
+    store = Store(); store.create("r")
+    e1 = store.claim("r", "w1", now=0)
+    store.save("r", {"step": 1}, e1)
+    e2 = store.claim("r", "w2", now=31)
+    with pytest.raises(LeaseLost):
+        store.save("r", {"step": 99}, e1)              # w1 woke up after a long pause
+    store.save("r", {"step": 2}, e2)
+    assert store.load("r") == {"step": 2}
+```
+
+### Failure scenarios
+- **Send a fresh `uuid4()` as the key in `execute_pending`.** Every `after_execute` line shows
+  `tickets=4`: the resumed call no longer matches the first one downstream. Log the key each attempt
+  sends for one (run, step, index) and compare.
+- **Drop the "without a result" check.** Tickets stay at 3 because the API dedupes, but `api_calls`
+  climbs on every resume after `after_result_saved`; against a tool without keys that is a duplicate.
+  Count tool executions per key in the trace.
+- **Claim only when `owner is null`.** The resume at `t=31` returns `busy` forever and the crash tests
+  fail on `"busy" != "done"`. Query runs whose `lease_until` is in the past but still have an owner.
+- **Save without the epoch condition.** The stale-worker test fails: the paused `w1` overwrites `w2`'s
+  checkpoint with step 99. Log worker and epoch on every write and look for two epochs interleaving.
+
+### Submission
+- **`lab.py`** with `claim`, `save` and `execute_pending` implemented; `run()` and the fakes unchanged.
+- **A green run** of `pytest -q test_lab.py` (11 passed) and the output of `python lab.py`.
+- **The crash table** above, extended with the two `after_result_saved` points the script skips, and
+  the `api_calls` you predicted for each before running.
+- **A short note:** what the epoch must be attached to, beyond the checkpoint write, so a paused worker
+  cannot repeat an external side effect.
+- **Evaluated on:** exactly one ticket per logical call at every crash point, no write from a stale
+  epoch, and a second worker that waits for lease expiry instead of running concurrently.
 
 ## Why it exists
 - **A chat completion is one request; an agent run is not.** If a single call's process dies, the client

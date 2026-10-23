@@ -5,7 +5,8 @@ name: Workshops
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - adoption/user-training
@@ -37,6 +38,65 @@ follow-up, it is a long meeting.
   the same week.
 - **What you can skip.** Facilitation games beyond silent work, 1-2-4-All and dot voting. The agreement
   math and the artifact-first agenda matter most.
+
+## Decision case
+### Scenario
+A legal-operations team is shipping a contract-review agent that flags risky clauses. Before the
+release gate, the agent team needs a written rubric and at least 40 expert-consensus labels to validate
+an LLM judge. All figures are illustrative planning numbers.
+- **Experts:** 6 senior lawyers, 3 in London and 3 in Singapore, with about 2 hours of shared working
+  time a day; each can give at most 4 hours in total.
+- **Veto holder:** the head of compliance, available for one 30-minute slot, rules on which criteria
+  are mandatory.
+- **Deadline:** 2 weeks to the release gate; no travel budget.
+- **Pacing from a pilot run:** silent labeling takes about 2 minutes per agent output; about half of
+  items split, and each split takes about 5 minutes to discuss.
+
+### Options
+| Option | How it works | Hours per expert | Anchoring control | Fits time zones and deadline? |
+|---|---|---|---|---|
+| One remote full-day session | Label, discuss and draft live, 6 hours | 6, over the 4-hour cap | Good if silent work comes first | No: only 2 shared hours a day |
+| Async only | Shared sheet for labels, disagreements argued by email | about 2 for 60 labels, plus open-ended email | Poor: the first senior reply sets the tone | Fits, but splits rarely converge by email |
+| Hybrid: async silent labels, two short live sessions | 30 items labeled alone (1 h); session one of 90 min on splits, with compliance for 30 min; session two of 60 min to draft criteria and owners; 15 fresh items relabeled alone (30 min) | 1 + 1.5 + 1 + 0.5 = 4.0 | Good: labels are hidden until all are in | Yes: both sessions fit the overlap window |
+| Two site-based sessions | London and Singapore each build a rubric, the owner reconciles | about 4 | Good within a site | Fits, but yields two rubrics and no cross-site agreement number |
+
+### Decision
+**Hybrid.** It is the only option that keeps every expert within 4 hours, fits the 2-hour overlap and
+still discusses splits live, where tacit rules surface.
+- **Discussion budget is computed, not hoped for:** 15 of 30 items splitting at 5 minutes each is 75
+  minutes, which fits session one with 15 minutes for framing and the decision rule.
+- **Labels produced:** 30 first-pass items resolved in discussion plus 15 relabeled items gives 45
+  consensus labels, above the 40 needed.
+- **The relabel is the check:** unanimous agreement and kappa on the 15 fresh items must rise against the
+  first pass; if they do not, escalate to the owner of quality before the judge is built.
+- **Compliance's 30 minutes is booked into session one**, for the criteria that will become
+  deterministic checks rather than judge criteria.
+
+**What would change it.**
+- **A higher split rate:** if the pilot shows 70% of items splitting, discussion needs 21 x 5 = 105
+  minutes, more than session one holds, so cut the first pass to 20 items and add the shortfall as a
+  second relabel round.
+- **A weak judge:** if the judge's kappa against the 45 consensus labels comes out low, the next spend is
+  more labels on the judge's misses, not another workshop.
+
+### Trade-offs accepted
+- **No in-person trust building.** Watch how many settled criteria get reopened in the month after; more
+  than one or two means the follow-up summary or the decision rule failed.
+- **Fewer labels than a full day would give.** Watch confidence in the judge: report the 45-item kappa
+  with its small sample stated, and add labels from production disagreements.
+- **Async labeling can be rushed.** Watch per-expert labeling time in the sheet; an expert finishing 30
+  items in 10 minutes gets their labels reviewed before the reveal.
+
+### Review rubric
+- **Artifact and count named first:** the write-up states the rubric and the number of consensus labels
+  needed, and designs backwards from them.
+- **Time budget multiplied out:** per-person hours and the discussion block are computed from item counts,
+  split rate and minutes per item.
+- **Anchoring addressed:** silent individual labeling happens before anyone sees others' labels.
+- **Veto holder placed:** the person who rules on hard constraints has a booked slot for that segment.
+- **Agreement measured twice:** first pass and relabel, with a chance-corrected statistic.
+- **Reversal triggers stated:** the write-up says which split rate or judge agreement would change the
+  format.
 
 ## Why it exists
 - **Agent knowledge lives in people's heads.** Which cases are hard, what "good" looks like for an answer,

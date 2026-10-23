@@ -5,7 +5,8 @@ name: Chaos engineering & resilience testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - reliability/fmea
@@ -38,6 +39,68 @@ measurement. Agent faults include 429s, slow tools, stale retrieval and malforme
   completion, steps per task, cost per task), the blast radius and abort rule, and the spending cap.
 - **What you can skip.** Infrastructure chaos platforms at first. Application-level hooks in your own
   clients cover most agent faults, because you cannot make a vendor's API fail, but your client can.
+
+## Decision case
+### Scenario
+An agent service handles 10 tasks a second and has never failed over to its secondary model provider in
+production. All figures are illustrative.
+- **Traffic mix:** 40% of tasks come from enterprise tenants on a contractual SLA; 60% (6 tasks a second)
+  come from standard and internal tenants.
+- **Hypothesis:** with the primary failing for a slice, the fault arm's task completion stays within one
+  point of control (99%). Telling 99% from 98% needs about 2,313 tasks per arm, from the sizing check below.
+- **Cost:** a task on the fallback costs about $0.02 more than on the primary.
+- **Constraints:**
+  - a verdict within one 8-hour business day, with room for one fix and re-run;
+  - experiment spend at most $300;
+  - no injected fault on enterprise SLA traffic;
+  - the run must use production keys, quotas and model names, because those are what rot.
+
+### Options
+| Option | How it works | Time per arm | Extra spend | SLA traffic | Real keys and quotas |
+|---|---|---|---|---|---|
+| **A. Staging only** | eval set of 500 tasks through the fault wrapper | minutes | 500 × $0.02 = $10 | untouched | no: staging keys differ, and 500 tasks cannot separate 99% from 98% |
+| **B. 1% production slice, all tenants** | flag routes 0.1 tasks a second to the fault arm | 2,313 ÷ 0.1 = 23,130 s, about 6.4 h | 2,313 × $0.02 ≈ $46 | hit: fails | yes |
+| **C. 10% slice from non-SLA tenants** | flag routes 1 task a second, all from the 6 a second of standard and internal traffic, to the fault arm | 2,313 ÷ 1 ≈ 39 min | $46 per run, about $93 with a re-run | untouched | yes |
+| **D. Full failover drill** | all traffic on the secondary for an hour | one hour | 36,000 × $0.02 = $720: fails | hit: fails | yes |
+
+### Decision
+Choose **C**, because it is the only option that is fast enough, cheap enough and keeps SLA traffic out.
+- **Time:** 39 minutes per run leaves most of the day for a fix and a re-run. B's 6.4 hours leaves none.
+- **Spend:** two runs cost about $93 against a $300 cap. D costs $720 for one hour.
+- **Contracts:** the slice is drawn from the 6 tasks a second of non-SLA traffic, about one in six of it,
+  so no enterprise task sees the fault.
+- **Signal:** it runs on production keys and quotas, which A cannot.
+- **Guardrails before the flag flips:**
+  - abort if the fault arm's completion drops below 97% after 200 tasks, or its spend passes $150;
+  - put steps and cost per task in the hypothesis next to completion.
+- **Staging still runs first.** A is the cheap check that the fallback path exists at all, before C
+  spends production risk on it.
+
+**What would change it:**
+- **Non-SLA traffic below about 1 task a second:** the 39 minutes stretch toward hours, and the slice
+  must widen or the verdict move to the next day.
+- **The real question being full-load capacity:** a secondary quota a tenth of the primary's never shows
+  at 1 task a second. Schedule D as a game day with its own budget and customer notice.
+- **A detectable difference smaller than one point:** the tasks per arm grow roughly with the inverse
+  square of the gap, so re-run the sizing check first.
+
+### Trade-offs accepted
+- **Capacity stays untested.** C proves keys, formats and quality at 1 task a second, not the secondary's
+  quota. Track the secondary's quota against peak traffic as a separate check.
+- **The slice is not the enterprise mix.** Compare task types between the arms, and re-run on an internal
+  enterprise-like tenant if they differ.
+- **Standard tenants carry the risk.** The abort rule bounds it. Watch time to abort; it must be shorter
+  than the window those tenants would notice.
+- **A one-point detection floor.** Smaller quality drops pass unseen. Run the eval set under the fault
+  nightly to catch them.
+
+### Review rubric
+- **The hypothesis is falsifiable** and names steady-state SLIs, including steps and cost per task.
+- **Slice size and duration are computed together** from a power calculation, not chosen by feel.
+- **The blast radius is stated** in tasks, tenants and dollars, with SLA traffic explicitly excluded or
+  justified.
+- **An abort rule and a kill switch exist before the run,** with thresholds as numbers.
+- **The write-up says what the experiment cannot show** and which later test covers it.
 
 ## Why it exists
 - **Fallback code is the least-tested code in any system.** A team ships multi-provider failover. Six

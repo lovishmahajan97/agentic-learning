@@ -5,7 +5,8 @@ name: Incident severity & escalation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - delivery-ownership/production-debugging
@@ -37,6 +38,64 @@ outputs and leaks that throw no errors.
   and who can flip them.
 - **What you can skip.** Designing an organisation-wide incident programme from scratch; adopt the
   company's scale and add agent-specific criteria and switches to it.
+
+## Decision case
+### Scenario
+A support agent with `issue_refund`, `send_email` and `file_ticket` tools launches to 30 enterprise
+tenants in 4 weeks. The team must decide what pages a human and at which severity. All figures are
+illustrative planning numbers from a two-week shadow run of candidate alerts.
+- **Scale:** about 20,000 runs a day and about 1,200 refund calls a day, roughly 50 an hour.
+- **On-call:** 5 engineers, one person on call per week; the team agreed at most about 3 pages per
+  on-call week.
+- **Contract:** customer P1s acknowledged within 30 minutes, 24x7.
+- **Shadow results:** uptime and error alerts fired 1 time (1 real). Guardrail-block spikes and
+  quality-score dips at unvalidated thresholds fired 18 times (2 real). Side-effect alerts (refunds per
+  hour against ticket volume, emails to addresses not in the CRM, another tenant's document IDs in a
+  response) fired 3 times (2 real).
+
+### Options
+| Option | How it works | Real incidents caught in shadow | Pages per on-call week | Mitigation without deploy |
+|---|---|---|---|---|
+| Company scale as is | Uptime and error criteria only | 1 of 5 | (1) / 2 = 0.5 | None for tools |
+| Agent criteria plus action and leak alerts | Add irreversible-action and cross-tenant SEV1 criteria, per-tool kill switches and read-only mode; quality dips open a working-hours SEV3 | 3 of 5 paged, 2 more as SEV3 tickets | (1 + 3) / 2 = 2 | Yes |
+| Page on everything | Every guardrail spike and quality dip pages | 5 of 5 | (1 + 18 + 3) / 2 = 11 | Yes |
+
+### Decision
+**Agent criteria plus action and leak alerts.** It is the only option inside the page budget that pages
+for the incidents agents cause while dashboards stay green.
+- **Why not the company scale as is:** both real refund and leak incidents in the shadow run returned
+  HTTP 200, so it caught 1 of 5 real incidents.
+- **Why not page on everything:** 11 pages a week at 5 real out of 22 means precision of about 23%, and
+  for the quality alerts alone 2 of 18, about 11%. People learn to ignore that pager.
+- **What makes it work:** irreversible actions and cross-tenant exposure are SEV1 even for one case,
+  every side-effecting tool has a flag tested before launch, and a SEV2 not mitigated in 60 minutes
+  escalates automatically.
+- **Contract fit:** customer P1 maps to internal SEV2 or higher and routes to the paged rotation, so the
+  30-minute acknowledgement is met by the pager, not by a ticket queue.
+
+**What would change it.** If a second shadow period shows the quality score above an agreed precision,
+say half of its alerts real, promote it to paging. If the agent loses its side-effecting tools, the
+action criteria shrink to cost and loop alerts.
+
+### Trade-offs accepted
+- **Quality regressions without an action wait for working hours.** Watch the share of incidents first
+  reported by customers rather than monitoring.
+- **Kill switches move work to humans.** Disabling `issue_refund` means people follow up; track the
+  manual queue and time from declaration to tool disabled.
+- **Declaring high produces early SEV1s that get downgraded.** Track downgrades and disputed
+  classifications per incident; rising disputes mean the criteria are unclear.
+
+### Review rubric
+- **Impact, not cause:** every criterion is an observable fact (share affected, irreversible action,
+  data crossing a tenant boundary), and none names a suspected cause.
+- **Agent actions covered:** side-effecting tools are listed as reversible or irreversible, each with a
+  severity and a first mitigation that needs no deploy.
+- **Page load computed:** pages per on-call week and alert precision are recomputed from the shadow
+  data and compared with the team's budget.
+- **Contract mapped:** customer priorities map to internal severities and to who is paged, with the
+  response target checked.
+- **Escalation is time-based:** SEV1 and SEV2 have timers, and the write-up names the evidence that
+  would change the paging set.
 
 ## Why it exists
 - **Without levels, every incident starts with a negotiation.** One engineer thinks a 5% error rate is a

@@ -5,7 +5,8 @@ name: Zero trust
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - security-governance-compliance/ai-security
@@ -38,6 +39,64 @@ for the shortest time, whatever its network location.
   sees (such as taint), where backend secrets are attached, and which egress destinations are allowed.
 - **What you can skip.** An organisation-wide zero-trust programme. Delegated, scoped, short-lived tokens
   plus one PEP in front of your agent's tools give most of the benefit for one agent.
+
+## Decision case
+### Scenario
+A multi-tenant SaaS for property managers runs an operations agent that calls six internal tools through
+MCP servers: tenants, leases, maintenance tickets, documents, messaging and payments. Today every tool
+runs under one service account inside the VPC. All figures are illustrative planning numbers, not
+benchmarks.
+- **Scale:** 300 customer tenants, 2 million tool calls a day, so 2,000,000 / 86,400 is about 23 a second
+  on average and about 70 at a 3x peak. About 10% of calls write.
+- **Security policy:** revoking a user or agent must stop money movement and record changes on the next
+  call; reads may lag by up to 5 minutes.
+- **Latency:** auth may add at most 30 ms at p95 per tool call.
+- **Identity provider:** supports RFC 8693 token exchange (confirmed in its docs for the version in use);
+  the identity team caps the agent platform at 30 introspection requests a second.
+- **Measured in staging:** exchange about 25 ms p95, introspection about 15 ms p95, local JWT validation
+  under 1 ms.
+- **Team and deadline:** 4 engineers, 10 weeks.
+
+### Options
+| Option | How it works | Cross-tenant blast radius | Revocation | Latency and IdP load |
+|---|---|---|---|---|
+| Service account plus AI subnet and mTLS | Tighter network, same credential | every tenant | next key rotation | none added |
+| Delegated tokens, local validation | Per-user, per-tool, 5-minute tokens; PEP checks claims locally | one tenant | up to 5 minutes for every tool | exchange only on cache miss |
+| Delegated tokens, introspect every call | As above, plus RFC 7662 introspection each call | one tenant | next call | about 70 a second at peak, over the 30 cap |
+| Delegated tokens, introspect writes only | Local validation for reads; introspection for write and payment tools | one tenant | next call for writes, 5 minutes for reads | about 7 a second at peak, 15 ms on writes |
+
+### Decision
+**Delegated per-tool tokens with local validation, plus introspection on write and payment tools.** It is
+the only option that meets the revocation policy without breaking the identity team's cap.
+- **Blast radius:** every token's `sub` is the user and `act` names the agent, so a steered agent can
+  touch only the current user's tenant, and audit logs show both.
+- **Latency:** reads add under 1 ms after the first exchange; writes add about 15 ms; a cache-miss
+  exchange adds about 25 ms. Each stays under the 30 ms budget on its own, but a write that also misses
+  the cache adds about 40 ms, so warm the write-scope token when the session starts.
+- **Load:** 10% of about 70 peak calls is about 7 introspections a second, under the cap of 30.
+- **Secrets stay at the PEP:** MCP servers receive the delegated token, never the backend credential.
+
+**What would change it.** If the identity provider lacked token exchange, run a small internal token
+service that mints downscoped tokens signed by the platform. If reads include regulated data such as
+payment details, introspect those reads too and ask for a higher cap.
+
+### Trade-offs accepted
+- **Reads lag revocation by up to 5 minutes.** Keep read tokens at 5 minutes or less and alert on any
+  token minted with a longer lifetime.
+- **A new dependency on the identity provider.** If exchange fails, tool calls fail closed. Track
+  exchange error rate and p95, and page on sustained errors.
+- **Some workflows need more than the user may do,** such as a scheduled rent run. Give them an explicit,
+  audited elevation path and count elevated calls.
+
+### Review rubric
+- **Blast radius compared:** the write-up states whose data a steered agent can reach under each option.
+- **Policy mapped to mechanism:** each revocation or scope requirement names the check that enforces it
+  (token lifetime, introspection, PEP rule).
+- **Load and latency recomputed:** per-second call rates, introspection load and added latency follow
+  from stated volumes and measurements.
+- **Credential placement shown:** where backend secrets live and that none reach the prompt or tool
+  servers.
+- **Failure mode chosen:** what happens when the identity provider is down, and why.
 
 ## Why it exists
 - **The perimeter model trusted location.** Outside the VPN or firewall was hostile, inside was trusted;

@@ -5,7 +5,8 @@ name: Gradient accumulation
 kind: practice
 difficulty: core
 est_minutes: 11
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/batch-size
@@ -144,6 +145,22 @@ flowchart TD
     G --> H["optimizer.step and scheduler.step"]
     H -->|"next window"| A
 ```
+
+## Misconceptions
+- **"Accumulation speeds training up."** It runs the `k` micro-batches one after another, so tokens per
+  second stay the same and each optimizer step takes about `k`× longer. It buys batch size on fixed
+  memory, not speed.
+- **"Dividing each micro-batch loss by `k` is always exact."** Only when every micro-batch holds the same
+  number of trained tokens. With masked agent traces, per-micro-batch means can weight a routing token 30×
+  a final-answer token. Divide summed token losses by the window's token count.
+- **"Steps still mean what the dataloader yields."** Warmup, `num_training_steps`, clipping and the
+  scheduler all count optimizer steps. 4,800 micro-batches at `k = 16` are 300 steps, and planning for
+  4,800 means the rate never even reaches its peak.
+- **"Accumulation can make one long trace fit."** Peak memory is one micro-batch, but a single sequence
+  with a huge tool result still has to fit on its own. That is gradient checkpointing's job.
+- **"`k` micro-batches always equal one big batch."** Not with batch-coupled layers such as BatchNorm, or
+  with clipping or `zero_grad()` inside the loop. Transformers use per-token norms, so the loop order and
+  loss normalization are what usually break it.
 
 ## Examples
 ### Worked scenario: a tool-calling LoRA on one 24 GB card

@@ -5,7 +5,8 @@ name: AI control plane vs data plane
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - system-design/ai-gateway
@@ -39,6 +40,67 @@ versioned snapshots, keeping the last if the control plane fails.
   which version a long run uses.
 - **What you can skip.** xDS and mesh internals; the pattern (snapshot, atomic swap, fail static) is what
   you apply.
+
+## Decision case
+### Scenario
+A platform team runs a shared agent runtime for 30 tenants. Tool allow-lists, step budgets, approval
+rules and bundle rollouts live in a policy service. The team must decide how the runtime reads them.
+All figures are illustrative.
+- **Load:** 2,000 runs a minute at peak; a run averages 10 model calls and 20 tool calls, so 30 policy
+  decisions per run, 60,000 a minute (1,000 a second).
+- **Policy service:** about 5 ms per call and 99.9% availability per call.
+- **Constraints:**
+  - policy adds at most 50 ms to a run and fails at most 0.1% of runs;
+  - a revoked tool or key stops working on every replica within 60 seconds;
+  - promotion and rollback without a redeploy, live everywhere within 2 minutes;
+  - serving survives a 2-hour control-plane outage, as in the worked outage;
+  - a regulated tenant's auditors must be able to tell which policy version each run used.
+
+### Options
+| Option | How it works | Added per run | Runs failed by config | Revocation | Rollback, and during an outage |
+|---|---|---|---|---|---|
+| **A. Per-call lookup** | runtime calls the policy service before every model and tool call | 30 × 5 ms = 150 ms: fails | 1 − 0.999^30 ≈ 3%: fails | instant | instant, and serving stops in an outage: fails |
+| **B. Baked into the image** | policy compiled into the runtime release | 0 | 0 | a redeploy, tens of minutes: fails | a redeploy: fails |
+| **C. Snapshot pull, fail static** | signed snapshot pulled every 30 s, atomic swap, pinned per run | 0 | 0 | about 30 s when healthy; never during an outage: fails | about 30 s; frozen during an outage |
+| **D. C plus a revocation channel and break-glass** | as C; revocations pushed with a heartbeat, fail closed after 60 s of silence; signed local override with an expiry | 0 | 0 | seconds; fail closed past 60 s | about 30 s; break-glass during an outage |
+
+### Decision
+Choose **D**, because it is the only option that keeps policy off the hot path and still meets the
+revocation and outage constraints.
+- **Latency and failures:** every check is a local lookup against the pinned snapshot, so a 30-check run
+  adds nothing. A adds 150 ms and fails about 3% of runs on its own.
+- **Load:** the policy service drops from 1,000 calls a second to one snapshot fetch per replica every
+  30 seconds.
+- **Revocation:** the push channel lands a revoked tool in seconds, even mid-run. If its heartbeat goes
+  silent for 60 seconds, the runtime denies requests that depend on revocation state rather than trusting
+  stale keys. C has no answer when the control plane is down.
+- **Outage:** replicas serve the last snapshot from disk; a bad bundle can still be rolled back through
+  the audited break-glass override.
+- **Audit:** every span carries the snapshot version, so "which policy did run 8812 use" is a query.
+
+**What would change it:**
+- **One team and one application:** an embedded admin store loaded into memory is enough.
+- **Revocations that must land in under 5 seconds** (for example a regulator's kill order): shorten the
+  heartbeat budget and accept more fail-closed denials during network blips.
+- **Exact per-tenant spend caps:** add a shared data-plane counter, a new dependency to size and protect.
+
+### Trade-offs accepted
+- **Up to 30 seconds of propagation** for ordinary changes. Monitor time from publish to the last replica
+  reporting the version.
+- **Fail closed on a silent revocation channel** can deny legitimate calls during a network blip. Track
+  fail-closed denials per hour and the channel's heartbeat gaps.
+- **Break-glass is a way around policy.** It needs an allow-listed operator, an expiry and central logging;
+  review every use.
+- **Runs keep their pinned policy** after an ordinary change, so a long run finishes on the old allow-list.
+  Only revocations cut in mid-run.
+
+### Review rubric
+- **Per-run cost of the lookup design is computed** (checks per run × latency, and 1 − availability^checks).
+- **Each entry type has a staleness rule:** which config serves stale and which fails closed.
+- **The outage behaviour is spelled out:** what still serves, what freezes, and how rollback still happens.
+- **Snapshots are whole, versioned and pinned per run**, with the version on every span.
+- **Revocation latency is stated as a number** with the mechanism that achieves it.
+- **At least two conditions that would change the choice** are stated, each tied to a measurable fact.
 
 ## Why it exists
 - **The two halves have opposite requirements.**

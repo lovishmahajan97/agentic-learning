@@ -5,7 +5,8 @@ name: Tool adapters / service interfaces
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -41,6 +42,215 @@ returns every outcome as a compact structured result, making tools testable, swa
   happen inside the adapter, idempotency keys, response projection and where large payloads go.
 - **What you can skip.** Generic API-gateway theory and full hexagonal-architecture ceremony. One base
   class with validation, timeout, error envelope and projection is enough to start.
+
+## Lab
+### Task
+Finish a `create_ticket` adapter whose vendor misbehaves the way real ones do: lost responses, rate
+limits, 403s, 502 pages and a second write that fails after the first succeeded. The agent-facing goal
+is that the model sees one small envelope for every outcome and a retry can never create a second
+ticket. Time box: 60-90 min.
+- **Prerequisites:** Tool calling; Typed tool contracts; the `create_ticket` adapter in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13 and pytest 9.1). Save the
+  starter as `lab.py` and the tests as `test_lab.py`.
+- **No network:** `FakeVendor` is the service interface. Its `plan` scripts failures per path, and it
+  records every idempotency key it receives so the tests can count real writes.
+- **You implement two methods:** `_send` (retry loop and error taxonomy) and `create_ticket` (validate,
+  translate, composite call, projection).
+
+### Starter code
+```python
+"""Lab: a tool adapter with bounded retries, one error vocabulary and honest partial failures.
+Run: python lab.py"""
+import time
+
+PROJECTS = {"billing": 10432, "platform": 1, "support": 2}    # enum for the model, ID for the vendor
+WEB_BASE = "https://tickets.example"
+
+class FakeVendor:
+    """The service interface. `plan` maps a path to outcomes it returns, in order, before succeeding:
+    an int HTTP status, "timeout" (no response), or "lost" (the write happens, then the response is lost).
+    Like many real APIs it honours Idempotency-Key on POST /v2/tickets only."""
+    def __init__(self, plan=None):
+        self.plan = {path: list(outcomes) for path, outcomes in (plan or {}).items()}
+        self.tickets, self.attachments, self.by_key, self.keys_seen = {}, [], {}, []
+
+    def post(self, path, json, headers):
+        self.keys_seen.append(headers.get("Idempotency-Key"))
+        outcome = self.plan[path].pop(0) if self.plan.get(path) else "ok"
+        if outcome == "timeout":
+            raise TimeoutError(path)
+        if isinstance(outcome, int):
+            retry_after = {"Retry-After": "2"} if outcome == 429 else {}
+            return outcome, retry_after, "<html>Bad Gateway</html>" if outcome >= 500 else {"code": "E" + str(outcome)}
+        if path == "/v2/tickets":
+            key = headers["Idempotency-Key"]
+            if key not in self.by_key:                       # same key -> same ticket, no duplicate
+                self.by_key[key] = 88 + len(self.tickets)
+                self.tickets[self.by_key[key]] = json
+            body = {"id": self.by_key[key], "status": "open", "custom_fields": ["..."] * 40}
+        else:
+            self.attachments.append(json)
+            body = {"attachment_id": "att-" + str(len(self.attachments))}
+        if outcome == "lost":
+            raise TimeoutError(path)
+        return 201, {}, body
+
+def validate(raw: dict) -> list[str]:
+    errs = []
+    if not isinstance(raw.get("title"), str) or not 0 < len(raw["title"]) <= 120:
+        errs.append("title: a string of 1-120 characters")
+    if raw.get("project") not in PROJECTS:
+        errs.append(f"project: one of {sorted(PROJECTS)}")
+    if "attachment" in raw and not isinstance(raw["attachment"], str):
+        errs.append("attachment: a file name")
+    return errs
+
+class TicketAdapter:
+    MAX_ATTEMPTS = 3
+
+    def __init__(self, vendor, sleep=time.sleep):
+        self.vendor, self.sleep = vendor, sleep
+
+    def _send(self, path: str, payload: dict, idem_key: str) -> dict:
+        """One service call with bounded retries inside the adapter. Never raises. Returns
+        {"ok": True, "body": <vendor body>} or
+        {"ok": False, "error": <code>, "retryable": <bool>, "attempts": <n>} (+ "http_status" if any).
+        - TimeoutError -> upstream_timeout; 429 -> rate_limited; 401/403 -> denied; 404 -> not_found;
+          any other status >= 400 -> upstream_error. Retryable: timeouts, 429 and 5xx only.
+        - Retry retryable failures up to MAX_ATTEMPTS attempts in total. Before attempt n+1 call
+          self.sleep(seconds): the 429 Retry-After value as a float, otherwise 0.5 * 2 ** (n - 1).
+        - Send the SAME Idempotency-Key header on every attempt."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+    def create_ticket(self, raw_args: dict, *, run_id: str, step: int) -> dict:
+        """The model-facing tool. Requirements:
+        - invalid args -> {"ok": False, "error": "invalid_arguments", "retryable": False, "detail": errs}
+          with no vendor call
+        - POST /v2/tickets {"summary": title, "project_id": PROJECTS[project]} with key f"{run_id}:{step}";
+          a failure returns the _send error as is
+        - if "attachment" is given, POST /v2/attachments {"ticket_id": id, "name": attachment} with key
+          f"{run_id}:{step}:attach"; if that fails return
+          {"ok": False, "error": "partial", "retryable": True, "created": {"ticket_id": id},
+           "failed_step": "attach_file", "cause": <the _send error code>}
+        - success -> {"ok": True, "ticket_id": id, "status": status, "url": f"{WEB_BASE}/tickets/{id}"}
+          and nothing else from the 40-field vendor body"""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+CASES = [
+    ("happy path", {}, {"title": "Refund stuck", "project": "billing"}),
+    ("bad arguments", {}, {"title": "Refund stuck", "project": "sales"}),
+    ("lost response", {"/v2/tickets": ["lost"]}, {"title": "Refund stuck", "project": "billing"}),
+    ("rate limited", {"/v2/tickets": [429, 429, 429]}, {"title": "Refund stuck", "project": "billing"}),
+    ("forbidden", {"/v2/tickets": [403]}, {"title": "Refund stuck", "project": "billing"}),
+    ("attach fails", {"/v2/attachments": [502, 502, 502]},
+     {"title": "Crash", "project": "platform", "attachment": "log.txt"}),
+]
+
+if __name__ == "__main__":
+    for name, plan, args in CASES:
+        vendor, waits = FakeVendor(plan), []
+        out = TicketAdapter(vendor, sleep=waits.append).create_ticket(args, run_id="run-1", step=3)
+        print(f"{name:<14} tickets={len(vendor.tickets)} waits={waits}")
+        print(f"  {out}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints the following (key order inside a dict may differ if you
+build the dicts in another order; the tests compare dicts, not text):
+
+```
+happy path     tickets=1 waits=[]
+  {'ok': True, 'ticket_id': 88, 'status': 'open', 'url': 'https://tickets.example/tickets/88'}
+bad arguments  tickets=0 waits=[]
+  {'ok': False, 'error': 'invalid_arguments', 'retryable': False, 'detail': ["project: one of ['billing', 'platform', 'support']"]}
+lost response  tickets=1 waits=[0.5]
+  {'ok': True, 'ticket_id': 88, 'status': 'open', 'url': 'https://tickets.example/tickets/88'}
+rate limited   tickets=0 waits=[2.0, 2.0]
+  {'ok': False, 'error': 'rate_limited', 'retryable': True, 'attempts': 3, 'http_status': 429}
+forbidden      tickets=0 waits=[]
+  {'ok': False, 'error': 'denied', 'retryable': False, 'attempts': 1, 'http_status': 403}
+attach fails   tickets=1 waits=[0.5, 1.0]
+  {'ok': False, 'error': 'partial', 'retryable': True, 'created': {'ticket_id': 88}, 'failed_step': 'attach_file', 'cause': 'upstream_error'}
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (Python 3.13, pytest 9.1).
+
+```python
+from lab import WEB_BASE, FakeVendor, TicketAdapter
+
+ARGS = {"title": "Refund stuck", "project": "billing"}
+
+def make(plan=None):
+    vendor, waits = FakeVendor(plan), []
+    return vendor, waits, TicketAdapter(vendor, sleep=waits.append)
+
+def test_success_is_projected_to_four_fields():
+    vendor, _, ad = make()
+    assert ad.create_ticket(ARGS, run_id="r", step=1) == {
+        "ok": True, "ticket_id": 88, "status": "open", "url": f"{WEB_BASE}/tickets/88"}
+    assert vendor.tickets[88] == {"summary": "Refund stuck", "project_id": 10432}
+
+def test_invalid_arguments_make_no_vendor_call():
+    vendor, _, ad = make()
+    out = ad.create_ticket({"title": "", "project": "sales"}, run_id="r", step=1)
+    assert out["error"] == "invalid_arguments" and out["retryable"] is False and len(out["detail"]) == 2
+    assert vendor.keys_seen == []
+
+def test_retry_after_lost_response_reuses_the_key_and_creates_one_ticket():
+    vendor, waits, ad = make({"/v2/tickets": ["lost"]})
+    out = ad.create_ticket(ARGS, run_id="run-1", step=3)
+    assert out["ok"] is True and len(vendor.tickets) == 1
+    assert vendor.keys_seen == ["run-1:3", "run-1:3"] and waits == [0.5]
+
+def test_retries_are_bounded_and_honour_retry_after():
+    vendor, waits, ad = make({"/v2/tickets": [429, 429, 429]})
+    out = ad.create_ticket(ARGS, run_id="r", step=1)
+    assert out == {"ok": False, "error": "rate_limited", "retryable": True, "attempts": 3, "http_status": 429}
+    assert waits == [2.0, 2.0] and len(vendor.keys_seen) == 3
+
+def test_non_retryable_errors_are_not_retried_and_never_raise():
+    vendor, waits, ad = make({"/v2/tickets": [403]})
+    assert ad.create_ticket(ARGS, run_id="r", step=1)["error"] == "denied"
+    assert waits == [] and len(vendor.keys_seen) == 1
+    _, waits, ad = make({"/v2/tickets": ["timeout", 502, "timeout"]})
+    out = ad.create_ticket(ARGS, run_id="r", step=1)
+    assert out["error"] == "upstream_timeout" and out["attempts"] == 3 and waits == [0.5, 1.0]
+
+def test_failed_second_write_reports_partial_state():
+    vendor, _, ad = make({"/v2/attachments": [502, 502, 502]})
+    args = {"title": "Crash", "project": "platform", "attachment": "log.txt"}
+    out = ad.create_ticket(args, run_id="r", step=2)
+    assert out == {"ok": False, "error": "partial", "retryable": True, "created": {"ticket_id": 88},
+                   "failed_step": "attach_file", "cause": "upstream_error"}
+    again = ad.create_ticket(args, run_id="r", step=2)       # the model retries the same step
+    assert again["ok"] is True and len(vendor.tickets) == 1 and len(vendor.attachments) == 1
+```
+
+### Failure scenarios
+- **Generate a fresh `uuid4()` key per attempt.** The lost-response test now finds two tickets: the
+  vendor deduplicates by key, and you gave it two keys. Print `vendor.keys_seen`; every attempt of one
+  logical write must carry the same run-and-step key.
+- **Retry every failure, including 403.** The non-retryable test sees three calls and two sleeps, and in
+  production a revoked token turns into a burst of denied writes. Log the error class next to the attempt
+  count for every call.
+- **Return the vendor's 502 body to the model.** The result carries `<html>Bad Gateway</html>`, so a real
+  model invents new arguments to "fix" it. Keep the raw body for the trace and hand the model only the
+  envelope.
+- **Report the attach failure as `upstream_error`.** The model retries the whole tool with a new step
+  number and creates ticket 89. Grep traces for two tickets with the same title in one run; the fix is
+  the `partial` result naming what already exists.
+
+### Submission
+- **`lab.py`** with `_send` and `create_ticket` implemented; `FakeVendor` and `validate` unchanged.
+- **A green test run** (6 passed) and the printed output of `python lab.py`.
+- **One extra test** of your own for a 404 and for a 401, asserting the code and that neither is retried.
+- **A two-line note** on where the token would be injected and why it never appears in any result.
+- **Evaluated on:** one envelope for every outcome, bounded retries only for retryable classes, one
+  vendor write per idempotency key, and an honest `partial` result.
 
 ## Why it exists
 - **Raw vendor APIs break three ways at once.** Hand a model the OpenAPI spec of a ticketing system and the

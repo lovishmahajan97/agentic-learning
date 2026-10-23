@@ -5,7 +5,8 @@ name: Computer use
 kind: concept
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -161,6 +162,23 @@ flowchart TD
     B -->|"yes"| O
     B -->|"no"| F["Stop: budget exhausted"]
 ```
+
+## Misconceptions
+- **"Computer use is the universal integration, so start with it."** It is the most general tool and the
+  least efficient: every step is a vision call and tasks take minutes. Use an API or DOM-level actions
+  whenever they exist and keep screenshots for canvas, desktop and no-API surfaces.
+- **"97% per-step accuracy is nearly reliable."** Steps compound: 0.97³⁰ ≈ 0.40, so a 30-step task fails
+  more often than it succeeds. Shorter sub-tasks with checkpoints and retries, plus per-step verification,
+  are what move completion toward 75%.
+- **"Higher-resolution screenshots give better clicks."** They cost more tokens and some APIs silently
+  downscale, so the model's coordinates stop matching yours. Fix the size and scale coordinates back to
+  the screen's logical input space.
+- **"The model can tell me which clicks are dangerous."** A click at (912, 640) does not say what it does,
+  and the screen itself can carry injected instructions. The harness hit-tests the target in the
+  accessibility tree, treats unknown targets as consequential and gates them.
+- **"Keeping every screenshot gives the model better memory."** It is the same quadratic as any
+  transcript: about 700k image tokens over a 30-step run versus about 130k when only the last three are
+  kept, with the action log carrying the history.
 
 ## Examples
 ### A minimal computer-use loop

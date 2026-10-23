@@ -5,7 +5,8 @@ name: Agent memory (short-term, long-term, episodic)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -178,6 +179,26 @@ flowchart TD
     RQ -->|"top-k within budget, dated"| CW["Context window"]
     CW --> M["Model call"]
 ```
+
+## Misconceptions
+- **"With a big enough context window, the agent does not need a memory layer."** Every token is re-read
+  on every step, sessions still end, and facts buried in the middle of a huge history are attended to
+  less reliably. Memory is the layer that decides what enters the window, not a workaround for a small one.
+- **"Long-term memory is a vector store of every past message."** Raw transcripts retrieved by
+  similarity return chatter instead of facts, contradict each other when the user changes their mind and
+  never forget. Store extracted facts and events with provenance, a timestamp and a scope.
+- **"Skipping near-duplicates on write keeps the store clean."** "plan is Pro" and "plan is Basic" embed
+  as near-duplicates, so skipping keeps the stale fact and drops the new one. Writes must decide add,
+  update or ignore, and supersede.
+- **"Episodic and semantic memory are the same, just stored differently."** An episode is evidence about
+  what happened ("on Oct 3 the deploy failed"); a semantic fact is what is true now. They need different
+  write rules, retrieval scores and lifetimes, and episodes consolidate into facts.
+- **"Recency is enough to rank memories."** Without an importance term, recent trivia ("user said
+  thanks") buries a significant old event such as a deleted production database. Blend relevance,
+  recency and an importance rating scored at write time.
+- **"Memory is just a feature; security lives elsewhere."** Writing from retrieved third-party text turns
+  memory into persistent prompt injection, and a wrong scope leaks one user's facts to another. Gate
+  writes by source and filter by scope before scoring.
 
 ## Examples
 ### A minimal semantic memory layer

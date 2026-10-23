@@ -5,7 +5,8 @@ name: User training
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - adoption/change-management
@@ -36,6 +37,62 @@ problems.
   "what changed" note for every prompt, tool or model release.
 - **What you can skip.** Instructional-design theory. Keep the two drill numbers (catch and false-reject),
   the four Kirkpatrick levels and the base-rate warning.
+
+## Decision case
+### Scenario
+An insurer is giving 400 claims handlers (20 teams of 20) an agent that drafts settlement letters and
+proposes payments through a tool the handler must approve. Go-live is in 3 weeks. All figures are
+illustrative planning numbers.
+- **Internal compliance rule:** no handler gets approval rights on agent-proposed payments without
+  per-person evidence that they can catch wrong proposals.
+- **Operations cap:** at most 1.5 hours off the queue per handler in the go-live month, so 400 x 1.5 =
+  600 user-hours in total.
+- **Training staff:** 2 FDEs with about 30 facilitation hours between them before go-live.
+- **Eval material:** 300 graded agent runs, of which 36 failed (wrong payee, wrong amount, missed policy
+  exclusion), enough to build drill sets.
+
+### Options
+| Option | How it works | User-hours | FDE hours | Per-person evidence? |
+|---|---|---|---|---|
+| Recorded video and job aid | 20-minute video, in-tool "always check" card | 400 x 20 min = about 133 | about 5 to record | No: completion only |
+| Full live program | Three 45-minute sessions per cohort of 20, drill in session two | 400 x 2.25 h = 900, over the 600 cap | 20 cohorts x 3 x 0.75 h = 45, over 30 | Yes |
+| Blended with a drill gate | One 45-minute live session per cohort of 40 (mental model, real failures, data rules), then a 30-minute in-product drill of 20 items that unlocks approval rights | 400 x 1.25 h = 500, plus retakes | 10 x 0.75 h = 7.5 | Yes: every handler's catch and false-reject scores |
+| Train-the-trainer only | FDEs train 40 champions, who run the live program for their teams | As full program, 900 | about 10 plus coaching | Yes, but scoring quality varies by champion |
+
+### Decision
+**Blended with a drill gate.** It is the only option inside both caps that also produces the evidence
+compliance requires.
+- **The gate:** approval rights switch on when a handler catches at least 4 of the 5 seeded wrong
+  proposals (catch 0.8) and rewrites no more than 2 of the 15 correct ones (false-reject about 0.13).
+  Scoring both numbers stops "reject everything" from passing.
+- **Retake budget:** if 20% of handlers need one 30-minute retake, that adds 80 x 0.5 = 40 hours, so the
+  total is 540 of the 600 user-hours.
+- **Drill items come from the 36 real eval failures,** so the seeded errors look like what the agent
+  actually gets wrong, not garbled text.
+- **Champions still exist** (2 per team) for office hours, but they do not score anyone.
+
+**What would change it.** If more than half of handlers fail the first drill, the live session is not
+teaching the habit, and the budget moves to a second live session for the failing teams. If the cap
+rises to 2.5 hours, the full live program becomes possible for the riskiest teams first.
+
+### Trade-offs accepted
+- **Less practice time than the full program.** Watch citation-open rate on payment amounts in the
+  first month; a fall signals vigilance decay and triggers a refresher.
+- **Drill base rate is 25% wrong, production is far lower.** Watch QA findings on approved payments
+  against drill scores; drill passes with QA misses mean the drill is too easy.
+- **Larger live cohorts of 40 get fewer questions answered.** Watch the volume of office-hours questions
+  per team in week one.
+
+### Review rubric
+- **Both caps computed per option:** user-hours and facilitator hours are multiplied out and compared
+  with the stated limits.
+- **Evidence matched to the requirement:** the chosen design produces per-person learning scores where
+  the case requires them, not completion records.
+- **Two-sided scoring:** the gate or assessment uses catch and false-reject, with thresholds stated.
+- **Realistic drill material:** seeded errors are drawn from the agent's own eval failures.
+- **Behavior and results measured after go-live:** at least one log-based behavior metric and one
+  business result are named, with what triggers retraining.
+- **Reversal triggers stated:** the write-up says which pass rate or budget change would change the plan.
 
 ## Why it exists
 - **Agents break the old training contract.** Traditional training teaches where the buttons are, because

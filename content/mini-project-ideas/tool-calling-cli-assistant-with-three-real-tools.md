@@ -5,7 +5,8 @@ name: tool-calling CLI assistant with three real tools
 kind: practice
 difficulty: intro
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/agent-loop
@@ -33,6 +34,189 @@ It proves you understand the tool-calling protocol itself, not a framework's wra
 - **What it proves to a reviewer.** You can debug a tool loop at the message level: why the model looped,
   why it picked the wrong tool, and what a malformed argument looks like on the wire.
 - **What you can skip.** Streaming UIs, multi-agent setups and any framework. Plain SDK calls are the point.
+
+## Lab
+### Task
+Build the core of the CLI assistant without an API key: the tool loop, a confined `read_file` and an
+allowlisted `http_get`, driven by a scripted fake model that replays Anthropic-shaped responses. Time box:
+45-60 min.
+- **Prerequisites:** The agent loop; Tool calling; Tool schemas and argument validation; Sandboxing.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.12, pytest 9.1). Save the starter
+  as `lab.py` and the tests as `test_lab.py`.
+- **Why a fake model:** the responses are recorded dicts with the same `stop_reason`, `tool_use` and
+  `tool_result` shapes as the Messages API, so the loop you write here works with the real client later.
+
+### Starter code
+```python
+"""Lab: the tool loop of a CLI assistant, driven by a scripted fake model. Run: python lab.py"""
+import pathlib
+import tempfile
+from urllib.parse import urlparse
+
+MAX_STEPS, MAX_CHARS = 8, 4000
+ALLOWED_HOSTS = {"api.github.com", "pypi.org"}
+
+def tool_use(id_, name, args):
+    return {"type": "tool_use", "id": id_, "name": name, "input": args}
+
+def text(t):
+    return {"type": "text", "text": t}
+
+class ScriptedModel:
+    """Stands in for client.messages.create: replays recorded responses (the last one repeats)
+    and records every request so tests can inspect what crossed the wire."""
+    def __init__(self, responses):
+        self.responses, self.requests = list(responses), []
+    def create(self, messages, tools):
+        self.requests.append(list(messages))
+        return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+
+def make_read_file(root: pathlib.Path):
+    root = root.resolve()
+    def read_file(path: str) -> str:
+        # YOUR CODE HERE:
+        # - resolve root / path; if it is not inside root return "error: path is outside the workspace"
+        # - if it is not a file return f"error: no such file: {path}"
+        # - return the text; if longer than MAX_CHARS keep the first MAX_CHARS characters and append
+        #   f"\n[truncated, {total} chars total]"
+        raise NotImplementedError
+    return read_file
+
+def make_http_get(fetch):
+    def http_get(url: str) -> str:
+        # YOUR CODE HERE: refuse hosts outside ALLOWED_HOSTS with f"error: host not allowed: {host}",
+        # otherwise return fetch(url)[:MAX_CHARS]
+        raise NotImplementedError
+    return http_get
+
+def run(question: str, model, impl: dict) -> str:
+    messages = [{"role": "user", "content": question}]
+    for _ in range(MAX_STEPS):
+        resp = model.create(messages=messages, tools=list(impl))
+        messages.append({"role": "assistant", "content": resp["content"]})
+        # YOUR CODE HERE:
+        # - if resp["stop_reason"] != "tool_use": return the joined text blocks
+        # - for every tool_use block, run impl[name](**input); an unknown tool gives
+        #   f"error: unknown tool {name}", any exception gives f"error: {type(e).__name__}: {e}"
+        # - append ONE user message whose content is a list of
+        #   {"type": "tool_result", "tool_use_id": <the call's id>, "content": <string>}
+        raise NotImplementedError
+    return "stopped: step budget reached"
+
+if __name__ == "__main__":
+    ws = pathlib.Path(tempfile.mkdtemp()) / "ws"
+    ws.mkdir()
+    (ws / "notes.txt").write_text("Deploy runs on Fridays.")
+    impl = {"read_file": make_read_file(ws), "http_get": make_http_get(lambda url: "{}")}
+    model = ScriptedModel([
+        {"stop_reason": "tool_use", "content": [tool_use("t1", "read_file", {"path": "../secret.txt"})]},
+        {"stop_reason": "tool_use", "content": [tool_use("t2", "read_file", {"path": "notes.txt"})]},
+        {"stop_reason": "end_turn", "content": [text("Deploys happen on Fridays.")]},
+    ])
+    answer = run("When do we deploy?", model, impl)
+    for msg in model.requests[-1]:
+        if msg["role"] == "user" and isinstance(msg["content"], list):
+            print(msg["content"][0]["tool_use_id"], msg["content"][0]["content"])
+    print("answer:", answer, "| model calls:", len(model.requests))
+    looping = ScriptedModel([{"stop_reason": "tool_use",
+                              "content": [tool_use("t9", "http_get", {"url": "https://evil.test/x"})]}])
+    print(run("loop forever", looping, impl), "| model calls:", len(looping.requests))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+t1 error: path is outside the workspace
+t2 Deploy runs on Fridays.
+answer: Deploys happen on Fridays. | model calls: 3
+stopped: step budget reached | model calls: 8
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution passes
+all 6.
+
+```python
+import pathlib
+from lab import (MAX_CHARS, MAX_STEPS, ScriptedModel, make_http_get, make_read_file, run, text,
+                 tool_use)
+
+def workspace(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "a.txt").write_text("alpha")
+    (ws / "big.txt").write_text("x" * 5000)
+    (tmp_path / "ws-secrets").mkdir()
+    (tmp_path / "ws-secrets" / "key.txt").write_text("sk-123")
+    return ws
+
+def test_read_file_is_confined(tmp_path):
+    read_file = make_read_file(workspace(tmp_path))
+    assert read_file("a.txt") == "alpha"
+    for bad in ["../ws-secrets/key.txt", "/etc/passwd", "sub/../../ws-secrets/key.txt"]:
+        assert read_file(bad) == "error: path is outside the workspace"
+    assert read_file("nope.txt") == "error: no such file: nope.txt"
+
+def test_read_file_truncates_and_says_so(tmp_path):
+    out = make_read_file(workspace(tmp_path))("big.txt")
+    assert out.startswith("x" * MAX_CHARS) and out.endswith("[truncated, 5000 chars total]")
+
+def test_http_get_allowlist():
+    http_get = make_http_get(lambda url: "body:" + url)
+    assert http_get("https://pypi.org/pypi/httpx/json") == "body:https://pypi.org/pypi/httpx/json"
+    assert http_get("https://evil.test/x?d=1") == "error: host not allowed: evil.test"
+
+def test_results_echo_call_ids_in_one_message(tmp_path):
+    impl = {"read_file": make_read_file(workspace(tmp_path))}
+    model = ScriptedModel([
+        {"stop_reason": "tool_use", "content": [text("checking"), tool_use("c1", "read_file", {"path": "a.txt"}),
+                                                tool_use("c2", "read_file", {"path": "zz.txt"})]},
+        {"stop_reason": "end_turn", "content": [text("done")]},
+    ])
+    assert run("q", model, impl) == "done"
+    last = model.requests[-1]
+    assert [m["role"] for m in last] == ["user", "assistant", "user"]
+    results = last[2]["content"]
+    assert [r["tool_use_id"] for r in results] == ["c1", "c2"]
+    assert results[0]["content"] == "alpha" and results[1]["content"].startswith("error: no such file")
+
+def test_errors_are_results_not_crashes(tmp_path):
+    impl = {"read_file": make_read_file(workspace(tmp_path))}
+    model = ScriptedModel([
+        {"stop_reason": "tool_use", "content": [tool_use("b1", "read_file", {"pathh": "a.txt"}),
+                                                tool_use("b2", "run_shell", {"cmd": "rm -rf /"})]},
+        {"stop_reason": "end_turn", "content": [text("recovered")]},
+    ])
+    assert run("q", model, impl) == "recovered"
+    results = model.requests[-1][2]["content"]
+    assert results[0]["content"].startswith("error: TypeError")
+    assert results[1]["content"] == "error: unknown tool run_shell"
+
+def test_step_budget_stops_a_runaway_loop(tmp_path):
+    impl = {"read_file": make_read_file(workspace(tmp_path))}
+    model = ScriptedModel([{"stop_reason": "tool_use", "content": [tool_use("l1", "read_file", {"path": "a.txt"})]}])
+    assert run("q", model, impl) == "stopped: step budget reached"
+    assert len(model.requests) == MAX_STEPS
+```
+
+### Failure scenarios
+- **Check confinement with `str(p).startswith(str(root))`.** The `../ws-secrets/key.txt` case passes the
+  check and returns the key. Print the resolved path next to the root; the sibling folder shares the prefix,
+  which is why `Path.is_relative_to` is the fix.
+- **Send one user message per tool result.** The ids test fails on the role sequence. With the real API,
+  results for one assistant turn belong in one user message; dump `messages` as JSON and compare roles.
+- **Let a tool exception escape.** `test_errors_are_results_not_crashes` dies with `TypeError` instead of
+  asserting. Wrap each call, return the error string, and count error results per tool in your transcript.
+- **Return early on the first `tool_use` block.** The second call in a parallel turn never gets a result,
+  which a real provider rejects. Assert that every `tool_use` id appears exactly once in the next message.
+
+### Submission
+- **`lab.py`** with the three `YOUR CODE HERE` parts implemented and no changes to `ScriptedModel`.
+- **A green test run** (6 passed) and the output of `python lab.py`.
+- **One extra test** of your own: a `read_file` call through a symlink that points outside the workspace.
+- **A JSONL transcript** of the demo run (one line per message) committed next to the code.
+- **Evaluated on:** tests passing, every refusal covered by a test, and ids that match call to result.
 
 ## Why it exists
 - **Every agent framework hides this loop.** LangGraph, the OpenAI Agents SDK and others all run the same

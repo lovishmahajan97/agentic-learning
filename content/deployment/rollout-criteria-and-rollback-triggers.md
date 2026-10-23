@@ -5,7 +5,8 @@ name: Rollout criteria & rollback triggers
 kind: practice
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -40,6 +41,70 @@ rationalise bad numbers mid-incident and agent quality signals are noisy and slo
   whether write tools are fenced in early stages.
 - **What you can skip.** Building your own traffic-shifting controller; use the flag service or an
   existing canary tool.
+
+## Decision case
+### Scenario
+A retailer's support agent handles about 20,000 tasks a day and can call an `issue_refund` tool. The
+provider will retire the pinned model in 21 days, so the team must roll out a newer model version
+under the same prompt and tools. All figures are illustrative planning numbers, not quotes or SLAs.
+- **Quality floor:** to detect a 3-point judge-pass drop near 91%, the gate needs about 1,600 judged
+  tasks per arm (the calculation in How it works). Today the LLM judge scores 10% of traffic.
+- **Agent hard triggers:** cost per task, step-budget hits and tool errors need at least 1,000 canary
+  tasks before they are trusted.
+- **Write-tool fence:** about 10% of tasks propose a refund. Support leads can approve at most about
+  150 refunds a day by hand, so only a stage of about 1,500 tasks a day or fewer can run refunds
+  approval-only.
+- **Rollback must stay possible:** the old model is only a rollback target until day 21.
+
+### Options
+| Option | How it works | Days to 1,600 judged canary tasks | Canary tasks exposed before a quality decision | Refunds fenced? |
+|---|---|---|---|---|
+| Small canary, normal judging | 5% canary (1,000 tasks a day), judge 10% | 1,600 / 100 = 16 days | 16 x 1,000 = 16,000 | yes: about 100 approvals a day |
+| Large canary, normal judging | 25% canary (5,000 tasks a day), judge 10% | 1,600 / 500 = 3.2 days | 3.2 x 5,000 = 16,000 | no: about 500 approvals a day exceeds the 150 limit |
+| Small canary, judge every canary task | 5% canary, judge 100% of canary and 10% of control | 1,600 / 1,000 = 1.6 days | 1.6 x 1,000 = 1,600 | yes: about 100 approvals a day |
+
+The control arm (95% of traffic, about 19,000 tasks a day, 10% judged) passes its own 1,600 floor in
+under a day in every option.
+
+### Decision
+**A 5% canary with every canary task judged, refunds approval-only during that stage, then 25% and 100%
+on hard triggers.**
+- **It reaches a quality decision fastest with the least exposure.** About 1.6 days and 1,600 exposed
+  tasks, against 16,000 exposed tasks in both other options. Raising the judge fraction buys evidence
+  without buying blast radius.
+- **It keeps the fence affordable.** About 100 refund approvals a day fits the 150 limit; the large
+  canary would have to run refunds unfenced.
+- **It fits the deadline.** Internal 2 days, the 5% stage held for 2 days so it sees weekday traffic,
+  25% for 2 days, then 100%: about 6 days, leaving about 15 days for one roll-back, fix and retry cycle.
+- **Hard triggers are ready on day 1:** 1,000 canary tasks arrive in about a day at 5%.
+
+**What would change it.**
+- **The retirement date moving to under a week:** there is no time for a retry, so prepare a
+  roll-forward fix path, since rollback disappears with the old model.
+- **A judge that cannot score the new model fairly** (it penalises the new style): quality falls back
+  to human review of a sample, and the 5% stage lengthens.
+- **More approval capacity:** a fenced 25% stage becomes possible.
+
+### Trade-offs accepted
+- **Higher judge spend for a few days.** About 900 extra judgements a day during the 5% stage. Watch:
+  judge cost per day, and drop canary judging back to 10% once the stage promotes.
+- **The judge sees only the canary at full rate.** Judge bias then matters more. Watch: a human reads a
+  sample of failing judgements before any quality hold becomes a rollback.
+- **Approval delay for 5% of customers.** Their refunds wait for a human. Watch: approval queue time and
+  refund-related complaints in the canary arm.
+- **Refunds run unfenced from the 25% stage.** About 500 a day is beyond manual approval. Watch: refund
+  count and value per task on canary versus control as a hard trigger, and the approval decisions from
+  the 5% stage (how many a human rejected) before promoting.
+
+### Review rubric
+- **Floors derived, not guessed:** judged and task floors follow from a baseline, the smallest
+  regression that matters, and traffic per stage.
+- **Exposure counted:** the write-up computes how many tasks run the new version before each decision.
+- **Irreversible actions fenced:** write tools are fenced in early stages, sized to real approval capacity.
+- **Hard and soft separated:** cost, steps and tool errors roll back automatically; judge drops hold
+  for a human.
+- **Deadline arithmetic shown:** stage durations add up against the rollback window.
+- **Flip conditions stated:** what deadline, judge or capacity change would pick another option.
 
 ## Why it exists
 - **A staged rollout only reduces risk if someone decides at each stage.** Without written criteria, that

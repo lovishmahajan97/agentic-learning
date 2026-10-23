@@ -5,7 +5,8 @@ name: Rapid prototyping / PoC
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - scoping/timeboxing
@@ -32,6 +33,64 @@ or never decide.
   starting with the strongest model, and the single held-out readout.
 - **What you can skip.** Memory, multi-agent orchestration, auth flows and UI, unless one of them is the
   riskiest assumption. Every extra component is something not under test.
+
+## Decision case
+### Scenario
+An IT department wants a helpdesk agent with nine tools (directory lookup, ticket read and update,
+password-reset trigger and others). Two things are unknown: whether staff want an agent that acts or one
+that drafts for a technician, and whether a model can pick among nine tools reliably. All figures are
+illustrative.
+- **Constraints:**
+  - 15 working days to a funding decision on a pilot;
+  - two engineers and one designer;
+  - senior technicians can label at most 250 past tickets with expected end states;
+  - the bar, set by the service desk: at least 70% task success, zero unauthorised writes, at most 10 tool
+    calls per task;
+  - the ticketing API grants a scoped service account only after a security form, typically a few days.
+- **Expected result:** the team guesses around 78% success, 8 points above the bar.
+
+### Options
+| Option | How it works | Desirability answered? | Feasibility answered? | Fits 15 days and 250 labels? |
+|---|---|---|---|---|
+| **A. One combined build** | real agent plus a chat UI, shown to users at the end | late and confounded with model errors | partly: engineers split with UI work | barely; no time for error analysis |
+| **B. Feasibility PoC only** | thinnest slice, strongest model, 100 dev and 150 held-out tickets | no | yes | yes |
+| **C. Wizard of Oz plus PoC, in parallel** | the designer runs a prototype where a technician plays the agent for six staff; the engineers run B | yes, by day 10 | yes | yes |
+| **D. Go straight to a pilot build** | wire all nine tools, auth and UI | yes, eventually | yes, eventually | no: an integration-heavy build |
+
+### Decision
+Choose **C**, because it is the only option that answers both unknowns inside the constraints.
+- **Two questions, two builds:** the prototype can fake the agent because its question is about people; the
+  PoC cannot fake the model, data or metric.
+- **Labels fit:** 100 dev plus 150 held-out uses exactly the 250 labels.
+- **Held-out size is enough:** to resolve an 8-point gap you need a 95% half-width under 8 points, which at
+  p = 0.78 takes about 103 tasks; 150 gives about ±6.6.
+- **Risk order:** the security form for the scoped account is filed on day 1, and tools not under test are
+  stubbed with real schemas.
+- **Readout:** one held-out run on day 14; pass if the lower bound clears 70%, inconclusive if the interval
+  straddles it.
+
+**What would change it:**
+- **The same agent pattern already runs elsewhere in the company:** skip the PoC; a pilot is cheaper.
+- **Staff have already said which hand-off they want:** drop the prototype and run B alone.
+- **Cost per task is the main fear:** run the cheapest acceptable model first instead of the strongest.
+- **A result near 70%:** label more or propose a pilot with the risk stated, rather than call it a pass.
+
+### Trade-offs accepted
+- **Six users is a small sample.** The prototype yields workflow findings, not adoption numbers. Treat them as
+  hypotheses for the pilot's success metric.
+- **Strongest model first hides cost.** Re-run the held-out set on one cheaper model in the last two days and
+  report both.
+- **Stubbed tools stay untested.** List every stub in the findings; each is integration work the pilot must
+  fund.
+- **One held-out read.** There is no second chance on those 150 tasks. Track the dev-versus-held-out gap.
+
+### Review rubric
+- **The write-up separates the desirability and feasibility questions** and says which build answers each.
+- **Assumptions are ranked** by likelihood of being false times cost if false, and the top one is tested first.
+- **The threshold comes from a business need** and includes agent guardrails: unauthorised writes and steps.
+- **Eval-set size is computed** from the gap between expected result and threshold.
+- **A locked held-out split is read once**, with pass, fail and inconclusive bands.
+- **What would change the plan is stated**, with at least two concrete triggers.
 
 ## Why it exists
 - **Two uncertainties no spec removes.** *Desirability*: do users want an assistant that drafts replies, or

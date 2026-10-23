@@ -5,7 +5,8 @@ name: Customer discovery
 kind: practice
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - scoping/ai-use-case-discovery
@@ -35,6 +36,59 @@ what its first eval set contains.
   error-cost question gets asked before anyone writes a tool schema.
 - **What you can skip.** Formal market-sizing and startup-style customer development; you need enough to
   write a one-page problem statement and an agent spec, not a business plan.
+
+## Decision case
+### Scenario
+An online retailer's Head of Customer Service asks for "an agent that handles refund emails". The CFO
+will see a demo in 6 weeks and decides then whether to fund a pilot. All figures are illustrative.
+- **Volume:** 9,000 refund emails a month, about 6 minutes each, worked by 40 support agents across two
+  shifts at a loaded $45 an hour, so handling time costs 9,000 × 0.1 h × $45 = $40,500 a month.
+- **Risk rule:** finance must approve every refund over $200; nobody has yet said what software may do
+  alone.
+- **Access:** reading the order system needs a security review that takes 3 weeks from the request.
+- **Team:** two FDEs, 6 weeks, no budget for a second phase before the CFO decides.
+
+### Options
+| Option | How it works | Demo in 6 weeks | Real data and access | Approval policy known | Risk of the wrong agent |
+|---|---|---|---|---|---|
+| A. Build the literal request | Autonomous refund agent from the requester's description | Yes | Only if someone files the access request | No, guessed | High |
+| B. Prototype first | Build on synthetic emails, show users, iterate | Yes | No: synthetic data hides messy emails | No | High, anchored on design one |
+| C. Full discovery, then build | 4 weeks of interviews, access request at the end | No: access lands in week 7 | Late | Yes | Low, but too late |
+| D. Time-boxed discovery plus narrow prototype | 2 weeks, 8 interviews, 50 samples; access request on day 1; read-only prototype from week 2 | Yes: access lands end of week 3 | Yes, from week 4 | Yes, by end of week 2 | Low |
+
+### Decision
+Choose **D**: a 2-week discovery sprint with the access request filed on day 1 and a narrow prototype
+built on the collected samples from week 2.
+- **The 3-week security review is the critical path.** Filing on day 1 gives real data by the end of week
+  3, leaving weeks 4 to 6 to build and test on it. C files in week 4 and gets access in week 7, after the
+  demo.
+- **Eight interviews cover every role:** the Head of Customer Service (champion), the CFO (buyer), the
+  finance controller (risk), four support agents across both shifts and the helpdesk admin.
+- **The finance controller interview sets autonomy.** The over-$200 rule and the controller's answer on
+  unreviewed actions decide whether the agent drafts replies or issues refunds. A and B guess at it.
+- **The 50 real emails become the eval seed** for the demo, so the CFO sees results on real cases.
+
+**What would change it:**
+- **No sample emails by day 5:** commitment is not real; escalate to the sponsor and pause the prototype.
+- **Interviews show most delay is waiting for finance approval:** route over-$200 refunds faster first; the
+  AI role shrinks to summarising each case for the approver.
+- **Security review drops to days:** C becomes affordable, and fuller discovery is worth it.
+
+### Trade-offs accepted
+- **Fewer interviews per role than full saturation:** log new pains per interview and book two more if
+  the last support-agent interviews still add new workarounds.
+- **A prototype that may anchor users:** show it only after the past-event interviews end, and present it
+  as one hypothesis in the playback.
+- **A read-only demo, not an autonomous one:** the CFO sees drafted replies with order data, not refunds
+  issued; state this in the problem statement so expectations match.
+
+### Review rubric
+- Names the critical-path constraint (here access) and schedules discovery around it, with dates.
+- Lists interviewees by stakeholder role, including the risk owner and end users on every shift.
+- Quantifies the pain with the cost formula and shows the arithmetic.
+- States how the agent's autonomy will be decided and by whom, before any tool is built.
+- Defines a commitment gate (samples, access, sponsor) with a date and an escalation path.
+- Gives at least two findings that would change the plan.
 
 ## Why it exists
 - **Requests arrive solution-shaped.** An executive saw a demo and wants "an agent for procurement" or

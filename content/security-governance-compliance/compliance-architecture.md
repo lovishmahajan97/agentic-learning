@@ -5,7 +5,8 @@ name: Compliance architecture (GDPR, SOC 2, HIPAA, ISO 42001, EU AI Act, DPDP Ac
 kind: concept
 difficulty: advanced
 est_minutes: 25
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - security-governance-compliance/data-residency
@@ -41,6 +42,66 @@ erasure across memory and vectors, and automatic evidence.
   write its own evidence.
 - **What you can skip.** Interpreting the law yourself. Know what each regime broadly demands and its
   timelines, then let counsel decide; your job is turning their answer into controls.
+
+## Decision case
+### Scenario
+A 30-person startup sells a document-processing agent with long-term memory and retrieval. Next year's
+pipeline has 12 enterprise deals, and the team must choose how to meet their compliance demands. All
+effort figures are illustrative engineer-weeks.
+- **Regimes from the applicability matrix:** SOC 2 Type II for all 12 buyers; GDPR for 4 EU customers;
+  HIPAA for 2 US healthcare customers (PHI, BAAs required); DPDP for 1 Indian customer. No use falls in an
+  EU AI Act Annex III area.
+- **Contract terms:** the EU customers require EU-only processing, the healthcare customers require PHI to
+  reach only BAA-covered services, and both groups keep audit rights.
+- **Constraints:**
+  - 2 engineers at half time for 6 months: 26 engineer-weeks;
+  - the SOC 2 Type II observation period must start within 2 months, so controls must operate and leave
+    evidence from then on;
+  - agent tools are added most months, each a possible new data path.
+
+### Options
+| Option | How it works | Effort vs 26 | Type II evidence | Drift when a tool is added | Erasure across memory and vectors |
+|---|---|---|---|---|---|
+| **A. One project per regime** | SOC 2 sprint 10, GDPR register 6, HIPAA addendum 6, DPDP review 3 | 25: 1 week of slack, repeated each audit cycle | gathered by hand before the audit | caught only if someone updates four documents | per regime, by hand |
+| **B. Common controls, policies on paper** | one control set mapped to 4 frameworks (4) and an automation tool for cloud and identity evidence (6) | 10 | continuous for cloud and identity only | not caught: routing and deletion are not enforced | not built |
+| **C. Common controls enforced in the agent platform** | gateway region and agreement policy (4), deletion fan-out with receipts over 6 stores (6), audit event per tool call (4), evidence jobs (2), mapping to 4 frameworks (4) | 20 | continuous, including AI data paths | the gateway fails closed on an endpoint without the right agreement | receipts per store |
+
+### Decision
+Choose **C, common controls enforced in the agent platform**, because only enforcement can prove the
+contract terms that carry audit rights.
+- **Capacity:** 20 engineer-weeks fits under 26; A uses 25 and must repeat its manual evidence each cycle.
+- **Type II:** C's controls emit evidence from the first day of the observation period, which A cannot
+  reconstruct afterwards.
+- **Drift:** a new tool calling a US endpoint with EU data is denied at the gateway; under B it is a policy
+  breach nobody sees.
+- **Agent data paths:** deletion reaches memory, vectors and eval sets with a receipt each, so an erasure
+  request is answered with evidence.
+- **Reuse:** C can still use B's automation tool for generic cloud and identity evidence.
+
+**What would change it:**
+- **One framework only** (SOC 2 for US-only buyers): a direct checklist is simpler, as the lesson's
+  trade-offs note.
+- **Capacity below 20 weeks:** phase it. Gateway policy and the audit trail first (8 weeks), because
+  contracts name them; deletion fan-out next.
+- **The healthcare deals fall through:** drop the BAA routing branch and the HIPAA mapping.
+
+### Trade-offs accepted
+- **Fail-closed routing causes outages.** When the only BAA-covered endpoint is down, healthcare tenants
+  get errors. Track deny counts per tenant and tell those customers how degraded mode behaves.
+- **The control map needs an owner.** Frameworks change; review the mapping quarterly and track controls
+  with no fresh evidence in their period.
+- **New features wait for agreements.** A tool that sends data to a SaaS vendor without a DPA cannot ship
+  until one is signed. Track time from tool request to allow-list entry.
+- **Effort figures are estimates.** Re-plan after the gateway work, the best-understood piece, is done.
+
+### Review rubric
+- **An applicability matrix is shown** with regime and role per customer segment.
+- **Effort is costed per option** against stated capacity and the audit timeline.
+- **Each contract term maps to a control** that is enforced, not only documented, with its evidence named.
+- **Agent-specific data paths are covered:** prompts to model providers, tool results, memory, vectors and
+  eval sets.
+- **Fail-closed behaviour for regulated data is stated** along with its availability cost.
+- **Conditions that would change the choice** are listed, each tied to a regime, deal or capacity number.
 
 ## Why it exists
 - **An enterprise AI product meets several regimes at once.** A European customer brings GDPR; a US hospital

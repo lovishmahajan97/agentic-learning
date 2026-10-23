@@ -5,7 +5,8 @@ name: Agent loop
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -144,6 +145,26 @@ flowchart TD
     B -->|"yes"| R
     B -->|"no"| Z["Final call, tools off: status report"]
 ```
+
+## Misconceptions
+- **"The model runs the tools."** The model only emits a tool name and JSON arguments; your harness
+  decides whether to execute, ask a human or refuse. That is why policy, budgets and logging live in
+  your code, not in the prompt.
+- **"The model remembers earlier steps between calls."** Each iteration is a stateless call, so the
+  transcript you resend is the only memory. Drop a `tool_use` block or send only the latest result and
+  the model repeats itself or the API rejects the unmatched `tool_use_id`.
+- **"`end_turn` is the only stop that matters."** `max_tokens` means truncated, not finished, and a
+  harness budget trip means unfinished work. Each needs its own handling and an explicit status, not the
+  same "return the text" branch.
+- **"A tool exception should end the run."** Returned as an `is_error` result, the failure is just
+  another observation the model can recover from, such as a mistyped order id. Raised, it throws away
+  every step already paid for.
+- **"Cost grows linearly with steps."** The whole history is resent each call, so input tokens grow
+  roughly quadratically: about 375k for a 20-step run whose final transcript is ~33k. Prompt caching on
+  an append-only prefix is what makes long loops affordable.
+- **"Frameworks run a different, smarter loop."** LangGraph, the Agents SDK and the Claude Agent SDK
+  wrap this same loop with defaults such as `recursion_limit` or `max_turns`; their errors map back to
+  its steps.
 
 ## Examples
 ### A complete manual loop

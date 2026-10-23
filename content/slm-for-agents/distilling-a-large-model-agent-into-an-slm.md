@@ -6,7 +6,8 @@ kind: concept
 difficulty: advanced
 est_minutes: 17
 agent_relevance: useful
-status: mastery-verified
+status: typed
+lesson_type: concept
 mastery: implement
 code_tested: partial
 prerequisites:
@@ -109,7 +110,44 @@ flowchart TD
     E -->|"meets gate"| D["Deploy with fallback to teacher"]
 ```
 
+## Misconceptions
+- **"Distillation means matching the teacher's logits."** That is classic distillation and needs the
+  teacher's token probabilities. A closed API returns only text, so agent distillation is mostly
+  sequence-level fine-tuning on filtered trajectories; token-level matching needs an open-weight teacher,
+  usually with a shared tokenizer.
+- **"Every teacher run is good training data."** The teacher fails, loops and wastes calls too, and the
+  student copies whatever it sees. In the scenario below only 4,100 of 10,000 runs (41%) survive the
+  verifier, dedup and efficiency filters; the filter, not the raw count, sets what the student learns.
+- **"An LLM judge is a safe filter."** Judge mistakes become training labels: fluent but ungrounded answers
+  pass and the student learns to produce them. Prefer programmatic checks of outcomes in a sandbox, and
+  hand-check a sample of judge-passed traces each round.
+- **"A well-distilled student will beat the teacher."** It rarely exceeds the teacher on the task (about
+  89% vs 92% below) and inherits every blind spot the verifier cannot see, so keep the teacher as the
+  fallback for hard or escalated cases.
+- **"Distillation is a one-off project."** Tool schemas, prompts and traffic drift, so the student's
+  coverage decays. The failure loop (rerun the teacher on escalations, verify, retrain) and schema-versioned
+  datasets are part of running it, not an optional extra.
+
 ## Examples
+### Worked scenario: distilling an order-support agent
+Illustrative numbers for a 3-tool support agent, teacher = large hosted model, student = 3B model.
+
+| Stage | Count or result |
+|---|---|
+| Task inputs (real + synthetic) | 5,000 |
+| Teacher runs (2 samples each) | 10,000 |
+| Passed verifier | 7,200 (72%) |
+| After dedup and efficiency filter | 4,100 trajectories |
+| Student task success, prompted only | ~55% |
+| Student after SFT on 4,100 | ~85% |
+| After one round on student failures (+900) | ~89% |
+| Teacher task success | ~92% |
+
+- **Cost shape:** teacher generation is a one-off cost per data round; inference savings recur on every
+  request, so distillation pays off on high-volume agents.
+- **Deployment:** the student takes all traffic; runs over the step budget escalate to the teacher and
+  become the next round's training data.
+
 ### Collect and filter teacher trajectories
 This runs a teacher through an OpenAI-compatible chat API with one tool, verifies the outcome, and writes
 only successful runs as `{"messages": [...]}` lines for SFT. Point `base_url` at any compatible provider.
@@ -156,25 +194,6 @@ Feed `distill.jsonl` to the SFT recipe in fine-tuning-an-slm-for-an-agent-task a
 - **Tool-call arguments:** the OpenAI API returns `arguments` as a JSON string, while many Hugging Face chat
   templates expect a dict; convert with `json.loads` and inspect one rendered example.
 - **The `tools` column:** whether your trainer renders it into the chat template depends on its version.
-
-### Worked scenario: distilling an order-support agent
-Illustrative numbers for a 3-tool support agent, teacher = large hosted model, student = 3B model.
-
-| Stage | Count or result |
-|---|---|
-| Task inputs (real + synthetic) | 5,000 |
-| Teacher runs (2 samples each) | 10,000 |
-| Passed verifier | 7,200 (72%) |
-| After dedup and efficiency filter | 4,100 trajectories |
-| Student task success, prompted only | ~55% |
-| Student after SFT on 4,100 | ~85% |
-| After one round on student failures (+900) | ~89% |
-| Teacher task success | ~92% |
-
-- **Cost shape:** teacher generation is a one-off cost per data round; inference savings recur on every
-  request, so distillation pays off on high-volume agents.
-- **Deployment:** the student takes all traffic; runs over the step budget escalate to the teacher and
-  become the next round's training data.
 
 ## Production patterns
 - **Use your tracing store as the data pipeline.** Log teacher runs with prompt version and tool schema

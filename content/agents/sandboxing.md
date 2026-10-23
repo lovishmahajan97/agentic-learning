@@ -5,7 +5,8 @@ name: Sandboxing
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -159,6 +160,23 @@ flowchart TD
     SB -->|"copy out outputs"| RV["Human review"]
     SB -.->|"destroy on completion"| X["Nothing persists"]
 ```
+
+## Misconceptions
+- **"Running it in a container means it is sandboxed."** A container shares the host kernel, and the
+  usual leak is not an escape at all: free egress, a mounted home directory, an injected secret or a
+  reachable metadata endpoint hand over credentials without breaking any isolation.
+- **"Strong isolation is the whole job."** A microVM that stops host compromise but allows open egress
+  still leaks every secret it can read. Isolation, filesystem scope, egress, credentials and limits each
+  answer a different threat.
+- **"An egress allowlist closes exfiltration."** It shrinks the surface. An allowed host can still carry
+  data out (an issue comment, a package upload), DNS is a covert channel, and a hostname check without
+  checking the resolved address falls to rebinding.
+- **"The agent needs the API key inside the box to call the API."** A credential broker outside the box
+  holds a short-lived, scoped token and applies policy per call; the sandbox sees only the broker's
+  endpoint, so there is nothing to steal.
+- **"A sandbox keeps the agent's task safe."** It bounds what code can reach, not whether the output is
+  right. A malicious pull request or wrong report leaves through the reviewed exit, so review outputs and
+  gate consequential actions too.
 
 ## Examples
 ### A minimal container sandbox for model-written Python

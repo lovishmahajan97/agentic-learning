@@ -5,7 +5,8 @@ name: coding agent (repo navigation, edits, tests in a sandbox)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/agent-loop
@@ -37,6 +38,65 @@ human reviewing every diff.
   point.
 - **What you can skip at first.** Multi-repo changes, background autonomous runs and model fine-tuning.
   One repository with a working test command is enough.
+
+## Decision case
+### Scenario
+A 40-engineer company wants its coding agent to work routine issues in a Python monorepo and open pull
+requests. The platform team must choose where the agent's `run(cmd)` tool executes. All figures are
+illustrative planning numbers.
+- **Volume:** about 300 issues a month, so 300 / 20 working days = 15 tasks a day, up to 5 at once.
+- **Budget per task:** 30 minutes wall-clock cap, 2 vCPU and 4 GB; worst case 300 x 0.5 h = 150
+  sandbox-hours a month.
+- **Untrusted code:** the agent installs third-party packages and runs code it wrote, so treat every
+  command as hostile.
+- **Data residency:** source code may not leave the company's own cloud account.
+- **Network:** packages come from an internal mirror; nothing else is needed.
+- **Team:** two platform engineers who already run a Kubernetes cluster and container images for CI.
+- **Deadline:** pilot in 8 weeks.
+
+### Options
+| Option | How it works | Isolation | Residency | Ops load for 2 people |
+|---|---|---|---|---|
+| Developer laptops | Agent CLI runs commands on the engineer's machine | weak: host files, SSH keys and cloud credentials in reach | yes | none |
+| Plain containers on CI runners | One fresh container per task, `--network none` plus the mirror | shared host kernel; a kernel exploit escapes | yes | low: existing images |
+| Containers under gVisor on the cluster | Same images, a gVisor `RuntimeClass` (runsc) intercepts syscalls; egress policy allows only the mirror | a user-space kernel sits between the code and the host kernel | yes | moderate: one runtime class, compatibility testing |
+| Hosted sandbox service | Vendor runs microVMs behind an API | strong | no: code leaves the account | low |
+
+### Decision
+**Run each task in a fresh pod under gVisor on the existing cluster, with egress limited to the package
+mirror and no credentials mounted.** Laptops fail the untrusted-code constraint and the hosted service
+fails residency.
+
+Plain containers fit the deadline but rely on the host kernel as the only boundary for code that is
+hostile by assumption. gVisor keeps the team's images and tooling, so it fits the 8 weeks and two people.
+- **Per-task lifecycle:** create pod, copy the repository, run the loop, export the diff, delete the pod.
+- **Limits in the pod spec:** 2 vCPU, 4 GB, and a 30-minute `activeDeadlineSeconds`, so the cap does not
+  depend on the agent loop.
+- **Only the diff leaves:** the pull request is opened by a separate service, so the sandbox holds no
+  Git push token.
+
+**What would change it.**
+- **Test suite incompatible with gVisor:** if tests need Docker-in-Docker, unusual syscalls or GPUs, move
+  to Firecracker-style microVMs (for example Kata Containers) on the same cluster.
+- **Residency relaxed:** if code may leave the account, a hosted sandbox removes most of the ops load.
+- **Volume grows:** at 1,500 tasks a month the worst case is 750 sandbox-hours; re-check node capacity.
+
+### Trade-offs accepted
+- **Slower commands.** gVisor adds syscall overhead, which hurts I/O-heavy tests. Compare test-suite
+  duration under runsc and the normal runtime on 20 tasks, and watch the timeout kill rate.
+- **Compatibility work.** Some tools may fail under gVisor. Run the full suite in the sandbox during the
+  first week and keep a list of failures with workarounds.
+- **No open internet.** The agent cannot read docs online or fetch packages missing from the mirror.
+  Count tasks that fail on missing packages and add packages through review.
+
+### Review rubric
+- **Threat stated first:** the write-up says the code is untrusted and what an escape would reach.
+- **Every constraint checked per option:** isolation, residency, team capacity and deadline appear in
+  the comparison, not just isolation.
+- **Credentials accounted for:** it names which secrets exist where, and shows the sandbox holds none.
+- **Limits enforced outside the agent:** CPU, memory, wall-clock and egress live in the platform config.
+- **Capacity math shown:** tasks a day, concurrency and worst-case sandbox-hours follow from inputs.
+- **Exit criteria named:** what finding (incompatibility, residency change, volume) moves the decision.
 
 ## Why it exists
 - **The user problem.** Engineers spend hours on small bug fixes, dependency bumps, test gaps and

@@ -5,8 +5,9 @@ name: Logging
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: typed
 agent_relevance: core
+lesson_type: lab
 related:
   - observability/tracing
   - observability/monitoring
@@ -37,6 +38,189 @@ errors, redacted and retained by policy.
   audit path for tools with side effects.
 - **What you can skip.** Log shipper and indexer internals. Know binding, levels, payload policy, the
   canonical line and the audit split.
+
+## Lab
+### Task
+Make an agent worker's logs safe to use in an investigation. One thread runs a refund run for a
+signed-in user, then a nightly system job.
+
+The starter has three defects: the nightly job's lines inherit the first run's `user_id`, a failed
+refund writes the customer's email and a key-shaped token from nested tool arguments to the log, and
+there is no per-run summary to query. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's How it works (binding context once, redaction in the pipeline, the
+  canonical log line).
+- **Setup:** Python 3.12 with `pip install structlog pytest` (checked on structlog 26.1, pytest 9.1).
+  Save the starter as `lab_logging.py` and the tests as `test_lab_logging.py`.
+- **Done:** `python lab_logging.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: agent-run logs you can trust in an investigation (checked on Python 3.12, structlog 26.1)."""
+import io, re
+import structlog
+from structlog.contextvars import bind_contextvars, clear_contextvars, merge_contextvars
+
+SINK = io.StringIO()                                    # stand-in for stdout shipped to the log store
+SECRET = re.compile(r"\b(sk|key)-[A-Za-z0-9]{8,}")
+EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+MAX_CHARS = 200
+
+
+def redact(logger, method, event):
+    """LAB 2: mask SECRET as [REDACTED] and EMAIL as [EMAIL], and cap every string at MAX_CHARS,
+    at ANY depth: tool arguments arrive as nested dicts and lists."""
+    for k, v in list(event.items()):
+        if isinstance(v, str):
+            event[k] = EMAIL.sub("[EMAIL]", SECRET.sub("[REDACTED]", v))[:MAX_CHARS]
+    return event                                        # BUG: nested values pass through untouched
+
+
+structlog.configure(
+    processors=[merge_contextvars, structlog.processors.add_log_level, redact,
+                structlog.processors.JSONRenderer(sort_keys=True)],   # no timestamp: stable output
+    logger_factory=structlog.PrintLoggerFactory(file=SINK),
+    cache_logger_on_first_use=False,
+)
+log = structlog.get_logger()
+
+
+def get_order(order_id):
+    return {"id": order_id, "total": 40}
+
+
+def refund(order_id, amount, customer):
+    raise RuntimeError("card declined")
+
+
+TOOLS = {"get_order": get_order, "refund": refund}
+
+
+def run_agent(run_id, tenant, script, user_id=None):
+    """`script` stands in for the model: one reply per step.
+    LAB 1: a worker reuses this thread for many runs. Every record of a run must carry exactly
+           this run's run_id, tenant and (only if given) user_id, and nothing from earlier runs.
+    LAB 3: end every run with ONE canonical `run.summary` record: steps, tools (names in call
+           order), tool_failures and stop_reason ("final_answer" or "step_budget")."""
+    bind_contextvars(run_id=run_id, tenant=tenant)                 # BUG: earlier runs' fields survive
+    if user_id:
+        bind_contextvars(user_id=user_id)
+    for step, reply in enumerate(script, 1):
+        log.info("agent.step", iteration=step, decision=reply.get("name", "final"))
+        if reply["type"] == "final":
+            log.info("agent.stopped", reason="final_answer", steps=step)
+            return reply["text"]
+        try:
+            TOOLS[reply["name"]](**reply["args"])
+            log.info("tool.call", tool=reply["name"], status="ok")
+        except Exception as e:
+            log.warning("tool.failed", tool=reply["name"], error=str(e), args=reply["args"],
+                        returned_to_model=True)
+    log.warning("agent.stopped", reason="step_budget", steps=len(script))
+
+
+REFUND_RUN = [
+    {"type": "tool", "name": "get_order", "args": {"order_id": "A-103"}},
+    {"type": "tool", "name": "refund", "args": {"order_id": "A-103", "amount": 40, "customer": {
+        "email": "ana@example.com", "note": "card on file key-9f8e7d6c5b4a"}}},
+    {"type": "final", "text": "I could not refund A-103; a human will follow up."},
+]
+NIGHTLY_RUN = [                                         # a system job: no signed-in user
+    {"type": "tool", "name": "get_order", "args": {"order_id": "B-7"}},
+    {"type": "final", "text": "B-7 is fine."},
+]
+
+if __name__ == "__main__":
+    run_agent("run-1", "acme", REFUND_RUN, user_id="u-17")
+    run_agent("run-2", "globex", NIGHTLY_RUN)
+    print(SINK.getvalue(), end="")
+```
+
+As given, it runs and prints ten JSON lines: every `run-2` line ends with `"user_id": "u-17"`, the
+`tool.failed` line contains `ana@example.com` and `key-9f8e7d6c5b4a`, and no `run.summary` appears.
+
+### Expected output
+```
+{"decision": "get_order", "event": "agent.step", "iteration": 1, "level": "info", "run_id": "run-1", "tenant": "acme", "user_id": "u-17"}
+{"event": "tool.call", "level": "info", "run_id": "run-1", "status": "ok", "tenant": "acme", "tool": "get_order", "user_id": "u-17"}
+{"decision": "refund", "event": "agent.step", "iteration": 2, "level": "info", "run_id": "run-1", "tenant": "acme", "user_id": "u-17"}
+{"args": {"amount": 40, "customer": {"email": "[EMAIL]", "note": "card on file [REDACTED]"}, "order_id": "A-103"}, "error": "card declined", "event": "tool.failed", "level": "warning", "returned_to_model": true, "run_id": "run-1", "tenant": "acme", "tool": "refund", "user_id": "u-17"}
+{"decision": "final", "event": "agent.step", "iteration": 3, "level": "info", "run_id": "run-1", "tenant": "acme", "user_id": "u-17"}
+{"event": "agent.stopped", "level": "info", "reason": "final_answer", "run_id": "run-1", "steps": 3, "tenant": "acme", "user_id": "u-17"}
+{"event": "run.summary", "level": "info", "run_id": "run-1", "steps": 3, "stop_reason": "final_answer", "tenant": "acme", "tool_failures": 1, "tools": ["get_order", "refund"], "user_id": "u-17"}
+{"decision": "get_order", "event": "agent.step", "iteration": 1, "level": "info", "run_id": "run-2", "tenant": "globex"}
+{"event": "tool.call", "level": "info", "run_id": "run-2", "status": "ok", "tenant": "globex", "tool": "get_order"}
+{"decision": "final", "event": "agent.step", "iteration": 2, "level": "info", "run_id": "run-2", "tenant": "globex"}
+{"event": "agent.stopped", "level": "info", "reason": "final_answer", "run_id": "run-2", "steps": 2, "tenant": "globex"}
+{"event": "run.summary", "level": "info", "run_id": "run-2", "steps": 2, "stop_reason": "final_answer", "tenant": "globex", "tool_failures": 0, "tools": ["get_order"]}
+```
+
+### Tests
+```python
+import json
+import pytest
+from structlog.contextvars import clear_contextvars
+import lab_logging as lab
+
+
+@pytest.fixture
+def records():
+    clear_contextvars(); lab.SINK.seek(0); lab.SINK.truncate()
+    lab.run_agent("run-1", "acme", lab.REFUND_RUN, user_id="u-17")
+    lab.run_agent("run-2", "globex", lab.NIGHTLY_RUN)
+    return [json.loads(line) for line in lab.SINK.getvalue().splitlines()]
+
+
+def test_second_run_does_not_inherit_the_first_runs_context(records):
+    run2 = [r for r in records if r["run_id"] == "run-2"]
+    assert run2 and all(r["tenant"] == "globex" for r in run2)
+    assert all("user_id" not in r for r in run2), "run-2 carries run-1's user_id"
+
+
+def test_nested_tool_arguments_are_redacted(records):
+    text = lab.SINK.getvalue()
+    assert "ana@example.com" not in text and "key-9f8e7d6c5b4a" not in text
+    failed = next(r for r in records if r["event"] == "tool.failed")
+    assert failed["args"]["customer"] == {"email": "[EMAIL]", "note": "card on file [REDACTED]"}
+    assert failed["args"]["amount"] == 40                      # non-strings are left alone
+
+
+def test_long_values_are_capped_at_any_depth():
+    event = lab.redact(None, "info", {"event": "x", "args": {"blob": ["y" * 5000]}})
+    assert len(event["args"]["blob"][0]) == lab.MAX_CHARS
+
+
+def test_one_canonical_summary_per_run(records):
+    summaries = [r for r in records if r["event"] == "run.summary"]
+    assert [s["run_id"] for s in summaries] == ["run-1", "run-2"]
+    s1, s2 = summaries
+    assert (s1["steps"], s1["tools"], s1["tool_failures"], s1["stop_reason"]) == \
+        (3, ["get_order", "refund"], 1, "final_answer")
+    assert (s2["steps"], s2["tools"], s2["tool_failures"]) == (2, ["get_order"], 0)
+```
+
+On the starter all four fail for the intended reason: `run-2` lines carry `user_id`, the email
+survives in the nested arguments, a 5,000-character nested string is not capped, and there are no
+summaries.
+
+### Failure scenarios
+- **Inject: move `redact` before `merge_contextvars` in the processor list.** Then bind a field such as
+  `user_email`. Observe: the bound email reaches the sink unmasked although call-site fields are clean.
+  Debug: print the processor list; redaction must run after every step that adds fields.
+- **Inject: run `run_agent`'s tool logging inside a `ThreadPoolExecutor` without copying context.**
+  Observe: those lines have no `run_id` or `tenant`, so "every line of run-1" misses them. Debug: count
+  records without `run_id` per event name; wrap the callable with `contextvars.copy_context().run`.
+- **Inject: call `clear_contextvars()` at the end of a run instead of the start,** and make a tool
+  raise out of the loop. Observe: the next run inherits the crashed run's fields again. Debug: the
+  clear must sit at the entry point, where it runs whatever happened before.
+
+### Submission
+- **Code:** your `lab_logging.py` with LAB 1-3 done and every `# BUG` line fixed.
+- **Test run:** `pytest -q` showing 4 passed, plus your output next to Expected output.
+- **A query:** load your JSON lines into DuckDB or pandas and show tool failures per tool and stop
+  reasons per tenant from `run.summary` alone.
+- **A short note (3-5 sentences):** which fields of the refund belong in a separate audit record rather
+  than these sampled logs, and why.
+- **Evaluation:** tests pass, no email or key-shaped token in the output, and one summary per run.
 
 ## Why it exists
 - **Wrong answers do not raise.** A model can return a well-formed response that is wrong, truncated or

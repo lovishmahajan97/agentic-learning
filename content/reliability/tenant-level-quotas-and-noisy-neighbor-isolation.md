@@ -5,7 +5,8 @@ name: Tenant-level quotas & noisy-neighbor isolation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - reliability/bulkheads
@@ -37,6 +38,67 @@ the whole platform.
   dedicated keys for premium tenants.
 - **What you can skip.** Proofs about weighted fair queuing. Know deficit round robin well enough to see why
   round-robin by request is unfair for LLM traffic.
+
+## Decision case
+### Scenario
+An agent platform serves 60 business tenants through one LLM gateway. All figures are illustrative.
+- **Shared capacity:** one provider key rated at 2,000,000 tokens per minute (TPM). Daytime interactive
+  traffic across all tenants peaks near 900,000 TPM.
+- **The noisy tenant:** tenant A runs a nightly re-embed of 80,000 documents at about 500 tokens each, so
+  40,000,000 tokens, plus research agents that occasionally loop.
+- **The contract tenant:** tenant E's contract guarantees 300,000 TPM at any hour.
+- **Constraints:**
+  - interactive agents' p95 queue wait under 1 second for every tenant;
+  - A's backfill finishes inside an 8-hour night window (480 minutes);
+  - procurement allows at most one additional provider key;
+  - two engineers and three weeks; Redis is already in the stack.
+
+### Options
+| Option | How it works | Interactive p95 wait | A's backfill | E's 300k guarantee | Keys and effort |
+|---|---|---|---|---|---|
+| **A. Global limit only** | one bucket at 2M TPM, FIFO queue | fails: a backfill or a loop fills the queue ahead of everyone | 40M ÷ 2M = 20 min | none: E queues like everyone else | no new key, already built |
+| **B. Hard cap per tenant** | E carved out at 300k; the other 59 get 1.7M ÷ 59 ≈ 28,814 TPM each | met: no tenant can exceed its slice | 40M ÷ 28,814 ≈ 1,388 min, about 23 h: fails | met | no new key, about one week |
+| **C. Soft caps plus fair share** | per-tenant Redis bucket of 500k TPM with reserve-then-reconcile, deficit round robin across tenant queues, a batch lane, a 25-step run budget; E on its own 300k key | met: each active tenant gets one fair turn per cycle | at most 500k TPM: 40M ÷ 500k = 80 min | met by the dedicated key | one new key, about three weeks |
+| **D. Dedicated key per tenant** | 60 keys, one per tenant | met | limited by A's own key size | met | 59 new keys: fails procurement |
+
+### Decision
+Choose **C**, because it is the only option that meets all four constraints.
+- **Latency:** deficit round robin divides tokens, not requests, so A's 20k-token calls cannot crowd out B's
+  400-token chats, and the batch lane keeps the backfill behind interactive turns.
+- **Backfill:** fair share is work-conserving. With others idle at night, A's 80 minutes fit the 480-minute
+  window six times over, where B's hard cap needs 23 hours.
+- **Contract:** the vendor's limiter does not know about tenants, so only E's own key isolates its 300k
+  from vendor-side 429s. That uses the one key procurement allows.
+- **Delivery:** the Redis bucket and the dispatcher are about three weeks of work for two engineers.
+
+**What would change it:**
+- **More contract tenants** whose guarantees sum past roughly half of the shared key: carve-outs or more
+  keys are needed, and procurement must be renegotiated.
+- **A provider batch endpoint with its own quota:** move A's backfill there and drop the batch lane.
+- **Fewer than about ten tenants with predictable load:** B's hard caps become simpler and good enough.
+
+### Trade-offs accepted
+- **Redis sits on the hot path.** An outage must fail somewhere. Fall back to a per-replica limit of the
+  cap divided by replica count, and alert on Redis p99 latency.
+- **Reserving prompt plus `max_tokens` over-reserves.** Tenants hit 429 earlier than their real use
+  implies. Track the refunded share per tenant and lower default `max_tokens` where it stays high.
+- **E's key idles when E is quiet.** Watch E's key utilization; low use argues for a smaller guarantee at
+  renewal.
+- **Clients must honor `Retry-After`.** Watch 429 counts per tenant against useful throughput. A tenant
+  whose 429s climb while throughput stays flat is retrying blindly.
+
+### Review rubric
+- **Scarce units are named and metered in tokens and concurrency,** not requests, with the reserve and
+  refund step stated.
+- **Every option is scored against every constraint** with recomputed arithmetic (allowance per tenant,
+  backfill time).
+- **Bounding the total is separated from dividing it fairly,** and the write-up says which mechanism does
+  each.
+- **Vendor-side limits are handled explicitly:** the write-up says which tenants need their own key or
+  deployment and why pooling cannot isolate them.
+- **A per-run step or token budget sits inside the tenant quota,** with what the agent sees when it hits
+  either.
+- **At least two triggers that would change the decision** are tied to a measurable signal.
 
 ## Why it exists
 - **Shared pools, one bursty tenant.** Every tenant draws on the same scarce pools: provider

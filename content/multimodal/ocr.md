@@ -5,7 +5,8 @@ name: OCR
 kind: concept
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - multimodal/document-understanding
@@ -153,6 +154,24 @@ flowchart TD
     C -->|"no"| E["Crop, upscale, re-OCR or escalate"]
     E -.->|"still low"| H["Cloud OCR, VLM or human review"]
 ```
+
+## Misconceptions
+- **"OCR is mostly about recognising characters."** Glyph recognition is the solved part; most failures
+  come from image quality, finding which pixels are text, and reading order. Interleaved columns with
+  every word spelled correctly are a layout bug, fixed by the page segmentation mode, not a new engine.
+- **"Engine confidence is a probability."** A "95-confidence" word can be wrong far more often than 5%
+  of the time, and scores are not comparable across engines. Plot error rate per confidence bucket on
+  labelled scans and set the threshold from that curve.
+- **"Language-model correction always improves accuracy."** It helps prose and corrupts codes: part
+  numbers and IDs get rewritten into dictionary-like strings. Turn dictionaries off for code and amount
+  fields.
+- **"A VLM is simply a better OCR engine."** It reads messy layouts, but under ambiguity it emits a
+  plausible digit with no confidence and no box, so errors become undetectable. Keep it as an escalation
+  rung for flagged crops.
+- **"Every PDF needs OCR."** Born-digital pages already carry exact text; OCR-ing them only adds errors
+  and cost. Check for a text layer first.
+- **"A low CER means the page was read correctly."** CER on a flattened string hides reading-order and
+  table-structure errors, so track layout errors separately.
 
 ## Examples
 ### Tesseract with preprocessing and a confidence gate

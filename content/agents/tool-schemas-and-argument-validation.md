@@ -5,7 +5,8 @@ name: Tool schemas & argument validation
 kind: practice
 difficulty: core
 est_minutes: 13
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -132,6 +133,23 @@ flowchart TD
     A --> X
     E -->|"retry, capped at 2 or 3"| C
 ```
+
+## Misconceptions
+- **"Strict mode means I can skip validation."** Constrained decoding removes shape errors only. A
+  well-typed `amount_cents` can still be 100x too large, an order id can still not exist, and keywords
+  outside the provider's subset (such as numeric bounds on Anthropic) are enforced only by your validator.
+- **"The schema is just a type check for my code."** It is the model's whole documentation of the tool.
+  A bare string `date` invites "next Friday"; a description with format and example fixes most "bad
+  arguments" before any validator runs.
+- **"Generating the schema from my database model saves work."** Thirty optional fields become thirty
+  chances to invent a value. A purpose-built input model with few parameters, enums and units in the
+  names is what the model fills reliably.
+- **"Passing `tenant_id` as an argument is fine if I validate it."** Validation checks format, not who is
+  calling; the model passes whatever id is in its context, injected ones included. Scope comes from the
+  session, and "not yours" returns the same message as "not found".
+- **"Fail fast: raise on the first bad field."** Raising kills the loop, and reporting one field at a time
+  costs a model round trip per field. Return one `is_error` result naming every bad field and its fix,
+  and cap retries at two or three.
 
 ## Examples
 ### One Pydantic model for schema and validator

@@ -5,7 +5,8 @@ name: Model integration
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/ai-gateway
@@ -34,6 +35,65 @@ capability check, ported prompts and the customer's suite as the gate.
   per-model prompt versions, the error taxonomy, pinned versions and the gate: contract tests, regression
   suite, shadow.
 - **What you can skip.** Each provider's full SDK surface; map only the fields your loop reads.
+
+## Decision case
+### Scenario
+A bank is moving your 6-tool support agent off a hosted model. Its security team mandates an open-weight
+model on the bank's own GPUs, with a 32,000-token window and no parallel tool calls. This is the
+migration from the agent scenario below, with the bank's 200-case regression suite as the gate.
+
+Constraints (figures illustrative):
+- **Data boundary.** No prompt, document or tool result may leave the bank's network, including during an
+  outage, so a hosted fallback is not allowed.
+- **Acceptance.** At least 170 of 200 suite cases (85%) must pass, and every tool call must parse.
+- **Deadline.** Go-live in 6 weeks.
+- **Context.** Prompts pack 10 chunks of 2,000 tokens; the new tokenizer counts about 15% more.
+- **Capacity.** Two GPU nodes, sized for the current median of 4 steps per task.
+
+### Options
+| Option | How it works | Meets acceptance? | Deadline | Data boundary |
+|---|---|---|---|---|
+| **A. Swap the endpoint and model name** | Point the loop at the new server, run a smoke test | No: 131 / 200 and 88% of tool calls parsed | Days | Yes |
+| **B. Full integration** | Adapter into `Completion`, capability check, chat-template test, token recount, ported prompts, mapped errors, suite and shadow | Yes: 176 / 200, 100% parsed | About 3 to 4 weeks | Yes |
+| **C. B plus a fine-tuned adapter** | Also run the fine-tuning pipeline on the bank's traces | Possibly higher than 176 | Fails: permission review, pipeline and gate add weeks | Yes, if trained in the bank's cloud |
+| **D. Ask for an exception** | Keep the hosted model behind a private endpoint | 182 / 200 | Depends on the bank | Only if its security team agrees |
+
+### Decision
+Choose **B**, because it meets acceptance inside the deadline without touching the boundary:
+- **Most of the gap was mechanical.** Parsing string arguments and fixing the chat template take tool
+  parsing from 88% to 100% and pass from 131 to 176.
+- **176 / 200 is 88%**, above the 85% bar. The 6 cases below the hosted model's 182 go to the bank as
+  paired flips, so it accepts the gap with evidence.
+- **The context budget is recomputed.** At +15% the old pack totals about 33,300 tokens, over the window,
+  so the packer deliberately takes 9 chunks, not 10.
+- **The capability check runs at deploy.** No parallel tool calls means the loop is configured for one
+  call per turn, which the contract tests cover.
+- **The fallback stays inside the network.** It is a second replica of the same model, with handoff to a
+  human queue, and it runs the same suite.
+
+What would change it:
+- **Pass below 170 after porting.** Then C is worth its weeks, and go-live moves.
+- **An in-tenancy hosted model offered by the bank's cloud.** Then D becomes a cost and quality comparison.
+- **A later need for parallel tool calls.** Then the capability entry fails at deploy, and the model choice
+  is reopened.
+
+### Trade-offs accepted
+- **About 3 points of task pass (91% to 88%).** Watch the bank's flipped cases and its escalation rate
+  per week after go-live.
+- **More steps per task.** The median rises from 4 to 5, about 25% more model calls. Watch GPU utilisation
+  and step-budget hits, and add capacity before they climb.
+- **One fewer retrieved chunk.** Watch quality on long, document-heavy questions in the suite.
+- **No hosted fallback.** Watch replica health and the share of requests handed to humans during outages.
+
+### Review rubric
+- **Mechanical differences are listed and tested.** The write-up names tool-call format, chat template,
+  tokenizer, finish reasons and errors, each with a test.
+- **The gate is the customer's suite.** It reports pass counts and paired flips, not a smoke test.
+- **Budgets are recomputed.** It redoes the context arithmetic with the new tokenizer and states what was cut.
+- **Fallback respects the constraints.** It says what serves traffic in an outage, and that it was tested.
+- **Cost and capacity are per task.** It uses steps per task, not cost per token.
+- **Reversal conditions are concrete.** It names the pass rate, capability or contract fact that would
+  change the choice.
 
 ## Why it exists
 - **In customer work the model is often not your choice.** A bank requires inference inside its own cloud

@@ -5,7 +5,8 @@ name: ETL / ELT for RAG
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - data-architecture/ingestion-pipelines
@@ -39,6 +40,69 @@ projection you can re-tune without re-crawling.
   eval.
 - **What you can skip.** Warehouse modelling theory (star schemas, slowly changing dimensions). The agent
   builder needs versioned stage tables, a cache and a reconciliation step.
+
+## Decision case
+### Scenario
+An insurer is building a claims-handler agent whose `search_docs` tool covers 400,000 policy documents and
+claim guides, averaging 4,000 tokens and 12 chunks each. Today a single script fetches, chunks, embeds
+and upserts. Figures are illustrative.
+
+The roadmap for the next six months has three changes: add contextual enrichment (month 1), switch to a
+semantic chunker (month 3) and upgrade the embedding model (month 5).
+
+Constraints:
+- **Compliance.** National ID numbers in claim guides must never be persisted outside the source system.
+- **Source rate.** The document system serves about 5 documents a second to the pipeline, so a full
+  re-crawl takes 80,000 s, about 22 hours.
+- **Cutover window.** Each re-index must finish inside a 48-hour weekend and be reversible within minutes.
+- **Team.** Three engineers who already run Airflow and Parquet tables on object storage.
+- **Spend.** LLM enrichment is the largest pipeline cost and finance wants it paid for once per chunk text.
+
+### Options
+| Option | How it works | PII rule | Cost of the three roadmap changes | Weekend cutover and rollback |
+|---|---|---|---|---|
+| **A. Single-pass ETL script** | Fetch, redact, chunk, enrich, embed, upsert; only the index is kept | Pass | Each change re-crawls and re-enriches: three full passes of about 21 billion input tokens each | Re-crawl alone is 22 h; rollback means another rebuild |
+| **B. Pure ELT** | Land raw bytes unredacted, run every transform after the load | Fails: raw copy holds ID numbers | Low | Pass |
+| **C. Redact before load, staged ELT after** | Redaction at the landing boundary, then stored `parsed`, `chunks`, `enriched` and `embeddings` tables with a text-hash cache and alias cutover | Pass | Enrichment runs fully once and again only for chunk text the new chunker changed; the model upgrade costs one embedding pass | Pass: re-runs start from `parsed`; the old index stays behind the alias |
+| **D. Vendor-managed ingestion** | The vector database's connector parses, chunks and embeds | Depends on the vendor; redaction has to happen before it | Each change is a vendor re-ingest; no intermediates to reuse | Vendor-dependent; hard to compare two versions |
+
+The arithmetic behind the columns: 400,000 × 12 = 4.8 million chunks. One embedding pass at about 400 tokens
+per chunk is about 1.9 billion tokens. Enrichment at 4,400 input tokens per chunk is about 21 billion, roughly
+11 times the embedding pass.
+
+### Decision
+Choose **C**, because it is the only option that passes the PII rule and the spend constraint together:
+- **Compliance forces ETL for exactly one step.** Redaction runs before the landing write, so no stored
+  table ever holds an ID number; every quality-driven step stays after the load.
+- **The roadmap is three transformation changes and zero source changes.** Stored stages turn each into a
+  re-run from `parsed` or `chunks`, never a 22-hour re-crawl.
+- **Enrichment is paid once per chunk text.** With structure-aligned chunking, the month-3 chunker change
+  re-enriches only chunks whose text moved. The month-5 model change costs about 1.9 billion embedding
+  tokens instead of another 21 billion enrichment tokens.
+- **The team already runs the tools.** Airflow tasks over Parquet tables need no new platform.
+
+What would change it:
+- **Encrypted raw storage approved.** If legal allows unredacted raw bytes in a restricted bucket, move toward B so
+  a redaction bug can be fixed by a replay instead of a re-crawl.
+- **A small static corpus.** At a few thousand files that rarely change, A with a kept raw copy is cheaper to run.
+- **No planned transformation changes.** If the chunker and model were frozen for a year, the stage tables would mostly be storage.
+
+### Trade-offs accepted
+- **Redaction is not replayable.** A redaction bug means re-fetching affected documents. Watch redaction
+  recall on a labelled sample every release and keep a re-fetch lane with its own rate budget.
+- **Storage for stages and two indexes.** Two embedding models coexist during the month-5 migration:
+  4.8 million × 1,536 float32 dimensions × 4 bytes is about 29.5 GB per model, so about 59 GB during the overlap.
+- **More moving parts.** Gates on parse yield, empty chunks and orphan count must be maintained; a gate failure blocks promotion.
+- **Mixed versions during cutover.** Tool-call traces log `chunker_version` and the index version, so a
+  regression is attributed to the right build.
+
+### Review rubric
+- **Compliance steps are separated from quality steps.** The write-up names which transforms run before the load and why.
+- **Change frequency is the driver.** It lists the planned transformation changes and costs each option against them.
+- **Costs are recomputed.** Chunk counts and embedding and enrichment tokens are derived from corpus numbers.
+- **Cutover and rollback are concrete.** Alias switch, the agent-eval gate and how long rollback takes are stated.
+- **The irreversible step is named.** It says what cannot be replayed and how that risk is watched.
+- **Reversal conditions are specific.** It says which policy, corpus size or roadmap change flips the choice.
 
 ## Why it exists
 - **The terms come from data warehousing.** ETL was the norm when warehouse storage and compute were

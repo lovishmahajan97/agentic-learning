@@ -5,7 +5,8 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - backend-fundamentals/redis
@@ -37,6 +38,207 @@ limits, run locks, short-term memory, token streams and BullMQ's store.
   persistence per instance, and whether each Redis call fails open or fails fast.
 - **What you can skip.** Redis internals, replication protocol details and most data structures. Strings,
   hashes, lists, sorted sets, Streams and Lua scripts cover nearly every agent use.
+
+## Lab
+### Task
+Harden two Redis helpers every agent worker in a fleet calls: a completion cache and a per-run lock.
+The drafts work in a single-user demo. Under load, one cache expiry turns into 20 paid model calls, a
+Redis outage fails agent steps that never needed Redis, and a worker whose lock expired deletes the
+next owner's lock.
+- **Agent goal:** a cold cache costs one model call, Redis down degrades to "no cache", and one run
+  has one driver at a time.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** this lesson's "Atomicity: single thread, MULTI, Lua" and "Typical AI-service uses"
+  sections, and the run-lock example.
+- **Needs:** Node 20+ with `npm i ioredis ioredis-mock` and `npm i -D tsx vitest`. `ioredis-mock`
+  implements the ioredis API in memory, Lua `EVAL` included, so no server is needed; instances in one
+  process share data, like replicas sharing one Redis. Checked with Node 24.21, ioredis 5.11.1,
+  ioredis-mock 8.13.1, tsx 4.23 and vitest 5.0.5.
+
+### Starter code
+```ts
+// redis-lab.ts: a single-flight completion cache and a safe run lock for agent workers
+// ioredis-mock implements the ioredis API in memory (Lua included), so no server is needed.
+import RedisMock from "ioredis-mock";
+import { createHash, randomUUID } from "node:crypto";
+import type Redis from "ioredis";
+
+export type Req = { model: string; system: string; messages: unknown[]; temperature: number };
+export type Opts = { ttlSec?: number; fillMs?: number; pollMs?: number; waitMs?: number };
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export const keyFor = (req: Req) =>
+  "llm:" + createHash("sha256").update(JSON.stringify([req.model, req.system, req.messages, req.temperature])).digest("hex");
+
+// A client for a Redis that is down: every command rejects, like ioredis with enableOfflineQueue: false.
+export const downRedis = new Proxy({}, { get: () => async () => { throw new Error("Connection is closed."); } }) as Redis;
+
+// YOUR CODE 1: the first draft is plain cache-aside, so N identical misses make N paid model calls.
+// Make it single-flight: the caller that wins `SET llm:fill:<hash> 1 NX PX fillMs` calls the model and
+// writes the cache; the others poll the cache key every pollMs for up to waitMs, then call the model
+// themselves. Sampled requests (temperature > 0) are never cached. Any Redis error must fall
+// through to `call()` instead of failing the agent step.
+export async function cachedComplete(redis: Redis, req: Req, call: () => Promise<string>, o: Opts = {}): Promise<string> {
+  const { ttlSec = 3600 } = o;
+  if (req.temperature !== 0) return call();
+  const key = keyFor(req);
+  const hit = await redis.get(key);
+  if (hit !== null) return hit;
+  const out = await call();
+  await redis.set(key, out, "EX", ttlSec);
+  return out;
+}
+
+// YOUR CODE 2: the first draft releases with a plain DEL and never refreshes. Make it store a random
+// token, refresh the TTL every ttlMs / 3 only while the token is still ours, and release with a
+// check-and-delete Lua script, so a worker whose lock expired cannot delete the next owner's lock.
+export async function withRunLock<T>(redis: Redis, runId: string, work: () => Promise<T>, ttlMs = 30_000): Promise<T | "busy"> {
+  const key = `run:${runId}:lock`;
+  const ok = await redis.set(key, "1", "PX", ttlMs, "NX");
+  if (ok !== "OK") return "busy";
+  try {
+    return await work();
+  } finally {
+    await redis.del(key);
+  }
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const redis = new RedisMock() as unknown as Redis;
+  let calls = 0;
+  const model = async () => { calls++; await sleep(50); return "Paris"; };
+  const req: Req = { model: "m-1", system: "You are terse.", messages: [{ role: "user", content: "Capital of France?" }], temperature: 0 };
+  const answers = await Promise.all(Array.from({ length: 20 }, () => cachedComplete(redis, req, model, { pollMs: 10 })));
+  console.log("answers", new Set(answers).size, "model calls", calls);
+  console.log("redis down:", await cachedComplete(downRedis, req, model).catch((e) => `threw ${e.message}`));
+
+  const a = withRunLock(redis, "r1", async () => { await sleep(100); return "A done"; }, 60);
+  await sleep(10);
+  await redis.del("run:r1:lock");                           // simulate expiry while A is paused in a long model call
+  const b = withRunLock(redis, "r1", async () => { await sleep(200); return "B done"; }, 10_000);
+  await a;
+  console.log("lock after A finished:", (await redis.exists("run:r1:lock")) ? "held by B" : "gone");
+  console.log(await b, "| lock after B:", (await redis.exists("run:r1:lock")) ? "still held" : "released");
+}
+```
+
+Run it with `npx tsx redis-lab.ts`. As given it prints `model calls 20`, `redis down: threw Connection
+is closed.` and `lock after A finished: gone`: worker A's plain `DEL` removed worker B's lock.
+
+### Expected output
+```
+answers 1 model calls 1
+redis down: Paris
+lock after A finished: held by B
+B done | lock after B: released
+```
+
+### Tests
+```ts
+// redis-lab.test.ts: run with `npx vitest run`
+import { beforeEach, describe, expect, it } from "vitest";
+import RedisMock from "ioredis-mock";
+import type Redis from "ioredis";
+import { cachedComplete, downRedis, keyFor, withRunLock, type Req } from "./redis-lab";
+
+const redis = new RedisMock() as unknown as Redis;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const req: Req = { model: "m-1", system: "s", messages: [{ role: "user", content: "hi" }], temperature: 0 };
+function fakeModel(ms = 50, failFirst = false) {
+  const m = { calls: 0, fn: async () => {
+    const n = ++m.calls; await sleep(ms);
+    if (failFirst && n === 1) throw new Error("529 overloaded");
+    return `answer ${n}`;
+  } };
+  return m;
+}
+beforeEach(async () => { await redis.flushall(); });
+
+describe("cachedComplete", () => {
+  it("makes one model call for 20 concurrent identical misses", async () => {
+    const m = fakeModel();
+    const out = await Promise.all(Array.from({ length: 20 }, () => cachedComplete(redis, req, m.fn, { pollMs: 10 })));
+    expect(m.calls).toBe(1);
+    expect(new Set(out)).toEqual(new Set(["answer 1"]));
+    expect(await redis.ttl(keyFor(req))).toBeGreaterThan(3000);
+  });
+  it("falls through to the model when Redis is down", async () => {
+    const m = fakeModel(1);
+    await expect(cachedComplete(downRedis, req, m.fn)).resolves.toBe("answer 1");
+  });
+  it("lets a waiter call the model itself when the filler fails", async () => {
+    const m = fakeModel(30, true);
+    const [first, second] = await Promise.allSettled([
+      cachedComplete(redis, req, m.fn, { pollMs: 10, waitMs: 100 }),
+      cachedComplete(redis, req, m.fn, { pollMs: 10, waitMs: 100 }),
+    ]);
+    expect(first.status).toBe("rejected");
+    expect(second).toEqual({ status: "fulfilled", value: "answer 2" });
+  });
+  it("never caches sampled output", async () => {
+    const m = fakeModel(1);
+    await cachedComplete(redis, { ...req, temperature: 0.7 }, m.fn);
+    await cachedComplete(redis, { ...req, temperature: 0.7 }, m.fn);
+    expect(m.calls).toBe(2);
+  });
+});
+
+describe("withRunLock", () => {
+  it("lets one worker drive a run", async () => {
+    const a = withRunLock(redis, "r1", () => sleep(30).then(() => "A"));
+    expect(await withRunLock(redis, "r1", async () => "B")).toBe("busy");
+    expect(await a).toBe("A");
+  });
+  it("refreshes the TTL while the work runs", async () => {
+    const a = withRunLock(redis, "r2", () => sleep(200).then(() => "A"), 60);
+    await sleep(150);
+    expect(await redis.exists("run:r2:lock")).toBe(1);      // 60 ms TTL, still held at 150 ms
+    await a;
+    expect(await redis.exists("run:r2:lock")).toBe(0);
+  });
+  it("never deletes a lock another worker now holds", async () => {
+    const a = withRunLock(redis, "r3", () => sleep(80).then(() => "A"), 60);
+    await sleep(10);
+    await redis.del("run:r3:lock");                         // A's lock expired during a pause
+    const b = withRunLock(redis, "r3", () => sleep(150).then(() => "B"), 10_000);
+    await a;
+    expect(await redis.exists("run:r3:lock")).toBe(1);
+    expect(await b).toBe("B");
+    expect(await redis.exists("run:r3:lock")).toBe(0);
+  });
+  it("releases the lock when the work throws", async () => {
+    await expect(withRunLock(redis, "r4", async () => { throw new Error("tool failed"); })).rejects.toThrow("tool failed");
+    expect(await redis.exists("run:r4:lock")).toBe(0);
+  });
+});
+```
+
+Four fail on the starter with `AssertionError`: 20 model calls instead of 1, a rejected promise when
+Redis is down, a lock that expired at 60 ms, and B's lock deleted by A. Four pass already and are
+guards: the waiter fallback, sampled output, `busy` and release-on-throw must survive your change.
+
+### Failure scenarios
+- **Inject a waiter loop with no `waitMs` cap.** The filler-fails test hangs until Vitest's 5 s
+  timeout: one failed model call now blocks every waiting agent step. Log how long each caller waited
+  and which path served it (hit, filled, polled, own call).
+- **Inject `await` on the cache write after the model call.** Nothing fails here, but with Redis slow
+  rather than down, every miss now waits on it. Time the hot path with Redis delayed by 2 s; the write
+  must be fire-and-forget.
+- **Inject a refresh that calls `PEXPIRE` without the token check.** A paused worker that wakes up
+  extends B's lock under its own schedule, so two workers believe they own the run. Read the lock's
+  value before and after each refresh: it must equal your token.
+- **Inject a cache key built from `JSON.stringify(req)`.** Two requests with the same fields in a
+  different key order miss each other. Print the key per request; fixed field order is the fix.
+
+### Submission
+- **Your `redis-lab.ts`** with both `YOUR CODE` parts done; `keyFor`, `downRedis` and the demo
+  unchanged.
+- **A `npx vitest run` log** showing 8 passed, run three times in a row (timing tests must be stable).
+- **The `npx tsx redis-lab.ts` output**, matching the expected lines.
+- **A note of 3-5 sentences:** which Redis failures your cache fails open on, why the lock fails
+  closed, and what still needs a fencing token downstream.
+- **Evaluated on:** one model call per cold key, no throw on Redis errors, token-checked refresh and
+  release in Lua, and no new `KEYS` or blocking commands on the hot path.
 
 ## Why it exists
 - **In-process state breaks at two replicas.** Every `Map` becomes a bug: the rate limiter counts half

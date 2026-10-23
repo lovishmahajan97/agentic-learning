@@ -5,7 +5,8 @@ name: SLAs / SLOs (and SLIs, error budgets)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - reliability/high-availability
@@ -40,6 +41,67 @@ done correctly", not "returned 200".
   is spent.
 - **What you can skip.** Contract law. Know that the SLA sits below your SLO and that vendor SLAs cover
   availability, not latency or quality.
+
+## Decision case
+### Scenario
+An enterprise prospect's procurement team asks for a 99.95% monthly availability SLA on your support agent
+before it signs. All figures are illustrative.
+- **Dependencies on every task:** a model provider with a 99.9% SLA and a vector store with 99.95%.
+- **Measured history:** task availability, after retries and fallbacks, averaged 99.9% over six months;
+  the worst month was 99.82%.
+- **Constraints:**
+  - the deal signs in four weeks;
+  - procurement's floor is 99.5% (they asked for more, but will accept that);
+  - a missed month costs a service credit of 10% of the monthly fee;
+  - adding a fallback provider is estimated at six weeks for the team of three.
+
+### Options
+| Option | SLA and internal SLO | Can the stack support it? | Deadline | Measurable from the customer's side? |
+|---|---|---|---|---|
+| **A. Sign 99.95% now** | SLA 99.95% (21.6 min a month) | no: the ceiling is 0.999 × 0.9995 ≈ 99.85%; the provider alone may use 43.2 min | met | yes |
+| **B. Sign 99.5%, run 99.8% inside** | SLA 99.5% (216 min); SLO 99.8% (86.4 min) | yes: dependencies may use 64.8 min, leaving 21.6 min for your own failures; the worst month passed | met | yes: task outcomes counted at the gateway |
+| **C. Add a fallback, then sign 99.9%** | SLA 99.9% (43.2 min); SLO near 99.93% (30.24 min) | only with an independent fallback: about 99.95% ceiling, and independence is rarely true | fails: six weeks against four | yes |
+| **D. Sign a task-quality SLA** | "99% of tasks correct" | no: vendors do not promise quality | met | no: needs sampled evals the customer cannot audit |
+
+### Decision
+Choose **B**, because it is the only option that the stack can support, meets the deadline and can be
+measured from the customer's side.
+- **The ceiling:** A promises more than the dependencies allow. One month with the provider at its own SLA
+  breaches it twice over.
+- **The margin:** the 99.8% SLO leaves 216 − 86.4 = 129.6 minutes between the internal target and the
+  contract, room to detect and fix before a credit is owed.
+- **The evidence:** the worst measured month (99.82%) would have met both numbers. The SLO is set just
+  below history, not from aspiration.
+- **The roadmap:** offer C at renewal, once the fallback has run long enough to measure its real
+  independence.
+
+**What would change it:**
+- **Procurement refusing anything below 99.9%:** sign C's number with an effective date after the fallback
+  ships, and require 60 days of measured history first.
+- **A provider SLA raised to 99.99%:** the ceiling becomes about 99.94%, and a 99.9% SLA is within reach
+  without a fallback.
+- **A low-traffic customer:** at a few thousand tasks a month, one flaky client exhausts a high-nines
+  budget, so use a longer window or a time-based SLA.
+
+### Trade-offs accepted
+- **A weaker headline number than the prospect asked for.** Sales must explain the ceiling arithmetic.
+  Track whether the 99.5% floor costs deals.
+- **The SLA covers availability only.** Latency and quality stay internal SLOs with burn-rate alerts and
+  an eval gate. Watch the quality SLI's pass rate per pinned model version.
+- **Credit exposure is real.** Alert on the SLO's slow burn long before the SLA's budget is touched, and
+  report budget remaining in the monthly review.
+- **Your own share is small.** 21.6 minutes a month for your own failures means deploy-caused 502s must be
+  near zero. Measure them at the edge during every deploy.
+
+### Review rubric
+- **The dependency ceiling is computed** by multiplying serial SLAs, and no promise exceeds it without
+  stated redundancy.
+- **SLA and SLO are distinct numbers,** with the SLO stricter and the minutes of margin between them shown.
+- **The SLI is defined in one sentence a query can implement,** counting tasks after the resilience layer
+  rather than model calls.
+- **Targets are anchored in measured history,** including the worst month, not only the average.
+- **What the SLA does not cover** (latency, quality, cost) is named, with the internal SLO that covers it.
+- **At least two triggers that would change the commitment** are stated with numbers.
 
 ## Why it exists
 - **Without targets, reliability is argued by anecdote.** Product wants features, operations wants

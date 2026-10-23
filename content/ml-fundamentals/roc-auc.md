@@ -5,7 +5,8 @@ name: ROC-AUC
 kind: metric
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 related:
   - ml-fundamentals/confusion-matrix
@@ -160,6 +161,23 @@ flowchart TD
     K -->|"no"| D["Ship threshold"]
     E --> D
 ```
+
+## Misconceptions
+- **"An AUC of 0.8 means the model is right 80% of the time."** AUC is the probability a random positive
+  outscores a random negative. It says nothing about accuracy at any threshold; 0.5 is random ranking and
+  1.0 perfect separation.
+- **"A high AUC means the detector is ready to ship on rare positives."** AUC ignores prevalence, so it hides
+  alert volume. A vendor's 0.97 AUC at 0.2% positives still produced about 15,900 alerts a day at 5.7%
+  precision. Read the PR curve and TPR at your false-block budget.
+- **"High AUC means the probabilities can be trusted."** AUC is a rank statistic, blind to calibration:
+  scores all between 0.49 and 0.51 can reach 0.95, and temperature scaling never changes it. Check ECE or
+  Brier wherever the score is used as a probability.
+- **"The model with the higher total AUC is the better product."** You ship one operating point. A curve
+  that is higher in the low-FPR corner wins at a tight budget even with a smaller area, and with 60
+  positives a 0.03 gap barely clears zero on a paired bootstrap.
+- **"Tuning the threshold will make a weak confidence signal route well."** If AUROC of confidence against
+  "agent was right" is near 0.5, no threshold can work. Change the signal (log-probabilities, sampling
+  agreement) before tuning the cut.
 
 ## Examples
 ### Ten items by hand, then prevalence vs PR-AUC

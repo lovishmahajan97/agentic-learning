@@ -5,7 +5,8 @@ name: Domain modeling
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/domain-driven-design-and-bounded-contexts
@@ -36,6 +37,60 @@ retrieval filters and eval labels, so "active" or "closed" never silently mean t
 - **What you can skip.** Heavyweight DDD tactical patterns (repositories, domain events, full context maps)
   unless you are building the system of record; a glossary, a few entities, one or two state machines and
   the invariants are enough.
+
+## Decision case
+### Scenario
+A wholesale distributor wants an email agent that answers "where is my order?" and handles cancellations.
+All figures are illustrative.
+- **Two meanings of "order":** sales calls the customer's purchase a sales order (`SO-` numbers in the
+  CRM); the warehouse and finance work per shipment (`SH-` numbers in the ERP), each invoiced separately.
+  18% of sales orders split into 2 to 4 shipments.
+- **Volume and error cost:** 300 cancellation requests a week; cancelling something already picked costs
+  about $180 in return handling.
+- **Spike:** on 60 labelled emails, a prompt-only agent acted on the wrong entity in 9 (15%).
+- **Constraints:** 6 weeks to pilot; sales ops and finance SMEs can give two 2-hour sessions each; the
+  agent must not write to the ERP except through existing APIs.
+
+### Options
+| Option | How it works | Wrong-entity actions | SME time | Fits 6 weeks |
+|---|---|---|---|---|
+| A. One canonical "order" | Force one definition on both teams | Low for one team, wrong for the other | High: the definition is debated | Unlikely |
+| B. Prompt glossary only | Explain both meanings and let the model infer | 15%: 45 a week, about $8,100 a week at $180 | Low | Yes |
+| C. Two bounded contexts plus guarded tools | `SalesOrder` and `Shipment` models, an explicit mapping, identity resolution by key pattern, `cancel_sales_order` refusing anything picked | Spike: 1 in 60 wrong, 6 in 60 sent to a person; cancelling a picked shipment is refused in code | Moderate: four sessions | Yes |
+| D. Knowledge graph of all entities | Model customers, orders, shipments, invoices and returns as a graph | Low | High | No: build and sync cost |
+
+### Decision
+Choose **C**: model sales and fulfilment as two bounded contexts with an explicit translation, and give
+the agent tools on aggregate roots with the lifecycle guard inside.
+- **Identity resolution does most of the work:** the `SO-` and `SH-` patterns in the tool schemas resolve
+  the entity by key; emails without either go to the strong-attribute lookup or a person.
+- **The lifecycle guard caps the error cost:** a cancellation after "picked" is refused and returned to the
+  agent as data, so the $180 return case cannot happen through the tool.
+- **The mapping is small and testable:** one sales order to 1 to 4 shipments; "where is my order" for a
+  split order lists every shipment.
+- **B's error rate is too costly** at about $8,100 a week; A and D do not fit the SME time or deadline.
+
+**What would change it:**
+- **Sales and finance agree one definition in the first session:** collapse to one context and drop the
+  translation code.
+- **Customers rarely quote a number** (most emails reach a person): add order lookup by customer and date,
+  and re-check escalation volume.
+- **Questions start crossing returns, credits and invoices routinely:** reconsider a graph for those
+  traversals.
+
+### Trade-offs accepted
+- **About 10% of requests go to a person** (6 in 60, about 30 a week): track the share per resolution rule.
+- **Translation code to maintain:** test the sales-order-to-shipment mapping on every ERP release.
+- **The agent cannot cancel part of a split order:** count refused partial cancellations and add a tool
+  deliberately if they are frequent.
+
+### Review rubric
+- Lists each term with its meaning per team, with an example and a counter-example.
+- Decides between one context and several from evidence (SME disagreement, spike errors), not taste.
+- Puts identity resolution and lifecycle guards in tools and validators, not in the prompt.
+- Prices the wrong-entity error rate per week with the arithmetic shown.
+- States the escalation path and its expected volume.
+- Names the evidence that would collapse or extend the model.
 
 ## Why it exists
 - **Every organisation has a private dialect.** In one insurer "claim" means a single loss event; in

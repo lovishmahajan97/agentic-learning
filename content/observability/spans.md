@@ -5,8 +5,9 @@ name: Spans
 kind: concept
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: typed
 agent_relevance: core
+lesson_type: lab
 related:
   - observability/tracing
   - observability/distributed-tracing-across-services
@@ -35,6 +36,204 @@ failures you can find.
   streaming generation spans open until the stream ends.
 - **What you can skip.** The wire format and exporter internals. Know the fields, the lifecycle, the
   streaming trap and the cardinality rule.
+
+## Lab
+### Task
+Fix the spans of one support-agent turn so they answer the questions you will ask of them. The model
+first calls `get_order` with a typo, reads the error, retries correctly, then streams the answer.
+
+The starter gets four things wrong: the generation span ends before streaming starts, the failed tool
+span stays `UNSET` with no exception, the step is painted red although the agent recovered, and the
+order id leaks into span names. Time box: 45-60 minutes.
+- **Prerequisites:** this lesson's How it works (lifecycle, the streaming trap, the agent-loop status
+  rules) and tracing.
+- **Setup:** Python 3.12 with `pip install opentelemetry-sdk pytest` (checked on opentelemetry-sdk 1.45,
+  pytest 9.1). Save the starter as `lab_spans.py` and the tests as `test_lab_spans.py`.
+- **Done:** `python lab_spans.py` prints the expected output and `pytest -q` passes.
+
+### Starter code
+```python
+"""Lab: shape one agent turn's spans (checked on Python 3.12, opentelemetry-sdk 1.45)."""
+import json, time
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import Status, StatusCode
+
+EXPORTER = InMemorySpanExporter()           # tests read finished spans from here
+provider = TracerProvider()
+provider.add_span_processor(SimpleSpanProcessor(EXPORTER))   # demo only; BatchSpanProcessor in prod
+tracer = provider.get_tracer("support-agent")
+
+
+def fake_stream():                          # stand-in for a streaming model call: 4 tokens
+    time.sleep(0.05); yield "Order"
+    for w in (" A-103", " ships", " Friday."):
+        time.sleep(0.01); yield w
+
+
+def stream_generation(model):
+    """LAB 1: the caller iterates the returned tokens. The `generation` span must stay open until
+    the stream is exhausted, get a `first_token` event, set gen_ai.usage.output_tokens to the
+    number of tokens, and end with status OK (end it in `finally`)."""
+    with tracer.start_as_current_span("generation") as span:      # BUG: ends when the iterator is returned
+        span.set_attribute("gen_ai.request.model", model)
+        return fake_stream()
+
+
+def get_order(order_id):
+    if not order_id.startswith("A-"):
+        raise LookupError(f"no such order {order_id}")
+    return {"id": order_id, "status": "shipped"}
+
+
+TOOLS = {"get_order": get_order}
+
+
+def call_tool(name, args):
+    """LAB 2: one span per call named tool.<name> (no ids in names); args go in app.tool.args.
+    On an exception: record it on the span, set status ERROR with the exception's type name as the
+    description, and return the error to the model as {"ok": False, "content": ...}."""
+    with tracer.start_as_current_span(f"tool.{name}.{args['order_id']}") as span:   # BUG: id in the name
+        span.set_attribute("app.tool.args", json.dumps(args))
+        try:
+            result = TOOLS[name](**args)
+        except Exception as e:
+            return {"ok": False, "content": f"Tool {name} failed: {e}"}   # BUG: span stays UNSET, no exception event
+        span.set_status(Status(StatusCode.OK))
+        return {"ok": True, "content": str(result)}
+
+
+def agent_step(iteration, name, args):
+    """LAB 3: a step succeeded if the loop can continue. When the tool failed, add the event
+    `tool_error_returned_to_model` to the step span and still end the step with status OK."""
+    with tracer.start_as_current_span("agent.step") as span:
+        span.set_attribute("app.agent.iteration", iteration)
+        obs = call_tool(name, args)
+        if obs["ok"]:
+            span.set_status(Status(StatusCode.OK))
+        else:
+            span.set_status(Status(StatusCode.ERROR, "tool failed"))     # BUG: a recovered error paints the step red
+        return obs
+
+
+def run_turn():
+    with tracer.start_as_current_span("agent.run") as root:
+        agent_step(1, "get_order", {"order_id": "A1O3"})       # model copied a typo: letter O
+        agent_step(2, "get_order", {"order_id": "A-103"})      # model fixed it after reading the error
+        text = "".join(stream_generation("example-model"))
+        root.set_status(Status(StatusCode.OK))
+        return text
+
+
+def show(spans):
+    for s in sorted(spans, key=lambda s: s.start_time):
+        events = ",".join(e.name for e in s.events) or "-"
+        line = f"{s.name:<20} {s.status.status_code.name:<6} events={events}"
+        if s.name == "generation":
+            held = (s.end_time - s.start_time) / 1e9 >= 0.08
+            line += f"  output_tokens={s.attributes.get('gen_ai.usage.output_tokens')}"
+            line += f"  held_open={'yes' if held else 'no'}"
+        print(line)
+    print("distinct span names:", len({s.name for s in spans}))
+
+
+if __name__ == "__main__":
+    print(run_turn())
+    show(EXPORTER.get_finished_spans())
+```
+
+As given, it runs and prints the right answer, but the spans say `agent.step ERROR`,
+`tool.get_order.A1O3 UNSET`, `generation UNSET events=-  output_tokens=None  held_open=no` and
+`distinct span names: 5`.
+
+### Expected output
+```
+Order A-103 ships Friday.
+agent.run            OK     events=-
+agent.step           OK     events=tool_error_returned_to_model
+tool.get_order       ERROR  events=exception
+agent.step           OK     events=-
+tool.get_order       OK     events=-
+generation           OK     events=first_token  output_tokens=4  held_open=yes
+distinct span names: 4
+```
+
+The generation span now covers the 0.05 s to first token plus three 0.01 s tokens, so it lasts at
+least 0.08 s instead of a few microseconds.
+
+### Tests
+```python
+import pytest
+from opentelemetry.trace import StatusCode
+import lab_spans as lab
+
+
+@pytest.fixture
+def spans():
+    lab.EXPORTER.clear()
+    assert lab.run_turn() == "Order A-103 ships Friday."
+    return lab.EXPORTER.get_finished_spans()
+
+
+def one(spans, name):
+    found = [s for s in spans if s.name == name]
+    assert len(found) == 1, f"expected one {name} span, got {[s.name for s in spans]}"
+    return found[0]
+
+
+def test_generation_span_lives_as_long_as_the_stream(spans):
+    gen, root = one(spans, "generation"), one(spans, "agent.run")
+    assert (gen.end_time - gen.start_time) / 1e9 >= 0.08, "span ended before the stream was consumed"
+    assert [e.name for e in gen.events] == ["first_token"]
+    assert gen.attributes["gen_ai.usage.output_tokens"] == 4
+    assert gen.status.status_code == StatusCode.OK
+    assert gen.parent.span_id == root.context.span_id
+
+
+def test_failed_tool_call_is_an_error_on_the_tool_span(spans):
+    tools = sorted((s for s in spans if s.name.startswith("tool.")), key=lambda s: s.start_time)
+    assert [t.name for t in tools] == ["tool.get_order", "tool.get_order"]
+    bad, good = tools
+    assert bad.status.status_code == StatusCode.ERROR and bad.status.description == "LookupError"
+    assert "exception" in [e.name for e in bad.events]
+    assert good.status.status_code == StatusCode.OK
+
+
+def test_recovered_tool_error_keeps_step_and_run_ok(spans):
+    steps = sorted((s for s in spans if s.name == "agent.step"), key=lambda s: s.start_time)
+    assert [s.status.status_code for s in steps] == [StatusCode.OK, StatusCode.OK]
+    assert [e.name for e in steps[0].events] == ["tool_error_returned_to_model"]
+    assert one(spans, "agent.run").status.status_code == StatusCode.OK
+
+
+def test_span_names_are_low_cardinality(spans):
+    assert {s.name for s in spans} == {"agent.run", "agent.step", "tool.get_order", "generation"}
+```
+
+On the starter all four fail for the intended reason: a generation span of a few microseconds,
+tool spans named `tool.get_order.A1O3`, a first step with status `ERROR`, and five distinct names.
+
+### Failure scenarios
+- **Inject: end the span after the loop instead of in `finally`.** Then call `next()` twice on the
+  stream and `close()` it, as a client disconnect does. Observe: no `generation` span is exported at
+  all. Debug: count spans per name in the exporter; a missing span at the failing step means an exit
+  path skipped `end()`.
+- **Inject: set `gen_ai.usage.output_tokens` after `span.end()`.** Observe: the SDK logs `Setting
+  attribute on ended span.` and the attribute reads `None`. Debug: search logs for that warning; it
+  always means work done after the span froze.
+- **Inject: set `ERROR` on the tool span but drop `record_exception`.** Observe: the error-rate panel
+  looks right, yet trace detail has no exception type, message or stack. Debug: compare `ERROR` span
+  counts with spans carrying an `exception` event; the gap is your missing calls.
+
+### Submission
+- **Code:** your `lab_spans.py` with LAB 1-3 done and every `# BUG` line fixed.
+- **Test run:** `pytest -q` showing 4 passed, plus your script output next to Expected output.
+- **A streamed span from your own agent:** a console-exporter dump or backend screenshot showing the
+  `first_token` event and token usage on one generation span.
+- **A short note (3-5 sentences):** why the failed tool span is `ERROR` while the step and run are `OK`,
+  and which dashboard number each choice protects.
+- **Evaluation:** tests pass, names are low-cardinality, and the note ties status to user-visible failure.
 
 ## Why it exists
 - **A trace tree needs a node unit that does three jobs.** *Timing*, so durations can be summed and
