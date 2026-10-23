@@ -5,10 +5,10 @@ name: ANN indexes (HNSW, IVF)
 kind: concept
 difficulty: core
 est_minutes: 19
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
-code_tested: partial
+code_tested: yes
 prerequisites:
   - rag-retrieval/similarity-search
 related:
@@ -146,15 +146,15 @@ search_layer(q, entry, ef):
 - **Agent memory and live tool corpora** get writes all day, which favors HNSW's incremental inserts.
 - **Large static knowledge bases** an agent only reads can take IVF-PQ and scheduled re-training.
 
-### pgvector settings
+### pgvector settings (checked on 0.8)
 | Index | Build time | Query time (per session) |
 |---|---|---|
 | HNSW | `m` and `ef_construction` (defaults 16 and 64) | `hnsw.ef_search` (default 40) |
 | IVFFlat | `lists`: rows/1000 up to a million rows, √rows beyond | `ivfflat.probes` (start near √lists) |
 
 - **`ef_search` caps rows.** It bounds the candidate list, so a plain HNSW scan returns at most that many
-  rows: `LIMIT 100` with the default can quietly yield 40. Raise `ef_search`, or use the iterative index
-  scans added in pgvector 0.8.
+  rows: `LIMIT 100` with the default can quietly yield 40. Raise `ef_search`, or enable the iterative
+  index scans added in pgvector 0.8 (`hnsw.iterative_scan = relaxed_order`; off by default).
 - **Build IVFFlat after loading representative data,** since centroids come from the rows present at
   build time.
 
@@ -246,8 +246,9 @@ for nprobe in (1, 8, 64):
 print("flat", report(flat))
 ```
 
-- **Expect** recall to climb toward 1.0 as `efSearch` or `nprobe` grows, per-query time with it, and
-  `flat` at exactly 1.0.
+- **Expect** recall and per-query time to climb with `efSearch` or `nprobe`, and `flat` at exactly 1.0.
+  One faiss-cpu 1.13 run gave HNSW 0.28 → 0.87 and IVF 0.02 → 0.43; random data is hard, so these
+  are not typical.
 - **Timings are throughput,** batch time divided by 500 (FAISS parallelizes across queries), not
   single-query latency, which is what an agent's one-at-a-time tool calls pay.
 - **Flat looks competitive here** because batched flat search is one BLAS matrix multiply and 200k vectors

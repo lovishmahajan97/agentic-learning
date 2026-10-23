@@ -5,7 +5,7 @@ name: Citation correctness
 kind: metric
 difficulty: advanced
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes

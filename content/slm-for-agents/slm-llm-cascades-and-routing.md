@@ -6,7 +6,7 @@ kind: concept
 difficulty: core
 est_minutes: 15
 agent_relevance: core
-status: mastery
+status: mastery-verified
 mastery: evaluate
 code_tested: partial
 prerequisites:
@@ -116,7 +116,7 @@ The SLM runs locally through Ollama's OpenAI-compatible endpoint; the large mode
 provider. Pydantic validation is the escalation signal.
 
 ```python
-# pip install openai pydantic   (checked against openai 3.36.1, pydantic 2.14.1 with stub endpoints)
+# pip install openai pydantic   (checked against openai 3.37.0, pydantic 2.14.1 with stub endpoints)
 import json, os
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
@@ -144,7 +144,7 @@ def route(text):
         out = Route.model_validate(json.loads(ask(small, SMALL_MODEL, text)))
         if out.tool in TOOLS and (out.tool == "handoff_human" or out.order_id):
             return out, "slm"
-    except (json.JSONDecodeError, ValidationError):
+    except (json.JSONDecodeError, TypeError, ValidationError):   # TypeError: empty content
         pass                                        # invalid output is the escalation signal
     return Route.model_validate(json.loads(ask(large, LARGE_MODEL, text))), "llm"
 
@@ -297,7 +297,7 @@ model costs 10. A cascade escalates on failed tests and on an LLM judge (1 unit 
 
 **A strong answer:**
 - counts the small tier as 3 units, so cost is 3 + 0.55 × 10 = 8.5 against 10 with break-even at 70%: a
-  thin saving that idle GPU or retries can erase, and escalated calls pay both latencies;
+  thin 15% saving that lower utilisation or retries can erase, and escalated calls pay both latencies;
 - breaks escalation down by task type and routes the worst types straight to the large model;
 - fine-tunes the SLM on logged escalations and drops the judge where tests suffice.
 

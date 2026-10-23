@@ -5,7 +5,7 @@ name: Knowledge graphs
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -182,13 +182,13 @@ print(customers_exposed("CVE-123"))
   (`(s)-[:USES|DEPENDS_ON*1..6]->(l)`) and a recursive CTE with cycle handling in SQL.
 
 ### Agent tool: a parametrised, bounded, read-only graph query
-Instead of the agent writing Cypher: fixed query, parameters only, bounded path length, currently-valid
-edges, a row limit, read routing. Uses the Neo4j Python driver (checked with
+No agent-written Cypher: fixed query, parameters only, bounded path length, currently-valid edges, a row
+limit, a timeout, read routing. Uses the Neo4j Python driver (checked with
 5.28 and 6.4 against Neo4j 5.26); the tool schema and errors are what the agent loop sees.
 
 ```python
 import os, re
-from neo4j import GraphDatabase, RoutingControl
+from neo4j import GraphDatabase, Query, RoutingControl
 
 driver = GraphDatabase.driver(os.environ["NEO4J_URI"],
                               auth=(os.environ["NEO4J_USER"], os.environ["NEO4J_PASSWORD"]))
@@ -210,8 +210,8 @@ TOOL = {"name": "customers_exposed_to_cve",
         "input_schema": {"type": "object", "properties": {"cve": {"type": "string"}}, "required": ["cve"]}}
 
 def customers_exposed(cve: str, limit: int = 200):
-    records, _, _ = driver.execute_query(EXPOSED, cve=cve, limit=min(limit, 200),
-                                         routing_=RoutingControl.READ)
+    records, _, _ = driver.execute_query(Query(EXPOSED, timeout=5.0),   # server-side timeout, seconds
+                                         cve=cve, limit=min(limit, 200), routing_=RoutingControl.READ)
     return [r.data() for r in records]       # rows plus per-hop sources for citations
 
 def handle(args):
@@ -400,9 +400,9 @@ plus extracted meeting notes. After a reorg it lists people who left her team, m
 one text-to-Cypher query timed out the database. Diagnose and fix.
 
 **A strong answer:**
-- traces stale reports to edges without validity dates and missing sync, and new hires to sync lag;
+- traces departed reports to edges without validity dates, and new hires to sync lag;
 - loads reporting lines from the HR system by ID, closing old edges, rather than from notes;
-- replaces free-form Cypher with a bounded parametrised tool plus a timeout;
+- replaces free-form Cypher (likely an unbounded `*` path) with a bounded parametrised tool plus a timeout;
 - monitors sync lag and entities with two current managers.
 
 ## Use cases & projects

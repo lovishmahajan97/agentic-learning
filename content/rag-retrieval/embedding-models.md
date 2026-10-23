@@ -167,7 +167,7 @@ model's contract, and `normalize_embeddings=True` makes the matrix product a cos
 from sentence_transformers import SentenceTransformer
 import numpy as np
 
-model = SentenceTransformer("intfloat/e5-base-v2")   # asymmetric: needs "query: " / "passage: "
+model = SentenceTransformer("intfloat/e5-base-v2")   # asymmetric: needs "query: " / "passage: " (run on s-t 6.2.0)
 docs = [
     "passage: Refunds are issued to the original payment method within 5-7 business days.",
     "passage: Our office is closed on public holidays.",
@@ -210,8 +210,9 @@ def select_tools(user_msg: str, k: int = 2) -> list[str]:
     return [names[i] for i in order]
 
 print(select_tools("I want my money back for order 1182"))
-# Likely issue_refund first, with lookup_order a close second: only the selected schemas go
-# into this step's tool list. Check the ranking on logged requests rather than trusting a toy.
+# Checked with sentence-transformers 6.2.0: ['issue_refund', 'cancel_subscription'], so lookup_order,
+# which the request also needs, was missed at k=2. Only selected schemas go into this step's tool
+# list: measure selection recall on logged requests and keep a fixed core set.
 ```
 
 | Setup (illustrative) | Schema tokens per step |

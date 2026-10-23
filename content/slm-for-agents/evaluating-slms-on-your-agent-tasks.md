@@ -6,7 +6,7 @@ kind: concept
 difficulty: core
 est_minutes: 16
 agent_relevance: core
-status: mastery
+status: mastery-verified
 mastery: evaluate
 code_tested: partial
 prerequisites:
@@ -303,15 +303,16 @@ your tools.
 > from your own eval set run on the served configuration.
 
 ## Mastery test
-**Problem:** candidate A scores 91% task success and B 89% on your 50-case multi-step suite, one run each.
+**Problem:** candidate A scores 91% task success and B 89% on your 100-case multi-step suite, one run each.
 A has a 0.7 s p95 step latency, B 0.4 s. Your agent averages 8 steps per task and every failed task
 escalates to a large model. Which do you pick, and what would you check first?
 
 **A strong answer:**
-- treats a 2-point gap on 50 cases from one run as noise until repeated runs and more cases show spread;
-- converts latency to task terms: about 5.6 s versus 3.2 s per task;
+- treats a 2-task gap from one run as noise (standard error about 3 points per rate) until repeated runs
+  show spread;
+- converts latency to task terms: at most 5.6 s versus 3.2 s if every step hits p95;
 - compares cost per successful task including escalations, not raw success;
-- checks both were run on the served quantization and template, then picks under the gate.
+- checks both ran the served quantization and template, then picks under the gate.
 
 ## Use cases & projects
 ### Use cases

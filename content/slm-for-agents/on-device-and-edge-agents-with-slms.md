@@ -235,7 +235,6 @@ numbers.
   constrained; use a cloud model or a hybrid design.
 - **Measure** task success, tool-call parse rate, time to first token, tokens per second, peak memory and
   battery per task on target devices.
-- **Interviews:** link memory arithmetic, runtime choice and the cloud boundary.
 
 ## Exercise
 **Goal:** predict, then measure, whether an offline three-tool agent fits a 3 GB budget. No solution is
@@ -322,7 +321,7 @@ breaks, and what do you change?
 
 **A strong answer:**
 - adds it up: about 4 GB of weights, up to about 2 GB of KV cache at 16k for a GQA 7B, plus runtime and
-  app, so the box is at or past its limit;
+  app, so the box is at or past its limit, and a 16k prefill per request is slow on edge hardware;
 - retrieves catalog entries into a 2-4k context, or drops to a 3B model;
 - replaces "unsure" with checkable triggers (schema failure, verifier reject, user tap), redacted and logged.
 

@@ -5,7 +5,7 @@ name: GraphRAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: partial
@@ -74,8 +74,8 @@ large indexing bill must be repaid by queries.
    they are grouped by name and type, and an LLM writes one consolidated description. This is a crude form
    of entity resolution; name variants ("IBM" vs "International Business Machines") remain a known weak
    spot.
-4. **Build the graph:** nodes are entities, edges are relationships, weighted by how many times the
-   relationship was extracted across chunks (some versions also fold in the LLM's strength score).
+4. **Build the graph:** nodes are entities, edges are relationships, weighted by repeated extraction:
+   graphrag 3.3.0 sums the LLM's strength score across chunks (the paper describes normalised counts).
 5. **Detect communities** hierarchically with the Leiden algorithm, which partitions the graph into densely
    connected groups and recursively subdivides them. Leiden is used *because* it guarantees well-connected
    communities, which the older Louvain method does not.
@@ -97,8 +97,6 @@ large indexing bill must be repaid by queries.
 - **Cost scales with communities, not relevance:** the map step reads every report at the chosen level
   whatever the question. Newer versions can first rate reports for relevance and skip whole branches of the
   hierarchy that do not matter to the query.
-
-**Local search** is where multi-hop connection pays off.
 
 ### Exposing the modes to an agent
 - **One tool per mode.** `global_search` for themes and corpus-wide counts, `local_search` for named
@@ -237,6 +235,7 @@ In graphrag 3.3.0 the query is positional (older releases took `--query`); a hig
 ```bash
 pip install graphrag
 graphrag init --root ./incidents            # writes settings.yaml, .env and default prompts
+# (3.3.0 prompts for chat and embedding model names; pass --model and --embedding to skip)
 # put text files in ./incidents/input, set the model and API key in settings.yaml / .env
 graphrag index --root ./incidents           # extraction, graph, Leiden communities, reports
 graphrag query --root ./incidents --method global "Most common root causes?"
@@ -417,7 +416,8 @@ naming a restricted client. Diagnose and redesign.
 **A strong answer:**
 - traces the leak to one graph across tiers, since reports inherit every chunk, and builds one per tier;
 - ties staleness to frozen reports, measures report age, and picks a refresh cadence or deferred variant;
-- checks the tool log for global calls on lookups, caps them and fixes the community level;
+- ties rising cost to map calls growing with community count, so uses dynamic selection or a higher
+  level, and caps global calls on lookups;
 - gates the redesign on a per-type eval with chunk citations.
 
 ## Use cases & projects

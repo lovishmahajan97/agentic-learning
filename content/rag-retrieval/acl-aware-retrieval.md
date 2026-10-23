@@ -5,7 +5,7 @@ name: ACL-aware retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -193,7 +193,7 @@ client's shape; the identity and source clients are the customer's directory and
 
 ```python
 from types import SimpleNamespace as NS
-from qdrant_client import QdrantClient, models          # checked against qdrant-client 1.16
+from qdrant_client import QdrantClient, models          # checked against qdrant-client 1.16 and 1.20
 
 client = QdrantClient(":memory:")                         # local mode; use QdrantClient("http://localhost:6333") in prod
 client.create_collection("docs", vectors_config=models.VectorParams(size=2, distance=models.Distance.COSINE))

@@ -276,7 +276,7 @@ questions that they help. No solution is given.
   and end offsets; a `collapse(hits, k)` step; a table of recall@5, duplicates per top-5 and chunk count
   at 0, 10% and 20% overlap.
 - **Acceptance:** no chunk begins mid-sentence; merged spans sliced from the source never repeat text;
-  chunk counts match `(T − O) / (S − O)` within a few percent; you name the overlap you would ship.
+  chunk counts match `(T − O) / (S − O)` at your measured mean overlap; you name the overlap you ship.
 
 ## Role lens
 - **Engineer:** Sets size and overlap in the splitter, writes the adjacent-chunk collapse step in the

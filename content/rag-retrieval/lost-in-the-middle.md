@@ -5,7 +5,7 @@ name: Lost-in-the-middle
 kind: concept
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -200,7 +200,7 @@ def simulated_llm(ctx):                                 # stand-in with a U-curv
 random.seed(0)
 acc = position_sweep(simulated_llm, lambda ctx, q: ctx, "GOLD", [f"d{i}" for i in range(100)], "q",
                      grader=int, trials=300)
-print({p: round(acc[p], 2) for p in (0, 10, 19)})       # close to {0: 0.9, 10: 0.65, 19: 0.8}
+print({p: round(acc[p], 2) for p in (0, 10, 19)})       # seed 0: {0: 0.89, 10: 0.65, 19: 0.83}
 ```
 
 ### Worked numbers: rerank, cut, reorder
@@ -404,15 +404,15 @@ a bigger k.
 
 ## Mastery test
 **Problem:** a coding agent fixes a bug over 25 steps. At step 3 it reads a config file stating
-`retries=0`. At step 22 it proposes adding retry logic "since none is configured to exist", and its final
+`retries=0`. At step 22 it proposes adding retry logic "since none is configured", and its final
 patch contradicts that config. Context at step 22 is 70k tokens. Explain and fix without a bigger model.
 
 **A strong answer:**
-- places the config result deep in the middle, behind 19 steps of verbose tool output;
+- places the config result deep in the middle, behind 18 later steps of verbose tool output;
 - checks trace evidence first: the file content was in context, so this is present-but-unused, not
   retrieval;
 - trims tool outputs, compacts old turns into notes that keep key facts and ids, restates the task and
-  constraints last, and verifies with repeat-read counts on replayed runs.
+  constraints last, and verifies by replaying the run and checking the patch against the config.
 
 ## Use cases & projects
 ### Use cases

@@ -334,7 +334,7 @@ print(auto_merge(child_hits, children_of))
 **Goal:** decide, with evidence, which granularity set-up to ship for one corpus. No solution is given.
 - **Inputs:** a document set with headings (a product manual or policy set), 30 golden questions
   labelled factoid or explanatory with their gold section, and an evidence budget of 4,000 tokens.
-- **Deliver:** three retrievers over one index (passage-only, sentence match with section return and
+- **Deliver:** three retrievers over one corpus (passage-only, sentence match with section return and
   max-child scoring, and auto-merging) and a table of parent-level recall@5, evidence tokens per call
   and answer correctness, split by question type.
 - **Acceptance:** no call exceeds the budget; duplicate parents never appear in one result; you

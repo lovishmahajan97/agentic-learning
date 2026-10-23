@@ -5,7 +5,7 @@ name: Reranking (cross-encoder)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -190,6 +190,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as Timeout
 from sentence_transformers import CrossEncoder
 
 ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
+ce.predict([("warm up", "warm up")])   # at startup: a cold first call (0.3-0.8 s on CPU) misses BUDGET_S
 pool = ThreadPoolExecutor(max_workers=4)
 THRESHOLD = 0.0          # calibrated on labeled queries for THIS model version
 BUDGET_S = 0.15          # hard latency budget for the rerank step
@@ -245,10 +246,10 @@ pairs = [(query, passages[i]) for i in stage1]
 scores = ce.predict(pairs)                            # one joint forward pass per pair
 for i, s in sorted(zip(stage1, scores), key=lambda t: -t[1]):
     print(f"{s:+6.2f}  {passages[i][:60]}")
-# Typically the 14-day laptop rule and the general 30-day rule rise to the top two, and the
-# price-match and warranty passages fall. The exact order of the top two varies by model, and
-# neither model reasons that the exception overrides the rule: that is the LLM's job, so both must
-# survive into the top k.
+# One run (sentence-transformers 5.1): the 14-day laptop rule +5.79 first, unopened software +3.61,
+# the general 30-day rule +2.27, then warranty -1.98 and price-match -7.45 at the bottom. The order
+# of the top three varies by model, and neither model reasons that the exception overrides the rule:
+# that is the LLM's job, so k must be large enough (here 3) for the rule and exception to survive.
 ```
 
 ### Production snippet: windowed scoring plus a per-source cap

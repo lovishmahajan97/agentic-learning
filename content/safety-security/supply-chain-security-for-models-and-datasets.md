@@ -5,7 +5,7 @@ name: Supply-chain security for models & datasets
 kind: practice
 difficulty: core
 est_minutes: 17
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: yes

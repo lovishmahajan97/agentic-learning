@@ -5,7 +5,7 @@ name: Dense vs sparse retrieval
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -241,8 +241,8 @@ for q in queries:
     print("  dense ->", docs[int(np.argmax(dense))][:60], np.round(dense.max(), 2))
 ```
 
-- **Error-code query:** BM25 nails it, because "e4012", "px" and "200" are exact tokens. The dense model
-  may confuse the PX-200 and PX-210 passages, whose vectors are nearly identical in shape.
+- **Error-code query:** BM25 nails it, because "e4012", "px" and "200" are exact tokens. MiniLM wins
+  only narrowly (0.57 vs 0.48 for PX-210), and "E4012" alone nearly ties E4021 (0.376 vs 0.373).
 - **Billing paraphrase:** BM25 scores every document at zero (no shared tokens; "billed" is not
   "billing" without a stemmer), so `argmax` just returns the first passage with a score of 0.0. The dense
   model ranks the cancellation passage first.

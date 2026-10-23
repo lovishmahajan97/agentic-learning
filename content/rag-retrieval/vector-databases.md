@@ -171,8 +171,7 @@ flowchart TD
 ## Examples
 ### pgvector end to end
 A chunk table keyed by the pipeline's content hash, an HNSW index on cosine distance, a tenant filter and
-the query-time recall knob. The index parameters shown are pgvector's defaults; raising
-`hnsw.ef_search` increases recall at the cost of latency.
+the query-time recall knob. The index parameters shown are pgvector's defaults.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS vector;
@@ -194,7 +193,7 @@ CREATE INDEX chunks_tenant_idx ON chunks (tenant_id);
 -- Query time: wider graph search for better recall (default 40).
 SET hnsw.ef_search = 100;
 -- pgvector 0.8.0+: keep scanning the graph until LIMIT rows survive the WHERE clause.
-SET hnsw.iterative_scan = relaxed_order;
+SET hnsw.iterative_scan = relaxed_order;   -- checked against pgvector 0.8.2
 
 SELECT id, doc_id, 1 - (embedding <=> $1::vector) AS cosine_similarity
 FROM chunks
@@ -215,7 +214,7 @@ Save waits for the write to apply, so the next agent step can recall it; recall 
 
 ```python
 import uuid
-from qdrant_client import QdrantClient, models
+from qdrant_client import QdrantClient, models   # checked: qdrant-client 1.20.0, server 1.19.1
 
 client = QdrantClient(url="http://localhost:6333")
 if not client.collection_exists("memories"):
@@ -297,8 +296,8 @@ Per-user memory wants pre-filtering by an indexed user field or isolation, not a
   results at several `hnsw.ef_search` values. Pick the lowest that meets the recall target; monitor
   recall@10 and p95 latency together.
 - **Bulk load, then index** — in pgvector, load rows, raise `maintenance_work_mem` for the session, then
-  `CREATE INDEX` (parallel workers speed it up); in Qdrant, defer HNSW indexing during the upload via the
-  collection's optimizer settings and restore them afterwards. Monitor build time and memory per
+  `CREATE INDEX` (parallel workers speed it up); in Qdrant, upload with HNSW `m=0` (checked on 1.19),
+  then restore `m`. Monitor build time and memory per
   million vectors.
 - **Index the filter fields** — create payload indexes on user, tenant and date fields (Qdrant
   `create_payload_index`, a B-tree in Postgres) and give tiny tenants their own namespace or partition.
@@ -353,6 +352,7 @@ Per-user memory wants pre-filtering by an indexed user field or isolation, not a
   the planner chose a sequential scan. Diagnose: `EXPLAIN` shows `Seq Scan` instead of the HNSW index.
 - **One giant multi-tenant collection with a selective tenant filter.** Small tenants get empty or slow
   results. Use namespaces, per-tenant shards or partitions.
+
 ## When to use
 - **Start with pgvector** when the app already runs on Postgres and the corpus is in the low millions:
   no new system, transactional updates alongside business data, row-level security for ACL-aware
@@ -374,7 +374,8 @@ Per-user memory wants pre-filtering by an indexed user field or isolation, not a
   field where one tenant owns 1%, and 50 queries.
 - **Deliver:** recall@10 against an exact filtered scan and p95 latency for both tenants, across
   `ef_search` 40, 100 and 400, iterative scan off and on (or Qdrant with and without a payload index).
-- **Acceptance:** one row reproduces the short-result problem; your chosen configuration meets 0.95 for
+- **Acceptance:** one row reproduces the short-result problem (drop any tenant B-tree, or the
+  planner pre-filters); your chosen configuration meets 0.95 for
   both tenants and you state its latency cost.
 
 ## Role lens

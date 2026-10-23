@@ -5,10 +5,10 @@ name: Similarity search (cosine, dot product)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
-code_tested: partial
+code_tested: yes
 prerequisites:
   - model-internals/embeddings
   - math-for-ai/linear-algebra-intuition
@@ -194,7 +194,8 @@ class SearchDocsTool:
     def __call__(self, query: str, k: int = 5) -> dict:
         q = normalize(self.embed(query))
         scores = self.D @ q                              # dot on unit vectors == cosine
-        top = np.argpartition(-scores, k)[:k]
+        k = min(k, len(scores))                          # a small memory may hold fewer than k
+        top = np.argpartition(-scores, k - 1)[:k]        # kth must be < N, so k - 1
         top = top[np.argsort(-scores[top])]
         hits = [{"text": self.chunks[i], "score": float(scores[i])}
                 for i in top if scores[i] >= THRESHOLD[MODEL_VERSION]]

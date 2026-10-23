@@ -277,8 +277,9 @@ Run blue/green: the old collection serves the agent for the five hours, so the w
 decides.
 
 ## Production patterns
-- **Record-manager incremental indexing** — when you use LangChain, call its `index(...)` function with
-  a `SQLRecordManager`, a `source_id_key` and `cleanup="incremental"`, so re-runs skip unchanged
+- **Record-manager incremental indexing** — in LangChain, call its `index(...)` function with a
+  `SQLRecordManager` (1.x: from `langchain_classic.indexes`, checked against 1.0.8), a `source_id_key`
+  and `cleanup="incremental"`, so re-runs skip unchanged
   documents and delete stale chunks. Monitor skipped versus embedded counts per run; a re-run on an
   unchanged corpus should embed close to zero.
 - **Docstore-backed ingestion pipeline** — in LlamaIndex, give `IngestionPipeline` a docstore and a
@@ -332,6 +333,7 @@ decides.
   returns ten copies of it. Use content-addressed ids per user.
 - **Embedding repeated boilerplate.** Navigation, headers and legal footers across thousands of pages
   fill top-k with near-duplicate boilerplate chunks. Fix: strip it at parse time.
+
 ## When to use
 - **Build a real pipeline** once the corpus will be updated more than once; a single script suits only a
   throwaway prototype on a static dump.
@@ -340,7 +342,7 @@ decides.
 - **Measure:** index lag (source change to searchable), re-run cost on an unchanged corpus (near zero),
   duplicate rate, and the golden-vector test in CI.
 - **Interviews:** "how do you keep the index in sync" is answered by content-hashed ids, incremental
-  upserts and versioned re-indexing; most RAG engineering time goes here.
+  upserts and versioned re-indexing.
 
 ## Exercise
 **Goal:** build an incremental indexer whose second run on an unchanged corpus embeds nothing.

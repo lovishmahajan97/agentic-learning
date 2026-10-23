@@ -5,7 +5,7 @@ name: Inverted indexes
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: background
 mastery: implement
 code_tested: partial

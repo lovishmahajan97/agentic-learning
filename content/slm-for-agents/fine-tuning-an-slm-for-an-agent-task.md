@@ -6,7 +6,7 @@ kind: concept
 difficulty: advanced
 est_minutes: 18
 agent_relevance: useful
-status: mastery
+status: mastery-verified
 mastery: implement
 code_tested: partial
 prerequisites:
@@ -129,7 +129,7 @@ with your real system prompt and tool schemas.
 
 ```python
 # pip install trl peft transformers datasets bitsandbytes accelerate
-# API checked against trl 1.16.0, peft 0.21.2, transformers 5.20.2 (CPU smoke run without 4-bit);
+# API checked against trl 1.16.0, peft 0.21.2, transformers 5.20.2 (CPU smoke run, tiny model, no 4-bit);
 # 4-bit loading needs a CUDA GPU for bitsandbytes. Versions move fast; check the docs for yours.
 import torch
 from datasets import load_dataset
@@ -154,7 +154,7 @@ args = SFTConfig(output_dir="out/router-lora", num_train_epochs=2,
 trainer = SFTTrainer(model=model, args=args, train_dataset=ds["train"], eval_dataset=ds["test"],
                      processing_class=tok, peft_config=peft_cfg)   # uses the tokenizer's chat template
 trainer.train()
-trainer.save_model("out/router-lora")   # saves the adapter only (a few MB to tens of MB)
+trainer.save_model("out/router-lora")   # adapter weights (a few MB to tens of MB) + tokenizer, no base
 ```
 
 Drop `quantization_config` for plain bf16 LoRA when memory allows (see Trade-offs).

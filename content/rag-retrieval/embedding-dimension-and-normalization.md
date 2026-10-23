@@ -180,8 +180,8 @@ print("256-dim ranking:", np.argsort(-(Xk @ qk)), "storage ratio:", k / d)
 print("10M x 1536 x 4 bytes =", 10_000_000 * 1536 * 4 / 1e9, "GB")   # 61.44 GB, before the index
 ```
 
-With random vectors the truncation keeps the order only because the signal is spread evenly; for a real
-model the prefix retains the order only if the model was trained Matryoshka-style.
+With random vectors the truncation keeps the order only because the signal is spread evenly; a real
+model's prefix keeps it only if the model was Matryoshka-trained.
 
 ### Agent scenario: a calibrated "nothing relevant" gate in the search tool
 The agent should hear "no good match" rather than five weak hits it treats as evidence. The cut-off is
@@ -317,6 +317,7 @@ LIMIT 10;
   on a 1% sample. Fix: size from that.
 - **Mixed dimensions in one collection.** Insert errors where the store enforces the column dimension
   (pgvector does), or silently wrong scores where it does not.
+
 ## When to use
 - **Size every vector store with it:** `vectors × d × bytes` tells you whether the index fits in RAM, and
   whether you need truncation, quantization, disk-based indexes or sharding. Agent memory stores grow
@@ -329,10 +330,9 @@ LIMIT 10;
   scratch.
 
 ## Exercise
-**Goal:** find the cheapest vector representation that keeps recall@10 within 2 points of float32 on
-your own data.
-- **Inputs:** 5,000-20,000 chunks embedded with an MRL-capable model (for example nomic-embed-text v1.5)
-  and 100 queries whose full-precision top 10 is ground truth.
+**Goal:** find the cheapest vector representation that keeps recall@10 within 2 points of float32.
+- **Inputs:** 5,000-20,000 chunks embedded with an MRL-capable model (for example nomic-embed-text v1.5),
+  100 queries whose full-precision top 10 is ground truth, and 50+ labelled relevant/irrelevant pairs.
 - **Deliver:** a table of recall@10, bytes per vector and query latency for float32, float16, int8,
   prefixes 512 and 256, and binary with and without rescoring the top 100; plus a calibrated relevance
   threshold for the chosen row.
@@ -441,8 +441,8 @@ proposes slicing every vector to its first 1024 numbers. What do you check and w
 - sizes it: 12,288 bytes per vector, about 492 GB raw, so 64 GB needs roughly an 8x cut or more;
 - checks the model is Matryoshka-trained before slicing, and renormalizes each prefix;
 - notes pgvector indexes `vector` only up to 2,000 dimensions, so the full width needs `halfvec` or a prefix;
-- proposes a compact candidate index (binary or int8 prefix) with full-precision rescoring, measured
-  against float32, and recalibrates any recall threshold.
+- proposes a compact candidate index (pgvector has no int8 type: `binary_quantize` bits or a short
+  `halfvec` prefix) with full-precision rescoring, measured against float32, and recalibrates thresholds.
 
 ## Use cases & projects
 ### Use cases

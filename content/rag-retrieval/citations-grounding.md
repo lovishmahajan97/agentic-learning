@@ -5,7 +5,7 @@ name: Citations / grounding
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -189,6 +189,7 @@ def on_submit_answer(answer, registry, attempts):
         return {"done": False, "tool_error": f"Fix or remove these claims: {problems}"}
     bad = {n for n, _ in problems if n is not None}
     answer["claims"] = [c for i, c in enumerate(answer["claims"]) if i not in bad]
+    answer["answerable"] = bool(answer["claims"])        # nothing verified left: abstain, never ship empty
     return {"done": True, "answer": answer, "dropped": sorted(bad)}
 
 reg = SourceRegistry()                                   # replay the refund-window scenario below

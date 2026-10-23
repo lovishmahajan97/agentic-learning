@@ -5,13 +5,12 @@ name: Hybrid search (BM25 + dense)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
-code_tested: partial
+code_tested: yes
 prerequisites:
   - rag-retrieval/dense-vs-sparse-retrieval
-  - rag-retrieval/bm25-internals
 related:
   - rag-retrieval/dense-vs-sparse-retrieval
   - rag-retrieval/bm25-internals
@@ -94,7 +93,7 @@ RRF(d) = Σ_arms 1 / (k + rank_arm(d))        k = 60 in the original paper
   hybrid search offer it (Elasticsearch, OpenSearch, Qdrant and Weaviate among them, in recent versions)
   and many RAG frameworks use it by default.
 - **Check your defaults;** they differ and change between releases. Weaviate, for example, moved its
-  default to a normalized score fusion.
+  default to a normalized score fusion in v1.24.
 - **Weakness:** it throws away magnitude; a dense hit at cosine 0.92 and the next at 0.55 are just
   adjacent ranks.
 - **Refinement 1, per-arm weights** (`w_arm / (k + rank)`): trust one arm more without touching scores.
@@ -284,7 +283,7 @@ A vague query. BM25's top three are a near-tie among weak matches; dense has a c
 
 ## Production patterns
 - **Start with server-side or library RRF.** Use your engine's built-in rank fusion (for example
-  Elasticsearch's `rrf` retriever, whose rank constant defaults to 60) or LangChain's `EnsembleRetriever`
+  Elasticsearch's `rrf` retriever, 8.14 and later, whose rank constant defaults to 60) or LangChain's `EnsembleRetriever`
   before writing custom fusion. Monitor recall@10 per arm and fused on a labeled set of real agent queries
   each release.
 - **One filter object, both arms.** Build tenant, ACL and metadata filters once from the agent's

@@ -5,7 +5,7 @@ name: BM25 internals
 kind: concept
 difficulty: core
 est_minutes: 17
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -79,7 +79,7 @@ IDF in Lucene's form:
 IDF(q) = ln( (N − n(q) + 0.5) / (n(q) + 0.5) + 1 )
 ```
 
-- Recent Lucene versions drop the constant `(k1 + 1)` from the numerator. It scales every score equally,
+- Lucene 8.0 and later drop the constant `(k1 + 1)` from the numerator. It scales every score equally,
   so it never changes the ranking, but it is why Lucene's raw scores are smaller than a textbook
   implementation's.
 - Each piece answers one of the three failures above.
@@ -374,8 +374,9 @@ solution is given.
 - **Deliver:** your own BM25 (Lucene IDF, k1, b exposed); a check against `rank_bm25` or Elasticsearch
   `explain` with the same analyzer; recall@5 over a small k1 by b grid; a tool that returns ranks and
   matched terms.
-- **Acceptance:** your scores match the reference up to the constant `(k1 + 1)` factor, or you can name the
-  formula difference; one hand-computed term score matches your code; your id-preserving analyzer raises
+- **Acceptance:** your scores match the reference once you account for its formula (Lucene drops
+  `(k1 + 1)`; `rank_bm25` 0.2.2 omits the +1 in IDF and floors negative IDFs); one hand-computed term
+  score matches your code; your id-preserving analyzer raises
   recall on the id queries.
 
 ## Role lens

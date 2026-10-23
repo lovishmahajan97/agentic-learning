@@ -6,7 +6,7 @@ kind: concept
 difficulty: advanced
 est_minutes: 17
 agent_relevance: useful
-status: mastery
+status: mastery-verified
 mastery: implement
 code_tested: partial
 prerequisites:
@@ -115,7 +115,7 @@ This runs a teacher through an OpenAI-compatible chat API with one tool, verifie
 only successful runs as `{"messages": [...]}` lines for SFT. Point `base_url` at any compatible provider.
 
 ```python
-# pip install openai   (checked against openai 3.36.1 with a stub OpenAI-compatible server)
+# pip install openai   (checked against openai 3.37.0 with a stub OpenAI-compatible server)
 import json, os
 from openai import OpenAI
 

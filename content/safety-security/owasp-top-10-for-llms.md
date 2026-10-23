@@ -5,7 +5,7 @@ name: OWASP Top 10 for LLMs
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes

@@ -5,7 +5,7 @@ name: Metadata filtering
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -130,7 +130,7 @@ it they run filtered traversal.
 | Qdrant | a threshold in its HNSW configuration |
 | Weaviate | a flat-search cutoff |
 | pgvector (historically) | post-filter: the planner pulls `ef_search` candidates from the index, then applies `WHERE`, so a selective predicate returns fewer than `LIMIT` rows |
-| pgvector (recent) | iterative index scans keep walking until enough rows pass |
+| pgvector 0.8.0+ | iterative index scans keep walking until enough rows pass |
 | pgvector (pre-filter option) | partial indexes (`CREATE INDEX ... WHERE tenant_id = ...`) |
 
 ### Why filtered traversal loses recall, and the repairs
@@ -233,16 +233,19 @@ def build_filter(llm_filter, tenant_id):
             continue                                               # model may not set security fields
         if field in ALLOWED and value in ALLOWED[field]:
             must.append({"key": field, "match": {"value": value}})
-        elif field in RANGE_FIELDS and isinstance(value, dict) and set(value) <= {"gte", "lt"}:
-            must.append({"key": field, "range": {op: int(v) for op, v in value.items()}})
+        elif (field in RANGE_FIELDS and isinstance(value, dict) and set(value) <= {"gte", "lt"}
+              and all(type(v) is int for v in value.values())):  # "2025-01-01" is dropped, not a crash
+            must.append({"key": field, "range": value})
     return {"must": must}                                          # unknown fields are dropped, not guessed
 
 def handle_search_docs(run, args, session, k=10):                  # called from the agent loop
     query, llm_filter = args["query"], {f: v for f, v in args.items() if f != "query"}
-    hits = run(query, build_filter(llm_filter, session.tenant_id), k)
-    if not hits and llm_filter:                                    # empty: likely misparse, relax, keep tenant
+    flt = build_filter(llm_filter, session.tenant_id)
+    hits = run(query, flt, k)
+    applied = flt["must"][1:]                                      # only model filters that passed validation
+    if not hits and applied:                                       # empty: likely misparse, relax, keep tenant
         hits = run(query, build_filter({}, session.tenant_id), k)
-        return {"results": hits, "note": f"no match for filters {llm_filter}; showing unfiltered results"}
+        return {"results": hits, "note": f"no match for filters {applied}; showing unfiltered results"}
     return {"results": hits}
 
 f = build_filter({"doc_type": "contract", "tenant_id": "evil", "year": "2025"}, "acme")
@@ -318,7 +321,7 @@ or filtered traversal step 1 returns 10 correct hits, and the run ends in two ca
   or partial index in pgvector). Monitor filtered p95 latency against collection size; growth means a
   scan.
 - **Let the engine choose by cardinality.** Configure the brute-force threshold (Qdrant's HNSW threshold,
-  Weaviate's flat-search cutoff) or enable pgvector iterative index scans on recent versions. Monitor the
+  Weaviate's flat-search cutoff) or enable pgvector iterative index scans (0.8.0+). Monitor the
   rate of queries returning fewer than k results, bucketed by selectivity.
 - **Tenant-aware layout for skewed tenants.** When a few tenants are huge and most are tiny, mark the
   tenant field as a tenant index (Qdrant) or use native per-tenant shards (Weaviate). Monitor per-tenant
@@ -385,7 +388,7 @@ or filtered traversal step 1 returns 10 correct hits, and the run ends in two ca
 ## Exercise
 **Goal:** measure filtered recall per selectivity band on a real engine and prove your search tool
 survives model-chosen filters. No solution is given.
-- **Inputs:** 50k-200k vectors (synthetic or your corpus) with `tenant_id`, `doc_type` and an integer
+- **Inputs:** 100k-200k vectors (synthetic or your corpus) with `tenant_id`, `doc_type` and an integer
   `created_at`; a local Qdrant, pgvector or Weaviate; 30 labeled queries.
 - **Constraints:** tenants sized so filters keep 50%, 5%, 0.5% and 0.01% of rows; payload indexes only on
   fields the tool exposes.
@@ -497,11 +500,11 @@ on a shared 8M-chunk pgvector table with HNSW. Each filter alone keeps 5% to 20%
 finds nothing recent". Diagnose and redesign.
 
 **A strong answer:**
-- multiplies the selectivities (as low as about 0.05% if independent) and sees the stacked filter, not
-  each filter alone, sits in the dangerous band;
-- checks whether the query post-filters `ef_search` candidates, and the type of the date column;
-- proposes iterative index scans (`hnsw.iterative_scan`, pgvector 0.8+) or a pre-filtered exact search for tiny sets, a payload index per field,
-  a relax note, and recall@k measured on stacked filters.
+- multiplies the selectivities: 0.0125% to 0.8% if independent (1,000 to 64,000 rows), so the default
+  40 `ef_search` candidates leave under one expected survivor; the stack breaks, not each filter;
+- checks whether the plan post-filters HNSW candidates, and the type of the date column;
+- proposes iterative index scans (`hnsw.iterative_scan`, pgvector 0.8+) or exact search over a B-tree
+  pre-filter for small sets, indexes on the filter columns, a relax note, and recall@k on stacked filters.
 
 ## Use cases & projects
 ### Use cases

@@ -5,7 +5,7 @@ name: Data leakage
 kind: concept
 difficulty: core
 est_minutes: 17
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
