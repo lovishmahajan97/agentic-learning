@@ -652,3 +652,29 @@ body { background:
 .checkpoint-list a { display: grid; gap: 2px; padding: 12px 16px; border-radius: 12px; background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--s7, var(--accent)); color: var(--ink); }
 .checkpoint-list a:hover { text-decoration: none; border-color: var(--accent); }
 .cp-proj { font-size: 12px; font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: .06em; }
+
+/* ---------- lesson types ---------- */
+.type-banner { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: -6px 0 18px; font-size: 14px; color: var(--ink-2); }
+.type-tag { padding: 4px 12px; border-radius: 999px; font-weight: 700; font-size: 12px; letter-spacing: .06em; text-transform: uppercase; color: #fff; }
+.type-concept .type-tag { background: linear-gradient(135deg, var(--s1), var(--s1b)); }
+.type-lab .type-tag { background: linear-gradient(135deg, var(--s6), var(--s5b)); }
+.type-decision .type-tag { background: linear-gradient(135deg, var(--s4), var(--s3)); }
+.list-cards.misconceptions li { border-left-color: var(--s3); } .list-cards.misconceptions li .mark { color: var(--s3); }
+.lab, .decision { display: grid; gap: 12px; max-width: 76ch; }
+.lab-block { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; min-width: 0; }
+.lab-head { display: flex; align-items: center; gap: 10px; font-weight: 700; margin-bottom: 10px; }
+.lab-head .lab-copy { margin-left: auto; }
+.lab-n { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 7px; color: #fff; font-family: var(--font-mono); font-size: 12px; background: linear-gradient(135deg, var(--s6), var(--s5b)); flex: none; }
+.decision .lab-n { background: linear-gradient(135deg, var(--s4), var(--s3)); }
+.lab-submit { border-color: color-mix(in srgb, var(--s6) 40%, var(--line)); display: grid; gap: 10px; }
+.decision .lab-submit { border-color: color-mix(in srgb, var(--s4) 40%, var(--line)); }
+.your-call { border-style: dashed; border-color: color-mix(in srgb, var(--s4) 60%, var(--line)); display: grid; gap: 10px; }
+.your-call textarea { min-height: 110px; resize: vertical; }
+details.reference { margin: 8px 0 44px; border: 1px solid var(--line); border-radius: 16px; background: color-mix(in srgb, var(--surface) 70%, transparent); }
+details.reference > summary { list-style: none; cursor: pointer; display: grid; gap: 4px; padding: 18px 22px; }
+details.reference > summary::-webkit-details-marker { display: none; }
+details.reference > summary::before { content: "▸"; float: left; margin-right: 10px; color: var(--accent); transition: transform .15s; }
+details.reference[open] > summary::before { transform: rotate(90deg); }
+.ref-title { font-family: var(--font-display); font-weight: 700; font-size: 18px; }
+details.reference > summary .muted { font-size: 13px; }
+details.reference > .section { padding: 0 22px; }

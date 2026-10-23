@@ -401,47 +401,75 @@
       main.innerHTML = `<div class="page-narrow">${head}<div class="empty"><p><strong>This lesson has not been generated yet.</strong></p><p>Taxonomy item: ${esc(t.taxonomy_name || t.name)}${t.caveat ? ' · ' + esc(t.caveat) : ''}${t.note ? ' · ' + esc(t.note) : ''}</p>${t.errors ? `<pre style="text-align:left;font-size:12px">${esc(t.errors.join('\n'))}</pre>` : ''}</div>${pager(prev, next, m, nextMod)}</div>`;
       bindLearn(t); return;
     }
-    const secs = [
-      ['why', 'Why it exists', md(t.why)],
-      ['how', 'How it works', md(t.how)],
-      ...(t.diagram && t.diagram.code ? [['diagram', 'Diagram', `<div class="prose diagram-caption">${md(t.diagram.caption)}</div><pre><code class="language-mermaid">${esc(t.diagram.code)}</code></pre>`]] : []),
-      ['example', t.format === 'crisp' ? 'Examples' : 'Example', md(t.example)],
-      ...((t.patterns && t.patterns.length) ? [['patterns', 'Production patterns', `<ul class="list-cards patterns">${t.patterns.map(b => `<li><span class="mark">▸</span><span>${mdi(b)}</span></li>`).join('')}</ul>`]] : []),
-      ['tradeoffs', 'Trade-offs', `<ul class="list-cards tradeoffs">${(t.tradeoffs || []).map(b => `<li><span class="mark">⇄</span><span>${mdi(b)}</span></li>`).join('')}</ul>`],
-      ['pitfalls', t.exercise ? 'Failure modes' : 'Pitfalls', `<ul class="list-cards pitfalls">${(t.pitfalls || []).map(b => `<li><span class="mark">!</span><span>${mdi(b)}</span></li>`).join('')}</ul>`],
-      ['when', 'When to use', md(t.when)],
-      ...(t.exercise ? [['exercise', 'Exercise', `<div class="exercise-box"><div class="proj-head">Do it yourself <span class="pill">no solution given</span></div><div class="prose">${md(t.exercise)}</div></div>`]] : []),
-      ['lens', 'Role lens', `<div class="lens">${['engineer', 'architect', 'fde'].map(r => `<div><b>${ROLE[r]}</b>${mdi((t.role_lens || {})[r] || '')}</div>`).join('')}</div>`],
-    ];
+    const sec = (id, title, body) => [id, title, body];
+    const listCards = (cls, mark, arr) => `<ul class="list-cards ${cls}">${(arr || []).map(b => `<li><span class="mark">${mark}</span><span>${mdi(b)}</span></li>`).join('')}</ul>`;
+    const exParts = String(t.example || '').split(/^(?=### )/m).filter(x => x.trim());
+    const T = t.typed, LT = T ? T.type : null;
+    const all = {
+      why: sec('why', LT === 'concept' ? 'The problem' : 'Why it exists', md(t.why)),
+      how: sec('how', LT === 'concept' ? 'The mechanism' : 'How it works', md(t.how)),
+      diagram: t.diagram && t.diagram.code ? sec('diagram', 'Diagram', `<div class="prose diagram-caption">${md(t.diagram.caption)}</div><pre><code class="language-mermaid">${esc(t.diagram.code)}</code></pre>`) : null,
+      misc: LT === 'concept' ? sec('misc', 'Common misconceptions', `<ul class="list-cards misconceptions">${T.misconceptions.map(b => `<li><span class="mark">✕</span><span>${mdi(b)}</span></li>`).join('')}</ul>`) : null,
+      example1: LT === 'concept' && exParts.length ? sec('example', 'Worked example', md(exParts[0])) : null,
+      example: LT === 'concept' ? (exParts.length > 1 ? sec('example-more', 'More examples', md(exParts.slice(1).join('\n'))) : null) : sec('example', t.format === 'crisp' ? 'Examples' : 'Example', md(t.example)),
+      lab: LT === 'lab' ? sec('lab', 'Engineering lab', labHtml(t)) : null,
+      decision: LT === 'decision' ? sec('decision', 'Decision case', decisionHtml(t)) : null,
+      patterns: t.patterns && t.patterns.length ? sec('patterns', 'Production patterns', listCards('patterns', '▸', t.patterns)) : null,
+      tradeoffs: sec('tradeoffs', 'Trade-offs', listCards('tradeoffs', '⇄', t.tradeoffs)),
+      pitfalls: sec('pitfalls', t.exercise ? 'Failure modes' : 'Pitfalls', listCards('pitfalls', '!', t.pitfalls)),
+      when: sec('when', 'When to use', md(t.when)),
+      exercise: t.exercise ? sec('exercise', 'Exercise', `<div class="exercise-box"><div class="proj-head">Do it yourself <span class="pill">no solution given</span></div><div class="prose">${md(t.exercise)}</div></div>`) : null,
+      lens: sec('lens', 'Role lens', `<div class="lens">${['engineer', 'architect', 'fde'].map(r => `<div><b>${ROLE[r]}</b>${mdi((t.role_lens || {})[r] || '')}</div>`).join('')}</div>`),
+    };
+    const FRONT = { concept: ['why', 'how', 'diagram', 'misc', 'example1'], lab: ['lab'], decision: ['decision'] }[LT]
+      || ['why', 'how', 'diagram', 'example', 'patterns', 'tradeoffs', 'pitfalls', 'when', 'exercise', 'lens'];
+    const front = FRONT.map(k => all[k]).filter(Boolean);
+    const refOrder = ['why', 'how', 'diagram', 'example', 'patterns', 'tradeoffs', 'pitfalls', 'when', 'exercise', 'lens'];
+    const reference = LT ? refOrder.filter(k => !FRONT.includes(k)).map(k => all[k]).filter(Boolean) : [];
+    const secs = front; // numbering base for the interactive sections
     const related = (t.related || []).map(k => topics.get(k)).filter(Boolean);
     const ivq = t.interview || [];
+    let n = 0; const num = () => pad2(++n);
+    const renderSec = ([id, title, body]) => `<section class="section" id="s-${id}"><h2><span class="num">${num()}</span>${title}</h2>${body.startsWith('<ul') || body.startsWith('<div') ? body : `<div class="prose">${body}</div>`}</section>`;
+    const TYPE_LABEL = { concept: 'Concept lesson', lab: 'Engineering lab', decision: 'Decision lesson' };
+    const frontHtml = front.map(renderSec).join('');
+    const checkHtml = `<section class="section" id="s-check"><h2><span class="num">${num()}</span>Check yourself</h2>
+        <div class="reveal"><div class="q prose">${md(t.check.q)}</div><button class="btn sm" id="revealBtn">Reveal a model answer</button><div class="a prose" id="answer" hidden>${md(t.check.a)}</div></div></section>`;
+    const quizHtml = `<section class="section" id="s-quiz"><h2><span class="num">${num()}</span>${LT ? 'Knowledge check' : 'Quiz'}</h2><div class="quiz" id="quiz">${(t.quiz || []).map((q, qi) => `<div class="qcard" data-q="${qi}"><div class="q"><span class="n">Q${qi + 1}</span>${mdi(q.q)}</div><div class="opts">${q.options.map((o, oi) => `<button class="opt" data-o="${oi}"><span class="k">${'ABCD'[oi]}</span><span>${mdi(o)}</span></button>`).join('')}</div><div class="expl" hidden></div></div>`).join('')}<div id="quizResult"></div></div></section>`;
+    const proveHtml = proveIt(t, ++n);
+    const ivqHtml = ivq.length ? `<section class="section" id="s-interview"><h2><span class="num">${LT ? '' : num()}</span>Interview questions</h2>
+        <div class="ivq-list">${ivq.map((x, xi) => `<details class="ivq"><summary><span class="ivq-n">Q${xi + 1}</span><span>${mdi(x.q)}</span></summary><div class="prose">${md(x.a)}</div></details>`).join('')}</div>
+        <div class="btn-row" style="margin-top:12px"><button class="btn sm" id="ivqAll">Expand all answers</button></div></section>` : '';
+    const relHtml = related.length ? `<section class="section" id="s-related"><h2>Related lessons</h2><div class="chips">${related.map(r => `<a class="chip" href="#t.${r.module}.${r.id}"><span class="dot ${topicDot(r)}"></span>${esc(r.name)}<span class="sub">${esc(r.moduleTitle)}</span></a>`).join('')}</div></section>` : '';
+    const projHtml = t.projects && (t.projects.use_cases || t.projects.mini_project) ? `<section class="section" id="s-projects"><h2>Use cases &amp; projects</h2>
+        <div class="proj-grid"><div class="proj-card proj-uses"><div class="proj-head">Use cases</div><div class="prose">${md(t.projects.use_cases)}</div></div>
+        <div class="proj-card proj-mini"><div class="proj-head">Mini project <span class="pill">1-3 hours</span></div><div class="prose">${md(t.projects.mini_project)}</div></div></div>
+        <a class="proj-major" href="#m.${m.id}"><span class="proj-head">Major project</span><span>The ${esc(m.title)} capstone combines this lesson with the rest of the module →</span></a></section>` : '';
+    const refOpen = !!S.refOpen;
+    const refHtml = LT ? `<details class="reference" id="s-reference" ${refOpen ? 'open' : ''}><summary><span class="ref-title">Full reference</span><span class="muted">${reference.map(r => r[1]).concat(ivq.length ? ['Interview questions'] : [], t.projects ? ['Use cases & projects'] : []).join(' · ')}</span></summary>
+        ${reference.map(renderSec).join('')}${ivqHtml}${projHtml}</details>` : '';
     let html = `<div class="reader"><article>${head}
       ${t.status === 'invalid' ? `<div class="banner">This lesson failed validation and may be incomplete.<pre style="font-size:12px;white-space:pre-wrap">${esc((t.errors || []).join('\n'))}</pre></div>` : ''}
       ${t.caveat ? `<div class="banner">Caveat: ${esc(t.caveat)}.</div>` : ''}
+      ${LT ? `<div class="type-banner type-${LT}"><span class="type-tag">${TYPE_LABEL[LT]}</span><span>${{ concept: 'Understand the problem, the mechanism and the misconceptions, then check yourself.', lab: 'Build it: run the starter, make the tests pass, break it on purpose, submit.', decision: 'Read the scenario, make your own call first, then compare with ours and grade yourself on the rubric.' }[LT]}</span></div>` : ''}
       <div class="tldr"><div class="eyebrow">In one breath</div><div class="prose">${md(t.tldr)}</div></div>
       ${t.mastery && t.mastery.prerequisites && t.mastery.prerequisites.length ? `<div class="prereq"><span class="prereq-head">Know these first</span>${t.mastery.prerequisites.map(k => topics.get(k)).filter(Boolean).map(r => `<a class="chip" href="#t.${r.module}.${r.id}"><span class="dot ${topicDot(r)}"></span>${esc(r.name)}<span class="sub">${LV[mlevel(r)]}</span></a>`).join('')}</div>` : ''}
       ${t.agent ? `<div class="agent-box"><div class="agent-box-head"><span class="agent-glyph" aria-hidden="true"></span><span>For agent builders</span>${pillRel(t.agent_relevance)}</div><div class="prose">${md(t.agent)}</div></div>` : ''}
-      ${secs.map(([id, title, body], i) => `<section class="section" id="s-${id}"><h2><span class="num">${String(i + 1).padStart(2, '0')}</span>${title}</h2>${body.startsWith('<ul') || body.startsWith('<div') ? body : `<div class="prose">${body}</div>`}</section>`).join('')}
-      ${related.length ? `<section class="section" id="s-related"><h2><span class="num">${pad2(secs.length + 1)}</span>Related lessons</h2><div class="chips">${related.map(r => `<a class="chip" href="#t.${r.module}.${r.id}"><span class="dot ${topicDot(r)}"></span>${esc(r.name)}<span class="sub">${esc(r.moduleTitle)}</span></a>`).join('')}</div></section>` : ''}
-      <section class="section" id="s-check"><h2><span class="num">${pad2(secs.length + 2)}</span>Check yourself</h2>
-        <div class="reveal"><div class="q prose">${md(t.check.q)}</div><button class="btn sm" id="revealBtn">Reveal a model answer</button><div class="a prose" id="answer" hidden>${md(t.check.a)}</div></div></section>
-      ${ivq.length ? `<section class="section" id="s-interview"><h2><span class="num">${pad2(secs.length + 3)}</span>Interview questions</h2>
-        <div class="ivq-list">${ivq.map((x, xi) => `<details class="ivq"><summary><span class="ivq-n">Q${xi + 1}</span><span>${mdi(x.q)}</span></summary><div class="prose">${md(x.a)}</div></details>`).join('')}</div>
-        <div class="btn-row" style="margin-top:12px"><button class="btn sm" id="ivqAll">Expand all answers</button></div></section>` : ''}
-      <section class="section" id="s-quiz"><h2><span class="num">${pad2(secs.length + (ivq.length ? 4 : 3))}</span>Quiz</h2><div class="quiz" id="quiz">${(t.quiz || []).map((q, qi) => `<div class="qcard" data-q="${qi}"><div class="q"><span class="n">Q${qi + 1}</span>${mdi(q.q)}</div><div class="opts">${q.options.map((o, oi) => `<button class="opt" data-o="${oi}"><span class="k">${'ABCD'[oi]}</span><span>${mdi(o)}</span></button>`).join('')}</div><div class="expl" hidden></div></div>`).join('')}<div id="quizResult"></div></div></section>
-      ${proveIt(t, secs.length + (ivq.length ? 5 : 4))}
-      ${t.projects && (t.projects.use_cases || t.projects.mini_project) ? `<section class="section" id="s-projects"><h2><span class="num">${pad2(secs.length + (ivq.length ? 5 : 4))}</span>Use cases &amp; projects</h2>
-        <div class="proj-grid"><div class="proj-card proj-uses"><div class="proj-head">Use cases</div><div class="prose">${md(t.projects.use_cases)}</div></div>
-        <div class="proj-card proj-mini"><div class="proj-head">Mini project <span class="pill">1-3 hours</span></div><div class="prose">${md(t.projects.mini_project)}</div></div></div>
-        <a class="proj-major" href="#m.${m.id}"><span class="proj-head">Major project</span><span>The ${esc(m.title)} capstone combines this lesson with the rest of the module →</span></a></section>` : ''}
-      <section class="section notes" id="s-notes"><h2><span class="num">${pad2(secs.length + (ivq.length ? 5 : 4))}</span>Your notes</h2><textarea id="notes" placeholder="What clicked, what is still fuzzy, how this connects to your own work…">${esc(S.notes[key] || '')}</textarea></section>
+      ${frontHtml}
+      ${LT ? '' : relHtml}
+      ${checkHtml}
+      ${LT ? '' : ivqHtml}
+      ${quizHtml}
+      ${proveHtml}
+      ${LT ? refHtml + relHtml : projHtml}
+      <section class="section notes" id="s-notes"><h2>Your notes</h2><textarea id="notes" placeholder="What clicked, what is still fuzzy, how this connects to your own work…">${esc(S.notes[key] || '')}</textarea></section>
       ${t.sources && t.sources.length ? `<section class="section"><h2>Sources</h2><ul class="sources">${t.sources.map(s => `<li>${esc(s)}</li>`).join('')}</ul></section>` : ''}
       ${pager(prev, next, m, nextMod)}
     </article>
     <aside class="toc"><div class="toc-title">On this page</div>
-      ${secs.map(([id, title]) => `<a href="#s-${id}" data-toc="s-${id}">${title}</a>`).join('')}
-      <a href="#s-check" data-toc="s-check">Check yourself</a>${ivq.length ? '<a href="#s-interview" data-toc="s-interview">Interview questions</a>' : ''}<a href="#s-quiz" data-toc="s-quiz">Quiz</a><a href="#s-prove" data-toc="s-prove">Prove it</a>${t.projects ? '<a href="#s-projects" data-toc="s-projects">Use cases &amp; projects</a>' : ''}
-      <div class="toc-side"><div class="toc-title">Module</div><a href="#m.${m.id}" style="border:0;padding-left:0">${esc(m.title)} →</a><div class="bar tier-${m.tier}"><i style="width:${modProgress(m).pct}%"></i></div><div class="muted" style="font-size:12px">${modProgress(m).done}/${modProgress(m).total} learned</div></div>
+      ${front.map(([id, title]) => `<a href="#s-${id}" data-toc="s-${id}">${title}</a>`).join('')}
+      <a href="#s-check" data-toc="s-check">Check yourself</a>${!LT && ivq.length ? '<a href="#s-interview" data-toc="s-interview">Interview questions</a>' : ''}<a href="#s-quiz" data-toc="s-quiz">${LT ? 'Knowledge check' : 'Quiz'}</a><a href="#s-prove" data-toc="s-prove">Prove it</a>${LT ? '<a href="#s-reference" data-toc="s-reference">Full reference</a>' : (t.projects ? '<a href="#s-projects" data-toc="s-projects">Use cases &amp; projects</a>' : '')}
+      <div class="toc-side"><div class="toc-title">Module</div><a href="#m.${m.id}" style="border:0;padding-left:0">${esc(m.title)} →</a><div class="bar tier-${m.tier}"><i style="width:${modProgress(m).pct}%"></i></div><div class="muted" style="font-size:12px">${modProgress(m).done}/${modProgress(m).total} read</div></div>
     </aside></div>`;
     main.innerHTML = html;
     highlight(main);
@@ -452,6 +480,60 @@
     const notes = $('#notes'); let nt; notes.oninput = () => { clearTimeout(nt); nt = setTimeout(() => { if (notes.value.trim()) S.notes[key] = notes.value; else delete S.notes[key]; save(); }, 300); };
     bindQuiz(t);
     bindProve(t);
+    const ref = $('#s-reference'); if (ref) ref.addEventListener('toggle', () => { S.refOpen = ref.open; save(); if (ref.open) highlight(ref); });
+    bindLab(t); bindDecision(t);
+  }
+  function subMd(x) { return x ? md(x) : ''; }
+  function labHtml(t) {
+    const L = t.typed || {}; const st = (S.labs || {})[t.key] || {};
+    const subs = String(L.submission || '').split(/\n/).filter(l => /^\s*[-*]\s+/.test(l)).map(l => l.replace(/^\s*[-*]\s+/, ''));
+    return `<div class="lab">
+      <div class="lab-block"><div class="lab-head"><span class="lab-n">1</span>Task</div><div class="prose">${subMd(L.task)}</div></div>
+      <div class="lab-block"><div class="lab-head"><span class="lab-n">2</span>Starter code <button class="btn sm lab-copy" data-copy="starter">Copy</button></div><div class="prose" data-block="starter">${subMd(L.starter)}</div></div>
+      <div class="lab-block"><div class="lab-head"><span class="lab-n">3</span>Expected output</div><div class="prose">${subMd(L.expected)}</div></div>
+      <div class="lab-block"><div class="lab-head"><span class="lab-n">4</span>Tests <button class="btn sm lab-copy" data-copy="tests">Copy</button></div><div class="prose" data-block="tests">${subMd(L.tests)}</div></div>
+      <div class="lab-block"><div class="lab-head"><span class="lab-n">5</span>Failure scenarios</div><div class="prose">${subMd(L.failures)}</div></div>
+      <div class="lab-block lab-submit"><div class="lab-head"><span class="lab-n">6</span>Submission</div>
+        <ul class="checklist">${subs.map((s, i) => `<li><label class="${st[i] ? 'done' : ''}"><input type="checkbox" data-sub="${i}" ${st[i] ? 'checked' : ''}><span>${mdi(s)}</span></label></li>`).join('')}</ul>
+        <input class="prove-input" id="labLink" placeholder="Link to your repo or test run" value="${esc(st.link || '')}">
+        <div class="muted" style="font-size:13px">Checking every item records <b>Implement</b> evidence in Prove it.</div></div>
+    </div>`;
+  }
+  function bindLab(t) {
+    const box = document.querySelector('.lab'); if (!box) return;
+    S.labs = S.labs || {}; const st = S.labs[t.key] = S.labs[t.key] || {};
+    box.querySelectorAll('[data-sub]').forEach(cb => cb.onchange = () => {
+      st[cb.dataset.sub] = cb.checked; cb.closest('label').classList.toggle('done', cb.checked); save();
+      const all = [...box.querySelectorAll('[data-sub]')]; if (all.length && all.every(x => x.checked)) { setMastery(t, { exercise: true, link: st.link || mrec(t).link }); toast('Lab submitted: Implement evidence recorded'); const ex = $('#pvEx'); if (ex) ex.checked = true; }
+    });
+    const ln = $('#labLink'); if (ln) ln.oninput = () => { st.link = ln.value; save(); };
+    box.querySelectorAll('.lab-copy').forEach(b => b.onclick = async () => { const code = box.querySelector(`[data-block="${b.dataset.copy}"] pre code`); if (!code) return; try { await navigator.clipboard.writeText(code.textContent); toast('Copied'); } catch (e) { const r = document.createRange(); r.selectNodeContents(code); const s = getSelection(); s.removeAllRanges(); s.addRange(r); toast('Selected: press Cmd/Ctrl+C'); } });
+  }
+  function decisionHtml(t) {
+    const D = t.typed || {}; const st = (S.decisions || {})[t.key] || {};
+    const rub = String(D.rubric || '').split(/\n/).filter(l => /^\s*[-*]\s+/.test(l)).map(l => l.replace(/^\s*[-*]\s+/, ''));
+    return `<div class="decision">
+      <div class="lab-block"><div class="lab-head"><span class="lab-n">1</span>Scenario</div><div class="prose">${subMd(D.scenario)}</div></div>
+      <div class="lab-block"><div class="lab-head"><span class="lab-n">2</span>Competing approaches</div><div class="prose">${subMd(D.options)}</div></div>
+      <div class="lab-block your-call"><div class="lab-head"><span class="lab-n">3</span>Your decision first</div>
+        <textarea id="decMine" class="prove-input" placeholder="Which option would you choose, and why, given the constraints? What would make you change your mind?">${esc(st.mine || '')}</textarea>
+        <div class="btn-row"><button class="btn sm" id="decReveal">Compare with our decision</button></div></div>
+      <div id="decOurs" ${st.revealed ? '' : 'hidden'}>
+        <div class="lab-block"><div class="lab-head"><span class="lab-n">4</span>Our decision</div><div class="prose">${subMd(D.decision)}</div></div>
+        <div class="lab-block"><div class="lab-head"><span class="lab-n">5</span>Trade-offs accepted</div><div class="prose">${subMd(D.tradeoffs)}</div></div>
+        <div class="lab-block lab-submit"><div class="lab-head"><span class="lab-n">6</span>Grade your decision on the review rubric</div>
+          <ul class="checklist">${rub.map((s, i) => `<li><label class="${st['r' + i] ? 'done' : ''}"><input type="checkbox" data-rub="${i}" ${st['r' + i] ? 'checked' : ''}><span>${mdi(s)}</span></label></li>`).join('')}</ul>
+          <div class="muted" style="font-size:13px" id="decScore"></div></div>
+      </div></div>`;
+  }
+  function bindDecision(t) {
+    const box = document.querySelector('.decision'); if (!box) return;
+    S.decisions = S.decisions || {}; const st = S.decisions[t.key] = S.decisions[t.key] || {};
+    const mine = $('#decMine'); let h; mine.oninput = () => { clearTimeout(h); h = setTimeout(() => { st.mine = mine.value; save(); }, 300); };
+    const score = () => { const cbs = [...box.querySelectorAll('[data-rub]')]; const k = cbs.filter(c => c.checked).length; const el = $('#decScore'); if (el) el.textContent = cbs.length ? `${k} of ${cbs.length} rubric criteria met${k < cbs.length ? ' · log what you missed in Prove it' : ''}` : ''; };
+    $('#decReveal').onclick = () => { if (!mine.value.trim()) { toast('Write your decision first'); mine.focus(); return; } st.revealed = true; save(); $('#decOurs').hidden = false; highlight($('#decOurs')); score(); };
+    box.querySelectorAll('[data-rub]').forEach(cb => cb.onchange = () => { st['r' + cb.dataset.rub] = cb.checked; cb.closest('label').classList.toggle('done', cb.checked); save(); score(); });
+    score();
   }
   function splitTest(md_) {
     const s = String(md_ || ''); const i = s.search(/\*\*A strong answer/i);
