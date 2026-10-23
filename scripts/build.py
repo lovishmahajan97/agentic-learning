@@ -24,6 +24,9 @@ TOPIC_SECTIONS = ["TL;DR", "Why it exists", "How it works", "Example", "Trade-of
 RELEVANCE = {"core", "useful", "background"}
 MASTERY = {"understand", "implement", "evaluate"}
 CODE_TESTED = {"yes", "partial", "no"}
+LESSON_TYPES = {"concept", "lab", "decision"}
+TYPE_SECTION = {"concept": "Misconceptions", "lab": "Lab", "decision": "Decision case"}
+V5_FORCE = False          # set by --v5: check against the typed format (SPEC v5)
 V4_FORCE = False          # set by --v4: check against the mastery format (SPEC v4)
 V3_FORCE = False          # set by --v3: check against the agent-builder format (SPEC v3)
 TOPIC_SECTIONS_V2 = ["TL;DR", "Why it exists", "How it works", "Diagram", "Example", "Production patterns",
@@ -47,6 +50,8 @@ def norm_heading(h):
                "pitfalls": "Pitfalls", "common pitfalls": "Pitfalls",
                "production patterns": "Production patterns", "in production": "Production patterns",
                "exercise": "Exercise", "hands-on exercise": "Exercise",
+               "misconceptions": "Misconceptions", "common misconceptions": "Misconceptions",
+               "lab": "Lab", "engineering lab": "Lab", "decision case": "Decision case",
                "mastery test": "Mastery test",
                "use cases & projects": "Use cases & projects", "use cases and projects": "Use cases & projects",
                "for agent builders": "For agent builders", "agent builder's take": "For agent builders",
@@ -178,6 +183,54 @@ def diagram(md, errs):
     caption = (md[:m.start()] + md[m.end():]).strip()
     if words(caption) < 8: errs.append("'Diagram' needs a one or two sentence caption saying what to look at")
     return {"code": code, "caption": caption}
+
+def typed_block(fm, got, errs):
+    lt = str(fm.get("lesson_type", "")).lower()
+    if lt not in LESSON_TYPES:
+        errs.append(f"front matter lesson_type must be one of {sorted(LESSON_TYPES)}"); return None
+    md_ = got.get(TYPE_SECTION[lt], "")
+    out = {"type": lt}
+    def capped(sec, lo, hi):
+        w = words(md_)
+        if w < lo: errs.append(f"'{sec}' too thin ({w} prose words, min {lo})")
+        if w > hi: errs.append(f"'{sec}' too long ({w} prose words, max {hi}); it is the lesson's front view, keep it tight")
+        for kind_, ww, head in long_blocks(md_):
+            errs.append(f"'{sec}': {kind_} of {ww} words; split it: {head!r}")
+    if lt == "concept":
+        b = bullets(md_)
+        if not 3 <= len(b) <= 6: errs.append(f"'Misconceptions' needs 3-6 bullets (found {len(b)})")
+        for x in b:
+            if not x.startswith("**"): errs.append(f"misconception must start with the wrong belief in bold: {x[:50]!r}")
+        capped("Misconceptions", 60, 450)
+        out["misconceptions"] = b
+        return out
+    secs, order, _ = split_sections(md_, level=3)
+    by = {re.sub(r"\s+", " ", h.strip().lower()): secs[h] for h in order}
+    def sub(prefix):
+        return next((v for k, v in by.items() if k.startswith(prefix)), None)
+    if lt == "lab":
+        parts = {"task": sub("task"), "starter": sub("starter"), "expected": sub("expected"), "tests": sub("test"),
+                 "failures": sub("failure"), "submission": sub("submission")}
+        for k, lab in (("task", "Task"), ("starter", "Starter code"), ("expected", "Expected output"), ("tests", "Tests"),
+                       ("failures", "Failure scenarios"), ("submission", "Submission")):
+            if parts[k] is None: errs.append(f"'Lab' needs '### {lab}'")
+        if parts["starter"] is not None and "```" not in parts["starter"]: errs.append("'Lab' ### Starter code needs a fenced code block")
+        if parts["expected"] is not None and "```" not in parts["expected"]: errs.append("'Lab' ### Expected output needs a fenced block with the exact output")
+        if parts["tests"] is not None and "```" not in parts["tests"]: errs.append("'Lab' ### Tests needs runnable tests in a fenced block")
+        if parts["failures"] is not None and len(bullets(parts["failures"])) < 2: errs.append("'Lab' ### Failure scenarios needs 2+ bullets (inject, observe, debug)")
+        if parts["submission"] is not None and len(bullets(parts["submission"])) < 3: errs.append("'Lab' ### Submission needs 3+ checkable bullets")
+        capped("Lab", 120, 900)
+        out.update({k: v or "" for k, v in parts.items()})
+        return out
+    parts = {"scenario": sub("scenario"), "options": sub("option") or sub("competing"), "decision": sub("decision"),
+             "tradeoffs": sub("trade"), "rubric": sub("review rubric") or sub("rubric")}
+    for k, lab in (("scenario", "Scenario"), ("options", "Options"), ("decision", "Decision"), ("tradeoffs", "Trade-offs accepted"), ("rubric", "Review rubric")):
+        if parts[k] is None: errs.append(f"'Decision case' needs '### {lab}'")
+    if parts["options"] is not None and "|" not in parts["options"]: errs.append("'Decision case' ### Options needs a comparison table of 2-4 options against the constraints")
+    if parts["rubric"] is not None and len(bullets(parts["rubric"])) < 4: errs.append("'Decision case' ### Review rubric needs 4+ observable criteria")
+    capped("Decision case", 200, 900)
+    out.update({k: v or "" for k, v in parts.items()})
+    return out
 
 def mastery_block(fm, got, errs):
     lvl = str(fm.get("mastery", "")).lower()
@@ -335,16 +388,19 @@ def parse_topic(path: Path):
         elif nh in got: errs.append(f"duplicate section '{nh}'")
         else: got[nh] = c
     st_ = str(fm.get("status", "")).lower()
-    v4 = V4_FORCE or st_.startswith("mastery")
-    v3 = v4 or V3_FORCE or st_.startswith("agentic")
+    v5 = V5_FORCE or st_.startswith("typed")
+    v4 = V4_FORCE or st_.startswith("mastery") or "mastery" in fm
+    v3 = v4 or v5 or V3_FORCE or st_.startswith("agentic") or "agent_relevance" in fm
     v2 = v3 or V2_FORCE or st_.startswith("crisp") or "Production patterns" in got
-    need = (["For agent builders"] + TOPIC_SECTIONS_V2 + (["Exercise", "Mastery test"] if v4 else []) + ["Use cases & projects"]) if v3 else (TOPIC_SECTIONS_V2 if v2 else TOPIC_SECTIONS)
+    ltype = str(fm.get("lesson_type", "")).lower()
+    need = (["For agent builders"] + TOPIC_SECTIONS_V2 + (["Exercise", "Mastery test"] if v4 else [])
+            + ([TYPE_SECTION[ltype]] if v5 and ltype in TYPE_SECTION else []) + ["Use cases & projects"]) if v3 else (TOPIC_SECTIONS_V2 if v2 else TOPIC_SECTIONS)
     for s in need:
         if s not in got: errs.append(f"missing section '## {s}'")
     if any(s not in got for s in need):
         return None, errs, warns
     is_tool = kind == "tool"
-    patterns, dia, ivq, proj, mastery = [], None, [], None, None
+    patterns, dia, ivq, proj, mastery, typed = [], None, [], None, None, None
     if not v2:
         mins = {"TL;DR": 15, "Why it exists": 120, "How it works": 150 if is_tool else 250,
                 "When to use": 60}
@@ -381,6 +437,8 @@ def parse_topic(path: Path):
             proj = projects(got["Use cases & projects"], errs)
             if v4:
                 mastery = mastery_block(fm, got, errs)
+            if v5:
+                typed = typed_block(fm, got, errs)
             fb = bullets(got["For agent builders"])
             if len(fb) < 3: errs.append("'For agent builders' needs 3-5 bold-led bullets (why it matters for agents, where it shows up in an agent stack, what you can skip)")
             if words(got["For agent builders"]) < 50: errs.append("'For agent builders' too thin (min 50 words)")
@@ -406,6 +464,7 @@ def parse_topic(path: Path):
          "example": got["Example"], "patterns": patterns, "agent": got.get("For agent builders") if v3 else None,
          "agent_relevance": str(fm.get("agent_relevance", "")).lower() or None, "projects": proj,
          "mastery": {k: v for k, v in mastery.items() if k not in ("exercise", "test")} if mastery else None,
+         "typed": typed, "lesson_type": (typed or {}).get("type") or str(fm.get("lesson_type", "")).lower() or None,
          "exercise": mastery["exercise"] if mastery else None, "mastery_test": mastery["test"] if mastery else None, "diagram": dia, "interview": ivq, "format": "crisp" if v2 else "long", "tradeoffs": tr, "pitfalls": pf, "when": got["When to use"],
          "role_lens": role_lens(got["Role lens"], errs, "Role lens"),
          "check": check_yourself(got["Check yourself"], errs), "quiz": quiz(got["Quiz"], errs)}
@@ -520,7 +579,7 @@ def build(report_only=False):
         for k, v in list(report["invalid"].items())[:40]:
             print(f"  ✗ {k}: {v[0]}")
         return
-    HEAVY = ("agent", "projects", "exercise", "mastery_test", "why", "how", "example", "patterns", "diagram", "interview", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
+    HEAVY = ("typed", "agent", "projects", "exercise", "mastery_test", "why", "how", "example", "patterns", "diagram", "interview", "tradeoffs", "pitfalls", "when", "role_lens", "check", "quiz", "sources")
     built = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     (ROOT / "site" / "data").mkdir(exist_ok=True)
     light_modules, total_bytes = [], 0
@@ -562,6 +621,8 @@ if __name__ == "__main__":
         a.remove("--v3"); V3_FORCE = True; V2_FORCE = True
     if "--v4" in a:
         a.remove("--v4"); V4_FORCE = True; V3_FORCE = True; V2_FORCE = True
+    if "--v5" in a:
+        a.remove("--v5"); V5_FORCE = True; V3_FORCE = True; V2_FORCE = True
     if a[:1] == ["--check"]:
         sys.exit(1 if check_files(a[1:]) else 0)
     if a[:1] == ["--check-module"]:

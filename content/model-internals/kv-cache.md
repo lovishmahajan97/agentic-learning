@@ -5,7 +5,8 @@ name: KV cache
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -131,6 +132,16 @@ flowchart TD
     T -->|"until stop"| D
     C -.->|"~0.5 MB per token"| M["GPU memory limit"]
 ```
+
+## Misconceptions
+- **"The KV cache makes attention linear."** It removes re-running projections and MLPs over old tokens,
+  but each new query still reads all cached keys, so total attention work stays quadratic.
+- **"A faster GPU makes decode proportionally faster."** Decode is bandwidth-bound: tokens per second
+  tracks memory bandwidth far more than peak FLOPs.
+- **"Prefix caching works for any similar prompt."** Reuse needs a byte-identical prefix; a timestamp or
+  reordered tool list at the top means a miss on every step.
+- **"Weights are what limit concurrency."** Past short contexts, the cache usually is: about 0.5 MB per
+  token on a 7B MHA model adds up to the whole card in a few dozen long chats.
 
 ## Examples
 ### Decode loop with and without the cache

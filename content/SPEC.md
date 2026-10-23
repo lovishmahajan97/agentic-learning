@@ -1,4 +1,71 @@
-# Lesson authoring spec (v4: mastery format, on top of v3)
+# Lesson authoring spec (v5: three lesson types, on top of v4/v3)
+
+**Why v5.** Not every topic should be taught the same way. Each lesson declares one type and gains ONE
+type-specific section that becomes the lesson's front view in the app. Everything else in the lesson
+stays as the full reference below it. Add material; do not delete existing sections or facts.
+
+Front matter: `lesson_type: concept | lab | decision` and `status: typed` once both checks pass
+(`typed-verified` after review). Keep every existing front-matter field.
+
+**Choosing the type** (a suggestion is provided per file; override it when it is clearly wrong):
+- **concept** — definitions, fundamentals, mental models (attention, embeddings, probability, RLHF).
+- **lab** — tools, implementation and debugging (asyncio, FastAPI routers, LangGraph, an MCP server).
+- **decision** — system design, reliability, security, delivery (build vs buy, multi-tenancy, rollout).
+
+## Type A: concept → add `## Misconceptions` (place it right after `## Diagram`)
+3-6 bullets, each: **the wrong belief in bold.** Why it is wrong, and the correct view, in one or two
+sentences. 60-450 words. These are the beliefs a smart engineer actually holds before learning this.
+(The concept view also shows TL;DR, Why it exists, How it works, the Diagram, the FIRST example and the
+Check yourself and Quiz; make sure the first `###` example in Examples is the single best worked example.)
+
+## Type B: lab → add `## Lab` (place it right after `## For agent builders`)
+```
+## Lab
+### Task
+What you will build or fix, the agent-related goal, time box (30-120 min), and the prerequisites to
+have done first (link lesson names). One short paragraph plus bullets.
+### Starter code
+One fenced, runnable block (Python, or TypeScript for Node lessons) that sets up the problem and leaves
+clearly marked TODOs. It must run as given (TODO paths may raise NotImplementedError).
+### Expected output
+A fenced block with the exact output (or the key lines) a correct solution prints.
+### Tests
+A fenced block with runnable tests (pytest or plain asserts; vitest for TS) that fail on the starter
+and pass on a correct solution.
+### Failure scenarios
+2-4 bullets: **inject this fault**, what you observe, and the debugging steps that find it.
+### Submission
+3-6 checkable bullets: what to hand in (repo, test run, a trace or log, a short note) and how it is
+evaluated.
+```
+120-900 prose words. Do not include the solution. Execute starter and tests in a temp venv under /tmp:
+the tests must fail on the starter for the right reason; write a private solution in /tmp to confirm
+they pass, then delete it.
+
+## Type C: decision → add `## Decision case` (place it right after `## For agent builders`)
+```
+## Decision case
+### Scenario
+A realistic business and technical situation: who, what they need, scale numbers, and explicit
+constraints (budget, latency, data residency, team skills, deadline).
+### Options
+A table of 2-4 competing approaches with columns for how it works and how it fares on each constraint.
+### Decision
+The choice and the justification, tied to the constraints, plus what would change the decision.
+### Trade-offs accepted
+Bullets: what you give up and how you will watch for it.
+### Review rubric
+4-6 observable criteria a reviewer uses to judge a learner's own decision write-up for a similar case.
+```
+200-900 prose words. Numbers must be consistent and recomputed; no invented vendor prices or SLAs
+presented as fact (label rough figures as illustrative).
+
+Check with `python3 scripts/build.py --check --v5 <file>` and `python3 scripts/compare_lesson.py <file>`
+(nothing lost vs tag `pre-typed`; lessons may grow by the new section only).
+
+---
+
+# v4: mastery format, on top of v3
 
 **Why v4.** Reading and passing a quiz is not competence. v4 lessons are built so a learner can show they
 can explain, implement and evaluate the topic independently. v4 applies to high-value lessons and all new

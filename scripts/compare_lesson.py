@@ -68,10 +68,11 @@ def compare(old_text, new_text):
     if ofm is None:
         return []
     nst = str(nfm.get("status", "")).lower()
+    typed = nst.startswith("typed")
     mastery = nst.startswith("mastery")
     agentic = nst.startswith("agentic") or mastery
     for k in sorted(set(ofm) | set(nfm)):
-        if k == "status" or (agentic and k == "agent_relevance") or (mastery and k in ("mastery", "prerequisites", "code_tested", "milestones", "est_minutes")):
+        if k == "status" or (agentic and k == "agent_relevance") or (mastery and k in ("mastery", "prerequisites", "code_tested", "milestones", "est_minutes")) or (typed and k in ("lesson_type", "est_minutes")):
             continue
         if ofm.get(k) != nfm.get(k):
             problems.append(f"front matter '{k}' changed: {ofm.get(k)!r} -> {nfm.get(k)!r}")
@@ -116,9 +117,11 @@ def main(argv):
                              capture_output=True).returncode == 0
     has_agentic = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "-q", "--verify", "refs/tags/pre-agentic"],
                                  capture_output=True).returncode == 0
+    has_typed = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "-q", "--verify", "refs/tags/pre-typed"],
+                               capture_output=True).returncode == 0
     has_mastery = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "-q", "--verify", "refs/tags/pre-mastery"],
                                  capture_output=True).returncode == 0
-    ref, files, all_mode = ("pre-mastery" if has_mastery else "pre-agentic" if has_agentic else "pre-crisp" if has_tag else "HEAD"), [], False
+    ref, files, all_mode = ("pre-typed" if has_typed else "pre-mastery" if has_mastery else "pre-agentic" if has_agentic else "pre-crisp" if has_tag else "HEAD"), [], False
     i = 0
     while i < len(argv):
         if argv[i] == "--ref":
@@ -131,7 +134,7 @@ def main(argv):
         for p in sorted((ROOT / "content").glob("*/*.md")):
             if p.name.startswith("_"):
                 continue
-            if re.search(r"^status:\s*(crisp|agentic|mastery)(-verified)?\s*$", p.read_text(encoding="utf-8")[:2000], re.M):
+            if re.search(r"^status:\s*(crisp|agentic|mastery|typed)(-verified)?\s*$", p.read_text(encoding="utf-8")[:2000], re.M):
                 files.append(str(p.relative_to(ROOT)))
     bad = 0
     for f in files:
