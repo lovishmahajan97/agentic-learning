@@ -5,8 +5,14 @@ name: Agent memory (short-term, long-term, episodic)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - model-internals/context-window
+  - rag-retrieval/vector-databases
 related:
   - agents/memory-retrieval-update-deletion-policies
   - agents/context-compaction-summarization
@@ -38,8 +44,8 @@ over the agent's own history, plus a write path.
 - **What you control.** Which memory types exist, the extraction prompt, write gating by source, scope at
   write time, the retrieval score and token budget, the dated memory block in the prompt and the
   compaction trigger.
-- **What you can skip.** The cognitive-science debate behind the memory taxonomy; keep the split between
-  what happened, what is true and how to act, because each needs its own write rule and lifetime.
+- **What you can skip.** The cognitive-science debate behind the memory taxonomy; keep the split itself,
+  because each type needs its own write rule and lifetime.
 
 ## Why it exists
 - **A model call is a pure function of its input.** Close the session and the agent forgets the user's
@@ -92,7 +98,7 @@ Treat the window as a budget you allocate, not a bucket you fill. Illustrative s
   memories.
 
 ### Long-term memory
-Persisted outside the model and loaded on demand. Two sub-types matter in practice:
+Persisted outside the model, loaded on demand:
 - **Semantic memory: facts.** Short declarative statements about the user, environment and domain, with
   provenance and a timestamp ("user's team deploys on Tuesdays", "prod DB is Postgres 15"). Written by an
   extraction step that reads a turn or session and emits candidate facts, deduplicated against the store.
@@ -155,8 +161,8 @@ or leaks where it must not appear.
 - **Common hybrid:** a small model-managed "core" block plus automatic extraction and retrieval.
 
 ## Diagram
-Follow the two paths around the model: writes are gated and deduplicated before storage, reads are
-scoped, scored and budgeted before they enter the context window.
+Two paths: writes are gated and deduplicated before storage; reads are scoped, scored and budgeted
+before entering the window.
 
 ```mermaid
 flowchart TD
@@ -175,8 +181,8 @@ flowchart TD
 
 ## Examples
 ### A minimal semantic memory layer
-Extract facts at session end, store them with embeddings and timestamps, retrieve by cosine similarity
-weighted by recency, and inject them into the next session's prompt.
+`embedding_model` and `llm_json` are any embedding call and any JSON-returning model call (run with
+numpy 2.0 and stubbed models).
 
 ```python
 import time, numpy as np
@@ -217,9 +223,9 @@ system = "You are a deployment assistant.\n\nKnown about this user (may be stale
          + recall("u42", "help me ship the payments service")
 ```
 
-- **Illustrative values:** the weights, the 0.92 threshold and the half-life. The shape to copy is scoping
-  by user before scoring, blending relevance with recency, and surfacing timestamps so the model can
-  discount old facts.
+- **Illustrative values:** the weights, the 0.92 threshold and the half-life. Copy the shape: scope by
+  user before scoring, blend relevance with recency, and show timestamps so the model can discount old
+  facts.
 - **The recency weight is small** *because* these are semantic facts: "prod DB is Postgres 15" is not less
   true for being old, and heavy decay would let last week's trivia outrank it. An episodic store would
   weight recency more and add the importance term above.
@@ -229,8 +235,7 @@ system = "You are a deployment assistant.\n\nKnown about this user (may be stale
   superseded value for audit.
 
 ### Episodic scoring: why the importance term matters
-Runnable pure Python. Relevance is fixed per episode for clarity (normally a cosine score); the decay,
-weights and ratings are illustrative.
+Pure Python; runs as is. The decay, weights and ratings are illustrative.
 
 ```python
 DECAY = 0.995                       # per hour since last access (illustrative)
@@ -291,20 +296,25 @@ for flag in (False, True):
 - **Targeted vs consistent.** Model-managed memory tools adapt to what the task needs, at the cost of extra
   tool calls and reliance on the model remembering to save; automatic extraction is more consistent but
   less targeted.
-- **Freshness vs stable facts.** Recency weighting keeps memories fresh, but buries stable long-term facts
-  under recent trivia unless importance or a semantic/episodic split counterbalances it.
+- **Freshness vs stable facts.** Recency weighting keeps memories fresh but buries stable facts under
+  recent trivia unless importance or a semantic/episodic split counters it.
 
 ## Pitfalls
 - **Storing raw transcripts and retrieving by similarity alone.** Symptom: "memories" that are chatter,
-  contradictions surfacing together, and the model picking the wrong one. Fix: extract facts.
+  contradictions surfacing together, and the model picking the wrong one. Diagnose: log what recall
+  returns for 20 real queries and label each row fact or chatter. Fix: extract facts.
 - **Writing memories from untrusted content** such as web pages or documents. Symptom: an instruction that
-  persists across sessions after a single injected page. Fix: gate writes by source.
+  persists across sessions after a single injected page. Diagnose: group stored rows by source tag; any
+  row derived from retrieved text is a breach. Fix: gate writes by source.
 - **No timestamps or provenance on memories.** Symptom: the agent confidently acts on a preference the user
-  changed months ago. Fix: store and show dates and sources.
+  changed months ago. Diagnose: run a changed-details test set and check which value it uses. Fix: store
+  and show dates and sources.
 - **Missing tenant or user scoping in retrieval.** Symptom: one user's facts appear in another user's
-  session, a privacy incident rather than a quality bug. Fix: scope as a hard filter.
+  session, a privacy incident rather than a quality bug. Diagnose: run a cross-user canary and check the
+  filter sits inside the store query. Fix: scope as a hard filter.
 - **Treating compaction summaries as lossless.** Symptom: an agent forgets a constraint stated early in a
-  long session right after the context was compacted. Fix: pin constraints outside the compacted region.
+  long session right after the context was compacted. Diagnose: diff the list of active constraints
+  before and after each compaction. Fix: pin constraints outside the compacted region.
 
 ## When to use
 - **Add long-term memory when** the same user or environment returns across sessions and re-asking costs
@@ -314,9 +324,17 @@ for flag in (False, True):
 - **Skip persistent memory** for one-shot tasks, and prefer in-context history when sessions are short.
 - **Measure** retrieval hit rate on a labelled set of "should have remembered" cases, staleness incidents,
   and token cost per turn.
-- **On the job:** the extraction prompt, the store schema and the retrieval budget.
-- **Interviews:** separate the three types, explain the write and read paths, and say why memory needs
-  scoping and provenance.
+
+## Exercise
+**Goal:** build episodic memory and a slot-budgeted context assembler for a deploy agent.
+- **Inputs:** 40 synthetic deploy episodes (time, outcome, text, importance 1-10), 15 queries labelled
+  with the episode that should surface, and any embedding model.
+- **Constraints:** relevance, recency and importance normalised before weighting; per-slot token caps;
+  compaction at a turn boundary before 80% of the window.
+- **Deliver:** the scorer, the assembler and a ranking table with and without the importance term.
+- **Acceptance:** the labelled episode is in the top 3 for at least 12 of 15 queries; removing
+  importance demotes the old high-impact incident as you predicted; a 40k-token tool result never
+  evicts the memory or plan slot.
 
 ## Role lens
 - **Engineer:** Builds the extraction and recall steps, the store schema with timestamps and scope,
@@ -395,6 +413,19 @@ where the agent must answer with the latest value.
 > Every step re-reads the full context, long sessions eventually exceed it, and facts buried in a huge
 > history are attended to less reliably than the same facts retrieved and placed near the question.
 
+## Mastery test
+**Problem:** a coding agent for a 30-person team stores facts per user. Developers say it keeps
+suggesting a deprecated build command, and one saw another developer's endpoint preferences. The team
+proposes doubling top-k. Diagnose and redesign.
+
+**A strong answer:**
+- rejects a bigger top-k, which pulls more stale and foreign rows into context;
+- sees the build command as team procedure stored as per-user facts: move it to reviewed tenant or
+  procedural memory and supersede it on change;
+- treats the leak as a scoping bug and privacy incident: filter inside the query, audit rows, add a
+  canary;
+- shows dates and sources in the memory block and tracks staleness and canary results.
+
 ## Use cases & projects
 ### Use cases
 - **Developer assistants tied to one codebase.** Semantic facts such as "staging DB is read-only" and
@@ -403,8 +434,6 @@ where the agent must answer with the latest value.
   customer with current plan details instead of asking again, and show when a fact may be stale.
 - **Agents in flaky environments.** Episodic records of past failures ("deploy failed on a missing env
   var") are retrieved before the next attempt and consolidated into a checklist.
-- **Long-running tasks.** A slot budget and early compaction keep constraints and the plan in context
-  while large tool results are summarised or stored by reference.
 
 ### Mini project
 **Add scoped, dated long-term memory to a chat agent (2-3 hours).**
@@ -418,6 +447,6 @@ where the agent must answer with the latest value.
   foreign rows, and a fact injected from a web page is rejected by write gating.
 
 ### Major project
-This lesson feeds the module Capstone (see the module guide): the billing-dispute agent keeps
+Feeds the module Capstone: the billing-dispute agent keeps
 per-customer memory such as preferred contact and past disputes, with provenance and a working erasure
 path.

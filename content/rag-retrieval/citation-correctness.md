@@ -41,8 +41,7 @@ necessary), scored per claim by an entailment model or calibrated judge.
 - **What you control.** How answers are split into claims, which passages the judge sees (only the cited
   tool results, at the version the agent saw), the judge's calibration against human labels, and the
   thresholds that block a release.
-- **What you can skip.** Training your own attribution model. An NLI model plus a calibrated LLM judge on
-  a sample covers most agent products.
+- **What you can skip.** Training your own attribution model; NLI plus a calibrated LLM judge covers most products.
 
 ## Why it exists
 - **A cited but unsupported sentence is worse than an uncited one:** it borrows the source's authority.
@@ -55,7 +54,7 @@ necessary), scored per claim by an entailment model or calibrated judge.
   because the source itself is outdated.
 - **Three different properties:** *answer correctness* (is it true), *faithfulness* (is it derived from the
   provided context), *citation correctness* (does this pointer back this claim). Users clicking a citation
-  test the third, and every failed click erodes trust in the others.
+  test the third.
 
 ## How it works
 ### Unit of evaluation
@@ -230,8 +229,8 @@ print(score_trace(trace, keyword_judge))   # 1 full, 1 misattributed, 1 invented
 | Runs with 1 search call | 400 | 352 | 20 | 28 |
 | Runs with 4+ search calls | 400 | 300 | 76 | 24 |
 
-- **Long runs misattribute more:** evidence is in the trace but the agent cites the wrong tool result, a
-  run-level ID or re-citation problem, not a retrieval one.
+- **Long runs misattribute more:** the evidence is in the trace but the wrong tool result is cited, an ID
+  problem, not a retrieval one.
 
 ### Putting an interval on the number
 Claims within one answer are correlated, so resample questions, not claims. Synthetic data, illustrative.

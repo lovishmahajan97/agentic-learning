@@ -5,7 +5,7 @@ name: Rollout criteria & rollback triggers
 kind: practice
 difficulty: core
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -47,8 +47,8 @@ rationalise bad numbers mid-incident and agent quality signals are noisy and slo
 - **The predictable failure is "probably noise, keep going"**, then an incident at 100% that was visible
   at 5%. The opposite also happens: a rollback on pure noise, and the team loses confidence in releasing
   at all.
-- **AI releases are often not code.** A new prompt, model version, re-embedded index or retrieval
-  parameter can degrade quality with no rise in errors or latency at all.
+- **AI releases are often not code.** A prompt, model, re-embedded index or retrieval parameter can
+  degrade quality with no rise in errors or latency.
 - **Quality signals are slow and noisy.** Thumbs-down rates, escalations and LLM-judge scores need
   hundreds of requests and hours or days before a difference beats noise. And some AI actions are
   irreversible: emails sent or records updated by an agent are not undone by redeploying.
@@ -384,8 +384,9 @@ Design the stages and triggers. What can the canary prove in a week, and what ca
 **A strong answer:**
 - computes that a doubled 0.5% error rate needs about 5,000 tasks (`min_requests(0.005, 2)`), over 12
   days of total traffic, so error triggers alone cannot decide in a week;
-- leans on fast hard signals (cost and steps per task) and a judged sample, and admits small tenants
-  stay underpowered;
+- leans on fast hard signals (cost and steps per task), judges every canary task since volume is low,
+  and shadow-runs the new model on real tasks (draft, never send) for evidence without exposure;
+- admits a 1,600-per-arm judged floor is also over a week away and small tenants stay underpowered;
 - fences sends behind dry-run or approval in early stages, because a sent email cannot be rolled back;
 - pins the model and keeps the old version behind the flag.
 
@@ -397,8 +398,6 @@ Design the stages and triggers. What can the canary prove in a week, and what ca
   quality loss are real before promotion.
 - **Enabling a new write tool.** Early stages run it in dry-run, counting would-be writes to size the blast
   radius before turning it on.
-- **Re-embedding the knowledge base behind a RAG agent.** The old index stays warm so rollback is a config
-  switch, not hours of re-embedding.
 
 ### Mini project
 **Canary gate for an agent release (2-3 hours).**

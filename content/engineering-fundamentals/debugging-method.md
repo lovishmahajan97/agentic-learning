@@ -220,9 +220,10 @@ An agent's eval success rate fell from 86% to 71% after a release that bundled t
 ## Exercise
 **Goal:** debug a deliberately broken mini agent using only the four-step method, keeping a written
 log. No solution is given.
-- **Setup:** write (or ask a colleague to write) a 3-tool agent with a scripted fake model that replays
-  recorded tool calls, then plant two bugs: one type bug in a tool argument and one in commit history
-  (for example a changed default).
+- **Setup:** write a 3-tool agent with a scripted fake model that replays recorded tool calls, commit
+  it, then have a colleague (or an LLM in a branch you do not read) plant two bugs: one type bug in a
+  tool argument and one buried in a run of 10+ commits (for example a changed default). Bugs you
+  planted yourself only rehearse the steps.
 - **Constraints:** no edit to code until you have a reproduction script that exits 1 on failure; one
   change per probe.
 - **Deliver:** the reproduction script, a debugging log (hypothesis, prediction, probe, result for each

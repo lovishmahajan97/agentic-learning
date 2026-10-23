@@ -5,7 +5,7 @@ name: Choosing an SLM (Llama, Qwen, Phi, Gemma, Mistral small models)
 kind: decision
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -103,7 +103,7 @@ Pull the candidates with `ollama pull`, then score each on correct tool, valid a
 Ollama's Python client. The model tags are examples; use the current tags from the Ollama library.
 
 ```python
-# Checked with the ollama Python client 0.6 (attribute access on responses needs 0.4+).
+# Run with the ollama Python client 0.6.3 against a mock server (attribute access needs 0.4+).
 import json, time
 import ollama
 
@@ -201,7 +201,8 @@ test. No solution is given.
   checking license and tool template, and printing pass or fail with the reason; then screen the survivors
   with the harness above.
 - **Acceptance:** every rejected model names the filter it failed; for one model you can run, your memory
-  estimate lands within about 15% of what `ollama ps` or `nvidia-smi` reports at your context.
+  estimate lands within about 15% of what `ollama ps` reports at your context and parallel setting
+  (vLLM pre-allocates, so `nvidia-smi` misleads there).
 
 ## Role lens
 - **Engineer:** Runs the screening harness across candidates, records scores per agent step, and pins the
@@ -286,10 +287,10 @@ license. What do you do?
 
 ## Use cases & projects
 ### Use cases
-- **On-premises agents.** Teams pick the best model that fits the customer's single GPU and license policy,
-  then lock its revision in a registry.
-- **Multilingual assistants.** Screening reveals which family keeps tool calling accurate in the customer's
-  languages, which general benchmarks rarely show.
+- **On-premises agents.** Teams pick the best model fitting the customer's single GPU and license policy,
+  then pin its revision in a registry.
+- **Multilingual assistants.** Screening shows which family keeps tool calling accurate in the customer's
+  languages; benchmarks rarely do.
 - **Vendor-exit planning.** Open models from different families give a tested fallback if a hosted
   provider changes terms.
 
@@ -300,5 +301,5 @@ license. What do you do?
   instruct models from different families that pass them, using current model cards; pull them with Ollama;
   build a 50-case golden set for one tool-calling step; run the screening harness and record pass rate, p50
   latency and peak memory.
-- **Done when:** you have a scorecard table, the chosen model with its exact tag and quantization, and a short
-  note on why the runners-up lost.
+- **Done when:** you have a scorecard table, the chosen model's exact tag and quantization, and a note on
+  why runners-up lost.

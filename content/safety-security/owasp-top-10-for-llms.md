@@ -5,8 +5,13 @@ name: OWASP Top 10 for LLMs
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - safety-security/prompt-injection
+  - safety-security/excessive-agency
 related:
   - safety-security/prompt-injection
   - safety-security/excessive-agency
@@ -51,8 +56,7 @@ prompts, tools and outputs must be redrawn.
 - **Item numbers are the lingua franca.** Vendors, questionnaires and increasingly regulators cite LLM01 or
   LLM06; an engineer who cannot say what they mean, and how their system addresses them, struggles in an
   enterprise security review regardless of how good the system is.
-- **Scope of this lesson:** it is the map; the classic boundaries (input validation, output encoding, least
-  privilege, supply chain, resource limits) each have deep lessons elsewhere in this module.
+- **Scope of this lesson:** it is the map; each boundary has a deep lesson elsewhere in this module.
 
 ## How it works
 ### The 2025 list, grouped by trust boundary
@@ -210,9 +214,8 @@ of context. Rough numbers, illustrative:
   alerts on limit hits, are the LLM10 evidence a reviewer asks for.
 
 ## Production patterns
-- **Matrix-as-code in the repo.** Store the per-item matrix next to the service, require evidence links to
-  tests or configs, and run a gap check in CI. Make adding a tool or data source require a matrix diff in
-  code review. Monitor coverage (every item has a row) and freshness (rows touched when architecture changes).
+- **Matrix-as-code in the repo.** The matrix and gap check above, with a matrix diff required in review
+  for any new tool or data source. Monitor coverage and freshness.
 - **Red-team suite tagged by item.** Tag each adversarial test case with the item it exercises (LLM01,
   LLM05, LLM06 and so on) and report pass rates per item on every release, so a regression shows up as
   "LLM05 dropped" rather than a generic score.
@@ -237,15 +240,19 @@ of context. Rough numbers, illustrative:
 
 ## Pitfalls
 - **Accepting "OWASP LLM Top 10 compliant" from a vendor.** Symptom: they cannot produce a per-item control
-  and evidence table when asked.
+  and evidence table when asked. Diagnose: request the table and one evidence link per row. Fix: make the
+  table a procurement requirement.
 - **Mapping LLM01 to an input classifier and declaring it solved.** Symptom: a red-team finding that a
-  paraphrased injection reaches the tool layer unchanged.
+  paraphrased injection reaches the tool layer unchanged. Diagnose: replay paraphrased and indirect cases
+  and log which reach a tool call. Fix: gate and scope the tools.
 - **Ignoring LLM10 because "the provider handles scaling".** Symptom: a month-end invoice several times the
-  forecast after a scripted client or a runaway agent loop.
+  forecast after a scripted client or a runaway agent loop. Diagnose: tokens and steps per run, per
+  tenant. Fix: caps and budgets in the orchestrator.
 - **Reading LLM05 as a model problem.** Symptom: cross-site scripting or command execution from a completion
-  rendered or executed without validation, which no model change would have fixed.
+  rendered or executed without validation, which no model change would have fixed. Diagnose: trace every
+  consumer of a completion. Fix: encode or validate there.
 - **Writing the matrix once at launch.** Symptom: a new tool or data source ships months later with no row
-  and no review.
+  and no review. Diagnose: diff the tool registry against the LLM06 row. Fix: CI rule tying them.
 - **Assessing each row in isolation.** Symptom: every row "mitigated" while a red team chains an injection
   through rendering into disclosure, because no single row owned the chain.
 
@@ -256,8 +263,15 @@ of context. Rough numbers, illustrative:
 - **Avoid:** using it as a scoring scheme or a certification.
 - **Measure:** coverage (every item has a row with control and evidence), freshness (rows updated when the
   architecture changes), and red-team results per item.
-- **Interviews:** "walk me through the OWASP LLM Top 10 for this design"; the strong answer groups items by
-  boundary and names a concrete control and test for each rather than reciting the list.
+
+## Exercise
+**Goal:** threat-model a small agent with the list and prove the matrix with tests. No solution is given.
+- **Inputs:** an agent you can run (or a stub) with RAG over uploaded files, one `create_ticket` write
+  tool and a markdown-rendering UI.
+- **Deliver:** all ten rows with manifests, control and evidence (or a one-line n/a), the `gaps` check in
+  CI, a ranked top three with reasons, and one chained attack written as a test.
+- **Acceptance:** the gap check fails when you delete a row; the chained test (injected file, then image
+  URL or ticket write) fails before your controls and passes after; each control is in code, not the prompt.
 
 ## Role lens
 - **Engineer:** Turns each applicable item into a test or configuration that can be pointed at as
@@ -309,13 +323,6 @@ what the list is meant to elicit.
   its output reach a renderer or interpreter (LLM05)?
 - **Add tagged red-team cases** for the new tool so its item pass rates appear in the next release report.
 
-### When is covering all ten items more process than it is worth?
-- **For a low-risk internal tool** with no write tools and no sensitive data, deep work on every row is
-  disproportionate.
-- **Still write every row,** with a one-line reason for items that do not apply, because reviewers read blanks
-  as gaps.
-- **Scale depth to blast radius:** a public-docs chatbot puts effort into LLM09 and LLM10, not LLM06.
-
 ### What evidence would you expect a vendor to show for LLM10 Unbounded Consumption?
 - **Concrete limits** in config: input and output token caps, requests per user per hour, per-tenant token
   budgets, and a step cap on agent loops.
@@ -348,6 +355,19 @@ what the list is meant to elicit.
 - [ ] The list was merged into the web application Top 10
 > The 2025 edition reflected real deployments: cost and extraction joined denial of service, and RAG and
 > agent failures earned their own items, while prompt injection stayed at number one.
+
+## Mastery test
+**Problem:** an HR agent answers employees from a policy wiki, reads their own payroll record, and can
+email the HR team. Its system prompt says "never reveal salaries of other employees". Rank the three
+items that matter most and give each a control with evidence.
+
+**A strong answer:**
+- flags the system prompt rule as LLM07 and LLM02: the salary scope must come from the token in the
+  payroll tool, tested with another employee's ID;
+- ranks LLM01 with LLM06 high: an edited wiki page can steer the email tool, so restrict recipients and
+  show a confirmation;
+- checks LLM05 (rendered links or images leaking payroll data) and LLM08 if the wiki index is shared;
+- gives evidence as tests or configs, and n/a reasons for the rest.
 
 ## Use cases & projects
 ### Use cases

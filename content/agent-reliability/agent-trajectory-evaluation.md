@@ -5,7 +5,7 @@ name: Agent trajectory evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -411,7 +411,7 @@ without the user's confirmation. The LLM judge rates the new transcripts "more h
 - blocks the release: a violation zeroes the run, so the 2 runs are failures and the gate requires zero;
 - notes a 5-point gain on 200 runs is inside the noise, so it needs per-task pass^k and an interval;
 - reads the fewer steps as possibly the skipped confirmation, not efficiency, and checks the order;
-- discounts the judge, which cannot see side effects and favours shorter transcripts;
+- discounts the judge: it cannot see side effects and was not recalibrated for the new model;
 - fixes with a confirmation gate or required-order check, then reruns.
 
 ## Use cases & projects

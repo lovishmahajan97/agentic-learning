@@ -5,7 +5,7 @@ name: Tool calling and structured output with SLMs
 kind: concept
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -87,8 +87,8 @@ schemas, and escalation to a larger model when validation still fails.
 | Examples | One or two worked calls in the system prompt | Small models imitate examples closely |
 
 ## Diagram
-One tool-call step with all three layers: the schema constrains syntax, the validator checks meaning, and the
-fallback catches what the small model cannot fix.
+One tool-call step: the schema constrains syntax, the validator checks meaning, the fallback catches what the
+SLM cannot fix.
 
 ```mermaid
 flowchart TD
@@ -109,7 +109,7 @@ flowchart TD
 Ollama's `format` takes a JSON schema and constrains decoding to it; Pydantic then checks meaning.
 
 ```python
-# Checked with the ollama Python client 0.6 and Pydantic 2.14 on Python 3.12 (`X | None` needs 3.10+).
+# Run with ollama client 0.6.3 and Pydantic 2.14 against a mock server (`X | None` needs Python 3.10+).
 from typing import Literal
 from pydantic import BaseModel, Field, ValidationError
 import ollama
@@ -127,7 +127,7 @@ def extract(text: str, model: str = "qwen2.5:7b", retries: int = 2) -> RefundReq
                         format=RefundRequest.model_json_schema(), options={"temperature": 0})
         try:
             return RefundRequest.model_validate_json(r.message.content)
-        except ValidationError as e:                  # valid JSON, invalid meaning
+        except ValidationError as e:                  # bad JSON or a failed constraint
             messages += [{"role": "assistant", "content": r.message.content},
                          {"role": "user", "content": f"Fix these errors and reply again: {e}"}]
     return None                                       # caller escalates to a larger model
@@ -137,11 +137,10 @@ print(extract("Order ORD-123456 arrived smashed, please refund the 89.90 EUR."))
 
 ### Two-stage tool calling with escalation
 With 20 tools, an SLM first picks the tool from an enum, then fills only that tool's schema. Both calls use
-JSON-schema `response_format` on an OpenAI-compatible server; support varies by engine and version, so
-check its docs.
+JSON-schema `response_format` on an OpenAI-compatible server; support varies by engine and version.
 
 ```python
-# Checked with openai 3.36 (Python SDK) on Python 3.12.
+# Run with openai 3.37 (Python SDK) against a mock OpenAI-compatible server.
 import json, re
 from openai import OpenAI
 
@@ -197,7 +196,7 @@ most of the work.
 
 ## Production patterns
 - **Constrain everything the code parses.** Use Ollama `format`, llama.cpp JSON schema or vLLM structured
-  outputs on every parsed SLM call. Invalid-output rate should be near zero, so any rise means a config
+  outputs on every parsed SLM call. Invalid-output rate should be near zero; a rise means a config
   regression.
 - **Validate against reality, not just the schema.** After Pydantic, check IDs exist, amounts are within
   limits and the user may act, before executing. Log rejected calls with the input for the eval set.

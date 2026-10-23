@@ -58,8 +58,6 @@ telling real regressions from noise with paired, per-item comparisons.
 - **Agents multiply the surface.** A change can now alter tool choice, argument values, step count and
   the final state of a backend, not only the text, so a suite that only reads the final message misses
   most regressions.
-- **What this borrows from unit tests.** Fast, automatic, per change, but with behavioural assertions
-  and judges instead of string equality, and a noise-aware baseline comparison instead of "all pass".
 
 ## How it works
 ### The suite is a golden set with a contract
@@ -444,14 +442,18 @@ whether any expectations were edited in the same change, which would be a prompt
 ## Mastery test
 **Problem:** a coding agent's suite has 150 cases, one sample each, and compares against a baseline
 stored three weeks ago. A change to the `run_tests` tool schema shows 7 pass→fail and 4 fail→pass flips,
-none critical. The author says "noise, merge it".
+none critical.
+
+30 of the 150 cases call `run_tests`, and 6 of the 7 regressions are among them. The author says
+"noise, merge it".
 
 What do you check, and what would you change about the suite?
 
 **A strong answer:**
-- computes McNemar ((7 − 4)² / 11 ≈ 0.82) and notes 11 pairs need the exact test: not significant,
-  but not proof of noise either;
-- checks whether the 7 regressions cluster in tasks that call `run_tests`, which would be signal;
+- computes McNemar ((7 − 4)² / 11 ≈ 0.82; exact p ≈ 0.55 on 11 pairs): the net change is not
+  significant, but that is not proof of noise;
+- tests the clustering: under noise each regression lands in the `run_tests` slice with probability
+  0.2, so 6 or more of 7 has probability ≈ 0.0004; that is signal, and it blocks;
 - reruns the baseline in the same job, since three weeks of drift contaminates the flips;
 - moves to *k* samples, tags incident cases critical, and measures flakiness on an identical rerun.
 
@@ -461,8 +463,6 @@ What do you check, and what would you change about the suite?
   tool description re-runs the pinned tasks and blocks on new failures in critical cases.
 - **Approving a model snapshot swap.** Running the suite on the old and new model in the same job gives a
   flip list that shows exactly which tasks broke before the switch.
-- **Locking in incident fixes.** Each production failure becomes a case with its stubbed tool responses,
-  so a later fix elsewhere cannot silently reintroduce it.
 - **Detecting drift with no commit.** A scheduled run with no code diff catches provider-side model
   updates, index rebuilds and dependency bumps.
 

@@ -5,8 +5,14 @@ name: Offline vs online evaluation
 kind: decision
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - evals/golden-dataset
+  - evals/llm-as-a-judge
+  - math-for-ai/statistics-for-evaluation
 related:
   - evals/a-b-testing
   - evals/golden-dataset
@@ -36,8 +42,8 @@ slow and noisy. Offline gates, online validates, traces refill it.
 - **What you control.** Which rungs a change must climb, the primary outcome event, how side-effecting
   tools behave in shadow (dry-run, never real), the trace sample that refreshes the golden set, and the
   launch log that tracks offline-online agreement.
-- **What you can skip.** Building a full experimentation platform up front. A launch log, a trace
-  sampler and one outcome event get most of the value.
+- **What you can skip.** A full experimentation platform up front; a launch log, a trace sampler and one
+  outcome event get most of the value.
 
 ## Why it exists
 Offline scores and real outcomes drift apart for four structural reasons:
@@ -57,9 +63,8 @@ Offline scores and real outcomes drift apart for four structural reasons:
 - **Failures reach users first**, and a regression cannot be bisected across the ten changes shipped
   that fortnight.
 
-The resolution is a ladder, each rung more expensive and more truthful than the one below, with defined
-hand-offs: offline catches what is cheap to catch, online confirms what only users can, and the two are
-reconciled whenever they disagree.
+The resolution is a ladder with defined hand-offs: offline catches what is cheap to catch, online
+confirms what only users can, and the two are reconciled whenever they disagree.
 
 ## How it works
 ### What each one measures
@@ -194,10 +199,11 @@ async def shadow(request_id: str, msg: str, candidate, tools: dict, prod_actions
 
 - **Read the action diff first:** a candidate that intends a refund where production did not is a
   policy question no text judge will surface.
+- **Keep a reference to each shadow task:** the event loop holds tasks only weakly (Python docs for
+  `create_task`), so add them to a set until done or a run can vanish mid-flight.
 
 ### Worked scenario: offline win, online flat
-Illustrative numbers for a support agent, chosen to show the failure mode rather than to report any
-real system.
+Illustrative numbers for a support agent, chosen to show the failure mode, not a real system.
 
 | Rung | v1 | v2 | Reading |
 |---|---|---|---|
@@ -250,8 +256,7 @@ print(f"rank agreement (Spearman): {spearman(*zip(*conclusive)):.2f}")          
 print(n_per_arm(0.60, 0.03), n_per_arm(0.60, 0.01))   # 4126 37511: ~4,000 and ~37,000 per arm
 ```
 
-- **Reading the log:** only 4 of 7 launches were conclusive online, which is itself a finding about
-  traffic. Of those, the offline metric got direction right 3 times in 4 and ranked them perfectly: a
+- **Reading the log:** only 4 of 7 launches were conclusive online, itself a finding about traffic. Of those, the offline metric got direction right 3 times in 4 and ranked them perfectly: a
   usable gate, with the +1-point offline gain that lost online worth investigating.
 
 ## Production patterns
@@ -262,12 +267,10 @@ print(n_per_arm(0.60, 0.03), n_per_arm(0.60, 0.01))   # 4126 37511: ~4,000 and ~
 - **Canary with automatic rollback.** Route a few percent of traffic to the new version and roll back
   automatically when error rate, p95 latency, cost per conversation or refusal rate crosses a threshold.
   Monitor these in short windows; do not read quality from the canary.
-- **Weekly stratified trace sampling.** Pull production traces by intent, oversampling flagged and
-  low-scored ones, label them, and add them to the golden set with a version bump. Monitor the distance
-  between the golden set's intent mix and production's.
-- **Launch log with agreement metrics.** One row per online-tested change with both deltas and the
-  decision, as in the example. Monitor directional agreement; stop gating on a metric that falls to
-  coin-flip level.
+- **Weekly stratified trace sampling** into the golden set with a version bump, oversampling flagged
+  and low-scored traces. Monitor the distance between the golden set's intent mix and production's.
+- **Launch log with agreement metrics,** as in the example. Monitor directional agreement; stop gating on
+  a metric that falls to coin-flip level.
 - **Sampled online judging off the request path.** Judge a fixed sample of live traces asynchronously,
   with the same pinned judge version as offline, so the two are comparable. Monitor judge score against
   the primary outcome on the same conversations.
@@ -291,17 +294,20 @@ print(n_per_arm(0.60, 0.03), n_per_arm(0.60, 0.01))   # 4126 37511: ~4,000 and ~
 
 ## Pitfalls
 - **Shipping on an offline gain without online confirmation.** Symptom: higher dashboard scores and
-  higher cost or escalation in the field, as in the example. Fix: climb the ladder.
+  higher cost or escalation in the field, as in the example. Diagnose: put offline delta beside online
+  cost, length and escalation per version. Fix: climb the ladder.
 - **A shadow agent with live write tools.** Symptom: customers receive two emails or a duplicate refund
-  the week shadow mode starts. Fix: dry-run every side-effecting tool in shadow and test that wrapper.
+  the week shadow mode starts. Diagnose: count real side-effect calls tagged with the shadow version;
+  any above zero is the bug. Fix: dry-run every side-effecting tool in shadow and test that wrapper.
 - **Reading shadow preference as user preference.** Symptom: a candidate that "wins" shadow and loses the
-  A/B because its replies are slower or longer. Fix: treat shadow as a distribution check.
+  A/B because its replies are slower or longer. Diagnose: compare reply length and latency between
+  arms. Fix: treat shadow as a distribution check.
 - **Implicit signals as the primary metric.** Symptom: optimising thumbs-up from the vocal few while the
-  silent majority escalates. Fix: one primary outcome per product.
+  silent majority escalates. Diagnose: rating coverage per conversation. Fix: one primary outcome per product.
 - **Never feeding traces back into the golden set.** Symptom: a steady high offline score while
-  production's intent mix has moved on. Fix: scheduled stratified sampling.
+  production's intent mix has moved on. Diagnose: diff intent mixes. Fix: scheduled stratified sampling.
 - **Treating offline validity as settled once.** Symptom: launches that each win offline by a few points
-  while the online outcome stays flat quarter after quarter. Fix: the launch log.
+  while the online outcome stays flat quarter after quarter. Fix: the launch log and its agreement rate.
 - **Week-over-week comparisons as experiments.** Symptom: a "regression" that was a holiday, a campaign
   or a provider update. Fix: randomise.
 
@@ -314,8 +320,17 @@ print(n_per_arm(0.60, 0.03), n_per_arm(0.60, 0.01))   # 4126 37511: ~4,000 and ~
 - **A/B test:** the change is expensive or strategic enough to need a causal answer on outcomes, and the
   traffic exists to get one.
 - **Measure:** offline-online agreement over time; that number is the health of the whole evaluation stack.
-- **Interviews:** describe the ladder, say what shadow mode cannot measure, and explain what you do when
-  offline and online disagree.
+
+## Exercise
+**Goal:** decide, with evidence, whether your offline metric may keep gating releases of an agent you
+run. No solution is given.
+- **Inputs:** two agent versions, a golden set of at least 30 tasks, and at least 200 logged (or
+  simulated) conversations per version with a resolution event keyed by conversation ID.
+- **Deliver:** a shadow run with dry-run write tools and an intended-action diff; judge score against
+  resolution on the same conversations; a launch log of 5+ changes with directional and rank agreement;
+  the A/B sample size for your smallest meaningful change.
+- **Acceptance:** the tool log shows zero real writes from shadow; every online delta has an interval;
+  a verdict (keep, repair or stop gating) cites the agreement numbers.
 
 ## Role lens
 - **Engineer:** Builds the shadow pipeline and the trace sampler, keeps the golden set refreshed from
@@ -353,11 +368,6 @@ calls the candidate flat, the evaluation stack is consistent again and the next 
   then run a pairwise judge on the replies.
 - **Know the limit:** a stubbed result can differ from what the real tool returns, so later steps may
   diverge; the canary and A/B rungs cover that.
-
-### What can shadow mode not tell you?
-- **User reaction:** nobody sees the candidate, so there are no thumbs, escalations or retries.
-- **Multi-turn effects:** the user's next message responds to production's reply, not the candidate's.
-- **Latency under real load** and anything else that depends on serving the candidate for real.
 
 ### Why is a canary not a quality test?
 - **Too little data:** a few percent of traffic for hours or a day is a few hundred conversations; a
@@ -408,6 +418,20 @@ calls the candidate flat, the evaluation stack is consistent again and the next 
 > every change, stop regressions early and point at what broke; online evaluation then confirms what only
 > users can confirm.
 
+## Mastery test
+**Problem:** a coding agent's offline pass rate on 400 tasks rose 6 points; shadow mode shows a 61%
+pairwise win. The outcome is PR merge rate: 40% on 1,500 PRs a week. Leadership wants it shipped
+Monday. What do you do, and what would change your decision?
+
+**A strong answer:**
+- calls the shadow win a judge preference on live inputs, not a merge-rate result;
+- sizes the A/B: a 3-point change on 40% needs roughly 4,200 PRs per arm, about six weeks of all
+  traffic, so a canary for guardrails (CI failures, cost, latency) comes first;
+- fixes the outcome window (merged within 7 days) and randomises by developer or repo, not PR, which
+  lowers the effective sample size further;
+- reads the launch log: if past offline gains predicted merge rate, a staged rollout is defensible;
+- looks for proxy gaps (longer diffs, tests edited to pass) and stops if merge rate is flat with cost up.
+
 ## Use cases & projects
 ### Use cases
 - **Shipping a new planner prompt.** It must pass the offline task set, then a shadow or canary rung,
@@ -416,8 +440,6 @@ calls the candidate flat, the evaluation stack is consistent again and the next 
   in dry-run mode, so real-world behaviour is observed without real actions.
 - **Refreshing the golden set from traces.** Sampled production conversations, especially failures,
   are added offline so the eval tracks this month's intent mix.
-- **Checking whether offline scores predict outcomes.** A launch log of offline deltas against online
-  results shows whether the offline gate can be trusted.
 
 ### Mini project
 **Wire an offline-to-online loop for a support agent (2-3 hours).**

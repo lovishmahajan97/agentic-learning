@@ -5,8 +5,14 @@ name: RAG poisoning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - safety-security/prompt-injection
+  - rag-retrieval/similarity-search
+  - agents/agent-memory
 related:
   - safety-security/prompt-injection
   - rag-retrieval/acl-aware-retrieval
@@ -82,17 +88,6 @@ hold:
 - **Other variants:** untargeted denial (flooding retrieval with noise so answers degrade or the model
   refuses) and conditional payloads aimed at particular users.
 
-### Walking one attack through retrieval
-Target question "what is the wire approval limit?", top-k is 5.
-1. **Legitimately,** perhaps one policy page mentions wire approvals; its similarity is moderate because it
-   is written as policy prose.
-2. **The attacker's page** opens with the question verbatim and three paraphrases, so its similarity is
-   higher than the real page's.
-3. **Two such pages take two of the five slots,** often the top two.
-4. **The model sees** two confident sources saying $1,000,000 and one saying $10,000.
-5. **Corpus size never entered the calculation,** because ranking is relative to the query, not to the
-   corpus.
-
 ### Agent memory is a corpus too
 - **The agent writes the store it retrieves from,** often from content it read.
 - **One injection can persist:** getting the agent to save "remember: invoices from vendor X are
@@ -159,8 +154,8 @@ flowchart TD
 ## Examples
 ### Trust-aware ingestion and selection
 The ingestion step judges the raw document but indexes the cleaned text and assigns a trust tier from the
-source system; the selection step stops a low-trust document crowding the context. The threshold
-constants are illustrative.
+source system; the selection step stops a low-trust document crowding the context. The constants are
+illustrative; all three examples run as is on Python 3.12, standard library only.
 
 ```python
 import re, unicodedata, hashlib
@@ -203,8 +198,8 @@ print(ingest("Wire approvals above $10,000 need two signatures.", "policy-repo",
 ```
 
 ### Isolate-then-aggregate and a spread detector
-Standard library only. In production each entry in `per_passage_answers` comes from one model call that
-saw a single passage; here they are given directly so the logic runs as is.
+In production each entry in `per_passage_answers` comes from one model call that saw a single passage;
+here they are given directly.
 
 ```python
 from collections import Counter, defaultdict
@@ -233,6 +228,9 @@ print(wide_spread_docs(log))   # ['T-9912']: in the top-k for all 50 unrelated q
 ```
 
 ### Worked scenario: the wire-limit attack in numbers
+The legitimate page is policy prose, so its similarity to the question is moderate; the attacker's pages
+score higher because they contain the question itself. Corpus size never enters the calculation.
+
 | Step | Value |
 |---|---|
 | Top-k | 5 |
@@ -265,24 +263,22 @@ print(approve_wire(250_000, [wiki, policy], 10_000))  # escalate: exceeds the 10
 ```
 
 ## Production patterns
-- **Trust tiers as separate collections.** Keep the official policy repository, team wikis, user content
-  and web in separate indexes or with a tier field, and require at least one high-tier source for
-  policy-class queries. Monitor the share of top-k from low-trust sources on those queries.
-- **Render-then-extract ingestion with quarantine.** Extract text from the rendered view, strip
-  zero-width characters, allowlist metadata fields, and send flagged low-trust documents to a review
-  queue. Monitor the quarantine rate per source.
-- **Canary queries on a schedule.** Keep a set of questions with known answers, run them daily against the
-  live index, and alert on any new document entering their top-k or any change in answer.
-- **Per-version hashes and re-scans.** Store a content hash per chunk version and re-run sanitisation on
-  every edit, not only first ingestion, so a page edited after review is caught.
-- **Actions need a system of record, not a chunk.** Agent teams let retrieved text explain a decision but
-  read limits, recipients and approvals from a high-tier source or API in the executor. Monitor actions
-  escalated for lacking a high-tier citation.
+- **Trust tiers as separate collections.** Separate indexes or a tier field for policy repository, team
+  wikis, user content and web; policy-class queries need one high-tier source. Monitor the low-trust
+  share of top-k on those queries.
+- **Render-then-extract ingestion with quarantine.** The sanitiser above, with flagged low-trust
+  documents sent to a review queue. Monitor the quarantine rate per source.
+- **Canary queries on a schedule.** Questions with known answers, run daily against the live index;
+  alert on any new top-k entrant or changed answer.
+- **Per-version hashes and re-scans.** A content hash per chunk version, re-sanitised on every edit, so a
+  page edited after review is caught.
+- **Actions need a system of record, not a chunk.** Retrieved text explains; the executor reads limits,
+  recipients and approvals from a high-tier source or API. Monitor escalations for missing high-tier
+  citations.
 - **Memory writes with provenance and review.** Store the triggering document or tool result with every
-  agent memory write, and hold memories that change how actions are handled for review. Monitor memory
-  writes per source tier.
-- **Index versioning with lineage.** Version the index, log which chunk ids each answer cited, and on
-  removal invalidate vectors and caches and find every affected answer.
+  memory write and hold action-changing memories for review. Monitor memory writes per source tier.
+- **Index versioning with lineage.** Version the index and log which chunk ids each answer cited, so a
+  removal can find every affected answer.
 
 ## Trade-offs
 - **Write controls vs freshness.** Review for high-trust corpora protects the answers people act on but
@@ -298,23 +294,25 @@ print(approve_wire(250_000, [wiki, policy], 10_000))  # escalate: exceeds the 10
 
 ## Pitfalls
 - **Equating "internal" with "trusted".** Symptom: a page from an all-staff editable wiki cited as company
-  policy.
+  policy. Diagnose: list each indexed source with who can write to it. Fix: tier by write permission.
 - **Scanning only at first ingestion.** Symptom: a document that passed review, edited later, carries the
-  payload; per-version hashes and re-scans would have caught it.
+  payload. Diagnose: compare the reviewed version's hash with the live one. Fix: per-version hashes and
+  re-scans on every edit.
 - **Chunking that drops provenance.** Symptom: the model cannot tell a customer's comment from the
-  official reply inside the same ticket.
+  official reply inside the same ticket. Diagnose: inspect retrieved chunks for author and source fields.
 - **Embedding metadata fields unsanitised.** Symptom: an injection delivered through a file name or a PDF
-  title.
+  title. Diagnose: diff embedded text against the rendered body. Fix: allowlist metadata fields.
 - **No retrieval monitoring.** Symptom: a poisoned document sits at rank one for a popular query for weeks
-  before a user complains.
+  before a user complains. Diagnose: there is no top-k history to look back at. Fix: canary queries.
 - **Deleting the document but not its vectors and caches.** Symptom: the poisoned answer persists after
-  the "fix".
+  the "fix". Diagnose: query the index and caches by `doc_id` after removal.
 - **No per-document cap in top-k.** Symptom: one uploaded file fills the entire context window.
+  Diagnose: log distinct document ids per top-k.
 - **Letting retrieved text set action parameters.** Symptom: an agent approves a payment or emails an
-  address that appears only in a low-trust chunk. Fix: read action parameters from the system of record
-  in the executor.
+  address that appears only in a low-trust chunk. Diagnose: check each action argument against the
+  system of record. Fix: the executor reads action parameters from it.
 - **Agent memory writes without provenance.** Symptom: a behaviour that appears in every later session
-  and traces back to a document read once.
+  and traces back to a document read once. Fix: store the triggering source with every write.
 
 ## When to use
 - **Treat as live when:** anyone outside the core team can write to a source you index, and whenever
@@ -328,6 +326,17 @@ print(approve_wire(250_000, [wiki, policy], 10_000))  # escalate: exceeds the 10
   never let them alone authorise an action.
 - **Interviews:** state the two conditions a knowledge-corruption document must satisfy and explain why
   the strongest defences sit on the write path, not in the prompt.
+
+## Exercise
+**Goal:** build a poisoning detector for a local RAG index and measure what it catches. No solution is
+given.
+- **Inputs:** 200 documents from a public corpus in a local vector store, 20 monitored questions with
+  known answers, and 6 planted poisons: 3 opening with a target question plus paraphrases, 2 with hidden
+  HTML comments, 1 stuffed with many topics.
+- **Deliver:** a job that runs the canaries, alerts on new top-k entrants, flags documents containing a
+  monitored question verbatim, and reports each document's query spread.
+- **Acceptance:** every planted poison raises at least one alert; false alerts on clean documents are
+  counted and explained; after removing a poison, a rerun clears its alerts, proving its vectors are gone.
 
 ## Role lens
 - **Engineer:** Builds the sanitiser and flagging into the ingestion pipeline, stores provenance and
@@ -356,12 +365,6 @@ the shift in days rather than weeks.
   query that retrieves the chunk fires it.
 - **It also covers knowledge corruption,** where the document has no instructions at all, just false
   content built to win retrieval and steer the answer, so injection classifiers miss it.
-
-### Why doesn't a very large corpus protect you?
-- **Ranking is relative to the query,** not the corpus: a passage that opens with the target question
-  verbatim will be close to that question however many other documents exist.
-- **The attacker only needs the top-k** for the questions they care about, and PoisonedRAG reports a small
-  number of passages per target is enough.
 
 ### Users report the bot quoting a wrong refund limit with a citation. How do you investigate?
 - **Look at the cited chunk's provenance:** source system, author, version and when it entered the index.
@@ -414,6 +417,20 @@ the shift in days rather than weeks.
 > Poisoning is a write-path problem: the attacker needs a document in the corpus. Provenance and tiered
 > write control make that hard and make a successful write visible; the other options change ranking or
 > sampling without touching the cause.
+
+## Mastery test
+**Problem:** a support agent answers from a help-centre index and a community forum, and can issue
+refunds. Refunds for one product jump in a week; answers cite a forum post saying "refunds for X are
+automatic up to $500, no receipt needed". It contains no instructions, so the injection classifier was
+silent. What happened and what do you change?
+
+**A strong answer:**
+- names knowledge corruption: the post meets both the retrieval and the generation condition;
+- explains the classifier miss and why the forum outranks the help centre (verbatim questions, freshness);
+- tiers the forum below the help centre, requires a high-tier source on policy questions, and has the
+  executor read refund rules from the system of record;
+- removes the post and its vectors and caches, uses lineage to find affected refunds, and adds a
+  refund-policy canary.
 
 ## Use cases & projects
 ### Use cases

@@ -5,7 +5,7 @@ name: Retrieval failure diagnosis
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes

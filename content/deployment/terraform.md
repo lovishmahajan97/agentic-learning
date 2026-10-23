@@ -5,8 +5,12 @@ name: Terraform (infrastructure as code)
 kind: tool
 difficulty: core
 est_minutes: 19
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: partial
+prerequisites:
+  - backend-fundamentals/ci-cd
 related:
   - deployment/customer-vpc-on-prem-air-gapped
   - deployment/private-endpoints
@@ -72,7 +76,8 @@ so every environment and customer account is reproducible and reviewable.
 - **Why it exists.** The tool must map `aws_s3_bucket.documents` in your code to one specific bucket in
   the account, and know which resources it owns so it can delete one you removed from the code.
 - **Remote with locking.** Teams store state remotely (object storage, Terraform Cloud/HCP, or similar)
-  with locking so two applies cannot run at once and corrupt it.
+  with locking so two applies cannot run at once and corrupt it (the S3 backend's native lock file is
+  `use_lockfile`), and version the state bucket so a bad write can be rolled back.
 - **It is a secret.** State holds every attribute the provider returns, including generated passwords and
   keys, in plain text, so encrypt and access-control it like a secret. Never give an agent's tools read
   access to it.
@@ -354,21 +359,25 @@ environment that already exists. A rename in the not-yet-applied staging root al
 
 ## Pitfalls
 - **Committing state or secrets to git, or storing state unencrypted.** Symptom: a secret scanner alert,
-  or an auditor finding database passwords readable by everyone with repository access.
+  or an auditor finding database passwords readable by everyone with repository access. Diagnose:
+  `git log --all -- '*.tfstate'` and the backend's encryption and access settings. Fix: remote encrypted
+  state, rotate every secret it held.
 - **Approving a plan without reading "must be replaced" lines.** Symptom: a vector database or bucket
-  recreated empty after an apparently harmless argument change, and the agent answers with no retrieval
-  hits.
-- **Refactoring names or module structure without `moved` blocks.** Symptom: a plan showing an equal
-  number of destroys and creates for a pull request that "only renamed things".
-- **Unpinned provider versions or an uncommitted `.terraform.lock.hcl`.** Symptom: a plan that suddenly
-  proposes changes nobody made, after a new provider release changed a default.
+  recreated empty, and the agent answers with no retrieval hits. Cause: an immutable argument changed.
+  Diagnose: in `terraform show -json`, list changes whose actions contain both delete and create. Fix:
+  the plan guard in CI.
+- **Refactoring names or module structure without `moved` blocks.** Symptom: equal destroys and creates
+  for a pull request that "only renamed things". Diagnose: pair each destroyed address with a created
+  one of the same type. Fix: `moved` blocks until the plan is a no-op.
+- **Unpinned provider versions or an uncommitted `.terraform.lock.hcl`.** Symptom: a plan proposing
+  changes nobody made, after a provider release changed a default. Diagnose: diff the provider version
+  in `terraform version` against the last good run.
 - **Emergency console fixes never back-ported.** Symptom: the next routine apply silently reverts the
-  fix and re-causes the incident.
+  fix and re-causes the incident. Diagnose: nightly `-detailed-exitcode` drift plans; exit code 2 flags it.
 - **Giving an agent apply rights.** Symptom: an infra agent "fixes" a failing plan by applying it, and a
-  stateful resource is replaced. Fix: plan-only credentials for the agent and a human approval on the
-  saved plan.
-- **Assuming an air-gapped environment can download providers.** Symptom: `terraform init` fails, fixed
-  only by shipping a provider mirror with the release bundle.
+  stateful resource is replaced. Fix: plan-only credentials and human approval of the saved plan.
+- **Assuming an air-gapped environment can download providers.** Symptom: `terraform init` fails; fixed
+  only by shipping a provider mirror.
 
 ## When to use
 - **Use IaC for** anything that must exist in more than one environment or survive an audit: every
@@ -381,6 +390,18 @@ environment that already exists. A rename in the not-yet-applied staging root al
   belong with the agent's code and release process, not in Terraform.
 - **Measure:** drift (plans that are not empty on main) and time to stand up a new environment.
 - **Interviews:** expect probes on state, plan review and the replace hazard.
+
+## Exercise
+**Goal:** extend the plan guard into the safety layer an infra agent's plan tool returns. No solution is
+given.
+- **Inputs:** hand-written plan JSON fixtures in the `terraform show -json` shape: a clean add, a bucket
+  replace, a rename with and without a `moved` block (moved resources carry `previous_address`), and an
+  IAM policy update widening `Resource` to `*`.
+- **Deliver:** a function returning a structured summary for the model (adds, changes, destroys, blocked
+  addresses with a reason), plus a rule flagging wildcard widenings in IAM policy diffs.
+- **Acceptance:** pytest passes on every fixture; the replace and the wildcard return BLOCK; the moved
+  rename returns zero destroys; if Terraform is installed, a real `terraform_data` rename reproduces the
+  fixture.
 
 ## Role lens
 - **Engineer:** Writes modules for GPU node pools, endpoints and buckets, runs plan in CI on every pull
@@ -426,21 +447,6 @@ include a provider mirror.
 - **Keep secrets away:** the agent never reads state, since state holds generated passwords and keys in
   plain text.
 
-### How do you use Terraform to keep an agent's tool permissions least-privilege?
-- **One IAM role per tool,** defined next to the agent service, scoped to exact resources (a bucket
-  prefix, one table), so a hijacked tool cannot reach anything else.
-- **Changes are diffs:** widening a policy appears in the plan, so security reviews it before the agent
-  gains access.
-- **Measure:** access-denied errors per tool role tell you when a scope is too tight, without reaching for
-  wildcards.
-
-### How do you keep Terraform state safe in production?
-- **Remote backend with locking** so two applies cannot corrupt it; the S3 backend supports a native
-  lock file (`use_lockfile`).
-- **Encrypt and restrict it** because it stores generated passwords and keys in plain text.
-- **One state per environment or customer**, matching the approval boundary, plus versioning on the
-  state bucket so a bad write can be rolled back.
-
 ### How do you deliver Terraform into an air-gapped customer account?
 - **Ship providers with the release:** build a mirror with `terraform providers mirror`, and configure a
   filesystem mirror so `terraform init` never contacts the registry.
@@ -472,6 +478,22 @@ include a provider mirror.
 - [x] AWS tracks the stack state itself, so there is no separate state file and locking setup to operate
 > The native service manages state and rollback for you, which removes an operational burden. Terraform's
 > advantage is breadth across clouds and SaaS, and Python-based infrastructure belongs to CDK or Pulumi.
+
+## Mastery test
+**Problem:** a customer's change board must approve every apply in their account. Your team switches a
+module's three vector-store collections from `count` to `for_each` and bumps the AWS provider from 5.x
+to 6.x in the same pull request.
+
+The plan shows 3 destroys, 3 creates and 2 unexpected in-place updates. What do you do before anything
+reaches the board?
+
+**A strong answer:**
+- splits the PR, because two causes in one plan make neither reviewable;
+- explains the 3 replaces as address changes (`[0]` to `["name"]`) and adds `moved` blocks until zero
+  destroys;
+- isolates the provider upgrade with `terraform init -upgrade` alone and traces each update to a changed
+  default in the changelog;
+- hands the board a saved plan per change, applied exactly, with the guard output attached.
 
 ## Use cases & projects
 ### Use cases

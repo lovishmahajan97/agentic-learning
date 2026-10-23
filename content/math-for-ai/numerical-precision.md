@@ -5,7 +5,7 @@ name: Numerical precision
 kind: concept
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -34,8 +34,8 @@ agents and why replays are not bit-identical.
 ## For agent builders
 - **Why it matters for agents.** Running an agent on a self-hosted or local model means choosing a
   dtype or quantization level. That choice sets GPU memory, speed, and whether tool calls stay correct.
-- **Where it shows up in your stack.** `torch_dtype` in Hugging Face loaders, `dtype` and
-  `kv_cache_dtype` in vLLM, quantized checkpoint formats (GPTQ, AWQ, GGUF), mixed-precision training
+- **Where it shows up in your stack.** `torch_dtype` in Hugging Face loaders (renamed `dtype` in
+  transformers 4.56+, old name still accepted with a warning), `dtype` and `kv_cache_dtype` in vLLM, quantized checkpoint formats (GPTQ, AWQ, GGUF), mixed-precision training
   flags, and NaN errors in logs.
 - **What you control.** The weight dtype, the KV-cache dtype, the quantization method and group size,
   and whether softmax and accumulations run in higher precision.
@@ -187,7 +187,8 @@ loaded it in fp16 to save memory.
 - **Quantize with an agent eval as the gate.** Before shipping a 4-bit or 8-bit checkpoint, run the same
   tool-calling and task eval on both precisions and compare with a paired test; JSON validity and
   argument accuracy often degrade before general chat quality.
-- **Quantize the KV cache separately.** An FP8 KV cache (`kv_cache_dtype="fp8"` in vLLM) roughly
+- **Quantize the KV cache separately.** An FP8 KV cache (`kv_cache_dtype="fp8"` in vLLM, option name as of
+  0.6.x) roughly
   doubles resident sequences versus fp16 at small quality cost; evaluate long-context agent runs, where
   errors accumulate.
 - **Keep sensitive math in fp32.** Softmax, layer norm, loss computation and accumulations stay in fp32
@@ -217,7 +218,7 @@ loaded it in fp16 to save memory.
   arguments after switching to a 4-bit checkpoint. **Diagnose** with a paired eval of tool-call validity
   between precisions on the same prompts. Fix: use 8-bit, a better quantization method, or constrained
   decoding.
-- **Exact-match replay tests.** Symptom: flaky tests after an engine or batch-size change. Diagnose by
+- **Exact-match replay tests.** Symptom: flaky tests after an engine or batch-size change. **Diagnose** by
   diffing outputs and finding the first divergent token at a near-tie. Fix: assert on outcomes.
 
 ## When to use
@@ -234,7 +235,9 @@ loaded it in fp16 to save memory.
 - **Constraints:** same prompts, greedy decoding, same engine; record dtype and quantization method.
 - **Deliver:** a table of memory use, tokens per second, JSON validity and argument accuracy per
   precision, with the paired difference and its interval versus the highest precision.
-- **Acceptance:** memory figures match bytes per parameter times parameter count within about 20%;
+- **Acceptance:** weight memory (checkpoint size or the loader's reported footprint, not total GPU
+  memory, which adds KV cache and runtime overhead) matches bytes per parameter times parameter count
+  within about 20%, or you explain the gap (scales, embeddings left unquantized);
   your recommendation names the precision and the eval evidence; one NaN or overflow check is included.
 
 ## Role lens
@@ -307,12 +310,17 @@ on other hardware, watch for NaN or empty outputs, and size the KV cache for the
 ## Mastery test
 **Problem:** you build a reranker for an agent's retrieval step that scores 200 chunks with your own code,
 computing `exp(score / 0.05)` in fp16 on a GPU and normalizing. With some queries every chunk gets NaN and
-the agent receives no context. Explain the failure and fix it without changing the model.
+the agent receives no context.
+
+Separately, chunks whose fp32 cosine scores are 0.8313 and 0.8317 come
+out tied. Explain both failures and fix them without changing the model.
 
 **A strong answer:**
 - notes that dividing by 0.05 multiplies scores by 20, so any score above about 0.55 pushes `exp` past
   fp16's limit (x above 11.09) and creates inf, then NaN;
-- fixes it with max subtraction or log-sum-exp, computed in fp32;
+- explains the ties: fp16 spacing between 0.5 and 1 is 2⁻¹¹ ≈ 0.00049, so both scores round to
+  0.83154 before the temperature is applied, and the order between them is lost;
+- fixes both with max subtraction or log-sum-exp, computed in fp32 from fp32 scores;
 - adds `isfinite` assertions and a fallback ranking so a numeric error cannot empty the agent's context;
 - adds a test with extreme scores.
 

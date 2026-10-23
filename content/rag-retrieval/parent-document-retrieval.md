@@ -5,7 +5,7 @@ name: Parent-document retrieval
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -263,8 +263,8 @@ parents:
 The snippet design uses less than half the context but adds 2 sequential steps.
 
 ## Production patterns
-- **Use the framework retriever when it fits.** LangChain's `ParentDocumentRetriever` takes a child
-  splitter, an optional parent splitter, a vector store for children and a document store for parents;
+- **Use the framework retriever when it fits.** LangChain's `ParentDocumentRetriever` (`langchain-classic` since 1.0)
+  takes a child splitter, an optional parent splitter, a vector store for children and a document store for parents;
   LlamaIndex offers `SentenceWindowNodeParser` (paired with a metadata-replacement postprocessor that
   swaps in the window) and `AutoMergingRetriever`. Monitor unique parents per query and
   tokens per request after adopting either.

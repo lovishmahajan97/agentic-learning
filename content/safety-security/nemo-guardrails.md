@@ -5,8 +5,13 @@ name: NeMo Guardrails
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: partial
+prerequisites:
+  - safety-security/input-output-guardrails
+  - rag-retrieval/embedding-models
 related:
   - safety-security/input-output-guardrails
   - safety-security/llama-guard
@@ -291,13 +296,16 @@ async def check_no_account_number(context: Optional[dict] = None) -> bool:
 
 ## Pitfalls
 - **Over-broad canonical-form examples.** Symptom: a sudden rise in refusals on ordinary queries after a rail
-  was added.
+  was added. Diagnose: log the matched intent and similarity score for each refused benign query. Fix:
+  narrow examples, raise the threshold or add contrasting intents.
 - **Self-check rails on the same model and account as generation.** Symptom: one jailbreak prompt disables
-  both the answer and its checker.
+  both the answer and its checker. Diagnose: red-team runs where checker and generator fail together.
+  Fix: a separate, smaller check model.
 - **Topical rails as a security boundary.** Symptom: a red-team report reaching the forbidden topic by
-  paraphrase or in another language.
+  paraphrase or in another language. Fix: enforce real limits in tools and data access.
 - **Mixing Colang 1.0 and 2.0 syntax,** or copying an example for the other version. Symptom: flows that
-  silently never fire.
+  silently never fire. Diagnose: `explain()` shows no matched flow for an exact example utterance. Fix:
+  pin one version.
 - **Dialog rails on a product that needed only input and output checks.** Symptom: time to first token rises
   by several model round-trips, visible as extra intent and next-step calls in the `explain()` summary.
 - **Shipping rails without an evaluation set.** Symptom: nobody can say what the false-refusal rate is when
@@ -311,8 +319,15 @@ async def check_no_account_number(context: Optional[dict] = None) -> bool:
 - **Before relying on it:** build adversarial and benign test sets, measure block rate on the first and
   false-refusal rate on the second for each rail, then track added latency per stage in production.
 - **Day to day:** a config directory under version control with its own CI.
-- **Interviews:** explain the five rail types, why intent matching uses embeddings, and what the toolkit
-  does not do.
+
+## Exercise
+**Goal:** put a rails config around a small support agent and prove what it costs. No solution is given.
+- **Inputs:** `nemoguardrails` (Colang 1.0), any chat model, and 20 benign plus 20 adversarial prompts you
+  write, with paraphrases and one other language.
+- **Deliver:** a config directory with an `embeddings_only` competitor intent, a deterministic output
+  action for one sensitive pattern, and an input check on a separate model; a results table.
+- **Acceptance:** a pytest for the action passes without an LLM; you report block rate, false-refusal
+  rate and median calls per turn from `explain()`; one paraphrase that slips past is shown and explained.
 
 ## Role lens
 - **Engineer:** Writes the Colang flows and Python actions, keeps the adversarial and benign test suites
@@ -355,25 +370,12 @@ English and the bank's other supported languages.
   or add contrasting intents.
 - **Prove the fix** with the benign set's false-refusal rate and the adversarial set's block rate.
 
-### Why does "NeMo adds latency" have no fixed answer?
-- **Each turn can make up to four or five model calls:** user intent, next step, bot message, plus one per
-  LLM-based input and output rail.
-- **Config removes them:** `embeddings_only`, matching flows, predefined messages, `single_call`, or input and
-  output rails only.
-- **So count calls** with the `explain()` summary rather than guessing.
-
 ### You are adding NeMo Guardrails to an existing tool-calling agent. Which rails do you turn on, and where do other checks live?
 - **Turn on input and output rails first** (content safety, PII masking, deterministic actions) and leave
   dialog rails off, so the agent loop still plans and calls tools itself.
 - **Use retrieval and execution rails** for chunk filtering and tool input or output checks where helpful.
 - **Keep authorization in the tool dispatcher:** scopes, ownership checks and taint rules need the
   principal and tool registry, which the rails config does not own.
-
-### When would you not use NeMo Guardrails?
-- **When you need one check:** a single moderation call or one schema validation is cheaper as direct code
-  than a framework, a DSL and a runtime in the request path.
-- **When rails would be mistaken for security:** topical rails are bypassed by paraphrase; injection still
-  needs architectural controls such as scoped tools.
 
 ### How would you keep an account number out of every reply, and why not use an LLM self-check?
 - **Deterministic output rail:** a custom action with a regex or Presidio recogniser for the bank's format,
@@ -406,6 +408,18 @@ English and the bank's other supported languages.
 - [ ] They only work with OpenAI models as the main engine
 > Intent matching knows only the examples it was given, so coverage and precision both depend on example
 > quality; this is why rails need adversarial and benign test sets like any other code.
+
+## Mastery test
+**Problem:** a travel agent wrapped in full dialog rails, with LLM self-checks on input and output, has a
+p95 time to first token of 6 seconds against a 2-second target. The rules: no medical advice, never show
+passport numbers. What do you change, and how do you prove it?
+
+**A strong answer:**
+- counts calls per turn with `explain()` before changing anything, and finds the dialog loop's steps;
+- turns dialog rails off or uses `embeddings_only` with a threshold, since the agent plans itself;
+- makes passport masking a deterministic action, not an LLM check, and moves remaining checks to a
+  small separate model, running the input one in parallel;
+- proves it with p95 latency, block rate and false-refusal rate on the same test sets, before and after.
 
 ## Use cases & projects
 ### Use cases

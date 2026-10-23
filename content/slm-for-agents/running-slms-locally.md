@@ -5,7 +5,7 @@ name: Running SLMs locally (Ollama, llama.cpp, vLLM)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -115,7 +115,7 @@ The same loop works with Ollama, llama.cpp (`--jinja`) or vLLM (tool parser on);
 `MODEL` only.
 
 ```python
-# Checked with openai 3.36 (Python SDK) on Python 3.12.
+# Run with openai 3.37 (Python SDK) on Python 3.12 against a mock OpenAI-compatible server.
 import json
 from openai import OpenAI
 
@@ -180,7 +180,8 @@ All three expose `/v1/chat/completions`, so the agent and its eval suite run unc
 
 ## Pitfalls
 - **Truncated context in Ollama.** Symptom: the agent ignores tools or the system prompt on longer runs.
-  Diagnose: log `usage.prompt_tokens` per step; a flat ceiling while the transcript grows means truncation.
+  Diagnose: log `usage.prompt_tokens` per step; a flat ceiling while the transcript grows, or a "truncating
+  input prompt" warning in the Ollama server log, means truncation.
   Fix: raise `num_ctx` (Modelfile, or `OLLAMA_CONTEXT_LENGTH` for the OpenAI-compatible endpoint).
 - **Tool calls returned as plain text.** Symptom: JSON-looking text in `content` and no `tool_calls`.
   Diagnose: log both fields for one request and check the engine's start flags. Fix: llama.cpp `--jinja`,
@@ -291,17 +292,16 @@ hits 6 seconds at peak. Explain each and fix it.
 
 ## Use cases & projects
 ### Use cases
-- **Offline development.** Agents built on laptops against Ollama, with no API keys or per-token cost.
-- **Air-gapped and on-premises agents.** llama.cpp or vLLM serve the agent's model inside the customer's
+- **Offline development.** Agents built on laptops against Ollama, with no keys or per-token cost.
+- **Air-gapped and on-premises agents.** llama.cpp or vLLM serve the model inside the customer's
   network.
-- **High-volume SLM steps.** A vLLM server handles classification and extraction calls for many agents,
-  while a hosted large model handles planning.
+- **High-volume SLM steps.** A vLLM server handles classification and extraction for many agents; a hosted
+  large model plans.
 - **Edge sites.** A CPU-only `llama-server` runs a small model in a store, factory or vehicle.
 
 ### Mini project
 **Run one agent on three engines (2-3 hours).**
-- **Goal:** prove your tool-calling agent runs unchanged on Ollama, llama.cpp and vLLM (or two of them if you
-  have no GPU).
+- **Goal:** prove your tool-calling agent runs unchanged on Ollama, llama.cpp and vLLM (two without a GPU).
 - **Steps:** pick one small instruct model with tool support; serve it with Ollama, then as a GGUF with
   `llama-server --jinja`, then with vLLM and its tool parser if a GPU is available; run the example agent and
   a 30-case tool-calling eval against each; record valid tool-call rate, time to first token and tokens per

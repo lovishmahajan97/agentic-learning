@@ -5,7 +5,7 @@ name: Structured event streams
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -416,16 +416,17 @@ that even a retry after a crash cannot repeat the effect.
 > keeps transport cheap and retention policies independent.
 
 ## Mastery test
-**Problem:** an agent runs three tool calls in parallel on separate workers, each writing its own events
-straight to a Kafka topic partitioned by `tool_name`. Replays of the same run sometimes rebuild different
-state, and the UI occasionally shows a result before its request. Explain and fix.
+**Problem:** three parallel tool workers each number their own events from a local counter and publish
+to a Kafka topic partitioned by `tool_name`. The eval consumer dedupes by `(run_id, seq)`, and some
+trajectories now lack tool results that the tools' own logs show ran. Explain and fix.
 
 **A strong answer:**
-- names two causes: several writers assign or race `seq`, and partitioning by tool scatters one run
-  across partitions, so no order holds across them;
-- moves to a single writer per run: workers report results, the writer appends in arrival order;
-- partitions by `run_id` and makes the UI tail the log, ordered by `seq`;
-- verifies with the replay-equality check and the timestamp-versus-`seq` inversion count.
+- sees `seq` collisions: three counters each emit `seq` 5, so the dedupe drops distinct events as
+  duplicates;
+- notes partitioning by tool scatters one run across partitions, so no order holds across them;
+- moves to a single writer per run that assigns `seq`; workers report to it;
+- partitions by `run_id`;
+- verifies by counting events per run at producer and consumer, plus replay equality.
 
 ## Use cases & projects
 ### Use cases

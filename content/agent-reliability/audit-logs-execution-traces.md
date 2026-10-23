@@ -5,7 +5,7 @@ name: Audit logs / execution traces
 kind: practice
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -425,7 +425,9 @@ recipient address and body inline. Redesign without losing completeness.
   policy version, decision, outcome, `run_id`;
 - moves recipient and body to a blob store with its own retention and per-record delete, referenced by id;
 - explains why the keyed hash still proves which email was sent, but cannot be reversed by guessing;
-- keeps the chain intact, because erasure deletes the blob, not the row;
+- notes keyed hashes are still pseudonymous personal data: document a legal-retention basis, or destroy
+  a per-customer key (crypto-shredding);
+- keeps the chain intact, because erasure deletes the blob or key, not the row;
 - reconciles the vendor's send log against audit rows.
 
 ## Use cases & projects
@@ -437,13 +439,12 @@ recipient address and body inline. Redesign without losing completeness.
 - **Debugging cost and latency.** Span attributes for tokens, cache hits and latency show which step or
   tool drives a slow or expensive run.
 - **Detecting bypasses.** Reconciling the payment or ticketing system's records against audit rows by
-  target id reveals effects that never went through the agent runtime, which neither sink can show.
+  target id reveals effects that bypassed the agent runtime and so appear in neither sink.
 
 ### Mini project
 **Trace and audit a refund agent (2-3 hours).**
 - **Goal:** produce both artifacts from one tool wrapper and prove the audit log is complete and
   tamper-evident.
-- **Steps:** wrap two tools (`lookup_order`, `refund`) so each call emits a span and, for `refund`, an
-  `authorized` row before and a `completed` row after; key the argument hash with an HMAC; chain rows
-  with `prev_hash`; crash the process between the two writes once; write a verifier.
+- **Steps:** wrap `lookup_order` and `refund` so each call emits a span and `refund` writes `authorized`
+  and `completed` rows; HMAC the arguments; chain with `prev_hash`; crash once between writes.
 - **Done when:** the first, second and fourth Exercise acceptance checks pass.

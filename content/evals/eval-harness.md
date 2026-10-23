@@ -5,7 +5,7 @@ name: Eval harness
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -473,11 +473,14 @@ per-slice interval that says whether six points at that n is signal at all.
 
 ## Mastery test
 **Problem:** a team's harness reports a new planner prompt at 88% versus 84% on 250 coding-agent tasks
-at *k* = 3. The run cost a third of the usual, 31 items show `output: None`, and every task's sandbox is one shared
-git checkout reset only at the start. The cache key is (config hash, item id). Would you approve?
+at *k* = 3. The run cost a third of the usual, and 31 items show `output: None`.
+
+Every task's sandbox is one shared git checkout reset only at the start. The cache key is (config hash,
+item id). Would you approve?
 
 **A strong answer:**
-- rejects the comparison: 31 errored items look excluded, which biases toward easy tasks;
+- rejects the comparison until the 31 errored items are retried and reported: if they left the
+  denominator, the score is biased toward easy tasks;
 - spots that a third of the cost at *k* = 3 means the cache returned one output three times; the key
   needs the sample index;
 - calls out shared checkout state as order dependence, fixed by a fresh sandbox per task;

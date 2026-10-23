@@ -5,7 +5,7 @@ name: Golden dataset (eval dataset)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -441,7 +441,8 @@ Can the set answer that, and what do you change?
 **A strong answer:**
 - sees escalation has roughly 10 tasks, so its standard error at p = 0.8 is about 12.6 points and nothing under
   that is detectable;
-- sizes paired runs with d = 0.2 and δ = 0.1: about 157 escalation tasks, not the whole set;
+- sizes paired runs with d = 0.2 (repeat-run rate; version flips usually run higher) and δ = 0.1:
+  about 157 escalation tasks, not the whole set;
 - sources them from escalation tickets and SME edge cases with seeds, quota per slice, and re-baselines
   on the new version.
 

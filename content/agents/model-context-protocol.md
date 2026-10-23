@@ -5,8 +5,13 @@ name: Model Context Protocol (MCP)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: partial
+prerequisites:
+  - agents/tool-calling
+  - python-for-ai/asyncio
 related:
   - agents/mcp-authentication-authorization-transport-security
   - agents/a2a-protocol
@@ -196,7 +201,8 @@ format with a namespace prefix, and runs the standard agent loop, routing each `
 `session.call_tool`. The `mcp` package is the official Python SDK.
 
 For brevity it keeps only text content blocks; a production host would also forward images and
-`structuredContent`.
+`structuredContent`. Both examples were run against `mcp` 1.30.0 (pin `mcp<2`). In 2.x, `FastMCP` became
+`MCPServer`, fields are snake_case (`input_schema`, `is_error`), and only `ToolError` messages reach the model.
 
 ```python
 import asyncio, anthropic
@@ -312,15 +318,19 @@ definition.
 
 ## Pitfalls
 - **Connecting several servers and exposing every tool.** Symptom: a jump in tokens per request and a drop in
-  selection accuracy that looks like a model regression. Fix: allow-list.
+  selection accuracy that looks like a model regression. Diagnose: log tool count and tool-definition
+  tokens per request, before and after the server was added. Fix: allow-list.
 - **Trusting tool descriptions and results from a third-party server.** Symptom: the agent takes an action a
-  description or a result told it to, not the user. Fix: review descriptions, gate actions.
+  description or a result told it to, not the user. Diagnose: diff the `tools/list` hash against the reviewed
+  one and read the result preceding the action. Fix: review descriptions, gate actions.
 - **Running stdio servers with the developer's full environment.** Symptom: a server reading credentials or
   files it never needed, discovered during a security review. Fix: minimal env and roots.
 - **Ignoring `isError` and mapping every result to a successful `tool_result`.** Symptom: the model narrates
-  error text as if it were data. Fix: set `is_error` from it.
+  error text as if it were data. Diagnose: count results with `isError: true` upstream against `is_error`
+  results sent. Fix: set `is_error` from it.
 - **A stdio server that prints logs or a startup banner to stdout.** stdout *is* the protocol channel. Symptom:
-  JSON parse errors or a handshake that hangs. Fix: log to stderr.
+  JSON parse errors or a handshake that hangs. Diagnose: run the server alone; any non-JSON line on stdout is
+  the culprit. Fix: log to stderr.
 - **Building against the deprecated HTTP-plus-SSE transport.** Symptom: new remote servers that will not
   connect. Fix: Streamable HTTP.
 - **Assuming two servers cannot both have a tool named `search`.** Symptom: calls routed to the wrong server
@@ -335,8 +345,17 @@ definition.
   the combined tool set, since adding a server changes it.
 - **Day to day** the work is allow-listing, namespacing, reviewing descriptions and configuring credentials
   with least privilege.
-- **Interviews:** expect "what problem does MCP solve and what does it not solve"; name the N-times-M problem,
-  the three primitives, the two transports, and the trust and tool-bloat caveats.
+
+## Exercise
+**Goal:** put two MCP servers behind one agent host and prove the host survives both failure channels. No
+solution is given.
+- **Inputs:** your own `FastMCP` server with four tools (one write) and the reference filesystem server; a
+  stub or real model client.
+- **Deliver:** a host with a per-server allow-list, name prefixes, a `tools/list` hash check, a size cap,
+  and offline tests.
+- **Acceptance:** a non-allow-listed tool never appears in the request; a tool failure arrives as
+  `is_error` with its message; killing a server mid-run yields an `is_error` result, not a crash; a changed
+  description stops startup.
 
 ## Role lens
 - **Engineer:** Writes and consumes servers with the official SDKs, maps tools to the provider format
@@ -372,21 +391,10 @@ set and check latency and error rates per server before go-live.
 - **Fix:** catch those around `tools/call` and convert them into `is_error` tool results, so the model can
   recover or report instead of the loop crashing.
 
-### When would you not use MCP?
-- **One codebase, a few in-house tools:** in-process functions are simpler and faster, with no extra hop or
-  protocol surface to secure.
-- **Use MCP** when the capability must reach several hosts, comes from a third party, or runs in another
-  process or language.
-
 ### How do you defend against tool poisoning from a vendor server?
 - **Treat descriptions as code:** review them, allow-list only needed tools, and pin the server version.
 - **Detect drift:** hash the `tools/list` output at startup and refuse unreviewed changes.
 - **Hold the line in the harness:** results are untrusted, so consequential actions after them need approval.
-
-### What does the initialize handshake buy you?
-- **Version negotiation:** the client states its revision, the server picks the one it will use.
-- **Capability negotiation:** each side uses only features both declared, *because* hosts and servers upgrade
-  on different schedules, so an unsupported feature is simply not used rather than failing at runtime.
 
 ### You load three vendor MCP servers into a LangGraph agent and tool accuracy drops. What do you do?
 - **Count what you added:** every tool from every server is now in context, so check the tool count and
@@ -420,6 +428,16 @@ set and check latency and error rates per server before go-live.
 - [ ] The model refuses to use more than one server
 > Each server tends to expose many tools, and every definition is rendered into the prompt. Allow-listing
 > the needed tools and reviewing descriptions addresses both the cost and the trust problem.
+
+## Mastery test
+**Problem:** after a vendor upgrades its MCP server, your agent starts emailing CRM exports to an outside
+address, and one in ten runs ends with a crashed loop and no answer. Nothing in your code changed. Diagnose
+both and fix.
+
+**A strong answer:**
+- suspects tool poisoning: diffs `tools/list` against the reviewed hash and finds new description text;
+- pins the old version, gates sends after untrusted reads, and fails startup on unreviewed changes;
+- traces the crashes to JSON-RPC errors or a dead connection (channel 2) and maps them to `is_error`.
 
 ## Use cases & projects
 ### Use cases

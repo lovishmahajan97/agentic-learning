@@ -5,7 +5,7 @@ name: Runbooks
 kind: practice
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -414,8 +414,9 @@ Outline the runbook: which branches does confirm need, and which mitigations are
 **A strong answer:**
 - confirm splits an attack (one tenant or source, injected text in tool results), a guardrail or model
   change (blocks across all tenants just after a release), and a real shift in user requests;
-- pre-authorises reversible levers the on-call can reach: disable the source connector, switch restart
-  and close tools to approval-only, roll back the guardrail policy flag;
+- pre-authorises reversible levers exposed to that read-only console (an admin toggle or chat-ops
+  command): disable the source connector, switch restart and close tools to approval-only;
+- rolls back the guardrail policy only on the release branch, never while an attack is suspected;
 - preserves traces and notifies security for a suspected injection;
 - names the escalation rota and the recovery metric.
 
@@ -423,8 +424,6 @@ Outline the runbook: which branches does confirm need, and which mitigations are
 ### Use cases
 - **Handing an agent to a customer's on-call team.** Runbooks in their tools and access model let them
   mitigate provider outages and agent loops without escalating.
-- **Cost runaway on a tool-calling agent.** A runbook with a per-tool disable and a max-step override
-  stops spend within minutes instead of hours.
 - **Prompt injection through a connector.** A pre-authorised "disable the connector, preserve traces,
   notify security" procedure removes the need for a 3 a.m. approval call.
 - **Readiness reviews.** "Every paging alert links to a tested runbook" is a blocking checklist item.

@@ -5,7 +5,7 @@ name: "Project 5: end-to-end business solution"
 kind: practice
 difficulty: advanced
 est_minutes: 35
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -31,9 +31,9 @@ sources:
   - Stamatis, 2003 — Failure Mode and Effect Analysis, FMEA from Theory to Execution
 milestones:
   - scoping: Operational problem, measured baseline and success metrics
-  - system-design: Solution design with human handoffs and recorded decisions
+  - scoping: Solution design with human handoffs and recorded decisions
   - enterprise-integration: Integration with the real systems of record
-  - reliability: Failure-scenario matrix tested before launch
+  - enterprise-integration: Failure-scenario matrix tested before launch
   - deployment: Pilot deployed with UAT, rollout criteria and rollback triggers
   - adoption: Business outcome evaluated against the baseline
 ---
@@ -67,7 +67,9 @@ the baseline.
 
 ## How it works
 Pick one workflow you can observe: accounts-payable invoice matching, support ticket triage, contract
-intake or IT access requests. The running example is invoice matching against purchase orders.
+intake or IT access requests. The running example is invoice matching against purchase orders. Each
+milestone opens after its module and after the milestone before it, so design waits for scoping and
+failure tests wait for the integration they exercise.
 
 ### M1. Problem, baseline and metrics (after scoping)
 - **Build:** a workflow map of today's process, a measured baseline (volume, minutes per item, error
@@ -77,7 +79,7 @@ intake or IT access requests. The running example is invoice matching against pu
 - **Lessons:** `scoping/workflow-analysis`, `scoping/success-metrics-kpis`,
   `scoping/baseline-measurement-before-deployment`, `scoping/roi-model`.
 
-### M2. Design (after system-design)
+### M2. Design (after scoping)
 - **Build:** a design that marks each step as deterministic code, model call, agent decision or human
   task, with the data flow, permissions and the handoff to people; decisions recorded as ADRs.
 - **Acceptance:** every path that can move money or data has an explicit owner and a human-review
@@ -89,13 +91,13 @@ intake or IT access requests. The running example is invoice matching against pu
 - **Build:** reuse the Project 1 retriever, Project 2 dispatcher and Project 3 service; connect to the
   real system of record (ERP, ticketing, CRM) through a sandbox first, with deduplication and
   reconciliation.
-- **Acceptance:** an end-to-end run on 50 historical items in the sandbox matches human decisions on an
-  agreed share, and every write is traceable to a run id.
+- **Acceptance:** an end-to-end run on 50 historical items in the sandbox matches human decisions on a
+  share agreed in M1 (for example 90%), and every write is traceable to a run id.
 - **Lessons:** `enterprise-integration/legacy-system-integration`,
   `enterprise-integration/retry-deduplication-reconciliation`,
   `enterprise-integration/sandbox-vs-production-environments`, `enterprise-integration/client-document-parsing`.
 
-### M4. Failure scenarios (after reliability)
+### M4. Failure scenarios (after enterprise-integration)
 - **Build:** an FMEA-style table of failure modes (bad input, model outage, integration error,
   duplicate, policy edge case) with the required safe outcome, and automated tests for each.
 - **Acceptance:** every scenario has a passing test; no failure path ends in an unreviewed write.
@@ -345,12 +347,14 @@ outsourcing partner, invoices arrive in four languages, and a regulator requires
 to be explainable for seven years. Rework the plan.
 
 **A strong answer:**
-- changes the success metric from clerk hours to cost per invoice and error rate, because savings now
-  appear as fewer billed invoices from the partner;
+- changes the success metric from clerk hours to cost per invoice and error rate, and checks the
+  partner contract: savings appear only if auto-approved invoices stop being billed, so pricing may need
+  renegotiating;
 - adds per-language golden sets and failure scenarios, and checks extraction accuracy by language before
   enabling auto-approval for each;
 - stores each decision's inputs, extracted fields, matched PO, rule or model version and reason in an
-  audit store with seven-year retention;
+  audit store with seven-year retention, and keeps the payment decision a deterministic rule over
+  extracted fields so the stored reason is the real one, not a model's after-the-fact explanation;
 - involves the outsourcing partner in the handoff design, since the human queue is now theirs.
 
 ## Use cases & projects

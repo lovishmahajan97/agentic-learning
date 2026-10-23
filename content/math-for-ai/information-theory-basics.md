@@ -5,7 +5,7 @@ name: Information theory basics
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: understand
 code_tested: yes
@@ -215,11 +215,13 @@ held-out routing set with the paired statistics from the evaluation lesson, and 
 - **Inputs:** 100 or more agent requests with known correct tool and arguments, and a model or API that
   returns token logprobs.
 - **Constraints:** compute entropy, mean negative logprob and perplexity yourself from the returned
-  values; state units.
+  values; state units. APIs return only the top few alternatives per token, so call your entropy a
+  truncated estimate.
 - **Deliver:** per-call mean negative logprob and perplexity, accuracy by quintile of that signal, and a
   threshold that routes the least confident 20% of calls to review.
-- **Acceptance:** the least confident quintile has measurably lower accuracy than the most confident;
-  one perplexity value is recomputed by hand from its logprobs; units are labeled everywhere.
+- **Acceptance:** you report the accuracy gap between the least and most confident quintiles with a
+  95% interval and say whether the signal is usable at your sample size; one perplexity value is
+  recomputed by hand from its logprobs; units are labeled everywhere.
 
 ## Role lens
 - **Engineer:** Reads loss and perplexity correctly, uses logprobs for uncertainty routing, and sets up
@@ -289,15 +291,22 @@ sure both numbers use the same tokenizer and validation text.
 > punishes mass where p is small, which is why distillation and RLHF choose directions deliberately.
 
 ## Mastery test
-**Problem:** you preference-tune a support agent. Over 2,000 steps the reward model's score rises
-steadily, KL to the reference model grows from 0.5 to 25 nats per response, and human reviewers say
-answers became long, repetitive and over-apologetic. Explain what happened and what you would change.
+**Problem:** you must pick a base model to fine-tune for a support agent. Both vendors scored the same
+10,000-character support-chat validation text.
+
+Model A's tokenizer splits it into 2,500 tokens and A
+reports perplexity 6.0; model B's splits it into 3,200 tokens and B reports perplexity 4.5. A teammate
+says B fits your domain better. Is that right, and how would you decide?
 
 **A strong answer:**
-- identifies reward hacking: the policy exploits reward-model preferences such as length and apology;
-- reads the fast-growing KL as the signal that outputs drifted far from the reference;
-- raises β or adds early stopping on a KL budget, and picks checkpoints with human or task evals;
-- improves the reward model with counter-examples, and adds length checks to the eval.
+- turns each perplexity back into total nats: tokens × ln(perplexity), so A ≈ 2,500 × 1.792 ≈ 4,479
+  and B ≈ 3,200 × 1.504 ≈ 4,813 nats for the same text;
+- divides by the shared unit, characters: A ≈ 0.448 nats ≈ 0.646 bits per character, B ≈ 0.481 nats
+  ≈ 0.694 bits per character, so A assigns the text more probability despite its higher perplexity;
+- explains that B's lower number comes from cutting the text into more, easier tokens, which lowers
+  the per-token average without improving fit;
+- still does not choose on fit alone: compares both on a tool-call and task eval, because likelihood
+  of support text is not task success.
 
 ## Use cases & projects
 ### Use cases

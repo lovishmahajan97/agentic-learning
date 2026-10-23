@@ -5,7 +5,7 @@ name: Query decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -441,9 +441,10 @@ the "changed" part is guessed. Design the retrieval plan.
 
 **A strong answer:**
 - splits into three parallel facets that each repeat "for directors", checked by a constraint-carry test;
-- treats "changed since last year" as dependent: compare current and prior versions per city via a date
-  or version filter after the first hop;
-- shares the chunk budget, tags facets, and reports "no evidence" per city instead of guessing.
+- treats "changed since last year" as a version facet, not a dependent hop: fetch each city's prior-year
+  policy with a date or version filter in the same fan-out (6 searches) and compare in synthesis;
+- checks per-facet logs for the missing city (call cap or budget), shares the budget, tags facets, and
+  reports "no evidence" per city instead of guessing.
 
 ## Use cases & projects
 ### Use cases

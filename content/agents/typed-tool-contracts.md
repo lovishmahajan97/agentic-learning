@@ -245,7 +245,7 @@ def test_tool_schemas_match_snapshot():
 - **One registry, generated specs.** As soon as two people edit tools; every tool is registered as a
   contract and the provider tool list is built from `spec()` at startup, never hand-written. Monitor
   per-tool schema-validation failure rate, which should be near zero.
-- **Snapshot in CI.** For every repository with tools; the test below, with its one-command update.
+- **Snapshot in CI.** For every repository with tools; the test above, with its one-command update.
   Monitor how often a contract change broke an eval.
 - **Alert on `internal`.** In production; an `internal` kind means the handler broke its own output
   contract, usually after an upstream change, so page on its rate per tool rather than waiting for users.
@@ -398,7 +398,8 @@ nothing in flight breaks.
 - calls it breaking (a type change) and ships `create_ticket_v2`, or accepts both with a mapping during a
   transition;
 - updates the snapshot, examples and eval cases in the same PR and reruns the arguments eval;
-- removes the old shape only when traced calls to it reach zero, keeping the write's idempotency key.
+- fixes one explicit, logged mapping for old calls (five levels onto three is lossy) and removes the old
+  shape only when traced calls using it reach zero.
 
 ## Use cases & projects
 ### Use cases

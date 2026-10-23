@@ -5,7 +5,7 @@ name: UAT (user acceptance testing)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -55,8 +55,8 @@ model defects from tool and integration bugs.
 - **The naive version fails for AI.** "Give users access for two weeks and ask what they think" means a
   handful of queries per person, judged on memorable failures. Output varies run to run, so one tester
   passes what another fails, and without a rubric nobody can settle it.
-- **So design it like an experiment:** fixed criteria, representative cases, a scoring rubric, and a
-  sample large enough to separate "good enough" from "not quite".
+- **So design it like an experiment:** fixed criteria, representative cases, a rubric, and a sample
+  large enough to decide.
 
 ## How it works
 ### 1. Fix acceptance criteria before testing starts
@@ -191,8 +191,7 @@ The criterion is "at least 85% of triage recommendations rated correct or accept
 | 400 cases | roughly 84.4% to 90.8% | No, still not clear |
 | about 600 cases | roughly 85.2% to 90.4% | Yes |
 
-- **The sample cannot tell** "comfortably above the bar" from "slightly below it", because the lower bound
-  is below 85%.
+- **The sample cannot tell** "above the bar" from "below it", because the lower bound is under 85%.
 - **The options are concrete:** score about 400 more cases, renegotiate to judge on the point estimate (an
   explicit, recorded decision), or improve the agent so the observed rate rises.
 
@@ -404,9 +403,10 @@ only 5% of the sample. Do you sign off?
 
 **A strong answer:**
 - computes the interval (roughly 89.5% to 95.4%), so the lower bound sits just under the bar;
-- sees that scanned PDFs are under-sampled and failing far more, so the true rate is likely lower;
-- re-weights or re-samples to 15% scanned, triages those failures (likely parsing, not the model) and
-  re-tests that slice;
+- sees scanned PDFs fail 12 of 15 and are under-sampled: re-weighted to 15% of work, the rate is about
+  85%, well under the bar;
+- re-samples to 15% scanned, triages those failures (likely parsing, not the model) and re-tests that
+  slice;
 - adds repeated runs to measure flips before signing.
 
 ## Use cases & projects
@@ -429,5 +429,5 @@ only 5% of the sample. Do you sign off?
   hand; compute case-level pass rate, Wilson interval, per-slice rates and flip rate.
 - **Done when:** the report states pass rate with its interval against an 85% bar, lists any hard-gate
   failures, shows the weaker slice, and classifies each failure by cause. Expect 30 cases to be too few
-  to clear the bar (even 29 of 30 gives a Wilson lower bound near 83%); the report should say so and
-  state how many cases sign-off would need.
+  to clear the bar (29 of 30 gives a Wilson lower bound near 83%; only 30 of 30 clears it); the report
+  should say so and state how many cases sign-off would need.

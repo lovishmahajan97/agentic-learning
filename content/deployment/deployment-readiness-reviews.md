@@ -5,7 +5,7 @@ name: Deployment readiness reviews
 kind: practice
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -275,8 +275,7 @@ Illustrative findings from one review of the claims-triage agent launch.
 - **Use before:** any first production launch of an agent, handing operations to a customer team, and
   material changes: a new model or provider, a new tool with side effects, a widened tool scope, a new data
   source, a new region.
-- **Scale it to risk:** a prompt tweak behind a flag needs an automated eval gate, not a meeting; an agent
-  that can issue refunds needs the full review.
+- **Scale it to risk** (see risk-tiered reviews): an agent that can issue refunds needs the full review.
 - **Measure the review by what escapes it:** for each incident in the first weeks, ask whether a checklist
   item would have caught it, and add one if so.
 
@@ -374,11 +373,12 @@ The sponsor says "nothing material changed". What do you re-review, and how do n
 invalidating every eval?
 
 **A strong answer:**
-- treats the model swap and the widened refund limit as material: re-run quality evals and trajectory
-  evals, and get security sign-off on the new scope and its approval gate;
+- treats the model swap and the widened refund limit as material: re-run quality, trajectory, load and
+  cost checks (a new model changes latency and cost per run), and get security sign-off on the new scope
+  and its approval gate;
 - spots that a tenfold refund limit is a scope change even though the tool name did not change;
-- fingerprints the index by schema and pipeline version rather than build date, or re-runs a fast eval
-  gate nightly, so routine rebuilds do not reset evidence;
+- fingerprints the index by schema and pipeline version rather than build date, and runs a fast eval
+  gate on each nightly build, so routine rebuilds neither reset evidence nor drift unchecked;
 - leaves untouched items (alerts, training) green and records the scaled-down decision.
 
 ## Use cases & projects

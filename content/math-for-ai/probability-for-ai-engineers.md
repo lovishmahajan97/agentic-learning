@@ -5,7 +5,7 @@ name: Probability for AI engineers
 kind: concept
 difficulty: intro
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -62,7 +62,7 @@ p_i = exp(z_i / T) / sum_j exp(z_j / T)
 ```
 
 - **T below 1 sharpens** (the top token gains mass); **T above 1 flattens**; T near 0 is greedy argmax.
-  Top-p keeps the smallest set of tokens whose probability sums to p and renormalizes over it.
+  Top-p keeps the smallest set of top tokens whose probability sums to at least p and renormalizes over it.
 
 ### Conditional probability and independence
 1. **Conditional:** `P(A|B) = P(A and B) / P(B)`, the probability of A once B is known.
@@ -217,8 +217,10 @@ with the error message fed back, then escalate to a human.
 - **Deliver:** per-attempt success, the conditional P(success | earlier failures), predicted versus
   observed completion within 3 attempts under the independence assumption, and a 10-bin reliability
   table for the confidence column.
-- **Acceptance:** your independence prediction and observed rate differ in the direction you can
-  explain; bin accuracies are computed from counts you can print; one row is checked by hand.
+- **Acceptance:** on a simulated log with independent attempts, predicted and observed completion
+  agree within about 2 points (your control); on real traces, or a simulation where each task draws its
+  own success rate, observed falls below predicted and you explain why; bin counts sum to the number of
+  attempts; one bin is checked by hand.
 
 ## Role lens
 - **Engineer:** Chooses temperature, retry counts and confidence thresholds from measured probabilities
@@ -295,8 +297,11 @@ wrong patches. Explain the gap and what you would measure and change.
 
 **A strong answer:**
 - identifies that samples from one prompt are correlated, so the independence formula overstates pass@4;
+- shows why with numbers: if half the tasks pass at 0.8 and half at 0, the mean is still 0.4 but
+  pass@4 is 0.5 · (1 − 0.2⁴) ≈ 50%, because extra samples cannot rescue a task the model never solves;
 - computes the empirical pass@k per task from logged samples instead of from the single-sample rate;
-- notes verifier false accepts let wrong patches through, and estimates their share with Bayes' rule;
+- notes verifier false accepts let wrong patches through (when all 4 samples are wrong, at least one is
+  accepted with probability 1 − 0.95⁴ ≈ 18.5%), and estimates their share with Bayes' rule;
 - proposes more diversity (different prompts or temperature), a stronger verifier, and per-task logging.
 
 ## Use cases & projects

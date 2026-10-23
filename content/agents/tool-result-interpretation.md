@@ -273,8 +273,6 @@ print([m["content"][0]["content"][:40] for m in msgs])   # t0, t1 stubbed; t2-t4
   and, in evals, how often the model quotes a value that was not in the result.
 - **Debug here first:** when an agent gives a confident wrong answer, read the tool result it was looking at
   before you read the prompt.
-- **Interviews:** "what do you return when a search finds nothing" separates people who have shipped agents
-  from people who have read about them.
 
 ## Exercise
 **Goal:** design the result layer for a customer lookup across two systems plus an update tool, and
@@ -324,11 +322,6 @@ eval set so a regression is caught before it ships.
 - **The defences that hold are in the harness:** least privilege, approval for consequential actions after
   untrusted reads, and no secrets in context.
 - **Test it** with adversarial documents in the eval set.
-
-### How would you size and enforce a per-result budget?
-- **Start with an illustrative ceiling** of a few thousand tokens per result and tune per model and task.
-- **When the cap fires,** shrink the payload, set `truncated`, and tell the model to narrow the query or page.
-- **Monitor** how often `truncated` is true per tool; a high rate means a narrower default.
 
 ### Two tools disagree about a customer's status. How should the model decide?
 - **Give it the means:** each result carries `as_of` and `source`, such as billing versus CRM.

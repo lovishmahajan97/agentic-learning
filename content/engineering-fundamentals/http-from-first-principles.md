@@ -75,7 +75,7 @@ POST /v1/chat HTTP/1.1
 Host: api.example.com
 Authorization: Bearer <key>
 Content-Type: application/json
-Content-Length: 61
+Content-Length: 66
 
 {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
 ```
@@ -121,6 +121,9 @@ The response mirrors it: `HTTP/1.1 429 Too Many Requests`, headers such as `Retr
   between tokens, not the whole answer.
 - **Total deadline** bounds the whole call and belongs to your agent step budget. SDK defaults are long
   (the OpenAI and Anthropic Python SDKs default to 10 minutes with 2 retries; verify for your version).
+- **httpx has no total timeout.** `httpx.Timeout` sets connect, read, write and pool limits only, so a
+  stream that trickles one byte per read window never trips them; enforce the deadline yourself, for
+  example `asyncio.wait_for` around the call (checked against httpx 0.28.1).
 
 ## Diagram
 Follow one model call: connection setup is paid once, a 429 is retried after `Retry-After`, and the

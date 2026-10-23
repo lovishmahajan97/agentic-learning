@@ -96,7 +96,7 @@ robustness on long tasks.
   remaining steps where the model will see them counteracts the pull of the latest tool output.
 
 ### Replanning
-Replanning triggers should be explicit:
+Make the triggers explicit:
 1. **A step fails twice.**
 2. **An observation contradicts an assumption** listed in the plan.
 3. **The step budget is half spent** with less than half the plan done.
@@ -138,7 +138,6 @@ flowchart TD
 
 ## Examples
 ### Plan-then-execute with verification and bounded replanning
-A plan-then-execute loop with structured steps, a verification check per step, and bounded replanning.
 `llm_json` is any call that returns parsed JSON; `run_step` executes a step with tools and returns the
 observation.
 

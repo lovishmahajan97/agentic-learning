@@ -5,7 +5,7 @@ name: Model evaluation
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -319,8 +319,8 @@ have (or a two-tool toy agent). No solution is given.
   a budget of 3 runs per task.
 - **Deliver:** a table per axis (success, all-runs-pass, hard-constraint violations, steps, cost per
   task), the paired gained/lost counts with a sign-test p-value, the weakest slice, and a one-line verdict.
-- **Acceptance:** re-running the baseline alone flips fewer items than the comparison does; every
-  pass-to-fail item links to its trace; the verdict names which axis decided it.
+- **Acceptance:** the report shows the baseline-versus-itself flip count next to the comparison's
+  flips; every pass-to-fail item links to its trace; the verdict names which axis decided it.
 
 ## Role lens
 - **Engineer:** Builds the dataset and harness, picks graders by output type, and refuses to merge a

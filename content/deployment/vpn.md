@@ -5,8 +5,12 @@ name: VPN
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: partial
+prerequisites:
+  - engineering-fundamentals/http-from-first-principles
 related:
   - deployment/private-endpoints
   - deployment/customer-vpc-on-prem-air-gapped
@@ -30,9 +34,8 @@ scope, routing and MTU need design.
 - **Why it matters for agents.** A cloud-hosted agent whose tools query a customer's on-prem database,
   file share or legacy API makes those calls over the tunnel, live, inside the agent loop. Tunnel
   failover, MTU stalls and slow links become tool timeouts the model sees.
-- **Where it shows up in your stack.** Tool adapter base URLs using internal DNS names, per-tool
-  timeouts and retry policy, RAG ingestion workers doing bulk syncs, and the integration VPC your agent
-  workers run in.
+- **Where it shows up in your stack.** Tool base URLs on internal DNS names, per-tool timeouts and
+  retries, RAG ingestion bulk syncs, and the integration VPC your workers run in.
 - **What you control.** Which on-prem hosts and ports the agent's tools may reach (scope the routes to
   those), timeouts that survive a BGP failover, resumable ingestion, and error messages that tell the
   model a tool is unavailable rather than inviting a retry loop.
@@ -40,10 +43,9 @@ scope, routing and MTU need design.
   tunnels, the MSS clamp and how overlap is solved; network teams do the rest.
 
 ## Why it exists
-- **The data has no public IP.** Your RAG product runs in the cloud; the customer's contracts live in an
-  on-prem document store and their ticket history in a database in the same data center. Neither has,
-  nor will ever have, a public IP, yet ingestion workers and agent tools must reach them on private
-  addresses.
+- **The data has no public IP.** Your RAG product runs in the cloud; the customer's contracts and ticket
+  history live in an on-prem document store and database that will never have a public IP, yet ingestion
+  workers and agent tools must reach them.
 - **Exposing them publicly is rejected.** A database or file share on the internet behind a firewall rule
   fails the first security meeting, rightly: credentials become the only barrier.
 - **Disks or nightly SFTP exports go stale.** They work once, but give you stale data, a manual process
@@ -52,9 +54,9 @@ scope, routing and MTU need design.
   Interconnect are right for heavy, permanent traffic, but take weeks to months through a carrier and
   cost accordingly.
 - **A VPN is the middle path.** It reuses both sides' internet connections, adds encryption and mutual
-  authentication, and can be up in days, which matters during a pilot. Its weakness is the flip side:
-  once networks are joined, anything routable can talk unless you narrow it, so a VPN is a network
-  integration, not just an encryption feature.
+  authentication, and can be up in days, which matters during a pilot. The flip side: once networks are
+  joined, anything routable can talk unless you narrow it, so it is a network integration, not just
+  encryption.
 
 ## How it works
 ### Site-to-site IPsec
@@ -111,8 +113,8 @@ negotiated by IKEv2. Two phases:
 - **Client VPNs** connect a single device, for example an FDE's laptop, into a customer network.
 - **WireGuard** is a newer, deliberately small protocol: fixed modern cryptography, peers identified by
   public keys, and a configuration of a few lines.
-- **Where you meet it.** Its simplicity makes it easy to audit and fast, but many enterprises standardize
-  on IPsec appliances, so you meet WireGuard more in your own infrastructure than in a bank's.
+- **Where you meet it.** It is easy to audit and fast, but many enterprises standardize on IPsec
+  appliances, so you meet it more in your own infrastructure than in a bank's.
 
 ### When address spaces overlap
 Routing only works if each side can tell local addresses from remote ones, so overlapping CIDRs are the
@@ -231,8 +233,8 @@ def lookup_case(case_id: str) -> dict:
             return {"ok": False, "retryable": False, "error": f"HTTP {e.response.status_code}"}
 ```
 
-- **Why the message is written for the model.** Without it, the agent often re-issues the same call every
-  step until its budget is gone; an explicit "do not call again" ends the loop.
+- **Why the message is written for the model.** Without it, the agent often re-issues the call every step
+  until its budget is gone.
 - **A full failover can outlast the retry.** Dead-peer detection and BGP hold timers often take tens of
   seconds to move traffic, so the tool returns the clear error rather than blocking the agent step;
   measure your gateway's failover time and size the retry from it.
@@ -269,9 +271,8 @@ PersistentKeepalive = 25
 - **Host routes and port filters only.** Ask the customer to advertise /32 routes for the hosts you need
   and allow only those ports from your worker subnet. Keep that list equal to the agent's tool backends.
   Review the advertised prefix list in every change.
-- **Integration VPC per customer.** Terminate each customer tunnel in its own small VPC with a range
-  chosen to avoid theirs, so overlaps never touch production, and run that customer's agent workers
-  there. Keep an address-allocation register.
+- **Integration VPC per customer.** Terminate each tunnel in its own small VPC with a range avoiding
+  theirs, running that customer's agent workers there. Keep an address-allocation register.
 - **Rate-limited bulk sync.** Schedule large initial syncs off-hours with a bandwidth cap, then switch to
   incremental deltas, so ingestion does not starve live agent tool calls. Monitor throughput against plan
   and the customer's uplink utilisation.
@@ -288,29 +289,33 @@ PersistentKeepalive = 25
 - **Dedicated circuit vs encryption.** A circuit gives predictable bandwidth and latency, but is private
   rather than encrypted by default, so regulated customers often still run IPsec (or MACsec where
   offered) over it. The choice flips back to VPN alone when volumes are modest and lead time matters.
-- **Static routes vs BGP.** Static routes are simple for one or two subnets but carry no liveness signal,
-  so failover depends on vendor-specific tunnel monitoring (dead-peer detection, route tracking) or
-  manual edits. BGP adds configuration and debugging skill in return for standard, automatic failover.
+- **Static routes vs BGP.** Static routes suit one or two subnets but carry no liveness signal, so
+  failover needs vendor-specific tunnel monitoring (dead-peer detection, route tracking) or manual edits;
+  BGP costs configuration skill and buys automatic failover.
 - **Client VPN vs zero-trust access.** Remote-access VPN gives engineers broad network access easily, but
   identity-aware zero-trust access per application is safer when many people need narrow access to a
   few internal tools.
 
 ## Pitfalls
 - **Overlapping CIDR ranges discovered after the tunnel is up.** Symptom: a healthy tunnel status with
-  traffic that never arrives, because each side routes the other's addresses locally.
-- **No MSS clamping or path MTU discovery when ICMP is filtered.** Symptom: small requests succeed while
-  large uploads, file reads or long model responses hang mid-transfer. In an agent, small tools work and
-  document tools time out.
-- **Configuring only one of the two provided tunnels.** Symptom: an outage during the provider's routine
-  maintenance window, often in the middle of the night.
+  traffic that never arrives. Cause: each side routes the other's addresses locally. Diagnose: compare
+  both route tables for the remote prefix; a capture on your gateway shows nothing entering the tunnel.
+  Fix: a fresh integration range or NAT.
+- **No MSS clamping when ICMP is filtered.** Symptom: small requests succeed while large file reads or
+  long responses hang mid-transfer; in an agent, small tools work and document tools time out. Diagnose:
+  `ping -M do -s <size>` at falling sizes, or a capture showing large segments retransmitted. Fix: clamp
+  MSS at the gateway.
+- **Configuring only one of the two provided tunnels.** Symptom: an outage in the provider's routine
+  maintenance window, often at night. Diagnose: per-tunnel state metrics show one always down.
+  Fix: configure both with BGP and test failover.
 - **Advertising whole corporate supernets "to keep it simple".** Symptom: the security review finds the
-  vendor network can reach thousands of customer hosts it never needed, and an agent's tool could be
-  steered toward any of them.
-- **Leaving DNS out of the design.** Symptom: IP addresses hard-coded in config because internal
-  hostnames do not resolve across the tunnel, which then break when the customer re-IPs a server.
-- **Tool timeouts that are shorter than failover or longer than the agent's patience.** Symptom: every
-  failover fails the task, or one hung call blocks a step for minutes. Fix: a deadline per tool and one
-  retry for idempotent reads.
+  vendor network can reach thousands of customer hosts, any of which a steered agent tool could target.
+  Diagnose: list the received BGP prefixes against the tools' backends. Fix: /32 routes and port filters.
+- **Leaving DNS out of the design.** Symptom: hard-coded IPs that break when the customer re-IPs a
+  server. Fix: forward the internal domain over the tunnel.
+- **Tool timeouts shorter than failover or longer than the agent's patience.** Symptom: every failover
+  fails the task, or one hung call blocks a step for minutes. Diagnose: log per-call latency and error
+  type next to tunnel state changes. Fix: a deadline per tool, one retry for idempotent reads.
 
 ## When to use
 - **Use a site-to-site VPN when** cloud workloads need private, bidirectional or multi-protocol access to
@@ -324,6 +329,18 @@ PersistentKeepalive = 25
   packets, and tool-call error rate per on-prem backend.
 - **Interviews and design reviews:** mentioning address planning, scope and MTU unprompted signals that
   you have actually operated one.
+
+## Exercise
+**Goal:** reproduce an MTU stall and the agent-side failure handling on one laptop, without a real
+tunnel. No solution is given.
+- **Inputs:** client, router and server Linux containers on two Docker networks, the router's
+  server-side link at MTU 1400 with outbound ICMP dropped (the endpoints keep 1500, so their MSS is too
+  big); a small HTTP service returning 200 bytes or 200 KB.
+- **Deliver:** a script that finds the largest passing don't-fragment ping, a `TCPMSS` clamp rule that
+  fixes the large response, and a `lookup_case`-style tool returning one structured error when the
+  service is stopped.
+- **Acceptance:** before the clamp the 200 KB request times out and the 200-byte one passes; after it,
+  both pass; with the service stopped the tool returns `retryable: False` after exactly two attempts.
 
 ## Role lens
 - **Engineer:** Configures ingestion workers to use internal DNS names over the tunnel, sets timeouts and
@@ -376,16 +393,8 @@ discovery works. Then retest with a large result set.
 
 ### How long will a 2 TB initial sync take over the tunnel, and how do you plan it?
 - **Arithmetic:** 2 TB × 8 = 16 Tbit; at an effective 400 Mbit/s that is 40,000 s, about 11 hours.
-- **Plan:** treat the rate as an assumption to measure, run the sync over a weekend with a bandwidth cap,
-  then switch to daily deltas (around 5 GB takes under two minutes).
-- **Make it resumable**, so a tunnel failover mid-sync does not restart the job.
-
-### Why clamp MSS at the gateway instead of relying on path MTU discovery?
-- **PMTUD depends on ICMP** "fragmentation needed" messages, which many enterprise firewalls block, so
-  oversized don't-fragment packets vanish silently.
-- **Clamping rewrites the SYN handshake** so both ends send segments that fit, fixing every TCP flow
-  without touching hosts.
-- **Limit:** it fixes TCP only; UDP traffic must be sized by the application.
+- **Plan:** measure the rate, sync over a weekend with a bandwidth cap, then daily deltas; make it
+  resumable so a failover mid-sync does not restart the job.
 
 ## Quiz
 ### Q: Why do production site-to-site VPNs usually use BGP rather than static routes?
@@ -415,14 +424,28 @@ discovery works. Then retest with a large result set.
 > VPNs are encrypted, and a circuit does nothing to fix overlapping address ranges, which still require
 > re-addressing or NAT.
 
+## Mastery test
+**Problem:** a cloud support agent calls a customer's on-prem order API over a route-based VPN. Every
+night around 02:00 a few conversations fail with the agent saying "I keep trying but the order system
+does not respond", after 8-10 identical tool calls. Daytime is clean. Diagnose it and fix both the
+network and the agent.
+
+**A strong answer:**
+- correlates failure times with per-tunnel state: the provider's maintenance moves one tunnel, and either
+  the second tunnel is unconfigured or static routes do not fail over;
+- fixes the network with both tunnels on BGP, then tests failover during a scripted agent run;
+- fixes the agent: a deadline sized from measured failover time, one retry for this read, then a
+  non-retryable error the model is told not to repeat;
+- verifies by counting identical consecutive tool calls per trace before and after.
+
 ## Use cases & projects
 ### Use cases
 - **Agents with on-prem tools.** A cloud-hosted support agent queries a customer's ticket database and
   legacy order API over a scoped site-to-site tunnel during each conversation.
 - **RAG ingestion from private file shares.** Ingestion workers sync a document archive over the tunnel
   into the vector index, with a rate-limited initial sync and daily deltas.
-- **Agent pilots before a dedicated circuit.** A VPN is up in days, so a pilot can prove value before the
-  customer orders Direct Connect or ExpressRoute.
+- **Agent pilots before a dedicated circuit.** A VPN is up in days, so a pilot proves value before
+  anyone orders Direct Connect or ExpressRoute.
 - **FDE access for debugging.** An engineer reaches the integration VPC over WireGuard or a client VPN
   scoped to that range only.
 
@@ -430,10 +453,9 @@ discovery works. Then retest with a large result set.
 **Make an agent tool resilient to a flaky link (1-2 hours).**
 - **Goal:** show that an agent with a remote read-only tool ends a turn cleanly when the backend becomes
   unreachable, instead of looping.
-- **Steps:** run a tiny HTTP service as the "on-prem" backend in a container; wrap it as the
-  `lookup_case` tool above inside a minimal tool-calling loop with a 10-step budget; add `tc netem`
-  delay or stop the container mid-run to simulate failover and outage; log each tool call and the
-  model's next action.
+- **Steps:** run a tiny "on-prem" HTTP backend in a container; wrap it as `lookup_case` in a
+  tool-calling loop with a 10-step budget; add `tc netem` delay or stop the container mid-run; log each
+  tool call and the model's next action.
 - **Done when:** a brief outage is absorbed by the single retry, a full outage produces one structured
   error and a user-facing answer within two steps, and your log table shows no repeated calls to the dead
   tool.

@@ -5,8 +5,13 @@ name: Task decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/planning
+  - prompting/structured-outputs-json-mode
 related:
   - agents/planning
   - agents/multi-agent-patterns
@@ -38,8 +43,8 @@ buys parallelism and isolated failures; done badly, coordination overhead.
   outputs.
 - **What you control.** Granularity, the dependency graph, the output schema at each seam, what crosses
   each edge (summaries and references, not transcripts), concurrency limits and per-subtask verifiers.
-- **What you can skip.** The benchmark details of least-to-most and decomposed prompting; keep the
-  lesson that solvable sub-problems beat one monolithic ask, and do the seam arithmetic for your graph.
+- **What you can skip.** The benchmark details of least-to-most and decomposed prompting; do the seam
+  arithmetic for your graph instead.
 
 ## Why it exists
 - **One call has fixed attention and context.** Ask for "a competitive analysis of five vendors with
@@ -51,8 +56,8 @@ buys parallelism and isolated failures; done badly, coordination overhead.
   slightly, but you still get one monolithic answer with no seam at which to verify, retry or parallelise.
   Chain-of-thought helps a single reasoning path but does not reduce the distinct work in context.
 - **Decomposition changes the economics.** Five vendor-research subtasks run in parallel with small
-  contexts; a comparison step reads five structured summaries instead of five raw web dumps; a writing
-  step gets a comparison table, not everything ever retrieved. Each piece can be checked, cached, retried
+  contexts; a comparison step reads five structured summaries, not five raw web dumps; the writer gets
+  only the table. Each piece can be checked, cached, retried
   or handed to a cheaper model.
 - **Evidence, with its limits.** Least-to-most and decomposed prompting showed that splitting problems
   into reliably solvable sub-problems beats asking for the whole answer on compositional benchmarks
@@ -100,13 +105,13 @@ buys parallelism and isolated failures; done badly, coordination overhead.
 
 ### Passing context across the seams
 - **Each subtask gets** the goal, its own inputs and only the upstream results it depends on.
-- **Pass summaries and structured results, not raw transcripts,** *because* the downstream model will
-  otherwise attend to irrelevant detail and the token bill grows with every edge.
+- **Pass summaries and structured results, not raw transcripts,** *because* otherwise downstream steps
+  attend to irrelevant detail and the token bill grows per edge.
 - **Keep a shared, read-only "task brief"** that every subtask sees, so terminology and constraints stay
   consistent.
 
 ### The arithmetic of seams
-Three numbers decide whether a decomposition pays. Sketch them for a proposed graph before building it.
+Three numbers decide whether a decomposition pays; sketch them before building the graph.
 
 | Number | Rule | Consequence |
 |---|---|---|
@@ -146,8 +151,7 @@ flowchart TD
 
 ## Examples
 ### DAG executor that passes only declared dependencies
-A small DAG executor that runs independent subtasks concurrently and passes only declared dependencies
-downstream. `call_model` is any async model call returning structured output.
+`call_model` is any async model call returning structured output.
 
 ```python
 import asyncio
@@ -184,15 +188,13 @@ final = asyncio.run(execute(GRAPH))
 print(final["recommend"]["text"])
 ```
 
-- **What runs when:** the four research subtasks run in one wave, `compare` runs when all four finish, and
-  `recommend` sees only the comparison table, never the raw research.
 - **Wave scheduling is the simplest correct executor,** but a ready node waits for the slowest node of the
   previous wave.
 - **On uneven graphs,** start each node as soon as its own dependencies finish (one task per node awaiting
   its parents) to cut wall-clock time.
 
 ### Seam calculator: reliability and critical path
-Runnable pure Python for the two numbers worth sketching before you build a graph.
+Pure Python; runs as is.
 
 ```python
 def chain_success(p, n, retries=0):
@@ -240,8 +242,8 @@ failure; latency rows assume about 20 seconds per subtask.
   run.
 - **Cache subtasks by input hash.** Key results on the task text plus a hash of declared inputs, so
   retries and reruns skip finished, unchanged pieces. Monitor cache hit rate and stale-result complaints.
-- **Pass references for raw data.** Put source ids or document chunk ids in the structured result, so the
-  merge step can fetch raw text when a detail matters. Monitor how often the merge step fetches.
+- **Pass references for raw data.** Put source or chunk ids in the structured result so the merge step
+  can fetch raw text when a detail matters. Monitor how often it fetches.
 - **Trace each subtask as its own span.** Give every subtask a span with its type, input hash, tokens
   and verifier result in your tracing tool (LangSmith or OpenTelemetry), and build an eval dataset per
   subtask type from those traces. Monitor per-subtask pass rate over time; it tells you which seam to fix.
@@ -252,25 +254,32 @@ failure; latency rows assume about 20 seconds per subtask.
   overhead dominates.
 - **Generality vs reliability.** Dynamic decomposition handles novel goals, yet it is the least reliable
   step in the system; static decomposition is more robust whenever the task shape is known.
-- **Small contexts vs lost detail.** Structured summaries across seams keep contexts small and cheap, at
-  the risk of dropping a detail a downstream step needed; when details matter, pass references so steps
-  can fetch raw data.
+- **Small contexts vs lost detail.** Structured summaries keep contexts cheap but can drop a detail a
+  downstream step needed; pass references so it can fetch raw data.
 - **Wall-clock vs concurrent load.** Parallel fan-out cuts wall-clock time dramatically, but multiplies
   concurrent tool and API usage, so rate limits and cost per task rise with the branching factor.
 
 ## Pitfalls
 - **Decomposing along narrative sections.** Symptom: pieces contradict each other and the merge step
-  rewrites everything. Fix: cut along data or verification boundaries.
+  rewrites everything, because the pieces share almost all their context. Diagnose: diff each piece
+  against the merged deliverable; heavy rewrites of every piece are the signature. Fix: cut along data
+  or verification boundaries.
 - **Subtasks without a success criterion.** Symptom: every subtask "succeeds" and the final output still
-  misses what was asked. Fix: a `done_when` per subtask.
+  misses what was asked. Diagnose: count subtask outputs that were never checked against anything. Fix:
+  a `done_when` per subtask.
 - **Passing full transcripts between subtasks.** Symptom: token cost grows with the number of edges and
-  downstream steps fixate on irrelevant upstream detail. Fix: structured results plus references.
+  downstream steps fixate on irrelevant upstream detail. Diagnose: log input tokens per edge in each
+  subtask span; one fat edge usually dominates. Fix: structured results plus references.
 - **Unbounded dynamic decomposition.** Symptom: forty subtasks for a question that needed two, and a budget
-  blown before any work happens. Fix: a count cap in the schema.
+  blown before any work happens. Diagnose: plot subtasks per request; a long tail is runaway splitting.
+  Fix: a count cap in the schema.
 - **Hidden dependencies not declared in the graph.** Symptom: intermittent failures when a subtask happens
-  to run before the one it silently relied on. Fix: pass only declared inputs, so missing edges fail loudly.
+  to run before the one it silently relied on. Diagnose: replay with a shuffled ready order; failures
+  that follow the order are missing edges. Fix: pass only declared inputs, so missing edges
+  fail loudly.
 - **Long unverified chains.** Symptom: end-to-end success far below any single step's success rate,
-  because per-step failures multiply. Fix: verify and retry each step, or flatten the chain.
+  because per-step failures multiply. Diagnose: compare measured end-to-end success with *pⁿ* from
+  per-step pass rates in traces. Fix: verify and retry each step, or flatten the chain.
 
 ## When to use
 - **Decompose when** a task has more than a few distinct pieces of work, parts can be verified
@@ -278,9 +287,17 @@ failure; latency rows assume about 20 seconds per subtask.
 - **Avoid when** tasks are short, reasoning is tightly coupled, or the pieces need almost all of the same
   context.
 - **Measure** per-subtask success, merge conflict rate and total tokens versus the monolithic baseline.
-- **On the job:** designing the subtask schema and the DAG for a research or migration agent.
-- **Interviews:** the strong answer covers granularity, dependency structure and interface contracts, and
-  explains where to cut and why.
+
+## Exercise
+**Goal:** decompose a real agent task into a verified DAG and test it against a one-shot baseline.
+- **Inputs:** a task with at least five distinct pieces (say, comparing three vector databases), any
+  model API, and a small hand-labelled answer key.
+- **Constraints:** every subtask has a typed output schema and a `done_when`; only declared dependencies
+  cross a seam; concurrency is capped.
+- **Deliver:** the DAG, the executor, per-subtask pass rates, and a table of accuracy, tokens and
+  wall-clock time against one monolithic call.
+- **Acceptance:** a corrupted subtask output is rejected by its validator; deleting one edge makes the
+  dependent subtask fail loudly; your predicted critical-path latency is within about 25% of measured.
 
 ## Role lens
 - **Engineer:** Writes the subtask schema, the DAG executor and the verifiers, and tunes granularity
@@ -371,12 +388,23 @@ raw text when needed. Measure recall per clause type before and after, and token
 > Dynamic decomposition is the least reliable step in an agent. If the phases are known, encoding them
 > in code gives testability and cost control; keep dynamic splitting for the genuinely open parts.
 
+## Mastery test
+**Problem:** a ticket-triage agent runs a six-step chain per ticket: classify, fetch account, fetch recent
+orders, check refund policy, draft reply, tone check. Traces show 93% success per step and about 8 s per
+step. Product wants 90% end-to-end success in under 20 s. Redesign it.
+
+**A strong answer:**
+- computes 0.93⁶ ≈ 0.65; one checked retry per step lifts the chain to about 0.97;
+- fans out the three lookups, which depend only on the classification: four waves, about 32 s, still
+  too slow;
+- removes model calls from the critical path: lookups as plain API calls, tone check folded into
+  drafting or done in code;
+- gives each lookup a structured contract so drafting never sees raw transcripts.
+
 ## Use cases & projects
 ### Use cases
 - **Document extraction at scale.** A contract-review agent fans out one subtask per clause type, each
   with a typed output schema, then merges results in code rather than in one giant prompt.
-- **Research agents.** A lead agent splits a question into independent sub-questions handled by
-  sub-agents that return short summaries and sources, not their full transcripts.
 - **Code migrations.** A migration agent decomposes by file or module, verifies each piece with tests and
   retries only the pieces that fail.
 - **Fixed business workflows.** Known phases such as intake, lookup and draft are encoded as a static
@@ -394,6 +422,5 @@ raw text when needed. Measure recall per clause type before and after, and token
   subtask output is caught by its validator instead of reaching the final answer.
 
 ### Major project
-This lesson feeds the module Capstone (see the module guide): the billing-dispute agent splits its run
-into intake, investigation with parallel lookups, reconciliation and proposal, each with its own
-contract and check.
+Feeds the module Capstone: the billing-dispute agent splits its run into intake, parallel lookups,
+reconciliation and proposal, each with its own contract and check.

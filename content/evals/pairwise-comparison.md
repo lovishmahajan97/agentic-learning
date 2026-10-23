@@ -5,7 +5,7 @@ name: Pairwise comparison
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -205,8 +205,8 @@ print(f"P(ft-model beats prod) = {1 / (1 + np.exp(-(beta[i] - beta[j]))):.2f}")
 
 - **Result:** ft-model first, promptB second, prod third, promptC last; ft-model is predicted to beat
   prod about 70% of the time, close to the directly observed 70/100.
-- **The value of the fit** is not that pair, which was observed, but the consistent ranking of all four
-  from unequal evidence and the ability to bootstrap intervals on it.
+- **The value of the fit** is not that observed pair but one consistent ranking of all four from
+  unequal evidence, with bootstrap intervals.
 
 ### Win rate with ties, a bootstrap interval and a sample-size check (runnable)
 Pure Python. The candidate is B, the production baseline is A.
@@ -334,8 +334,8 @@ agent with two planner prompts) should replace version 1. No solution is given.
   inconsistent pairs count as ties.
 - **Deliver:** discordant outcome counts with a McNemar z, the win rate on both-succeeded pairs with a
   bootstrap interval, the position-flip rate, the tool-call-count difference, and a ship call.
-- **Acceptance:** shuffling the verdict order leaves every number unchanged; your interval agrees with
-  √(p(1−p)/n) within a point; the decision names the number that decided it.
+- **Acceptance:** shuffling the verdict order leaves every point estimate unchanged; your bootstrap
+  half-width agrees with 1.96 × √(p(1−p)/n) within a point; the decision names the number that decided it.
 
 ## Role lens
 - **Engineer:** Builds the comparison harness: randomised order, both orders for an LLM judge, tie
@@ -427,8 +427,9 @@ from the judge's family. Design the comparison and the decision rule.
 
 **A strong answer:**
 - scores outcome in code on every configuration first, so judge calls go only to both-succeeded pairs;
-- anchors to the current configuration instead of all 15 pairs, with both orders halving the budget to
-  about 225 verdicts, and spends a second round where intervals overlap;
+- anchors to the current configuration instead of all 15 pairs; both orders halve the budget to about
+  225 verdicts, roughly 45 per challenger (±15 points), so outcome rates rank and the judge breaks
+  near-ties, with a second round where intervals overlap;
 - fits Bradley–Terry with bootstrap intervals, checks per-category intransitivity and length or step
   gaps, and swaps in a cross-family judge for the sibling model.
 

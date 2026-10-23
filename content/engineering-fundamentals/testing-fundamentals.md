@@ -176,6 +176,8 @@ for s in 0 1 2 3 4 5; do printf "seed $s: "; PYTHONHASHSEED=$s pytest -q test_re
 # seed 5: 1 failed, 3 passed
 ```
 
+- **Which seeds fail depends on the Python version**, because the string hash changed in 3.11: on
+  Python 3.12.14 seeds 3 and 4 fail instead. Only some seeds fail, so loop over 10 or more to be sure.
 - **The fix is in the code, not the test:** break ties deterministically with
   `sorted(hits, key=lambda d: (-scored[d], d))`. With that change all six seeds pass.
 - **Why it matters for agents:** an unstable tie decides which chunk lands in the context window, so
@@ -250,7 +252,8 @@ No solution is given.
 - **Deliver:** the suite, a one-paragraph note on what each level covers, and a list of three bugs you
   planted.
 - **Acceptance:**
-  - unit tests run in under 5 s with networking disabled;
+  - unit tests run in under 5 s with networking disabled (for example the pytest-socket plugin's
+    `pytest --disable-socket`, which fails any test that opens a socket);
   - each planted bug (wrong tie order, empty-result crash, missing source id) makes at least one test
     fail;
   - the suite passes under `PYTHONHASHSEED` values 0 to 9 and in random order;

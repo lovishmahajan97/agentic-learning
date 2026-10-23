@@ -378,11 +378,11 @@ corrects itself. Then watch the distribution of amounts in traces to confirm the
 
 ## Mastery test
 **Problem:** a `book_meeting` tool takes `start_time` (pattern-checked ISO 8601) with strict mode on, so
-validation never fails. Users in India report meetings landing 5 hours 30 minutes early. Find, confirm
+validation never fails. Users in India report meetings landing 5 hours 30 minutes late. Find, confirm
 and fix the bug.
 
 **A strong answer:**
-- a contract bug: the time has no zone, so local times are stored as UTC;
+- a contract bug: the time has no zone, so a local 15:00 (UTC+5:30) is stored as 15:00 UTC, 20:30 local;
 - traces show a constant stated-versus-stored offset matching the user's zone;
 - renames to `starts_at_utc` or requires an offset, takes the user's zone from the session, adds a
   semantic check (future, plausible hours), and returns a fixable error.

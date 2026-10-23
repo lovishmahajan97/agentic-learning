@@ -38,13 +38,11 @@ across runs.
 - **Why it matters for agents.** Small models vary far more than large ones across tasks, quantization
   levels and prompt formats. A model that tops a general benchmark can still misname your tools or break
   your JSON.
-- **Where it shows up in your stack.** An eval harness (your own pytest-style script, or tools covered in
-  evals/tooling), OpenAI-compatible endpoints from Ollama, vLLM or llama.cpp so models are swappable, and
-  tracing for production samples.
-- **What you control.** The test cases, the metrics and pass thresholds, the models and quantizations
-  compared, and the release gate.
-- **What you can skip.** Running every public benchmark. Use them only to shortlist; the decision comes from
-  your own cases.
+- **Where it shows up in your stack.** An eval harness (your own script, or evals/tooling), swappable
+  OpenAI-compatible endpoints from Ollama, vLLM or llama.cpp, and tracing for production samples.
+- **What you control.** Test cases, metrics and pass thresholds, the models and quantizations compared, and
+  the release gate.
+- **What you can skip.** Running every public benchmark; use them only to shortlist.
 
 ## Why it exists
 - **General benchmarks measure the wrong thing.** Knowledge and reasoning scores say little about following
@@ -54,8 +52,8 @@ across runs.
   serve.
 - **Agent errors compound.** A per-step success rate of 95% over 10 steps leaves about 60% of tasks fully
   correct (0.95^10 ≈ 0.6, assuming independent steps), so step-level and task-level metrics both matter.
-- **Model families change monthly.** New Llama, Qwen, Phi, Gemma and Mistral releases arrive often; a
-  reusable eval lets you re-test a new model in an hour instead of guessing from a model card.
+- **Model families change monthly.** Llama, Qwen, Phi, Gemma and Mistral release often; a reusable eval
+  re-tests a new model in an hour instead of guessing from a model card.
 
 ## How it works
 ### 1. Build the eval set from your agent
@@ -70,7 +68,7 @@ across runs.
 
 - **Source cases** from production traces, SME-written cases and synthetic variants; keep 100-300 cases per
   slice for a first pass (illustrative; enough to see differences of a few points).
-- **Freeze it** as a versioned golden set and never train on it.
+- **Freeze it** as a versioned golden set; never train on it.
 
 ### 2. Define metrics per level
 - **Call level:** parse rate (valid JSON or tool call), schema validity, tool-name accuracy, argument exact
@@ -93,7 +91,6 @@ across runs.
 ### 4. Gate releases and monitor
 - Set thresholds per slice (for example schema validity at least 99%, task success within 2 points of the
   baseline) and block a model swap that misses any of them.
-- Sample production traces into the eval set regularly so it tracks real traffic.
 
 ## Diagram
 Every candidate runs the same frozen cases under the same settings; only the scorecard decides.
@@ -115,11 +112,10 @@ flowchart TD
 
 ## Examples
 ### A minimal tool-call eval across local models
-Compares models served by Ollama (or any OpenAI-compatible server) on tool name, argument match and
-latency. Each case lists the expected tool and arguments.
+Compares models on any OpenAI-compatible server (here Ollama) on tool name, argument match and latency.
 
 ```python
-# pip install openai   (checked against openai 3.36.1 with a stub OpenAI-compatible endpoint)
+# pip install openai   (checked against openai 3.37.0 with a stub OpenAI-compatible endpoint)
 import json, statistics, time
 from openai import OpenAI
 
@@ -156,8 +152,8 @@ for m in MODELS:
     print(f"{m}: exact {ok}/{len(CASES)}, median latency {statistics.median(lat):.2f}s")
 ```
 
-Grow `CASES` to hundreds, add a schema check, repeat with sampling on, and add a multi-step sandbox suite
-before trusting the ranking.
+Before trusting the ranking, grow `CASES` to hundreds, add a schema check and a multi-step sandbox
+suite, and repeat with sampling on.
 
 ### Worked scenario: picking an SLM for an extraction-and-routing agent
 Illustrative scorecard on 600 cases, same prompts and hardware, three runs each.
@@ -170,34 +166,34 @@ Illustrative scorecard on 600 cases, same prompts and hardware, three runs each.
 | 3B, 4-bit | 95% | 86% | 77% | 0.4 s | quantization hurt; reject |
 | 1B, 8-bit | 88% | 74% | 61% | 0.3 s | too weak for this task |
 
-- **Insight:** the 3B model lost 7 task-success points going from 8-bit to 4-bit, so the quantized model,
-  not the family, was the real choice to evaluate.
-- **Read it against the gate:** no SLM alone is within 2 points of the 93% baseline, so none passes the
-  example gate in section 4 by itself; the 7B 4-bit model comes closest at 89%.
-- **Decision:** no SLM ships alone. Put the 3B 8-bit model (or the 7B 4-bit if hardware allows) behind a
-  cascade that escalates on schema failure or verifier reject, score the cascade as a whole on the same 600
-  cases against the gate, and ship only if it passes. Re-run this scorecard when a new model family appears.
+- **Insight:** the 3B lost 7 task-success points from 8-bit to 4-bit, so the quantized build, not the
+  family, is what you evaluate.
+- **Against the gate:** no SLM alone is within 2 points of the 93% baseline; the 7B 4-bit comes closest at
+  89%.
+- **Decision:** put the 3B 8-bit (or the 7B 4-bit if hardware allows) behind a cascade that escalates on
+  schema failure or verifier reject, and ship only if the cascade as a whole passes the gate on the same
+  600 cases.
 
 ## Production patterns
 - **Keep the harness model-agnostic.** Call every candidate through an OpenAI-compatible endpoint (Ollama,
-  vLLM, llama.cpp server, hosted APIs) so a new model is a config line. Store results per model, quantization
-  and prompt version.
-- **Run evals in CI on any model or prompt change.** Treat a model swap like a code change: the eval suite
-  runs, and a slice below its threshold blocks the merge. Track trends per slice over releases.
-- **Refresh the golden set from production.** Sample traces weekly, especially escalations and failures, have
-  them labelled, and add them as new cases so the eval tracks real traffic. Version the dataset.
-- **Measure cost per successful task.** Combine success rate with tokens, latency and hardware cost, because a
+  vLLM, llama.cpp server, hosted APIs) so a new model is a config line. Store results per model,
+  quantization and prompt version.
+- **Run evals in CI on any model or prompt change.** Treat a model swap like a code change: a slice below
+  its threshold blocks the merge. Track per-slice trends over releases.
+- **Refresh the golden set from production.** Sample traces weekly, especially escalations and failures,
+  label them and add them as versioned cases so the eval tracks real traffic.
+- **Measure cost per successful task.** Combine success rate with tokens, latency and hardware cost: a
   cheaper model that fails more can cost more per completed task once retries and escalations count.
-- **Shadow before switching.** Run the candidate SLM on live traffic in shadow mode, compare its outputs with
-  production, and only then canary it. Monitor parse rate and task success by model version.
+- **Shadow before switching.** Run the candidate in shadow on live traffic, compare with production, then
+  canary. Monitor parse rate and task success by model version.
 
 ## Trade-offs
-- **Own eval set vs public benchmarks.** Your set predicts your agent's behaviour but costs time to build and
-  maintain; public benchmarks are free but only good for shortlisting.
+- **Own eval set vs public benchmarks.** Your set predicts your agent's behaviour but costs time to
+  maintain; public benchmarks are free but only shortlist.
 - **Code checks vs LLM judges.** Code checks are precise and cheap but cover only verifiable outputs; judges
   cover free text but add cost, bias and noise that small score differences can hide.
 - **Big suite vs fast iteration.** Thousands of cases detect small regressions but slow every experiment;
-  keep a fast smoke subset for development and the full suite for release gates.
+  use a smoke subset in development, the full suite at release.
 - **Single run vs repeated runs.** One deterministic run is cheap but hides instability; repeated sampled
   runs show variance at multiplied cost.
 
@@ -216,20 +212,20 @@ Illustrative scorecard on 600 cases, same prompts and hardware, three runs each.
 ## When to use
 - **Use when** choosing between SLMs or quantizations, before and after fine-tuning or distillation, when
   tuning a cascade, and on every model or prompt change.
-- **Avoid** relying on it alone when production traffic differs sharply from the set; shadow and online
-  metrics must confirm.
+- **Avoid** relying on it alone when production traffic differs sharply from the set; confirm with shadow
+  and online metrics.
 - **Measure** parse rate, schema validity, tool and argument accuracy, task success, steps, latency, memory
   and cost per successful task.
 
 ## Exercise
 **Goal:** decide whether a 4-bit build of a small model is safe to ship in place of its 8-bit build. No
 solution is given.
-- **Inputs:** one small instruct model in two quantizations behind an OpenAI-compatible server, 3 tool
-  schemas, and 100+ cases across the slices in section 1, including 10 multi-step sandbox tasks.
-- **Deliver:** a scorecard over 3 runs per build with parse rate, tool and argument accuracy, task success
-  (mean and spread), p95 latency and memory, plus failures by category.
-- **Acceptance:** settings other than the quantization are provably identical; the verdict names the gate it
-  applies and whether any gap exceeds run-to-run spread.
+- **Inputs:** one small model in two quantizations behind an OpenAI-compatible server, 3 tool schemas,
+  and 100+ cases across the section 1 slices, 10 of them multi-step sandbox tasks.
+- **Deliver:** a scorecard over 3 runs per build with the section 2 metrics (task success as mean and
+  spread), plus failures by category.
+- **Acceptance:** only the quantization differs, provably; the verdict names its gate and whether any gap
+  exceeds run-to-run spread.
 
 ## Role lens
 - **Engineer:** Builds the model-agnostic harness, writes code-checked cases for each tool and runs
@@ -319,19 +315,17 @@ escalates to a large model. Which do you pick, and what would you check first?
 
 ## Use cases & projects
 ### Use cases
-- **Model selection.** Teams shortlist a few Llama, Qwen, Phi, Gemma or Mistral small models and pick one
-  from a scorecard on their own tasks.
+- **Model selection.** Shortlisting a few small models and picking one from a scorecard on your own tasks.
 - **Quantization decisions.** Choosing between 4-bit and 8-bit builds for a device or GPU budget based on
   measured task success.
-- **Fine-tuning and distillation gates.** Proving a trained adapter beats the prompted baseline before it
-  ships.
-- **Cascade tuning.** Using the same set to set escalation thresholds between an SLM and a large model.
+- **Fine-tuning and distillation gates.** Proving a trained adapter beats the prompted baseline.
+- **Cascade tuning.** Setting escalation thresholds between an SLM and a large model.
 
 ### Mini project
 **Build an SLM scorecard for a three-tool agent (2-3 hours).**
 - **Goal:** rank three local models or quantizations on your own agent task with a reusable harness.
-- **Steps:** define three tool schemas; write 100 cases (each tool, "no tool", tricky arguments, paraphrases)
-  plus 10 multi-step sandbox tasks; pull candidates in Ollama; run each three times; compute parse rate, tool
-  and argument accuracy, task success, and median and p95 latency; categorise the top failures.
+- **Steps:** three tool schemas; 100 cases (each tool, "no tool", tricky arguments, paraphrases) plus 10
+  multi-step sandbox tasks; candidates pulled in Ollama, each run three times; the section 2 metrics with
+  median and p95 latency; top failures categorised.
 - **Done when:** you have a scorecard table, a recommendation with a stated release threshold, and a script
   that re-scores a new model with one config change.

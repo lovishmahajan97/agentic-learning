@@ -6,7 +6,13 @@ kind: concept
 difficulty: advanced
 est_minutes: 16
 agent_relevance: useful
-status: agentic-verified
+status: mastery
+mastery: implement
+code_tested: partial
+prerequisites:
+  - slm-for-agents/running-slms-locally
+  - slm-for-agents/quantized-slms
+  - slm-for-agents/tool-calling-and-structured-output-with-slms
 related:
   - infra-capacity-economics/edge-ai-deployment
   - slm-for-agents/running-slms-locally
@@ -30,23 +36,22 @@ tools. It buys privacy, offline use and zero per-call cost, within tight memory,
 ## For agent builders
 - **Why it matters for agents.** Some agents must work offline, keep data on the device, or respond in
   well under a second: field apps, assistants inside desktop software, kiosks, vehicles, factory gateways.
-- **Where it shows up in your stack.** llama.cpp (GGUF) and its bindings, Ollama on desktops, MLX on Apple
-  silicon, ONNX Runtime and ExecuTorch on mobile and embedded, WebGPU runtimes in the browser, and OS-level
-  on-device models where the platform provides one.
+- **Where it shows up in your stack.** The runtimes tabled below, from llama.cpp (GGUF) and Ollama to
+  mobile and browser runtimes, plus OS-level on-device models.
 - **What you control.** Model size and quantization, context length, the tool set exposed on the device,
   constrained decoding for tool calls, and when to hand off to a cloud model.
-- **What you can skip.** Kernel-level optimisation and NPU compiler details; pick a runtime that supports
-  your target hardware and measure on real devices.
+- **What you can skip.** Kernel-level optimisation and NPU compiler details; pick a runtime for your
+  hardware and measure on real devices.
 
 ## Why it exists
 - **Data cannot always leave the device.** Health notes, personal messages, regulated industrial data, or
   customer policy rule out sending prompts to a cloud API.
 - **Connectivity is not guaranteed.** Field workers, vehicles and remote sites need an agent that still
   works with no network.
-- **Round trips add latency.** A local SLM avoids network time for short, frequent steps like intent
+- **Round trips add latency.** A local SLM skips network time on short, frequent steps like intent
   detection, form filling or command parsing.
-- **Cloud cost scales with users.** On-device inference costs nothing per call once shipped, which matters
-  for consumer apps with millions of users.
+- **Cloud cost scales with users.** On-device inference costs nothing per call, which matters for
+  consumer apps with millions of users.
 - **The catch:** a phone may give an app only a few GB of memory, sustained inference drains battery and
   heats the device, and small models are weaker, so the agent must be designed around those limits.
 
@@ -63,9 +68,8 @@ e.g. 3B × 4 bits / 8 ≈ 1.5 GB   (plus KV cache, runtime and app memory)
 | Edge box with a small GPU | ~3-14B | can serve several local users |
 | Browser (WebGPU) | ~0.5-3B | first load downloads the weights; cache them |
 
-Rough orders of magnitude; check each runtime's docs and measure on the target device. Practical "4-bit"
-files run a little larger than the formula: GGUF types such as Q4_K_M keep some tensors at higher precision,
-so a 3B file is closer to 2 GB than 1.5 GB.
+Rough orders of magnitude; measure on the target device. Real "4-bit" files run larger than the formula:
+GGUF types such as Q4_K_M keep some tensors at higher precision, so a 3B file is closer to 2 GB than 1.5 GB.
 
 ### 2. Pick a runtime for the platform
 | Runtime | Where it fits | Model format |
@@ -83,17 +87,15 @@ change often, so check the current platform docs.
 ### 3. Design the agent for a small model
 - **Few, narrow tools.** Expose 3-8 local tools with short schemas; every schema token costs context and
   latency on a slow device.
-- **Constrain the output.** Use grammar or JSON-schema-constrained decoding (llama.cpp grammars, JSON
-  schema mode in llama-cpp-python) so tool calls always parse.
+- **Constrain the output** with llama.cpp grammars or JSON schema mode so tool calls always parse.
 - **Short context.** Keep context to a few thousand tokens, summarise or drop old turns, because KV cache
   memory and prefill time grow with length.
 - **Specialise.** A LoRA fine-tune for the device's task often matters more than a bigger base model.
 
 ### 4. Plan the cloud boundary
-- **Local-first with optional escalation:** hard requests go to a cloud model only with consent and
-  connectivity (see slm-llm-cascades-and-routing).
-- **Redact before escalation:** strip personal data on the device first if policy allows escalation at all.
-- **Sync later:** queue actions taken offline and reconcile with the server when the network returns.
+- **Local-first:** hard requests escalate to a cloud model only with consent and connectivity (see
+  slm-llm-cascades-and-routing), after on-device redaction if policy allows escalation at all.
+- **Sync later:** queue offline actions and reconcile when back online.
 
 ## Diagram
 The device handles the loop locally; the cloud is an optional, policy-gated fallback.
@@ -111,9 +113,33 @@ flowchart TD
 ```
 
 ## Examples
+### Runnable: will it fit, and at what context length?
+Weights are fixed but the KV cache grows with context, which usually breaks the fit. The 3 GB budget
+is illustrative.
+
+```python
+# Does the model fit the device? Pure Python, no dependencies.
+def fit(params_b, bits_per_weight, layers, kv_heads, head_dim, ctx_tokens,
+        kv_bytes=2, runtime_gb=0.3, budget_gb=3.0):
+    weights = params_b * 1e9 * bits_per_weight / 8
+    kv = 2 * layers * kv_heads * head_dim * kv_bytes * ctx_tokens   # keys + values, fp16 cache
+    total = (weights + kv) / 1e9 + runtime_gb
+    return {"weights_gb": round(weights / 1e9, 2), "kv_gb": round(kv / 1e9, 2),
+            "total_gb": round(total, 2), "fits": total <= budget_gb}
+
+# Illustrative 3B config with grouped-query attention: read yours from the model's config.json.
+# ~4.8 bits/weight approximates a Q4_K_M-style file (some tensors stay at higher precision).
+for ctx in (2048, 8192, 32768):
+    print(ctx, fit(3.2, 4.8, layers=28, kv_heads=8, head_dim=128, ctx_tokens=ctx))
+
+# Expected output:
+# 2048 {'weights_gb': 1.92, 'kv_gb': 0.23, 'total_gb': 2.45, 'fits': True}
+# 8192 {'weights_gb': 1.92, 'kv_gb': 0.94, 'total_gb': 3.16, 'fits': False}
+# 32768 {'weights_gb': 1.92, 'kv_gb': 3.76, 'total_gb': 5.98, 'fits': False}
+```
+
 ### A local tool-calling step with llama-cpp-python and a JSON schema
-Runs fully offline with a downloaded GGUF file. JSON schema mode constrains decoding, so the tool call
-always parses even from a small model.
+Offline with a downloaded GGUF; schema mode makes the call parse. API checked against llama-cpp-python LLAMA_VERSION.
 
 ```python
 # pip install llama-cpp-python   (build options for Metal or CUDA: see its docs)
@@ -145,8 +171,7 @@ else:
     print(call)
 ```
 
-On a laptop this runs on CPU or Metal or CUDA; for phones, use a mobile runtime from the table with the
-same design: small model, constrained output, local tools.
+For phones, keep the design and use a mobile runtime from the table.
 
 ### Worked scenario: a field-maintenance agent on a rugged tablet
 Requirements: works offline, keeps site data on the device, answers within about 2 seconds. Illustrative
@@ -161,44 +186,45 @@ numbers.
 | Cloud | escalate only when online and the technician taps "ask expert" | privacy and cost |
 | Sync | fault logs queued and uploaded when connected | offline-first |
 
-- **Measured on device (illustrative):** first token in well under a second for short prompts, a few tokens
-  per second to tens of tokens per second depending on chip, and acceptable battery drain for a shift
-  because calls are short.
+- **Measured on device (illustrative):** first token well under a second, a few to tens of tokens per
+  second by chip, and acceptable battery per shift because calls are short.
 - **Biggest win:** constraining output and cutting tool schemas fixed most failures, more than switching to a
   larger model.
 
 ## Production patterns
 - **Test on the slowest supported device.** Benchmark time to first token, tokens per second, peak memory and
-  battery drain on the oldest target hardware, because a model that is fine on a developer laptop may be
-  killed by the OS on a phone. Gate releases on those numbers.
+  battery drain on the oldest target hardware, because a model fine on a developer laptop may be killed by
+  the OS on a phone. Gate releases on those numbers.
 - **Download models separately from the app.** Ship the app small, fetch the model on first run over Wi-Fi,
   verify a checksum, and version models so you can roll back. Monitor download failures and storage errors.
-- **Always constrain tool calls.** Use grammars or JSON-schema decoding in the runtime and still validate in
-  code, because a malformed call on a device cannot be retried against a stronger model when offline.
-- **Treat local tools as privileged.** On-device agents can reach files, contacts or sensors; give each tool
-  least privilege and require user confirmation for destructive actions (see agents/sandboxing).
+- **Always constrain tool calls.** Use grammars or JSON-schema decoding and still validate in code: offline,
+  a malformed call cannot be retried against a stronger model.
+- **Treat local tools as privileged.** On-device agents reach files, contacts or sensors; give each tool
+  least privilege and confirm destructive actions with the user (see agents/sandboxing).
 - **Collect evals, not data.** Where users consent, report anonymous outcome signals (tool-call parse rate,
-  escalation taps, latency) instead of raw prompts, and use them to choose what to fine-tune next.
+  escalation taps, latency) instead of raw prompts, to choose what to fine-tune next.
 
 ## Trade-offs
 - **Privacy and offline vs capability.** Keeping everything local rules out frontier-model quality; the
   balance flips when a task needs broad reasoning and data policy allows a cloud call.
-- **Zero per-call cost vs engineering cost.** No inference bill, but you maintain model packaging,
-  runtimes per platform and device testing across hardware generations.
+- **Zero per-call cost vs engineering cost.** No inference bill, but you maintain packaging, per-platform
+  runtimes and device testing across hardware generations.
 - **Smaller model vs better quantization.** A 4-bit 3B model may beat an 8-bit 1B in the same memory, or
-  not; measure on your task rather than assuming.
+  not; measure on your task.
 - **Latency vs battery.** Running the GPU or NPU flat out gives fast answers but drains battery and throttles
   under heat; short prompts and few calls per task keep both acceptable.
 
 ## Pitfalls
-- **Benchmarking only on a desktop.** Symptom: crashes or 10-second responses on real phones. Fix: test on
-  target devices with realistic background apps and thermal state.
-- **Large tool schemas and long history.** Symptom: slow first token and context overflow. Fix: fewer, shorter
-  tools and aggressive context trimming.
+- **Benchmarking only on a desktop.** Symptom: crashes or 10-second responses on real phones. Diagnose: log
+  peak memory, OS kill reasons and tokens per second per device, again after 10 minutes of use (thermal
+  throttling). Fix: test on target devices with realistic background apps.
+- **Large tool schemas and long history.** Symptom: slow first token and context overflow. Diagnose: log
+  prompt tokens per step split into schemas, history and retrieved text. Fix: fewer, shorter tools and aggressive context trimming.
 - **Unconstrained output from a small model.** Symptom: occasional malformed tool calls that break the loop
-  offline. Fix: grammar or schema-constrained decoding plus code validation.
-- **Silent cloud fallback.** Symptom: privacy review finds data leaving the device. Fix: make escalation
-  explicit, consented, redacted and logged.
+  offline. Diagnose: track parse rate, keep failing raw outputs, and confirm the
+  runtime received the schema. Fix: grammar or schema-constrained decoding plus code validation.
+- **Silent cloud fallback.** Symptom: privacy review finds data leaving the device. Diagnose: capture network
+  traffic in a test run and match each request to a logged escalation. Fix: make escalation explicit, consented, redacted and logged.
 
 ## When to use
 - **Use when** data must stay on the device, the agent must work offline, per-user cloud cost is
@@ -207,7 +233,17 @@ numbers.
   constrained; use a cloud model or a hybrid design.
 - **Measure** task success, tool-call parse rate, time to first token, tokens per second, peak memory and
   battery per task on target devices.
-- **Interviews:** connect memory arithmetic, runtime choice and the cloud boundary.
+- **Interviews:** link memory arithmetic, runtime choice and the cloud boundary.
+
+## Exercise
+**Goal:** predict, then measure, whether an offline three-tool agent fits a 3 GB budget. No solution is
+given.
+- **Inputs:** two GGUF quantizations of one small model, its config.json, the fit calculator, and 30
+  requests at 2k and 8k context.
+- **Deliver:** per quantization and context: predicted and measured peak memory, time to first token,
+  tokens per second, parse rate and tool accuracy, and which limit binds first.
+- **Acceptance:** network off; every call parses; measured memory within about 20% of prediction, or the
+  gap explained.
 
 ## Role lens
 - **Engineer:** Packages a quantized model for the target runtime, builds constrained local tool calls, and
@@ -234,12 +270,6 @@ benchmarks, an explicit "contact expert" path, and staged rollouts.
   your context length, runtime overhead and the app itself, and compare with what the OS allows the app.
 - **Then measure** time to first token, tokens per second and battery on the slowest target device, and pick
   the largest model that meets the latency and memory budget.
-
-### Why is constrained decoding especially important for on-device agents?
-- **Small models produce malformed tool calls more often**, and offline there is no stronger model to retry
-  against.
-- **Grammar or JSON-schema decoding** in the runtime guarantees parseable output, and code validation still
-  checks argument semantics.
 
 ### How would you design the boundary between an on-device agent and a cloud model?
 - **Local by default**, with escalation only when the request needs it, the user or policy allows it, and
@@ -283,23 +313,32 @@ benchmarks, an explicit "contact expert" path, and staged rollouts.
 > Explicit, consented, redacted escalation keeps privacy guarantees testable while still offering a path for
 > hard requests. Silent fallback is the classic privacy failure.
 
+## Mastery test
+**Problem:** a kiosk edge box has 8 GB of RAM, 2 GB used by the app. The team wants a 7B model at 4-bit
+with the product catalog in a 16k context, escalating to the cloud "whenever the model is unsure". What
+breaks, and what do you change?
+
+**A strong answer:**
+- adds it up: about 4 GB of weights, up to about 2 GB of KV cache at 16k for a GQA 7B, plus runtime and
+  app, so the box is at or past its limit;
+- retrieves catalog entries into a 2-4k context, or drops to a 3B model;
+- replaces "unsure" with checkable triggers (schema failure, verifier reject, user tap), redacted and logged.
+
 ## Use cases & projects
 ### Use cases
 - **Field and industrial assistants.** Offline agents on tablets or gateways that search manuals, read
   sensors and log faults at remote sites.
 - **Private personal assistants.** Note, email or health assistants that summarise and act on personal data
-  without sending it off the phone or laptop.
+  without it leaving the device.
 - **In-app copilots.** Desktop software that parses natural-language commands into local actions with no
   per-user API bill.
-- **Vehicles, kiosks and retail devices.** Voice or text agents that must answer instantly with unreliable
-  connectivity.
+- **Vehicles, kiosks and retail devices.** Agents that must answer instantly on unreliable networks.
 
 ### Mini project
 **Build an offline note agent on your laptop (1-2 hours).**
 - **Goal:** a local agent that answers questions over your notes and creates reminders with no network.
-- **Steps:** download a small instruct GGUF model; use llama-cpp-python with a JSON schema for three tools
-  (search_notes, set_reminder, none); implement tools over a local folder and a JSON file; disconnect from the
-  network; run 30 test requests and record tool-call accuracy, time to first token and peak memory; try a
-  second quantization level and compare.
-- **Done when:** the agent works offline, every tool call parses, and you have a table comparing two
-  quantization levels on accuracy, latency and memory.
+- **Steps:** extend the llama-cpp-python example with tools over a local folder and a JSON file;
+  disconnect; run 30 requests recording tool-call accuracy, time to first token and peak memory; repeat
+  at a second quantization level.
+- **Done when:** it works offline, every call parses, and a table compares both levels on accuracy,
+  latency and memory.

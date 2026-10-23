@@ -5,7 +5,7 @@ name: Calculus intuition for gradients
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: understand
 code_tested: yes
@@ -217,13 +217,18 @@ than the loss alone.
 ## Exercise
 **Goal:** train a tiny classifier with hand-written gradients and reproduce the three learning-rate regimes.
 - **Inputs:** a synthetic dataset of 500 points labeling whether an agent request needs a search tool,
-  from two features you invent (for example, length and question-mark count), with a fixed seed.
+  from two features you invent (for example, length and question-mark count), with a fixed seed. Keep
+  the length feature unscaled (raw characters), because logistic gradients are bounded by |x| and only
+  large inputs let a big step push the loss far above where it started.
 - **Constraints:** numpy only; implement logistic regression's forward pass, chain-rule gradients and
   updates yourself; no autograd.
 - **Deliver:** a gradient check against finite differences, loss curves for at least four learning rates,
   and a run with gradient clipping that survives a rate that otherwise diverges.
 - **Acceptance:** analytic and numeric gradients agree to at least 5 decimal places; one rate converges
-  smoothly, one oscillates or crawls, and one diverges without clipping.
+  smoothly, one oscillates or crawls, and one ends with loss well above its starting 0.693 without
+  clipping, and for at least one such rate, clipping the gradient norm at 1.0 keeps loss within about 2x
+  of its start. Compute loss with
+  `np.logaddexp` so large logits give big finite numbers instead of inf.
 
 ## Role lens
 - **Engineer:** Sets learning rate, warmup, schedule and clipping for fine-tunes on agent traces, and
@@ -301,7 +306,11 @@ what you would change.
 
 **A strong answer:**
 - notes validation loss and task quality can diverge: the model fits token likelihood, not tool success;
-- suspects overfitting to trace style or forgetting general skills late in training;
+- explains how: mean loss is dominated by many easy tokens, so the few decisive ones (tool name,
+  argument values) can get worse while the average falls; measures loss on tool-call tokens only;
+- notes held-out traces come from the teacher, so falling loss also rewards copying its style and
+  errors, and checks general skills the eval needs for forgetting;
+- confirms the gap is real with a paired comparison of the two checkpoints on the same eval tasks;
 - adds a task eval per checkpoint and keeps the best one, not the last;
 - tries learning-rate decay, fewer epochs or a lower rate, and compares on the task eval.
 

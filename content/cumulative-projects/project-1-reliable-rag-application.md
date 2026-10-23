@@ -5,7 +5,7 @@ name: "Project 1: reliable RAG application"
 kind: practice
 difficulty: advanced
 est_minutes: 30
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -30,11 +30,11 @@ sources:
   - Es et al., 2023 — RAGAS, Automated Evaluation of Retrieval Augmented Generation
   - Liu et al., 2023 — Lost in the Middle, How Language Models Use Long Contexts
 milestones:
-  - python-for-ai: Ingestion and chunking pipeline over a real corpus
+  - rag-retrieval: Ingestion and chunking pipeline over a real corpus
   - rag-retrieval: Hybrid retrieval with a measured recall baseline
-  - prompting: Grounded answers with chunk-level citations and abstention
+  - rag-retrieval: Grounded answers with chunk-level citations and abstention
   - evals: Retrieval and answer-correctness evaluation gated in CI
-  - fastapi-for-ai: Simple UI with streaming answers and clickable sources
+  - evals: Simple UI with streaming answers and clickable sources
   - observability: Traced queries and a weekly failure review
 ---
 
@@ -68,9 +68,10 @@ refuses when the answer is absent, and proves all three with a golden set you re
 ## How it works
 Pick one real corpus of 50-500 documents you can get questions for: product docs, an internal handbook
 or public regulations. Each milestone below lists acceptance criteria you can run and the lessons it
-draws on.
+draws on. Each runs after the module that unlocks it and after the milestone before it, so M1-M3 all
+open once rag-retrieval is done.
 
-### M1. Ingestion and chunking (after python-for-ai)
+### M1. Ingestion and chunking (after rag-retrieval)
 - **Build:** parse PDFs and HTML to clean text, keep headings, assign stable chunk ids
   (`doc_id#offset`), store source URL and version per chunk.
 - **Acceptance:** re-running ingestion yields identical chunk ids; 20 sampled chunks read as
@@ -85,7 +86,7 @@ draws on.
 - **Lessons:** `rag-retrieval/hybrid-search`, `rag-retrieval/reranking`, `rag-retrieval/metadata-filtering`,
   `evals/golden-dataset`.
 
-### M3. Grounded generation (after prompting)
+### M3. Grounded generation (after rag-retrieval)
 - **Build:** a prompt that answers only from supplied chunks, cites chunk ids inline, and abstains below
   a retrieval-score threshold or when chunks do not contain the answer.
 - **Acceptance:** every factual sentence carries a citation; at least 10 out-of-scope questions in the
@@ -97,11 +98,11 @@ draws on.
 - **Build:** one command that runs the golden set and prints retrieval metrics, answer correctness,
   citation correctness and abstention rate; CI fails if any drops past a set tolerance.
 - **Acceptance:** a deliberately broken chunker makes CI fail; the judge (if you use one) agrees with
-  your own labels on at least 30 hand-checked answers.
+  your own labels on at least 90% of 30 or more hand-checked answers.
 - **Lessons:** `evals/retrieval-evaluation`, `evals/faithfulness-groundedness`,
   `rag-retrieval/citation-correctness`, `evals/llm-as-a-judge`, `evals/regression-tests`.
 
-### M5. Simple UI (after fastapi-for-ai)
+### M5. Simple UI (after evals)
 - **Build:** a FastAPI endpoint plus a single page: question box, streamed answer, numbered sources that
   open the cited passage.
 - **Acceptance:** first token under 2 seconds on your hardware; every citation link opens the exact
@@ -191,7 +192,8 @@ Run on Python 3.9, it prints `chunks=7 hit@2=4/4 answer_correct=2/4`. The two fa
 - **Express shipping.** The right document is found, but "costs 15 dollars" sits in the next chunk and
   "cost" does not match "costs", so only the first chunk is retrieved.
 - **CEO salary.** The common word "is" matches the security chunk, so the app cites it instead of abstaining.
-- **Takeaway.** Retrieval hit@k looked perfect while answers were wrong; you need both metrics.
+- **Takeaway.** Retrieval hit@k looked perfect while answers were wrong; you need both metrics. The
+  out-of-scope row has no gold document, so it counts as a hit by definition; score it on abstention.
 
 ### Evaluation table to fill per variant
 Keep one row per configuration in the repo and update it on every change. Targets are illustrative
@@ -258,7 +260,7 @@ starting points; set yours from the first honest baseline.
 - **Deliver:** an `ingest` command, a golden set file mapping each question to answering chunk ids (or
   none), and a script printing hit@5 and recall@5.
 - **Acceptance:** two ingestion runs produce identical chunk id sets; the eval script runs in under a
-  minute; you can explain the three worst misses by looking at their chunks.
+  minute; for the three worst misses you record whether the answer was split, ranked below 5 or absent.
 - **Acceptance (stretch):** change chunk size once and report both rows in the evaluation table.
 
 ## Role lens
@@ -344,7 +346,7 @@ evaluation.
 
 **A strong answer:**
 - adds an access-control field per chunk at ingestion and filters at retrieval time, before ranking,
-  never only in the UI or the prompt;
+  never only in the UI or the prompt, and keys any answer or retrieval cache by role so it cannot leak;
 - adds golden questions per role, including HR questions asked by an engineering user that must abstain,
   and treats any leak as a release-blocking failure, not a percentage;
 - handles daily change with delete-by-document-id on update, re-embedding only changed documents, and a

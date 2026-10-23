@@ -5,7 +5,7 @@ name: Tool adapters / service interfaces
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -156,7 +156,7 @@ sequenceDiagram
 ## Examples
 ### A `create_ticket` adapter
 Typed arguments on the outside, a vendor HTTP API on the inside, one error vocabulary, and a projected
-result. Nothing vendor-specific leaks to the model.
+result. Nothing vendor-specific leaks to the model. Checked with pydantic 2.14 and httpx 0.28.
 
 ```python
 from typing import Literal
@@ -401,7 +401,8 @@ with its error class so success rate per tool is visible from day one.
 
 **A strong answer:**
 - deduplicates locally by a run-and-step key before calling, because the vendor will not;
-- treats a timeout as unknown, not failed: looks the charge up by its key before any retry;
+- treats a timeout as unknown, not failed: sends the key as the charge's client reference or metadata
+  and looks the charge up by it before any retry;
 - returns `pending` as its own outcome with the charge id, so the model does not read it as success
   or failure;
 - moves settlement to a separate status tool or the runtime;
@@ -421,8 +422,6 @@ with its error class so success rate per tool is visible from day one.
 ### Mini project
 **Wrap a real API as an agent tool (2-3 hours).**
 - **Goal:** turn a public or internal HTTP API into one tool an agent can use reliably.
-- **Steps:** pick an API with a large response; write a Pydantic argument model with enums; implement
-  validate, translate, timeout, error normalization and projection; add contract tests with
-  `httpx.MockTransport` for a 201, a 429 and a 502; mount the tool in a small agent loop and run ten tasks.
-- **Done when:** every outcome reaches the model in the `ok/error/retryable` envelope, results stay under
-  a few hundred tokens, the contract tests pass, and you can report success rate per error class.
+- **Steps:** do the Exercise with a Pydantic argument model, then mount the tool in a small agent loop
+  and run ten tasks.
+- **Done when:** the Exercise acceptance checks pass and you can report success rate per error class.

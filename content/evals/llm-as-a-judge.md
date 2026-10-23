@@ -5,8 +5,13 @@ name: LLM-as-a-judge
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: mastery-verified
 agent_relevance: core
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - evals/golden-dataset
+  - evals/eval-harness
 related:
   - evals/judge-calibration-and-bias
   - evals/rubrics
@@ -49,15 +54,13 @@ and self-preference biases and grade confidently, right or wrong.
   similarity cannot see that one number in a financial summary is wrong.
 - **Humans do not scale.** A prompt iteration loop needing 300 outputs graded ten times a day is a
   full-time reviewer per engineer, and human grading drifts over a long session anyway.
-- **A strong model with a clear rubric fills the gap**: a grader that is cheap, fast, consistent and
-  *good enough*.
-  - *It can work:* in the MT-Bench study, a capable judge with pairwise prompts reached agreement with
-    human preferences comparable to human-human agreement.
-  - *It can fail:* the same line of work found judges prefer the first position, longer answers and
-    their own model family's style, and struggle to verify math and code by reading.
+- **A strong model with a clear rubric fills the gap**: cheap, fast, consistent and *good enough*.
+  - *It can work:* in the MT-Bench study, a capable pairwise judge agreed with human preferences about
+    as well as humans agree with each other.
+  - *It can fail:* judges prefer the first position, longer answers and their own family's style, and
+    struggle to verify math and code by reading.
 - **"Rate it 1 to 10" fails.** An undefined scale compresses toward 7 or 8, varies with phrasing, and
-  gives a number you cannot act on or audit. The pattern is "design a grader, calibrate it against
-  humans, and keep it calibrated".
+  cannot be acted on or audited. So: design a grader, calibrate it against humans, keep it calibrated.
 
 ## How it works
 ### Modes
@@ -76,8 +79,8 @@ and self-preference biases and grade confidently, right or wrong.
   cost tokens on every item.
 - **Truncate long tool outputs deliberately,** keeping the fields the reply cites, and record what was
   cut, so a "fail" is not caused by evidence the judge never saw.
-- **Assert first, judge second.** Final state, forbidden tools and step budgets come from code; the
-  judge sees only runs that passed those, so its budget goes to the questions code cannot answer.
+- **Assert first, judge second.** Code checks final state, forbidden tools and step budgets; the judge
+  sees only runs that passed.
 
 - **Probability-weighted detail.** G-Eval reads the probabilities the judge assigns to each score token
   and reports the expected value, after a chain-of-thought step that writes out the evaluation steps. A
@@ -128,18 +131,16 @@ true ≈ (observed + r_fail − 1) / (r_pass + r_fail − 1)
 - **The point:** an uncorrected judge score is an estimate of the judge, not of the system.
 
 ### When one judge is not enough
-- **Ensemble:** several judges from different model families, or the same judge with candidate order
-  swapped, combined by majority vote.
-- **Route disagreement to humans:** disagreement between judges flags items for a human.
-- **Re-calibrate** when the generator, the task or the judge model changes, and keep sampling live
-  outputs for human spot checks so drift is caught.
+- **Ensemble:** judges from different families, or one judge with order swapped, by majority vote;
+  disagreement routes the item to a human.
+- **Re-calibrate** when the generator, task or judge model changes, and keep human spot checks of live
+  outputs to catch drift.
 
 ### Cost and placement
-- **Judge cost can exceed generation cost:** a judge call costs tokens per item per criterion.
-- **Spend wisely:** deterministic checks for anything deterministic, a smaller model for simple criteria
-  once calibrated, and batch offline.
-- **Placement:** judges belong in the offline harness and in sampled online monitoring. A synchronous
-  guardrail adds a full model call to every request's latency and should be a deliberate decision.
+- **Judge cost can exceed generation cost:** tokens per item per criterion. Keep deterministic checks
+  deterministic, use a smaller model for simple criteria once calibrated, batch offline.
+- **Placement:** the offline harness and sampled online monitoring. A synchronous guardrail adds a full
+  model call to every request's latency and should be a deliberate decision.
 
 ## Diagram
 The path a criterion takes to become a trusted grader: deterministic checks first, then a judge that
@@ -211,8 +212,8 @@ def calibrate(items, human: dict[str, bool]) -> dict:
 | Missed failures | 15 | Where to look to improve the rubric |
 | Headline bias | +5 points | Observed 0.75 vs true 0.70 |
 
-- **Why the bias matters:** when comparing two systems, if version B's errors are the kind this judge
-  misses more often, B can look better than A while being worse.
+- **Why the bias matters:** if version B's errors are the kind this judge misses, B can look better
+  than A while being worse.
 
 ### Agent scenario: a judge for "the reply is grounded in tool results"
 A support agent's final reply must state only facts its tools returned. The judge sees the tool
@@ -292,9 +293,8 @@ print("corrected pass rate:", round(rogan_gladen(0.75, 135 / 140, 0.75), 3))
   the generator, task or judge model changes. Monitor failure recall per calibration run.
 - **Order-swapped pairwise by default.** Run every pairwise comparison in both orders and count flips
   as ties, as in the example. Monitor the tie rate; a rising rate means position is driving verdicts.
-- **Sampled online judging with a human queue.** Judge a fixed sample of live traffic asynchronously,
-  off the request path, and route judge disagreements and low-scoring items to human reviewers.
-  Monitor judge-human agreement on the reviewed sample week over week.
+- **Sampled online judging with a human queue.** Judge a fixed sample of live traffic off the request
+  path; route disagreements and low scores to reviewers. Monitor judge-human agreement weekly.
 - **Structured verdicts, errors kept separate.** Request JSON (a structured-output or JSON mode where
   the API offers one), validate the `verdict` field, and count unparseable replies as grader errors,
   not as fails. Monitor the parse-error rate.
@@ -302,14 +302,12 @@ print("corrected pass rate:", round(rogan_gladen(0.75, 135 / 140, 0.75), 3))
   generator, combined by majority vote. Monitor per-judge agreement by generator to catch
   self-preference.
 - **Critic step inside the agent, measured like any judge.** When an agent reviews its own draft
-  before sending (a reflection or critic step), calibrate that critic on labeled traces the same way,
-  and cap revisions at a small fixed number. Monitor how often the critic triggers a revision and
-  whether revised replies actually pass the offline judge more often.
+  before sending (a reflection or critic step), calibrate that critic on labeled traces and cap
+  revisions at a small fixed number. Monitor revision rate and whether revised replies pass more often.
 
 ## Trade-offs
-- **Speed vs bias.** A judge grades hundreds of outputs in minutes for a few dollars, but every verdict
-  carries the judge's biases, so the savings are real only after calibration against human labels on
-  this task.
+- **Speed vs bias.** A judge grades hundreds of outputs in minutes for a few dollars, but the savings
+  are real only after calibration against human labels on this task.
 - **Reference-guided accuracy vs labeling.** Far more accurate for correctness, but needs a golden
   answer per item, the expensive thing a judge was supposed to avoid; it moves labeling, not removes it.
 - **Pairwise sensitivity vs gating.** More sensitive than absolute scores for comparing two versions,
@@ -321,19 +319,26 @@ print("corrected pass rate:", round(rogan_gladen(0.75, 135 / 140, 0.75), 3))
 
 ## Pitfalls
 - **Shipping a judge never compared with human labels.** Symptom: a stable, high offline score
-  alongside user complaints about exactly the failures the judge passes.
+  alongside user complaints about exactly the failures the judge passes. Diagnose: hand-label the
+  judge's passes on a sample of complaint traces and count real failures. Fix: calibrate and gate on
+  failure recall.
 - **Pairwise in one order only.** Symptom: a preference rate near 60–70% for whichever candidate is
-  listed first, regardless of content.
+  listed first, regardless of content. Diagnose: rerun with order swapped and log the flip rate. Fix:
+  both orders, flips as ties.
 - **One judge for many criteria with a 1–10 score.** Symptom: scores clustered at 7–8 with no way to
-  say what changed when the average moves by 0.3.
-- **Judging the generator with the same model.** Symptom: a persistent preference for the house style
-  that disappears when a different judge family is used.
+  say what changed when the average moves by 0.3. Diagnose: histogram the scores. Fix: one binary
+  criterion per call.
+- **Judging the generator with the same model.** Symptom: a persistent preference for the house style.
+  Diagnose: split agreement with humans by generator, or re-judge with another family; the preference
+  disappears. Fix: a cross-family judge or panel.
 - **Verifying arithmetic or code by reading.** Symptom: confidently passed outputs that fail when
-  executed.
+  executed. Fix: execute them.
 - **Feeding the judge the whole agent trace.** Symptom: grading cost grows with every step the agent
-  takes and verdicts cite irrelevant turns. Fix: pass only the trace parts the criterion needs.
+  takes and verdicts cite irrelevant turns. Diagnose: log judge input tokens per item against step
+  count. Fix: pass only the trace parts the criterion needs.
 - **Never re-calibrating after a generator change.** Symptom: failure recall quietly drops as the new
-  generator's errors look different from the ones the rubric anticipated.
+  generator's errors look different from the ones the rubric anticipated. Diagnose: label a fresh
+  sample from the new generator and recompute recall. Fix: re-calibrate on every generator change.
 
 ## When to use
 - **Use when:** the criterion cannot be checked deterministically: factual agreement with a reference,
@@ -342,9 +347,18 @@ print("corrected pass rate:", round(rogan_gladen(0.75, 135 / 140, 0.75), 3))
   failure recall on human-labeled items is known.
 - **Measure:** agreement, kappa and per-class recall, reported next to the scores the judge produces,
   plus continual spot checks of live outputs.
-- **Day to day:** the judge is a versioned prompt in the harness with its own calibration report.
 - **Interviews:** name the biases, explain why binary rubric criteria beat numeric scales, and describe
   how you would prove a judge is trustworthy before gating a release on it.
+
+## Exercise
+**Goal:** build a judge that may gate releases for one open criterion of an agent you have, e.g. "asks
+a clarifying question when the request is ambiguous". No solution is given.
+- **Inputs:** 120+ stored traces you labeled pass or fail, at least 30 failures, split dev and held-out.
+- **Deliver:** `judge(trace)` returning `verdict` and `reason` for that one criterion, with anchors; a
+  held-out report with agreement, kappa, failure recall and the corrected pass rate; the judge version.
+- **Acceptance:** your report code gives 0.90, 0.75 and 0.75 on the worked example's counts; the
+  failure-recall threshold is stated with its reason; padding 10 passing replies with filler flips no
+  verdict, or you report how many flip; a malformed judge reply counts as a grader error, not a fail.
 
 ## Role lens
 - **Engineer:** Writes single-criterion judge prompts with structured verdicts, runs the calibration
@@ -408,11 +422,11 @@ feeds back into the rubric and triggers re-calibration when the generator change
   so it should be a deliberate decision rather than the default.
 
 ### Judge costs on your agent's eval runs now exceed the agent's own costs. How do you bring them down?
-- **Move deterministic criteria off the judge** and keep it only for what cannot be checked otherwise.
-- **Use a smaller judge model per criterion** once its agreement has been re-measured, knowing cheap
-  judges fail first on subtle factual errors.
-- **Batch offline and sample online:** grade a fixed sample of live traffic asynchronously rather than
-  every request, and weigh the extra output tokens of reasoning-first prompts.
+- **Move deterministic criteria off the judge** and keep it for what nothing else can check.
+- **Use a smaller judge model per criterion** once agreement is re-measured; cheap judges fail first
+  on subtle factual errors.
+- **Batch offline and sample online** instead of judging every request, and weigh the extra output
+  tokens of reasoning-first prompts.
 
 ## Quiz
 ### Q: Why should a judge used as a release gate be evaluated on recall of failures rather than overall agreement with humans?
@@ -442,16 +456,24 @@ feeds back into the rubric and triggers re-calibration when the generator change
 > compared to the expected rows deterministically, which is cheaper and more reliable than any judgment.
 > Tone, groundedness and completeness against the question are the kinds of criteria that need a judge.
 
+## Mastery test
+**Problem:** a team switches its support agent to the judge's own model family. The grounding judge,
+calibrated six months ago on the old generator at 0.80 failure recall, now reports a 0.86 pass rate
+for the new agent versus 0.78 for the old. The new replies are 40% longer. Would you accept the gain?
+
+**A strong answer:**
+- flags self-enhancement: the judge now grades its own family, so re-judge with another family;
+- flags verbosity: plot verdict against reply length and pad a few replies to probe it;
+- treats the calibration as stale: label a fresh sample of new-generator replies, recompute failure
+  recall, and only then apply the correction;
+- compares both versions paired by item on the corrected rate before claiming a gain.
+
 ## Use cases & projects
 ### Use cases
-- **Grading groundedness of a RAG agent's reply.** A judge checks whether each claim in the final answer
-  is supported by what the retrieval and tools returned.
-- **Scoring trajectories.** A judge reviews the plan and tool sequence for cases code cannot assert, such
-  as whether the agent should have asked a clarifying question.
-- **Online monitoring of sampled production traces.** A calibrated judge flags low-quality replies daily
-  so the team reviews the worst ones first.
-- **Critic step inside the agent.** A judge-style review of a draft before it is sent catches unsupported
-  claims, at the cost of an extra model call.
+- **Grading groundedness of a RAG agent's reply** against what retrieval and tools returned.
+- **Scoring trajectories** where code cannot assert, such as whether to ask a clarifying question.
+- **Online monitoring of sampled production traces,** so the team reviews the worst replies first.
+- **Critic step inside the agent** that catches unsupported claims in a draft, at one extra model call.
 
 ### Mini project
 **Build and calibrate a groundedness judge for a RAG agent (2-3 hours).**

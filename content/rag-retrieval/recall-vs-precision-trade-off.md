@@ -5,7 +5,7 @@ name: Recall vs precision trade-off
 kind: concept
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -40,8 +40,8 @@ recall, then a reranker and token budget for precision.
   or your own golden set script) that scores it.
 - **What you control.** Candidate depth k, the reranker, how many tokens one tool result may return, a
   relevance threshold, and an explicit "no evidence" result the agent can act on.
-- **What you can skip.** The formal IR theory of F-beta. Know recall@k, precision@k, nDCG and the
-  difference between hit rate and full recall; that is enough to tune and debug an agent's retrieval.
+- **What you can skip.** The formal IR theory of F-beta; recall@k, precision@k, nDCG and hit rate vs
+  full recall are enough to tune and debug an agent's retrieval.
 
 ## Why it exists
 - **You must cut a ranked list somewhere.** Cut early (top-3) and the list is clean but incomplete: an
@@ -276,8 +276,7 @@ transcript for the rest of the run.
 
 ## Production patterns
 - **Wide-then-narrow inside the tool.** When the corpus is large, the search tool fetches 50–200 hybrid
-  candidates and reranks with a cross-encoder down to the 5–10 that fit a per-call budget, so the agent
-  only sees the short list. Monitor recall@50 on the golden set and the reranker's p95 latency separately,
+  candidates and reranks with a cross-encoder down to the 5–10 that fit a per-call budget. Monitor recall@50 on the golden set and the reranker's p95 latency separately,
   since tool latency adds to every agent step.
 - **Pick k at the knee, on a schedule.** In the nightly or CI eval, sweep k over values such as 5, 10, 20,
   50, 100, plot recall@k, and set candidate depth just past the knee. Re-run whenever the embedding model,
@@ -445,15 +444,19 @@ in the candidate set.
 > for one query can be above every candidate for another, which silently returns nothing.
 
 ## Mastery test
-**Problem:** a contract-review agent finds the right clause in 90% of runs (hit rate@10 = 0.9), yet lawyers
-report that a third of answers miss a carve-out. Raising k to 30 made answers worse. Each question needs
-the main clause plus any exceptions. Diagnose and redesign the search tool.
+**Problem:** a contract-review agent's search tool shows hit rate@10 = 0.9, yet lawyers say a third of
+answers miss a carve-out. Carve-outs sit in a separate exceptions schedule that cites clauses by number
+("Clause 7.2 does not apply where...").
+
+The tool already reranks the top-50. Say what you measure first, then redesign it.
 
 **A strong answer:**
-- names hit rate as the wrong metric for all-of questions and measures full recall@10 and recall@30;
-- explains why k = 30 hurt: precision fell, distractors and stale versions entered every later step;
-- proposes wide candidates, a cross-encoder rerank to a token budget, and possibly fetching linked
-  exceptions, gated on per-stage metrics.
+- calls hit rate wrong for all-of questions; measures full recall@10 and recall@50 split by main-clause
+  and exception chunks;
+- sees that if exception recall@50 is low the reranker cannot help: it only reorders, and "Clause 7.2"
+  shares no words with the question;
+- fixes stage 1 by structure (fetch exceptions citing a retrieved clause, or prefix each with that
+  clause), within the token budget, gated on exception recall.
 
 ## Use cases & projects
 ### Use cases

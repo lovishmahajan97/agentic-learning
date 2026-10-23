@@ -5,7 +5,7 @@ name: Retrieval evaluation (recall@k, MRR, NDCG)
 kind: metric
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -33,8 +33,8 @@ context budget and honest judgments matter more than formulas.
 
 ## For agent builders
 - **Why it matters for agents.** When a RAG agent answers wrongly, the first question is whether the
-  evidence ever reached it. Retrieval metrics answer that in seconds without an LLM call, so they run
-  on every change to chunking, embeddings or the search tool.
+  evidence ever reached it. Retrieval metrics answer that without an LLM call, so they run on every
+  change to chunking, embeddings or the search tool.
 - **Where it shows up in your stack.** The search or memory-lookup tool your agent calls (a vector store
   such as pgvector or Qdrant, hybrid search, a reranker), retriever evaluators in eval tools such as
   LangSmith, Ragas or Braintrust, and a qrels file versioned next to the index config.
@@ -46,8 +46,8 @@ context budget and honest judgments matter more than formulas.
 
 ## Why it exists
 - **A wrong RAG answer has two suspects.** The retriever did not surface the evidence, or the generator
-  mishandled evidence that was there. An end-to-end answer score cannot tell them apart, so it cannot tell
-  you what to fix. Retrieval evaluation isolates the first suspect.
+  mishandled evidence that was there. An end-to-end answer score cannot tell them apart, so it cannot say
+  what to fix; retrieval evaluation isolates the first.
 - **It is cheap.** No LLM call is needed, so a change to chunking, embedding model, hybrid weights or
   filters can be scored on hundreds of queries in seconds and run on every commit.
 - **The naive alternatives fail.** Eyeballing a few queries does not scale and misses regressions.
@@ -347,8 +347,9 @@ documents you choose, and use it to decide one change. No solution is given.
   judging; one change only (k, chunking, hybrid or a reranker).
 - **Deliver:** recall@k at the first-stage and final k, MRR and NDCG@k per query set and per category,
   run-level recall on 10 traces, and a paired-bootstrap interval for the change.
-- **Acceptance:** your NDCG matches `sklearn.metrics.ndcg_score` on three queries; the unjudged share of
-  the new system's top-k is under 10%; the ship call cites the interval.
+- **Acceptance:** your linear-gain NDCG matches `sklearn.metrics.ndcg_score` on three queries (put every
+  judged item in y_true, unretrieved ones scored lowest, or its IDCG shrinks); the unjudged share of the
+  new system's top-k is under 10%; the ship call cites the interval.
 
 ## Role lens
 - **Engineer:** Keeps the qrels file and the metrics script in CI so an embedding-model swap that drops
@@ -404,8 +405,7 @@ queries with a paired bootstrap.
   which includes no change.
 - **Look per category:** if the gain is concentrated where users struggle, it may still be worth a larger
   test.
-- **Add queries** to narrow the interval, because means on a few dozen queries move by several points on
-  resampling.
+- **Add queries** to narrow the interval before deciding.
 
 ## Quiz
 ### Q: Each query has one relevant chunk; the retriever ranks it first for half the queries and fourth for the rest, with k = 5. What are recall@5 and MRR?
@@ -440,7 +440,8 @@ fell 6 points.
 The qrels were written from developer questions. What are the likely causes and what settles it?
 
 **A strong answer:**
-- suspects a query mismatch: the agent searches with identifiers and error strings, not developer
+- confirms the 6-point drop with a paired test on the same tasks, then suspects a query mismatch: the
+  agent searches with identifiers and error strings, not developer
   questions, so it scores the logged tool arguments as a second set;
 - checks run-level recall and searches per run, since worse first calls can trigger extra searches;
 - pools the old and new top-8 and re-judges, and checks the 8 snippets for near-duplicates crowding out
@@ -449,7 +450,7 @@ The qrels were written from developer questions. What are the likely causes and 
 ## Use cases & projects
 ### Use cases
 - **Changing chunking or embeddings.** recall@k on a versioned qrels file shows in seconds whether a new
-  index config still brings the evidence in, before any LLM call.
+  index config still brings the evidence in.
 - **Debugging a wrong RAG answer.** Checking whether the relevant chunk was in the search tool's results
   splits retrieval failures from generation failures.
 - **Tuning the agent's search tool.** k per call, a reranker and hybrid search are compared with paired

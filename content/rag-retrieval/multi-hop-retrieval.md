@@ -5,7 +5,7 @@ name: Multi-hop retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -142,7 +142,7 @@ P(chain succeeds) = r1 × r2 × ...      # r2 is hop-two success *given* a corre
 |---|---|
 | Plan the next query | the model's tool call; its `query` argument is the bridge query |
 | Planner "done" signal | the model replies without a tool call |
-| Hop cap | a max-steps or max-tool-calls limit in your loop (LangGraph's `recursion_limit` plays this role) |
+| Hop cap | a max-steps or max-tool-calls limit in your loop (LangGraph's `recursion_limit` plays this role, but counts graph steps: about two per hop) |
 | No-progress detection | the tool executor: repeated query or zero new passage ids |
 | Accumulate evidence | tool results appended to the transcript |
 | Answer with citations | the final model turn, checked by a citation validator |

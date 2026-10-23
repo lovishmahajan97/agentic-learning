@@ -5,7 +5,7 @@ name: Inter-annotator agreement
 kind: metric
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -351,9 +351,9 @@ reliable enough to gate a release. No solution is given.
 - **Constraints:** both labelers see the same rendered trajectory; no conferring until labels are in.
 - **Deliver:** per-criterion p_o, κ with a bootstrap interval and the confusion table; Krippendorff's α
   over all three labelers; a guideline rewrite for the weakest criterion and its re-measured κ.
-- **Acceptance:** your κ matches `sklearn.metrics.cohen_kappa_score` to three decimals and your α
-  matches the `krippendorff` package; each criterion is marked gate or informational with the interval
-  that justifies it.
+- **Acceptance:** your κ matches `sklearn.metrics.cohen_kappa_score` within 0.001 and your α matches
+  the `krippendorff` package (nominal, rows = labelers; checked on 0.8.1); each criterion is marked
+  gate or informational with the interval that justifies it.
 
 ## Role lens
 - **Engineer:** Adds the kappa or alpha computation to the labeling export, routes disagreements to

@@ -49,10 +49,9 @@ class, run every release beside over-refusal, because average-case evals miss th
 
 ## Why it exists
 - **Golden sets measure the centre; incidents live in the tail.** The tail is not sampled: someone goes
-  looking for it. An assistant can score 97% on its golden set and still obey an instruction hidden in a
-  vendor's PDF to email the contract outside, or produce a refund code in the right role-play.
-- **These are not rare inputs.** They are inputs nobody in the eval sampled, because no normal user
-  sends them.
+  looking for it, because no normal user sends it. An assistant can score 97% on its golden set and still
+  obey an instruction hidden in a vendor's PDF to email the contract outside, or produce a refund code in
+  the right role-play.
 - **"We red-teamed before launch" does not hold.** Every prompt edit and model update re-opens closed
   holes, and new techniques appear monthly. Findings in a slide deck are forgotten; findings in a test
   suite are checked every release.
@@ -130,10 +129,8 @@ Decide who attacks, what they want and through which channel, because the suite 
   enough trials for that bound to be one the business accepts.
 
 ### Make it repeatable, and keep part of it hidden
-- **Version the attack set** like a golden set; known attacks are regression tests.
-- **Gate critical cells** (data exfiltration through tool calls, for instance) at zero successes on
-  known attacks.
-- **Run adaptive generation** nightly or weekly as discovery, and promote its successes into the fixed set.
+- **Version the attack set** like a golden set; known attacks are regression tests, gated at zero on
+  critical cells (data exfiltration through tool calls, for instance).
 - **Hold out and rotate templates,** because defences tuned against a fixed set overfit it.
 - **Re-seed with humans:** periodically run a human red team against the current best.
 
@@ -311,7 +308,6 @@ Illustrative numbers. A support agent's report averages ASR over technique cells
 - **Lighter option:** for a pure summariser over trusted documents a small perturbation suite may be enough.
 - **Order of work:** threat model, then cells, then gates: zero on known attacks for critical goals,
   thresholds elsewhere, an over-refusal ceiling alongside.
-- **Cadence:** fixed suite on every prompt or model change, adaptive discovery on a schedule.
 - **Measure:** ASR per cell and worst case per goal, robustness gap, over-refusal, and the judge's own
   precision on attack outcomes.
 
@@ -421,8 +417,6 @@ number that says whether it can launch. What do you build and what do you report
   email or issuing refunds, is a ship condition, measured beside over-refusal.
 - **Measuring a guardrail layer.** Running the same suite with and without a guardrail shows what it
   actually blocks and what benign requests it now refuses.
-- **Re-testing after every prompt or model change.** A versioned attack suite re-runs every known
-  attack, because a prompt edit or model update can reopen a hole a one-off pre-launch red team saw closed.
 
 ### Mini project
 **Build a canary-graded injection suite for an email agent (2-3 hours).**

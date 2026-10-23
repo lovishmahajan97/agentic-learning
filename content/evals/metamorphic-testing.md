@@ -439,7 +439,8 @@ different numbers". Design a metamorphic suite that finds the cause, and say how
 
 **A strong answer:**
 - compares executed result sets (or normalised SQL), not query text, because equivalent SQL differs in
-  wording;
+  wording; results are compared as multisets on a pinned warehouse snapshot, so row order and new data
+  are not counted as violations;
 - runs identity first to separate sampling noise from real sensitivity;
 - uses relations that fit SQL: paraphrase, reordered schema or table list, an added unused table,
   a changed date format, plus a directional one (adding a filter must not grow the row count);
@@ -451,8 +452,6 @@ different numbers". Design a metamorphic suite that finds the cause, and say how
   arguments, which catches brittle tool descriptions before users do.
 - **Testing robustness to distractors.** Adding an irrelevant tool to the list or an off-topic chunk to
   the context should not change the agent's action.
-- **Reusing unlabelled production logs.** Sampled real requests, transformed and compared, become
-  stability tests with no labelling cost.
 - **Validating a pairwise judge.** Swapping the order of the two candidates must not flip the verdict,
   or the judge's agent rankings are partly position bias.
 

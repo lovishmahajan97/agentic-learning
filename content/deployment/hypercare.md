@@ -5,7 +5,7 @@ name: Hypercare
 kind: practice
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -368,8 +368,10 @@ Meanwhile the customer asks to slip in a model upgrade "while you are all here".
 and do?
 
 **A strong answer:**
-- reads the falling issue rate as partly users trusting approvers to catch errors, so quality may be
-  worse, not better;
+- reads the falling issue rate as errors now caught silently by approvers instead of reported, so
+  quality may be worse, not better;
+- checks whether the rise lines up with a week-1 fix release, a shift in request mix, or stricter
+  approvers (rejection reasons per approver);
 - samples rejected proposals, classifies the cause (tool description, retrieval of supplier data, a
   recent fix) and adds them as regression cases;
 - refuses the model upgrade until exit, because two changes would hide which one moved rejections;

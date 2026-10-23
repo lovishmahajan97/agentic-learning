@@ -5,7 +5,7 @@ name: Statistics for evaluation
 kind: practice
 difficulty: core
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -219,8 +219,9 @@ which scored +4 points.
 - **Constraints:** numpy or plain Python; resample tasks, not samples.
 - **Deliver:** a function returning mean, 95% CI, paired B − A CI, fixed and broke counts, and the
   sample size needed to detect a gain you choose; a CI step that exits non-zero on regression.
-- **Acceptance:** an A-versus-A run gives a CI containing zero; a planted +10-point change on 300 tasks
-  is detected; and your sample-size estimate is within about 20% of a simulation you run yourself.
+- **Acceptance:** across 200 simulated A-versus-A' runs (same per-task pass rates, fresh sampling
+  noise) the paired CI contains zero at least about 93% of the time; a planted +10-point change on 300
+  tasks is detected; and your sample-size estimate is within about 20% of a power simulation you run.
 
 ## Role lens
 - **Engineer:** Builds the harness so every score carries n and a confidence interval, compares versions
@@ -302,6 +303,8 @@ conversations, but the conversations differ (logged from separate weeks of traff
 
 **A strong answer:**
 - notes the design is unpaired and confounded by week, so traffic mix could explain 0.2;
+- sizes the noise: if per-conversation scores have a standard deviation near 1 point, the SE of the
+  difference is sqrt(1/120 + 1/120) ≈ 0.13, so the 95% interval is about ±0.25 and a 0.2 gap is not established;
 - asks for per-conversation scores and a bootstrap CI for the difference in means;
 - measures judge noise by re-judging a subset and checks agreement with human labels;
 - proposes replaying the same conversations through both agents, sized with the formula.

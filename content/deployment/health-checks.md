@@ -5,7 +5,7 @@ name: Health checks
 kind: practice
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -114,8 +114,8 @@ reaction_time ≈ periodSeconds × failureThreshold   (+ up to timeoutSeconds pe
 | **Liveness** | How long a hung process keeps its share of traffic before restart | Short detects hangs fast but also restarts pods merely slow under a load spike (a long GC pause, a CPU-starved event loop) |
 | **Readiness** | How long an overloaded or draining instance keeps getting new requests | The matching `successThreshold` decides how quickly it is trusted again |
 
-- **Choose from measured load times and latency, not copied defaults.** That is most of the difference
-  between probes that help and probes that cause outages.
+- **Choose from measured load times and latency, not copied defaults.** That mostly separates probes
+  that help from probes that cause outages.
 
 ### Making checks cheap and honest
 - **Fast, and never calling the LLM**, because probes run often.
@@ -230,6 +230,8 @@ spec:
         preStop:
           exec:
             command: ["sleep", "10"]      # let endpoint removal propagate before SIGTERM
+            # exec needs a sleep binary in the image (distroless has none); Kubernetes 1.30+
+            # also offers the built-in handler  preStop: { sleep: { seconds: 10 } }
 ```
 
 ### A golden agent task as a synthetic check
@@ -421,6 +423,8 @@ Which conditions go behind that URL, and how do you deploy without cutting runs?
 **A strong answer:**
 - puts only local conditions behind it (model or client initialised, in-flight budget, draining flag),
   never the proxy or the LLM, so one proxy blip does not eject every VM;
+- first asks whether a failed check only ejects or also replaces the VM (some autoscaling groups do);
+  if it replaces, the in-flight budget stays out;
 - notes ejection takes about 15 seconds, so draining fails the check first, waits that long, then
   finishes runs;
 - checkpoints runs per tool step because 8 minutes exceeds any sane drain;
@@ -430,8 +434,6 @@ Which conditions go behind that URL, and how do you deploy without cutting runs?
 ### Use cases
 - **Self-hosted model behind an agent.** A startup probe sized to cold weight loads stops restart loops
   when nodes scale up.
-- **Agents depending on a hosted LLM provider.** Local-only liveness and readiness keep the fleet serving a
-  fallback during a provider blip instead of restarting.
 - **Long-running tool-calling agents.** Draining plus checkpointing keeps deploys from killing
   multi-minute runs.
 - **RAG agents over customer content.** A golden-task synthetic check catches stale indexes, expired

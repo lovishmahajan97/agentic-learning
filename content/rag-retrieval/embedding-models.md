@@ -5,8 +5,13 @@ name: Embedding models
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - model-internals/embeddings
+  - rag-retrieval/similarity-search
 related:
   - model-internals/embeddings
   - rag-retrieval/embedding-dimension-and-normalization
@@ -30,29 +35,27 @@ match on both sides, or retrieval breaks silently.
 
 ## For agent builders
 - **Why it matters for agents.** Every semantic lookup an agent makes (knowledge search, recalling past
-  conversations, picking the few relevant tools out of hundreds) is a nearest-neighbour query over
-  embeddings. A wrong model or missing prefix degrades all of them without a single error.
+  conversations, picking tools out of hundreds) is a nearest-neighbour query over embeddings, so a wrong
+  model or missing prefix degrades all of them without an error.
 - **Where it shows up in your stack.** The `embeddings` object you pass to a LangChain or LlamaIndex
   vector store, hosted embedding APIs (OpenAI, Cohere, Voyage, Google), open models via
   sentence-transformers, and the memory store behind a LangGraph agent.
 - **What you control.** Which model, its query and passage prefixes, its pinned version, the reranker
   after it, and the eval set that proves the choice on your agent's real queries.
-- **What you can skip.** Training your own embedder. Know how contrastive training works well enough to
-  read a model card; spend the effort on a bake-off and a reranker instead.
+- **What you can skip.** Training your own embedder. Know contrastive training well enough to read a
+  model card; spend the effort on a bake-off and a reranker.
 
 ## Why it exists
 - **Keyword search misses different wording.** BM25 matches tokens, so it fails on "cancel my plan"
-  against "terminate the subscription", or a German question against English documentation. Vocabulary
-  mismatch is the most common reason a keyword system returns nothing useful.
+  against "terminate the subscription", or a German question against English documentation.
 - **Averaged word vectors lose order.** word2vec or GloVe averages capture some synonymy, but "the dog
   bit the man" equals "the man bit the dog", and frequent, meaningless words dominate.
-- **Raw BERT is bad at similarity.** It was trained to predict masked tokens, not to make sentence vectors
-  comparable, so its [CLS] or mean outputs sit in a narrow cone where everything is cosine-similar to
-  everything. Sentence-BERT fixed this with contrastive fine-tuning on sentence pairs; every modern
-  embedding model descends from that recipe.
-- **Cross-encoders are too slow for the first stage.** Reading query and passage together is the most
-  accurate matcher, but a million passages means a million forward passes per query. The bi-encoder
-  gives up a little accuracy to precompute the document side once and reuse it for every query.
+- **Raw BERT is bad at similarity.** Trained to predict masked tokens, its [CLS] or mean outputs sit in
+  a narrow cone where everything is cosine-similar to everything. Sentence-BERT fixed this with
+  contrastive fine-tuning on sentence pairs; every modern embedding model descends from that recipe.
+- **Cross-encoders are too slow for the first stage.** Reading query and passage together is most
+  accurate, but a million passages means a million forward passes per query. The bi-encoder trades a
+  little accuracy to precompute the document side once.
 
 ## How it works
 ### Architecture: the bi-encoder
@@ -63,13 +66,12 @@ match on both sides, or retrieval breaks silently.
    decoder-based models.
 4. **Optionally** apply a linear projection and L2 normalization.
 
-- **Pooling is part of the trained model, not a free option.** Training taught the network to put its
-  summary where the pooling reads it, so mean-pooling a [CLS]-trained model (or the reverse) returns
-  vectors, just worse ones. Loading through the model's own configuration, as sentence-transformers
-  does, keeps this right.
-- **Query and document pass through the same network independently.** That is the whole point: a
-  document's vector never depends on the query, so it is computed once, stored and compared with a dot
-  product. An agent's search call therefore costs one query embedding plus a lookup.
+- **Pooling is part of the trained model, not a free option.** Training put the summary where the
+  pooling reads it, so mean-pooling a [CLS]-trained model (or the reverse) returns worse vectors.
+  Loading through the model's own configuration, as sentence-transformers does, keeps this right.
+- **Query and document pass through the same network independently,** so a document's vector is
+  computed once, stored and compared with a dot product. An agent's search call costs one query
+  embedding plus a lookup.
 
 ### Background: contrastive training
 Training data is (query, positive passage) pairs. The loss (InfoNCE and relatives) pulls the positive
@@ -93,16 +95,15 @@ L = −log( exp(s(q, p⁺)/τ) / Σ_j exp(s(q, p_j)/τ) )      s = cosine simila
 | 1.0 | 1.134 | 0.322 | 0.306 | 0.195 | near-uniform softmax, spread over all negatives, easy ones included |
 | 0.05 | 0.313 | 0.731 | 0.269 | about 0 | easy negatives vanish; almost entirely on the hard negative at 0.75 |
 
-- **In-batch negatives are free.** With a batch of B pairs, every query gets B − 1 negatives. More
-  negatives make the task harder and the space finer, which is why models train with very large batches.
+- **In-batch negatives are free.** With a batch of B pairs, every query gets B − 1 negatives; more
+  negatives make the space finer, which is why models train with very large batches.
 - **Hard negatives matter more.** Passages sharing topic and vocabulary with the query but not answering
   it, mined from BM25 or an earlier model version, teach "about the same thing" versus "answers the
   question". DPR made this explicit.
 - **Modern recipes (E5, BGE):** pretrain on hundreds of millions of weakly supervised pairs (titles and
-  bodies, questions and accepted answers, near-duplicates), then fine-tune on curated retrieval datasets
-  with hard negatives.
-- **Why an agent builder cares:** it explains why embeddings find "about the same topic" easily but may
-  rank a near-miss above the answer, which is the job a reranker does.
+  bodies, questions and answers, near-duplicates), then fine-tune on curated sets with hard negatives.
+- **Why an agent builder cares:** embeddings find "about the same topic" easily but may rank a near-miss
+  above the answer, which a reranker fixes.
 
 ### Asymmetric models and prefixes
 - **Queries are short and question-shaped; passages are long and declarative.** Many models train with a
@@ -111,18 +112,16 @@ L = −log( exp(s(q, p⁺)/τ) / Σ_j exp(s(q, p_j)/τ) )      s = cosine simila
   instruction prepended to the query.
 - **Omit the prefix and nothing errors.** The model still returns vectors, just worse ones: a quiet
   recall drop.
-- **Agent-written queries are a third shape.** An agent often searches with terse, keyword-like strings
-  it composed itself, not the user's sentence. Evaluate on queries pulled from agent traces, not only on
-  user questions.
+- **Agent-written queries are a third shape:** terse, keyword-like strings the agent composed, not the
+  user's sentence. Evaluate on queries from agent traces too.
 
 ### Capacity limits
 - **Maximum input length:** typically 512 tokens for BERT-derived models and around 8,000 for many newer
   long-context ones.
 - **Longer inputs are truncated silently** by most local libraries (some hosted APIs reject them with an
   error instead), one reason chunking exists.
-- **Bigger models** generally give better vectors but embed more slowly and emit more dimensions, which
-  cost storage and comparison time for every chunk forever (see the dimension lesson). Query-side
-  embedding latency also lands on every agent search step.
+- **Bigger models** give better vectors but embed more slowly and emit more dimensions, costing storage
+  and comparison time for every chunk (see the dimension lesson) and latency on every agent search step.
 
 ### Where it sits against the alternatives
 | Approach | How it scores | Role |
@@ -136,11 +135,11 @@ L = −log( exp(s(q, p⁺)/τ) / Σ_j exp(s(q, p_j)/τ) )      s = cosine simila
 - **Start from MTEB**, which ranks models across retrieval, clustering and classification, with two
   caveats: the rank averages tasks that may not resemble yours, and popular models are increasingly
   trained on data close to the benchmark.
-- **What decides in practice:** domain (legal, medical, code and non-English text all reshuffle the
-  ranking), input length, multilingual needs, embedding latency and cost, and whether chunk text may
-  leave your environment (hosted API versus self-hosted open weights).
-- **Measure before committing:** recall@k on a few hundred labelled query–passage pairs from your own
-  corpus, because changing the model later means re-embedding everything, including agent memories.
+- **What decides in practice:** domain (legal, medical, code and non-English text reshuffle the
+  ranking), input length, multilingual needs, latency and cost, and whether chunk text may leave your
+  environment.
+- **Measure before committing:** recall@k on a few hundred labelled pairs from your corpus, because
+  changing the model later means re-embedding everything, including agent memories.
 
 ## Diagram
 The document side runs once at index time; the agent's query side runs per search call through the
@@ -189,8 +188,8 @@ for q, row in zip(queries, scores):
 ```
 
 ### Agent scenario: embedding tool descriptions to pick tools
-An agent platform has many tools; sending every schema on every step wastes context and confuses the
-model. Embed each tool's description once, then expose only the closest few for the current request.
+Sending every tool schema on every step wastes context and confuses the model. Embed each tool's
+description once, then expose only the closest few for the current request.
 
 ```python
 from sentence_transformers import SentenceTransformer
@@ -220,8 +219,8 @@ print(select_tools("I want my money back for order 1182"))
 | 200 tools at ~150 tokens each, all sent | ~30,000 |
 | Top 8 selected by embedding | ~1,200 |
 
-- **The catch:** a missed tool is a capability the agent does not have this step. Measure tool-selection
-  recall on logged requests, and always include a small fixed core set.
+- **The catch:** a missed tool is a capability the agent lacks this step. Measure selection recall on
+  logged requests and always include a small fixed core set.
 
 ## Production patterns
 - **One `embed()` with everything pinned** — wrap the model behind a single function that applies the
@@ -245,33 +244,40 @@ print(select_tools("I want my money back for order 1182"))
 - **Precomputed lookup vs token interaction.** A bi-encoder makes retrieval a nearest-neighbour lookup
   but loses the query–document interaction a cross-encoder has; once you can afford to rerank the top
   50, most of that gap closes.
-- **Larger models vs speed and size.** Better vectors, but slower embedding and bigger vectors; it flips
-  to a cost when the corpus is small, the workload is latency-bound (an agent searching many times per
-  task), or a reranker already corrects first-stage mistakes.
-- **Hosted vs self-hosted.** Hosted API models (OpenAI, Cohere, Voyage, Google) remove serving work and
-  are often strong, but every chunk's text leaves your network and a vendor deprecation forces a full
-  re-embed; self-hosted open models (BGE, E5, GTE, Nomic) reverse both sides.
+- **Larger models vs speed and size.** Better vectors, but slower and bigger; it flips to a cost when
+  the corpus is small, the workload is latency-bound (an agent searching many times per task), or a
+  reranker already corrects first-stage mistakes.
+- **Hosted vs self-hosted.** Hosted API models (OpenAI, Cohere, Voyage, Google) remove serving work, but
+  every chunk's text leaves your network and a vendor deprecation forces a full re-embed; self-hosted
+  open models (BGE, E5, GTE, Nomic) reverse both sides.
 - **Multilingual vs English-specialised.** Multilingual models handle cross-language queries but tend to
-  be a little weaker on English-only tasks than an English model of the same size; the corpus decides.
-- **Long-context embeddings vs precision.** They reduce the need for chunking, but each vector becomes a
-  blurrier average of more content, lowering precision for specific questions.
+  be a little weaker on English-only tasks than a same-size English model.
+- **Long-context embeddings vs precision.** Less chunking, but each vector is a blurrier average of more
+  content, lowering precision for specific questions.
 
 ## Pitfalls
-- **Different models (or versions) for index and queries.** Every similarity is mediocre and the top
-  results look random. Vectors from two models are not comparable even when their dimensions match.
-- **Dropping the `query:`/`passage:` prefix or the instruction.** A measurable recall drop on an
-  asymmetric model, with no error anywhere in the logs.
+- **Different models (or versions) for index and queries.** Symptom: every similarity is mediocre and
+  the top results look random. Cause: vectors from two models are not comparable even when their
+  dimensions match. Diagnose: compare the model id stored with the vectors against the query path's id.
+  Fix: one pinned `embed()`, re-index.
+- **Dropping the `query:`/`passage:` prefix or the instruction.** Symptom: a measurable recall drop on an
+  asymmetric model, no error in the logs. Diagnose: log the exact encoder input on both paths. Fix:
+  apply prefixes inside `embed()`.
 - **Wrong pooling or normalization on an open model.** For example a raw `AutoModel` with mean pooling on
   a [CLS]-pooled model: recall noticeably below the model card's reported quality, no error raised.
-- **Silent truncation of long chunks.** Questions about the tail of long documents never retrieve, while
-  the same content pasted as a short chunk works.
+  Diagnose: compare your vectors with the sentence-transformers output for the same text (cosine near 1).
+  Fix: load through the model's own config.
+- **Silent truncation of long chunks.** Symptom: questions about the tail of long documents never
+  retrieve, while the same content as a short chunk works. Diagnose: count tokens per chunk against
+  `max_seq_length`. Fix: re-chunk.
 - **Choosing by leaderboard rank alone.** The model a point higher on MTEB underperforms the old one on
-  your own labelled queries.
-- **Treating cosine as absolute confidence.** A threshold copied from a blog post lets nothing or
-  everything through after a model swap, so an agent's "no relevant results" branch fires always or
-  never. Scores are model-specific.
-- **Upgrading the model in place without a re-embed plan.** Old and new vectors mix in one index, and
-  quality degrades as new content arrives.
+  your own labelled queries. Fix: decide on your bake-off.
+- **Treating cosine as absolute confidence.** Scores are model-specific, so a copied threshold lets
+  nothing or everything through after a model swap and the agent's "no relevant results" branch fires
+  always or never. Diagnose: plot score distributions of labelled relevant and irrelevant pairs. Fix:
+  recalibrate per model.
+- **Upgrading the model in place without a re-embed plan.** Old and new vectors mix in one index and
+  quality degrades as content arrives. Fix: blue/green re-index.
 
 ## When to use
 - **Use when:** users describe what they want in their own words and the corpus says it differently:
@@ -281,10 +287,19 @@ print(select_tools("I want my money back for order 1182"))
   names; pair the two, or give the agent a separate exact-match tool.
 - **Measure:** recall@k and MRR on labelled pairs from your data, embedding time per thousand chunks, and
   vector bytes per chunk.
-- **Day to day:** pick a model, pin its version, apply its prefixes, and re-evaluate whenever the corpus
-  or model changes.
 - **Interviews:** bi-encoder versus cross-encoder, contrastive training with hard negatives, and why two
   models can never share one index.
+
+## Exercise
+**Goal:** decide, with evidence, which of two open embedding models your agent's search tool should use.
+- **Inputs:** 200-500 chunks from a corpus you know and 30 agent-style queries, each labelled with the
+  chunk ids that answer it. Candidates: for example `intfloat/e5-base-v2` and `BAAI/bge-small-en-v1.5`,
+  each with its documented prefixes.
+- **Deliver:** an `embed(texts, side)` per model, a script printing recall@5 and MRR per model with and
+  without prefixes, and the five queries where the models disagree most, with your reading of why.
+- **Acceptance:** a rerun reproduces the numbers; every vector is unit length; your pick names the
+  metric it won on.
+
 
 ## Role lens
 - **Engineer:** Wraps the model behind one `embed(texts)` function with the prefix, normalization and
@@ -378,6 +393,18 @@ error codes, which embeddings handle badly in any language.
 > In-batch negatives are mostly random, unrelated passages and are easy to push away. Hard negatives
 > share vocabulary and topic with the query, so the model must learn finer distinctions, which is what
 > separates a retriever from a topic classifier.
+
+## Mastery test
+**Problem:** a legal-research agent uses a general English embedder. Recall@5 is 0.82 on the vendor's
+demo set but 0.51 on 40 queries from your agent's traces, which are terse citation-style strings like
+"indemnity cap carve-out gross negligence". What do you check, what do you change, and how do you prove it?
+
+**A strong answer:**
+- first rules out pipeline faults: model id parity, prefixes, pooling, truncation;
+- names a query-shape and domain gap (keyword-like agent queries, legal vocabulary);
+- tests a domain or larger model, query instructions, hybrid BM25 for exact terms and a reranker, each as
+  a measured change on the trace set;
+- budgets the re-embed as a blue/green re-index and keeps the trace queries as a standing eval.
 
 ## Use cases & projects
 ### Use cases

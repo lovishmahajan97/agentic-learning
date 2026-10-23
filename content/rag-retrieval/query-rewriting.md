@@ -5,7 +5,7 @@ name: Query rewriting
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -37,7 +37,7 @@ that rewrite and guard it.
   conversation into a query string. Bad queries (dropped references, "fixed" error codes, invented
   entities) are a common reason an agent's retrieval step fails, and they are visible in every trace.
 - **Where it shows up in your stack.** The tool's `description` and parameter descriptions (your rewriter
-  prompt), LangChain's `create_history_aware_retriever` and `MultiQueryRetriever` in pipeline-style RAG,
+  prompt), LangChain's `create_history_aware_retriever` and `MultiQueryRetriever` (in `langchain-classic` since 1.0),
   LlamaIndex query transforms, and the traces (LangSmith or similar) where you read the queries agents wrote.
 - **What you control.** What the tool description asks the query to look like, which filters the agent may
   set, server-side guards on literals and filters, and whether the original user text is also searched.
@@ -429,7 +429,8 @@ and say "same as last week". Recall on follow-ups is fine, but tickets with IDs 
 missed and one user's rewrite set a `team` filter to another team. Redesign the rewrite path.
 
 **A strong answer:**
-- extracts IDs and error codes as literals for the sparse leg, guarded so they survive verbatim;
+- extracts IDs and error codes as literals for the sparse leg, guarded so they survive verbatim (a
+  `[A-Z]+_\d+` guard misses `INC-20931`, so widen it);
 - resolves "last week" from session context into a date filter, not from the model's guess;
 - takes team or tenant scope from the session, allow-lists filters, and validates arguments in code;
 - measures recall@k on identifier and follow-up slices separately before and after.

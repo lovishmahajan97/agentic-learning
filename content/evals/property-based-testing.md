@@ -462,7 +462,8 @@ occasional double-applied refunds after retries. Which properties and strategies
 
 **A strong answer:**
 - states a round trip: any valid arguments object, split into arbitrary fragments, reassembles to the
-  same object, with a strategy that splits inside escapes and multibyte characters;
+  same object, with a strategy that splits inside escapes and multibyte characters and puts braces and
+  quotes inside string values (a brace-counting "complete?" check ends early on them: the truncation);
 - asserts incomplete input never returns arguments, only "need more" or a typed error;
 - models retries as a `RuleBasedStateMachine` (fragment, retry, complete) with an invariant that each
   call ID is applied at most once;
@@ -476,8 +477,6 @@ occasional double-applied refunds after retries. Which properties and strategies
   exceeds its token limit and the system prompt and latest user turn are always kept.
 - **Checking RAG chunkers.** Coverage, size bound and overlap properties catch dropped or duplicated text
   before it reaches the index.
-- **Escaping prompt templates.** Random user text with backticks, braces and header-like lines must not
-  break the rendered prompt's structure.
 
 ### Mini project
 **Property-test an agent's tool-call parser and history trimmer (2-3 hours).**

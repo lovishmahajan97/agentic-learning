@@ -254,9 +254,14 @@ def sha256(path, chunk=1 << 20):
             h.update(block)
     return h.hexdigest()
 
+SKIP = {"manifest.json", "manifest.json.sig"}   # the manifest and its cosign signature
+
+def payload(root):
+    return [p for p in root.rglob("*") if p.is_file() and str(p.relative_to(root)) not in SKIP]
+
 def build(bundle_dir, version):
     root = pathlib.Path(bundle_dir)
-    files = [p for p in root.rglob("*") if p.is_file() and p.name != "manifest.json"]
+    files = payload(root)
     manifest = {"version": version, "artifacts": {
         str(p.relative_to(root)): {"sha256": sha256(p), "bytes": p.stat().st_size} for p in files}}
     (root / "manifest.json").write_text(json.dumps(manifest, indent=1))
@@ -267,8 +272,7 @@ def verify(bundle_dir):
     root = pathlib.Path(bundle_dir)
     manifest = json.loads((root / "manifest.json").read_text())
     listed = manifest["artifacts"]
-    present = {str(p.relative_to(root)) for p in root.rglob("*")
-               if p.is_file() and p.name != "manifest.json"}
+    present = {str(p.relative_to(root)) for p in payload(root)}
     missing = [r for r in listed if r not in present]
     altered = [r for r in listed if r in present and sha256(root / r) != listed[r]["sha256"]]
     extra = sorted(present - set(listed))
@@ -407,14 +411,15 @@ spec:
 - **Interviews:** list what breaks without a network and how delivery changes.
 
 ## Exercise
-**Goal:** prove an agent you have already built can run with no network path out. No solution is given.
+**Goal:** prove an agent you have already built can run with no network path out.
 - **Inputs:** any small agent of yours (one model call, one or two tools), Docker, and the two scripts
-  above as starting points.
+  above.
 - **Constraints:** the model must be served locally (a 0.5-3B open-weight model is enough); nothing may
   be fetched at container start.
 - **Deliver:** a table of every outbound dependency you found and how you removed it; a bundle directory
   with a manifest; a one-line command that runs one scripted agent task.
-- **Acceptance:** the task completes under `docker run --network none`; `verify` rejects the bundle
+- **Acceptance:** the task completes with agent and model on a `docker network create --internal`
+  network (or in one container under `--network none`); `verify` rejects the bundle
   after you flip one byte in a weights file and after you add a stray file; pointing one tool at a public
   host makes the preflight exit 1 before the agent starts.
 
@@ -525,7 +530,8 @@ and they expect a fix bundle every month. Plan the delivery and say what you mus
 - notes 140 GB of 16-bit weights cannot fit in 96 GB, so proposes 8-bit (~70 GB, little KV-cache room)
   or 4-bit (~35 GB), and ships only the one precision that passed;
 - re-runs the agent eval suite, especially tool-call accuracy, on exactly that model and precision;
-- keeps weights out of monthly bundles unless they change, so each fix is images and chart only;
+- keeps weights out of monthly bundles unless they change, so each fix is images and chart only, and
+  tells them even an urgent fix lands three days after it ships;
 - requires reversible migrations, a tested rollback, expiry warnings and a support-bundle command.
 
 ## Use cases & projects

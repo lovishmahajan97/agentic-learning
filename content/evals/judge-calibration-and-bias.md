@@ -5,7 +5,7 @@ name: Judge calibration & bias
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -56,7 +56,7 @@ before it gates an agent release.
 - **"Use the strongest model and trust it" fails.** Stronger judges still show these biases, just less,
   and without human labels you cannot tell how much.
 - **Biases are invisible in an aggregate score.** They must be probed deliberately with controlled
-  inputs, not discovered by accident after a bad release.
+  inputs.
 
 ## How it works
 ### The known biases
@@ -393,10 +393,11 @@ agent you build). No solution is given.
 - **Constraints:** at least 30 human-fail traces, some claiming an action whose tool call failed; a
   judge from another family than the agent.
 - **Deliver:** human–human kappa, judge TPR and TNR for a reply-only and a reply-plus-tools view,
-  the flip rate under order swap on 30 pairs, and the corrected pass rate with a bootstrap interval.
-- **Acceptance:** recomputing TPR and TNR by hand from your confusion counts matches the script; the
-  corrected rate falls within the interval of the human pass rate on a held-out 20 traces; you state a
-  go or no-go with the number that decided it.
+  the flip rate under order swap on 30 same-task trace pairs, and the corrected pass rate with a
+  bootstrap interval.
+- **Acceptance:** recomputing TPR and TNR by hand from your confusion counts matches the script; on 20+
+  held-out traces the human pass rate falls inside your corrected interval; you state a go or no-go with
+  the number that decided it.
 
 ## Role lens
 - **Engineer:** Implements both-order judging, structured verdict output, a pinned judge version, and a
@@ -493,8 +494,9 @@ On 150 labeled items the judge has TPR 0.97 and TNR 0.55, and the new model's pa
 conclude and do?
 
 **A strong answer:**
-- computes TPR + TNR − 1 = 0.52, so the true pass rates are about 48% and 63%: the judge inflates both
-  levels heavily, and the corrected gap rests on a weak TNR estimate that needs a bootstrap interval;
+- computes TPR + TNR − 1 = 0.52, so corrected rates are about 48% and 63%, but notes the inversion
+  assumes one TPR and TNR for both models; a same-family judge on longer patches is likely more lenient
+  on the new one, so it measures TNR on new-model items separately and bootstraps;
 - names three confounds: shared family (self-preference), verbosity on 40% longer patches, and lenient
   TNR, and proposes a cross-family judge, a length-controlled comparison and more human-fail labels;
 - replaces the judge for "does it work" with executed tests wherever they exist, keeping the judge only

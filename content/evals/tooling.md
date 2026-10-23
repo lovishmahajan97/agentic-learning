@@ -5,8 +5,14 @@ name: Tooling (Promptfoo, RAGAS, DeepEval, Braintrust, LangSmith, Langfuse)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - evals/eval-harness
+  - evals/llm-as-a-judge
+  - observability/tracing
 related:
   - evals/eval-harness
   - evals/llm-as-a-judge
@@ -92,8 +98,6 @@ output and the list of tool calls, so scorers can grade the outcome and the traj
   (`similar` via embeddings) and model-graded (`llm-rubric`, `factuality`, context-faithfulness and
   recall style checks).
 - **Red-team mode:** generates adversarial probes by plugin and strategy.
-- **Best fit:** fast prompt or model comparisons and a CI gate, including for teams that do not write
-  Python.
 - **Sharp edges:** the YAML grows with the suite; model-graded assertions use a default grader you should
   pin explicitly; a multi-step agent has to be wrapped as a custom provider.
 
@@ -110,7 +114,6 @@ embeddings:
 
 - **Labels:** faithfulness and answer relevancy need no reference labels; context recall does.
 - **Also:** generates synthetic test sets from your documents.
-- **Best fit:** bootstrapping RAG evaluation before labels exist.
 - **Sharp edge 1:** "reference-free" means "compared to the context, not to the truth", so a faithful
   answer built on the wrong chunk scores perfectly.
 - **Sharp edge 2:** every score depends on the judge model and on the statement-splitting prompt.
@@ -122,8 +125,6 @@ embeddings:
 - **Metrics** are classes with a `threshold`: `FaithfulnessMetric`, `AnswerRelevancyMetric`,
   `ContextualPrecisionMetric`, `HallucinationMetric`, and `GEval` for custom criteria written in prose,
   each returning a `score` and a `reason`.
-- **Best fit:** evals that live in the repository next to the tests, and a custom rubric metric without
-  writing a judge from scratch.
 - **Sharp edges:** pass/fail per case hides the score distribution; prebuilt metrics are judge prompts
   you do not own; the hosted Confident AI platform is where the dashboards live.
 
@@ -133,7 +134,6 @@ embeddings:
 - **Scorers:** the open-source `autoevals` package provides `Factuality`, `ClosedQA`, `Levenshtein`,
   embedding similarity and a generic `LLMClassifier`.
 - **Also:** logs production calls as traces, curates datasets from logs, has a prompt playground.
-- **Best fit:** a tight experiment-diff loop with a UI non-engineers can read.
 - **Sharp edge:** it is hosted, so where your traces and prompts may reside is a plan-level question to
   settle before adopting.
 
@@ -143,7 +143,6 @@ embeddings:
   evaluators=[...])`.
 - **Also:** annotation queues for human review, online evaluators that sample production traces, and a
   prompt hub with a playground. It does not require LangChain.
-- **Best fit:** LangChain or LangGraph shops and teams that need a human annotation workflow.
 - **Sharp edges:** hosted by default, with self-hosting on enterprise tiers; pricing scales with trace
   volume; its native run/trace schema is LangSmith-specific (OpenTelemetry ingestion exists, but the
   evaluation features are built around the native format).
@@ -229,6 +228,8 @@ providers with deterministic and rubric assertions.
 
 ```python
 # test_support_bot.py — run with: deepeval test run test_support_bot.py
+# imports and signatures checked against deepeval 4.3.1 (needs Python 3.10+); there LLMTestCaseParams
+# still works but is deprecated in favour of SingleTurnParams. Judge metrics need a model API key.
 import pytest
 from deepeval import assert_test
 from deepeval.metrics import FaithfulnessMetric, GEval
@@ -252,6 +253,7 @@ def test_answer(question):
 
 ```yaml
 # promptfooconfig.yaml — run with: npx promptfoo eval && npx promptfoo view
+# `promptfoo validate` accepts this config (checked with promptfoo 0.124.1)
 prompts: [file://prompts/support_v7.txt, file://prompts/support_v8.txt]
 providers: [openai:chat:MODEL_A, anthropic:messages:MODEL_B]   # substitute current model ids
 tests:
@@ -270,8 +272,8 @@ A LangGraph agent evaluated on a LangSmith dataset with two of your own scorers:
 on the trajectory. The target runs the full loop per item and returns the tool calls it made.
 
 ```python
-# assumes langsmith 0.2+ (evaluators may take outputs/reference_outputs and return a bool),
-# LANGSMITH_API_KEY and tracing env vars set, and a dataset "support-agent-v3" that already exists
+# assumes langsmith 0.2+ (evaluators may take outputs/reference_outputs and return a bool; the evaluate
+# signature, incl. num_repetitions, checked against langsmith 0.14.12), LANGSMITH_API_KEY and tracing env vars set, and a dataset "support-agent-v3" that already exists
 from langsmith.evaluation import evaluate
 from my_agent import agent          # compiled LangGraph graph, e.g. create_react_agent(model, tools)
 
@@ -382,22 +384,26 @@ print(faithfulness(3, 4))                # 0.75 the SCIM case above
   distributions; score tables show distributions but need a separate gating rule before they stop
   anything. Per-case thresholds suit a small suite of must-pass behaviours; once the suite is large and
   noisy, gate on aggregate drops and regressed-item counts instead.
-- **Several tools vs one source of truth.** Combining tools covers each one's gaps but multiplies copies
-  of the dataset and metric definitions. Keep one canonical store and import into the rest.
 
 ## Pitfalls
-- **Reading a RAGAS faithfulness of 0.95 as "accurate".** Symptom: answers are perfectly faithful to the
-  wrong chunk, and only a retrieval metric against labelled queries reveals it.
+- **Reading a RAGAS faithfulness of 0.95 as "accurate".** Symptom: users report wrong answers while
+  faithfulness stays high, because answers are faithful to the wrong chunk. Diagnose: log retrieved chunk
+  ids per item and compute recall@k on labelled queries. Fix: pair faithfulness with a retrieval metric.
 - **Comparing scores across tool versions or judge models.** Symptom: a jump or drop after a dependency
-  upgrade with no change to the system under test.
+  upgrade with no change to the system under test. Diagnose: diff the lockfile and judge model id
+  between the two runs, then re-score old outputs with the new setup. Fix: pin both; re-baseline on upgrade.
 - **Leaving the judge model at the tool's default.** Symptom: CI and a developer's laptop disagree on the
-  same run because each resolved a different default.
+  same run because each resolved a different default. Diagnose: record the resolved grader model in
+  every run's metadata. Fix: set it explicitly in config.
 - **Sending production traces with customer data to a hosted platform** without redaction or a data
   agreement. Symptom: a security review blocks the rollout months after the team came to depend on it.
+  Diagnose: scan a sample of stored traces for PII patterns. Fix: redact in the SDK or self-host.
 - **Running judge metrics on every commit.** Symptom: eval spend exceeds the feature's own inference
-  cost. Fix: deterministic checks per commit, judge runs per pull request or nightly.
+  cost. Diagnose: count judge calls per run with the formula above. Fix: deterministic checks per commit,
+  judge runs per pull request or nightly.
 - **Treating packaged "hallucination" or "toxicity" metrics as safety guarantees.** Symptom: a confident
-  dashboard and an incident the judge's blind spots let through.
+  dashboard and an incident the judge's blind spots let through. Diagnose: run the metric on the
+  incident and on labelled failures. Fix: calibrate, and keep deterministic guards.
 
 ## When to use
 - **Use a library when** the eval is a CI gate owned by engineers and the data is small.
@@ -410,6 +416,16 @@ print(faithfulness(3, 4))                # 0.75 the SCIM case above
   traces become dataset items each week.
 - **Interviews:** answer "what would you use to evaluate a RAG system?" by naming the pipeline, saying the
   tool is packaging, and explaining what RAGAS faithfulness measures and what it cannot see.
+
+## Exercise
+**Goal:** decide whether a prebuilt faithfulness metric may gate releases for one of your agents. No
+solution is given.
+- **Inputs:** 30 items from your agent (question, retrieved chunks, answer), at least 5 answered from the
+  wrong chunk; one library (DeepEval or RAGAS) with a pinned version and judge model.
+- **Deliver:** your own pass/fail label per item, the metric's score per item, an agreement table, and a
+  written gate decision with the threshold you would use.
+- **Acceptance:** re-running gives the same scores within judge noise; you show which wrong-chunk items
+  the metric passed and which retrieval or task check catches them.
 
 ## Role lens
 - **Engineer:** Wires the chosen scorers into the harness or CI, pins judge models and library
@@ -501,6 +517,16 @@ numbers are components, not the verdict.
 > A packaged metric is a prompt, a model and a parser; its agreement with your definition of a
 > hallucination is unknown until measured. Pinning the judge keeps the gate stable across environments
 > and upgrades.
+
+## Mastery test
+**Problem:** a bank's agent team has no eval tooling, uses a custom loop, and must keep customer data
+in its own network. They run 800 golden tasks, *k* = 3, four judge metrics nightly, and want a stack. What do you
+propose, and what do you measure first?
+
+**A strong answer:**
+- picks a self-hosted platform such as Langfuse for traces and scores, and a library in CI;
+- computes 800 × 3 × 4 = 9,600 judge calls before multi-call metrics, and puts judges nightly with a smoke subset per PR;
+- writes trajectory checks as own code, pins judge and library, and calibrates against labelled items first.
 
 ## Use cases & projects
 ### Use cases

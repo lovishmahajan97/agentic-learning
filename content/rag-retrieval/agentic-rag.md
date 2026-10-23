@@ -5,7 +5,7 @@ name: Agentic RAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -257,7 +257,7 @@ except GraphRecursionError:
 
 - **What the framework did not do:** prune results, verify citations against returned IDs, or cap tokens.
   Add those as nodes or inside the tools, as in the hand-rolled loop above.
-- **Version checked:** run with langgraph 1.2 and langchain-core 1.6 using a fake tool-calling model;
+- **Version checked:** run with langgraph 1.2.16 and langchain-core 1.7.0 using a fake tool-calling model;
   `RunnableConfig` parameters are injected by `ToolNode` and hidden from the model.
 
 ### Token cost of pruning, and a novelty check

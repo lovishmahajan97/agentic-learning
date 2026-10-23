@@ -101,7 +101,6 @@ Three regimes, in decreasing order of reliability:
   because "it was founded then" cannot be verified alone.
 - **Route by claim type in agents.** Fact claims go to the verifier with tool outputs and retrieved
   evidence; action claims ("I cancelled it") are checked deterministically against successful tool calls.
-- **Verify.** Each claim goes to the verifier with its retrieved evidence.
 
 ### The metrics
 - **Claim precision:** supported claims / all claims, averaged per response, then per slice.
@@ -375,7 +374,7 @@ small document set), and decide whether one prompt change is worth shipping. No 
 - **Deliver:** a script that prints the four numbers per slice and per version, lists each contradicted
   claim with its trace ID, and flags action claims with no successful tool call.
 - **Acceptance:** your verifier agrees with your own labels on 50 claims (report kappa); at least one
-  action hallucination is caught by the tool-log check alone; you state whether the difference between
+  action hallucination (plant one if none occur) is caught by the tool-log check alone; you state whether the difference between
   versions exceeds the interval for your slice size.
 
 ## Role lens
@@ -466,16 +465,20 @@ different model. Finally gate on false abstention too, or the fix will be a mode
 > corpus or human check can catch it.
 
 ## Mastery test
-**Problem:** a travel-booking agent searches flights, holds seats and emails itineraries. After launch,
-users report itineraries with flight numbers that do not exist and "your seat is held" when the hold
-API timed out. The eval shows 98% claim precision on 300 tasks. Design the evaluation that would have
-caught both, and say what you gate on.
+**Problem:** a travel-booking agent searches flights, holds seats and emails itineraries. Users report
+flight numbers that appear in no search result, and "your seat is held" when the hold API timed out
+(some timed-out holds did succeed server-side).
+
+The eval shows 98% claim precision on 300 tasks, about 10 claims per answer. Design the evaluation
+that would have caught both, and say what you gate on.
 
 **A strong answer:**
-- explains why 98% precision hides it: holistic or answerable-only items, and no response-level rate;
-- checks hold and email claims deterministically against successful calls, on all traffic;
-- verifies flight numbers against the search tool's results, with a cross-family verifier measured
-  against human labels;
+- explains why 98% hides it: if errors are spread out, 1 − 0.98^10 ≈ 18% of answers contain one, and
+  no response-level rate was reported;
+- checks identifiers (flight numbers, prices) by exact match against the trace's search results, since
+  a verifier with world knowledge accepts plausible flight numbers;
+- treats a timeout as unknown, not failed: "held" is supported only by a confirmed hold, and the right
+  answer is "pending", checked on all traffic;
 - adds slices for empty results, timeouts and nonexistent routes, large enough to see the change;
 - gates on fabrication there plus a false-abstention ceiling and zero action hallucinations.
 
@@ -483,8 +486,6 @@ caught both, and say what you gate on.
 ### Use cases
 - **Gating a RAG support agent release.** Claim precision against retrieved chunks, plus a ceiling on
   false abstention, decides whether a new prompt or retriever ships.
-- **Catching action hallucinations.** Comparing the final message with the tool-call trace flags replies
-  that say "refund issued" or "email sent" when no such call succeeded.
 - **Auditing production traces.** A weekly sample of live conversations, decomposed and verified, tracks
   the fabrication rate per intent after launch.
 - **Testing abstention on unanswerable requests.** A false-premise and out-of-KB slice shows whether the

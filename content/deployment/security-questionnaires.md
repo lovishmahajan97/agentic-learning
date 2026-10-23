@@ -5,8 +5,11 @@ name: Security questionnaires
 kind: practice
 difficulty: intro
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: background
+mastery: evaluate
+code_tested: yes
+prerequisites: []
 related:
   - deployment/security-and-architecture-reviews
   - deployment/compliance-constraints
@@ -265,21 +268,24 @@ def draft(question, llm):
 
 ## Pitfalls
 - **Answering aspirationally to unblock a deal.** Symptom: a later audit or incident shows the
-  contract-referenced answer is false, turning a technical gap into a legal one.
+  contract-referenced answer is false, turning a technical gap into a legal one. Diagnose: every answer
+  should link to evidence; list entries with none. Fix: answer "Partially" with a dated plan.
 - **Forgetting subprocessors in the data-flow story**, especially model providers and observability
-  tools. Symptom: a buyer finds an unlisted vendor in your trace exports or DNS logs.
-- **Letting answers diverge across customers.** Symptom: two customers compare notes, or the same
-  question is answered differently in a renewal, prompting a full re-review.
-- **Never revisiting answers after architecture changes.** Symptom: stale claims, for example "data
-  never leaves the EU" after someone added a US-hosted model fallback route.
+  tools. Symptom: a buyer finds an unlisted vendor in your trace exports or DNS logs. Diagnose: diff the
+  external domains in egress and DNS logs, and vendor billing, against the published list.
+- **Letting answers diverge across customers.** Symptom: two customers compare notes, or a renewal
+  answers differently, prompting a full re-review. Diagnose: search sent questionnaires for answers not
+  traceable to a library id. Fix: answer only from the library.
+- **Never revisiting answers after architecture changes.** Symptom: "data never leaves the EU" after
+  someone added a US-hosted model fallback. Cause: no link from code changes to the library. Diagnose:
+  compare model routing config and regions with residency entries. Fix: the pull-request trigger.
 - **Saying "the agent is read-only" after adding a write tool.** Symptom: a buyer's pilot logs show the
   agent creating tickets or sending email. Fix: derive the answer from the tool registry.
-- **Attaching sensitive evidence without controls.** A full penetration-test report with unfixed
-  findings or a detailed network diagram, on a portal outside an NDA. Symptom: your internal security
-  detail circulates among people you have never met. Share summaries and attestation letters by
-  default, full reports under NDA on request.
-- **Treating "not applicable" as a shortcut.** Symptom: reviewer follow-ups asking why, which slow the
-  review more than a one-line justified answer would have.
+- **Attaching sensitive evidence without controls**, such as a full pen-test report with unfixed findings
+  or a detailed network diagram on a portal outside an NDA. Symptom: your security detail circulates
+  among strangers. Fix: summaries and attestation letters by default, full reports under NDA.
+- **Treating "not applicable" as a shortcut.** Symptom: reviewer follow-ups asking why, slower than a
+  one-line justified answer.
 
 ## When to use
 - **Prepare before the first deal.** Every sale to a regulated or large enterprise passes through one:
@@ -291,6 +297,17 @@ def draft(question, llm):
 - **Measure:** turnaround time, follow-up rounds and the number of answers changed after engineering review.
 - **Interviews (FDE and architect):** expect "how do you answer a question where the honest answer is
   no?" The answer: honestly, with compensating controls and a dated plan.
+
+## Exercise
+**Goal:** generate the agent section of your answer library from configuration and prove it goes stale
+when the agent changes. No solution is given.
+- **Inputs:** a toy tool registry (YAML or JSON: tool, read or write, credential scope, approval
+  required), a retention config (traces, logs, memory TTLs) and a model routing config with regions.
+- **Deliver:** a script that renders library entries for the five agent questions in the table above,
+  each with owner, evidence path and review date, plus a check that fails when config changed after an
+  entry's review date.
+- **Acceptance:** adding a write tool flips "Can the agent take actions?" and fails the check; adding a
+  US fallback route changes the residency entry; an unchanged config passes.
 
 ## Role lens
 - **Engineer:** Owns accurate answers about the systems they build, such as retention in traces,
@@ -334,27 +351,12 @@ next questionnaire is correct, and tell engineering the routing change has compl
 - **Make it stay true:** generate this entry from config and trip the change trigger whenever a tool or
   scope is added.
 
-### How would you use an LLM to speed up questionnaire responses safely?
-- **RAG over the approved library**, not over raw documents, so drafts reuse wording an owner already
-  signed off.
-- **Owner approval on every answer**, because a fluent wrong answer is a misrepresentation; track which
-  answers were edited before sending.
-- **Freshness gate:** refuse to draft from entries past their review date, and route low-match questions
-  to an owner with no draft.
-
 ### When is pursuing SOC 2 not yet worth it?
 - **Low deal volume:** an early-stage vendor with few enterprise deals may get further with a strong
   answer library, a clear data-flow diagram and a pen-test summary.
 - **Cost:** a Type II audit costs significant time and money every year and covers a period, so it pays
   off once questionnaire volume and deal size justify it.
 - **Signal to watch:** repeated deals stalling on "do you have a SOC 2 report?"
-
-### What does a strong answer to an AI training-use question contain?
-- **The direct answer** for your own models, then the same for every model subprocessor and their
-  retention and region.
-- **The mechanism and evidence:** the API terms that exclude training, the DPA section, the subprocessor list.
-- **Per data flow:** separate statements for the hosted-API path and a self-hosted path, because the
-  honest answers differ.
 
 ## Quiz
 ### Q: Why does sending a SOC 2 Type II report early often shorten a security questionnaire?
@@ -380,6 +382,20 @@ next questionnaire is correct, and tell engineering the routing change has compl
 - [x] Requiring the owner of each underlying control to approve the drafted answer before it is sent
 > Retrieval speeds drafting, but answers are commitments, and a fluent wrong answer is a misrepresentation.
 > Model size and agreement between drafts do not establish truth; an accountable owner's review does.
+
+## Mastery test
+**Problem:** a bank asks "Are prompts or tool results ever stored outside our tenant?" Your agent
+streams traces to a SaaS observability vendor, caches tool results in Redis for 1 hour, and stores
+long-term memory per user. Last quarter you told another bank "No". Write the answer and say what else
+you must do.
+
+**A strong answer:**
+- answers "Yes", per flow: traces at the vendor with its retention and region, the cache with its TTL,
+  memory with its deletion path, and states which are in the tenant;
+- names the vendor as a subprocessor and checks it is on the published list;
+- treats last quarter's "No" as a misstatement to correct with that customer, not to repeat;
+- offers a fix, such as payload redaction in traces or an in-tenant trace store, and updates the library
+  entry and its owner.
 
 ## Use cases & projects
 ### Use cases

@@ -5,7 +5,7 @@ name: Rubrics
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -36,8 +36,8 @@ gate catastrophic actions, and version it.
 - **What you control.** Which criteria are code checks over the trace and which need a judge, which
   are gates (destructive action without confirmation, fabricated tool result, leaked secret), each
   criterion's applicability condition, and the rubric version stamped on every result.
-- **What you can skip.** Elaborate weighting schemes and long Likert scales. Binary criteria, a few
-  gates and per-criterion pass rates cover almost every agent eval.
+- **What you can skip.** Elaborate weighting and long Likert scales. Binary criteria, a few gates and
+  per-criterion pass rates cover almost every agent eval.
 
 ## Why it exists
 - **Unanchored scores measure the grader.** Ask three engineers to rate a support-bot answer from 1 to
@@ -161,8 +161,8 @@ Two layers work well:
 
 ## Diagram
 How one graded item becomes a score: applicability first, gates before aggregation, and N/A kept out of
-the denominator. The top two boxes are how the rubric itself is built and frozen; the gate check runs
-once per item, after every applicable criterion has been graded.
+the denominator. The top two boxes build and freeze the rubric; the gate check runs once per item,
+after all applicable criteria are graded.
 
 ```mermaid
 flowchart TD
@@ -374,7 +374,8 @@ Illustrative release comparison over 200 eval runs:
   describe a failure mode no criterion covers. Diagnose: track the share of complaints that map to no
   criterion. Fix: periodic error analysis.
 - **Scripting the agent's exact tool sequence as a criterion.** Symptom: a new model that solves tasks
-  in fewer steps fails "process" checks while the outcome rate rises. Fix: check outcome and forbidden
+  in fewer steps fails "process" checks while the outcome rate rises. Diagnose: list runs that pass
+  outcome but fail process. Fix: check outcome and forbidden
   or wasteful steps, not one expected path.
 
 ## When to use
@@ -490,8 +491,8 @@ report more broken builds. Redesign the rubric and say what the new numbers woul
 - splits outcome (tests and build pass, run in code), process (no edits outside the task's files, no
   disabled tests: code over the diff) and reply (the description matches the diff: judge);
 - makes "build breaks" and "tests deleted or skipped" gates, with N/A where no tests exist;
-- expects per-criterion rates to show the build gate failing more often while explanation criteria
-  rise, which the blended 1–5 mean hid.
+- regrades the old model's PRs under the new rubric version, expecting the build gate to fail more
+  often while explanation criteria rise, which the blended 1–5 mean hid.
 
 ## Use cases & projects
 ### Use cases

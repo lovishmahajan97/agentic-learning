@@ -5,7 +5,7 @@ name: Long-context vs RAG
 kind: decision
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -240,7 +240,8 @@ print(f"long, 50/day   : ${per_q:.3f} per question vs ${C * p * 0.10:.3f} at a p
   edits. Monitor corpus size in tokens and edit rate.
 - **Cache-friendly agent prompt layout.** Put system prompt, tool schemas and any preloaded corpus first
   as a byte-identical prefix, then the append-only transcript; with Anthropic, mark the prefix with a
-  `cache_control` breakpoint, while OpenAI caches long prefixes automatically. Monitor cached-token counts
+  `cache_control` breakpoint, while OpenAI caches prefixes of 1,024+ tokens automatically (provider docs,
+  2026). Monitor cached-token counts
   in the usage fields of each response, per step, not an assumed hit rate.
 - **Search plus read tools for document-level retrieval.** Give the agent a `search` tool that returns
   document or section IDs with per-user filters (parent-document retrieval) and a `read_document` tool
@@ -398,14 +399,15 @@ revisit when one changes.
 ## Mastery test
 **Problem:** a coding agent preloads a 60k-token repository summary and runs 30-step sessions. Each step
 adds about 2,000 tokens of tool output. Users report it "forgets the architecture" late in sessions and
-the bill doubled after a change that put the current git branch name at the top of the system prompt.
+the bill rose sevenfold once `git status` output, refreshed every step, was put atop the system prompt.
 Explain both and redesign.
 
 **A strong answer:**
 - computes the late-step context (about 60k + 30 × 2k = 120k) and links forgetting to the summary
   drifting into the middle, plus compaction if the window is tight;
-- identifies the branch name as breaking the byte-identical prefix, so the cache misses across sessions
-  and branches, and moves volatile text after the stable prefix;
+- identifies the refreshed status text as changing the prefix on nearly every step, so each step
+  re-bills the whole context at full price (about 2.67M versus 0.37M token-equivalents per session at
+  *d* = 0.1, roughly 7×), and moves volatile text after the stable prefix or into a tool result;
 - proposes keeping a short architecture core in the prefix and the rest behind a `search` or
   `read_document` tool, checked by cached-token counts and accuracy split by step number.
 

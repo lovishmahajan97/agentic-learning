@@ -5,8 +5,14 @@ name: Multi-agent patterns (orchestrator-worker, handoffs)
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
+  - agents/task-decomposition
+  - agents/tool-calling
 related:
   - agents/task-decomposition
   - agents/planning
@@ -91,9 +97,8 @@ Practical rules the research-system write-ups emphasise:
   conversation continues.
 - **The history can be passed** whole, filtered (drop tool calls, keep user turns) or summarised, and the
   handoff can carry a structured payload (the account id, the reason).
-- **Why one active agent instead of an orchestrator?** In user-facing conversations the user talks to
-  *someone*, and a specialist that sees the dialogue directly answers better than one fed a summary by a
-  coordinator.
+- **Why one active agent instead of an orchestrator?** The user talks to *someone*, and a specialist that
+  sees the dialogue answers better than one fed a coordinator's summary.
 - **Simple mental model:** a state machine whose states are agents and whose transitions are tool calls.
 - **The cost:** no parallelism, and the receiving agent inherits whatever context was passed, so filtering
   decisions matter.
@@ -118,14 +123,12 @@ the specialist transfers again. The choice turns on who should own the next user
 - **Evaluator-optimizer pairs:** generator plus critic, the multi-agent form of reflection.
 - **Hierarchical orchestrators:** an orchestrator whose workers are themselves orchestrators.
 - **Debate or group chat:** several agents argue, a judge decides.
-- **In practice:** most production systems are an orchestrator-worker core with handoffs at the
-  user-facing edge.
 
 ### Communication, state and tracing
 - **Share through structured messages and a shared store** (a task table, files, a blackboard), not by
   reading each other's contexts.
 - **For bulky outputs, return a reference plus a summary.** Workers write the artifact to the store,
-  *because* every hop where one model paraphrases another's findings loses detail, like a game of telephone.
+  *because* every hop where one model paraphrases another's findings loses detail.
 - **Propagate a trace id** from each run to every worker so a failure can be followed across agents.
 - **Decide what each worker may write** to shared state, because concurrent writers produce the hardest bugs.
 - **Set a global budget the orchestrator enforces,** since each worker will happily spend its own.
@@ -152,8 +155,8 @@ Why the bill rises even though each context is smaller (illustrative run):
   mostly that it *does more work*, in parallel: the point when breadth matters, the waste when it does not.
 
 ## Diagram
-Compare the two shapes: the orchestrator fans out and gets structured results back, while a handoff moves
-the conversation itself to one specialist at a time.
+Compare the shapes: the orchestrator fans out and gets structured results back; a handoff moves the
+conversation to one specialist.
 
 ```mermaid
 flowchart TD
@@ -213,10 +216,7 @@ def run(messages, agent="triage", max_turns=20, max_transfers=3):
     return messages, agent
 ```
 
-The deliberate choices:
-- **A transfer is just a tool call** the model can make, whose arguments become a structured brief in the
-  specialist's system prompt.
-- **History is filtered at the boundary,** so the specialist starts with a small, relevant context.
+The deliberate choices, beyond transfer-as-tool and filtered history:
 - **Transfers are capped,** because two agents that each think the other owns the request will otherwise
   bounce it until the turn budget runs out.
 - **The `break` matters.** The filter removes the assistant message that issued the calls, so executing
@@ -226,8 +226,8 @@ The deliberate choices:
   it has just been filtered out.
 
 ### Orchestrator with briefs, a global budget and failure tolerance
-Runnable pure Python with simulated workers. One worker fails; the orchestrator records a gap instead of
-crashing, and every worker spends from one shared budget.
+Pure Python with simulated workers; runs as is. One worker fails and becomes a gap, not a crash; all
+workers spend one shared budget.
 
 ```python
 import asyncio, random, uuid
@@ -301,16 +301,20 @@ The `gaps` list is what drives a follow-up worker or an honest "could not verify
 
 ## Pitfalls
 - **Workers returning transcripts instead of structured findings.** Symptom: the orchestrator context
-  bloats after two rounds and synthesis ignores most of the input. Fix: an output schema per brief.
+  bloats after two rounds and synthesis ignores most of the input. Diagnose: log orchestrator input tokens
+  per round and per worker result. Fix: an output schema per brief.
 - **Overlapping worker objectives.** Symptom: several workers cite the same three sources and gaps nobody
-  covered. Fix: distinct objectives in each brief.
+  covered. Diagnose: measure source overlap (shared URLs or doc ids) across workers. Fix: distinct
+  objectives in each brief.
 - **No global budget or stopping owner.** Symptom: runs spawn follow-up workers indefinitely and bills vary
-  tenfold between similar tasks. Fix: one owner, one budget.
+  tenfold between similar tasks. Diagnose: count follow-up dispatches per run in the trace. Fix: one
+  owner, one budget.
 - **Handing off the entire history including tool noise.** Symptom: specialists answer the triage agent's
-  internal notes rather than the user. Fix: filter at the boundary.
+  internal notes rather than the user. Diagnose: inspect the first prompt on the handoff span. Fix: filter
+  at the boundary.
 - **Treating worker output as trusted.** Symptom: an orchestrator following instructions that arrived
-  inside a worker's web search result. Fix: wrap results as delimited data and validate them against the
-  output schema.
+  inside a worker's web search result. Diagnose: tag each orchestrator action with the provenance of the
+  text that triggered it. Fix: wrap results as delimited data and validate them against the output schema.
 - **Reaching for multi-agent first.** Symptom: a fragile system whose single-agent baseline was never
   measured and would have sufficed. Fix: build and measure the single agent first, then split only where
   it fails.
@@ -325,8 +329,18 @@ The `gaps` list is what drives a follow-up worker or an honest "could not verify
   or the baseline already works.
 - **Measure** task completion, tokens per task against the single-agent baseline, boundary losses (how
   often the synthesis lacked something a worker found) and per-agent failure rates.
-- **Interviews:** explain both patterns, when each flips to the other, and why structured hand-off
-  payloads and budgets are non-negotiable.
+
+## Exercise
+**Goal:** build an orchestrator-worker research run and decide, with numbers, whether it beats one agent.
+- **Inputs:** 10 research questions with a short answer key, a search tool or a fixed local corpus, and
+  any model API.
+- **Constraints:** each brief carries objective, tools, effort limit and output schema; one global
+  budget; a trace id on every worker; one worker forced to time out.
+- **Deliver:** single-agent and orchestrator-worker versions with accuracy, tokens and wall-clock per
+  question.
+- **Acceptance:** the forced timeout shows up as a stated gap, not a crash or an invented fact; every
+  worker span carries the run's trace id; spend stays within budget; you can state the cost multiple and
+  whether accuracy justified it.
 
 ## Role lens
 - **Engineer:** Implements the orchestrator loop, worker briefs with output schemas and budgets, the
@@ -408,6 +422,18 @@ rate and transfer loops before and after.
 > Every agent boundary loses context. When pieces share nearly all their context, partitioning costs
 > more than it saves; the other options are precisely the conditions where multi-agent pays off.
 
+## Mastery test
+**Problem:** an insurance claims assistant talks to the claimant, checks policy coverage, pulls three
+independent records (police report, repair estimate, medical bill), and only a human adjuster may approve
+payment. Design the agent topology.
+
+**A strong answer:**
+- keeps one user-facing voice (a single agent, or handoffs between intake and claims specialists);
+- runs the three pulls as parallel agent-as-tool or plain tool calls returning structured records;
+- keeps payment out of every agent's tools, behind an approval gate, with per-role credentials;
+- treats documents as data, not instructions, and adds transfer caps, a global budget and one trace id;
+- measures it against a single-agent baseline before adding agents.
+
 ## Use cases & projects
 ### Use cases
 - **Customer support with specialists.** A triage agent with only transfer tools hands the conversation
@@ -416,8 +442,6 @@ rate and transfer loops before and after.
   structured findings and sources, then synthesises one report with honest gaps.
 - **Large code changes.** A lead coding agent dispatches sub-agents per module, each in its own context,
   and checks their results against tests before merging.
-- **Least-privilege operations.** Read-only investigation agents never hold the write credential; only
-  an execution agent behind approval can change state.
 
 ### Mini project
 **Split a fourteen-tool support bot into triage plus two specialists (2-3 hours).**
@@ -430,6 +454,6 @@ rate and transfer loops before and after.
   run of the tech agent can reach `issue_refund`.
 
 ### Major project
-This lesson feeds the module Capstone (see the module guide): the billing-dispute agent separates
+Feeds the module Capstone: the billing-dispute agent separates
 read-only investigation from the gated refund step, so the credential that can move money is never in
 the investigating loop's tool list.

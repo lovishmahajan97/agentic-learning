@@ -5,8 +5,13 @@ name: Supply-chain security for models & datasets
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: yes
+prerequisites:
+  - python-for-ai/safetensors
+  - python-for-ai/hugging-face
 related:
   - python-for-ai/safetensors
   - python-for-ai/hugging-face
@@ -35,9 +40,8 @@ scanned, signed, quarantined, loaded with least capability.
 - **Where it shows up in your stack.** Self-hosted models in vLLM or similar engines, LoRA adapters
   fine-tuned for tool use, embedding models for RAG, `tokenizer_config.json` chat templates, and the
   datasets you fine-tune or evaluate agents on.
-- **What you control.** Safetensors only, `trust_remote_code=False`, pinned commit hashes and per-file
-  SHA-256, an internal registry with quarantine, and behavioural acceptance evals that include tool-calling
-  and refusal behaviour.
+- **What you control.** The eight controls below, from safe formats to behavioural acceptance evals that
+  include tool-calling and refusal behaviour.
 - **What you can skip.** If you only call hosted APIs, the artifact pipeline is your provider's job; you
   still own your fine-tuning and eval datasets. Backdoor detection research is also skippable: there is no
   general detector, so limit blast radius instead.
@@ -56,10 +60,9 @@ scanned, signed, quarantined, loaded with least capability.
 - **4. Datasets are often lists of URLs, not content.** Carlini et al. showed in 2024 that buying expired
   domains referenced in web-scale datasets controls what future downloaders receive; about US$60 would
   have bought control of 0.01% of LAION-400M or COYO-700M.
-- **"Only popular models from well-known organisations" does not hold.** Hub namespaces can be squatted with
-  look-alike names, accounts get compromised, a branch like `main` is mutable, and researchers repeatedly
-  find malicious pickle payloads in public repositories. Popularity says nothing about poisoning or
-  backdoors, which pass every download count.
+- **"Only popular models from well-known organisations" does not hold.** Namespaces get squatted with
+  look-alike names, accounts get compromised, `main` is mutable, and researchers repeatedly find malicious
+  pickles in public repositories. Download counts say nothing about poisoning or backdoors.
 
 ## How it works
 ### Threat model by layer
@@ -77,7 +80,7 @@ scanned, signed, quarantined, loaded with least capability.
   without touching a weight; for an agent that includes how tool definitions and tool results are framed.
 - **Templates can execute.** A 2024 vulnerability in llama-cpp-python showed that rendering an untrusted
   template outside a sandbox could execute code on the server.
-- **So configs are part of the artifact,** not metadata around it.
+- **So configs are part of the artifact.**
 
 ### Controls in order of leverage
 1. **Safe formats only.** Load `safetensors`, a flat tensor format with a JSON header and no code path, and
@@ -240,9 +243,9 @@ ticketing tool and a shell-free deploy tool. The acceptance run on their own sui
 - **Agent acceptance evals in the promotion gate.** Before a model or adapter can back an agent, run
   tool-call accuracy, refusal on unsafe tool requests and unprompted-consequential-call probes against
   the base model. Block promotion on any regression in safety metrics, not just on task accuracy.
-- **Signed artifacts verified at deploy.** Sign the promoted bundle with `cosign sign-blob` (or sign an OCI
-  artifact that wraps it) and verify the signature in the deploy step before load. Monitor the share of
-  production models with a verified signature.
+- **Signed artifacts verified at deploy.** Sign the promoted bundle with `cosign sign-blob` (or an OCI
+  artifact wrapping it) and verify before load. Monitor the share of production models with a verified
+  signature.
 - **AI-BOM per deployment.** Emit a CycloneDX ML-BOM listing base model, adapters, datasets and hashes with
   each release, so an advisory about one component maps to every affected deployment in minutes.
 - **Pin review cadence.** Pins do not pick up upstream tokenizer or config fixes, so schedule a quarterly
@@ -255,9 +258,8 @@ ticketing tool and a shell-free deploy tool. The acceptance run on their own sui
 - **Refusing `trust_remote_code` vs new architectures.** It blocks arbitrary execution, yet some new
   architectures ship only that way. Vendoring the reviewed code preserves safety at the cost of maintaining
   a fork until upstream support lands.
-- **Pinning by hash vs automatic fixes.** It guarantees reproducibility, but security fixes to a tokenizer
-  or config do not arrive automatically. Pair pins with a review cadence rather than treating them as
-  permanent.
+- **Pinning by hash vs automatic fixes.** It guarantees reproducibility, but tokenizer or config fixes do
+  not arrive automatically; pair pins with a review cadence.
 - **Snapshotting dataset content vs storage and licensing.** It removes split-view poisoning and makes
   training reproducible, at the cost of storing terabytes you previously only referenced and taking on
   licence obligations for holding copies.
@@ -267,18 +269,25 @@ ticketing tool and a shell-free deploy tool. The acceptance run on their own sui
 
 ## Pitfalls
 - **`torch.load` on community checkpoints on a laptop with cloud credentials.** Symptom: a security alert
-  about outbound connections from a Python process during "model loading".
+  about outbound connections from a Python process during "model loading". Diagnose: run picklescan on the
+  files and list which were `.bin` or `.pt`. Fix: safetensors only, rotate every credential that process
+  could reach.
 - **Pinning `revision="main"` or no revision.** Symptom: an evaluation regresses overnight although nobody
-  changed anything on your side.
+  changed anything on your side. Diagnose: compare the resolved commit and file hashes with the review
+  manifest. Fix: pin a commit hash.
 - **Relying on the hub's own malware scan.** Symptom: a flagged file was already pulled into a training job
-  because your pipeline never looked at the scan result.
+  because your pipeline never looked at the scan result. Diagnose: check that ingestion logs its own scan
+  result per artifact. Fix: scan in your job and block on findings.
 - **Treating a leaderboard score as evidence of safety.** Symptom: a fine-tune that performs well on the
-  benchmark has had its refusal behaviour stripped, discovered by a customer.
+  benchmark has had its refusal behaviour stripped, discovered by a customer. Diagnose: refusal and
+  unprompted-call probes versus the base model. Fix: safety regressions block promotion.
 - **Reviewing weights, ignoring tokenizer and chat template.** Symptom: the model behaves differently in
   your serving stack than in the reference implementation, tool calls are parsed wrongly, or unexplained
-  text appears in rendered prompts in your traces.
+  text appears in rendered prompts in your traces. Diagnose: diff one fixed conversation's rendered prompt
+  against the reference. Fix: hash configs with the weights.
 - **Building datasets from live URLs at training time.** Symptom: the training data differs from what was
-  audited, and model behaviour nobody can reproduce.
+  audited, and model behaviour nobody can reproduce. Diagnose: re-hash a sample against curation-time
+  hashes. Fix: snapshot content.
 
 ## When to use
 - **Full pipeline:** anything that reaches production or touches customer data: base models, fine-tunes,
@@ -290,8 +299,16 @@ ticketing tool and a shell-free deploy tool. The acceptance run on their own sui
 - **Measure:** the fraction of production models served from the registry (target 100%), the share of
   artifacts with recorded hashes and signatures, scan coverage at ingestion, and time from upstream release
   to promoted availability.
-- **Interviews:** expect "a team wants to use a community fine-tune; what do you check?" Separate what you
-  can verify (format, hash, code, behaviour on your evals) from what you cannot (absence of backdoors).
+
+## Exercise
+**Goal:** build an ingestion gate for a small open-weight model, then attack it. No solution is given.
+- **Inputs:** a test-sized public model repo (tens of MB), one commit hash, and a sandbox directory with no
+  credentials.
+- **Deliver:** a script that writes a per-file SHA-256 manifest at review, then on every load verifies
+  file set and hashes, runs picklescan, and loads with safetensors and no remote code; plus a tamper table.
+- **Acceptance:** the clean snapshot loads; the gate fails on one changed byte in `tokenizer_config.json`,
+  on an added `extra.py`, and on a `pytorch_model.bin` carrying a `__reduce__` payload, which picklescan
+  also flags; you name one attack that passes every check.
 
 ## Role lens
 - **Engineer:** Writes loaders that enforce safetensors, pinned revisions and hash checks, and adds
@@ -319,12 +336,6 @@ customer-facing agent with tools is not, unless you can reproduce the fine-tune 
 dataset.
 
 ## Interview questions
-### Why is loading a model checkpoint a code-execution risk, and how do you remove it?
-- **Pickle-based formats** (`.bin`, `.pt`) run whatever `__reduce__` returns on load, so loading is running
-  the uploader's code with your credentials.
-- **Remove it** with safetensors only, `weights_only=True` where `torch.load` is unavoidable, and
-  `trust_remote_code=False`, with any needed custom code vendored and reviewed.
-
 ### Your eval scores for a pinned-by-name model regressed overnight with no change on your side. How do you investigate?
 - **Suspect a moving reference:** a name or `main` branch was updated upstream, or a mirror served
   different bytes.
@@ -346,12 +357,6 @@ dataset.
   ordinary floats; there is no general detector.
 - **Mitigate with** behavioural acceptance evals (including safety and refusal), provenance checks, and
   limiting blast radius: no tools or customer-facing use for unverifiable fine-tunes.
-
-### When is a full quarantine-and-promote registry overkill?
-- **For research sandboxes** with no production credentials or customer data, where hours or days of
-  ingestion delay cost more than the risk.
-- **Still keep the floor:** safe formats and no remote code, because developer laptops hold cloud
-  credentials too.
 
 ### How would you defend a training set built from web URLs against poisoning?
 - **Snapshot the content,** hash it and store it immutably, instead of re-fetching URLs at training time,
@@ -385,6 +390,20 @@ dataset.
 > Scanners detect dangerous code and integrity failures, but backdoored behaviour is encoded in ordinary
 > floating-point weights; only behavioural evaluation, provenance and limiting blast radius address it,
 > and none of them fully.
+
+## Mastery test
+**Problem:** your RAG agent's embedding model is pulled by name from the hub at container start. An
+advisory says the publishing organisation's account was compromised for two days last week. What do you
+do today, and what do you change for good?
+
+**A strong answer:**
+- scopes exposure first: which deployments pulled in the window, and whether their files' hashes match a
+  known-good copy, tokenizer and config included;
+- treats a mismatch as code execution: rotate credentials that host could reach, rebuild the node;
+- notes tampered safetensors weights pass every scan, so compares retrieval evals and re-embeds the index
+  with a known-good model if anything differs;
+- then pins commits, hashes, mirrors through the registry, blocks hub egress and records the model in an
+  AI-BOM so the next advisory maps to deployments in minutes.
 
 ## Use cases & projects
 ### Use cases

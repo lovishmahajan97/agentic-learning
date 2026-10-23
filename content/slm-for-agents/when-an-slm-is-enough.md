@@ -5,7 +5,7 @@ name: When an SLM is enough (task fit, cost, latency, privacy)
 kind: decision
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -104,7 +104,7 @@ Both models sit behind OpenAI-compatible endpoints (here Ollama locally and any 
 harness compares them. Replace the model names with your candidates.
 
 ```python
-# Checked with openai 3.36 (Python SDK) on Python 3.12; any OpenAI-compatible server works.
+# Run with openai 3.37 (Python SDK) on Python 3.12 against a mock server; any OpenAI-compatible server works.
 import json
 from openai import OpenAI
 
@@ -152,8 +152,8 @@ roughly 60%, while the two hardest calls keep frontier quality.
 - **Gate with a golden set in CI.** Re-run each step's golden set when the prompt, model or quantization
   changes; block the change if the pass rate drops beyond tolerance.
 - **Price the server, not the token.** For self-hosting, compute cost per task from GPU hours at real
-  utilisation. Below some volume, a dedicated GPU idling most of the day costs more per task than a hosted
-  small or large model.
+  utilisation. Below some volume, a mostly idle dedicated GPU costs more per task than a hosted small or
+  large model.
 - **Keep private steps local by policy.** Mark steps that touch regulated fields and route them only to
   self-hosted models, enforced in the gateway rather than by convention.
 
@@ -189,8 +189,8 @@ roughly 60%, while the two hardest calls keep frontier quality.
 - **Measure** pass rate per step against the large model, escalation rate, cost per task and p95 latency.
 
 ## Exercise
-**Goal:** estimate, before building anything, which steps of one agent should move to an SLM and what that
-saves. No solution is given.
+**Goal:** estimate, before building, which steps of one agent should move to an SLM and the saving. No
+solution is given.
 - **Inputs:** 100+ traced runs (yours or synthetic) with calls tagged by step and tokens; prices for a large
   and a small model; an assumed escalation rate per step.
 - **Deliver:** a script printing cost per task for all-large and for your routing, counting escalated calls
@@ -275,11 +275,12 @@ cost per task, because a high escalation rate erases the savings.
 model memory, and a summary for the partner. Which steps go small, and what do you change?
 
 **A strong answer:**
-- sees privacy forces every step onto self-hosted models, so low volume no longer decides it; the question
-  is size and design per step;
-- moves classifier and extraction small with validators, and replaces memory recall with retrieval over the
-  firm's sources, because SLMs hallucinate facts;
-- keeps escalation inside the boundary (larger self-hosted model or human) and evals on site.
+- sees privacy forces every step self-hosted, so volume no longer decides; the question is size and design
+  per step;
+- moves classifier and extraction small with validators, evals the 12 labels one by one (above the 3-8 sweet
+  spot), and replaces memory recall with retrieval over the firm's sources;
+- keeps the summary on the largest self-hosted model, judge-rated; escalation stays inside the boundary
+  (bigger model or human).
 
 ## Use cases & projects
 ### Use cases
@@ -289,8 +290,8 @@ model memory, and a summary for the partner. Which steps go small, and what do y
   because records cannot leave their network.
 - **High-volume back-office extraction.** Invoice, form and email extraction agents process thousands of
   documents a day where per-call cost decides feasibility.
-- **Latency-critical steps.** Voice and in-product assistants use a local SLM for intent and slot filling so
-  the first response arrives quickly.
+- **Latency-critical steps.** Voice and in-product assistants use a local SLM for intent and slot filling to
+  answer fast.
 
 ### Mini project
 **Per-step SLM audit of an existing agent (2-3 hours).**

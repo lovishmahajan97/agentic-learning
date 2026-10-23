@@ -5,7 +5,7 @@ name: Linear algebra intuition
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -46,8 +46,8 @@ and debug retrieval that returns the wrong chunks.
   definition is linear algebra.
 - **Ranking millions of items must be fast.** A matrix-vector product scores every stored vector against
   a query in one operation that hardware is built for.
-- **Raw dot products mix two things.** They reward both direction (topic) and length (often driven by
-  text length or model quirks), so a long generic chunk can outrank a short exact one.
+- **Raw dot products mix two things.** They reward both direction (topic) and length (which, depending on the
+  model, can track text length or other quirks), so a long generic chunk can outrank a short exact one.
 - **Memory is arithmetic.** One million 1,536-dimension float32 vectors take 6.144 GB before any index
   overhead, and that number sets your vector store bill.
 
@@ -161,7 +161,7 @@ embedding call did not normalize.
 ## Production patterns
 - **Normalize once, at write time.** If the embedding model's docs recommend cosine, normalize vectors
   before storing (many libraries expose a flag such as `normalize_embeddings=True` in
-  sentence-transformers) and use inner product in the index. Monitor norms of stored vectors: they should
+  sentence-transformers `encode`, present in 2.x and later) and use inner product in the index. Monitor norms of stored vectors: they should
   all be 1.0.
 - **Match the metric to the model.** Read the embedding model card for its intended similarity; some
   models are trained for dot product with meaningful norms. Record the metric next to the model name in
@@ -209,7 +209,9 @@ embedding call did not normalize.
 - **Deliver:** recall@5 for raw dot product, cosine, and L2 on normalized vectors; a scatter of chunk
   length versus vector norm; and the raw memory for your corpus at float32 and int8.
 - **Acceptance:** cosine and normalized L2 give identical rankings; you can explain any difference from
-  raw dot product using the norms you printed; one memory figure is checked by hand.
+  raw dot product using the norms you printed; one memory figure is checked by hand. If every norm is
+  already 1.0, your model normalizes for you (many embedding APIs do): record that, and repeat with a
+  model whose raw output is not unit length to see the effect.
 
 ## Role lens
 - **Engineer:** Configures vector stores with the right metric, normalizes at write time, asserts
@@ -223,8 +225,9 @@ embedding call did not normalize.
 **Q:** You index 5 million chunks with a 1,024-dimension model in float32 using inner product, without
 normalizing. Users report that long policy documents appear for every question. What is wrong and
 what does the index cost in raw memory?
-**A:** Inner product on unnormalized vectors rewards vector length as well as direction, and longer or
-denser chunks tend to have larger norms, so they win regardless of topic. Normalize every vector to unit
+**A:** Inner product on unnormalized vectors rewards vector length as well as direction, and with this
+model the long, dense policy chunks evidently have the largest norms (confirm by printing them), so
+they win regardless of topic. Normalize every vector to unit
 length and re-index, or switch the metric to cosine; on unit vectors dot product, cosine and L2 all rank the
 same. Raw memory is 5,000,000 × 1,024 × 4 bytes ≈ 20.5 GB before index overhead, about half that in
 float16.
@@ -279,15 +282,24 @@ float16.
 > metadata add more on top of this raw figure.
 
 ## Mastery test
-**Problem:** a tool-routing agent picks a tool by embedding the user request and comparing it with
-embedded tool descriptions. After a teammate adds very long descriptions to two tools, those two tools
-get picked for almost everything. The index uses inner product. Explain and fix it.
+**Problem:** an agent's semantic cache returns a stored answer when cosine similarity between a new
+request and a cached one is at least 0.92, using 1,536-dimension unit vectors.
+
+To cut memory for 2 million entries, the team moves to a store that only supports Euclidean distance and truncates every
+stored and query vector to its first 256 components. The hit rate jumps from 18% to 41% and users get
+wrong cached answers.
+
+What threshold matches the old rule, why did hits jump, and what did memory drop to?
 
 **A strong answer:**
-- explains that longer descriptions produced larger-norm vectors that inner product rewards;
-- checks by printing norms and scores per tool for a few requests;
-- normalizes tool and query vectors (or uses cosine) and re-embeds the tool set;
-- adds a labeled routing eval and an assertion that stored norms are 1.
+- converts the rule with ‖a − b‖² = 2 − 2·cosine: cosine ≥ 0.92 means squared L2 ≤ 0.16, or L2 ≤ 0.4,
+  and checks whether the store reports distance or squared distance;
+- explains the jump: truncated vectors are no longer unit length (norms well below 1), and dropping
+  components can only shrink distances, so far more pairs fall under a threshold set for unit vectors;
+- re-normalizes after truncating, then re-tunes the threshold on labeled same-intent and
+  different-intent request pairs, because 256-dimension similarities are distributed differently;
+- computes memory: 2,000,000 × 1,536 × 4 bytes ≈ 12.3 GB raw becomes 2,000,000 × 256 × 4 ≈ 2.05 GB,
+  before index overhead, and tracks wrong-hit rate, not just hit rate, after the change.
 
 ## Use cases & projects
 ### Use cases

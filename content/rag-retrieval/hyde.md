@@ -5,7 +5,7 @@ name: HyDE (Hypothetical Document Embeddings)
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -37,8 +37,8 @@ draft the agent writes into the tool call.
 - **Why it matters for agents.** When an agent's searches over a generic embedder keep returning FAQ-style
   near misses, HyDE can lift recall without labels. Every generation it adds is paid on each search call,
   and agents search several times per task.
-- **Where it shows up in your stack.** LangChain's `HypotheticalDocumentEmbedder`, LlamaIndex's HyDE query
-  transform, or a few lines inside your own search tool; the embedder's query and passage modes; the
+- **Where it shows up in your stack.** LangChain's `HypotheticalDocumentEmbedder` (`langchain-classic` since
+  1.0), LlamaIndex's HyDE query transform, or a few lines in your search tool; the embedder's query and passage modes; the
   reranker.
 - **What you control.** Whether HyDE runs always, as a fallback on weak first-pass scores, or from a draft
   the agent writes as a tool argument; the number of samples; and keeping the hypothetical out of evidence.
@@ -414,8 +414,8 @@ lifted recall in a demo on public cloud docs. Do you agree?
 **A strong answer:**
 - doubts the demo transfers: the model cannot write plausibly about private parts, so hypotheticals go
   generic or confuse entities, and part codes need the original query in BM25;
-- notes the generation runs on every search at high volume, so index-time question generation or an
-  instruction-prefixed embedder is likely cheaper;
+- notes HyDE costs a generation per search, so index-time question generation (40k generations once,
+  not 2 million a month) or an instruction-prefixed embedder is likely cheaper;
 - proposes measuring recall@k on the real golden set, HyDE only as a fallback if it wins.
 
 ## Use cases & projects

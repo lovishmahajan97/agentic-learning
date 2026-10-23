@@ -126,7 +126,9 @@ history, and a `fixup!` commit is folded into its target non-interactively (test
 set -e
 export GIT_CONFIG_GLOBAL=/dev/null                   # ignore personal config for a clean demo
 export GIT_AUTHOR_NAME=demo GIT_AUTHOR_EMAIL=demo@example.com GIT_COMMITTER_NAME=demo GIT_COMMITTER_EMAIL=demo@example.com
-rm -rf /tmp/efund/repo && mkdir /tmp/efund/repo && cd /tmp/efund/repo
+rm -rf /tmp/efund/repo
+mkdir -p /tmp/efund/repo                             # separate lines: set -e ignores failures inside &&
+cd /tmp/efund/repo                                   # chains, so a failed mkdir would leave you in the cwd
 git init -q -b main
 printf 'def top_k(scores, k):\n    return sorted(scores, reverse=True)[:k]\n' > rank.py
 printf 'from rank import top_k\nassert top_k([0.2, 0.9, 0.5], 2) == [0.9, 0.5]\n' > check.py
@@ -161,7 +163,8 @@ git log --oneline main..HEAD
 ```
 
 - **Why the check script matters:** bisect is only as good as the command it runs. Exit 0 means good,
-  1-127 bad, and 125 means "cannot test this commit, skip it".
+  125 means "cannot test this commit, skip it", any other code from 1 to 127 means bad, and a code
+  above 127 aborts the bisect.
 - **On a real branch** you would drop the bad commit with an interactive rebase before review instead
   of reverting; revert is the tool once a commit is on a shared branch.
 
@@ -212,7 +215,8 @@ An assistant produced a 180-line `fetch_invoice` tool with tests, all green in C
   production. Diagnose: check the lockfile diff and grep the diff for broad `except` clauses and
   `shell=True` before reading the rest. Fix: the checklist, and run the code yourself.
 - **Committing secrets.** Symptom: an API key appears in history, or a secret scanner alerts. Diagnose:
-  `git log -p -S'sk-'` (or the key's prefix) to find every commit containing it. Fix: rotate the key
+  `git log -p --all -S'sk-'` (or the key's prefix) to find every commit on every branch that adds or
+  removes it. Fix: rotate the key
   first, then purge history; deleting the file in a new commit does not remove it from history.
 
 ## When to use
@@ -317,6 +321,8 @@ last month came from its PRs: one added a dependency with a typo-squatted name, 
 - runs the eval set whenever `prompts/` or model config changes, posts the score delta, and blocks
   regressions past a threshold;
 - limits the agent's PR size and scope, and keeps a human approval requirement on `main`;
+- gives the coding agent a token that can open PRs but not approve or merge, and adds CODEOWNERS
+  review for `prompts/` and dependency files so those changes reach the people who own them;
 - adds the two incidents as regression checks (the dependency rule and the router eval cases);
 - tracks escaped defects per PR source to see whether the gates work.
 

@@ -149,7 +149,7 @@ flowchart TD
 ### A multi-dimension budget with projection and sub-budgets
 - **What it does:** caps steps, tokens and seconds with one soft warning at 80% of whichever is closest;
   refuses a call whose *projected* cost breaches the token limit and returns a labelled partial; and
-  `child()` / `absorb()` fund a sub-agent from what remains, so delegation cannot overspend.
+  `child()` / `absorb()` fund a sub-agent from what remains and debit the parent on its return.
 
 Why the warning also fires on `last`, traced for a run whose context grows by about 15k tokens per step
 (step *n* sends roughly 15k × n; cumulative spend after *n* steps is 15k × n(n+1)/2):
@@ -403,17 +403,16 @@ larger payloads. Report the exhaustion rate by task class rather than lowering t
 > can resume. Returning the last message as success hides the failure; discarding loses the work.
 
 ## Mastery test
-**Problem:** a support agent has a 20-step cap and no other budget. After a search tool starts returning
-full documents instead of snippets, cost per run triples while steps stay flat, and the fleet hits its
-provider rate limit at peak. What failed, and what do you add?
+**Problem:** a parent on the example's default `Budget` has used 4 steps and 100k tokens. It spawns 4
+parallel sub-agents with `child()` before any returns. All succeed, yet the parent's synthesis call is
+refused. Compute each child's allowance and redesign the funding.
 
 **A strong answer:**
-- explains that each step now carries a larger tool result that is re-sent on every later call, so
-  tokens rise with flat steps;
-- adds a token or money budget with projection, and a cap or truncation on tool output size;
-- adds a tenant or platform token quota and a concurrency cap, because in-budget runs together hit
-  the rate limit;
-- names the signals: tokens per step, tool output size per tool, quota burn rate.
+- 0.75 × 0.25 = 0.1875 each: 3 steps, 75k tokens, 112.5 s, so four take all 300k left;
+- nothing is debited until `absorb()`, so parallel spawns slice the same remainder, with no reserve for
+  the parent's synthesis;
+- reserve the parent's remaining work first, debit each allowance at spawn, refund unused on return;
+- check 3 steps against the children's success p95; fund fewer children if too low.
 
 ## Use cases & projects
 ### Use cases

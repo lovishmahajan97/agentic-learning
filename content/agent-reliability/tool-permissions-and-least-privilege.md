@@ -5,7 +5,7 @@ name: Tool permissions & least privilege
 kind: practice
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -164,6 +164,7 @@ class Policy:
     write_roots: tuple[Path, ...] = ()
     egress_allow: tuple[str, ...] = ()              # hostname globs
     needs_approval: set[str] = field(default_factory=set)
+    version: str = "v1"                             # stamped on every audit row
 
 RESEARCH = Policy({"read_file", "search", "http_get"}, egress_allow=("*.internal.example",))
 CODING = Policy({"read_file", "write_file", "run_tests"}, write_roots=(Path("/workspace/task-123"),))
@@ -185,7 +186,8 @@ def check(policy: Policy, name: str, args: dict) -> str:
 
 def execute(policy, name, args, *, user, run_id, approve, vault, tools, audit):
     verdict = check(policy, name, args)
-    audit.write(run_id=run_id, user=user, tool=name, args=args, verdict=verdict)
+    audit.write(run_id=run_id, user=user, tool=name, args=args, verdict=verdict,
+                policy_version=policy.version)
     if verdict == "deny":
         return {"ok": False, "error": f"{name} is not permitted in this task"}  # model re-plans
     if verdict == "ask" and not approve(name, args):

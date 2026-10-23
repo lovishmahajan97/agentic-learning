@@ -5,7 +5,7 @@ name: Task-specific acceptance criteria
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -196,13 +196,16 @@ def gate(results):                     # results: [(slice, [(name, passed, sever
     verdict["ship"] = not hard_fail and all(ok for _, ok in verdict["soft"].values())
     return verdict
 
-# demo: 49 clean tickets and one whose summary carries an email address
+# demo: 46 clean tickets, 3 miscategorised, and one whose summary carries an email address
 lab = {"category": "billing", "priority": "P2"}
 ok = json.dumps({"category": "billing", "priority": "P2", "summary": "Customer was charged twice"})
+wrong = json.dumps({"category": "refund", "priority": "P2", "summary": "Customer was charged twice"})
 bad = json.dumps({"category": "billing", "priority": "P2", "summary": "Reply to ann@example.com"})
 t = {"text": "I was charged twice"}
-v = gate([("billing", list(checks(t, ok, lab)))] * 49 + [("billing", list(checks(t, bad, lab)))])
-print(v["blocking"], v["ship"])        # [('billing', 'no_pii_in_summary')] False
+rows = [list(checks(t, ok, lab))] * 46 + [list(checks(t, wrong, lab))] * 3 + [list(checks(t, bad, lab))]
+v = gate([("billing", r) for r in rows])
+print(v["blocking"], v["soft"]["category_correct/all"], v["ship"])
+# [('billing', 'no_pii_in_summary')] (0.94, True) False
 ```
 
 - **Intended behaviour:** a single ticket whose summary contains an email address blocks the release

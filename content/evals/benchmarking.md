@@ -5,7 +5,7 @@ name: Benchmarking (MMLU, HumanEval, SWE-bench, GPQA)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -277,7 +277,7 @@ reaches a selection memo.
   computed as above. Monitor how often memo rankings agree with the golden-dataset run that follows.
 - **Reproduce before trusting.** Re-run claimed scores with an open harness such as EleutherAI's
   lm-evaluation-harness (for example `lm_eval --tasks mmlu --num_fewshot 5`, plus `--model` and
-  `--model_args` naming the model under test) or Inspect, pinning the
+  `--model_args` naming the model under test; flags as of lm-eval 0.4.x) or Inspect, pinning the
   same protocol for every model. Monitor the gap between your number and the reported one.
 - **Benchmark in your own scaffold.** For coding agents, run SWE-bench Verified instances through your
   agent loop and tools, and log resolved rate and cost per task together. Monitor cost per resolved

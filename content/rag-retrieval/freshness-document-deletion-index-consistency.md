@@ -5,7 +5,7 @@ name: Freshness, document deletion and index consistency
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -234,9 +234,9 @@ def chunk_ids(doc_id, version, n):
 
 def index_document(store, bm25, embed, split, doc_id, text, manifest, tombstones):
     version = hashlib.sha256(text.encode()).hexdigest()[:16]
-    tombstones.discard(doc_id)                              # a re-created document must become visible
-    if manifest.get(doc_id) == version:
+    if manifest.get(doc_id) == version and doc_id not in tombstones:
         return "unchanged"                                  # content hash: no embedding call needed
+    tombstones.discard(doc_id)                              # a re-created document must become visible
     chunks = split(text)
     ids = chunk_ids(doc_id, version, len(chunks))
     meta = [{"doc_id": doc_id, "version": version, "chunk": i, "indexed_at": time.time()}
@@ -245,7 +245,7 @@ def index_document(store, bm25, embed, split, doc_id, text, manifest, tombstones
     bm25.upsert(ids, chunks, meta)
     old = manifest.get(doc_id)
     manifest[doc_id] = version                              # 2. flip the pointer
-    if old:                                                 # 3. delete old chunks by filter, not by count
+    if old and old != version:                              # 3. delete old chunks by filter, not by count
         store.delete(filter={"doc_id": doc_id, "version": old})
         bm25.delete(filter={"doc_id": doc_id, "version": old})
     return "updated"
@@ -331,7 +331,7 @@ that window every agent run that quotes the price uses the old one.
   document hashes keyed by a source id and can clean up chunks of changed or vanished sources ("incremental"
   or "full" cleanup); LlamaIndex ingestion pipelines can attach a docstore for upsert-and-delete behaviour.
   Both are a manifest you did not write, so still run leak probes against every store (checked against
-  `langchain_core.indexing.index`, langchain-core 1.6).
+  `langchain_core.indexing.index`, langchain-core 1.7.0).
 - **Default-filter archived documents.** Set `status: current | archived` at ingestion and apply
   `status = current` as a default filter, lifting it only when the query is explicitly historical.
   Monitor how often both a document and its `superseded_by` successor appear in one result set.
@@ -404,7 +404,7 @@ fresh and deletable through edits, deletes and a broken connector. No solution i
 - **Inputs:** 30 short text files in a folder (make three of them near-identical "2024" and "2025"
   policy pairs), any vector store or a dict, and a BM25 index or a second dict as the keyword leg.
 - **Constraints:** deterministic chunk ids, write-new-then-delete-old, a manifest, a tombstone set and a
-  deletion-fraction breaker; the agent-facing tool returns `version` and `modified_at`.
+  deletion-fraction breaker sized so 2 of 30 deletions pass; the agent-facing tool returns `version` and `modified_at`.
 - **Deliver:** a sync script, the tool, and a test file that edits two files (one shrinking by at least
   two chunks), deletes two, then simulates an empty listing.
 - **Acceptance:** after one sync, no chunk of an old version exists in either leg; a probe for a

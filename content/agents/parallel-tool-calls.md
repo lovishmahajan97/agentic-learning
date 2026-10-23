@@ -5,8 +5,13 @@ name: Parallel tool calls
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/tool-calling
+  - python-for-ai/asyncio
 related:
   - agents/tool-calling
   - agents/agent-loop
@@ -177,6 +182,19 @@ async def execute_turn(response) -> dict:
 # inside the loop:
 #   messages.append({"role": "assistant", "content": response.content})
 #   messages.append(await execute_turn(response))
+
+# try it offline (Python 3.10+): fake blocks shaped like SDK tool_use blocks
+from types import SimpleNamespace as NS
+
+async def get_order(order_id):  await asyncio.sleep(0.2); return {"order_id": order_id, "status": "open"}
+async def get_weather(city):    raise LookupError(f"no station for {city}")
+async def refund(order_id):     return {"order_id": order_id, "refunded": True}
+HANDLERS = {"get_order": get_order, "get_weather": get_weather, "refund": refund}
+
+resp = NS(content=[NS(type="tool_use", id="t1", name="get_order", input={"order_id": "A1"}),
+                   NS(type="tool_use", id="t2", name="get_weather", input={"city": "Oslo"}),
+                   NS(type="tool_use", id="t3", name="refund", input={"order_id": "A1"})])
+print(asyncio.run(execute_turn(resp)))   # t1 ok, t2 is_error, t3 ok; one message, model's order
 ```
 
 ### See the speedup and the isolation locally
@@ -241,16 +259,19 @@ asyncio.run(main())
 
 ## Pitfalls
 - **On the Claude API, splitting results into separate user messages.** Symptom: an API error about
-  unanswered tool calls, or a model that stops batching after a few turns. Fix: one message, every call.
+  unanswered tool calls, or a model that stops batching after a few turns. Diagnose: count `tool_use` ids
+  per assistant turn against `tool_result` ids in the next user message. Fix: one message, every call.
 - **Using `gather` without isolating failures.** Symptom: one 404 cancelling every sibling call and a turn
-  with no results at all. Fix: a `run_one` that never raises.
+  with no results at all. Diagnose: turns where results returned is below calls emitted, with an
+  exception in the harness log. Fix: a `run_one` that never raises.
 - **Running writes concurrently.** Symptom: duplicated or out-of-order side effects that only appear under
-  load. Fix: serialize anything not marked parallel-safe.
+  load. Diagnose: log start and end times per call; look for overlapping writes to one record. Fix:
+  serialize anything not marked parallel-safe.
 - **No per-call timeout.** Symptom: a whole turn stalled on one slow upstream while the others finished long
-  ago. Fix: `asyncio.wait_for` per call.
+  ago. Diagnose: per-call duration spans; turn time equals the slowest call. Fix: `asyncio.wait_for` per call.
 - **Telling the model to "retry" a write that timed out.** The timeout cancelled your wait, not necessarily
-  the downstream operation. Symptom: a double charge or duplicate ticket, unless the write carries an
-  idempotency key or the model is told the outcome is unknown and checks first.
+  the downstream operation. Symptom: a double charge or duplicate ticket. Diagnose: match timed-out calls
+  to downstream records. Fix: an idempotency key, and an "outcome unknown, check first" result.
 - **Dropping the result for a call the policy refused to run.** Symptom: a protocol error. Fix: an `is_error`
   result saying the call was declined.
 
@@ -262,8 +283,16 @@ asyncio.run(main())
 - **Measure** average calls per assistant turn (stuck at one means the model is not batching, usually
   because the transcript taught it not to), wall-clock per step, and error rate under concurrency.
 - **Day to day** the bugs are in the harness: isolation, timeouts, caps and the one-message rule.
-- **Interviews:** "what changes in your loop to support parallel calls" tests whether someone has built one;
-  answer scheduling by contract metadata, failure isolation, and completeness of the result message.
+
+## Exercise
+**Goal:** build the turn executor for a support agent with mixed tools and prove it under failure. No
+solution is given.
+- **Inputs:** three simulated reads (0.5-2 s, one sometimes raises, one sometimes hangs), two writes to
+  the same order, an upstream limit of 3 concurrent calls, and recorded multi-call turns.
+- **Deliver:** an executor with per-upstream caps, timeouts and write serialization, plus offline tests.
+- **Acceptance:** every `tool_use` id gets exactly one result in one message; a hang yields `is_error`
+  within the timeout; a span log shows no overlapping writes and never more than 3 concurrent calls;
+  a four-read turn takes about the slowest read, not the sum.
 
 ## Role lens
 - **Engineer:** Implements concurrent execution with a semaphore, per-call timeouts and failure
@@ -300,22 +329,12 @@ effects it must be excluded from the concurrent group. Confirm with calls per tu
 - **So** writes run sequentially in the model's order, or behind an approval gate, unless the contract marks
   them parallel-safe.
 
-### Estimate the latency saved by batching four independent lookups.
-- **Illustrative:** 3 s per model call and 1 s per tool call.
-- **Sequential:** 4 × (3 + 1) + 3 = 19 s. **Batched:** 3 + 1 + 3 = 7 s.
-- **Plus** one assistant turn instead of four, so later turns resend a shorter transcript.
-
 ### You enabled parallel calls but the model still calls one tool per turn. Why?
 - **Check the transcript shape first:** results split across messages teach the model, in context, to make
   calls one at a time.
 - **Check the instructions:** add "request independent lookups in the same turn" to the system prompt.
 - **Check for real dependencies:** if B needs A's output, sequential is correct; consider programmatic tool
   calling for long chains.
-
-### When would you disable parallel tool calls entirely?
-- **Write-heavy, low-volume agents** where ordering and correctness matter more than seconds.
-- **Fragile downstream systems** that cannot absorb bursts even with caps.
-- **The cost** is giving up the latency win, so measure wall-clock per task before and after.
 
 ### Your framework runs every call in a turn concurrently, writes included. How do you make it safe?
 - **Classify tools in your own registry** as read-only or side-effecting, because the framework does not
@@ -352,6 +371,17 @@ effects it must be excluded from the concurrent group. Confirm with calls per tu
 > Every `tool_use` needs a `tool_result`, and an error result tells the model what happened so it can
 > retry just that call. An empty result looks like success, and re-running the successful calls wastes
 > time and may duplicate side effects.
+
+## Mastery test
+**Problem:** after enabling parallel calls, a travel agent books two hotel rooms for some trips and its
+p95 turn time rose although median fell. One turn holds `search_hotels` x6, `book_room` and
+`get_trip`. Diagnose and redesign the executor.
+
+**A strong answer:**
+- double bookings: `book_room` timed out, the model retried, the first booking landed; idempotency key
+  plus "outcome unknown" result;
+- p95: six searches burst one provider's rate limit, so 429 retries stretch the slowest call; per-upstream cap;
+- `book_room` excluded from the concurrent set, and verifies with spans and calls per turn.
 
 ## Use cases & projects
 ### Use cases

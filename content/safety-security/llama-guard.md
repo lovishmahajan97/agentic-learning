@@ -5,8 +5,13 @@ name: Llama Guard
 kind: tool
 difficulty: core
 est_minutes: 13
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - safety-security/input-output-guardrails
+  - ml-fundamentals/precision-recall-f1
 related:
   - safety-security/content-moderation
   - safety-security/input-output-guardrails
@@ -229,8 +234,8 @@ labelled sample of 500 of your own prompts (50 truly unsafe, 450 benign; illustr
 | `p_unsafe > 0.5` | 46 of 50 | 9 of 450 (2%) | 0.84 | 0.92 |
 | 0.2 | 49 of 50 | 30 of 450 (6.7%) | 0.62 | 0.98 |
 
-- **Which point is right is a product decision** about the cost of a miss versus a false refusal, and you
-  can only make it with the score, not with the argmax verdict.
+- **Which point is right is a product decision** about the cost of a miss versus a false refusal, made with
+  the score, not the argmax.
 
 A sweep over your own labelled sample, pure Python:
 
@@ -289,14 +294,19 @@ sweep(sample)
 ## Pitfalls
 - **Using Llama Guard as the prompt-injection defence.** Symptom: injected instructions in retrieved
   documents or tool results pass straight through, because they contain nothing the hazard taxonomy
-  recognises.
+  recognises. Diagnose: score a set of injected tool results and log `p_unsafe`. Fix: tool scopes and taint
+  rules.
 - **Checking only the input.** Symptom: a benign question produces a harmful answer that nothing inspected.
+  Fix: an output rail judged with the question in view.
 - **Taking the argmax verdict and ignoring the probability.** Symptom: a product that is too strict or too
-  lax with no knob to adjust.
+  lax with no knob to adjust. Diagnose: log `p_unsafe` per rail and plot its distribution on labelled
+  traffic. Fix: thresholds from the sweep.
 - **Upgrading versions without re-running the eval set.** Symptom: a shift in refusal rate because category
-  definitions changed between taxonomies.
+  definitions changed between taxonomies. Diagnose: block rate per category code, old versus new, in
+  shadow mode. Fix: re-pick thresholds before enforcing.
 - **Assuming categories mean what your legal or trust team means.** Symptom: "specialised advice" blocks the
-  core use case of a finance or medical product.
+  core use case of a finance or medical product. Diagnose: group false blocks by code. Fix: reword or drop
+  the category.
 
 ## When to use
 - **Use when:** you need content-safety classification of prompts and replies inside your own
@@ -306,8 +316,15 @@ sweep(sample)
   enforced category, measure precision and recall at several thresholds for each rail separately, and pick
   thresholds per rail.
 - **Day to day:** a service behind the chat endpoint with its own dashboards for block rate and latency.
-- **Interviews:** explain why a generative classifier with policy in the prompt is customisable and how you
-  would get a score out of it.
+
+## Exercise
+**Goal:** choose and defend per-rail thresholds for one product. No solution is given.
+- **Inputs:** Llama Guard 3 1B or 8B (or any guard returning `p_unsafe`), about 100 prompts and 100 agent
+  replies you label for a chosen product, including ten on its core sensitive topic.
+- **Deliver:** a precision and recall table per rail at five thresholds, the chosen values with a
+  written miss-versus-false-refusal reason, and one reworded or dropped category.
+- **Acceptance:** `sweep` reproduces your table; a held-out 20% lands within a few points of it; the
+  core-topic prompts pass after the policy edit; an injected tool result is shown passing every rail.
 
 ## Role lens
 - **Engineer:** Serves the model behind an internal endpoint with prefix caching, wires input and output
@@ -334,12 +351,6 @@ appropriateness of supportive content, it is not a crisis detector, and it will 
 phrased outside its training distribution; those need domain-specific classifiers and human review.
 
 ## Interview questions
-### Why use a separate classifier like Llama Guard instead of asking the main model whether a message is safe?
-- **The main model is the one under attack,** was never evaluated as a classifier, and gives uncalibrated
-  prose verdicts at the highest cost per call.
-- **A dedicated guard** returns a parseable verdict and a probability, runs on cheaper hardware, survives
-  main-model swaps, and has its own measurable precision and recall.
-
 ### Your Llama Guard deployment blocks legitimate questions in a medical product. How do you fix it?
 - **Find the category:** block logs with codes will likely show specialised advice (or similar) firing on the
   core use case.
@@ -352,11 +363,6 @@ phrased outside its training distribution; those need domain-specific classifier
 - **Do not rely on it** for injection in tool results, tool authorization or data exfiltration; those need
   typed tools, scopes, taint rules and egress limits.
 - **Measure** block rates and latency per rail, so the guard does not quietly dominate step latency.
-
-### How do you get a confidence score out of a model that generates text?
-- **Locate the verdict token,** skipping any leading whitespace or newline tokens.
-- **Renormalise** its logits over `safe` and `unsafe` to get `p_unsafe`, then threshold per rail from a
-  labelled precision/recall sweep.
 
 ### When would you choose a hosted moderation API over self-hosting Llama Guard?
 - **Choose hosted** when data residency allows sending prompts out, the vendor taxonomy fits, and you do not
@@ -396,6 +402,19 @@ phrased outside its training distribution; those need domain-specific classifier
 > The verdict token carries the decision, so its probability (renormalised against `safe`) is a natural
 > confidence score; the paper evaluates this way and it lets input and output rails run at different
 > strictness, whereas sampled or self-reported numbers are not calibrated.
+
+## Mastery test
+**Problem:** a coding agent for students runs Python in a sandbox. After launch, 4% of normal homework
+requests are refused, while a red team got it to write a port scanner without any block. Using Llama
+Guard, what do you inspect and change?
+
+**A strong answer:**
+- groups refusals by rail and category code first, likely S14 or S2 on the action rail firing on benign
+  code, and checks that rail's threshold against a labelled sample;
+- notes a port scanner may not read as hazardous; reword S14 for this product, or add a zero-shot
+  category and measure it, budgeting a fine-tune if it stays weak;
+- keeps the sandbox (no network) as the real control, because the guard is a signal;
+- runs changes in shadow mode and reports per-rail precision and recall before enforcing.
 
 ## Use cases & projects
 ### Use cases

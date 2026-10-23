@@ -5,8 +5,13 @@ name: A/B testing
 kind: practice
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - math-for-ai/statistics-for-evaluation
+  - evals/offline-vs-online-evaluation
 related:
   - evals/offline-vs-online-evaluation
   - evals/pairwise-comparison
@@ -53,9 +58,9 @@ randomisation unit, one primary metric, fixed sample size, no peeking.
   Costs move with quality: 1% more resolved tickets at 40% more tokens per conversation may be a loss,
   which only a test with cost as a guardrail reveals.
 - **Randomisation removes confounders.** With a coin-flip assignment the only systematic difference
-  between arms is the change, so the outcome difference is effect plus quantifiable noise. It sits at
-  the top of the evaluation ladder, not instead of it, because it is slow, needs traffic and exposes real
-  users, so it is reserved for changes that passed the cheaper rungs.
+  between arms is the change, so the outcome difference is effect plus quantifiable noise. It tops the
+  evaluation ladder rather than replacing it: slow, traffic-hungry and exposing real users, it is kept
+  for changes that passed the cheaper rungs.
 
 ## How it works
 ### One hypothesis, one primary metric, guardrails
@@ -271,9 +276,8 @@ print(f"false-positive rate with daily peeks: {peeking_false_positive_rate():.2f
 - **Pre-registered experiment record.** Store hypothesis, primary metric, minimum detectable effect,
   sample size and planned end date before launch, and the decision after. Monitor the share of
   experiments whose primary metric changed after launch (it should be zero).
-- **Ramp with auto-stop.** Go 1%, then 10%, then 50/50, with automatic stop when a guardrail (error rate,
-  p95 latency, cost per conversation, refusal rate, and for agents the share of runs hitting the step
-  limit) breaches its threshold. Monitor guardrails in short windows during the ramp.
+- **Ramp with auto-stop.** 1%, 10%, then 50/50, stopping automatically when a guardrail (including,
+  for agents, the share of runs hitting the step limit) breaches. Monitor guardrails in short windows.
 - **CUPED by default.** Compute each user's pre-period value of the primary metric and apply the CUPED
   adjustment in the analysis pipeline. Monitor the achieved variance reduction per metric.
 - **Per-arm cache keys and pinned snapshots.** Include the arm in prompt or semantic cache keys and pin
@@ -293,19 +297,22 @@ print(f"false-positive rate with daily peeks: {peeking_false_positive_rate():.2f
 
 ## Pitfalls
 - **Randomising by user, analysing by request.** Symptom: many "significant" results that fail to
-  reproduce, because correlated requests counted as independent. Fix: per-user aggregation or delta method.
+  reproduce, because correlated requests counted as independent. Diagnose: run A/A tests through the
+  pipeline; a false-positive rate well above 5% is the tell. Fix: per-user aggregation or delta method.
 - **Peeking daily and stopping at the first significant day.** Symptom: a win rate across experiments far
-  above what effects justify, and shipped changes that do nothing. Fix: fixed horizon or sequential tests.
+  above what effects justify, and shipped changes that do nothing. Diagnose: compare each test's stop
+  date with its planned horizon. Fix: fixed horizon or sequential tests.
 - **Ignoring a sample ratio mismatch.** Symptom: a clean-looking lift caused by one arm silently dropping
-  users who hit an error. Fix: SRM gate before analysis.
+  users who hit an error. Diagnose: SRM p-value per day and per platform. Fix: SRM gate before analysis.
 - **Model-vs-model without pinned versions.** Symptom: a result that flips halfway through when the
-  provider updates one model. Fix: pin snapshots.
+  provider updates one model. Diagnose: log the served model version per request, plot the effect by
+  day. Fix: pin snapshots.
 - **Declaring the primary metric after seeing data.** Symptom: every experiment "winning" on a different
   metric. Fix: pre-registration.
 - **User randomisation when teammates share work.** Symptom: an effect that shrinks or vanishes at full
   rollout, because control users already benefited from treated colleagues. Fix: cluster randomisation.
 - **Stopping after three days.** Symptom: a weekday-only population and a novelty effect reported as a
-  durable lift. Fix: at least one weekly cycle.
+  durable lift. Diagnose: effect by week. Fix: at least one weekly cycle.
 
 ## When to use
 - **Use when:** a change is strategic or expensive enough to need a causal answer on user outcomes, the
@@ -315,8 +322,17 @@ print(f"false-positive rate with daily peeks: {peeking_false_positive_rate():.2f
   months. Use pairwise judging on shadow traffic and accept a weaker answer.
 - **Measure:** the primary metric with a confidence interval, the guardrails and the sample ratio; record
   every experiment with its hypothesis and decision.
-- **Interviews:** the randomisation-unit argument, a back-of-envelope sample size, and the peeking and SRM
-  failure modes.
+
+## Exercise
+**Goal:** prove an experiment pipeline is trustworthy before it decides anything about an agent. No
+solution is given.
+- **Inputs:** your bucketing function, exposure and outcome logs (real, or simulated users with several
+  correlated requests each), and a planned 50/50 split.
+- **Deliver:** 1,000 A/A tests analysed per user and per request; an injected bug that drops 3% of
+  one arm's users (those whose first session failed); CUPED on a pre-period covariate.
+- **Acceptance:** per-user A/A false positives land between 3.5% and 6.5% (the 95% range for 1,000
+  tests) and per-request ones visibly higher; the SRM gate (p < 0.001) flags the bug at your simulated
+  size, and you state the per-arm *n* below which it would not; the variance ratio is close to 1 − ρ².
 
 ## Role lens
 - **Engineer:** Implements deterministic bucketing with a per-experiment salt, logs assignment and
@@ -375,12 +391,6 @@ guardrails (latency, cost, escalations) are checked before anyone reads the prim
   code paths.
 - **Fix and rerun;** a lift computed on biased arms cannot be trusted.
 
-### When would you not run an A/B test at all?
-- **Too little traffic:** if the power analysis says months, as for small enterprise deployments.
-- **Cheap, reversible changes:** prompt tweaks belong to offline evals and canaries.
-- **Instead:** shadow mode with a validated pairwise judge, a larger minimum detectable effect, or
-  interleaving for rankers and retrievers.
-
 ## Quiz
 ### Q: A team randomises by user but computes significance over individual requests. What goes wrong?
 - [ ] The test loses power because users are counted once
@@ -409,6 +419,20 @@ guardrails (latency, cost, escalations) are checked before anyone reads the prim
 > users (errors, logging failures), which biases who remains. Any result computed on biased arms is
 > untrustworthy, so fix the pipeline first.
 
+## Mastery test
+**Problem:** an email-triage agent tests a new planner, per user, 6,000 users per arm, sample ratio
+fine. The primary metric, success per started task, rose 4 points (p = 0.01), but treatment users
+started 12% fewer tasks, and both arms call the model alias "latest". Ship?
+
+**A strong answer:**
+- spots a post-treatment denominator: success per task can rise while successes per user fall, if
+  harder tasks are abandoned (at a 50% baseline, 0.88 × 0.54 ≈ 0.475 vs 0.50 per user: about 5% fewer);
+- suspects the p = 0.01 if it treated tasks as independent under per-user assignment;
+- asks for successful tasks per user (delta method if a ratio is kept), as a new pre-registered test,
+  not a metric swapped after the fact;
+- checks served model versions per arm and day, since "latest" may have moved mid-test;
+- reads guardrails (cost per success, step-limit share) and does not ship yet.
+
 ## Use cases & projects
 ### Use cases
 - **Choosing between two agent models.** Users are bucketed to each model snapshot and compared on task
@@ -417,8 +441,6 @@ guardrails (latency, cost, escalations) are checked before anyone reads the prim
   escalation rates decide whether it stays.
 - **Catching costly wins.** A guardrail on tokens per conversation shows when a quality gain costs more
   than it is worth.
-- **Validating offline gains.** An A/B test confirms whether an offline eval improvement moves a real
-  user outcome.
 
 ### Mini project
 **Analyse a simulated A/B test of two agent versions (2-3 hours).**

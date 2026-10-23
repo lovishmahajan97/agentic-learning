@@ -5,7 +5,7 @@ name: Document parsing (OCR, layout, tables)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -217,7 +217,7 @@ def read_document(path: str, pages: list[int] | None = None, min_conf: float = 8
 | Citation | "the lease says" | "page 3 (scanned, unclear)" |
 
 The threshold `min_conf=80.0` and the page cap are illustrative; tune them on pages you have labelled.
-Checked with pdfplumber 0.11 and pytesseract 0.3.13 on a generated PDF; the OCR branch needs the
+Checked with pdfplumber 0.11.10 and pytesseract 0.3.13 on a generated PDF; the OCR branch needs the
 Tesseract binary installed and was exercised with a stub.
 
 ### Per-page parser with OCR fallback and row-wise tables

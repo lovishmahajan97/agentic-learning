@@ -5,7 +5,7 @@ name: pass@k
 kind: metric
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -134,9 +134,8 @@ pass@k ≈ 1 − Π_{i = n − c + 1}^{n} (1 − k / i)
   pass^8 ≈ 0.66, while one at p = 0.6 drops to about 0.02.
 
 ## Diagram
-The evaluation pipeline for an agent or a code model: run n times per task at a fixed temperature,
-verify each final state in a sandbox, estimate per task, then average. The dotted path is the pooled
-shortcut that overestimates.
+For an agent or a code model: run n times per task at a fixed temperature, verify each final state in
+a sandbox, estimate per task, then average; the dotted path is the pooled shortcut that overestimates.
 
 ```mermaid
 flowchart TD
@@ -288,7 +287,7 @@ Two problems, k = 5. Problem 1 has p = 0.9; problem 2 has p = 0.
 - **Headroom vs realisability.** A larger k reveals headroom, but that headroom is only realisable with a
   verifier or test oracle; with no cheap check, pass@1 or maj@k is the honest number to publish.
 - **Variance vs inference cost.** More samples per problem reduce estimator variance but cost n×
-  inference; use a small n for the pass@1 trend in CI and a large n only when comparing models carefully.
+  inference, hence a small n for the CI trend and a large n for model comparisons.
 - **pass@k vs pass@1 temperature.** Higher temperature raises pass@k for large k and lowers pass@1; a
   product that serves one answer should tune and report at the temperature it ships with.
 - **Objective vs incomplete oracle.** Tests are objective but incomplete: a sample can pass visible tests
@@ -330,8 +329,8 @@ you build, from repeated runs. No solution is given.
 - **Deliver:** a per-task table of c, pass@1, pass@3 and pass^3, the means, the three flakiest tasks with
   one read trace each, and the number you would put on the release report.
 - **Acceptance:** your estimator matches a brute-force average over all k-subsets of the runs for one
-  task; rerunning with a new seed moves mean pass@1 by less than its standard error; pooling c and n
-  gives a different pass@3, and you can say why.
+  task; a full rerun moves mean pass@1 by under 2√2 ≈ 2.8 standard errors (the noise of a difference);
+  pooling c and n gives a different pass@3, and you can say why.
 
 ## Role lens
 - **Engineer:** Implements the product-form estimator, runs samples in a sandbox against hidden tests,
@@ -384,8 +383,8 @@ rerun similar queries daily, report pass^k as well, since reliability is what th
   the first thing to fix.
 
 ### How would you budget samples for a 500-problem benchmark?
-- **For a pass@1 trend in CI,** a few samples per problem at the shipping temperature is enough when the
-  per-problem estimates are averaged over 500 problems.
+- **For a pass@1 trend in CI,** a few samples per problem at the shipping temperature suffice when
+  averaged over 500 problems.
 - **For pass@k at large k,** n must be at least k and preferably well above it; Chen et al. used n = 200
   to report up to k = 100.
 - **Cost scales as problems × n × sandbox time,** so run the large-n protocol only for model selection.
@@ -423,7 +422,8 @@ success". Bookings cannot be undone. What do you report and recommend?
 
 **A strong answer:**
 - rejects pass@5 as deliverable: blind retries of a non-idempotent action can double-book, and only a
-  verifier that checks before committing could realise any of the headroom;
+  verifier that checks before committing could realise any of the headroom, and live retries share
+  state (the slot is gone), unlike independent fresh-sandbox runs;
 - reports pass@1 per task and pass^k for repeat users, and computes per-task pass^5 to find flaky tasks;
 - recommends a dry-run or confirm step so retries happen before the commit, then re-measures the
   realised success rate of that design, not pass@k.
@@ -433,7 +433,7 @@ success". Bookings cannot be undone. What do you report and recommend?
 - **Reliability reports for customer agents.** pass^k shows how often a task that users repeat daily
   works every time, which single-run accuracy hides.
 - **Sizing retry and best-of-n loops.** The gap between pass@1 and pass@k says how much a verifier plus
-  retries can recover, and at what cost in runs.
+  retries can recover.
 - **Finding flaky tasks.** Per-task pass counts over n runs separate tasks that always fail from tasks
   the agent solves only sometimes.
 

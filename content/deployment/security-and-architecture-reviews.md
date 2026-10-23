@@ -5,8 +5,12 @@ name: Security & architecture reviews
 kind: practice
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - security-governance-compliance/threat-modeling
 related:
   - deployment/security-questionnaires
   - deployment/compliance-constraints
@@ -46,14 +50,13 @@ accurate diagram, a threat model and evidence tests; leave with dated findings.
 - **Those answers depend on the deployment**, so large organizations route new systems through an
   architecture review board and a security review before production access is granted. Good engineering
   teams run the same review on their own designs before building.
-- **Without a review, problems surface in the worst places:** an over-privileged service account noticed
-  during an incident, a data path to an unapproved region found by an auditor, an agent's tool that can
-  modify records discovered by a user. Fixing design after deployment costs far more than changing a diagram.
-- **Marketing slides fail.** Reviewers want specifics: every data store, every boundary crossing, every
-  credential. Vague answers produce a long list of open actions and a second meeting weeks later.
-- **AI makes it harder.** Reviewers often meet LLM-specific risks for the first time and need you to
-  explain how the model can be manipulated and what bounds the damage. The vendor who brings that
-  analysis unprompted earns trust a slide deck cannot.
+- **Without a review, problems surface in the worst places:** an over-privileged service account found in
+  an incident, a path to an unapproved region found by an auditor, a record-modifying tool found by a
+  user. Fixing design after deployment costs far more than changing a diagram.
+- **Marketing slides fail.** Reviewers want every data store, boundary crossing and credential; vague
+  answers produce open actions and a second meeting weeks later.
+- **AI makes it harder.** Reviewers often meet LLM risks for the first time and need you to explain how
+  the model can be manipulated and what bounds the damage; bringing that unprompted earns trust.
 
 ## How it works
 ### The typical flow
@@ -89,9 +92,8 @@ accurate diagram, a threat model and evidence tests; leave with dated findings.
   evals and red-team results for injection.
 
 ### Applying STRIDE at a boundary
-A threat model is not a list of scary words; it is the same six questions asked wherever data or control
-crosses a trust boundary. It works *because* boundaries are finite and enumerable, while "think of
-attacks" is not. In an agent, the critical boundaries are retrieved text entering the prompt and model
+A threat model is the same six questions asked wherever data or control crosses a trust boundary. It
+works *because* boundaries are finite and enumerable, while "think of attacks" is not. In an agent, the critical boundaries are retrieved text entering the prompt and model
 output becoming a tool call.
 
 | Letter | Question | At "retrieved document text enters the model prompt" |
@@ -129,8 +131,8 @@ with their estate matters as much as internal elegance.
 | Can a user's data be deleted from indexes, caches and fine-tuned weights? | documented deletion path per store |
 
 ### Your own reviews
-- **Run the same process internally first.** A design review with a peer architect and a security
-  engineer catches the obvious findings cheaply.
+- **Run the same process internally first.** A peer architect and a security engineer catch the obvious
+  findings cheaply.
 - **Record decisions as ADRs** so the reasoning survives staff changes.
 
 ## Diagram
@@ -264,9 +266,8 @@ def test_internal_draft_allowed_and_logged():
 - **Tool inventory in the pre-read.** Generate a table of every agent tool (read or write, credential,
   scope, approval required) from the tool registry, so the excessive-agency discussion starts from facts.
   Regenerate it before each review.
-- **Diagram generated from or checked against production.** Reconcile the architecture diagram with the
-  deployed inventory (cloud resource listings, egress destinations) before each review, because a
-  missing service destroys reviewer confidence.
+- **Diagram checked against production.** Reconcile it with the deployed inventory (resource listings,
+  egress destinations) before each review, because a missing service destroys reviewer confidence.
 - **Findings as tickets with dates and expiring acceptances.** Every finding gets an owner, severity,
   outcome and due date in the tracker, mirrored to the customer's risk register. Each accepted risk
   records the approver and a review date, such as the six-month TLS review above. Monitor the percentage
@@ -291,16 +292,20 @@ def test_internal_draft_allowed_and_logged():
 
 ## Pitfalls
 - **A diagram that does not match production.** Symptom: a reviewer asks about a service the diagram
-  omits, and the review loses confidence in everything else presented.
+  omits, and the review loses confidence in everything else. Diagnose: diff the diagram's components
+  against cloud resource listings and egress destinations. Fix: regenerate it before each review.
 - **Omitting the model provider and observability vendors from data flows.** Symptom: a high-severity
-  finding for undisclosed data transfer, often discovered from a network-egress question.
+  finding for undisclosed data transfer, often from a network-egress question. Diagnose: list every
+  external host in egress logs and trace exporter config, and map each to a DFD arrow.
 - **Relying on the system prompt as the control.** Symptom: the reviewer asks what happens if the prompt
-  is overridden and there is no answer. Fix: enforce limits in tool code and credentials, and show tests.
-- **Agreeing to findings without owners and dates.** Symptom: the same findings reappear at the next
-  review, or block go-live at the last minute.
-- **Treating the review as a one-time gate.** Symptom: a later feature, such as a new agent tool or a
-  cross-region fallback, ships without review and is flagged by an audit.
-- **Arguing every finding.** Symptom: a reviewer escalates to a reject, when a compensating control or a
+  is overridden and there is no answer. Diagnose: call each write tool directly with out-of-scope
+  arguments, bypassing the model. Fix: limits in tool code and credentials, with tests.
+- **Agreeing to findings without owners and dates.** Symptom: findings reappear next review or block
+  go-live late. Diagnose: count open findings lacking an owner or due date.
+- **Treating the review as a one-time gate.** Symptom: a new agent tool or a cross-region fallback ships
+  unreviewed and an audit flags it. Diagnose: compare the tool registry and routing config with the last
+  approved pre-read. Fix: release-checklist triggers.
+- **Arguing every finding.** Symptom: a reviewer escalates to a reject, when a compensating control or
   dated fix would have closed it.
 
 ## When to use
@@ -314,6 +319,14 @@ def test_internal_draft_allowed_and_logged():
   your template matures) and the percentage of findings closed by their due date.
 - **Interviews:** a strong candidate describes the pre-read package and names AI-specific threats with
   concrete controls, rather than claiming the system is secure.
+
+## Exercise
+**Goal:** prepare a delta review for adding a write tool ("update ticket status") to an approved RAG
+agent. No solution is given.
+- **Deliver:** the new DFD arrow and credential, STRIDE rows for "model output becomes this tool call",
+  a tool inventory generated from the registry, and pytest evidence tests for the tool's limits.
+- **Acceptance:** every row maps to a control with a test or a named owner; the tests fail when you
+  delete the code-level check and pass with it; out-of-scope calls appear in the audit log.
 
 ## Role lens
 - **Engineer:** Produces the evidence reviewers ask for, such as a test proving permission-filtered retrieval
@@ -367,16 +380,10 @@ anomalous tool use. The key point is that safety rests on capability limits, not
   feel resisted.
 
 ### When is a full architecture review overkill?
-- **Low-risk internal tools** with no sensitive data, no integrations with identity or internal systems,
-  and no actions: a short template review is proportionate.
-- **Small changes inside an approved design** need a delta review, not the whole process.
-- **Not overkill** when an agent gains a new tool, a new model provider or a new region, because those
-  change the data flows the original approval rested on.
-
-### Which numbers would you track to show your review process is working?
-- **Time from intake to approval**, per data classification.
-- **High findings per review**, which should fall as the pre-read template matures.
-- **Percentage of findings closed by due date**, plus the count of risk acceptances past their review date.
+- **Low-risk internal tools** with no sensitive data, identity integrations or actions: a short template
+  review is proportionate; small changes inside an approved design need only a delta review.
+- **Not overkill** when an agent gains a new tool, model provider or region, because those change the
+  data flows the original approval rested on.
 
 ## Quiz
 ### Q: Which pre-read document do reviewers usually scrutinize most closely, and why?
@@ -403,12 +410,28 @@ anomalous tool use. The key point is that safety rests on capability limits, not
 > Formal acceptance makes the decision visible and owned, and a date ensures it is revisited. Deleting or
 > downgrading the finding hides the risk, which is what the review exists to prevent.
 
+## Mastery test
+**Problem:** six months after approval, the bank's policy assistant gains a "book meeting room" tool
+and a fallback to a second model provider in another region. Product wants to ship next week and says
+"it is the same system". Decide what review is needed, list the new threats, and name the evidence you
+would bring.
+
+**A strong answer:**
+- calls for a delta review, not a full one, because both changes alter data flows the approval rested
+  on;
+- adds threat rows: an injected booking (elevation), and prompts reaching an undisclosed provider and
+  region (disclosure);
+- proposes controls: a scoped booking role with limits enforced in code and logged per user, and the
+  fallback disabled or the provider added to the DFD and subprocessor list;
+- brings tests calling the tool with out-of-scope arguments, a routing config excerpt and injection eval
+  results.
+
 ## Use cases & projects
 ### Use cases
 - **Getting an enterprise agent to production.** A bank's review of a SharePoint-backed assistant ends
   with dated findings on permission filtering and trace destinations.
 - **Delta reviews for new tools.** Each new write tool, model provider or region triggers a short review
-  with its own threat rows and evidence tests.
+  with its own threat rows and tests.
 - **Internal design reviews of agent architectures.** A peer architect and a security engineer walk the
   agent's boundaries before the first line of tool code.
 - **Answering excessive-agency questions with tests.** Tool limits enforced in code, plus injection evals,

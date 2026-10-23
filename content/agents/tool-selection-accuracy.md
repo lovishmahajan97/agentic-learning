@@ -277,7 +277,7 @@ print(f"6 vs 3 flips:  p = {discordant_p(6, 3):.3f}")    # 0.508 -> noise
 - **Inputs:** baseline and candidate JSONL files of per-case outcomes (case id, expected tool, chosen
   tool, argument match), three repeats per case; generate synthetic ones first.
 - **Deliver:** a script printing the decomposed scores, the confusion-pair diff and the paired
-  discordant counts with a sign-test p-value, exiting non-zero on a significant regression.
+  discordant counts with a sign-test p-value, exiting non-zero on a regression with p < 0.05.
 - **Acceptance:** a synthetic 14-to-3 regression fails the gate and a 6-to-3 one passes; the diff names
   the pair you planted; a case that flips between repeats is reported as unstable, not counted as a
   regression.

@@ -5,8 +5,11 @@ name: Compliance constraints
 kind: concept
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: yes
+prerequisites: []
 related:
   - security-governance-compliance/compliance-architecture
   - security-governance-compliance/data-residency
@@ -309,17 +312,20 @@ print(ok, report)
 
 ## Pitfalls
 - **Treating "compliant" as a vendor property rather than a configuration.** Symptom: using a provider's
-  HIPAA-eligible service without a signed BAA or with ineligible features enabled.
+  HIPAA-eligible service without a signed BAA or with ineligible features enabled. Diagnose: list each
+  PHI-touching subprocessor against signed BAAs and the features actually enabled. Fix: exclude or sign.
 - **Forgetting derived data.** Embeddings, caches, eval datasets, traces, agent memory and checkpoints
-  contain the same personal data. Symptom: an erasure request completed in the database while vectors
-  and logs still hold it.
+  hold the same personal data. Symptom: an erasure completed in the database while vectors and logs
+  still hold it. Diagnose: query every store by the subject's identifiers after erasure. Fix: an erasure
+  job with per-store verification.
 - **Fine-tuning on customer personal data without a deletion story.** Symptom: an erasure request that
-  can only be honored by retraining or discarding the model.
-- **Engineering changes that silently violate a constraint**, such as a new fallback region, a new
-  analytics SDK or a new tool that calls an outside API. Symptom: an audit finding against a previously
-  compliant system.
+  can only be honored by retraining or discarding the model. Diagnose: trace each training set back to
+  its source records.
+- **Engineering changes that silently violate a constraint**, such as a new fallback region, analytics
+  SDK or tool calling an outside API. Symptom: an audit finding against a previously compliant system.
+  Diagnose: gateway refusal counts per release and new domains in egress. Fix: deny-by-default routing.
 - **Deciding the EU AI Act risk tier or other legal classifications in engineering alone.** Symptom: a
-  design built for the wrong obligations, discovered when counsel finally reviews it.
+  design built for the wrong obligations, found when counsel finally reviews it.
 
 ## When to use
 - **Ask in discovery**, before choosing a deployment model or model provider: which regimes apply, which
@@ -331,6 +337,18 @@ print(ok, report)
 - **Go deeper** in the security-governance-compliance module for the full design of controls, audit
   trails and residency.
 - **Interviews:** show the translation from regime to architecture.
+
+## Exercise
+**Goal:** harden the gateway and erasure sketches into tested components for a two-tenant agent. No
+solution is given.
+- **Inputs:** the `route` and `erase` examples above, an EU tenant with no content logging and a US
+  tenant with BAA-covered providers only.
+- **Deliver:** an HMAC-keyed input hash instead of plain SHA-256, refusal records written to an audit
+  list, a per-store TTL check that fails for any trace store without expiry, and an erasure job whose
+  report lists every store the agent writes to.
+- **Acceptance:** pytest shows a disallowed region refused and logged, no trace containing prompt text,
+  the same input hashing differently under two keys, and an erasure report failing when one store's
+  delete is a no-op.
 
 ## Role lens
 - **Engineer:** Implements constraints as code: region and provider allowlists in the gateway, log
@@ -353,14 +371,6 @@ favor of retrieval over deletable indexes, train only on anonymized data, or agr
 Ensure deletion reaches embeddings and caches. Document it all in the DPA and data-flow diagram.
 
 ## Interview questions
-### Why are compliance requirements architectural rather than paperwork?
-- **They select components:** residency picks regions and endpoints, no-training terms pick model
-  providers, and BAAs decide whether a hosted API is allowed at all.
-- **They shape data design:** erasure rules argue against fine-tuning on personal data, and audit versus
-  minimization decides what logs contain.
-- **So learn them in discovery**, because finding them after the build can force a different deployment
-  model.
-
 ### A customer says "we are HIPAA-regulated". What do you translate that into?
 - **BAA chain:** a BAA with the customer and coverage for every subprocessor that sees PHI, including the
   cloud and model providers; exclude providers that cannot sign.
@@ -374,13 +384,6 @@ Ensure deletion reaches embeddings and caches. Document it all in the DPA and da
 - **Delete and verify:** an erasure job per store, then queries by the subject's identifiers that must
   return nothing; the verification output is the evidence.
 - **Design so it stays possible:** TTLs on memory and traces, and no fine-tuning on that personal data.
-
-### How do you stop an engineer from silently breaking residency with a new fallback?
-- **Runtime chokepoint:** all model calls go through a gateway with per-tenant allowed providers and
-  regions, so an unlisted route is refused and logged.
-- **Change-time checks:** policy checks on infrastructure plans and review when a new subprocessor appears
-  in dependencies or egress.
-- **Periodic proof:** reconcile actual egress against the subprocessor list.
 
 ### When would you choose self-hosting a model over an API provider for compliance reasons?
 - **When terms cannot be confirmed:** no BAA, no clear no-training or retention terms, or no in-region
@@ -421,6 +424,22 @@ Ensure deletion reaches embeddings and caches. Document it all in the DPA and da
 > Separating audit records from debug telemetry satisfies each requirement on its own terms. Keeping all
 > content for seven years violates minimization, encryption does not remove retention duties, and
 > disabling logs fails the audit obligation.
+
+## Mastery test
+**Problem:** an EU bank's contract requires EU-only processing and 90-day log retention. Your agent's
+tools now include web search through a US-hosted search API, and the team wants to fine-tune a small
+model on six months of the bank's agent traces to cut cost.
+
+Which constraints does each change hit, and what do you propose?
+
+**A strong answer:**
+- sees the search tool as a data flow: queries can carry customer data to a new US subprocessor, so it
+  needs an EU endpoint, query redaction, or disabling for this tenant, plus a subprocessor update;
+- sees that six months of traces cannot exist under 90-day retention, so the dataset is already a
+  finding;
+- flags fine-tuning on personal data as an erasure problem, proposing de-identified or synthetic data
+  with the bank's agreement;
+- routes both changes through the gateway allowlist and a delta review, and counsel for contract terms.
 
 ## Use cases & projects
 ### Use cases

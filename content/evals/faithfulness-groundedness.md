@@ -5,7 +5,7 @@ name: Faithfulness / groundedness
 kind: metric
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -296,9 +296,8 @@ An eval run over 400 answers (illustrative numbers).
   and monitor the rate per action type.
 - **NLI-first cascade.** Score claims with a small NLI model and send only low-confidence claims to an LLM
   judge to cut cost. Monitor the escalated share and the cascade's agreement with the labeled claim set.
-- **Shuffled-context canary and one triad dashboard.** On a schedule, run the verifier with contexts
-  shuffled across items; the score should collapse toward zero, so alert when it does not, because the
-  judge is answering from memory. Show faithfulness, answer relevance and abstention rate side by side,
+- **Shuffled-context canary and one triad dashboard.** On a schedule, run the verifier on contexts
+  shuffled across items and alert if the score does not collapse toward zero. Show faithfulness, answer relevance and abstention rate side by side,
   so a faithfulness gain from saying less is visible immediately.
 
 ## Trade-offs
@@ -460,9 +459,11 @@ claiming "shares rose 4% after the earnings call" when the price tool showed a 4
 metric missed it and redesign the check.
 
 **A strong answer:**
-- sees that the number guard passes (4 appears in the context) and a lenient verifier can miss a
-  flipped direction, so a contradiction hid inside a 0.96 mean;
-- adds structured checks of figure plus direction and date against the price tool, a contradiction gate
+- sees that the number guard passes (4 appears in the context), a lenient verifier can miss a flipped
+  direction, and a news chunk about another stock or day can "support" it, so a contradiction hid
+  inside a 0.96 mean;
+- adds structured checks of figure, direction and date against the price tool as the only authority
+  for prices, a contradiction gate
   per note, and verifier calibration on sign-flip and wrong-entity claims;
 - reports the share of notes with any contradiction and runs the shuffled-context canary.
 

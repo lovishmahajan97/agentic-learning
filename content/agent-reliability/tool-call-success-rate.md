@@ -5,7 +5,7 @@ name: Tool-call success rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -372,7 +372,7 @@ change for arguments, an index check for empties.
 > early warning that a tool is degrading.
 
 ## Mastery test
-**Problem:** a research agent averages 12 steps; completion fell from 81% to 64% over two weeks. The
+**Problem:** a research agent averages 12 steps; completion fell from 81% to 67% over two weeks. The
 dashboard shows overall tool success steady at about 97%. `web_search` is 40% of calls at 99%; `fetch_page`
 is 30% at 98%; `extract_table` is 8% of calls but its per-step rate fell from 97% to 80%. Explain.
 
@@ -381,7 +381,7 @@ is 30% at 98%; `extract_table` is 8% of calls but its per-step rate fell from 97
 - checks layers: is the drop well-formed (a description change), executed (a vendor) or effective
   (new page layouts returning empty tables)?
 - joins tool events to outcomes: completion conditional on an `extract_table` failure;
-- notes a tool used once per task caps completion at its own per-step rate (0.80 here);
+- does the arithmetic: about one call per task, so 0.81 × 0.80 / 0.97 ≈ 0.67 explains the whole drop;
 - adds a per-tool alert so the next drop is caught in days.
 
 ## Use cases & projects

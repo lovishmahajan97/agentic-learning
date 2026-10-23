@@ -5,7 +5,7 @@ name: "Project 3: production AI service"
 kind: practice
 difficulty: advanced
 est_minutes: 30
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -31,8 +31,8 @@ sources:
   - The Twelve-Factor App — Config, Logs, Disposability
 milestones:
   - fastapi-for-ai: Typed endpoints with validation and one error envelope
-  - backend-fundamentals: Authentication, tenancy and persistent storage with migrations
-  - reliability: Provider timeouts, fallbacks and graceful degradation
+  - fastapi-for-ai: Authentication, tenancy and persistent storage with migrations
+  - serving-inference: Provider timeouts, fallbacks and graceful degradation
   - observability: Request ids, traces and per-tenant cost tracking
   - llmops-platform: Unit, integration and eval tests gated in CI
   - deployment: Containerised deploy with health checks and a rollback path
@@ -66,7 +66,8 @@ observable, tested in CI, cost-tracked per tenant, failing cleanly, and deployed
 
 ## How it works
 Reuse the core from Project 1 or 2 as a library; this project builds the service around it. Each
-milestone lists acceptance checks and the lessons it draws on.
+milestone lists acceptance checks and the lessons it draws on. M1 and M2 open early in the track, before
+Projects 1-2 exist, so build them on a stubbed core like `fake_llm` below and swap the real one in later.
 
 ### M1. API contract (after fastapi-for-ai)
 - **Build:** Pydantic request and response models with length limits, routers, and one JSON error
@@ -76,7 +77,7 @@ milestone lists acceptance checks and the lessons it draws on.
 - **Lessons:** `fastapi-for-ai/pydantic-request-response-models`, `fastapi-for-ai/response-model`,
   `fastapi-for-ai/httpexception-handling`, `fastapi-for-ai/request-size-limits-and-upload-security`.
 
-### M2. Auth, tenancy and storage (after backend-fundamentals)
+### M2. Auth, tenancy and storage (after fastapi-for-ai)
 - **Build:** API keys (hashed at rest) or OAuth2/JWT mapped to a tenant; PostgreSQL tables for runs,
   messages and usage, created with migrations; every query scoped by tenant.
 - **Acceptance:** a missing or wrong key returns 401; tenant A cannot read tenant B's runs (a test proves
@@ -84,12 +85,13 @@ milestone lists acceptance checks and the lessons it draws on.
 - **Lessons:** `fastapi-for-ai/api-keys-oauth2-jwt`, `backend-fundamentals/authentication-vs-authorization`,
   `fastapi-for-ai/alembic-migrations`, `system-design/tenant-isolation`, `backend-fundamentals/secrets-management`.
 
-### M3. Failure handling (after reliability)
+### M3. Failure handling (after serving-inference)
 - **Build:** timeouts on every provider call, bounded retries on 429 and 5xx, a circuit breaker or
   fallback model, and mapping of provider failures to 503 with a retry hint.
 - **Acceptance:** with the provider stubbed to time out, the API returns 503 in under the configured
   timeout plus margin, and the error is logged with the request id.
-- **Lessons:** `fastapi-for-ai/timeouts`, `reliability/circuit-breakers`, `system-design/model-fallback-strategies`,
+- **Lessons:** `fastapi-for-ai/timeouts`, `serving-inference/retry-strategies`, `serving-inference/fallbacks`;
+  architect track: `reliability/circuit-breakers`, `system-design/model-fallback-strategies`,
   `system-design/graceful-degradation`.
 
 ### M4. Observability and cost (after observability)
@@ -207,8 +209,8 @@ if __name__ == "__main__":
     print(db.execute("SELECT tenant, sum(cost) FROM calls GROUP BY tenant").fetchall())
 ```
 
-All four tests pass, each request logs one JSON line with `rid`, status and milliseconds, and the last
-line prints cost per tenant. Gaps left for the milestones:
+All four tests pass, each request logs one JSON line with `rid`, status and milliseconds (httpx, used by
+the test client, adds its own INFO line), and the last line prints cost per tenant. Gaps left for the milestones:
 - **Errors are not one envelope yet.** 401 and 422 still use FastAPI's default `detail` shape (M1).
 - **Keys are plaintext and storage is in memory** (M2); there is no retry or fallback (M3).
 - **Usage is only written on success,** so failed calls that still cost tokens are invisible (M4).
@@ -365,6 +367,8 @@ design.
 - adds a self-hosted fallback model (often a smaller one) behind the same interface, routed to by a circuit
   breaker, and runs the eval suite against it to know the quality drop;
 - marks degraded responses in the API and usage table so cost and quality reporting stay honest;
+- notes the primary model must also be reached in-account (the cloud's managed model service through a
+  private endpoint, with no-retention terms), since a public provider API would send prompts out;
 - tests failover by disabling the primary in staging, and documents the runbook and data-flow diagram for
   security review.
 

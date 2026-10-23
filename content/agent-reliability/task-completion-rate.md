@@ -5,7 +5,7 @@ name: Task completion rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -380,7 +380,7 @@ Should you pilot it for unattended dependency upgrades? What do you ask for and 
 
 **A strong answer:**
 - rejects self-report: asks for a verified predicate such as tests passing in CI and the PR merged;
-- asks how many tasks were excluded as questions, since that inflates the rate;
+- asks how many tasks were excluded as questions: unattended, nobody answers, so they are failures;
 - wants the rate for dependency upgrades only, with an interval, not the pooled 92%;
 - needs repeated trials per task for pass^k, because unattended use needs consistency;
 - runs a pilot suite of real upgrades.

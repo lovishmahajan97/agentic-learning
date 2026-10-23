@@ -5,7 +5,7 @@ name: Contextual retrieval
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -441,16 +441,18 @@ baseline.
 > dominates, all chunks of a document collapse toward one vector and intra-document discrimination is lost.
 
 ## Mastery test
-**Problem:** a support agent searches 8,000 per-customer runbooks (about 30,000 tokens each, 5% edited
-daily). Queries like "Globex failover steps" miss because chunks say "the primary cluster". Heading
+**Problem:** a support agent searches 8,000 per-customer runbooks (about 30,000 tokens and 75 chunks each,
+5% edited daily). Queries like "Globex failover steps" miss because chunks say "the primary cluster". Heading
 prefixes did not help: runbooks share one template. Should you contextualise, and how do you keep it
 affordable?
 
 **A strong answer:**
 - confirms the failure is lost subject, so contextual embeddings plus contextual BM25 fit, query side
   unchanged;
-- prices it with the cached cost model, splitting runbooks into sections to tame the squared term;
-- re-contextualises only edited documents by hash (about 400 a day), warming the cache before fan-out;
+- prices it with `ingest_cost` (~297,000 full-price equivalents per runbook), then splits runbooks into
+  sections to tame the squared term;
+- re-contextualises only edited documents by hash (about 400 a day, ~119 million equivalents unsplit),
+  warming the cache before fan-out;
 - validates contexts against the source and measures recall@20 per arm.
 
 ## Use cases & projects

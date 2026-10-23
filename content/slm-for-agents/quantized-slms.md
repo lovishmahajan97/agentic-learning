@@ -5,7 +5,7 @@ name: Quantized SLMs (GGUF, AWQ, quality vs memory)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: partial
@@ -87,7 +87,8 @@ Effective bits include the per-block scales, so a "4-bit" file is really around 
 Small models tend to lose more from aggressive quantization than large ones, because each weight carries
 more of the model's capacity. So a 4-bit 7B is often a better buy than a 2-bit 14B of similar size.
 
-At a fixed budget a 4-bit larger model often wins; below about 3 bits a smaller 8-bit model is safer.
+At a fixed memory budget, compare both on your eval: a 4-bit larger model often wins, but below about 3 bits
+a smaller 8-bit model is usually safer.
 
 ## Diagram
 Follow one model from full precision to a deployable file: the engine picks the format, and the agent eval,
@@ -133,7 +134,7 @@ Run the same tool-calling golden set on each build. Ollama publishes several qua
 separate tags; check the model's tag list for exact names.
 
 ```python
-# Checked with the ollama Python client 0.6 (attribute access on responses needs 0.4+).
+# Run with the ollama Python client 0.6.3 against a mock server (attribute access needs 0.4+).
 import json, ollama
 
 BUILDS = ["qwen2.5:7b-instruct-q8_0", "qwen2.5:7b-instruct-q4_K_M", "qwen2.5:7b-instruct-q3_K_M"]
@@ -177,6 +178,7 @@ became the only metric that mattered.
   16-bit reference.
 - **Calibrate with your own prompts.** When producing GGUF yourself, build an importance matrix with
   `llama-imatrix` on text resembling your agent's inputs, then pass it to `llama-quantize --imatrix`.
+  Compare with the non-imatrix build on the golden set.
 - **Pin the exact file.** Record the repo, file name and hash of the GGUF or the revision of the AWQ repo,
   because community re-uploads with the same name can differ in template or quantization recipe.
 - **Spend saved memory on context and sessions.** After quantizing weights, re-run KV-cache sizing and raise
@@ -219,7 +221,7 @@ became the only metric that mattered.
 **Goal:** make your own GGUF quants of one small model and test whether an imatrix from your agent's
 prompts helps. No solution is given.
 - **Inputs:** a 0.5B-3B instruct model, llama.cpp (`convert_hf_to_gguf.py`, `llama-imatrix`,
-  `llama-quantize`), 200 prompts resembling your agent's inputs, and a 50-case JSON golden set.
+  `llama-quantize`, `llama-perplexity`), 200 prompts resembling your agent's inputs, and a 50-case JSON golden set.
 - **Deliver:** `Q4_K_M` with and without imatrix plus `Q3_K_M`, each with file size, valid-JSON rate, field
   accuracy and tokens per second against a `Q8_0` reference.
 - **Acceptance:** you can explain each file size's gap from parameters × effective bits ÷ 8; one script
@@ -306,18 +308,16 @@ a 4B model at `Q8_0`, an 8B at `Q3_K_M` (about 4 GB of weights), or the 4B at `Q
 
 ## Use cases & projects
 ### Use cases
-- **Laptop and desktop agents.** A 4-bit GGUF lets a 7B-8B model run locally next to the user's files.
-- **Edge devices.** Stores, vehicles and factory boxes run 1B-4B models at 4-5 bits within tight memory.
-- **Denser GPU serving.** AWQ or FP8 weights free memory for KV cache. Where 16-bit weights filled most of the
-  card (a 7B on a 24 GB GPU), that can roughly double the agent sessions it holds; on an 80 GB GPU the gain
-  is much smaller.
+- **Laptop and desktop agents.** A 4-bit GGUF lets a 7B-8B model run next to the user's files.
+- **Edge devices.** Stores, vehicles and factory boxes run 1B-4B models at 4-5 bits.
+- **Denser GPU serving.** AWQ or FP8 weights free memory for KV cache: roughly double the sessions where
+  16-bit weights filled most of the card (a 7B on a 24 GB GPU), much less on an 80 GB GPU.
 
 ### Mini project
 **Find the smallest safe quantization for one agent step (1-2 hours).**
 - **Goal:** pick the lowest-memory build of one model that keeps an extraction or tool-calling step within
   tolerance.
-- **Steps:** pull three or four quantizations of one model in Ollama (for example 8-bit, 5-bit, 4-bit,
+- **Steps:** pull 3-4 quantizations of one model in Ollama (for example 8-bit, 5-bit, 4-bit,
   3-bit); build a 50-case golden set with expected JSON; run the eval gate script and record pass rate,
   valid-JSON rate, peak memory and tokens per second for each.
-- **Done when:** you have a table per build, a chosen build with its exact tag, and one sentence on where
-  quality fell off.
+- **Done when:** you have a table per build, the chosen build's exact tag, and where quality fell off.

@@ -5,7 +5,7 @@ name: "Project 4: SLM feasibility study"
 kind: practice
 difficulty: advanced
 est_minutes: 30
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -30,12 +30,12 @@ sources:
   - Kwon et al., 2023 — Efficient Memory Management for Large Language Model Serving with PagedAttention
   - Liang et al., 2022 — Holistic Evaluation of Language Models (HELM)
 milestones:
-  - scoping: Narrow task, success criteria and a non-LLM baseline
+  - evals: Narrow task, success criteria and a non-LLM baseline
   - evals: Golden set and a scoring harness for the task
   - slm-for-agents: Two or three candidate SLMs running locally with structured output
-  - serving-inference: Latency and throughput measured at realistic concurrency
-  - infra-capacity-economics: Operating cost per 1,000 tasks for every option
-  - system-design: Written viability decision with a routing fallback
+  - slm-for-agents: Latency and throughput measured at realistic concurrency
+  - slm-for-agents: Operating cost per 1,000 tasks for every option
+  - slm-for-agents: Written viability decision with a routing fallback
 ---
 
 ## TL;DR
@@ -69,20 +69,24 @@ SLM is viable.
 ## How it works
 Choose one subtask from your Project 1-3 system: query routing, intent classification, entity
 extraction, tool-argument filling or citation checking. It must have a checkable correct output.
+M1-M2 open after evals; M3-M6 need candidate SLMs, so they open after slm-for-agents, the last module in
+the track, even though serving and cost lessons come earlier.
 
-### M1. Task and baseline (after scoping)
+### M1. Task and baseline (after evals)
 - **Build:** a one-page task definition (inputs, allowed outputs, what counts as correct, daily volume,
   latency budget) and the simplest credible non-LLM baseline.
-- **Acceptance:** two people label 20 examples independently and agree on most of them; the baseline
-  runs on the full set.
-- **Lessons:** `scoping/problem-decomposition`, `scoping/success-metrics-kpis`,
+- **Acceptance:** two people label 20 examples independently and agree on at least 90% of them (report
+  Cohen's kappa too); the baseline runs on the full set.
+- **Lessons:** `evals/task-specific-acceptance-criteria`, `evals/inter-annotator-agreement`; FDE track:
+  `scoping/problem-decomposition`, `scoping/success-metrics-kpis`,
   `scoping/baseline-measurement-before-deployment`.
 
 ### M2. Golden set and harness (after evals)
 - **Build:** at least 200 examples sampled from real traffic, stratified to include rare and hard cases;
   a harness reporting accuracy, valid-output rate, per-class errors and latency percentiles.
-- **Acceptance:** the large hosted model is run once to set the quality reference; the harness is
-  deterministic (temperature 0, fixed prompts) and re-runs give the same scores.
+- **Acceptance:** the large hosted model is run once to set the quality reference; raw outputs are cached
+  so re-scoring gives identical numbers; fresh re-runs at temperature 0 stay within a stated tolerance,
+  since hosted and batched GPU inference is not bit-exact.
 - **Lessons:** `evals/golden-dataset`, `evals/task-specific-acceptance-criteria`,
   `customer-data-evaluation/representative-test-case-sampling`, `evals/error-analysis`.
 
@@ -94,7 +98,7 @@ extraction, tool-argument filling or citation checking. It must have a checkable
 - **Lessons:** `slm-for-agents/choosing-an-slm`, `slm-for-agents/running-slms-locally`,
   `slm-for-agents/quantized-slms`, `slm-for-agents/tool-calling-and-structured-output-with-slms`.
 
-### M4. Latency under load (after serving-inference)
+### M4. Latency under load (after slm-for-agents)
 - **Build:** measure time to first token and total latency at concurrency 1 and at your expected peak,
   on the hardware you would actually deploy.
 - **Acceptance:** p50 and p95 reported per model at both concurrencies, with hardware and runtime
@@ -102,7 +106,7 @@ extraction, tool-argument filling or citation checking. It must have a checkable
 - **Lessons:** `serving-inference/ttft`, `serving-inference/throughput-vs-latency`,
   `serving-inference/batching-and-concurrency-limits`, `observability/latency-percentiles`.
 
-### M5. Operating cost (after infra-capacity-economics)
+### M5. Operating cost (after slm-for-agents)
 - **Build:** cost per 1,000 tasks for the hosted model (tokens times price) and for each SLM (hardware
   cost per hour divided by tasks per hour at target utilisation), plus the break-even volume.
 - **Acceptance:** every input in the cost model is sourced or labelled as an assumption; a sensitivity
@@ -110,7 +114,7 @@ extraction, tool-argument filling or citation checking. It must have a checkable
 - **Lessons:** `infra-capacity-economics/cost-modeling`, `infra-capacity-economics/break-even-analysis`,
   `infra-capacity-economics/unit-economics-per-successful-task`.
 
-### M6. Decision (after system-design)
+### M6. Decision (after slm-for-agents)
 - **Build:** a two-page write-up: task, setup, evaluation table, cost model, failure analysis and a
   recommendation (adopt, adopt behind a router with LLM fallback, or reject).
 - **Acceptance:** a reviewer can reproduce the headline numbers from the repo; the recommendation names
@@ -336,7 +340,8 @@ fully offline for field technicians, with a 1-second latency budget. Redo the pl
 - swaps the hosted model for a reference-only role (it sets quality but cannot be deployed) and picks
   smaller, heavily quantized candidates that fit device memory;
 - measures latency on the actual device, including load time and battery or thermal behaviour, not on a
-  workstation;
+  workstation, and keeps prompts and outputs short, since CPU prefill and decode speed usually bind the
+  1-second budget before accuracy does;
 - replaces cost per 1,000 tasks with device requirements and update distribution cost;
 - designs an offline fallback (rules baseline, or queue the case for later sync) instead of an LLM route;
 - states which task variants are out of scope on-device.
