@@ -153,11 +153,11 @@ sequenceDiagram
 
 ## Examples
 ### Scoring a prompt and a reply
-Moderates a user message, then the assistant's reply in context, returning the generated verdict and the
-probability of `unsafe` at the position where the verdict token is generated.
+Moderates a user message, then the reply in context, returning the verdict and `p_unsafe` at the verdict
+token.
 - **Gated model:** the licence must be accepted on the Hub first.
-- **Multi-piece tokens:** if `unsafe` tokenises to more than one piece, the code compares the first pieces
-  of the two words, which is where the decision is made.
+- **Multi-piece tokens:** if `unsafe` is several tokens, the code compares the first pieces, where the
+  decision is made.
 
 ```python
 import torch
@@ -191,6 +191,8 @@ reply = {"role": "assistant", "content": "I can't help with that. If it's your o
 print(moderate([user, reply]))                   # output rail: the reply is judged given the question
 ```
 
+- **Versions:** mechanics checked on transformers 4.57, where `device_map` needs `accelerate` and
+  `torch_dtype` is deprecated for `dtype`; verdicts not run.
 - **Expected (typical, verify on your setup):** the input call comes back `unsafe` with a non-violent-crimes
   code (S2); the output call comes back `safe`, because the refusal is judged in context.
 
@@ -315,15 +317,15 @@ sweep(sample)
 - **Before launch:** build a labelled set of a few hundred examples from your own traffic covering each
   enforced category, measure precision and recall at several thresholds for each rail separately, and pick
   thresholds per rail.
-- **Day to day:** a service behind the chat endpoint with its own dashboards for block rate and latency.
+- **Day to day:** a service with its own block-rate and latency dashboards.
 
 ## Exercise
 **Goal:** choose and defend per-rail thresholds for one product. No solution is given.
-- **Inputs:** Llama Guard 3 1B or 8B (or any guard returning `p_unsafe`), about 100 prompts and 100 agent
+- **Inputs:** Llama Guard 3 1B or 8B (or any guard returning `p_unsafe`), 100 prompts and 100 agent
   replies you label for a chosen product, including ten on its core sensitive topic.
 - **Deliver:** a precision and recall table per rail at five thresholds, the chosen values with a
   written miss-versus-false-refusal reason, and one reworded or dropped category.
-- **Acceptance:** `sweep` reproduces your table; a held-out 20% lands within a few points of it; the
+- **Acceptance:** `sweep` reproduces your table; a held-out 20% is reported with raw counts, since ten positives move recall in 0.1 steps; the
   core-topic prompts pass after the policy edit; an injected tool result is shown passing every rail.
 
 ## Role lens

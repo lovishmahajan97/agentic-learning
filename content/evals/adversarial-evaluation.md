@@ -5,7 +5,7 @@ name: Adversarial evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes

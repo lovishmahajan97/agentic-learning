@@ -5,7 +5,7 @@ name: Output validation (Pydantic, Instructor, Outlines)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -176,7 +176,7 @@ what Instructor packages behind `response_model=` and `max_retries=`.
 from datetime import date
 from typing import Literal
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
-import anthropic
+import anthropic                     # checked against anthropic 2.1.0 and pydantic 2.14 (HTTP mocked)
 
 class RefundDecision(BaseModel):
     order_id: str = Field(pattern=r"^ORD-\d{6}$")
@@ -230,7 +230,7 @@ print(decide("ORD-104233, placed 2026-09-30, blender arrived cracked, paid $89.9
 Instructor replaces the hand-written loop: pass the Pydantic class as `response_model` and a retry count.
 
 ```python
-import anthropic, instructor
+import anthropic, instructor         # checked against instructor 1.17.0 (sends the schema as a tool)
 
 client = instructor.from_anthropic(anthropic.Anthropic())
 

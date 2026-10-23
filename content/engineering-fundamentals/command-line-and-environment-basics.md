@@ -5,7 +5,7 @@ name: Command line and environment basics
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -113,7 +113,7 @@ flowchart TD
 ## Examples
 ### Env vars, a background server, a port conflict and exit codes
 The script plays out the four ideas with a stand-in model server. Run it with `bash env_and_ports.sh` in
-an empty directory (tested with GNU bash 3.2.57 on macOS, Python 3.9.6, curl 8.7.1).
+an empty directory (tested with GNU bash 3.2.57 on macOS, Python 3.9.6 and 3.12.14, curl 8.7.1).
 
 ```bash
 #!/usr/bin/env bash
@@ -328,6 +328,8 @@ Diagnose it with what you know about processes, streams and environments.
 - notes that an app launched from the desktop does not run your interactive shell profile, so `DB_URL`
   (and possibly the `PATH` that finds your venv's Python) is missing; pass `env` and an absolute
   interpreter path in the client config;
+- checks the working directory too: the app may start the server somewhere other than your project,
+  so relative paths (a `.env`, a SQLite file) silently resolve elsewhere; use absolute paths;
 - reproduces outside the app with `env -i PATH=/usr/bin:/bin <absolute python> server.py < /dev/null`
   and reads the exit code and stderr;
 - adds a startup check that exits non-zero with a clear stderr message when config is missing.

@@ -5,8 +5,14 @@ name: Knowledge graphs
 kind: concept
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: implement
+code_tested: yes
+prerequisites:
+  - agents/tool-calling
+  - prompting/structured-outputs-json-mode
+  - rag-retrieval/multi-hop-retrieval
 related:
   - rag-retrieval/graphrag
   - rag-retrieval/multi-hop-retrieval
@@ -28,9 +34,8 @@ tool that answers joins, counts and exact constraints similarity cannot. The har
 extraction, entity resolution, schema design and sync.
 
 ## For agent builders
-- **Why it matters for agents.** Questions like "which customers are exposed to CVE-123?" need a chain of
-  exact hops. An agent doing this with vector searches drifts at every hop; one graph tool call returns
-  the exact rows with a source per hop.
+- **Why it matters for agents.** "Which customers are exposed to CVE-123?" needs a chain of exact hops.
+  Vector searches drift at every hop; one graph tool call returns exact rows with a source per hop.
 - **Where it shows up in your stack.** Graph-query tools your agent calls (Neo4j via its Python driver,
   Neptune, Memgraph), text-to-Cypher chains in agent frameworks, and graph-shaped agent memory where
   facts about users and entities carry validity dates.
@@ -47,15 +52,14 @@ extraction, entity resolution, schema design and sync.
   service Y?".
 - **The facts share an entity, not wording.** They are scattered across documents. Top-k returns passages
   about the CVE but cannot follow product to deployment to customer, and cannot count reliably at all.
-- **Naive alternatives fail somewhere.** Bigger k or long-context stuffing hopes the model does the join in
-  its head, unreliably and unverifiably. Iterative agentic retrieval can follow links, but each hop is a
-  fuzzy search that can drift, and every query re-derives the same structure.
-- **Relational tables are close but awkward.** They represent the facts, but variable-length paths ("any
-  number of reporting levels") are awkward to express, though recursive CTEs handle many cases.
-- **A graph makes relationships first-class data.** Entities get identities, so mentions across documents
-  resolve to one node; relationships get types and direction, so a query follows exactly the edges it
-  means; the schema rejects wrong facts at write time. The question becomes a precise traversal instead of
-  a similarity guess.
+- **Naive alternatives fail somewhere.** Bigger k or long-context stuffing hopes the model joins in its
+  head, unreliably and unverifiably. Iterative agentic retrieval follows links, but each hop is a fuzzy
+  search that can drift, re-deriving the same structure every query.
+- **Relational tables are close but awkward** for variable-length paths ("any number of reporting
+  levels"), though recursive CTEs handle many cases.
+- **A graph makes relationships first-class data.** Entities get identities, so mentions resolve to one
+  node; typed, directed relationships let a query follow exactly the edges it means; the schema rejects
+  wrong facts at write time.
 
 ## How it works
 ### Background: data model
@@ -72,8 +76,7 @@ Either way the unit is a fact like `(Service:payments)-[:DEPENDS_ON]->(Database:
 - **It is the leverage point.** A good schema makes common questions short traversals. A vague one
   ("RELATED_TO" everywhere) degrades the graph back into a co-occurrence network that cannot answer precise
   questions.
-- **Start from the questions** the graph must answer and model only what they need. For an agent, that
-  means the questions its tools must answer.
+- **Start from the questions** the agent's tools must answer and model only what they need.
 
 ### Construction
 1. **From structured sources** (CMDB, HR system, CRM, ticketing): deterministic mapping, high precision. Do
@@ -94,14 +97,13 @@ Either way the unit is a fact like `(Service:payments)-[:DEPENDS_ON]->(Database:
 | Tools for agents | expose a few parametrised graph queries as tools instead of free-form generation | use when reliability matters more than flexibility |
 
 ### How an agent uses the graph
-1. **Pick a tool** by its description: a parametrised query for known question types, a validated
-   text-to-Cypher tool for the rest, vector search for prose.
-2. **Get rows plus provenance**, small enough to fit the context (bounded by `LIMIT`).
-3. **Chain tools:** use the rows (customer names, services) as arguments to the next tool, for example a
-   ticket search filtered to those customers.
-4. **Cite per hop:** the provenance list becomes the citation trail of the final answer.
-5. **Recover on errors:** an empty result or a validator rejection goes back to the agent as a tool error
-   it can act on, not a silent "none".
+1. **Pick a tool** by description: a parametrised query for known question types, validated
+   text-to-Cypher for the rest, vector search for prose.
+2. **Get rows plus provenance**, bounded by `LIMIT` to fit the context.
+3. **Chain tools:** rows (customers, services) become arguments to the next tool, such as a ticket search.
+4. **Cite per hop:** the provenance list becomes the answer's citation trail.
+5. **Recover on errors:** an empty result or validator rejection returns as an actionable tool error, not
+   a silent "none".
 
 ### Keeping it true
 - **The graph is derived data.** Sync it from systems of record with change feeds, re-extract changed
@@ -170,19 +172,19 @@ print(customers_exposed("CVE-123"))
 #         RETURN c.name, s.name
 ```
 
-- **Three facts, three documents** (advisory, SBOM, CRM). A vector search would likely return the advisory
-  and maybe an SBOM, but nothing connects library version to customer.
-- **The traversal is exact:** it returns Acme and Globex, excludes Initech because its service uses a
-  different library version, and carries a source for every hop, which becomes the citation trail.
+- **Three facts, three documents** (advisory, SBOM, CRM). Vector search might return the advisory and an
+  SBOM, but nothing connects library version to customer.
+- **The traversal is exact:** Acme and Globex, not Initech (different library version), with a source per
+  hop for the citation trail.
 - **This alone does not justify a graph database:** a fixed three-hop query is also three SQL joins.
 - **Variable length is where the graph pays.** Real dependency data is transitive: svc-billing uses libbar,
   which bundles libfoo 2.1. "Any path of `USES|DEPENDS_ON` edges of length 1 to 6" is one Cypher pattern
   (`(s)-[:USES|DEPENDS_ON*1..6]->(l)`) and a recursive CTE with cycle handling in SQL.
 
 ### Agent tool: a parametrised, bounded, read-only graph query
-What an agent calls instead of writing Cypher itself: fixed query text, parameters only, bounded path
-length, currently-valid edges, a row limit, and read routing. Uses the Neo4j Python driver (5.x); the tool
-schema and error handling are what the agent loop sees.
+Instead of the agent writing Cypher: fixed query, parameters only, bounded path length, currently-valid
+edges, a row limit, read routing. Uses the Neo4j Python driver (checked with
+5.28 and 6.4 against Neo4j 5.26); the tool schema and errors are what the agent loop sees.
 
 ```python
 import os, re
@@ -231,8 +233,7 @@ illustrative.
 | Vector search only | search advisory, search SBOMs, search CRM, guess the join, search tickets | misses customers on transitive dependencies; no per-hop source |
 | Graph tool, then ticket search | `customers_exposed_to_cve`, then `search_tickets` filtered to the returned customers | exact list (Acme, Globex), provenance per hop, tickets scoped by a metadata filter |
 
-The graph result also feeds the next tool as a filter, which is the "graph as filter" pattern driven by
-the agent.
+Feeding the graph result to the next tool is the "graph as filter" pattern, driven by the agent.
 
 ## Production patterns
 - **Parametrised tools over free-form Cypher.** Expose a few tested queries with bounded hops, `LIMIT` and
@@ -269,34 +270,47 @@ the agent.
 - **Graph database vs relational.** A dedicated graph database suits deep variable-length traversal but adds
   an operational system. For shallow, fixed joins plain relational joins are enough, and recursive CTEs
   cover moderate variable-length cases such as reporting chains of bounded depth.
-- **Graph tool vs agentic multi-hop search.** A graph tool answers in one exact call but only for what the
-  schema models; iterative search reaches anything in the text but drifts per hop. Many agents get both.
+- **Graph tool vs agentic multi-hop search.** A graph tool is one exact call but covers only what the
+  schema models; iterative search reaches any text but drifts per hop. Many agents get both.
 
 ## Pitfalls
 - **Modelling everything as a generic `RELATED_TO` edge.** Traversals return everything or nothing, and the
-  graph answers nothing more precisely than vector search.
+  graph answers nothing more precisely than vector search. Diagnose: count edges per relationship type.
+  Fix: specific types derived from the questions.
 - **Skipping entity resolution.** Symptom: answers list "Acme" and "ACME Corp" as different customers, or
-  miss half of an entity's relationships.
+  miss half of an entity's relationships. Diagnose: group nodes by normalised name and count collisions.
+  Fix: merge on IDs, then attributes.
 - **Letting the LLM generate unvalidated queries.** Symptom: hallucinated labels returning empty results,
-  or an unbounded path query that times out the database.
-- **Building the graph once from a document dump.** It drifts from source systems and answers with
-  reorganised teams or retired services weeks later.
+  or an unbounded path query that times out the database. Diagnose: log generated Cypher with labels used
+  and run time. Fix: a validator or parametrised tools.
+- **Building the graph once from a document dump.** It drifts, answering with reorganised teams or
+  retired services weeks later. Diagnose: measure source-to-graph sync lag.
 - **Time-bound relationships without validity dates.** Symptom: "who owns service X?" returns both the
   current and the previous owner, or history vanishes after a re-extraction.
 - **Dropping provenance.** Graph answers cannot be cited, and when an extracted fact is wrong nobody can
   find which document or extraction run produced it.
 - **Returning silent empty results to the agent.** Symptom: the agent reports "no customers exposed"
-  when the CVE node was simply never loaded. Fix: say why the result is empty.
+  when the CVE node was simply never loaded. Diagnose: check whether the anchor node exists. Fix: say why
+  the result is empty.
 
 ## When to use
-- **Use when** important questions are relational (dependencies, ownership, supply chains, org structure,
-  fraud rings), need exact counts or constraints, or span many documents joined by shared entities, and
-  much of the data already exists in structured systems.
+- **Use when** key questions are relational (dependencies, ownership, supply chains, org structure,
+  fraud rings), need exact counts or constraints, or join documents by shared entities, and much of the
+  data already sits in structured systems.
 - **Avoid when** the corpus is prose and questions are explanatory.
 - **Measure** on a question set split into lookup, relational and aggregate types, comparing graph-backed
   answers with hybrid retrieval, and count agent steps per task with and without the graph tool.
 - **Interviews:** explain when a graph beats embeddings, how you would build one from messy text, and how
   you keep it consistent with its sources.
+
+## Exercise
+**Goal:** show one bounded graph tool beats vector search on relational questions. No solution given.
+- **Inputs:** a local Neo4j (or Postgres) with about 50 services, libraries and customers, some
+  dependencies transitive and some edges closed with `valid_to`.
+- **Deliver:** a parametrised read-only tool with hop limit, `LIMIT` and actionable errors, plus 10
+  relational questions answered by it and by a vector-search-only agent.
+- **Acceptance:** exact rows with provenance per hop; closed edges excluded; an unknown CVE yields an
+  explanatory note, not a bare empty list; a 3-hop transitive case is found.
 
 ## Role lens
 - **Engineer:** Writes the extraction pipeline with constrained output types, the entity resolution step,
@@ -379,6 +393,17 @@ types in the extraction schema, and better still, load ownership from the projec
 - [ ] When users only ask open-ended exploratory questions
 > Fixed, tested queries cannot hallucinate labels or write unbounded traversals. Free-form generation buys
 > flexibility for open questions, at the cost of validation work and occasional broken or slow queries.
+
+## Mastery test
+**Problem:** an HR assistant agent answers "who reports to Dana?" from a graph built from the HR system
+plus extracted meeting notes. After a reorg it lists people who left her team, misses two new hires, and
+one text-to-Cypher query timed out the database. Diagnose and fix.
+
+**A strong answer:**
+- traces stale reports to edges without validity dates and missing sync, and new hires to sync lag;
+- loads reporting lines from the HR system by ID, closing old edges, rather than from notes;
+- replaces free-form Cypher with a bounded parametrised tool plus a timeout;
+- monitors sync lag and entities with two current managers.
 
 ## Use cases & projects
 ### Use cases

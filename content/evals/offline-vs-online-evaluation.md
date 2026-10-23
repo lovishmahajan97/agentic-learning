@@ -5,7 +5,7 @@ name: Offline vs online evaluation
 kind: decision
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -62,9 +62,6 @@ Offline scores and real outcomes drift apart for four structural reasons:
 - **Sparse, noisy outcomes.** Detecting a real change takes weeks of traffic.
 - **Failures reach users first**, and a regression cannot be bisected across the ten changes shipped
   that fortnight.
-
-The resolution is a ladder with defined hand-offs: offline catches what is cheap to catch, online
-confirms what only users can, and the two are reconciled whenever they disagree.
 
 ## How it works
 ### What each one measures
@@ -269,8 +266,6 @@ print(n_per_arm(0.60, 0.03), n_per_arm(0.60, 0.01))   # 4126 37511: ~4,000 and ~
   Monitor these in short windows; do not read quality from the canary.
 - **Weekly stratified trace sampling** into the golden set with a version bump, oversampling flagged
   and low-scored traces. Monitor the distance between the golden set's intent mix and production's.
-- **Launch log with agreement metrics,** as in the example. Monitor directional agreement; stop gating on
-  a metric that falls to coin-flip level.
 - **Sampled online judging off the request path.** Judge a fixed sample of live traces asynchronously,
   with the same pinned judge version as offline, so the two are comparable. Monitor judge score against
   the primary outcome on the same conversations.
@@ -436,8 +431,7 @@ Monday. What do you do, and what would change your decision?
 ### Use cases
 - **Shipping a new planner prompt.** It must pass the offline task set, then a shadow or canary rung,
   before a full rollout is judged on task completion.
-- **Running shadow traffic safely.** A candidate agent replays live requests with side-effecting tools
-  in dry-run mode, so real-world behaviour is observed without real actions.
+- **Approving a model swap.** Shadow mode with dry-run writes, then an A/B on resolution, decides it.
 - **Refreshing the golden set from traces.** Sampled production conversations, especially failures,
   are added offline so the eval tracks this month's intent mix.
 

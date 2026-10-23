@@ -5,7 +5,7 @@ name: Model Context Protocol (MCP)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -430,14 +430,16 @@ set and check latency and error rates per server before go-live.
 > the needed tools and reviewing descriptions addresses both the cost and the trust problem.
 
 ## Mastery test
-**Problem:** after a vendor upgrades its MCP server, your agent starts emailing CRM exports to an outside
-address, and one in ten runs ends with a crashed loop and no answer. Nothing in your code changed. Diagnose
-both and fix.
+**Problem:** your host connects an unpinned vendor `crm` server and your own unchanged `mail` server. After
+the vendor upgrades, runs email CRM exports to an outside address, and one in ten crashes on a JSON-RPC
+`-32602` (invalid params) error. Diagnose both without disabling either server.
 
 **A strong answer:**
-- suspects tool poisoning: diffs `tools/list` against the reviewed hash and finds new description text;
-- pins the old version, gates sends after untrusted reads, and fails startup on unreviewed changes;
-- traces the crashes to JSON-RPC errors or a dead connection (channel 2) and maps them to `is_error`.
+- `crm` text (a poisoned description or result) steers a call on the trusted `mail` server, so the gate
+  keys on "this run read untrusted content", not on which server owns the send tool;
+- confirms by diffing `tools/list` against the reviewed hash and reading the result before each send;
+  pins the version and fails startup on unreviewed changes;
+- `-32602` is channel 2 (likely a changed `inputSchema` meeting a stale tool snapshot); maps it to `is_error`.
 
 ## Use cases & projects
 ### Use cases

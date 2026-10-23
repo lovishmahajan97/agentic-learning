@@ -5,7 +5,7 @@ name: Typed tool contracts
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -275,7 +275,7 @@ def test_tool_schemas_match_snapshot():
 - **Exposing the ORM or API model as the tool input.** Symptom: a thirty-field schema and a model that
   invents values for fields it does not understand. Fix: a thin tool-facing input type.
 - **Returning upstream JSON unchanged.** Symptom, weeks later: an upstream field rename makes the agent
-  report null values with full confidence. Diagnose: diff result shapes in traces before and after the
+  confidently report nulls. Diagnose: diff result shapes in traces before and after the
   date nulls began. Fix: a typed output mapped at your boundary.
 - **Renaming a parameter in place.** Symptom: fresh-prompt evals pass while cached conversations and
   few-shot examples with the old name break. Diagnose: validation failures per tool, grouped by the
@@ -288,7 +288,7 @@ def test_tool_schemas_match_snapshot():
 ## When to use
 - **Use when** several people edit tools, several agents share them, or any tool has side effects.
 - **Lighter option:** for a throwaway prototype with two read-only tools, an SDK decorator deriving the
-  schema from a function signature is enough and is still the same idea.
+  schema from a function signature is enough, and the same idea.
 - **Measure** schema-validation failure rate per tool (near zero with a good contract), the share of errors
   that carry a kind, and how often a contract change broke an eval.
 - **Debug here first:** when a tool "stopped working", compare the committed schema snapshot with what the
@@ -397,9 +397,9 @@ nothing in flight breaks.
 **A strong answer:**
 - calls it breaking (a type change) and ships `create_ticket_v2`, or accepts both with a mapping during a
   transition;
-- updates the snapshot, examples and eval cases in the same PR and reruns the arguments eval;
-- fixes one explicit, logged mapping for old calls (five levels onto three is lossy) and removes the old
-  shape only when traced calls using it reach zero.
+- updates snapshot, examples and eval cases in one PR and reruns the arguments eval;
+- logs one explicit mapping for old calls (five levels onto three is lossy); drops the old shape when
+  traced calls to it reach zero.
 
 ## Use cases & projects
 ### Use cases

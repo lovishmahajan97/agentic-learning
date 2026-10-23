@@ -5,7 +5,7 @@ name: Parallel tool calls
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -378,10 +378,11 @@ p95 turn time rose although median fell. One turn holds `search_hotels` x6, `boo
 `get_trip`. Diagnose and redesign the executor.
 
 **A strong answer:**
-- double bookings: `book_room` timed out, the model retried, the first booking landed; idempotency key
-  plus "outcome unknown" result;
-- p95: six searches burst one provider's rate limit, so 429 retries stretch the slowest call; per-upstream cap;
-- `book_room` excluded from the concurrent set, and verifies with spans and calls per turn.
+- double bookings: traces show a timed-out `book_room` retried while the first booking landed;
+  idempotency key plus an "outcome unknown, check first" result;
+- p95: a turn waits for the slowest of six searches, so per-call tail latency becomes turn latency, and an
+  uncapped burst adds 429 retries; per-upstream cap and per-call timeout;
+- `book_room` excluded from the concurrent set; verified with spans and calls per turn.
 
 ## Use cases & projects
 ### Use cases

@@ -5,7 +5,7 @@ name: Customer VPC / on-prem / air-gapped deployment
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -193,9 +193,9 @@ flowchart TD
 
 ## Examples
 ### Offline preflight for an agent's model and tool hosts
-Run at agent start-up inside the customer's network. It refuses to start if the model or any tool
-endpoint resolves to a host outside the allowlist from the values file, so a leftover public tool fails
-at install, not mid-task with customer data in the request.
+An init container that blocks the agent if the model or any tool endpoint names a host outside the
+values-file allowlist, so a leftover public tool fails at install, not mid-task with customer data in
+the request.
 
 ```python
 """Preflight: every model and tool endpoint must be an approved internal host."""
@@ -344,9 +344,9 @@ spec:
   CA bundle, proxy, model endpoint and tool endpoints as chart values (Bitnami-style charts use
   `global.imageRegistry` for the registry). Lint with `helm template` against each customer's values
   file before shipping.
-- **Per-model agent evals in the bundle.** Ship the eval set and a runner with the bundle so the customer
-  (or your FDE) can re-run task-completion and tool-call accuracy on their GPUs after install. Track the
-  scores per site and per bundle version.
+- **Per-model agent evals in the bundle.** Ship the eval set and a runner so the customer or your FDE
+  can re-run task-completion and tool-call accuracy on their GPUs after install; track scores per site
+  and bundle version.
 - **Mirror relocation with skopeo.** Use `skopeo copy` to move images into an OCI layout for the media,
   then into the customer's mirror, keeping digests unchanged so signatures still verify. Monitor
   signature-verification failures at admission.
@@ -416,8 +416,8 @@ spec:
   above.
 - **Constraints:** the model must be served locally (a 0.5-3B open-weight model is enough); nothing may
   be fetched at container start.
-- **Deliver:** a table of every outbound dependency you found and how you removed it; a bundle directory
-  with a manifest; a one-line command that runs one scripted agent task.
+- **Deliver:** a table of every outbound dependency and how you removed it; a bundle directory with a
+  manifest; one command that runs a scripted agent task.
 - **Acceptance:** the task completes with agent and model on a `docker network create --internal`
   network (or in one container under `--network none`); `verify` rejects the bundle
   after you flip one byte in a weights file and after you add a stray file; pointing one tool at a public

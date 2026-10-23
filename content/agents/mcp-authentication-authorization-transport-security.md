@@ -5,7 +5,7 @@ name: MCP authentication / authorization / transport security
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -46,8 +46,7 @@ model is never the trust boundary.
   tool, audience pinning in validation, where the host keeps tokens (never in the model's context), and
   whether upstream calls use token exchange or the server's own credentials.
 - **What you can skip.** Hand-writing an OAuth client: SDKs and hosts run discovery, registration and
-  PKCE for you. Know the 401, discovery, token chain and the audience rule well enough to debug a failed
-  connection and answer a security review.
+  PKCE for you. Know the 401-to-token chain and the audience rule well enough to debug a failed connection.
 
 ## Why it exists
 - **An MCP server has side effects.** It is a remote-procedure interface that reads a customer's CRM,
@@ -230,7 +229,9 @@ async def mcp_auth(request, call_next):
         return unauthorized(f"invalid token: {exc}")
     if request.method == "POST":                           # GET opens an SSE stream, no body
         body = await request.json()
-        needed = SCOPE_FOR.get(body.get("method")) if isinstance(body, dict) else None
+        if not isinstance(body, dict):                     # a batch array would skip the check
+            return JSONResponse({"error": "batch not supported"}, status_code=400)
+        needed = SCOPE_FOR.get(body.get("method"))
         if needed and needed not in claims.get("scope", "").split():
             return JSONResponse({"error": "insufficient_scope"}, status_code=403,
                 headers={"WWW-Authenticate": f'Bearer error="insufficient_scope", scope="{needed}"'})
@@ -241,6 +242,8 @@ async def mcp_auth(request, call_next):
 
 - **Tested:** against PyJWT 2.15 and Starlette 0.49 (`BaseHTTPMiddleware`, `TestClient`) with a stubbed
   JWKS: no token, wrong audience and expired tokens get 401, a read-only token on `tools/call` gets 403.
+- **Fail closed:** without the `isinstance` guard a batch (JSON array) skips the scope check; 2025-06-18
+  dropped batching, so reject it.
 - **Built in:** `jwt.decode` already rejects expired tokens and `PyJWKClient` caches fetched keys.
 - **In production also:** discover the JWKS URL from the authorization server's metadata, pass a small
   `leeway` for clock skew, and log the subject and method on every call.
@@ -297,9 +300,9 @@ A user holds tokens for two servers: a low-risk `docs` server and a sensitive `b
   rate per tool; a persistent rate means scopes are too narrow for real tasks.
 - **Lock down local HTTP servers.** Bind to `127.0.0.1`, keep an exact `Origin` allowlist, and prefer
   stdio when only one user runs the server. Monitor rejected origins in logs.
-- **Carry the subject into agent traces.** Attach the authenticated subject, tenant and MCP server name
-  on each tool-call span (LangSmith, or OpenTelemetry to any backend), so one agent run reads end to end
-  with a person on every write. Monitor spans missing a subject.
+- **Carry the subject into agent traces.** Attach subject, tenant and MCP server name to each tool-call
+  span (LangSmith, or OpenTelemetry), so every write in a run names a person. Monitor spans missing a
+  subject.
 
 ## Trade-offs
 - **Per-user identity vs login ceremony.** OAuth 2.1 with discovery gives per-user identity, consent and
@@ -345,8 +348,7 @@ A user holds tokens for two servers: a low-risk `docs` server and a sensitive `b
   without rotating a shared key, and does a token from one server fail on another?
 
 ## Exercise
-**Goal:** make a remote MCP endpoint reject every token it should, with per-tool scopes. No solution is
-given.
+**Goal:** make a remote MCP endpoint reject every token it should, with per-tool scopes.
 - **Inputs:** the middleware above, a locally generated RSA key standing in for the authorization server,
   and two tools: `search_tickets` (read) and `close_ticket` (write).
 - **Constraints:** scope per tool name from `params.name`, not per JSON-RPC method; the handler reads the
@@ -354,7 +356,7 @@ given.
 - **Deliver:** the middleware, a tests file, and a log line per call with subject, method and tool.
 - **Acceptance:** tests pass for: no token gives 401 with `resource_metadata`; wrong audience gives 401;
   expired gives 401; a read-only token on `close_ticket` gives 403 naming `tickets:write`; a bad `Origin`
-  gives 403; a valid call logs the subject.
+  gives 403; a JSON array body gives 400, never 200; a valid call logs the subject.
 
 ## Role lens
 - **Engineer:** Implements the resource-metadata endpoint, validates audience and scopes in middleware,
@@ -455,7 +457,7 @@ customer reports tickets closed by "the integration" that nobody asked for. Revi
 - asks whether audience is pinned, since customer IdP tokens issued for other apps may be accepted;
 - fixes with audience-bound tokens, a tenant check on every tool call, token exchange or per-tenant
   credentials upstream, write scopes on step-up, and traces that tie each close to a subject and the
-  tool result that preceded it.
+  tool result that preceded it (likely an injected ticket; the admin token reaches every tenant).
 
 ## Use cases & projects
 ### Use cases
@@ -465,8 +467,8 @@ customer reports tickets closed by "the integration" that nobody asked for. Revi
   process boundary is the identity and the review focuses on supply chain and secrets in the environment.
 - **Multi-tenant SaaS connectors.** A vendor hosts one MCP server for many customers, and audience-bound
   tokens plus tenant checks on every tool call keep one customer's agent out of another's data.
-- **Security review of an agent rollout.** Mapping each tool to a scope, checking token audience
-  validation and confirming tokens never enter the model's context before agents reach production.
+- **Security review of an agent rollout.** Map each tool to a scope, check audience validation and
+  confirm tokens never enter the model's context.
 
 ### Mini project
 **Put OAuth scopes in front of a small remote MCP server (2-3 hours).**
@@ -478,8 +480,8 @@ customer reports tickets closed by "the integration" that nobody asked for. Revi
 - **Done when:** a read-scoped token can call the read tool but gets `403 insufficient_scope` on the
   write tool, a token minted for another audience gets 401, and the server log attributes every call to
   a user subject rather than a shared key.
-- **Note:** the middleware example above scopes by JSON-RPC method, so every `tools/call` needs the write
-  scope; for this project, read `params.name` from the body and map each tool name to its own scope.
+- **Note:** the middleware above scopes by JSON-RPC method, so every `tools/call` needs the write scope;
+  scope by tool name instead, as in the Exercise.
 
 ### Major project
 This lesson feeds the module Capstone (see the module guide): the billing-dispute agent exposes its

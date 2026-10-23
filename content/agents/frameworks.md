@@ -5,8 +5,13 @@ name: Frameworks (LangGraph, LangChain, LlamaIndex, Pydantic AI, DSPy)
 kind: tool
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: mastery-verified
 agent_relevance: core
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - agents/agent-loop
+  - agents/state-machines
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -58,9 +63,6 @@ Each trades speed for abstraction you must understand, so pick the thinnest laye
   and painful later: hidden prompts, abstractions that leak the moment you need something different, and
   version churn.
 
-The skill is knowing which problem each framework actually solves, so you adopt the layer you need and
-no more.
-
 ## How it works
 ### The common core
 Strip any framework down and the same loop remains:
@@ -74,8 +76,6 @@ SDKs, multi-agent libraries):
 - **Who owns control flow?** The model inside a loop, or an explicit graph or event flow you wrote.
 - **Where does state live?** A message list, a typed state object, or event payloads.
 - **What is first-class?** Integrations, retrieval, types or prompt optimization.
-
-Answering those three tells you most of what a framework will be like to debug.
 
 ### LangChain
 - **What it is:** the broad integration layer, a common interface over chat models, embeddings, vector
@@ -206,8 +206,9 @@ flowchart TD
   task and leaves the prompt to the compiler.
 - **Model identifiers are configuration, not code,** and the two libraries spell them differently:
   Pydantic AI uses `provider:model`, DSPy passes LiteLLM's `provider/model`.
-- **Versions:** parameter names follow Pydantic AI 1.x (`output_type`, `result.output`; older releases
-  used `result_type` and `result.data`) and DSPy 2.5+.
+- **Versions:** parameter names follow Pydantic AI 1.0 and later (`output_type`, `result.output`; older
+  releases used `result_type` and `result.data`) and DSPy 2.5+. Ran on pydantic-ai-slim 2.60.0
+  (`FunctionModel`), DSPy 3.4.1 (`DummyLM`) and LangGraph 1.2.16.
 
 ```python
 import os
@@ -341,9 +342,9 @@ Four layers, each answering a named need; DSPy waits until there are labels.
   Postgres checkpointer (`PostgresSaver` from the `langgraph-checkpoint-postgres` package), keep
   `InMemorySaver` for tests, and pass a stable `thread_id` per run. Monitor resume success after
   redeploys and checkpoint table growth.
-- **Side effects after the interrupt node.** For every approval in LangGraph. Put the notification,
-  ticket or write in its own node that runs after the approval node, or give it an idempotency key.
-  Monitor duplicate side effects per resumed run, which should be zero.
+- **Side effects after the interrupt node.** For every LangGraph approval: the notification, ticket or
+  write gets its own node after approval, or an idempotency key. Monitor duplicate side effects per
+  resumed run, which should be zero.
 - **Pin and upgrade deliberately.** For every framework named here. Lock exact versions (a lock file
   such as `uv.lock` or pinned requirements), upgrade on a branch, and run the golden task set before
   merging. Monitor import and validation errors after each upgrade.
@@ -378,32 +379,44 @@ Four layers, each answering a named need; DSPy waits until there are labels.
 
 ## Pitfalls
 - **LangChain's early text-parsing agent patterns in production.** Symptom: an agent that breaks when the
-  model's phrasing changes, and a loop you cannot inspect.
+  model's phrasing changes, and a loop you cannot inspect. Diagnose: count output-parse failures per run
+  in traces. Fix: native tool calling.
 - **LangGraph without a checkpointer** ("we will add persistence later"). Symptom: a human-interrupt
-  feature that cannot resume after a redeploy.
+  feature that cannot resume after a redeploy. Diagnose: pause a staging run, redeploy, resume its
+  `thread_id`. Fix: a durable checkpointer.
 - **Pinning nothing and upgrading casually.** Symptom: import errors and renamed parameters on a Monday
-  morning, across every framework named here.
+  morning, across every framework named here. Diagnose: diff installed versions against the last good
+  deploy. Fix: pin.
 - **Treating LlamaIndex's default chunking and prompts as tuned.** Symptom: retrieval that works on the
-  demo PDF and fails on the customer's scanned contracts.
+  demo PDF and fails on the customer's scanned contracts. Diagnose: recall on labelled questions over
+  their documents. Fix: tune parsing and chunking.
 - **DSPy optimization on a metric that does not match the business outcome.** Symptom: a compiled prompt
-  that scores well and ships worse answers.
+  that scores well and ships worse answers. Diagnose: compare metric scores with human judgements on
+  held-out cases.
 - **A side effect before `interrupt()` in a LangGraph node.** Symptom: a notification or ticket created
-  twice, once when the graph paused and again when it resumed.
+  twice, once when the graph paused and again when it resumed. Diagnose: count side effects per resumed
+  thread.
 - **Hidden framework system prompts conflicting with yours.** Symptom: behaviour you cannot explain until
   you print the final rendered prompt.
 
 ## When to use
-- **Choose by the problem, not the popularity.**
-- **Retrieval over documents is the hard part:** start with LlamaIndex's data layer and keep the agent
-  layer thin.
-- **Resumable, inspectable control flow with human interrupts:** LangGraph is the strongest option and
-  maps directly onto a state-machine design.
-- **Typed tools and outputs with nothing hidden:** Pydantic AI, or a hand-rolled loop of similar size.
-- **Fragile prompts, with labelled examples and a metric:** DSPy.
+- **Choose by the problem, not the popularity,** as in the table and diagram above: LlamaIndex when
+  retrieval is the hard part (keep the agent layer thin); LangGraph for resumable control flow with
+  interrupts, since it maps onto a state-machine design; Pydantic AI or a similar-sized loop for typed I/O;
+  DSPy only with labels and a metric.
 - **LangChain:** use its integrations where they save real work, not its older agent abstractions.
 - **Measure the same things regardless:** task completion on a golden set, p95 cost and latency, resume
   success, and how long a new engineer takes to read the final rendered prompt.
 - **Interviews:** expect "what does a framework do under the hood?" and "when would you not use one?"
+
+## Exercise
+**Goal:** extend the mini project below with a human pause and judge whether the framework earned its
+place. No solution is given.
+- **Constraints:** the refund needs human approval, the run resumes in a fresh process, and the tools
+  module never imports the framework.
+- **Deliver:** both versions and a half-page memo: lines of code, rendered prompts, upgrade risk.
+- **Acceptance:** killing the process between pause and resume still yields exactly one refund in each
+  version (count the calls); `grep` finds the framework imported in one module only.
 
 ## Role lens
 - **Engineer:** Picks the thinnest layer that solves the actual problem, pins versions, reads the
@@ -497,14 +510,25 @@ may fit.
 > the model the validation error, with nothing hidden. The others solve different problems or carry
 > more abstraction.
 
+## Mastery test
+**Problem:** a claims agent built on a multi-agent library must now pause up to a week for adjuster
+approval and be fully traced, and the library's latest release renamed half its API. Migrate, and to what?
+
+**A strong answer:**
+- separates the needs (durable pause, tracing, exit cost) and asks whether multiple agents are needed;
+- picks durable control flow (LangGraph with a Postgres checkpointer, or a hand-rolled state machine)
+  and a tracing tool as a separate choice;
+- first moves tools, state and evals behind a thin adapter;
+- verifies resume after redeploy, zero duplicate side effects and golden-set completion.
+
 ## Use cases & projects
 ### Use cases
-- **Choosing a stack for a new agent team.** Map each hard part (retrieval, resumable control flow,
-  typed outputs, prompt tuning) to the thinnest framework layer that owns it, and write the choice down.
+- **Choosing a stack for a new agent team.** Map each hard part to the thinnest framework layer that
+  owns it, and write the choice down.
 - **Adding human approval to an existing agent.** Teams move the loop onto LangGraph so a checkpointer can
-  pause the run at an interrupt and resume it after review without re-running earlier tools.
-- **Document Q&A agents.** LlamaIndex handles parsing, chunking and query engines, while the agent loop
-  stays in plain code or a thin orchestration layer.
+  pause at an interrupt and resume after review without re-running earlier tools.
+- **Document Q&A agents.** LlamaIndex handles parsing, chunking and query engines; the agent loop stays
+  thin.
 - **Hardening a fragile multi-step prompt pipeline.** DSPy replaces hand-tuned prompts with modules and a
   metric, so prompt changes are driven by an eval set instead of guesswork.
 

@@ -5,7 +5,7 @@ name: Content moderation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: partial
@@ -140,7 +140,7 @@ The classifier scores; your routing table picks one of four actions; every decis
 ```mermaid
 flowchart TD
     I["Input, output or retrieved text"] --> C["Classifier: score per category"]
-    C --> W["Pick worst category vs its threshold"]
+    C --> W["Most severe action across categories"]
     W --> B{"Above block threshold?"}
     B -->|"self-harm on input"| SC["Safe completion with resources"]
     B -->|"yes, other"| BL["Block, templated message"]
@@ -186,17 +186,20 @@ def score(text: str) -> dict[str, float]:
         output_format=Scores)
     return r.parsed_output.model_dump()     # LLM-written scores are ranks, not calibrated probabilities
 
+SEVERITY = {"allow": 0, "allow_and_flag": 1, "block": 2, "safe_completion": 2}
+
 def route(text: str, direction: str) -> dict:
     s = score(text)
-    worst = max(s, key=lambda k: s[k] / THRESHOLDS[k][0])      # severity relative to its own threshold
-    block, review = THRESHOLDS[worst]
-    if s[worst] >= block:
-        action = "safe_completion" if worst == "self_harm" and direction == "input" else "block"
-    elif s[worst] >= review:
-        action = "allow_and_flag"                                # sent to the user, queued for review
-    else:
-        action = "allow"
-    return {"action": action, "category": worst, "score": round(s[worst], 2), "direction": direction}
+    def action(k: str) -> str:                                   # each category against its own thresholds
+        block, review = THRESHOLDS[k]
+        if s[k] >= block:
+            return "safe_completion" if k == "self_harm" and direction == "input" else "block"
+        return "allow_and_flag" if s[k] >= review else "allow"  # flagged: sent to the user, queued for review
+    # Most severe action wins, then score relative to its block threshold. Picking the category first and
+    # checking only its thresholds would let sexual_minors=0.02 (over its 0.01 review line) pass as "allow"
+    # whenever violence=0.45 has the higher ratio.
+    worst = max(s, key=lambda k: (SEVERITY[action(k)], s[k] / THRESHOLDS[k][0]))
+    return {"action": action(worst), "category": worst, "score": round(s[worst], 2), "direction": direction}
 
 print(route("I don't see the point in going on anymore.", "input"))
 # -> self_harm over its block threshold on input: answer with support resources, not a refusal.
@@ -216,7 +219,8 @@ oa = OpenAI()
 
 def hosted_scores(text: str) -> dict[str, float]:
     res = oa.moderations.create(model="omni-moderation-latest", input=text).results[0]
-    return res.category_scores.model_dump()   # e.g. {"harassment": 0.01, "self_harm": 0.72, ...}
+    cs = res.category_scores                   # model_dump() would repeat each score under its raw "self-harm" key
+    return {f: getattr(cs, f) for f in type(cs).model_fields}   # {"harassment": 0.01, "self_harm": 0.72, ...}
 # Map the vendor's category names onto your taxonomy, then call the same route() logic.
 ```
 

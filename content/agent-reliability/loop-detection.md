@@ -5,7 +5,7 @@ name: Loop detection
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -359,25 +359,23 @@ persists. Log both cases so the thresholds can be tuned from real traces rather 
 > differently and are never counted. Hashing only the name would flag unrelated calls instead.
 
 ## Mastery test
-**Problem:** a browsing agent searches, opens a result, finds nothing useful, and searches again with a
-reworded query. Each page includes a fresh ad id and timestamp. The guard never fires and runs end at
-the budget. Why, and what do you change?
+**Problem:** a writer agent revises a report and a critic agent scores it. Over 12 rounds scores go 6,
+7, 6, 7 and the flagged issue alternates between "tone" and "missing citation". Every draft differs, so
+the guard never fires. Why, and what do you build?
 
 **A strong answer:**
-- sees that reworded queries hash differently and volatile page fields make every result unique, so
-  neither exact nor no-progress signals fire;
-- strips volatile fields per tool and adds a progress metric such as distinct useful URLs or new facts
-  found, counting steps since it last improved;
-- considers semantic similarity on queries only if that still misses, accepting its cost and false
-  positives;
-- validates offline on exhausted traces before enabling block.
+- new draft text each round makes every hash unique, so the loop is visible only at agent level;
+- in the orchestrator, hashes each critique's issue set (A B A B is a period-2 cycle) and counts
+  rounds that do not beat the best score (stuck at 7 since round 2);
+- informs the writer of both issues at once, then stops, returning the best draft as partial, not the
+  last.
 
 ## Use cases & projects
 ### Use cases
 - **Coding agents re-running a failing test.** The (action, result) hash shows nothing changed, so the
   guard informs, then blocks, before the budget burns.
-- **Search and browsing agents.** Reworded queries returning the same empty result are caught once
-  arguments are canonicalized and results are hashed.
+- **Search and browsing agents.** Rewording defeats exact hashing, so stripped result hashes are paired
+  with a progress metric such as new useful URLs.
 - **Job-polling agents.** Pollable tools get a higher ceiling or a time cap, so a changing status counts as
   progress while ten identical statuses count as a loop.
 - **Multi-agent routers.** An orchestrator-level (from, to, task) counter stops a router and a billing agent

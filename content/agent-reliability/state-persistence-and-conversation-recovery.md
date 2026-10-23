@@ -5,7 +5,7 @@ name: State persistence & conversation recovery
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -255,8 +255,8 @@ for e in s.since("c1", after_seq=3):                     # client reconnects
 
 ## Production patterns
 - **SSE event ids as the catch-up cursor.** Send each event with an SSE `id:` field equal to its `seq`;
-  the browser's `EventSource` sends it back as the `Last-Event-ID` header on reconnect, so the server
-  replays from there. Monitor reconnect counts and the gap between last-sent and last-acknowledged seq.
+  the browser's `EventSource` sends it back as the `Last-Event-ID` header on automatic reconnect, so the
+  server replays from there. Monitor reconnect counts and the gap between last-sent and last-acknowledged seq.
 - **Database-enforced idempotent submit.** Put a unique constraint on the turn id and insert with
   `INSERT ... ON CONFLICT (turn_id) DO NOTHING` in Postgres, plus a unique `(conversation_id, seq)`
   constraint so two writers cannot claim one slot. Monitor conflict hits, which equal client retries.

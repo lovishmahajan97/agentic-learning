@@ -5,7 +5,7 @@ name: Regression tests
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: partial

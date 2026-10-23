@@ -5,7 +5,7 @@ name: Terraform (infrastructure as code)
 kind: tool
 difficulty: core
 est_minutes: 19
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -124,7 +124,8 @@ so every environment and customer account is reproducible and reviewable.
   inputs.
 - **Drift.** If someone changes a resource in the console, the next plan shows drift and proposes
   reverting it.
-- **Import.** Existing hand-built resources are adopted with an `import` block or `terraform import`, so
+- **Import.** Existing hand-built resources are adopted with an `import` block (Terraform 1.5+) or
+  `terraform import`, so
   they come under management without being recreated.
 
 ### One state per environment
@@ -376,8 +377,8 @@ environment that already exists. A rename in the not-yet-applied staging root al
   fix and re-causes the incident. Diagnose: nightly `-detailed-exitcode` drift plans; exit code 2 flags it.
 - **Giving an agent apply rights.** Symptom: an infra agent "fixes" a failing plan by applying it, and a
   stateful resource is replaced. Fix: plan-only credentials and human approval of the saved plan.
-- **Assuming an air-gapped environment can download providers.** Symptom: `terraform init` fails; fixed
-  only by shipping a provider mirror.
+- **Assuming an air-gapped environment can download providers.** Symptom: `terraform init` fails. Fix:
+  ship a provider mirror.
 
 ## When to use
 - **Use IaC for** anything that must exist in more than one environment or survive an audit: every
@@ -392,8 +393,7 @@ environment that already exists. A rename in the not-yet-applied staging root al
 - **Interviews:** expect probes on state, plan review and the replace hazard.
 
 ## Exercise
-**Goal:** extend the plan guard into the safety layer an infra agent's plan tool returns. No solution is
-given.
+**Goal:** extend the plan guard into the safety layer an infra agent's plan tool returns.
 - **Inputs:** hand-written plan JSON fixtures in the `terraform show -json` shape: a clean add, a bucket
   replace, a rename with and without a `moved` block (moved resources carry `previous_address`), and an
   IAM policy update widening `Resource` to `*`.
@@ -492,7 +492,7 @@ reaches the board?
 - explains the 3 replaces as address changes (`[0]` to `["name"]`) and adds `moved` blocks until zero
   destroys;
 - isolates the provider upgrade with `terraform init -upgrade` alone and traces each update to a changed
-  default in the changelog;
+  default in the changelog, knowing state written by 6.x may not load under 5.x;
 - hands the board a saved plan per change, applied exactly, with the guard output attached.
 
 ## Use cases & projects

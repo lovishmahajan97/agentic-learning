@@ -5,7 +5,7 @@ name: Reflection / self-critique
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -235,10 +235,9 @@ The fix was not more iterations; it was giving the critic the source document an
 - **Scoped, expiring lesson memory.** Store cross-episode lessons keyed by task type with a creation date,
   retrieve only matching ones, and expire them. Monitor whether success on a task type improves after
   lessons start applying.
-- **Trace every attempt and critique.** Record each attempt, its evaluator score and the critic's issues
-  as child spans of the agent run (LangSmith or OpenTelemetry), then turn disputed critiques into a
-  labelled dataset for the critic. Monitor score per iteration; a flat or falling curve says remove the
-  loop.
+- **Trace every attempt and critique.** Record each attempt, its score and the critic's issues as child
+  spans (LangSmith or OpenTelemetry), and turn disputed critiques into a labelled dataset for the critic.
+  Monitor score per iteration; a flat or falling curve says remove the loop.
 
 ## Trade-offs
 - **Higher success vs per-iteration cost.** Grounded reflection raises success on checkable tasks
@@ -377,7 +376,8 @@ queries against a staging warehouse. Design the reflection step and predict its 
 **A strong answer:**
 - grounds the check in execution first: errors, empty or absurd results, and known answers for a small
   question set, because they add information the critic lacks;
-- computes gated cost 1 + 0.3 × 2 = 1.6 calls per question against at least 2.6 for the always-on critic;
+- computes gated cost 1 + f × 2, where f ≤ 0.3 is the share execution flags, so at most 1.6 calls per
+  question, against at least 2.6 for the always-on critic;
 - notes a query that runs can still be wrong, so adds a fresh-context critic only for risky questions,
   validated against human labels;
 - keeps the best attempt, caps iterations and tracks right-to-wrong flips.
@@ -398,8 +398,8 @@ queries against a staging warehouse. Design the reflection step and predict its 
 - **Steps:** generate a first solution; one arm self-reviews with no new evidence and returns its last
   revision; the other gets the failing test output and keeps the best; cap both at three revisions; run
   the tests on every attempt for logging only; log pass rate, tokens and right-to-wrong flips.
-- **Done when:** you have a table of pass rate and cost per arm, and a count of right-to-wrong flips that
-  shows whether ungrounded critique hurt.
+- **Done when:** a table of pass rate and cost per arm, and a right-to-wrong flip count showing whether
+  ungrounded critique hurt.
 
 ### Major project
 Feeds the module Capstone: the billing-dispute agent critiques its invoice reconciliation against totals computed in a sandboxed code tool before it proposes any refund.

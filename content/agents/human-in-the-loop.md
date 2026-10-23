@@ -5,7 +5,7 @@ name: Human-in-the-loop
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -133,7 +133,7 @@ p_error × catch_rate × harm  >  review_cost + delay_cost
   is looking.
 - **Canaries:** inject known-bad proposals and measure the catch rate.
 - **Queue depth:** decisions made under backlog pressure are worse.
-- **Reviewer clarity:** reviewers who cannot say what they check need a redesigned view.
+- **Reviewer clarity:** if reviewers cannot say what they check, redesign the view.
 
 ## Diagram
 The harness, not the model, routes each proposed action to blocking review, automatic execution with a
@@ -180,8 +180,7 @@ and 94% agreement above $50.
 - **Above $50** the harm term grows with the amount and the error rate is 6%, so review stays.
 - **The audit is the safety net:** if audited agreement falls below a set threshold, the harness returns
   the class to blocking review automatically.
-- **Window size matters.** 70 audits a day yield well under one disagreement, so judge over several
-  hundred audits; a two-day window of 140 cannot tell 99% from 97%.
+- **Window size matters:** judge over several hundred audits, not two days' worth (see the code below).
 - **Canary proposals** (obviously wrong refunds in the blocking queue) confirm reviewers still catch
   most errors; if not, redesign what they see before widening autonomy.
 
@@ -240,8 +239,8 @@ for n in (140, 500):
   traffic; flips when the input distribution shifts faster than the audit cadence can notice.
 - **Clarifying questions vs user attention.** They prevent wrong work but spend attention; past a few per
   task, users abandon the agent and do the work themselves.
-- **Rich previews vs engineering cost.** Diffs and effects make decisions fast and accurate but require
-  every tool to support a dry run, which is engineering work per tool.
+- **Rich previews vs engineering cost.** Diffs and effects make decisions fast and accurate but need
+  a dry run built for every tool.
 
 ## Pitfalls
 - **Letting the model decide when to ask.** Symptom: silence on the adversarial case and constant
@@ -366,16 +365,17 @@ so the customer can widen autonomy on evidence rather than on trust.
 > tests. Transcripts are large and rarely read; the other options carry little signal.
 
 ## Mastery test
-**Problem:** a hospital scheduling agent books, moves and cancels appointments. Cancelling a
-chemotherapy slot is rare but severe. Staff review every action today and say the queue takes four hours
-a day. Design the loop.
+**Problem:** a hospital scheduling agent takes 1,200 actions daily: 900 bookings, 280 moves and 20
+cancellations, 3 of them chemotherapy slots. Staff review all of them, four hours a day; agreement
+is 99.6% on bookings, 98% on moves and 95% on cancellations. Design the loop.
 
 **A strong answer:**
-- splits classes by harm and reversibility: oncology cancellations always block, routine moves go to
-  sampled audit, bookings auto with audit;
-- routes clinical-slot changes to the owning clinic, with deny on timeout;
-- shows the effect (patient, slot, conflicts) rather than the transcript;
-- measures agreement per class with a window large enough to see rare errors, plus canaries.
+- notices 12 seconds per item (four hours over 1,200), a rubber-stamp signal: run canaries before
+  trusting agreement;
+- automates bookings with a sampled audit; moves go to audit unless a clinical slot changes;
+- keeps every cancellation blocking, routed to the owning clinic, deny on timeout: 3 chemotherapy
+  cancellations a day cannot measure a rare error rate, and harm dominates;
+- shows the effect (patient, slot, conflicts), not the transcript.
 
 ## Use cases & projects
 ### Use cases

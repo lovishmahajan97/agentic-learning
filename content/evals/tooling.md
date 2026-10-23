@@ -5,7 +5,7 @@ name: Tooling (Promptfoo, RAGAS, DeepEval, Braintrust, LangSmith, Langfuse)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -200,8 +200,8 @@ illustrative: 500 rows × 3 metrics × ~2 calls × 3 samples ≈ 9,000 judge cal
 
 - **So the cost pyramid** (deterministic checks per commit, judges per PR or nightly) is a budgeting
   decision, not a style preference.
-- **Caching rarely helps the run that matters:** library caching only helps when the target's output is
-  unchanged, which is rarely true for the run that tests a change.
+- **Caching rarely helps the run that matters:** it only helps when the target's output is unchanged,
+  which a change under test rarely leaves true.
 
 ## Diagram
 Every tool implements this one pipeline; libraries end it in a CI pass or fail, platforms add the
@@ -273,7 +273,8 @@ on the trajectory. The target runs the full loop per item and returns the tool c
 
 ```python
 # assumes langsmith 0.2+ (evaluators may take outputs/reference_outputs and return a bool; the evaluate
-# signature, incl. num_repetitions, checked against langsmith 0.14.12), LANGSMITH_API_KEY and tracing env vars set, and a dataset "support-agent-v3" that already exists
+# signature, incl. num_repetitions, checked against langsmith 0.14.12), LANGSMITH_API_KEY and tracing
+# env vars set, and a dataset "support-agent-v3" that already exists
 from langsmith.evaluation import evaluate
 from my_agent import agent          # compiled LangGraph graph, e.g. create_react_agent(model, tools)
 
@@ -320,8 +321,8 @@ quality and a trajectory judge) at one call each.
 - **The four claims:** SCIM lives under Settings → Security; it needs the Enterprise plan; you generate a
   token; you paste the token into the identity provider. The article says SCIM is available on every
   plan, so the plan claim contradicts it.
-- **Metric definitions differ:** DeepEval's faithfulness counts a claim as truthful unless it
-  *contradicts* the context, so a claim the article is merely silent on would not lower the score. RAGAS
+- **Metric definitions differ:** DeepEval's faithfulness (default `penalize_ambiguous_claims=False`, 4.3.1)
+  counts a claim as truthful unless it *contradicts* the context, so a claim the article is merely silent on would not lower the score. RAGAS
   counts a claim the context cannot support as unfaithful. Same name, different number.
 - **The trap:** if retrieval had returned the SSO article and the bot faithfully described SSO setup,
   faithfulness would be 1.0 and the test would pass.
@@ -526,6 +527,7 @@ propose, and what do you measure first?
 **A strong answer:**
 - picks a self-hosted platform such as Langfuse for traces and scores, and a library in CI;
 - computes 800 × 3 × 4 = 9,600 judge calls before multi-call metrics, and puts judges nightly with a smoke subset per PR;
+- keeps the judge model in-network too, because every judge call ships customer data;
 - writes trajectory checks as own code, pins judge and library, and calibrates against labelled items first.
 
 ## Use cases & projects

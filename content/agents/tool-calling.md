@@ -5,7 +5,7 @@ name: Tool calling
 kind: concept
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: partial

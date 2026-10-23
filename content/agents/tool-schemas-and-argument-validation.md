@@ -5,7 +5,7 @@ name: Tool schemas & argument validation
 kind: practice
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -382,7 +382,7 @@ validation never fails. Users in India report meetings landing 5 hours 30 minute
 and fix the bug.
 
 **A strong answer:**
-- a contract bug: the time has no zone, so a local 15:00 (UTC+5:30) is stored as 15:00 UTC, 20:30 local;
+- a contract bug: with no zone, a local 15:00 is stored as 15:00 UTC (20:30 IST);
 - traces show a constant stated-versus-stored offset matching the user's zone;
 - renames to `starts_at_utc` or requires an offset, takes the user's zone from the session, adds a
   semantic check (future, plausible hours), and returns a fixable error.

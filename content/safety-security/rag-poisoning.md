@@ -5,7 +5,7 @@ name: RAG poisoning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -172,7 +172,8 @@ class Chunk:
     text: str; source: str; doc_id: str; trust: int; sha: str; flagged: bool
 
 def ingest(raw: str, source: str, doc_id: str) -> Optional[Chunk]:
-    norm = unicodedata.normalize("NFKC", raw)                     # fold look-alike characters first
+    norm = unicodedata.normalize("NFKC", raw)                     # fold fullwidth/compatibility forms first
+                                                                  # (Cyrillic look-alikes need a confusables map)
     hidden = bool(HIDDEN.search(norm) or ZERO_WIDTH.search(norm))
     flagged = hidden or bool(INSTRUCTION_LIKE.search(norm))       # judge the raw document...
     text = re.sub(r"\s+", " ", ZERO_WIDTH.sub("", HIDDEN.sub(" ", norm))).strip()   # ...index the clean text

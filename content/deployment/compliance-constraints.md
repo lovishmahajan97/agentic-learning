@@ -5,7 +5,7 @@ name: Compliance constraints
 kind: concept
 difficulty: core
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: yes

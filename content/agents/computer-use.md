@@ -5,7 +5,7 @@ name: Computer use
 kind: concept
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -55,8 +55,8 @@ it for the long tail, and sandbox it.
   does, decides, and acts: "click at (412, 230)" or "type 'Q3 report'". The loop supplies feedback
   (screenshot, act, screenshot), and nothing about the application has to cooperate.
 - **Alternatives each cover a slice.** DOM or accessibility-tree agents are more reliable and far cheaper,
-  but only on the web, and break on canvas-rendered or obfuscated pages. Recorded scripts are
-  deterministic but cannot handle variation. An API is right whenever it exists.
+  but only on the web, and break on canvas-rendered or obfuscated pages. An API is right
+  whenever it exists.
 - **So it is the last tool tried, not the first.** Its value is generality; its price, cost and
   reliability, is what the engineering contains.
 
@@ -417,9 +417,10 @@ completion, $1.10 per claim. The customer wants 90% at under $0.50, and one run 
 should have flagged. What do you change, and what do you promise?
 
 **A strong answer:**
-- infers per-step success near 99% from 0.99⁵⁰ ≈ 0.61, so 90% needs checkpointed sub-tasks with retries
-  and verification, not a better prompt;
-- cuts cost with screenshot pruning, fixed resolution and any structured layer (accessibility API);
+- infers per-step success near 99% (0.62^(1/50) ≈ 0.990), so no 50-step chain reaches 90%; five
+  checkpointed 10-step sub-tasks, one retry each, give (1 − (1 − 0.99¹⁰)²)⁵ ≈ 0.95;
+- cuts cost: three kept screenshots take image tokens from about 1.9M to 220k per run (`plan`), plus the
+  accessibility API;
 - gates the Approve button by hit-test, with a human-reviewed batch;
 - promises only numbers measured in a follow-up pilot.
 
@@ -430,7 +431,7 @@ should have flagged. What do you change, and what do you promise?
 - **Cross-application workflows.** Copying data from one tool into a web portal is split into
   checkpointed sub-tasks so a failure retries from a known state.
 - **QA and UI testing agents.** An agent walks through a product's screens like a user and reports what
-  broke, with every action logged with its screenshot.
+  broke.
 - **Browser agents with a fallback.** DOM-level actions handle most steps and screenshots cover canvas
   content or obfuscated pages.
 

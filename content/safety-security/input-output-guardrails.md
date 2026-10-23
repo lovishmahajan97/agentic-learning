@@ -5,7 +5,7 @@ name: Input / output guardrails
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: partial
@@ -41,9 +41,8 @@ prompt is an instruction, not an enforcement boundary.
   hand-rolled policy table with a decision log.
 - **What you control.** Which rails run on which hop, their order (deterministic first), fail-open or
   fail-closed per rail, block versus flag thresholds, and whether a failed output retries with feedback.
-- **What you can skip.** Building your own safety classifier from scratch; start with size limits, schema
-  checks, a canary and an off-the-shelf moderation model, and add rails only when a measured failure
-  justifies them.
+- **What you can skip.** Building your own safety classifier from scratch; start small (see When to use)
+  and add rails only when a measured failure justifies them.
 
 ## Why it exists
 - **LLM features add a new trust boundary.** Apps already validate forms, payloads and uploads. An LLM
@@ -72,8 +71,9 @@ user input ──▶ input rails ──▶ model (+ tools) ──▶ output rail
 - The model is treated as an untrusted function in the middle.
 
 ### Input rails
-- **Size, encoding, normalisation.** Token limits, control-character stripping, Unicode normalisation
-  (homoglyph tricks turn "ignore" into look-alike characters). Cheap, deterministic, run first.
+- **Size, encoding, normalisation.** Token limits, control-character stripping, NFKC normalisation (folds
+  fullwidth letters) plus a confusables check, since NFKC leaves Cyrillic look-alikes of "ignore"
+  untouched. Cheap, deterministic, run first.
 - **Scope / topic.** A small classifier or embedding-similarity check against the intents the product
   supports, *because* off-topic use is the most common form of abuse and the cheapest to stop.
 - **Injection and jailbreak signals.** Regex for the obvious ("ignore previous instructions"), plus a
@@ -358,8 +358,8 @@ solution is given.
   must call a checker you can make time out.
 - **Deliver:** per-rail false-positive rate, recall and block precision; predicted versus observed tasks
   interrupted; a policy table with block, flag or remove and fail-open or fail-closed per rail.
-- **Acceptance:** predicted interruption rate (from the per-check rates) is within 3 points of observed;
-  no poisoned task reaches the write tool; with the checker forced to time out, an alert fires and the
+- **Acceptance:** predicted interruption rate (from per-check rates) lies inside the observed rate's
+  95% binomial interval; no poisoned task reaches the write tool; with the checker forced to time out, an alert fires and the
   fail policy you chose is what the log shows.
 
 ## Role lens

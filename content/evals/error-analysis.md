@@ -5,7 +5,7 @@ name: Error analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -288,7 +288,7 @@ for k in (7, 9):
 
 ## Production patterns
 - **Weekly reading hour on a shared queue.** When the agent has live traffic, push a random plus
-  stratified sample into an annotation queue (LangSmith and Langfuse both have annotation queues) or a
+  stratified sample into an annotation queue (LangSmith and Langfuse both have annotation queues, as of 2026) or a
   sheet with a notes column, and read for one hour a week. Monitor traces read per round and new
   categories per round; when new categories stop appearing you have hit saturation.
 - **Flip-diff on every eval run.** After any change to a prompt, tool or model, join the old and new runs
@@ -361,7 +361,7 @@ decide what to fix with numbers. No solution is given.
   categories with definitions; counts with 95% intervals; the ceiling for the top two; a one-paragraph
   decision naming the first fix and why severity or fixability did or did not reorder the list.
 - **Acceptance:** a second person labels 15 failing traces from your definitions alone and matches your
-  category on most of them; you can say which ranking differences are inside the noise; the fix, re-run
+  category on at least 12; you can say which ranking differences are inside the noise; the fix, re-run
   on the same traces, shrinks its target category without growing another.
 
 ## Role lens
@@ -460,6 +460,7 @@ and slices, not the aggregate, to the product owner.
 - computes ceilings against all 200 traces: 7, 6 and 4.5 points, so the top three cap at about 17.5
   points and +15 needs nearly all of them fixed perfectly;
 - notes 14 vs 12 is a tie (intervals roughly 3.5-10.5% and 2.7-9.3%), so fixability decides between them;
+- tells the lead 90% in one sprint is unlikely, and reads the 14 "other" before promising more;
 - gates the single file deletion first, because severity outweighs count;
 - turns "tests not run" into a deterministic grader, re-measures on the same 200, then on fresh tasks.
 

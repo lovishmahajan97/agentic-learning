@@ -139,7 +139,7 @@ for ctx in (2048, 8192, 32768):
 ```
 
 ### A local tool-calling step with llama-cpp-python and a JSON schema
-Offline with a downloaded GGUF; schema mode makes the call parse. API checked against llama-cpp-python LLAMA_VERSION.
+Offline with a downloaded GGUF; schema mode makes the call parse. API checked against llama-cpp-python 0.3.36.
 
 ```python
 # pip install llama-cpp-python   (build options for Metal or CUDA: see its docs)
@@ -219,12 +219,14 @@ numbers.
   peak memory, OS kill reasons and tokens per second per device, again after 10 minutes of use (thermal
   throttling). Fix: test on target devices with realistic background apps.
 - **Large tool schemas and long history.** Symptom: slow first token and context overflow. Diagnose: log
-  prompt tokens per step split into schemas, history and retrieved text. Fix: fewer, shorter tools and aggressive context trimming.
+  prompt tokens per step split into schemas, history and retrieved text. Fix: fewer, shorter tools and
+  aggressive context trimming.
 - **Unconstrained output from a small model.** Symptom: occasional malformed tool calls that break the loop
-  offline. Diagnose: track parse rate, keep failing raw outputs, and confirm the
-  runtime received the schema. Fix: grammar or schema-constrained decoding plus code validation.
+  offline. Diagnose: track parse rate, keep failing raw outputs, and confirm
+  the runtime received the schema. Fix: grammar or schema-constrained decoding plus code validation.
 - **Silent cloud fallback.** Symptom: privacy review finds data leaving the device. Diagnose: capture network
-  traffic in a test run and match each request to a logged escalation. Fix: make escalation explicit, consented, redacted and logged.
+  traffic in a test run and match each request to a logged escalation. Fix: make escalation explicit,
+  consented, redacted and logged.
 
 ## When to use
 - **Use when** data must stay on the device, the agent must work offline, per-user cloud cost is

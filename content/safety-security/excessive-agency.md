@@ -5,7 +5,7 @@ name: Excessive agency
 kind: concept
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -121,14 +121,12 @@ When reviewing an agent, compute this product per tool; the largest one is your 
 
 ### Measuring agency
 - **Tools exposed vs tools used** per workflow; the gap is unnecessary surface.
-- **Share of calls requiring approval and the approval acceptance rate;** a rate near 100% means the gate
-  is either too broad or being rubber-stamped.
-- **Blast radius per credential:** what is the worst query or action it permits?
+- **Approval share and acceptance rate;** near 100% means the gate is too broad or rubber-stamped.
+- **Blast radius per credential:** the worst query or action it permits.
 - **Incident reviews:** record which axis failed.
 
 ## Diagram
-Every proposed call goes through the executor's checks in order; denials return a reason to the model and
-are audited just like executions.
+Every proposed call passes the executor's checks in order; denials return a reason and are audited too.
 
 ```mermaid
 flowchart TD
@@ -148,8 +146,7 @@ flowchart TD
 ## Examples
 ### Tool registry and policy-enforcing executor
 Consequence tiers and required scopes per tool; the executor enforces the user's scopes, a step budget, a
-spend cap and human approval for tier-2 actions. The model never sees credentials and cannot talk its way
-past a scope it does not hold.
+spend cap and approval for tier-2 actions. The model never sees credentials. Runs as is on Python 3.12.
 
 ```python
 from dataclasses import dataclass, field
@@ -200,7 +197,7 @@ print(execute(s, TOOLS["issue_refund"], {"order_id": "ORD-104233", "amount_cents
 ```
 
 ### Blast-radius calculator
-Pure Python: the count factor is the smallest of the rate-limited throughput and every cap in force.
+The count factor is the smallest of rate-limited throughput and every cap in force.
 
 ```python
 def worst_case_calls(rate_per_s: float, hours: float, session_cap=None, daily_cap=None, sessions=1):
@@ -218,8 +215,9 @@ print(worst_case_calls(1, 8, session_cap=25, daily_cap=200, sessions=1))   # 25:
 ```
 
 ### Enforcing tenant scope in the resource layer
-A production snippet for PostgreSQL row-level security: the agent's connection sets the tenant for the
-transaction, and the database refuses other tenants' rows whatever SQL the tool sends.
+PostgreSQL row-level security (tested on PostgreSQL 17 as a non-superuser table owner; superusers
+bypass RLS): the connection sets the tenant per transaction, and other tenants' rows stay invisible
+whatever SQL the tool sends.
 
 ```sql
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
@@ -249,14 +247,13 @@ COMMIT;
   the agent report "budget exhausted" rather than fail silently, and alert on sessions that hit caps.
 
 ## Trade-offs
-- **Narrow typed tools vs engineering effort.** They are policeable, but every new capability is work;
-  this flips for exploratory tasks such as coding agents, where one broad tool inside a strong sandbox
-  beats fifty narrow ones.
-- **Approval gates vs fatigue.** They bound damage but work only while rare and informative; once users
+- **Narrow typed tools vs engineering effort.** Policeable, but every new capability is work; for
+  exploratory tasks such as coding agents, one broad tool inside a strong sandbox beats fifty narrow ones.
+- **Approval gates vs fatigue.** They bound damage only while rare and informative; once users
   rubber-stamp, the gate is theatre with a false sense of safety.
 - **Delegated credentials vs identity plumbing.** Per-user credentials remove the confused-deputy risk but
-  need identity integration with every downstream system; for unattended batch jobs with no user, fall
-  back to a tightly scoped service identity with hard budgets.
+  need identity integration everywhere; unattended batch jobs fall back to a tightly scoped service
+  identity with hard budgets.
 - **Budgets vs long tasks.** They stop runaway loops but can cut off legitimate long tasks, hence caps
   per task class.
 - **Dry-run vs round trips.** Plan review catches destructive mistakes at the cost of a second round trip;

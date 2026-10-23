@@ -5,7 +5,7 @@ name: Testing fundamentals
 kind: practice
 difficulty: core
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes

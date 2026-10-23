@@ -5,7 +5,7 @@ name: Agent memory (short-term, long-term, episodic)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -231,8 +231,7 @@ system = "You are a deployment assistant.\n\nKnown about this user (may be stale
   weight recency more and add the importance term above.
 - **The write path supersedes.** "plan is Pro" and "plan is Basic" embed as near-duplicates, so *skipping*
   near-duplicates would keep the stale fact and drop the new one. The crude fix lets the newest statement
-  win; the update-policy lesson replaces it with an explicit add/update/ignore decision and keeps the
-  superseded value for audit.
+  win; the update-policy lesson uses an explicit add/update/ignore decision that keeps history for audit.
 
 ### Episodic scoring: why the importance term matters
 Pure Python; runs as is. The decay, weights and ratings are illustrative.
@@ -280,7 +279,7 @@ for flag in (False, True):
 - **Dated memory block in the prompt.** Render retrieved memories with their dates under a heading such as
   "may be stale", capped by a token budget. Monitor staleness incidents from a labelled "changed details"
   test set.
-- **Scheduled consolidation job.** Run a periodic job that merges near-duplicates, rolls episodes into
+- **Scheduled consolidation job.** A periodic job merges near-duplicates, rolls episodes into
   semantic facts and expires entries past their lifetime. Monitor store growth per user and retrieval hit
   rate over time.
 - **Context budget with early compaction.** Assign token caps per slot and trigger compaction at a turn
@@ -293,9 +292,8 @@ for flag in (False, True):
 - **Precise retrieval vs lossy extraction.** Extracting facts at write time makes retrieval precise, yet
   extraction is lossy and biased by the prompt; storing raw episodes too lets you re-extract later at
   storage cost.
-- **Targeted vs consistent.** Model-managed memory tools adapt to what the task needs, at the cost of extra
-  tool calls and reliance on the model remembering to save; automatic extraction is more consistent but
-  less targeted.
+- **Targeted vs consistent.** Model-managed memory tools adapt to the task but cost tool calls and rely on
+  the model remembering to save; automatic extraction is more consistent, less targeted.
 - **Freshness vs stable facts.** Recency weighting keeps memories fresh but buries stable facts under
   recent trivia unless importance or a semantic/episodic split counters it.
 
@@ -419,12 +417,12 @@ suggesting a deprecated build command, and one saw another developer's endpoint 
 proposes doubling top-k. Diagnose and redesign.
 
 **A strong answer:**
-- rejects a bigger top-k, which pulls more stale and foreign rows into context;
-- sees the build command as team procedure stored as per-user facts: move it to reviewed tenant or
-  procedural memory and supersede it on change;
+- rejects a bigger top-k, which pulls in more stale and foreign rows;
+- sees the build command as team procedure stored as per-user facts, and moves it to reviewed tenant
+  memory;
 - treats the leak as a scoping bug and privacy incident: filter inside the query, audit rows, add a
   canary;
-- shows dates and sources in the memory block and tracks staleness and canary results.
+- shows dates and sources in the memory block; tracks staleness and the canary.
 
 ## Use cases & projects
 ### Use cases

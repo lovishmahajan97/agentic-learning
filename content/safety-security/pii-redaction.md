@@ -5,7 +5,7 @@ name: PII redaction
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -467,7 +467,8 @@ design.
 - places redaction on tool results and the user turn before the model call, and in the trace exporter;
 - re-hydrates names only in the calendar tool's executor, after an authorisation check;
 - stores memory under a keyed pseudonym per patient, not session placeholders, and treats the accessibility
-  need as special-category data with its own retention;
+  need as special-category data with its own retention, kept out of the vendor prompt (the executor maps
+  it to an accessible-room flag for the calendar);
 - notes dates of birth are quasi-identifiers: generalise or redact them, and audit recall on them.
 
 ## Use cases & projects

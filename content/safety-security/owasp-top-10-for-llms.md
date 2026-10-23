@@ -187,7 +187,10 @@ def gaps(matrix):
         row = matrix.get(item)
         if row is None:
             out.append(f"{item}: no row (reviewers read blanks as gaps)")
-        elif "n/a" not in row and not all(row.get(k) for k in ("manifests", "control", "evidence")):
+        elif "n/a" in row:
+            if not str(row["n/a"]).strip():                    # an empty reason is still a blank
+                out.append(f"{item}: n/a without a reason")
+        elif not all(row.get(k) for k in ("manifests", "control", "evidence")):
             out.append(f"{item}: missing manifests/control/evidence")
     return out
 

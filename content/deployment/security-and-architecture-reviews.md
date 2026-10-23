@@ -5,7 +5,7 @@ name: Security & architecture reviews
 kind: practice
 difficulty: core
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -48,8 +48,7 @@ accurate diagram, a threat model and evidence tests; leave with dated findings.
   system fits theirs: which networks it touches, what identity reads their SharePoint, whether an agent
   could email a customer, where a prompt containing patient data is logged.
 - **Those answers depend on the deployment**, so large organizations route new systems through an
-  architecture review board and a security review before production access is granted. Good engineering
-  teams run the same review on their own designs before building.
+  architecture review board and a security review before production access is granted.
 - **Without a review, problems surface in the worst places:** an over-privileged service account found in
   an incident, a path to an unapproved region found by an auditor, a record-modifying tool found by a
   user. Fixing design after deployment costs far more than changing a diagram.
@@ -84,7 +83,8 @@ accurate diagram, a threat model and evidence tests; leave with dated findings.
 - **Network:** ingress and egress paths, private endpoints, VPNs, what is publicly reachable.
 - **Encryption and keys:** in transit, at rest, who holds keys, whether customer-managed keys are used.
 - **Logging and monitoring:** what is logged, where, for how long, whether prompts or outputs are included.
-- **Threat model:** for example STRIDE per boundary, plus AI-specific threats from the OWASP LLM list:
+- **Threat model:** for example STRIDE per boundary, plus AI-specific threats from the OWASP LLM list
+  (2025 edition):
   prompt injection (direct and via retrieved documents), sensitive information disclosure, excessive
   agency of tools, improper output handling (called insecure output handling in the 2023 list), vector
   and embedding weaknesses, and supply chain of models and datasets.
@@ -281,8 +281,8 @@ def test_internal_draft_allowed_and_logged():
 - **Early vs late engagement.** Engaging reviewers at design stage finds structural problems while they
   are cheap, but the design may change and need re-review. Late engagement saves meetings but risks
   findings that force a redesign, such as removing a write tool the agent's main flow depends on.
-- **Thorough pre-read vs preparation time.** It shortens the meeting and the follow-up cycle, but takes
-  days to prepare. For a low-risk internal tool, a lightweight review with a short template is proportionate.
+- **Thorough pre-read vs preparation time.** It shortens the meeting and follow-ups, but takes days to
+  prepare; for a low-risk internal tool, a short template is proportionate.
 - **Risk acceptance vs invisible debt.** Accepting risks with a named approver keeps launches moving, but
   accumulated accepted risks become invisible debt unless they carry expiry dates and are re-reviewed.
 - **Frameworks vs deployment specifics.** STRIDE and the OWASP LLM list give reviewers shared vocabulary,
@@ -322,7 +322,8 @@ def test_internal_draft_allowed_and_logged():
 
 ## Exercise
 **Goal:** prepare a delta review for adding a write tool ("update ticket status") to an approved RAG
-agent. No solution is given.
+agent.
+- **Inputs:** your mini-project agent (or a stub with one read tool) and a ticket API stub.
 - **Deliver:** the new DFD arrow and credential, STRIDE rows for "model output becomes this tool call",
   a tool inventory generated from the registry, and pytest evidence tests for the tool's limits.
 - **Acceptance:** every row maps to a control with a test or a named owner; the tests fail when you
@@ -422,7 +423,7 @@ would bring.
 - adds threat rows: an injected booking (elevation), and prompts reaching an undisclosed provider and
   region (disclosure);
 - proposes controls: a scoped booking role with limits enforced in code and logged per user, and the
-  fallback disabled or the provider added to the DFD and subprocessor list;
+  fallback disabled or the provider added to the DFD and subprocessor list, with the bank notified;
 - brings tests calling the tool with out-of-scope arguments, a routing config excerpt and injection eval
   results.
 

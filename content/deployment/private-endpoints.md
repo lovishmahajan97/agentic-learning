@@ -5,7 +5,7 @@ name: Private endpoints
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -188,7 +188,7 @@ if failures:
     print("\n".join("FAIL " + f for f in failures)); sys.exit(1)
 ```
 
-- **Run it from inside the workload,** not a laptop, because resolution depends on the caller's resolver.
+- **Run it inside the workload,** because resolution depends on the caller's resolver.
 - **Storage may use a gateway route** rather than a private IP; check the route table for those.
 - **Derive the list from the agent's config** (model region, every tool's base URL) into
   `REQUIRED_PRIVATE`, so adding a tool cannot skip the check.
@@ -320,15 +320,15 @@ With the adapter above, each missing path is one named, non-retryable error, not
 - **Letting the agent retry network faults.** Symptom: the task burns its step budget re-trying one
   tool. Diagnose: count identical consecutive tool calls per trace. Fix: classify network errors in the
   adapter and return them as non-retryable.
-- **Single-zone interface or auto-accept for any principal.** Symptom: a full outage of model calls
-  during a zone incident plus unexpected cross-zone data charges in normal operation; or unknown
-  accounts in your endpoint service's connection list, which an audit will flag immediately. Diagnose:
+- **Single-zone interface or auto-accept for any principal.** Symptom: model calls fail during a zone
+  incident plus cross-zone data charges normally; or unknown accounts in your endpoint service's
+  connection list, which an audit will flag. Diagnose:
   count endpoint subnets per zone and review connections. Fix: one interface per zone, manual acceptance.
 
 ## When to use
 - **Use when** a customer's workload in a cloud network must call a managed service and policy says "no
   internet egress" or "no public endpoints for data services". That covers most regulated buyers calling
-  hosted model APIs, storage and key management in their own account, which is where their agents run.
+  hosted model APIs, storage and key management in their own account.
 - **Offer your SaaS this way**: it is the standard way to serve enterprise customers without a VPN.
 - **Prefer it over VPN or peering** when the flow is one-directional to a single service.
 - **Do not use it** as a substitute for authorization, encryption or data-processing terms.
@@ -337,14 +337,16 @@ With the adapter above, each missing path is one named, non-retryable error, not
 
 ## Exercise
 **Goal:** turn the Terraform example into a reusable endpoint module whose guarantees are tested without
-an AWS account. No solution is given.
-- **Inputs:** a list of interface services, a list of workload subnets (one per zone) and one S3 bucket.
+an AWS account.
+- **Inputs:** a list of interface services, workload subnet ids with their CIDRs (one per zone) and one
+  S3 bucket.
 - **Deliver:** a module that creates one interface endpoint per service with private DNS on, a shared
   security group admitting 443 only from the workload subnets, an S3 gateway endpoint, and a bucket
   policy denying requests whose `aws:SourceVpce` is not that endpoint.
 - **Acceptance:** `terraform validate` passes; a `terraform test` file using `mock_provider "aws"`
   (Terraform 1.7 or later) asserts every endpoint has `private_dns_enabled = true` and spans every
-  subnet, and the bucket policy names the gateway endpoint.
+  subnet, and the bucket policy names the gateway endpoint (run it with `command = apply`, since ids
+  are unknown at plan).
 
 ## Role lens
 - **Engineer:** Writes the endpoint, security group and private DNS resources in Terraform, and adds a
@@ -440,14 +442,16 @@ check to deployment so a regression is caught before traffic flows.
 ## Mastery test
 **Problem:** an agent in a customer's Azure Kubernetes cluster calls Azure OpenAI through a private
 endpoint. Security then disables public network access. Next morning the cluster works, but the nightly
-agent eval job on hosted CI runners fails, and analysts on-prem get timeouts from a desktop tool. Explain
-both failures and fix them without re-enabling public access.
+eval job on hosted CI runners and a desktop tool used by analysts on-prem (linked by site-to-site VPN)
+both get 403s.
+
+Explain both failures and fix them without re-enabling public access.
 
 **A strong answer:**
 - sees the CI failure as the intended effect: hosted runners now arrive on the public path, so the evals
   move to a self-hosted runner inside the network or reach it over VPN;
 - traces on-prem to DNS: the private zone answers only inside, so on-prem resolvers need a conditional
-  forward to an inbound resolver (Azure DNS Private Resolver);
+  forward to an inbound resolver (Azure DNS Private Resolver), and the VPN must route the endpoint's IP;
 - verifies with a lookup from each caller, and proves a valid key from outside is now denied.
 
 ## Use cases & projects

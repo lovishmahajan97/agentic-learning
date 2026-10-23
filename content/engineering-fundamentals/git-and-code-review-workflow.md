@@ -5,7 +5,7 @@ name: Git and code review workflow
 kind: practice
 difficulty: core
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -216,8 +216,8 @@ An assistant produced a 180-line `fetch_invoice` tool with tests, all green in C
   `shell=True` before reading the rest. Fix: the checklist, and run the code yourself.
 - **Committing secrets.** Symptom: an API key appears in history, or a secret scanner alerts. Diagnose:
   `git log -p --all -S'sk-'` (or the key's prefix) to find every commit on every branch that adds or
-  removes it. Fix: rotate the key
-  first, then purge history; deleting the file in a new commit does not remove it from history.
+  removes it. Fix: rotate the key first, then purge history; deleting the file in a new commit does
+  not remove it from history.
 
 ## When to use
 - **Always:** a branch and pull request for any change to code, prompts or tool schemas that others

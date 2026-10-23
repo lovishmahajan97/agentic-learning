@@ -5,7 +5,7 @@ name: VPN
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -332,10 +332,10 @@ PersistentKeepalive = 25
 
 ## Exercise
 **Goal:** reproduce an MTU stall and the agent-side failure handling on one laptop, without a real
-tunnel. No solution is given.
+tunnel.
 - **Inputs:** client, router and server Linux containers on two Docker networks, the router's
-  server-side link at MTU 1400 with outbound ICMP dropped (the endpoints keep 1500, so their MSS is too
-  big); a small HTTP service returning 200 bytes or 200 KB.
+  client-side link at MTU 1400 and its outbound ICMP "fragmentation needed" dropped (endpoints keep
+  1500, so the server's segments are too big); an HTTP service returning 200 bytes or 200 KB.
 - **Deliver:** a script that finds the largest passing don't-fragment ping, a `TCPMSS` clamp rule that
   fixes the large response, and a `lookup_case`-style tool returning one structured error when the
   service is stopped.

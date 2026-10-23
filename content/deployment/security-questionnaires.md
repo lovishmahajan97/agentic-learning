@@ -5,7 +5,7 @@ name: Security questionnaires
 kind: practice
 difficulty: intro
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: background
 mastery: evaluate
 code_tested: yes
@@ -300,7 +300,7 @@ def draft(question, llm):
 
 ## Exercise
 **Goal:** generate the agent section of your answer library from configuration and prove it goes stale
-when the agent changes. No solution is given.
+when the agent changes.
 - **Inputs:** a toy tool registry (YAML or JSON: tool, read or write, credential scope, approval
   required), a retention config (traces, logs, memory TTLs) and a model routing config with regions.
 - **Deliver:** a script that renders library entries for the five agent questions in the table above,
@@ -393,7 +393,8 @@ you must do.
 - answers "Yes", per flow: traces at the vendor with its retention and region, the cache with its TTL,
   memory with its deletion path, and states which are in the tenant;
 - names the vendor as a subprocessor and checks it is on the published list;
-- treats last quarter's "No" as a misstatement to correct with that customer, not to repeat;
+- treats last quarter's "No" as a misstatement to correct with that customer, via legal, since it may
+  be contractual;
 - offers a fix, such as payload redaction in traces or an in-tenant trace store, and updates the library
   entry and its owner.
 

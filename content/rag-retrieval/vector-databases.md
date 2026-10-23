@@ -5,8 +5,13 @@ name: Vector databases (pgvector, Qdrant, Pinecone, Weaviate, Milvus, Chroma)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - rag-retrieval/ann-indexes
+  - rag-retrieval/similarity-search
 related:
   - rag-retrieval/ann-indexes
   - rag-retrieval/similarity-search
@@ -30,15 +35,15 @@ Chroma differ on operations, filtering and scale, not retrieval quality.
 
 ## For agent builders
 - **Why it matters for agents.** Every search-tool call and memory recall is a filtered nearest-neighbour
-  query on the agent's critical path, often several per task. Per-user memory is a very selective filter,
-  and "save, then recall on the next step" needs read-your-writes; both are where stores differ most.
+  query on the agent's critical path. Per-user memory is a very selective filter, and "save, then recall
+  next step" needs read-your-writes; stores differ most on both.
 - **Where it shows up in your stack.** LangChain and LlamaIndex vector store integrations (PGVector,
   Qdrant, Pinecone, Weaviate, Milvus, Chroma), the store behind a LangGraph agent's long-term memory, and
   managed "file search" features that hide a vector store behind a tool.
 - **What you control.** Which store, the collection schema and metadata (user, tenant, ACL, model),
   filter indexes, `ef_search`, consistency on writes, and the token budget of what the tool returns.
-- **What you can skip.** HNSW internals and vendor feature matrices. Know filtered-search behaviour,
-  read-your-writes and the memory sizing sum.
+- **What you can skip.** HNSW internals and vendor feature matrices; know filtered search,
+  read-your-writes and the memory sum.
 
 ## Why it exists
 - **Exact search is O(N·d) per query.** Ten million 1536-dimensional vectors is roughly 15 billion
@@ -52,7 +57,7 @@ Chroma differ on operations, filtering and scale, not retrieval quality.
   exact and simple, but somewhere between hundreds of thousands and a few million vectors (illustrative;
   it depends on dimension, hardware and latency budget) it stops fitting an interactive request.
 - **So a vector database packages ANN indexing with database properties:** durability, CRUD, filtering,
-  access control and horizontal scale, which an agent's memory needs as much as its knowledge base.
+  access control and horizontal scale.
 
 ## How it works
 ### The common core
@@ -78,16 +83,16 @@ Chroma differ on operations, filtering and scale, not retrieval quality.
   graph until enough matching rows are found, up to the cap set by `hnsw.max_scan_tuples`, so a very
   selective filter can still come back short.
 - **`relaxed_order` versus `strict_order`:** relaxed is faster but may return rows slightly out of
-  distance order, so re-sort in an outer query (pgvector's docs use a materialized CTE) when order matters.
-- **Knowing your store's behaviour** is the key to debugging "the filtered query returns nothing", which
-  an agent experiences as "no memories found" for a user who has plenty.
+  order; re-sort in an outer query (pgvector's docs use a materialized CTE) when order matters.
+- **Knowing your store's behaviour** is how you debug "the filtered query returns nothing", which an
+  agent sees as "no memories found" for a user who has plenty.
 
 ### Agent memory is the extreme filter
 - **One user's memories are a tiny slice** of a shared collection, so post-filtering an ANN scan almost
   never finds them.
 - **Small slices are cheap to search exactly.** A few thousand vectors per user can be scored directly
-  after selecting them by an indexed user field; in Postgres the planner may pick the B-tree on the user
-  column and compute distances for just those rows.
+  after selecting them by an indexed user field; Postgres may pick the B-tree on the user column and
+  compute distances for just those rows.
 - **Or isolate by design:** a namespace, partition or per-tenant shard per user group, or a store whose
   filter-aware traversal or brute-force fallback handles very selective filters.
 
@@ -109,16 +114,15 @@ Chroma differ on operations, filtering and scale, not retrieval quality.
 - **Milvus:** open-source distributed system separating compute from storage: segments in object storage,
   metadata in etcd, a log service as write-ahead log (historically Pulsar or Kafka; varies by release).
   Many index types (IVF variants, HNSW, DiskANN, GPU).
-- **Milvus at scale:** it targets billions of vectors and is heavier to operate; Milvus Lite embeds in
-  Python for development, Zilliz Cloud is the managed version.
+- **Milvus at scale:** targets billions of vectors, heavier to operate; Milvus Lite embeds in Python for
+  development, Zilliz Cloud is managed.
 - **Pinecone:** fully managed, proprietary; serverless and pod-based deployments, namespaces for tenant
   isolation, metadata filtering, sparse-dense hybrid search. Zero operations; you pay per usage and data
   and index live with the vendor.
 - **Chroma:** open source, Python/JS-first; embedded in the app process with on-disk persistence or as a
   small server; collections with `add`, `query` and `where` filters over an HNSW index. Single-node mode
   suits prototypes and tests, not high concurrency or multi-node.
-- **Chroma hosted:** the hosted service is a separate, distributed offering; check its current
-  capabilities rather than assuming.
+- **Chroma hosted:** a separate, distributed offering; check its current capabilities.
 - **Adjacent options:** FAISS and hnswlib (libraries, not databases), Elasticsearch and OpenSearch kNN
   (if you already run them for lexical search), Redis, LanceDB and Vespa.
 
@@ -130,9 +134,8 @@ Chroma differ on operations, filtering and scale, not retrieval quality.
 | Milvus | consistency levels per collection or query: Strong, Bounded, Session, Eventually |
 | Pinecone | documented as eventually consistent; a short delay before new records appear |
 
-This matters for pipelines that upsert then immediately verify counts or run a test query, for "upload
-a document, then ask about it" flows, where the first question can miss the new document, and for agents
-that save a memory and try to recall it one step later.
+This matters for pipelines that upsert then verify counts, for "upload a document, then ask about it"
+flows, where the first question can miss it, and for agents that recall a memory one step after saving.
 
 ### What "scale" means here
 1. **Memory is the first wall.** Vectors plus the HNSW graph must be in RAM for low latency; as an
@@ -234,8 +237,8 @@ def recall_memory(user_id: str, query: str, k: int = 5) -> list[str]:
     return [h.payload["text"] for h in hits]
 ```
 
-- **`wait=True`** trades a little save latency for read-your-writes within the same agent run.
-- **The payload index** lets Qdrant's filter-aware search handle a filter that matches a tiny slice.
+- **`wait=True`** trades a little save latency for read-your-writes in the same run.
+- **The payload index** lets Qdrant's filter-aware search handle a tiny slice.
 
 ### Why a small tenant gets empty results
 A pure-Python simulation of post-filtering: the "small" tenant owns 1% of 10,000 rows, and the index
@@ -279,7 +282,7 @@ partition.
 | Candidates needed for 5 survivors | about 250,000 |
 | Exact scan of that user's 2,000 vectors at 1536 dims | about 3 million multiply-adds, trivial |
 
-So per-user memory wants pre-filtering by an indexed user field or isolation, not a bigger `ef_search`.
+Per-user memory wants pre-filtering by an indexed user field or isolation, not a bigger `ef_search`.
 
 ### Worked choice: three teams
 | Situation | Pick | Because |
@@ -304,11 +307,10 @@ So per-user memory wants pre-filtering by an indexed user field or isolation, no
   flows and agent memory saves, use Strong consistency in Milvus for verification queries, and poll
   before confirming in eventually consistent services. Monitor time from upsert to first successful query.
 - **Treat the index as derived** — keep documents and chunk text in a source-of-truth store, snapshot the
-  vector store on a schedule, and rehearse a full rebuild. Monitor soft-deleted fraction and compact or
-  re-index before it erodes recall.
-- **Budget search latency per agent step** — an agent that searches five times per task pays store p95
-  five times. Trace each tool call (LangSmith or your own spans) and alert on store latency per step,
-  not just per request.
+  vector store, and rehearse a full rebuild. Monitor soft-deleted fraction; compact or re-index before
+  it erodes recall.
+- **Budget search latency per agent step** — an agent searching five times per task pays store p95 five
+  times. Trace each tool call (LangSmith or your own spans) and alert on latency per step.
 
 ## Trade-offs
 - **pgvector consolidation vs scale.** One system, transactions and joins against business data, but
@@ -316,40 +318,41 @@ So per-user memory wants pre-filtering by an indexed user field or isolation, no
   tens of millions of vectors or when filtered queries dominate the load.
 - **Dedicated open-source engine vs operating it.** Qdrant, Weaviate and Milvus generally give stronger
   filtered search, quantization and horizontal scale, but are another stateful system to run, upgrade
-  and back up; without a platform team that burden flips the decision toward managed.
+  and back up; without a platform team, go managed.
 - **Managed vs self-hosted.** Pinecone, Qdrant Cloud, Zilliz Cloud and Weaviate Cloud remove operations,
   at usage-based pricing (storage plus reads and writes, model varies by vendor), a data-residency
   question and an exit cost; strict residency or a large, rarely-queried corpus flips it back.
 - **Embedded vs server.** Chroma, Milvus Lite and LanceDB need no infrastructure and suit notebooks, tests
-  and demos, but offer no concurrency, replication or multi-node growth; the first multi-user deployment
-  flips it.
-- **Waiting writes vs agent latency.** Read-your-writes makes a memory recallable on the next step but
-  adds latency to the save tool; skip it only when the memory is not needed within the same run.
+  and demos, but offer no concurrency, replication or multi-node growth.
+- **Waiting writes vs agent latency.** Read-your-writes makes a memory recallable next step but slows the
+  save tool; skip it only when the memory is not needed within the run.
 - **Text in the payload vs a pointer.** One hop for retrieval, but inflated memory and backups; a pointer
-  to a document store is leaner at the cost of a second lookup.
+  is leaner at the cost of a second lookup.
 
 ## Pitfalls
-- **Filtered query returns fewer than k, or none.** Cause: post-filtering inside the index scan. Fix
-  with a higher `ef_search`, iterative scans, a store with filterable HNSW, or partitioning by the
-  filter key.
+- **Filtered query returns fewer than k, or none.** Cause: post-filtering inside the index scan.
+  Diagnose: log result count against k per query, and rerun the query with the filter applied before
+  ranking (exact) to compare. Fix: a higher `ef_search`, iterative scans, a store with filterable HNSW,
+  or partitioning by the filter key.
 - **Agent memory recall is empty for active users.** Cause: a per-user filter post-applied to a global
-  ANN scan. Fix: index the user field, pre-filter, or partition memories by user group.
+  ANN scan. Diagnose: `EXPLAIN` the recall query, or count that user's rows directly. Fix: index the
+  user field, pre-filter, or partition memories by user group.
 - **HNSW on a `vector(3072)` column.** The build fails on pgvector's 2,000-dimension limit. Use
   `halfvec(3072)` with `halfvec_cosine_ops`, or a truncated Matryoshka dimension, decided before the
   schema ships.
 - **Building HNSW before the bulk load.** The load takes hours because every insert updates the graph.
   Load first, index after.
 - **Measuring recall only at default query parameters.** Great benchmark numbers, then missing results
-  once filters and real queries arrive.
+  once filters and real queries arrive. Diagnose: recall@10 versus brute force on logged, filtered
+  queries.
 - **Vector store as the source of truth.** After a chunking bug or model upgrade nobody can rebuild the
   index. Keep documents elsewhere and treat the index as derived.
 - **Letting soft-deleted vectors accumulate.** Memory grows and recall degrades until the collection is
-  compacted or re-indexed.
+  compacted or re-indexed. Diagnose: track the soft-deleted fraction.
 - **A different distance operator than the index.** Latency jumps from milliseconds to seconds because
-  the planner chose a sequential scan.
+  the planner chose a sequential scan. Diagnose: `EXPLAIN` shows `Seq Scan` instead of the HNSW index.
 - **One giant multi-tenant collection with a selective tenant filter.** Small tenants get empty or slow
   results. Use namespaces, per-tenant shards or partitions.
-
 ## When to use
 - **Start with pgvector** when the app already runs on Postgres and the corpus is in the low millions:
   no new system, transactional updates alongside business data, row-level security for ACL-aware
@@ -363,6 +366,16 @@ So per-user memory wants pre-filtering by an indexed user field or isolation, no
   million vectors.
 - **Interviews:** explain filtered-search behaviour and size memory from vector count and dimension,
   rather than reciting vendor features.
+
+## Exercise
+**Goal:** measure how filtered recall behaves in a real store and find the settings that keep it above
+0.95 for a tenant owning 1% of the rows.
+- **Inputs:** pgvector 0.8+ or Qdrant in Docker, 100,000 unit vectors at 384 dimensions, a `tenant`
+  field where one tenant owns 1%, and 50 queries.
+- **Deliver:** recall@10 against an exact filtered scan and p95 latency for both tenants, across
+  `ef_search` 40, 100 and 400, iterative scan off and on (or Qdrant with and without a payload index).
+- **Acceptance:** one row reproduces the short-result problem; your chosen configuration meets 0.95 for
+  both tenants and you state its latency cost.
 
 ## Role lens
 - **Engineer:** Chooses index parameters, writes the filtered queries, tunes `ef_search` against measured
@@ -455,6 +468,19 @@ when hybrid sparse-dense search and quantization become requirements.
 > than building the graph in one pass over loaded data. Bulk load, then build, is the documented
 > sequence for pgvector, and engines such as Qdrant let you defer indexing during bulk upload for the
 > same reason.
+
+## Mastery test
+**Problem:** a B2B agent stores 30 million chunks for 400 tenants in one pgvector table. The largest
+tenant owns 40% of rows, the smallest 0.01%. Small tenants report "no results"; a 1536-dimension model
+upgrade is planned. Choose a design and justify it.
+
+**A strong answer:**
+- sizes it: about 184 GB raw at float32 before the graph, so one node needs `halfvec`, quantization or
+  more memory;
+- explains post-filter starvation and fixes it with iterative scans, exact scans via an indexed tenant
+  column for tiny tenants, or partitions;
+- plans the upgrade blue/green with a `model` column or new table, measured against brute force;
+- names when Qdrant or Milvus wins: filtered traffic dominates or one node stops fitting.
 
 ## Use cases & projects
 ### Use cases

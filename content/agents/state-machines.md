@@ -5,7 +5,7 @@ name: State machines
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes

@@ -5,7 +5,7 @@ name: Sandboxing
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -166,15 +166,17 @@ flowchart TD
   that also kills the container.
 - **Two gotchas:** the working directory must be writable by the unprivileged uid, and the bind-mount
   source must be an absolute path (a bare name after `-v` is a named volume, not a host directory).
-- **Checked** on Docker 29.7: network and writes outside `/work` refused, an infinite loop killed.
+- **Checked** on Docker 29.7 (Desktop, macOS): network and writes outside `/work` refused, an infinite
+  loop killed.
 - **Stronger isolation** swaps the `docker` command for a microVM launcher; the policy stays the same.
 
 ```python
 import subprocess, uuid, pathlib
 
 def run_in_sandbox(code: str, workdir: pathlib.Path, timeout_s: int = 60) -> dict:
-    (workdir / "main.py").write_text(code)
     name = f"sbx-{uuid.uuid4().hex[:12]}"
+    script = f"{name}.py"     # new file per run: Docker Desktop's file sharing served a stale, truncated rewrite
+    (workdir / script).write_text(code)
     cmd = [
         "docker", "run", "--rm", "--name", name,
         "--network", "none",                       # default deny; add a logging proxy if egress is required
@@ -183,7 +185,7 @@ def run_in_sandbox(code: str, workdir: pathlib.Path, timeout_s: int = 60) -> dic
         "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
         "--user", "65534:65534",                   # unprivileged uid inside the container
         "-v", f"{workdir.resolve()}:/work:rw", "-w", "/work",   # absolute path, or docker treats it as a volume name
-        "python:3.12-slim", "python", "-I", "main.py",
+        "python:3.12-slim", "python", "-I", script,
     ]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)

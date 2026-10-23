@@ -5,8 +5,14 @@ name: Memory retrieval / update / deletion policies
 kind: practice
 difficulty: advanced
 est_minutes: 14
-status: agentic-verified
+status: mastery-verified
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - agents/agent-memory
+  - rag-retrieval/metadata-filtering
+  - data-architecture/data-retention-and-deletion-architecture
 related:
   - agents/agent-memory
   - agents/context-compaction-summarization
@@ -55,7 +61,7 @@ erases memories everywhere, including indexes and backups.
 - **These are missing policies, not retrieval-quality bugs.** "A better embedding model" or "a bigger k"
   make the pile larger and faster to search without deciding what belongs in it. Memory is user data with
   a designed lifecycle: what gets in and from whom, how conflicts reconcile, how long each kind lives, how
-  it is removed completely. A customer's privacy and security reviewers will ask about exactly these.
+  it is removed completely. Privacy reviewers ask exactly these.
 
 ## How it works
 ### Retrieval policy: what enters the context
@@ -145,8 +151,8 @@ nothing or, worse, still carry the text in the index payload. Treat the raw reco
 and the index as a derived view rebuilt from it.
 
 ## Diagram
-Follow one fact's lifecycle: gated on write, superseded rather than overwritten when it changes, and
-either expired by policy or hard-deleted on request with a tombstone that blocks it coming back.
+One fact's lifecycle: gated on write, superseded when it changes, then expired by policy or hard-deleted
+with a tombstone that blocks its return.
 
 ```mermaid
 stateDiagram-v2
@@ -171,9 +177,8 @@ stateDiagram-v2
 
 ## Examples
 ### Upsert with provenance, and a verified erasure routine
-An `upsert_memory` that implements the add/update/ignore/delete decision with provenance, plus an erasure
-routine that clears every copy and leaves a tombstone. `store` is any document store with a vector index
-keyed by id.
+`store` is any document store with a vector index keyed by id; `llm_json` returns parsed JSON (run here
+against in-memory stubs).
 
 ```python
 import time, uuid
@@ -183,7 +188,7 @@ TRUSTED = {"user", "verified_tool", "operator"}        # write gating: never "re
 def upsert_memory(user_id, text, source, kind="semantic"):
     if source not in TRUSTED:
         return "rejected_untrusted_source"
-    if tombstones.blocks(user_id):                     # erased users stay erased
+    if tombstones.blocks(user_id, text):               # erased user, or keyed hash of a forgotten fact
         return "rejected_tombstoned"
     neighbors = store.search(user_id=user_id, query=text, k=3, active_only=True)   # scoped first
     listing = "\n".join(f"{i}: {n['text']}" for i, n in enumerate(neighbors)) or "none"
@@ -220,18 +225,17 @@ def erase_user(user_id):
 ```
 
 The decisions that matter:
-- **The trusted-source gate,** superseding rather than overwriting, filtering on `active` at retrieval
-  time, and erasing the index and summaries along with the raw records.
+- **Gate, supersede, filter on `active`,** and erase the index and summaries with the raw records.
 - **The model picks the target by *index*,** because asking it to echo the existing text verbatim fails on
   any paraphrase.
-- **The tombstone is checked on the write path,** since a tombstone nobody reads blocks nothing. It records
-  the user id and time, not the erased content.
+- **Tombstones are checked on the write path,** since a tombstone nobody reads blocks nothing. They hold
+  user ids and keyed hashes of forgotten facts, never the erased content.
 - **Verification counts records** rather than running a similarity search, *because* a search with a
   filter or a score threshold can return nothing while rows still exist.
 
 ### Scheduled retention pass: TTL by kind and a per-user cap
-Runnable pure Python for the deletion policy's scheduled half. Lifetimes, cap and history window are
-illustrative; set them from your retention policy.
+Pure Python; runs as is. Lifetimes, cap and history window are illustrative; set them from your
+retention policy.
 
 ```python
 DAY = 86400
@@ -310,8 +314,7 @@ or the index drifts from the source of truth.
   a larger store and a mandatory active-only filter; if history has no value in your product, hard
   overwrite is simpler.
 - **Paraphrase handling vs per-candidate cost.** LLM-decided add/update/ignore handles paraphrase and
-  contradiction well, yet costs a model call per candidate; for high-volume extraction, use
-  embed-similarity thresholds first and ask the model only for ambiguous cases.
+  contradiction well, yet costs a model call per candidate; at high volume, threshold first.
 - **Poisoning protection vs learning.** Strict write gating prevents memory poisoning, but stops the agent
   learning useful facts found in documents; the compromise is storing such facts as low-trust, clearly
   labelled, and never as instructions.
@@ -321,17 +324,21 @@ or the index drifts from the source of truth.
 ## Pitfalls
 - **Scoring across all users and filtering afterwards.** Symptom: users with few memories get thin or empty
   recall because the global top-k was filled by other users' entries, and any bug in that post-filter
-  becomes a cross-user leak. Fix: pass scope as a filter inside the vector query.
+  becomes a cross-user leak. Diagnose: compare recall size per user with that user's row count. Fix: pass
+  scope as a filter inside the vector query.
 - **Append-only updates.** Symptom: two addresses, two plans or two names retrieved together and the agent
-  choosing the wrong one. Fix: an add/update/ignore decision that supersedes.
+  choosing the wrong one. Diagnose: count active entries per user and subject; more than one is a
+  contradiction. Fix: an add/update/ignore decision that supersedes.
 - **Storing memories from retrieved documents or web pages.** Symptom: an instruction-shaped memory that
-  appeared after a single browsing task and now influences every session. Fix: gate writes by source.
+  appeared after a single browsing task and now influences every session. Diagnose: list stored rows by
+  source tag and review instruction-shaped text. Fix: gate writes by source.
 - **Deleting from the vector index but not the raw store, or the reverse.** Symptom: retrievals that
-  reference missing ids, or erased facts reappearing after a reindex. Fix: delete by the same ids in
-  both and rebuild the index from the raw store.
+  reference missing ids, or erased facts reappearing after a reindex. Diagnose: run an orphan-id check in
+  both directions. Fix: delete by the same ids in both and rebuild the index from the raw store.
 - **Forgetting compaction summaries and consolidated facts during erasure.** Symptom: a "deleted" user's
-  detail resurfacing from a session summary months later. Fix: list every derived store in the erasure
-  routine and verify each by count.
+  detail resurfacing from a session summary months later. Diagnose: plant a canary fact, erase, then
+  search every derived store for it. Fix: list every derived store in the erasure routine and verify each
+  by count.
 - **No audit log of memory writes.** Symptom: being unable to explain why the agent believes something,
   which is exactly what a customer will ask. Fix: log every mutation with user, source and id.
 - **Handling "forget this" as a soft supersede.** Symptom: a user's export or a data-subject request still
@@ -346,9 +353,17 @@ or the index drifts from the source of truth.
   superseding when contradictions appear, caps or TTLs when the store outgrows what retrieval handles well.
 - **Measure** staleness incidents, duplicate rate in retrieved sets, erasure verification results and
   memory-write audit coverage.
-- **On the job:** schema design for the memory table and the extraction prompt's decision step.
-- **Interviews:** walk through one fact's lifecycle from write to supersession to erasure, including the
-  index and the summaries.
+
+## Exercise
+**Goal:** evaluate a retrieval policy on a seeded store and show it neither leaks nor goes stale.
+- **Inputs:** about 500 synthetic memories across 20 users, 30 changed-detail cases, and 10 foreign
+  memories near-identical to another user's query.
+- **Constraints:** scope inside the store query; normalised relevance, recency and importance; a 2k-token
+  memory budget.
+- **Deliver:** the retrieval function, an eval script, and a table of staleness, cross-user rows and
+  duplicate rate for relevance-only versus blended scoring, on append-only versus superseding stores.
+- **Acceptance:** zero cross-user rows, canary included; superseding drives staleness to zero; you can
+  explain each case blended scoring fixed or missed.
 
 ## Role lens
 - **Engineer:** Implements scoped retrieval, the add/update/ignore decision, active-only filtering,
@@ -429,16 +444,28 @@ inspect.
 > Retrieved third-party content can contain injected instructions. If it can write memory, an attack
 > persists across sessions; gating writes to trusted sources is the defence.
 
+## Mastery test
+**Problem:** a health-coaching agent keeps memories in Postgres plus a vector index, writes nightly
+compaction summaries and keeps 30 days of backups. A user says "forget my medication", later deletes the
+account, and a week after that ops restores a 10-day-old backup. What happens at each event?
+
+**A strong answer:**
+- forget: hard-deletes the medication facts and their history from every store, with a keyed-hash
+  tombstone, not the text;
+- deletion: erases across raw store, index, summaries and caches, writes a user tombstone, checks counts
+  and audits without the erased text;
+- restore: the backup is 3 days older than the deletion (and may predate the forget), so it brings rows
+  back; user and fact tombstones are replayed and counts re-run before traffic returns;
+- checks the write path reads tombstones, and confirms legal retention exceptions.
+
 ## Use cases & projects
 ### Use cases
-- **Support agents handling changed details.** A customer's new address supersedes the old one, so the
-  agent ships to the current address while history stays available for audit.
+- **Support agents handling changed details.** A new address supersedes the old one; history stays for
+  audit.
 - **Browsing and research agents.** Write gating keeps instructions found on web pages out of long-term
   memory, so one malicious page cannot steer every later session.
 - **Privacy and offboarding requests.** An erasure job removes a user's memories from the raw store, the
   vector index, summaries and caches, then proves it with per-store counts.
-- **Keeping memory cheap at scale.** TTL by kind and per-user caps stop stores from growing until
-  retrieval returns near-duplicates instead of the useful fact.
 
 ### Mini project
 **Build the full lifecycle for one agent's memory store (2-3 hours).**
@@ -452,6 +479,6 @@ inspect.
   after erasure and a snapshot restore every per-store count for the user is zero.
 
 ### Major project
-This lesson feeds the module Capstone (see the module guide): the billing-dispute agent's memory note
+Feeds the module Capstone: the billing-dispute agent's memory note
 covers retrieval scoping and scoring, supersession of contradictory facts, TTLs and an erasure procedure
 across the raw store, the vector index and compaction summaries.

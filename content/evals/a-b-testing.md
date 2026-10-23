@@ -5,7 +5,7 @@ name: A/B testing
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -58,9 +58,7 @@ randomisation unit, one primary metric, fixed sample size, no peeking.
   Costs move with quality: 1% more resolved tickets at 40% more tokens per conversation may be a loss,
   which only a test with cost as a guardrail reveals.
 - **Randomisation removes confounders.** With a coin-flip assignment the only systematic difference
-  between arms is the change, so the outcome difference is effect plus quantifiable noise. It tops the
-  evaluation ladder rather than replacing it: slow, traffic-hungry and exposing real users, it is kept
-  for changes that passed the cheaper rungs.
+  between arms is the change, so the outcome difference is effect plus quantifiable noise.
 
 ## How it works
 ### One hypothesis, one primary metric, guardrails
@@ -131,7 +129,6 @@ n per arm ≈ 16 · p(1 − p) / δ²        δ = p₂ − p₁
   (group-sequential boundaries or always-valid p-values).
 - **Segments generate hypotheses, not results,** because twenty segments at α = 0.05 produce a
   "significant" one by chance.
-- **Watch for novelty:** compare week two with week one, since a new behaviour can draw attention that fades.
 
 ### LLM-specific wrinkles
 - **Non-stationary models.** If model X is silently updated mid-test in "X vs Y", the comparison is

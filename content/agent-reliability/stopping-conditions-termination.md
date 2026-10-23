@@ -5,7 +5,7 @@ name: Stopping conditions / termination
 kind: concept
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes

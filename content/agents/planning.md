@@ -5,7 +5,7 @@ name: Planning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -296,9 +296,9 @@ Interleaved grows quadratically, so doubling to 20 steps more than triples its t
 - **Budgets on steps and replans.** Set explicit limits (for example 20 steps, 3 replans) and return a
   status report rather than an exception when they trip. Monitor replans per task and budget-exhausted
   rate.
-- **Count planner calls in traces.** Tag planner, executor and verifier spans separately in your tracing
-  tool (LangSmith, or any OpenTelemetry backend) so a dashboard shows planner calls per tool call and
-  replans per task. Alert when the ratio climbs, which is the signature of over-eager replanning.
+- **Count planner calls in traces.** Tag planner, executor and verifier spans separately (LangSmith, or
+  any OpenTelemetry backend) and chart planner calls per tool call and replans per task. A climbing
+  ratio signals over-eager replanning.
 - **Plan against the real tool list.** Put the available tool names and descriptions in the planner prompt
   and reject plan steps that need tools the agent lacks before execution starts. Monitor plan validation
   failures.
@@ -434,17 +434,18 @@ batch. Better still, "matched" should be a deterministic check on stored records
 > periodic replanning without a signal burns planner calls while shuffling work that was fine.
 
 ## Mastery test
-**Problem:** a data-onboarding agent maps 30 CSV columns to a schema, then loads rows. Traces show 11
-planner calls per run, column 17 mapped three times, and runs marked complete with 4 columns unmapped.
-Each column needs one lookup tool call. Redesign the planning.
+**Problem:** an interleaved trip-booking agent makes 24 tool calls per trip (searches, then flight, hotel
+and car bookings) with a 2,000-token stable prompt and 800-token observations. Bookings sometimes fail
+"sold out". A teammate proposes ReWOO to cut cost. Estimate both costs and decide.
 
 **A strong answer:**
-- diagnoses over-eager replanning, plan state lost from context, and success judged by the model rather
-  than a check;
-- uses one step per column with a code-checked `done_when` (mapping stored and valid), plan state in
-  storage re-injected as a compact header, and independent columns run in parallel waves;
-- sets replan triggers and a cap, gates completion on all 30 checks, and estimates cost as roughly
-  linear in columns.
+- computes interleaved input as 24 × 2,000 + 800 × (0 + … + 23) = 268,800 tokens, and ReWOO as a
+  planner call plus a solver reading 24 observations, about 23,200;
+- rejects pure ReWOO for bookings, because "sold out" changes *which* step runs next and bookings are side
+  effects a fixed plan cannot adapt around;
+- proposes a hybrid: placeholder-style parallel searches, then plan-then-execute bookings with a
+  code-checked `done_when` (confirmation number stored), "sold out" as a replan trigger, a replan cap and
+  approval before paying.
 
 ## Use cases & projects
 ### Use cases
@@ -465,8 +466,8 @@ Each column needs one lookup tool call. Redesign the planning.
   `done_when` check per step; re-inject the plan with step statuses each turn; replan only when a step
   fails twice or an observation breaks an assumption; cap steps and replans; log tokens, steps and
   success per task.
-- **Done when:** you have a table of success, steps and tokens for both versions, and at least one trace
-  where a replan trigger fired for a stated reason.
+- **Done when:** a table of success, steps and tokens for both versions, and one trace where a replan
+  trigger fired for a stated reason.
 
 ### Major project
 This lesson feeds the module Capstone (see the module guide): the billing-dispute agent's investigation

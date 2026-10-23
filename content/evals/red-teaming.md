@@ -5,10 +5,10 @@ name: Red teaming
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
-code_tested: partial
+code_tested: yes
 prerequisites:
   - safety-security/prompt-injection
   - evals/adversarial-evaluation
@@ -221,6 +221,7 @@ def leaked(reply: str) -> bool:          # deterministic grader; no judge needed
             texts.append(base64.b64decode(tok, validate=True).decode())
         except (binascii.Error, UnicodeDecodeError):
             pass
+    # the pattern encodes YOUR code format; a code it cannot match (e.g. "VIP99") scores as no leak
     codes = {c for t in texts for c in re.findall(r"\b[A-Z]{4,}\d{1,3}\b", t)}
     return bool(codes - APPROVED)
 
@@ -398,8 +399,8 @@ prove a structural fix holds. No solution is given.
   channels (user turn plus a tool result or document); a table of attempts, per-sample hit rate and
   "works at all" per objective; one server-side fix.
 - **Acceptance:** every grader is deterministic or has its judge positives hand-reviewed; after the fix,
-  zero executed harmful calls over enough samples to catch a 5% attack with 95% confidence; benign
-  refusal rate unchanged within a couple of points; every success saved as a regression case your script
+  zero executed harmful calls over enough samples to catch a 5% attack with 95% confidence; at most
+  one more benign task refused than before (one of 20 is 5 points); every success saved as a regression case your script
   re-runs.
 
 ## Role lens
@@ -493,12 +494,13 @@ security report says 0 of 120 attacks succeeded: all typed into chat, each run o
 graded by a judge reading the reply. Launch is to 5,000 users. Do you sign off, and what do you change?
 
 **A strong answer:**
-- refuses sign-off: incoming email, the main injection channel, was never attacked;
-- defines action objectives (invites to outside domains, canary data in event descriptions, invites sent
-  without confirmation) graded from tool-call logs, not the reply;
+- refuses sign-off: incoming email, the main injection channel and open to anyone, was never attacked;
+- defines action objectives (invites to addresses the user never named, canary data in event
+  descriptions, invites sent without confirmation) graded from tool-call logs, not the reply;
 - re-runs at production temperature with enough samples per attack (59 for a 5% attack at 95%) and checks
   attempts generated;
-- adds a recipient allow-list or confirmation in the invite handler, a benign scheduling set, and a CI suite.
+- adds handler-side confirmation for attendees taken from email text, a benign scheduling set, and a CI
+  suite.
 
 ## Use cases & projects
 ### Use cases

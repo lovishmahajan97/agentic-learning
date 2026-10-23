@@ -5,7 +5,7 @@ name: Prompt injection (direct, indirect)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: partial

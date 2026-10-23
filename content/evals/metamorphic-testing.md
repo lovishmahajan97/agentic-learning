@@ -5,7 +5,7 @@ name: Metamorphic testing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: partial

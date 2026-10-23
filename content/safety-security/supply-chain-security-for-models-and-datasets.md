@@ -85,7 +85,7 @@ scanned, signed, quarantined, loaded with least capability.
 ### Controls in order of leverage
 1. **Safe formats only.** Load `safetensors`, a flat tensor format with a JSON header and no code path, and
    reject pickle-based files in production. Where `torch.load` is unavoidable, pass `weights_only=True`;
-   newer PyTorch releases default to it, older pins do not.
+   PyTorch 2.6 and later default to it, older pins do not.
 2. **No remote code by default.** `trust_remote_code=False`. If an architecture genuinely needs custom code,
    vendor it into your repository after review and pin it there, so a later push to the hub cannot change
    what runs.
@@ -133,9 +133,8 @@ flowchart TD
 
 ## Examples
 ### A pinned, hash-checked, safe loader
-Pins a reviewed revision, downloads only tensor and config files, verifies hashes recorded at review time,
-runs a pickle scan as a second line of defence, and loads with remote code disabled. The hash and revision
-placeholders are filled in by the review step that promoted this artifact into the registry.
+Four steps, numbered in the comments: fetch pinned, verify, scan, load safely. The review step that promoted this artifact into the registry
+fills in the hash and revision placeholders.
 
 ```python
 import hashlib, subprocess, sys
@@ -162,7 +161,8 @@ local = snapshot_download(REPO, revision=REV,
                           allow_patterns=["*.safetensors", "*.json", "tokenizer*"])
 
 # 2. integrity: exactly the reviewed files, with exactly the reviewed bytes
-got = {p.name: sha256(str(p)) for p in Path(local).iterdir() if p.is_file()}
+got = {str(p.relative_to(local)): sha256(str(p))           # rglob: "*.json" also matches sub/x.json
+       for p in Path(local).rglob("*") if p.is_file()}
 if got.keys() != EXPECTED.keys():
     sys.exit(f"file set changed: {sorted(got.keys() ^ EXPECTED.keys())}")
 bad = [n for n in EXPECTED if got[n] != EXPECTED[n]]
@@ -184,6 +184,8 @@ model = AutoModelForCausalLM.from_pretrained(local, use_safetensors=True, trust_
 | A new file appears in the snapshot | the file-set comparison fails before anything loads |
 | A backdoor in `model.safetensors` that was there when you reviewed it | **none of the steps**; that is the job of behavioural acceptance and blast-radius limits |
 
+- **Checked against** huggingface_hub 0.36, transformers 4.57 and picklescan 1.0.4 (exit code 1 on a
+  finding, so `check=True` stops the load).
 - **In a real pipeline,** steps 1 to 3 run once at ingestion inside the sandboxed registry job, and serving
   nodes pull the promoted, signed artifact from the registry rather than from the hub at all.
 

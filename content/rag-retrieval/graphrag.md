@@ -5,8 +5,14 @@ name: GraphRAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: mastery
 agent_relevance: useful
+mastery: evaluate
+code_tested: partial
+prerequisites:
+  - rag-retrieval/hybrid-search
+  - rag-retrieval/multi-hop-retrieval
+  - agents/tool-calling
 related:
   - rag-retrieval/knowledge-graphs
   - rag-retrieval/multi-hop-retrieval
@@ -37,13 +43,12 @@ large indexing bill must be repaid by queries.
 - **What you control.** Whether the corpus and question mix justify indexing, the tool descriptions that
   steer routing, the community level and cost cap per global call, refresh cadence, and building graphs
   per permission domain.
-- **What you can skip.** Leiden's internals and extraction prompt engineering details until you commit;
-  price a pilot slice first and compare against hybrid search with reranking.
+- **What you can skip.** Leiden's internals and extraction prompt details until you commit; first price
+  a pilot slice against hybrid search with reranking.
 
 ## Why it exists
-- **Top-k works only when the answer resembles the question.** Standard RAG retrieves the chunks most
-  similar to the query; that works when the answer lives in a few such chunks. Two question classes break
-  it.
+- **Top-k works only when the answer resembles the question,** living in a few chunks most similar to
+  the query. Two question classes break it.
 - **Global, sensemaking questions.** "What are the recurring complaints across these 5,000 support
   tickets?" No single chunk is similar; the answer is a property of the whole corpus. Top-k returns a
   handful of arbitrary tickets, summarised confidently and unrepresentatively. Stuffing the whole corpus
@@ -51,8 +56,8 @@ large indexing bill must be repaid by queries.
 - **Connective questions.** "Which suppliers are linked to the plant that had the recall?" The plant is in
   one document, its suppliers in another; the documents share an entity, not vocabulary or embedding
   neighbourhood. Vector search finds one side of the join and misses the other.
-- **Naive fixes pay too much.** Larger k dilutes context; map-reduce summarisation of every chunk at query
-  time pays the full corpus-reading cost on every query. An agent issuing many searches pays it in steps.
+- **Naive fixes pay too much.** Larger k dilutes context; map-reduce over every chunk at query time pays
+  the full corpus-reading cost per query, and an agent issuing many searches pays it in steps.
 - **The design bet: move the cost to index time.** Read everything once, extract who and what is connected
   to whom, summarise related groups ahead of time, and let queries reuse that work. Worth it when many
   queries need a corpus-level view.
@@ -100,8 +105,8 @@ large indexing bill must be repaid by queries.
   entities and their connections, plain `search_docs` for lookups. The tool descriptions do the routing.
 - **Global search is a heavy tool.** One call is dozens of LLM calls inside it, so cap it per run and
   return the source-chunk links, not just the synthesised prose.
-- **Local search composes well in a loop.** The agent can call it, read the neighbours, and call it again
-  on a new entity, which is multi-hop retrieval driven by the agent.
+- **Local search composes in a loop:** call, read neighbours, call again on a new entity, which is
+  agent-driven multi-hop retrieval.
 
 ### Variants that move the cost
 The expensive part is LLM extraction and summarisation of everything at index time, so most variants move
@@ -112,15 +117,10 @@ or shrink it.
 | LazyGraphRAG (Microsoft) | graph from cheap NLP noun-phrase co-occurrence instead of LLM extraction; all LLM summarisation deferred to query time; indexing roughly as cheap as vector RAG, paid per query instead | corpora that change often or are queried rarely |
 | LightRAG and similar | keep LLM extraction, skip the community hierarchy; retrieve over entity-level and theme-level keys; merge new documents incrementally rather than re-clustering | incremental updates |
 
-The choice is always the same: pay once at index time when many queries need the corpus-level view, pay at
-query time when they do not.
-
 ### Why each piece is there
-- **Extraction** converts unstructured text into joinable keys (entities).
-- **Communities** give the corpus a table of contents that no chunk contains.
-- **Pre-written summaries** turn an O(corpus) read per query into an O(communities) read.
-- **Links back to source chunks** preserve grounding: a community report is a model-written paraphrase, so
-  answers should still cite original text where possible.
+Extraction turns text into joinable keys (entities); communities give the corpus a table of contents no
+chunk contains; summaries turn an O(corpus) read per query into an O(communities) read; source-chunk links
+keep grounding, since a report is a model-written paraphrase.
 
 ## Diagram
 The upper chain is the expensive index-time pipeline; the lower part shows the agent choosing a tool:
@@ -200,13 +200,12 @@ totalling about 4 million tokens.
 matches the entity PAYMENTS-DB, follows its edges to incidents and from incidents to TEAM entities, and
 pulls the source chunks for those edges, joining facts that never co-occur in one chunk.
 
-**Agent run, same corpus (illustrative):** with only `search_docs`, an analyst agent answering the
-root-cause question tends to issue many searches of 10 chunks each and still covers a few percent of the
-corpus. With `global_search` it makes one heavy call (about 41 LLM calls inside) and then a few
-`search_docs` calls to quote source chunks.
+**Agent run, same corpus (illustrative):** with only `search_docs`, an analyst agent issues many searches
+of 10 chunks each and still covers a few percent of the corpus. With `global_search` it makes one heavy
+call (about 41 LLM calls inside), then a few `search_docs` calls to quote source chunks.
 
-**Decision:** if most traffic is lookup questions ("what is the on-call rotation for X?"), the indexing bill
-buys little; if analysts ask thematic and relational questions daily, it is repaid.
+**Decision:** lookup-heavy traffic ("what is the on-call rotation for X?") buys little; daily thematic and
+relational questions repay the bill.
 
 ### Runnable estimator for your own corpus
 Prompt and output sizes and the price ratio are placeholders: replace them with your extraction prompt's
@@ -232,15 +231,16 @@ print(estimate(4_000_000))
 
 ### Production snippet: the reference implementation's CLI flow
 Microsoft's `graphrag` package is driven by a project folder with a settings file and an input directory.
-Check flag names against your installed version.
+In graphrag 3.3.0 the query is positional (older releases took `--query`); a higher
+`--community-level` number means smaller communities.
 
 ```bash
 pip install graphrag
 graphrag init --root ./incidents            # writes settings.yaml, .env and default prompts
 # put text files in ./incidents/input, set the model and API key in settings.yaml / .env
 graphrag index --root ./incidents           # extraction, graph, Leiden communities, reports
-graphrag query --root ./incidents --method global --query "Most common root causes?"
-graphrag query --root ./incidents --method local  --query "Teams involved with PAYMENTS-DB?"
+graphrag query --root ./incidents --method global "Most common root causes?"
+graphrag query --root ./incidents --method local  "Teams involved with PAYMENTS-DB?"
 ```
 
 ## Production patterns
@@ -275,29 +275,32 @@ graphrag query --root ./incidents --method local  --query "Teams involved with P
   graph is more precise.
 - **Compression vs a paraphrase layer.** Summaries compress well for themes but sit between source and
   answer. For audit-heavy use, require answers to cite underlying chunks rather than community reports.
-- **Higher vs lower community levels.** Higher levels are cheaper and broader per global query; lower
-  levels give detail at more map calls. The right level depends on whether users want an overview or
-  specifics.
+- **Higher vs lower community levels.** Higher is cheaper and broader; lower gives detail at more map
+  calls. Pick by whether users want an overview or specifics.
 - **More tools vs agent routing errors.** Three retrieval tools let the agent pick the right one, but
   each extra tool is another choice to get wrong; if routing is poor, a fixed classifier is more
   predictable than tool choice.
 
 ## Pitfalls
 - **Adopting GraphRAG for fact lookup.** Symptom: a large indexing bill and answer quality no better than
-  hybrid search with reranking on the eval set.
+  hybrid search with reranking. Diagnose: score both on an eval set split by question type. Fix: route
+  only global and relational questions to it.
 - **Skipping entity resolution.** One real entity becomes several nodes; local search returns partial
-  neighbourhoods and communities split along spelling variants.
-- **Treating extraction as done once.** Documents are added and edited and the graph silently drifts from
-  the source, visible as answers that omit recent incidents.
+  neighbourhoods and communities split along spelling variants. Diagnose: sample nodes and count alias
+  duplicates. Fix: an alias-merging pass.
+- **Treating extraction as done once.** Documents change and the graph silently drifts from the source,
+  visible as answers that omit recent incidents. Diagnose: compare report age with newest-document age.
+  Fix: a refresh cadence or deferred-summarisation variant.
 - **Citing community reports as evidence.** Reviewers cannot find the claimed statement in any source
-  document, because the indexing model synthesised it.
+  document, because the indexing model synthesised it. Fix: cite source chunks.
 - **Evaluating only with a judge on "comprehensiveness".** Broad, fluent answers win those comparisons even
   when specific facts are wrong, so add fact-level checks.
 - **Letting the agent call global search freely.** Symptom: cost per run spikes because the model uses
-  the heavy tool for lookups. Fix: a per-run cap and descriptions that say "expensive".
+  the heavy tool for lookups. Diagnose: log tool choice and LLM calls per run against question type. Fix:
+  a per-run cap and descriptions that say "expensive".
 - **One graph over documents with different permissions.** Symptom: a theme summary mentions a restricted
   project to users who could not open any of its source documents, because a report inherits the content
-  of every chunk it summarises.
+  of every chunk it summarises. Fix: one graph per permission domain.
 
 ## When to use
 - **Use when** a meaningful share of questions is thematic ("what are the main issues"), comparative across
@@ -310,6 +313,15 @@ graphrag query --root ./incidents --method local  --query "Teams involved with P
   rest to plain RAG.
 - **Avoid when** traffic is mostly lookups, or the corpus changes faster than you can afford to re-index.
 - **Interviews:** explain the indexing-for-query trade and when you would not use it.
+
+## Exercise
+**Goal:** decide go or no-go on GraphRAG for one corpus with measured numbers. No solution is given.
+- **Inputs:** 200-500 documents, 20 labelled questions (half global or relational, half lookup), a
+  hybrid-search baseline and any LLM API with a spending cap.
+- **Deliver:** metered indexing tokens and cost, the estimator re-run with your real prompt sizes, graded
+  answers per question type for both systems, and a break-even query volume.
+- **Acceptance:** estimator within 2x of metered tokens; every graded answer cites a source chunk; the
+  decision follows from the per-type table, not the overall average.
 
 ## Role lens
 - **Engineer:** Tunes chunk size, extraction prompts and entity types, runs incremental re-indexing, and
@@ -396,6 +408,17 @@ plain retrieval for lookups. Validate with an eval split by question type before
 - [ ] A question answered by a keyword match on a product code
 > Local search starts at matched entities and follows relationships to neighbours and their source chunks,
 > joining facts that never co-occur. Single-chunk and keyword lookups are served as well by hybrid search.
+
+## Mastery test
+**Problem:** a legal team's agent runs GraphRAG over 30,000 contracts in three permission tiers. Global
+answers cost more each month, partners say themes miss last week's deals, and one associate saw a summary
+naming a restricted client. Diagnose and redesign.
+
+**A strong answer:**
+- traces the leak to one graph across tiers, since reports inherit every chunk, and builds one per tier;
+- ties staleness to frozen reports, measures report age, and picks a refresh cadence or deferred variant;
+- checks the tool log for global calls on lookups, caps them and fixes the community level;
+- gates the redesign on a per-type eval with chunk citations.
 
 ## Use cases & projects
 ### Use cases

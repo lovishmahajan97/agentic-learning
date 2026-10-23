@@ -5,7 +5,7 @@ name: Conversation / execution identifiers
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -376,16 +376,15 @@ which are intended.
 > deriving idempotency keys all need the attempt-level id, which a conversation id cannot provide.
 
 ## Mastery test
-**Problem:** a mobile client loses connectivity mid-turn. It reconnects ten minutes later, by which time
-the original run crashed, was resumed on another worker, and finished. The user then taps "send" again
-on the queued message. Which ids are involved, what should happen, and what must the client keep?
+**Problem:** the agent now starts with no human client: a nightly cron that sometimes fires twice after a
+scheduler failover, a webhook the sender redelivers on timeout, and a parent run that spawns three
+children at step 2. Who mints each turn id, and how does a resumed parent avoid duplicate children?
 
 **A strong answer:**
-- the client keeps the turn id and the last sequence number it rendered, so the re-send hits the existing
-  turn and creates no run;
-- reconnecting by conversation id plus that sequence number streams the missed events, scoped by tenant;
-- the resume kept the run id and step, so derived keys matched and no side effect repeated;
-- only an explicit regenerate would mint a new run with `attempt = 2`.
+- cron: derive the turn id from schedule id and *scheduled* fire time, so both fires hit one turn;
+- webhook: use the sender's event id, scoped by tenant and verified first, since redeliveries keep it;
+- children: record each child's run id with `parent_run_id`, step and call index (unique) before
+  spawning, so a resume finds them; `tool_call_id` is safe only if persisted.
 
 ## Use cases & projects
 ### Use cases

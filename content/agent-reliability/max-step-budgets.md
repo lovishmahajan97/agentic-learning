@@ -5,7 +5,7 @@ name: Max-step budgets
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes

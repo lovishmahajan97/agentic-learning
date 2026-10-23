@@ -5,7 +5,7 @@ name: State & checkpoint stores
 kind: decision
 difficulty: core
 est_minutes: 16
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: evaluate
 code_tested: yes

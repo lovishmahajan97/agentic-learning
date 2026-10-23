@@ -5,7 +5,7 @@ name: Durable execution & checkpointing
 kind: concept
 difficulty: core
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -429,17 +429,19 @@ attempts and a second ticket appears.
 > repeats the side effect or loses it. Prompt text and settings are reconstructable from a version id.
 
 ## Mastery test
-**Problem:** a payments-ops agent issues refunds through a provider API that has no idempotency keys.
-Runs often wait a day for a manager's approval, and workers redeploy several times a day. Design
-checkpointing and resume so no refund is ever issued twice.
+**Problem:** using the example loop, two incidents. Run `run_42` opened ticket T-17, ended `partial`,
+and a user's "retry" started `run_43`, which opened a second ticket. Run `run_51` crashed mid-step
+during a deploy that renamed `create_ticket` to `open_ticket`, and its resume fails. Explain both and
+fix them.
 
 **A strong answer:**
-- records the intent with a deterministic key before calling, and wraps the API in an adapter with its
-  own dedup table, writing the key into the refund's reference field;
-- on a pending intent without a result, reconciles first (look up by reference) instead of retrying
-  blindly, because the call is not idempotent;
-- parks the run during the approval wait and resumes under a lease with fencing;
-- marks the refund call non-retryable and tests a crash at every boundary.
+- `run_43` is a new attempt: new run id, new keys, so dedup sees nothing; crash-resume protection
+  never covered user retries;
+- keys user-retryable effects by a logical task id, or seeds the retry with the old attempt's effect
+  log so it finds T-17 first;
+- sees `run_51`'s pending intent names a tool the new code lacks, so `tools[call["name"]]` fails;
+- migrates old checkpoints on read (alias the old name) or drains runs first; tests resume across the
+  version bump.
 
 ## Use cases & projects
 ### Use cases

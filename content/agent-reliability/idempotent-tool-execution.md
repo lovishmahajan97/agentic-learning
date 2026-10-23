@@ -5,7 +5,7 @@ name: Idempotent tool execution
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -76,8 +76,8 @@ dedupe downstream or locally, and gate unkeyable effects behind approvals or an 
 | **Non-idempotent writes** | `create_ticket`, `send_email`, `charge`, `increment` | Must be wrapped |
 
 - **Record the class in the tool schema** so the harness picks the retry policy automatically.
-- **MCP tool annotations** (`readOnlyHint`, `idempotentHint`, `destructiveHint`) exist for exactly this.
-  They are hints, not guarantees: verify them in integration tests.
+- **MCP tool annotations** (`readOnlyHint`, `idempotentHint`, `destructiveHint`; spec 2025-03-26 on)
+  exist for this. They are hints, not guarantees: verify them in integration tests.
 
 ### Make the operation idempotent where you can
 - **Relative writes repeat their effect.** `increment(balance, 10)` and `append(list, item)` change state
@@ -199,7 +199,7 @@ def idempotent(store: DedupStore, wait_s: float = 10):
             row, deadline = store.begin(key), time.time() + wait_s
             while row and row["status"] == "in_flight" and time.time() < deadline:
                 time.sleep(0.2)                     # another worker holds the key
-                row = store.rows.get(key)
+                row = store.begin(key)              # re-claims it if the holder released it
             if row and row["status"] == "done":
                 return {**row["result"], "replayed": True}
             if row:                                 # still in flight after the wait
@@ -430,17 +430,18 @@ approval or an outbox worker rather than guessing.
 > acting on stale state. Writes are where replaying the first result prevents duplicates.
 
 ## Mastery test
-**Problem:** a refund agent calls `refund(order_id, amount)` on a payment API that honours idempotency
-keys for 24 hours. Refunds above a threshold wait for a manager's approval, which can take a weekend.
-Finance reports occasional double refunds, all on approved large refunds. Explain and fix.
+**Problem:** `send_email` runs through the example wrapper with derived keys, and the provider honours
+them. Users still get two near-identical emails. Traces: the first call timed out, the model saw the
+`TimeoutError`, and next step it called `send_email` with a reworded body. Why did no dedup fire, and
+how do you fix it without blocking real second emails?
 
 **A strong answer:**
-- identifies the parked run: a resume more than 24 hours later re-executed the pending call with a key
-  the provider had pruned;
-- checks the local dedup table's retention too, and whether the key is derived (run, step, index);
-- fixes by recording the intent in an outbox or dedup row that outlives the longest approval, looking up
-  existing refunds for the order before retrying, or only issuing the call after approval;
-- adds a test that parks a run past the provider window and asserts one refund.
+- the model's retry is a new step, so its key and argument hash both differ: key dedup covers harness and
+  runtime retries only;
+- the harness should retry the ambiguous timeout itself with the same key, returning the provider's
+  replay, never a bare failure;
+- if still unknown, tell the model "outcome unknown, do not resend" and offer a status lookup;
+- adds recipient-plus-turn identity only as a deliberate product choice.
 
 ## Use cases & projects
 ### Use cases

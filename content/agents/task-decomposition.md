@@ -5,7 +5,7 @@ name: Task decomposition
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -188,10 +188,8 @@ final = asyncio.run(execute(GRAPH))
 print(final["recommend"]["text"])
 ```
 
-- **Wave scheduling is the simplest correct executor,** but a ready node waits for the slowest node of the
-  previous wave.
-- **On uneven graphs,** start each node as soon as its own dependencies finish (one task per node awaiting
-  its parents) to cut wall-clock time.
+- **Wave scheduling is the simplest correct executor,** but a ready node waits for the previous wave's
+  slowest node; on uneven graphs, start each node when its own parents finish.
 
 ### Seam calculator: reliability and critical path
 Pure Python; runs as is.
@@ -242,8 +240,8 @@ failure; latency rows assume about 20 seconds per subtask.
   run.
 - **Cache subtasks by input hash.** Key results on the task text plus a hash of declared inputs, so
   retries and reruns skip finished, unchanged pieces. Monitor cache hit rate and stale-result complaints.
-- **Pass references for raw data.** Put source or chunk ids in the structured result so the merge step
-  can fetch raw text when a detail matters. Monitor how often it fetches.
+- **Pass references for raw data.** Put source or chunk ids in each result so the merge can fetch raw
+  text. Monitor how often it fetches.
 - **Trace each subtask as its own span.** Give every subtask a span with its type, input hash, tokens
   and verifier result in your tracing tool (LangSmith or OpenTelemetry), and build an eval dataset per
   subtask type from those traces. Monitor per-subtask pass rate over time; it tells you which seam to fix.
@@ -398,7 +396,7 @@ step. Product wants 90% end-to-end success in under 20 s. Redesign it.
 - fans out the three lookups, which depend only on the classification: four waves, about 32 s, still
   too slow;
 - removes model calls from the critical path: lookups as plain API calls, tone check folded into
-  drafting or done in code;
+  drafting or done in code, giving about 8 + 1 + 8 ≈ 17 s, so a retry on that path breaks the budget;
 - gives each lookup a structured contract so drafting never sees raw transcripts.
 
 ## Use cases & projects

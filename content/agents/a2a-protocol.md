@@ -5,7 +5,7 @@ name: A2A protocol (Agent2Agent)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: useful
 mastery: implement
 code_tested: yes
@@ -182,9 +182,10 @@ stateDiagram-v2
 A minimal client with `httpx`. It reads the Agent Card, sends a message, handles a direct answer without
 a task, polls until a terminal state, and loops through any `input-required` turns.
 
-Method and field names follow the 0.2/0.3-era JSON-RPC binding (later revisions rename some of them); check
-`protocolVersion` in the card before relying on them. Tested against a local server built with `a2a-sdk`
-0.3.26 (Python), including one `input-required` turn.
+Names follow the 0.2/0.3-era JSON-RPC binding; check `protocolVersion` in the card first. Tested against
+a local `a2a-sdk` 0.3.26 server, including one `input-required` turn. The 1.0 binding (`a2a-sdk` 1.x,
+checked 1.2.3) renames methods (`SendMessage`, `GetTask`) and states (`TASK_STATE_*`), with a v0.3
+compatibility layer.
 
 ```python
 import httpx, time, uuid
@@ -283,7 +284,7 @@ belong on push.
   anything longer than a request timeout; use `message/stream` when a user is watching. Monitor webhook
   verification failures and notifications that `tasks/get` does not confirm.
 - **Correlation IDs across organisations.** Log your request id next to the remote task id and
-  `contextId` on every call, and share the mapping in the integration runbook. Monitor time spent in each
+  `contextId` on every call. Monitor time spent in each
   state per skill.
 - **Quarantine peer artifacts.** Pass remote artifacts to your model as clearly delimited data, and require
   confirmation for any side effect that traces back to them. Monitor actions whose provenance is a peer

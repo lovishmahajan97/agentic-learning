@@ -5,7 +5,7 @@ name: Tool-result interpretation
 kind: concept
 difficulty: core
 est_minutes: 13
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -372,7 +372,8 @@ API returned HTTP 200 with a rate-limit message. Diagnose each and fix.
 - injection through issue bodies: wrap them as untrusted and gate `close` after an untrusted read;
 - an error in a success body read as data: the normalizer detects it and returns `is_error` with
   `rate_limited` and `retryable`;
-- reads the result preceding each bad action in traces, and adds both cases to the eval set.
+- reads the result before each bad action in traces, reopens those issues, and adds both cases to the
+  eval set.
 
 ## Use cases & projects
 ### Use cases

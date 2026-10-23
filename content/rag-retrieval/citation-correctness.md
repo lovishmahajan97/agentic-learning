@@ -41,7 +41,7 @@ necessary), scored per claim by an entailment model or calibrated judge.
 - **What you control.** How answers are split into claims, which passages the judge sees (only the cited
   tool results, at the version the agent saw), the judge's calibration against human labels, and the
   thresholds that block a release.
-- **What you can skip.** Training your own attribution model; NLI plus a calibrated LLM judge covers most products.
+- **What you can skip.** Training your own attribution model; NLI plus a calibrated judge covers most products.
 
 ## Why it exists
 - **A cited but unsupported sentence is worse than an uncited one:** it borrows the source's authority.

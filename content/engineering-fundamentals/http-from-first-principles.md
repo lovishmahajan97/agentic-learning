@@ -5,7 +5,7 @@ name: HTTP from first principles
 kind: concept
 difficulty: core
 est_minutes: 20
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes

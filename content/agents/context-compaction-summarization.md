@@ -5,7 +5,7 @@ name: Context compaction / summarization
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -113,7 +113,6 @@ model read the file, edited it and moved on.
 - **Any compaction breaks the cache suffix.** Caches match the longest unchanged prefix, so after a
   summary or a stub the next call misses for everything after the first changed message; only the
   pinned head (system prompt, tools, task) still hits.
-- **So compact rarely and in large chunks** rather than a little every step.
 - **Tell the model it happened** ("earlier context was compacted; summary follows"), because otherwise it
   will refer to things it believes it can still see.
 
@@ -130,8 +129,8 @@ model read the file, edited it and moved on.
 - **The cheapest tokens to compact never entered the main context.** Delegate a noisy sub-task (search
   the codebase for every caller of `charge()`) to a sub-agent with a fresh context and return only its
   condensed answer.
-- **Provider features:** some providers now offer server-side context editing or compaction. They
-  implement the same layers; you still own the policy for what must survive.
+- **Provider features:** some providers (as of 2026) offer server-side context editing or compaction.
+  They implement the same layers; you still own what must survive.
 
 ### What must survive
 The test: would forgetting this cause a wrong action?
@@ -165,9 +164,8 @@ flowchart TD
 ## Examples
 ### Compaction step that runs before each model call
 It prunes old tool outputs first, because that needs no extra model call and loses nothing a re-run
-cannot recover, and only summarizes when pruning is not enough. Both are prefix edits, so the cache is
-rebuilt after either; the threshold check keeps them rare. The summary is JSON and is validated before
-it replaces the old span.
+cannot recover, and only summarizes when pruning is not enough. The summary is JSON and is validated
+before it replaces the old span.
 
 ```python
 import json
@@ -318,8 +316,8 @@ print(m["goal"], m["ids_created"], m["next_step"])
   and two constraints stated early; a token counter (tiktoken, or characters ÷ 4).
 - **Deliver:** prune, schema summary and anchored merge, tuned so the run compacts at least three
   times, plus a per-step table of tokens sent and compaction events.
-- **Acceptance:** an assertion shows no orphaned tool result after any pass; probe questions for all
-  three IDs and both constraints answer correctly after the third compaction; total tokens sent fall by
+- **Acceptance:** an assertion shows no orphaned tool result after any pass; after the third compaction
+  all three IDs and both constraints appear verbatim in the merged summary; total tokens sent fall by
   at least half versus no compaction.
 
 ## Role lens
@@ -407,16 +405,16 @@ probe-question accuracy after compaction, not just token savings.
 > preferences are not, and forgetting them causes wrong actions or duplicate side effects.
 
 ## Mastery test
-**Problem:** a contract-review agent reads 300-page agreements clause by clause and must quote exact
-wording in its final memo. Since compaction was added, memos paraphrase clauses and twice cited the wrong
-clause number. Redesign the policy.
+**Problem:** a procurement agent calls a paid market-data API ($0.40 a call) and `place_order`. After
+pruning shipped, input tokens per run fell from 4M to 1.6M (illustratively $3 per million), yet cost per
+run rose: traces show 35 repeated API calls per run, and two runs placed duplicate orders. Explain and fix.
 
 **A strong answer:**
-- sees that exact text must never pass through a summarizer: store clauses keyed by number outside the
-  context and keep only pointers;
-- keeps clause numbers and findings in append-only fields merged in code, so they are never paraphrased;
-- has the memo step re-read quoted clauses by number from the store;
-- measures exact-match of quotes against the source and clause-number accuracy, before and after.
+- computes it: tokens save 2.4M × $3/M = $7.20, repeat calls add 35 × $0.40 = $14, net +$6.80 a run;
+- names the cause: "re-run the tool if needed" stubs are only safe for cheap, idempotent tools;
+- stubs paid results with a pointer to a saved file (re-read, not re-call) and keeps order IDs in
+  append-only `ids_created`, with an idempotency key on `place_order`;
+- tracks repeat (tool, arguments) calls after compaction events and cost per run including API fees.
 
 ## Use cases & projects
 ### Use cases

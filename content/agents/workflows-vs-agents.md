@@ -5,8 +5,12 @@ name: Workflows vs agents
 kind: decision
 difficulty: intro
 est_minutes: 12
-status: agentic-verified
+status: mastery-verified
 agent_relevance: core
+mastery: evaluate
+code_tested: yes
+prerequisites:
+  - agents/agent-loop
 related:
   - agents/agent-loop
   - agents/state-machines
@@ -26,16 +30,16 @@ If you can draw the flowchart, build the workflow: cheaper, bounded, testable. M
 are workflows with small agentic islands where the path is unforeseeable.
 
 ## For agent builders
-- **Why it matters for agents.** This is the first design decision on every agent project: how much of
-  the path the model chooses. Get it wrong one way and you pay agent prices and tails for a flowchart;
+- **Why it matters for agents.** The first design decision on every agent project: how much of the
+  path the model chooses. Get it wrong one way and you pay agent prices and tails for a flowchart;
   get it wrong the other way and the system cannot handle the cases it was built for.
 - **Where it shows up in your stack.** Plain code with structured outputs for workflow steps, routers and
   parallel calls, an agent loop for the agentic island, an orchestrator (Temporal, AWS Step Functions or
   a LangGraph graph) for the skeleton, and traces tagged by route.
 - **What you control.** Which steps are code and which are agentic, each island's step budget, tool set
   and gates, the per-run cost cap, and when trace data moves the boundary.
-- **What you can skip.** Debating what counts as a "real" agent. The useful question is only who
-  chooses the next step, your code or the model.
+- **What you can skip.** Debating what counts as a "real" agent; only who chooses the next step
+  matters.
 
 ## Why it exists
 - **"Agent" hides the real decision.** The word covers everything from a prompt template to a fully
@@ -52,9 +56,8 @@ are workflows with small agentic islands where the path is unforeseeable.
   document it has never seen; a support flow cannot investigate an anomaly needing three lookups whose
   order depends on the results.
 
-The decision is rarely binary: a workflow can contain one agentic step, and an agent can call
-workflow-shaped tools. The core skill is drawing that boundary, spending autonomy like a budget exactly
-where the environment is unpredictable, and nowhere else.
+The core skill is drawing the boundary: spend autonomy like a budget where the environment is
+unpredictable, and nowhere else.
 
 ## How it works
 ### The spectrum of control
@@ -97,8 +100,7 @@ Ask, in order:
 5. **Can I evaluate it?** Without a task set with success criteria, you cannot safely run an agent.
 
 ### Moving the boundary over time
-Logged trajectories tell you where to move it; both moves use path frequencies from traces and the
-exception rate.
+Logged trajectories and the exception rate tell you where to move it.
 - **Agent → workflow.** If most runs follow the same two or three tool sequences, that is a flowchart you
   did not know you had: codify those sequences as branches, route matching inputs to them, keep the
   agent for the residue.
@@ -110,8 +112,6 @@ exception rate.
   step budget and a restricted tool set, then fixed validation and delivery by code.
 - **Agent with workflow tools:** tools like "run the full reconciliation", so each call is reliable and
   the agent makes only a few high-level choices.
-- **Same principle either way:** put the model's judgement where the path is unpredictable and surround
-  it with code where it is not.
 
 ## Diagram
 The decision path for one step of a system: most steps end as workflow code, every agentic exit
@@ -149,8 +149,7 @@ or exception handling.
 
 - **The agent handles strange cases well:** a scanned invoice with two POs, a vendor renamed since the PO
   was issued. The hybrid keeps that capability where it is needed.
-- **Hybrid arithmetic:** roughly 8% of invoices × five to eight times the per-invoice workflow cost, so
-  about 40–65% extra.
+- **Hybrid arithmetic:** 8% of invoices × five to eight times the workflow cost ≈ 40–65% extra.
 
 ### Hybrid skeleton: code owns the path, the agent owns the exceptions
 Runs with stubs. The agentic island is budgeted, read-only, and its output is a proposal that still goes
@@ -229,20 +228,23 @@ print(f"top 3 sequences cover {sum(n for _, n in seqs.most_common(3)) / total:.0
   much of an agent's adaptivity with bounded structure, but only if you can state the decomposition or
   the criteria up front.
 - **Fast demo vs fast production.** Starting with the agent gets a demo fastest and a production system
-  slowest; starting with the workflow is the reverse, and the exception rate tells you when to add
-  autonomy.
+  slowest; starting with the workflow is the reverse.
 
 ## Pitfalls
 - **An agent for a napkin-sized flowchart.** Symptom: a bill several times what a three-call pipeline
-  would cost and regressions nobody can localize.
+  would cost and regressions nobody can localize. Diagnose: mine tool sequences; if a few cover most
+  runs, you had a flowchart. Fix: codify them.
 - **A router with 40 branches and growing.** Symptom: a new branch every week, meaning the path is not
-  actually predictable and an agentic step is overdue.
+  actually predictable and an agentic step is overdue. Diagnose: chart branches added and exception rate
+  per week.
 - **Evaluating an agent with step-level unit tests.** Symptom: green tests and a falling completion
-  rate, because the failures are in the trajectory, not any step.
+  rate, because the failures are in the trajectory, not any step. Diagnose: score completion on a golden
+  task set and read the failing trajectories.
 - **Budgeting from the typical run** (the median, or a mean from a handful of demo runs). Symptom: a
-  monthly bill well above plan, dominated by the few percent of runs that hit the step limit.
+  monthly bill well above plan, dominated by the few percent of runs that hit the step limit. Diagnose:
+  plot cost per run by route and compare mean, p95 and the budget-exhaustion rate.
 - **An agentic node without budget, restricted tools or gates** inside an otherwise fixed workflow.
-  Symptom: that one node produces all of the incidents.
+  Symptom: that one node produces all of the incidents. Diagnose: attribute incidents to the acting step.
 - **Never revisiting the boundary.** Symptom: traces show the same three tool sequences in nine runs out
   of ten, paying agent prices for a path that could be code.
 - **"Agent" as a product requirement** rather than a design choice. Symptom: autonomy where it should be
@@ -252,13 +254,19 @@ print(f"top 3 sequences cover {sum(n for _, n in seqs.most_common(3)) / total:.0
 - **Default to a workflow;** add autonomy only where you cannot enumerate the path: investigation,
   open-ended research, repair after unexpected failures.
 - **Keep agentic islands small,** budgeted, tool-restricted and gated, and measure them separately.
-- **Measure agentic parts:** completion rate on a golden set, steps and cost per run at the p95, the
-  fraction of runs ending at the budget, and the distribution of tool sequences every few weeks to find
-  codifiable paths.
-- **Measure workflow parts:** per-step accuracy and latency, plus the exception rate.
-- **Day to day,** "should this be an agent?" gets the first answer "show me the flowchart". **In
-  interviews,** name the workflow patterns, explain what the choice changes for cost, testing and failure
-  modes, and describe a hybrid.
+- **Measure** agentic parts on golden-set completion, p95 steps and cost, and budget exhaustion;
+  workflow parts on per-step accuracy, latency and the exception rate.
+- **Day to day,** "should this be an agent?" gets the answer "show me the flowchart". **In interviews,**
+  name the patterns, what the choice changes, and a hybrid.
+
+## Exercise
+**Goal:** place the boundary for a new process from data. No solution is given.
+- **Inputs:** 200 synthetic expense reports under a five-rule policy, about 15% messy (missing receipts,
+  foreign currency, split trips).
+- **Deliver:** the flowchart, a hybrid on the skeleton above with stub model calls, and exception rate,
+  mean and p95 calls, and cost by route.
+- **Acceptance:** the clean path makes the same number of calls every run; no agentic run exceeds its
+  budget; trace mining names a sequence to codify, or shows none dominates.
 
 ## Role lens
 - **Engineer:** Implements the workflow patterns as plain code with structured outputs, isolates
@@ -344,6 +352,19 @@ workflow cannot handle, and widen autonomy only as those metrics and human agree
 > Autonomy is spent where the environment is unpredictable and nowhere else. Surrounding a small
 > agentic island with deterministic code keeps cost bounded and lets each part be tested appropriately.
 
+## Mastery test
+**Problem:** a pure agent triages 20,000 security alerts a day at a mean of 11 calls (median 6, p95 40).
+70% of runs follow one 6-call sequence; 0.5% of alerts are real incidents. Leadership expects a 2-call
+branch for that sequence to cut cost 70%. What do you build and promise?
+
+**A strong answer:**
+- computes 220,000 calls a day; the branch saves 14,000 × 4 = 56,000, about 25%, because the residue
+  (about 23 calls a run) is the tail;
+- routes on features known before the run, exiting to the agent when any check deviates, so an incident
+  resembling noise still reaches the agent;
+- caps the residue from its own p95; budget-exhausted alerts go to an analyst;
+- proves no missed incidents on a targeted set of past incidents: 1,000 random alerts hold about 5.
+
 ## Use cases & projects
 ### Use cases
 - **Invoice and document processing.** A workflow handles the clean majority and an exception agent with
@@ -351,7 +372,7 @@ workflow cannot handle, and widen autonomy only as those metrics and human agree
 - **Customer support automation.** Intake, routing, retrieval and drafting are a workflow, while
   investigating anomalous accounts is a budgeted agentic step.
 - **Scoping a customer's "build us an agent" request.** Drawing the flowchart first shows which steps
-  actually need a model choosing the path.
+  need a model choosing the path.
 - **Cutting an existing agent's cost.** Mining traces for repeated tool sequences turns the common paths
   into workflow branches and keeps the agent for the residue.
 
@@ -359,8 +380,7 @@ workflow cannot handle, and widen autonomy only as those metrics and human agree
 **Same task as workflow, agent and hybrid (2-3 hours).**
 - **Goal:** measure what autonomy costs and buys on one task.
 - **Steps:** create 50 synthetic invoices, 10 of them messy (two POs, renamed vendor); build a three-call
-  workflow, a tool-calling agent with a 15-step budget, and the hybrid skeleton from the examples; run
-  all three and log calls, tokens, latency and correct routes; run the trace-mining snippet on the
-  agent's tool sequences.
+  workflow, an agent with a 15-step budget, and the hybrid skeleton; log calls, tokens, latency and
+  correct routes; mine the agent's tool sequences.
 - **Done when:** a table compares completion, mean and p95 cost and latency for the three designs, and
   you can name which agent sequences you would codify next.

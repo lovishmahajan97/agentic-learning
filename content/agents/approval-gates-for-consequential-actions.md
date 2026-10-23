@@ -5,7 +5,7 @@ name: Approval gates for consequential actions
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: mastery
+status: mastery-verified
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -196,7 +196,7 @@ def execute(run_id, step, tool, args, env, tools, store, approver):
         if store.claimed_by(run_id, h) != key:   # first use, not a retry of this step after a failure
             preview = tools[tool].dry_run(**args)
             if preview != approval.preview:      # the world changed since it was approved: ask again
-                store.save_pending(run_id, step, tool, args, h, preview=preview)   # supersedes the old one
+                store.save_pending(run_id, step, tool, args, h, preview=preview)   # must also drop the old approval
                 return {"status": "awaiting_approval", "request": h, "reason": "effect changed"}
             if not store.claim(run_id, h, key):  # atomic compare-and-set: one execution key per approval
                 return {"status": "denied", "reason": "approval already consumed by another execution"}
