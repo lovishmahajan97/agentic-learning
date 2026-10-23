@@ -189,7 +189,7 @@ equal to 1144`, `promise resolved ... instead of rejecting` for the departed cli
 
 ### Failure scenarios
 - **Buffer events but decode with `chunk.toString()`.** Split JSON now parses, but the test that cuts
-  inside `ö` and `🙂` gets `�` replacement characters. Debug by logging `chunk.length` and the last
+  inside `ö` and `🙂` gets `U+FFFD` replacement characters. Debug by logging `chunk.length` and the last
   bytes of each chunk; a chunk ending in a lead byte (0xC3, 0xF0) is the split.
 - **Await `'drain'` without the signal.** The bounded-buffer test passes, but with a client that stops
   acknowledging, the loop hangs forever, holding the generator and its model call. The departed-client
