@@ -5,7 +5,8 @@ name: structured extraction pipeline with Pydantic validation and retries
 kind: practice
 difficulty: intro
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/pydantic
@@ -33,6 +34,175 @@ feeds validation errors back to the model for bounded retries, and reports field
 - **Why it matters for agents.** Every tool call is a structured extraction: the model fills arguments that your code
   must trust. The validate-then-retry loop here is the same loop that guards tool inputs.
 - **What you can skip.** OCR and PDF layout parsing. Start from plain text; add parsing as a stretch goal.
+
+## Lab
+### Task
+Build the core of the extraction pipeline against a recorded model: two business-rule validators, a
+bounded retry loop that sends the exact validation error back, a dead-letter queue for documents that use
+up the budget, and per-field accuracy against labels. Time box: 45-60 min.
+- **Prerequisites:** Pydantic; Structured outputs and JSON mode; Typed tool contracts; Retry strategies.
+- **Setup:** Python 3.10+, `pip install pydantic pytest` (checked with pydantic 2.14.1, pytest 9.1,
+  Python 3.12). Save the starter as `lab.py` and the tests as `test_lab.py`.
+- **No API key:** `ScriptedLLM` replays recorded replies and keeps every message list it received, so the
+  tests can check what feedback the model would have seen. Swap in a real `llm` callable afterwards.
+
+### Starter code
+```python
+"""Lab: validate, retry with error feedback, dead-letter and score field accuracy. Run: python lab.py"""
+import json
+from datetime import date
+from decimal import Decimal
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+
+class LineItem(BaseModel):
+    description: str
+    quantity: int = Field(gt=0)
+    unit_price: Decimal = Field(ge=0)
+
+class Invoice(BaseModel):
+    vendor: str
+    invoice_number: str
+    issue_date: date
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    items: list[LineItem] = Field(min_length=1)
+    total: Decimal
+    # YOUR CODE HERE: two business rules as validators
+    # - vendor: strip whitespace; a blank vendor raises ValueError("vendor must not be blank")
+    # - total must equal sum(quantity * unit_price) within 0.01, else
+    #   ValueError(f"total {total} != sum of items {expected}")
+
+class ScriptedLLM:
+    """A recorded model: returns its replies in order and keeps every message list it was sent."""
+    def __init__(self, replies: list[str]):
+        self.replies, self.seen = list(replies), []
+    def __call__(self, messages: list[dict]) -> str:
+        self.seen.append([dict(m) for m in messages])
+        return self.replies.pop(0)
+
+DEAD_LETTERS: list[dict] = []
+
+def extract(text: str, llm, max_attempts: int = 3) -> tuple[Invoice | None, int]:
+    """Return (invoice or None, attempts used). On failure append
+    {"text": text, "attempts": [raw replies], "error": str(last error)} to DEAD_LETTERS."""
+    messages = [{"role": "system", "content": "Extract the invoice as JSON matching this schema: "
+                 + json.dumps(Invoice.model_json_schema())},
+                {"role": "user", "content": text}]
+    # YOUR CODE HERE: up to max_attempts calls; validate with Invoice.model_validate_json; on
+    # ValidationError append the reply as an assistant message and a user message containing
+    # "Validation failed:\n{error}\nReturn corrected JSON only."
+    raise NotImplementedError
+
+def field_accuracy(preds: list[Invoice | None], labels: list[dict], fields: list[str]) -> dict:
+    # YOUR CODE HERE: for each field, the share of documents whose prediction equals the label
+    # (compare str(getattr(pred, field)) with str(label[field])); a None prediction is wrong
+    raise NotImplementedError
+
+def doc(vendor="Acme", total="20.00", number="INV-1"):
+    return json.dumps({"vendor": vendor, "invoice_number": number, "issue_date": "2025-03-01",
+                       "currency": "EUR", "items": [{"description": "pens", "quantity": 4,
+                       "unit_price": "5.00"}], "total": total})
+
+if __name__ == "__main__":
+    runs = [ScriptedLLM([doc(vendor="Acme GmbH")]),
+            ScriptedLLM([doc(total="25.00", number="INV-2"), doc(number="INV-2")]),
+            ScriptedLLM([doc(vendor="  "), doc(vendor=""), doc(vendor=" ")])]
+    labels = [{"vendor": "Acme", "total": "20.00", "invoice_number": n} for n in ("INV-1", "INV-2", "INV-3")]
+    results = [extract(f"invoice text {i}", llm) for i, llm in enumerate(runs)]
+    preds = [inv for inv, _ in results]
+    print("parsed:", sum(p is not None for p in preds), "of", len(preds),
+          "| attempts:", [n for _, n in results])
+    print("feedback sent:", "total 25.00 != sum of items 20.00" in runs[1].seen[1][-1]["content"])
+    print("dead letters:", len(DEAD_LETTERS), "| last error has rule:",
+          "vendor must not be blank" in DEAD_LETTERS[0]["error"])
+    acc = field_accuracy(preds, labels, ["vendor", "total", "invoice_number"])
+    print({f: round(v, 2) for f, v in acc.items()})
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly the lines below. The parse rate is 2 of 3, yet
+`vendor` is right on only 1 of 3 documents: "Acme GmbH" is valid JSON and passes every rule, and only the
+labels catch it.
+
+```
+parsed: 2 of 3 | attempts: [1, 2, 3]
+feedback sent: True
+dead letters: 1 | last error has rule: True
+{'vendor': 0.33, 'total': 0.67, 'invoice_number': 0.67}
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail: the rules test with `AssertionError` (the vendor is
+not stripped and nothing is rejected), the rest with `NotImplementedError`. A correct solution passes all 5.
+
+```python
+import json
+import pytest
+from decimal import Decimal
+from pydantic import ValidationError
+import lab
+from lab import Invoice, ScriptedLLM, doc, extract, field_accuracy
+
+@pytest.fixture(autouse=True)
+def clean():
+    lab.DEAD_LETTERS.clear()
+
+def test_business_rules_reject_bad_documents():
+    assert Invoice.model_validate_json(doc(vendor="  Acme ")).vendor == "Acme"
+    with pytest.raises(ValidationError, match="vendor must not be blank"):
+        Invoice.model_validate_json(doc(vendor="   "))
+    with pytest.raises(ValidationError, match=r"total 21.00 != sum of items 20.00"):
+        Invoice.model_validate_json(doc(total="21.00"))
+    assert Invoice.model_validate_json(doc(total="20.005")).total == Decimal("20.005")   # within 0.01
+
+def test_first_valid_reply_uses_one_attempt():
+    inv, n = extract("t", ScriptedLLM([doc()]))
+    assert n == 1 and inv.total == Decimal("20.00")
+
+def test_retry_sends_the_exact_error_back():
+    llm = ScriptedLLM([doc(total="25.00"), "not json at all", doc()])
+    inv, n = extract("t", llm)
+    assert inv is not None and n == 3
+    second = llm.seen[1]
+    assert [m["role"] for m in second] == ["system", "user", "assistant", "user"]
+    assert second[2]["content"] == doc(total="25.00")
+    assert "total 25.00 != sum of items 20.00" in second[3]["content"]
+    assert "Return corrected JSON only." in second[3]["content"]
+
+def test_budget_spent_goes_to_dead_letters():
+    llm = ScriptedLLM([doc(vendor=""), doc(vendor=" "), doc(vendor="\t"), doc()])
+    inv, n = extract("broken doc", llm, max_attempts=3)
+    assert inv is None and n == 3 and len(llm.replies) == 1            # 4th reply never requested
+    (dl,) = lab.DEAD_LETTERS
+    assert dl["text"] == "broken doc" and len(dl["attempts"]) == 3
+    assert "vendor must not be blank" in dl["error"]
+
+def test_field_accuracy_counts_missing_predictions_as_wrong():
+    a = Invoice.model_validate_json(doc())
+    b = Invoice.model_validate_json(doc(number="INV-9"))
+    labels = [{"vendor": "Acme", "invoice_number": "INV-1"}] * 3
+    acc = field_accuracy([a, b, None], labels, ["vendor", "invoice_number"])
+    assert acc == {"vendor": pytest.approx(2 / 3), "invoice_number": pytest.approx(1 / 3)}
+```
+
+### Failure scenarios
+- **Retry without feedback** (call `llm(messages)` again unchanged). The retry test fails on the role
+  sequence; with a real model the same wrong total comes back. Log attempts per document and compare the
+  mean before and after adding feedback.
+- **Compare `total` with `==`.** The `20.005` case is rejected, and real invoices with rounding differences
+  burn every retry. Print `expected - self.total` in the error so the size of the gap is visible.
+- **Dead-letter only the error string.** The dead-letter test fails on `attempts`, and in production you
+  cannot tell a bad document from a bad prompt. Keep every raw reply, then read three dead letters by hand.
+- **Divide accuracy by parsed documents only.** In the demo `vendor` reads 0.5 instead of 0.33, the accuracy
+  test fails, and failures inflate the score. Use the labelled set size as the denominator, and report parse rate separately.
+
+### Submission
+- **`lab.py`** with the validators, `extract` and `field_accuracy` done; the recorded replies unchanged.
+- **A green test run** (5 passed) and the output of `python lab.py`.
+- **One real run:** wrap a provider SDK as `llm` on 10 of your documents and paste parse rate, mean
+  attempts and the per-field table.
+- **A short note:** one field the validators cannot protect, and how you would catch it.
+- **Evaluated on:** tests passing, exact error text in the retry message, bounded attempts and per-field
+  numbers over the whole labelled set.
 
 ## Why it exists
 - **"Valid JSON" is not "correct data".** Schema-constrained output guarantees shape, not that the total equals the

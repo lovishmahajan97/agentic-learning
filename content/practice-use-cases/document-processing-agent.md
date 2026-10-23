@@ -5,7 +5,8 @@ name: document processing agent (extraction, validation, human review)
 kind: practice
 difficulty: core
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - mini-project-ideas/structured-extraction-pipeline-with-pydantic-validation-and-retries
@@ -38,6 +39,63 @@ straight-through processing for most documents with audited accuracy.
   validator layer, lookup tools (vendor master, purchase orders), a review UI and a durable job queue.
 - **What you can skip at first.** Training custom layout models. Modern multimodal models extract well
   from page images; spend the effort on validation and review.
+
+## Decision case
+### Scenario
+An accounts-payable team is moving its invoice agent from pilot to production and must choose the rule
+that sends an invoice straight through or to a reviewer. The agent never pays; it posts records that a
+payment run uses later. The rates below come from a 1,000-invoice labelled pilot and, like all figures
+here, are illustrative.
+- **Volume:** 8,000 invoices a month; 15% (1,200) are above 5,000 euros.
+- **Escaped-error limit:** under 0.5% of straight-through invoices may have a wrong key field.
+- **Review capacity:** 4 reviewers x 2 hours a day x 21 days = 168 hours a month, at about 1.5 minutes
+  per flagged invoice.
+- **Extraction cost:** about 0.04 euros per invoice; a second extraction costs the same again.
+- **Audit:** finance samples straight-through invoices weekly and reports the error rate.
+
+### Options
+| Option | How it works | Straight-through | Review hours | Escaped error | Fits? |
+|---|---|---|---|---|---|
+| Review everything | Every invoice goes to a reviewer | 0% | 8,000 x 1.5 min = 200 h | about 0 | no: over 168 h |
+| Model confidence 0.9+ | Straight through when the model says it is confident | 85% | 1,200 x 1.5 min = 30 h | 3.1% | no: error |
+| Validation and PO match | Straight through only if all rules pass and vendor and PO match | 72% | 2,240 x 1.5 min = 56 h | 0.6% | no: error, just over |
+| Validation, PO match and dual extraction above 5,000 euros | As above, plus a second extraction that must agree on key fields for large invoices | 70% | 2,400 x 1.5 min = 60 h | 0.3% | yes |
+
+### Decision
+**Route on validation and PO match, and require two agreeing extractions for invoices above 5,000
+euros.** It is the only rule under the 0.5% escaped-error limit, and its 60 review hours sit well inside
+the 168-hour capacity.
+
+Self-reported confidence automates the most but lets about 6,800 x 0.031 = 211 wrong invoices a month
+through.
+- **Extra cost is small:** 1,200 x 0.04 = 48 euros a month for the second extractions.
+- **Escaped errors:** 5,600 straight-through x 0.003 = about 17 a month, against about 35 with
+  validation alone (5,760 x 0.006).
+- **Disagreement is a review reason:** reviewers see both values and the page region side by side.
+
+**What would change it.**
+- **Volume triples:** at 24,000 invoices, 30% review is 7,200 x 1.5 min = 180 hours, over capacity;
+  add reviewers or tighten rules for the vendors that cause most flags.
+- **Audit misses the target:** if the weekly sample shows errors above 0.5%, extend dual extraction to
+  a lower amount threshold and recompute cost and review load.
+- **Errors cluster in one field:** add a field-specific rule rather than more extraction.
+
+### Trade-offs accepted
+- **Only 70% straight-through instead of 85%.** Track straight-through rate per vendor and work down the
+  vendors with the most flags.
+- **About 17 escaped errors a month remain.** They are caught later by payment-run controls and the
+  weekly audit; track escaped errors by field and add each to the regression set.
+- **Large invoices take longer.** Watch time from receipt to posting for invoices above 5,000 euros
+  against payment terms.
+
+### Review rubric
+- **Routing signal justified:** the rule uses validation and system matches, and explains why model
+  confidence alone is not enough.
+- **Error limit applied to the right base:** escaped errors are measured on straight-through records.
+- **Review load computed** from volume, flag rate and minutes per document, and compared with capacity.
+- **Cost of extra checks shown** and tied to where errors are expensive (high amounts).
+- **Measurement loop named:** audit sampling and corrections feed a regression set.
+- **Change triggers stated** with the recomputed numbers.
 
 ## Why it exists
 - **The user problem.** Operations teams key in invoices, claims and onboarding forms by hand: slow,

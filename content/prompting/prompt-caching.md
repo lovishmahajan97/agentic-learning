@@ -5,7 +5,7 @@ name: Prompt caching
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -164,8 +164,9 @@ flowchart TD
 - **"Turning caching on can only save money."** A write costs about 1.25× ordinary input and is wasted if
   never read; in the 10-step agent example a per-step reminder at the top costs ~203k
   full-price-equivalent tokens versus 162.5k uncached.
-- **"Only edits to the text break the cache."** Reordering or adding tools, switching models, or toggling
-  thinking and effort per request also invalidate it, even when the visible text is byte-identical.
+- **"Only edits to the system prompt or messages break the cache."** Tools render first, so adding,
+  removing or reordering one invalidates everything after it; switching models, or toggling thinking and
+  effort per request, causes misses even when every byte of prompt text is identical.
 - **"Fifty parallel calls on one document pay for one write."** An entry is readable only once the first
   response has started, so simultaneous requests all miss; warm with one request, then fan out.
 - **"Prompt caching is a response cache, so it can return a stale answer."** It reuses attention state

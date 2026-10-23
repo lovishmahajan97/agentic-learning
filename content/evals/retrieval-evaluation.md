@@ -5,7 +5,7 @@ name: Retrieval evaluation (recall@k, MRR, NDCG)
 kind: metric
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement

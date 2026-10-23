@@ -5,7 +5,7 @@ name: Hybrid / on-prem
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -51,7 +51,8 @@ match the sizing scenario below.
 - **Overnight batch** (re-indexing, agent evals) could use 4 replicas for 8 hours on weekdays.
 - **Constraints:** patient data may never leave the group's datacenter; the agent eval set shows
   planning needs a hosted frontier model; capital budget covers at most 6 replicas of GPUs; GPU
-  procurement takes about 4 months; a platform team of two.
+  procurement takes about 4 months; a platform team of two; the team's TCO model (illustrative) puts an
+  extra owned replica's break-even against renting at about 60% utilization across the week.
 
 ### Options
 | Option | How it works | Data rule | Owned replicas | Planning quality | Owned GPUs busy? |
@@ -67,8 +68,8 @@ Choose **C**, because:
   fits the budget with room to spare.
 - **Everything else is filled or rented:** the spare and restricted slack take eligible daytime work, and
   overnight 1 + 3 = 4 replicas keep the pool busy around the clock.
-- **D's extra replicas would be busy under half the week** (about 160 of 336 replica-hours), below the
-  break-even the team's TCO model needs, so that load is cheaper rented.
+- **D's extra replicas would be busy under half the week** (about 160 of 336 replica-hours, ~48%),
+  below the ~60% break-even in the team's TCO model, so that load is cheaper rented.
 - **Frontier planning survives:** the cloud planner sees only task metadata and public guidelines; every
   step after the first restricted tool result runs on-prem.
 

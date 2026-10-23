@@ -161,8 +161,9 @@ def test_literal_unknown_and_missing():
 
 ### Failure scenarios
 - **Read `fn.__annotations__` instead of `get_type_hints(fn, include_extras=True)`.** You see
-  `KeyError: 'int'` from `PRIMITIVES`, because the future import stored `"int"` as a string. Debug by
-  printing `fn.__annotations__` and noting every value is a `str`.
+  a `KeyError` from `PRIMITIVES` on a string key (`'float'` for `convert`, the whole
+  `"Annotated[str, ...]"` text for `search`), because the future import stored every annotation as a
+  string. Debug by printing `fn.__annotations__` and noting every value is a `str`.
 - **Drop `include_extras=True`.** The `query` description disappears from the schema, because
   `get_type_hints` strips `Annotated` by default. `test_search_schema` shows the missing key; print the
   resolved hint to confirm it is plain `str`.

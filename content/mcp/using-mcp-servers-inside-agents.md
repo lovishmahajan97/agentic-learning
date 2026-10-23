@@ -5,7 +5,8 @@ name: using MCP servers inside agents (Claude, OpenAI Agents SDK, LangGraph adap
 kind: tool
 difficulty: core
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/model-context-protocol
@@ -38,6 +39,171 @@ and controlling which calls need approval.
   whether the tool list is cached, timeouts and retries, approval for risky tools, and tracing.
 - **What you can skip.** Writing JSON-RPC by hand. The protocol details live in
   `agents/model-context-protocol`; here you only need the client knobs each framework exposes.
+
+## Lab
+### Task
+Build the client layer every framework in this lesson hides from you: a `ToolRouter` that sits between
+the model and two MCP servers. It filters, prefixes and caches the tool list, routes calls, gates writes
+and degrades when a server is down. Time box: 45-60 min.
+- **Prerequisites:** Model Context Protocol (`agents/model-context-protocol`) and Tool calling; the first
+  example in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13 and pytest 9.1). Save the
+  starter as `lab.py` and the tests as `test_lab.py`.
+- **No model or real server:** `FakeSession` returns the same `tools/list` and `tools/call` shapes as an
+  MCP `ClientSession` (sync here, `async` in the real SDK), so the lab runs offline.
+
+### Starter code
+```python
+"""Lab: the client layer an agent framework puts between your model and MCP servers. Run: python lab.py"""
+class FakeSession:
+    """Stands in for an MCP ClientSession: same tools/list and tools/call result shapes."""
+    def __init__(self, tools: dict, fail: bool = False):
+        self.tools, self.fail, self.list_calls = tools, fail, 0     # name -> (description, handler)
+
+    def list_tools(self) -> list[dict]:
+        self.list_calls += 1
+        return [{"name": n, "description": d, "inputSchema": {"type": "object"}}
+                for n, (d, _) in self.tools.items()]
+
+    def call_tool(self, name: str, args: dict) -> dict:
+        if self.fail:
+            raise ConnectionError("server closed the connection")
+        try:
+            return {"content": [{"type": "text", "text": str(self.tools[name][1](**args))}], "isError": False}
+        except KeyError as e:
+            return {"content": [{"type": "text", "text": f"not found: {e.args[0]}"}], "isError": True}
+
+class ToolRouter:
+    """allow: server -> tool names the agent may see. approve(name, args) -> bool gates writes."""
+    def __init__(self, servers: dict, allow: dict, writes: set, approve):
+        self.servers, self.allow, self.writes, self.approve = servers, allow, writes, approve
+        self._cache = None
+
+    def tools(self) -> list[dict]:
+        # YOUR CODE HERE (1): list each server's tools ONCE per router (cache the result), keep only the
+        # allowlisted ones, and rename each to "<server>__<tool>" so two servers' `search`
+        # cannot collide. Return model-ready dicts: name, description, input_schema.
+        raise NotImplementedError
+
+    def call(self, name: str, args: dict) -> dict:
+        # YOUR CODE HERE (2): route "<server>__<tool>" to that server's call_tool with the bare tool name and
+        # return {"role": "tool", "name": name, "content": <joined text>, "is_error": bool}.
+        # - names not in tools(): is_error message "unknown tool <name>", never call a server
+        # - "<server>__<tool>" in writes and approve() says no: "denied: <name> needs approval"
+        # - ConnectionError: is_error message "tool unavailable: <server> is down", no raise
+        raise NotImplementedError
+
+def build(kb_down=False):
+    tickets = FakeSession({
+        "get_ticket": ("Fetch one ticket by id, e.g. T-1.", lambda ticket_id: {"T-1": "open"}[ticket_id]),
+        "search": ("Search ticket titles.", lambda q: ["T-1"]),
+        "close_ticket": ("Close a ticket.", lambda ticket_id: "closed"),
+        "delete_all": ("Delete every ticket.", lambda: "gone")})
+    kb = FakeSession({"search": ("Search help articles.", lambda q: ["KB-7: refunds take 5 days"])},
+                     fail=kb_down)
+    router = ToolRouter({"tickets": tickets, "kb": kb},
+                        allow={"tickets": {"get_ticket", "search", "close_ticket"}, "kb": {"search"}},
+                        writes={"tickets__close_ticket"}, approve=lambda name, args: False)
+    return router, tickets, kb
+
+if __name__ == "__main__":
+    router, tickets, kb = build()
+    print(sorted(t["name"] for t in router.tools()))
+    for step in range(3):                                   # three agent steps, one tools/list
+        router.tools()
+    print("tools/list calls:", tickets.list_calls, kb.list_calls)
+    for name, args in [("tickets__get_ticket", {"ticket_id": "T-1"}),
+                       ("tickets__get_ticket", {"ticket_id": "T-9"}),
+                       ("kb__search", {"q": "refund"}),
+                       ("tickets__delete_all", {}),
+                       ("tickets__close_ticket", {"ticket_id": "T-1"})]:
+        r = router.call(name, args)
+        print(r["is_error"], r["content"])
+    r = build(kb_down=True)[0].call("kb__search", {"q": "refund"})
+    print(r["is_error"], r["content"])
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+['kb__search', 'tickets__close_ticket', 'tickets__get_ticket', 'tickets__search']
+tools/list calls: 1 1
+False open
+True not found: T-9
+False ['KB-7: refunds take 5 days']
+True unknown tool tickets__delete_all
+True denied: tickets__close_ticket needs approval
+True tool unavailable: kb is down
+```
+
+- **Read the lines:** `delete_all` exists on the server but was never shown to the model, so a
+  hallucinated call to it is refused without touching the server. Every failure is a tool message the
+  model can read, not an exception that ends the run.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (Python 3.13, pytest 9.1).
+
+```python
+from lab import build
+
+def test_tools_are_filtered_prefixed_and_cached():
+    router, tickets, kb = build()
+    names = sorted(t["name"] for t in router.tools())
+    assert names == ["kb__search", "tickets__close_ticket", "tickets__get_ticket", "tickets__search"]
+    assert all(set(t) == {"name", "description", "input_schema"} for t in router.tools())
+    assert (tickets.list_calls, kb.list_calls) == (1, 1)          # cached across agent steps
+
+def test_calls_route_to_the_right_server_by_prefix():
+    router, _, _ = build()
+    assert router.call("kb__search", {"q": "x"})["content"] == "['KB-7: refunds take 5 days']"
+    assert router.call("tickets__search", {"q": "x"})["content"] == "['T-1']"
+
+def test_tool_errors_come_back_as_tool_messages():
+    router, _, _ = build()
+    r = router.call("tickets__get_ticket", {"ticket_id": "T-9"})
+    assert r == {"role": "tool", "name": "tickets__get_ticket", "content": "not found: T-9", "is_error": True}
+
+def test_hidden_and_unapproved_tools_never_reach_the_server():
+    router, tickets, _ = build()
+    tickets.fail = True                                           # any call that got through would raise
+    assert router.call("tickets__delete_all", {})["content"] == "unknown tool tickets__delete_all"
+    r = router.call("tickets__close_ticket", {"ticket_id": "T-1"})
+    assert r["is_error"] and r["content"] == "denied: tickets__close_ticket needs approval"
+
+def test_approved_write_runs():
+    router, _, _ = build()
+    router.approve = lambda name, args: args == {"ticket_id": "T-1"}
+    assert router.call("tickets__close_ticket", {"ticket_id": "T-1"})["content"] == "closed"
+
+def test_server_outage_degrades_instead_of_crashing():
+    router, _, _ = build(kb_down=True)
+    r = router.call("kb__search", {"q": "refund"})
+    assert r["is_error"] and r["content"] == "tool unavailable: kb is down"
+```
+
+### Failure scenarios
+- **Drop the prefix and key tools by bare name.** `kb.search` overwrites `tickets.search` (or the
+  reverse, depending on dict order), and the filter and routing tests fail. Debug by
+  printing the tool list the model receives and checking for duplicate names.
+- **Call `list_tools()` inside `call()` to validate names.** Output is still correct, but `list_calls`
+  grows with every step, the same per-request cost the Pitfalls describe. The caching assertion catches
+  it; in production, count `tools/list` spans per run in your traces.
+- **Let `ConnectionError` propagate.** The outage test errors and, in a real agent, the whole run dies
+  on one flaky server. Find it by forcing `fail=True` and checking the agent still produces an answer.
+- **Check approval after calling the server.** The write already happened when the human says no. The
+  hidden-tools test sets `fail=True`, so any call that reached the server returns the wrong message.
+
+### Submission
+- **`lab.py` and `test_lab.py`** in a repo, with `pytest -q` output showing 6 passed.
+- **The `python lab.py` output** matching the expected block line for line.
+- **A 5-line note** mapping each `ToolRouter` behaviour to the matching knob in one real framework
+  (`tool_filter`, `cache_tools_list`, `tool_name_prefix`, `require_approval` or `allowed_tools`).
+- **One added test of your own** for a case the suite misses, for example a server that returns two text
+  content blocks.
+- **Evaluated on:** tests green, no server call for hidden or denied tools, and no exception escaping
+  `call()`.
 
 ## Why it exists
 - **Tools are the expensive part of an agent.** Each integration needs auth, schemas, pagination and error

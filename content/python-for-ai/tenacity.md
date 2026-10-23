@@ -5,7 +5,7 @@ name: tenacity
 kind: tool
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -47,7 +47,7 @@ Wrap an agent's `create_ticket` write tool in a tenacity policy that retries onl
 honors a capped `Retry-After`, reuses one idempotency key across retries and hands permanent errors back
 to the model. The agent goal is a write tool that can be retried without creating duplicate tickets.
 Time box: 45-60 min.
-- **Prerequisites:** Exceptions & custom exception hierarchies; Dependency injection & interface boundaries.
+- **Prerequisites:** Exceptions and custom exception hierarchies; Dependency injection & interface boundaries.
 - **Setup:** Python 3.10+, `pip install tenacity pytest` (checked with tenacity 9.2.1). Save the starter as
   `lab.py`, the tests as `test_lab.py`.
 - **No real sleeping and no network:** `sleep` is injected (tenacity's `Retrying(sleep=...)`) and the
@@ -169,8 +169,11 @@ def test_each_logical_call_gets_a_fresh_key():
 - **Leave out `reraise=True`.** The exhausted case raises `tenacity.RetryError` and `pytest.raises(Transient)`
   fails; in an agent, error handlers keyed on your exception types stop matching. Read
   `RetryError.last_attempt.exception()` to see the original.
-- **Retry on every exception (the default `retry`).** The permanent-error test sees four attempts and
-  three sleeps for a 404 the model could have fixed. Print `api.keys` and `slept` after one permanent error.
+- **Retry on every exception (the default `retry`).** The permanent-error test fails with
+  `is_error: False`: the 404 is retried after a 1 s sleep, the scripted API succeeds on the second
+  attempt and the model never sees the error. Against a real API the 404 repeats, so you pay four
+  attempts and three sleeps for an error the model could have fixed. Print `api.keys` and `slept` after
+  one permanent error: `['k1', 'k1']` and `[1.0]` show the retry.
 - **Forget the `MAX_HINT` cap.** A buggy or hostile `Retry-After: 120` parks the agent step for two minutes;
   the capped test shows `[5, 120]`. Add a log line in `wait_retry_after` with the raw hint and the chosen wait.
 

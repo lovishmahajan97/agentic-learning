@@ -5,7 +5,7 @@ name: TCO (total cost of ownership)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -53,11 +53,12 @@ per run, $200k per loaded engineer-year).
 |---|---|---|---|---|
 | A. Build on a hosted API | the table below: 340 to build, then 330 a year (tokens 60 to 120 as runs grow) | 1,330 / 1,420 | 1,161 / 1,231 | no: 1.5 FTE-years is six months for three engineers |
 | B. Hosted agent platform | $0.40 per run (illustrative) with a 7% escalator, 120 for integration, security review and a vendor-neutral eval set, 0.4 FTE of admin | 1,132 / 1,535 | 956 / 1,268 | yes: 0.6 FTE-years is about ten weeks |
-| C. Self-host an open-weight model | same 340 build, two GPU replicas at 72 a year, 1.5 FTE of upkeep | 1,666 / 1,666 | 1,439 / 1,439 | no |
+| C. Self-host an open-weight model | same 340 build, two GPU replicas at 72 a year (assumed enough for 100,000 runs a month), 1.5 FTE of upkeep, the same 70 a year of evals, tracing and migration | 1,666 / 1,666 | 1,439 / 1,439 | no |
 
 - **B's exit is contingent:** 150 to export traces, memory and embeddings and re-integrate, at a judged
   30% probability by year 3, about 34 in expected NPV.
-- **C carries more people,** so it loses at this volume whatever the GPU price.
+- **C carries more people,** so it loses at this volume whatever the GPU price: even with free GPUs its
+  NPV is about 1,260, above A's 1,231 in the growth case.
 
 ### Decision
 Choose **B** on a 12-month term, with a capped per-run price and a contractual export of traces, memory

@@ -5,7 +5,8 @@ name: Tool-call success rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -42,6 +43,172 @@ layers localize it to model, policy, tool or environment.
   per-step target you derive from task goals.
 - **What you can skip.** One global success percentage. It averages a broken tool against healthy ones
   and hides which layer failed.
+
+## Lab
+### Task
+Build the tool-health report for a three-tool support agent from one day of `tool.call.result` events
+and its 100 verified run outcomes, then name the tool that most limits completion. Time box: 45-75 min.
+- **The twist:** `refund` has by far the worst per-attempt rate, yet retries carry it, and another tool
+  is the one actually losing tasks.
+- **Prerequisites:** Tool calling; Tool adapters; the rates and compounding examples in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13 and pytest 9.1). Save the
+  starter as `lab.py` and the tests as `test_lab.py`.
+- **No services:** `make_events` generates the events your adapters would emit (with `run_id`,
+  `step_id`, `attempt` and `error_class`) and the verified outcome of every run.
+- **You implement four functions:** `funnel`, `step_rates`, `alerts` and `lost_tasks`.
+
+### Starter code
+```python
+"""Lab: a layered tool-health report that names the tool limiting task completion. Run: python lab.py"""
+from collections import Counter, defaultdict
+
+LAYER = {"invalid_arguments": "well_formed", "denied": "permitted", "upstream_timeout": "executed",
+         "upstream_error": "executed", "rate_limited": "executed", "not_found": "effective",
+         "empty_result": "effective"}
+OWNER = {"well_formed": "prompt", "permitted": "policy", "executed": "integration", "effective": "retrieval"}
+ORDER = ["well_formed", "permitted", "executed", "effective"]
+
+def make_events():
+    """One tool.call.result per attempt, as the adapters emit them, plus verified run outcomes."""
+    ev = []
+    def add(i, tool, attempt, cls):
+        ev.append({"type": "tool.call.result", "run_id": f"r{i}", "step_id": f"r{i}:{tool}",
+                   "tool": tool, "attempt": attempt, "error_class": cls})
+    for i in range(100):
+        cls = "empty_result" if i < 6 else "invalid_arguments" if i < 10 else "ok"
+        add(i, "search", 1, cls)
+        if cls == "invalid_arguments":
+            add(i, "search", 2, "ok")                  # the model fixed the named field
+        add(i, "lookup", 1, "denied" if 10 <= i < 13 else "ok")
+        if i < 50:
+            add(i, "refund", 1, "rate_limited" if i >= 35 else "ok")
+            if i >= 35:
+                add(i, "refund", 2, "rate_limited" if i >= 47 else "ok")
+            if i >= 47:
+                add(i, "refund", 3, "upstream_timeout" if i == 49 else "ok")
+    failed = {f"r{i}" for i in [*range(6), 10, 11, 12, 49, 60, 61]}   # r60, r61: model misread the task
+    outcomes = {f"r{i}": f"r{i}" not in failed for i in range(100)}
+    return ev, outcomes
+
+def funnel(events: list[dict], tool: str) -> dict:
+    """Conditional layer rates for one tool, each rounded to 3 places:
+    {"attempts": n, "well_formed": passed/attempted, "permitted": passed/well-formed,
+     "executed": passed/permitted, "effective": passed/executed}.
+    A call fails at the layer LAYER maps its error_class to; "ok" passes all four."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def step_rates(events: list[dict], tool: str) -> dict:
+    """{"per_attempt": ok attempts / attempts, "per_step": steps with any ok attempt / steps,
+        "recovery": of steps whose attempt 1 failed, the share with a later ok attempt}  (3 places;
+        recovery is 0.0 when no first attempt failed)."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def alerts(events: list[dict], step_threshold: float = 0.05, gap_threshold: float = 0.1) -> list[dict]:
+    """Per tool, sorted by tool name:
+    - {"tool", "kind": "per_step", ...} when 1 - per_step > step_threshold
+    - {"tool", "kind": "retry_gap", ...} when per_step - per_attempt > gap_threshold (retries carrying it)
+    Each alert also has "class": the most common failing error_class over all attempts of that tool,
+    and "owner": OWNER[LAYER[class]]. Never alert on an aggregate over all tools."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def lost_tasks(events: list[dict], outcomes: dict) -> dict:
+    """Join tool events to verified outcomes: per tool, the number of FAILED runs in which that tool's
+    step never got an ok attempt. Return a dict sorted by count, highest first."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    events, outcomes = make_events()
+    for tool in ("search", "lookup", "refund"):
+        print(tool, funnel(events, tool), step_rates(events, tool))
+    for a in alerts(events):
+        print("alert:", a)
+    print("completion:", sum(outcomes.values()) / len(outcomes))
+    print("lost tasks:", lost_tasks(events, outcomes))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+search {'attempts': 104, 'well_formed': 0.962, 'permitted': 1.0, 'executed': 1.0, 'effective': 0.94} {'per_attempt': 0.904, 'per_step': 0.94, 'recovery': 0.4}
+lookup {'attempts': 100, 'well_formed': 1.0, 'permitted': 0.97, 'executed': 1.0, 'effective': 1.0} {'per_attempt': 0.97, 'per_step': 0.97, 'recovery': 0.0}
+refund {'attempts': 68, 'well_formed': 1.0, 'permitted': 1.0, 'executed': 0.721, 'effective': 1.0} {'per_attempt': 0.721, 'per_step': 0.98, 'recovery': 0.933}
+alert: {'tool': 'refund', 'kind': 'retry_gap', 'class': 'rate_limited', 'owner': 'integration'}
+alert: {'tool': 'search', 'kind': 'per_step', 'class': 'empty_result', 'owner': 'retrieval'}
+completion: 0.88
+lost tasks: {'search': 6, 'lookup': 3, 'refund': 1}
+```
+
+Recompute one line by hand: `refund` makes 50 + 15 + 3 = 68 attempts with 35 + 12 + 2 = 49 ok
+(49/68 = 0.721), yet 49 of its 50 steps end ok (0.98), and 14 of the 15 failed first attempts recover.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution
+passes all 5 (Python 3.13, pytest 9.1).
+
+```python
+from lab import alerts, funnel, lost_tasks, make_events, step_rates
+
+EVENTS, OUTCOMES = make_events()
+
+def ev(step, attempt, cls, tool="t", run="r0"):
+    return {"type": "tool.call.result", "run_id": run, "step_id": step, "tool": tool, "attempt": attempt,
+            "error_class": cls}
+
+def test_funnel_rates_are_conditional_on_the_previous_layer():
+    calls = [ev("s1", 1, "invalid_arguments"), ev("s2", 1, "denied"), ev("s3", 1, "rate_limited"),
+             ev("s4", 1, "empty_result"), ev("s5", 1, "ok")]
+    assert funnel(calls, "t") == {"attempts": 5, "well_formed": 0.8, "permitted": 0.75,
+                                  "executed": 0.667, "effective": 0.5}
+    assert funnel(EVENTS, "refund")["executed"] == 0.721 and funnel(EVENTS, "search")["effective"] == 0.94
+
+def test_per_step_counts_retries_as_one_intent():
+    calls = [ev("s1", 1, "rate_limited"), ev("s1", 2, "ok"), ev("s2", 1, "ok"), ev("s3", 1, "upstream_timeout")]
+    assert step_rates(calls, "t") == {"per_attempt": 0.5, "per_step": 0.667, "recovery": 0.5}
+    assert step_rates(list(reversed(calls)), "t") == step_rates(calls, "t")      # order of events must not matter
+
+def test_suite_step_rates():
+    assert step_rates(EVENTS, "refund") == {"per_attempt": 0.721, "per_step": 0.98, "recovery": 0.933}
+    assert step_rates(EVENTS, "search") == {"per_attempt": 0.904, "per_step": 0.94, "recovery": 0.4}
+
+def test_alerts_are_per_tool_and_routed_to_owners():
+    assert alerts(EVENTS) == [
+        {"tool": "refund", "kind": "retry_gap", "class": "rate_limited", "owner": "integration"},
+        {"tool": "search", "kind": "per_step", "class": "empty_result", "owner": "retrieval"}]
+    healthy = [ev(f"s{i}", 1, "ok") for i in range(97)] + [ev(f"s{i}", 1, "denied") for i in range(97, 100)]
+    assert alerts(healthy) == []
+
+def test_join_to_outcomes_names_the_limiting_tool():
+    assert lost_tasks(EVENTS, OUTCOMES) == {"search": 6, "lookup": 3, "refund": 1}
+    assert list(lost_tasks(EVENTS, OUTCOMES))[0] == "search"     # not refund, despite the worst per-attempt rate
+```
+
+### Failure scenarios
+- **Divide every layer by total attempts.** The funnel test fails (`executed` is no longer 0.667), and
+  a tool that rejects most calls at the schema looks healthy on infrastructure. Print
+  the count that reaches each layer next to its rate.
+- **Take recovery from the event list order instead of `attempt`.** The reversed-events assertion
+  fails; with real streams, out-of-order delivery makes recovery look like a first-attempt success.
+  Sort each step's events by `attempt` before reading the first one.
+- **Alert on per-attempt failure.** `refund` pages the integration team every day at 0.279 while users
+  see 0.98 per step, and the real loss in `search` hides behind it. Alert on per-step and treat the
+  retry gap as a warning, not a page.
+- **Rank tools by failure rate instead of joining to outcomes.** You fix `refund` first and completion
+  barely moves; `search` cost 6 of the 12 failed runs. Two failed runs (r60, r61) have no tool failure at
+  all, which is the share no tool fix can recover.
+
+### Submission
+- **`lab.py`** with the four functions implemented; `make_events`, `LAYER` and `OWNER` unchanged.
+- **A green test run** (5 passed) and the printed output of `python lab.py`.
+- **One extra test** of your own: a `not_found` class on `lookup` and the alert it should raise.
+- **A short note** naming the change you would make first, its owner, and the completion you expect
+  after it (at most 0.94 if every `search` loss is recovered).
+- **Evaluated on:** conditional layer rates, retries counted as one intent, per-tool alerts routed to
+  owners, and a decision based on lost tasks, not on the loudest metric.
 
 ## Why it exists
 - **Completion rate says the agent fails, not why.** Most agent failures are tool failures in disguise: a

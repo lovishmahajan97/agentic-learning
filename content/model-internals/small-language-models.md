@@ -5,7 +5,7 @@ name: Small language models (SLMs)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -158,7 +158,7 @@ flowchart TD
   and fine-tune for the form of the output.
 - **"Moving most agent calls to an SLM cuts the bill by about that share."** Cost follows tokens times
   price, not call count: in the research-agent example seven of ten calls moved but the bill fell only 41%,
-  because the planner calls carry most of the frontier spend.
+  because the three planner calls stay on the frontier model and are about 89% of the mixed bill.
 - **"Small models are trained compute-optimally, so more data would not help them."** Modern SLMs are
   deliberately over-trained (Llama 3 8B at close to 2,000 tokens per parameter versus about 20) because
   inference, not training, dominates lifetime cost.

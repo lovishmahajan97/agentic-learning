@@ -5,7 +5,8 @@ name: Multi-tenant state isolation
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - system-design/multi-tenancy
@@ -37,6 +38,66 @@ the model, and enforce it at each store's storage layer.
   through every adapter, filter-inside-search helpers, per-run sandboxes, and a canary test in CI.
 - **What you can skip.** Building per-tenant cells for every customer. Shared stores with storage-level
   scoping are the default; reserve dedicated stores for regulated or residency-bound tenants.
+
+## Decision case
+### Scenario
+A B2B SaaS company sells an assistant agent with long-term memory, document upload and code execution.
+It must choose an isolation model before onboarding its first regulated customers. All figures are
+illustrative planning numbers.
+- **Tenants:** 1,200 in total: 1,150 small (about 5,000 memory vectors each), 45 mid-size (about 200,000
+  each) and 5 enterprise (about 2 million each), so 5.75M + 9M + 10M = 24.75M vectors.
+- **Regulation:** 2 of the enterprise tenants are healthcare customers that require EU data residency and
+  a contractual "no shared database" clause.
+- **Ops team:** 2 SREs; every extra deployment adds upgrades, backups and on-call surface.
+- **Cost:** a full deployment cell is about $1,500 a month at minimum size.
+- **Assurance target:** a cross-tenant canary test must pass on every build, for every store.
+
+### Options
+| Option | How it works | Leak blast radius | Residency clause | Ops and cost | Small-tenant recall |
+|---|---|---|---|---|---|
+| Shared everything, storage-level scoping | Postgres RLS, one vector collection with a tenant payload index, prefix-scoped object credentials, per-run sandboxes | platform-wide if a policy is wrong | fails the 2 healthcare tenants | lowest | must be measured with filtered search |
+| Collection or schema per tenant | 1,200 schemas and 1,200 vector collections | one tenant per bug | still a shared database | many tiny collections strain the engine and the SREs | good |
+| Tiered | shared with storage-level scoping for small and mid; a dedicated collection for each enterprise tenant; an EU cell for the 2 healthcare tenants | shared tier: wide; enterprise: per tenant | met by the cells | 2 cells, about $3,000 a month | measured for the smallest tenants |
+| Cell per tenant | a separate deployment for everyone | one tenant | met | 1,200 × $1,500 = $1.8M a month | good |
+
+### Decision
+**Tiered isolation, decided per surface and per tenant tier.**
+- **Shared tier (1,195 tenants):** RLS with transaction-local `set_config` and forced RLS, one memory
+  collection filtered inside the search, tenant in every cache key, per-run sandboxes and tenant-attributed
+  traces with redacted prompt bodies.
+- **Enterprise collections (3 tenants):** at about 2 million vectors each they are large enough to justify
+  their own collection, which removes filter selectivity from their recall.
+- **EU cells (2 tenants):** the only option that satisfies residency and the "no shared database" clause;
+  2 × $1,500 = $3,000 a month against 0.17% of the cost of a cell for everyone.
+- **One rule across all tiers:** tenant identity comes from authentication into the run context, and no
+  tool schema accepts `tenant_id`.
+
+**What would change it.**
+- **A tenant-count jump of 10x small tenants:** stays shared; verify recall and payload index size.
+- **More residency customers:** template the cell so the SREs can stamp one out; past roughly 10 cells,
+  automate fleet upgrades first.
+- **A canary failure in the shared tier:** move that surface to per-tenant partitions until the cause is
+  fixed.
+
+### Trade-offs accepted
+- **Shared-tier blast radius.** One RLS or filter bug affects 1,195 tenants; the canary runs in CI on every
+  store and on every new tool, and we alert on queries run with the tenant setting unset.
+- **Two code paths for the vector store.** Shared and dedicated collections must behave the same; the
+  recall helper hides the difference, and the canary runs against both.
+- **Cell drift.** The EU cells lag platform releases; we track the release gap per cell.
+- **Tenant-scoped caches lose cross-tenant hits.** We accept the lower hit rate and keep a separate curated
+  cache for public content.
+
+### Review rubric
+- **The surface inventory comes first:** every store, cache, sandbox, trace sink and eval set is listed
+  with its isolation mechanism.
+- **The tier assignment is justified by a constraint:** regulation, size or contract, not preference.
+- **Costs are recomputed** from tenant counts and per-unit figures for each option.
+- **Identity source is explicit:** tenant from authentication, never from a model-filled argument.
+- **The proof is continuous:** a canary test covering every surface and both vector paths, run on every
+  build.
+- **Offboarding is covered:** deletion from every inventoried surface in each tier, verified by re-running
+  the canary.
 
 ## Why it exists
 - **A CRUD app has one place to forget the `WHERE`.** Multi-tenancy there is mostly one `tenant_id` column.

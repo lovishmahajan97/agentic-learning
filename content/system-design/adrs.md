@@ -5,7 +5,7 @@ name: ADRs (architecture decision records)
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:

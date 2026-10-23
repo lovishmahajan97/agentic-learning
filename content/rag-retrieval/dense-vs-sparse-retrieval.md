@@ -5,7 +5,7 @@ name: Dense vs sparse retrieval
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: evaluate
@@ -177,14 +177,14 @@ flowchart TD
 ## Misconceptions
 - **"Embeddings made keyword search obsolete."** A single vector loses rare, high-information tokens such
   as "PX-200" or "E4012", because the tokenizer splits them into pieces shared with unrelated strings.
-  Agents pass exactly these tokens between tools, and out of domain BM25 often beats dense retrievers.
+  Agents pass exactly these tokens between tools, and out of domain BM25 often beats many dense retrievers.
 - **"BM25 is just word counting, a weak baseline."** IDF, saturation and length normalization make it hard
   to beat without in-domain labels. Any dense model must beat it on your labeled queries before it earns
   its embedding and re-indexing cost.
 - **"Dense retrieval understands the query, so it handles negation and constraints."** "Flights not via
   Frankfurt" averages out in one vector, and term matching ignores the "not" too. Hard constraints belong
   in filters or a reranker, not in either retriever.
-- **"If dense has higher recall, a sparse arm adds nothing."** What decides is the overlap, not the
+- **"If one arm has higher recall, the other adds nothing."** What decides is the overlap, not the
   average. In the toy ablation below, recall@1 is 0.75 for BM25 and 0.50 for dense, yet their union is
   1.00. Drop an arm only when its hits are a subset of the other's.
 - **"SPLADE and ColBERT are just better dense models."** SPLADE is learned sparse: term weights with

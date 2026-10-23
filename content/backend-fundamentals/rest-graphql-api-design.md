@@ -5,7 +5,7 @@ name: REST / GraphQL API design
 kind: decision
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -65,7 +65,7 @@ integrations that sync tickets. Figures are illustrative but internally consiste
 | C. REST + OpenAPI underneath, GraphQL BFF for the console | REST as in A; a GraphQL layer only in front of the console | as in A | as in A | 1 query | two stacks to run and secure | as in A |
 
 - **The token gap in B:** about 4,200 extra prompt tokens per model call; at about 7 model calls per
-  conversation that is about 29,400 extra input tokens per conversation before prompt caching.
+  conversation (6 tool-call turns plus the final answer) that is about 29,400 extra input tokens per conversation before prompt caching.
 
 ### Decision
 Choose **A now, with C as the planned next step if its trigger fires.** The agent and the partners are

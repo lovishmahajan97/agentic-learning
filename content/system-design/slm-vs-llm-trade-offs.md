@@ -5,7 +5,7 @@ name: SLM vs LLM trade-offs
 kind: decision
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -76,14 +76,17 @@ Measured latencies per check: about 0.8 s on the LLM, about 0.08 s on the self-h
 **What would change it.**
 - **Escalation creep.** Latency allows at most 21% escalation, since 8 × (0.08 + 0.8e) ≤ 2 gives
   e ≤ 0.2125. If recalibration pushes escalation past that, retrain the SLM rather than lowering the bar.
-- **Lower volume.** Below about 241,000 checks a day (100 ÷ 0.000415) the GPU costs more than the API
-  calls it replaces; latency still rules out A, so a hosted small-model API with fine-tuning becomes
+- **Lower volume.** The cascade still sends 10% of checks to the API, so the GPU replaces 90% of
+  calls: below about 268,000 checks a day (100 ÷ (0.9 × 0.000415)) it costs more than the API calls it
+  replaces; latency still rules out A, so a hosted small-model API with fine-tuning becomes
   the candidate.
 - **No serving owner.** If the half-time engineer leaves, the same hosted option replaces self-hosting.
 
 ### Trade-offs accepted
 - **A calibrated threshold to maintain.** It drifts with inputs; it is recalibrated monthly on fresh
   human labels, with escalation rate and accepted-item accuracy on the dashboard.
+- **A point-estimate pass.** C's 97.1% clears the 97% bar by 0.1 point, well inside the ±0.75-point
+  interval; the test set is grown and re-scored monthly so a true rate below the bar shows up.
 - **Two code paths.** An escalation pays both calls; p95 added latency per run is tracked against 2 s.
 - **A retraining treadmill.** New tools change what tool results look like; schema and label changes
   per month are counted as the signal to re-distil.

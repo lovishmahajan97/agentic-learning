@@ -5,7 +5,7 @@ name: Embedding pipelines
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 mastery: implement
@@ -240,8 +240,9 @@ def test_crash_then_rerun_matches_a_clean_run():
   unsearchable. Debug: log every store write with its doc id and read the order.
 - **Index only the documents you are given.** Removed documents keep their chunks, so the agent cites a
   deleted page. Debug: diff `store.doc_ids()` against the corpus keys after each run.
-- **Make chunking non-deterministic** (for example strip whitespace differently per run). Run 2 embeds
-  everything again. Debug: run twice on an unchanged corpus and diff the two id sets.
+- **Make chunk text non-deterministic** (for example append a random amount of trailing whitespace or a
+  run timestamp before hashing). Run 2 embeds everything again, and the edit, removal and crash tests fail
+  with it. Debug: run twice on an unchanged corpus and diff the two id sets.
 
 ### Submission
 - **`pipeline.py` and `test_pipeline.py`** in a repo or gist, with no edits to the tests.

@@ -5,7 +5,7 @@ name: pass@k
 kind: metric
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement
@@ -161,7 +161,8 @@ flowchart TD
 - **"pass^k is just the observed rate to the power k."** p̂^k is biased upward because x^k is convex:
   12 of 20 runs gives 0.6^4 ≈ 0.13, while the unbiased C(c, k) / C(n, k) gives 0.102.
 - **"pass@k measures the model alone."** It is tied to a temperature and a sample count. Greedy decoding
-  makes all k samples identical, so pass@10 equals pass@1; compare only under one stamped protocol.
+  makes the k samples (near-)identical, so pass@10 collapses to about pass@1; compare only under one
+  stamped protocol.
 - **"A good mean pass^k means every task is reliable."** One flaky task dominates: at p = 0.95 a task
   keeps pass^8 ≈ 0.66, at p = 0.6 it drops to about 0.02. Read the per-task table.
 

@@ -5,7 +5,7 @@ name: Structured / constrained generation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -191,8 +191,10 @@ flowchart TD
 - **"JSON mode already enforces my schema."** JSON mode guarantees syntactically valid JSON of any shape;
   structured-output modes enforce your fields, types and enums.
 - **"Masking is expensive because every step checks the whole vocabulary."** The state-to-token table is
-  compiled once per schema and tokenizer, so a step is a lookup. The real cost is compilation, paid again
-  whenever a request brings a new schema, visible as higher TTFT.
+  compiled once per schema and tokenizer, so a step is mostly a lookup (for nested grammars XGrammar
+  caches the stack-independent tokens and checks only the rest). The real costs are compilation, paid
+  again whenever a request brings a new schema (higher TTFT), and CPU mask work that must keep pace with
+  the batch (higher TPOT when it falls behind).
 
 ## Examples
 ### The token index for "exactly three digits", in pure Python

@@ -5,7 +5,7 @@ name: Caching strategy & cache invalidation
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -73,8 +73,9 @@ Choose **B**, shipping A in week one.
   a day with no staleness risk at all.
 - **Tool caches:** they add latency savings without reusing any answer, and the write tool is never
   cached.
-- **Erasure:** the exact cache's 6-hour TTL (as in the Redis example below) could alone serve erased data for hours. The reverse index and per-answer
-  document versions make removal immediate, including the in-flight race.
+- **Erasure:** the exact cache's 6-hour TTL (as in the Redis example below) could alone serve erased
+  data for hours. The reverse index and per-answer document versions make removal immediate, including
+  the in-flight race.
 - **Why not C or D:** they fail on the accuracy limit and tenant isolation, not on economics.
 
 **What would change it:** a semantic cache becomes a candidate if a verifier on borderline hits plus a

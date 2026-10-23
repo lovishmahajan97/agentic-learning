@@ -5,7 +5,7 @@ name: response_model
 kind: concept
 difficulty: core
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:

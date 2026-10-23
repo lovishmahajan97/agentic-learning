@@ -5,7 +5,7 @@ name: Lost-in-the-middle
 kind: concept
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: evaluate
@@ -155,8 +155,8 @@ flowchart TD
   attention is a fixed budget split among similar chunks, and a fact in the middle of a long prompt is
   used least reliably. Agents show this as repeat searches for results they already hold.
 - **"Higher recall@k means better answers, so raise k."** Every extra chunk is a lookalike distractor that
-  pushes the evidence deeper into the trough. Recall rises while end-to-end accuracy falls; rerank and cut
-  to a small k instead.
+  pushes the evidence deeper into the trough. Recall keeps rising while end-to-end accuracy plateaus or
+  falls; rerank and cut to a small k instead.
 - **"Accuracy fades steadily with distance from the question."** The curve is U-shaped, not a linear
   decay: the start was strongest in the original study, then the end, with the trough between. Rank order
   therefore wastes the strong last slot on the weakest chunk; edge reordering uses both ends.

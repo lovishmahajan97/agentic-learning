@@ -5,7 +5,7 @@ name: Transformer
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: background
 related:
@@ -187,8 +187,9 @@ flowchart TD
   positions: without prefix reuse each step re-reads the whole transcript, and even with it late tokens
   are dearer.
 - **"Instructions placed after a tool result change how the model reads that result."** Attention is
-  causal: the result's tokens were encoded before the instruction existed. Only tokens after the
-  instruction see both, so put guidance before the content it should shape.
+  causal: the result's tokens were encoded before the instruction existed and stay unchanged. Only later
+  tokens, the answer included, see both, so a trailing instruction steers the output but not how the
+  result itself was encoded.
 - **"Any transformer works for any agent step."** An encoder-only model cannot generate, and a
   decoder's last hidden state is not a good embedding out of the box; match layout to the step.
 

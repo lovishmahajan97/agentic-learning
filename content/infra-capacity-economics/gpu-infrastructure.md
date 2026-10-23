@@ -5,7 +5,7 @@ name: GPU infrastructure
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -81,8 +81,10 @@ utilisation and a dedicated GPU-ops hire make C worth its cost per GPU hour.
   base-image bumps until every pool runs the new driver.
 - **Fixed eight-card blocks.** Two 4-GPU replicas fill a node exactly, but any 3-GPU or 5-GPU change
   strands cards. Watch GPU hours used versus purchased.
-- **Quota for burst nodes.** Hold quota or reservations for the two extra nodes; alert on
-  "insufficient capacity" during the morning ramp.
+- **Burst nodes join before the ramp.** Creating a node, installing its driver stack and staging 140 GB
+  onto its NVMe does not fit in 5 minutes, so add the two office-hours nodes on a schedule ahead of the
+  ramp; the 5-minute budget covers a replica starting on a node already in the pool. Hold quota or
+  reservations for them and alert on "insufficient capacity".
 - **Owning the health loop.** Alert on `DCGM_FI_DEV_XID_ERRORS`, track cordoned nodes, and tag every agent
   trace span with the node that served it.
 

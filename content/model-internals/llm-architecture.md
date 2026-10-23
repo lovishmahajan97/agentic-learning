@@ -5,7 +5,7 @@ name: LLM architecture (encoder–decoder vs decoder-only)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -156,9 +156,9 @@ flowchart TD
 - **"A chat model has a separate input channel for the prompt and tool results."** In a decoder-only
   model, system prompt, tool results and answer are one token sequence; "input" only means positions
   the loss skipped. A tool result is read exactly like an instruction.
-- **"Reading the prompt is cheap because there is no encoder."** Prefill is fast in wall-clock time
+- **"Prompt tokens are nearly free because prefill is fast."** Prefill is fast in wall-clock time
   because positions run in parallel, but each prompt token still costs a full-stack pass, roughly 2 FLOPs
-  per parameter.
+  per parameter, so a long re-sent prompt dominates compute in read-heavy jobs.
 - **"Parameter count tells you the cost."** Each token passes through only one stack of an
   encoder–decoder, so 2N parameters split evenly cost about the FLOPs per token of an N-parameter
   decoder-only model. Compare FLOPs per token and memory.

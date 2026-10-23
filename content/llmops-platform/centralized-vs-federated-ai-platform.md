@@ -5,7 +5,7 @@ name: Centralized vs federated AI platform
 kind: decision
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -55,8 +55,8 @@ with refund and chargeback tools. The CTO asks for a platform model. All figures
 ### Options
 | Option | How it works | EU residency | Money-moving audit | Onboarding | Quota isolation | Platform load |
 |---|---|---|---|---|---|---|
-| **A. Full centralization** | platform owns keys, gateway, prompts and reviews every change | only if the gateway moves to the EU, for everyone | yes | queue: 8 teams × 3 requests × 2 days = 48 of 80 days on review | yes | over half on review: fails |
-| **B. Federated, policy document** | teams keep keys, tools and tracing | yes | no inventory: fails | fast | separate accounts, no shared pool | low; 8 × 6 = 48 engineer-weeks duplicated in the teams |
+| **A. Full centralization** | platform owns keys, gateway, prompts and reviews every change | only if the gateway moves to the EU, for everyone | yes | queue: 8 teams × 3 change requests a month × 2 days = 48 of 80 days on review | yes | over half on review: fails |
+| **B. Federated, policy document** | teams keep keys, tools and tracing | yes | no inventory: fails | fast | separate accounts, no shared pool | low; 8 teams × about 6 engineer-weeks = 48 engineer-weeks duplicated in the teams |
 | **C. Thin core, one US gateway** | mandatory gateway, virtual keys, tool inventory, trace pipeline, paved road | fails, or EU payments keeps its own keys and leaves a hole in the inventory | partial | self-service | per-team keys and priority classes | one quarter to build |
 | **D. Thin core, central control plane, EU data-plane replicas** | as C; EU payments runs gateway and agent-runtime replicas in its network on central config | yes | yes: every agent's tools and side-effect classes in one registry | self-service | per-team keys and priority classes | as C plus operating one EU replica set |
 

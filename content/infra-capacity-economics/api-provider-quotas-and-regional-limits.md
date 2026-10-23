@@ -5,7 +5,7 @@ name: API provider quotas & regional limits
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -66,8 +66,10 @@ Choose **B**, and file the quota increase today, because:
   per minute at the self-limit, so peak uses about 85% of what the gateway admits.
 - **The bigger lever is the transcript:** compaction cuts the charge from 105,600 to 57,600 per run
   after `max_tokens` is fixed, as the worked scenario shows.
-- **Evals cannot share the live quota:** 2,000 × 57,600 = 115.2M tokens is about 5.6 hours of the whole
-  self-limited budget, so they go to the batch API.
+- **Evals should not share the live quota:** 2,000 × 57,600 = 115.2M tokens is about 5.6 hours of the
+  whole self-limited budget, which leaves no room for overnight live runs and almost no slack before
+  07:00. They go to the batch API, which has separate limits, after confirming it is offered in the
+  allowed region.
 - **Checkpoint and resume** turns a throttle into a pause, so no ticket or email is sent twice.
 
 **What would change it:**
@@ -84,6 +86,9 @@ Choose **B**, and file the quota increase today, because:
 - **Compaction may drop context the agent needed.** Watch task success and tool-argument errors on the
   eval set.
 - **A tight `max_tokens` can truncate answers.** Watch the truncation rate per step type.
+- **Batch jobs complete within a provider window, not by our deadline.** Submit the sweep early in the
+  evening and watch batch completion time against 07:00; the fallback is a low-priority share of the
+  live bucket after midnight.
 
 ### Review rubric
 - **Demand is converted into the provider's units** per run (steps × prompt plus `max_tokens`), and the

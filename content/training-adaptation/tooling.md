@@ -5,7 +5,7 @@ name: Tooling (Unsloth, Axolotl, TRL)
 kind: tool
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 agent_relevance: useful
 lesson_type: lab
 related:

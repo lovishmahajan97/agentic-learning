@@ -5,7 +5,7 @@ name: Feature stores (hybrid ML only)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: background
 related:
@@ -84,7 +84,8 @@ What would change it:
 - **The sources were mutable current-state tables.** Then no backfill is possible, and A's log-and-wait
   would be the only honest path.
 - **Many models with sub-minute streaming features.** Then C's managed streaming may justify the contract.
-- **The fraud model is retired.** Then no feature store is needed, because the agent uses LLMs over text only.
+- **The fraud model is retired and the churn model is dropped.** Then only the router remains on a few
+  features, and the shared feature library from A is enough without a store.
 
 ### Trade-offs accepted
 - **Running Feast ourselves.** Materialization jobs and registry upkeep land on one engineer; watch

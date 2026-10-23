@@ -5,7 +5,8 @@ name: State & checkpoint stores
 kind: decision
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -42,6 +43,79 @@ Redis only for leases and stream buffers, and a tenant id on every row.
   on every row and key, and retention per data class.
 - **What you can skip.** A distributed database on day one. A single Postgres holds about 200 MB a day for a
   thousand runs (illustrative); move only when one primary becomes the bottleneck.
+
+## Decision case
+### Scenario
+A legal-tech company runs a contract-review agent for 40 law-firm tenants and must pick its state store
+before launch. All figures are illustrative.
+- **Load:** 5,000 runs a day, about 30 steps and 80 events per run, events averaging 3 KB; 80% of runs
+  fall in a 10-hour EU business window.
+- **Blobs:** 15% of runs (750 a day) capture three court-docket pages of about 2 MB each.
+- **Waits and effects:** some runs park up to 3 days for a partner's approval, then file a matter in
+  the firm's practice-management system, a side effect that must not happen twice.
+- **Constraints:**
+  - **Residency:** customer data, backups included, stays in EU regions.
+  - **Latency:** checkpoint write p95 under 50 ms.
+  - **Durability:** no acknowledged step lost when a node crashes.
+  - **Deletion:** a tenant's data is erased within 30 days of contract end.
+  - **Team and deadline:** 3 backend engineers who know Postgres well, none with a workflow engine;
+    8 weeks to launch, one managed database plus object storage, no new vendor contract this quarter.
+
+Derived load (recomputed):
+
+| Quantity | Calculation | Result |
+|---|---|---|
+| Event volume | 5,000 × 80 × 3 KB | 1.2 GB a day, about 216 GB over 180 days |
+| Blob volume | 750 × 3 × 2 MB | 4.5 GB a day, about 810 GB over 180 days |
+| Step commits | 5,000 × 30 = 150,000 a day; 120,000 in 36,000 s | about 3.3 a second, about 17 at a 5x burst |
+
+### Options
+| Option | How it works | Durability and latency | Residency and deletion | Team, 8 weeks, approval waits |
+|---|---|---|---|---|
+| **A. Redis only** | Runs, events and blobs in Redis with `appendonly yes`, `appendfsync everysec` | Sub-millisecond writes, but `everysec` can lose about the last second, the step a resume needs | 810 GB of blobs in memory is the wrong cost shape; deletion by key scan | Fast to start; 3-day parked runs depend on persistence never being flushed |
+| **B. Postgres + object storage + Redis for leases** | `runs`, `events`, `checkpoints` in one managed EU Postgres, one transaction per step; blobs over a threshold under `tenant/run_id/seq`; Redis only for leases and stream buffers | Durable by default with `synchronous_commit` on; low-millisecond commits on a local network fit 50 ms easily at 17 a second | Region pinned at creation; `tenant_id` on every row and prefix on every key makes deletion a query plus a prefix delete | Uses existing skills; parked runs are a status plus a wake-up row |
+| **C. Managed document store** | One item per run plus event items, per-item TTL | Durable writes, but checkpoint and run status need a transactional write or a repair step | EU region available; deletion needs a tenant index on every item | New skills; item size limits (400 KB on DynamoDB) force blob offload anyway |
+| **D. Workflow engine** (self-hosted Temporal on Postgres) | Engine owns history, timers and signals; model and tool calls become activities | Durable history, retries and timers built in | Engine's database and blobs still need residency and deletion work | Determinism and versioning to learn, and an extra cluster to run, in 8 weeks |
+
+### Decision
+**Choose B.** It is the only option that meets every constraint with the current team and deadline.
+- **Load is small for one primary:** about 17 step commits a second at burst and 216 GB of events
+  over six months.
+- **Durability is the default,** so the filing intent recorded before the practice-management call
+  survives a node crash.
+- **Residency and deletion are design-time properties:** EU region for the database, bucket and
+  backups, with `tenant_id` everywhere.
+- **Approval waits cost storage, not workers:** a 3-day park is a row, not a held process.
+
+**What would change it:**
+- **Step commits approaching thousands a second,** or a single tenant dominating writes: shard by
+  tenant, or move the event log to a wide-column store.
+- **Workflows growing into many timers, signals and compensations:** with an engineer to own it, D
+  starts paying for its learning curve.
+- **A sub-5 ms checkpoint target** (a voice product): revisit with relaxed commit for steps without
+  side effects.
+
+### Trade-offs accepted
+- **A single primary's write ceiling.** Watch commit p95 and WAL volume per day; alert when p95 passes
+  25 ms, half the budget.
+- **Orphan blobs after a rolled-back commit.** A lifecycle rule and a weekly sweep; track
+  unreferenced objects per tenant.
+- **Leases lost if Redis restarts.** Runs wait out the lease TTL; track lease steals and re-claim delay.
+- **Backups kept 30 days or less,** so erasure reaches them in time, which shortens point-in-time
+  recovery. Per-tenant encryption keys are the follow-up if longer backups are required.
+- **Resume logic written in-house instead of an engine's.** Kill-at-every-boundary tests in CI; track
+  duplicate-filing incidents, target zero.
+
+### Review rubric
+- **Numbers are derived:** write rate, event and blob volume come from stated inputs, and the choice is
+  checked against them.
+- **Durability is named precisely:** the write says which acknowledgement level the configuration gives
+  and which step a loss would hit.
+- **Every constraint gets a verdict per option,** backups and blobs included.
+- **Side effects are protected:** the write-up shows where the intent is recorded before the external
+  call and how a stale worker is fenced.
+- **Reversal conditions are measurable:** thresholds that would flip the choice, each with its metric.
+- **Each accepted trade-off names its signal and alert level.**
 
 ## Why it exists
 - **Every step pays a durable write** on its critical path. A few hundred milliseconds per write

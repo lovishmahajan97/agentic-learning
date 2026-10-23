@@ -5,7 +5,7 @@ name: Positional encoding (RoPE)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -168,8 +168,9 @@ flowchart TD
 - **"`max_position_embeddings` is how long a transcript the model handles."** Reliable length is a
   property of the angles the model was trained or extended on, and a window the model accepts is not one
   your agent uses well; set limits from evals at your lengths.
-- **"Going past the limit will raise an error."** Nothing fails: slow pairs reach unseen angles and the
-  agent quietly starts looping, forgetting instructions or emitting malformed tool calls.
+- **"Going past the limit will raise an error."** Past the trained angles nothing throws (only an engine's
+  own length cap rejects a request): slow pairs reach unseen angles and the agent quietly starts looping,
+  forgetting instructions or emitting malformed tool calls.
 - **"RoPE adds a position vector to the embeddings."** It rotates queries and keys (never values) after the
   projections, so `qₘ·kₙ` depends only on the offset `n − m` and the contents.
 - **"Setting `rope_scaling` extends context for free."** Interpolation and YaRN assume a fine-tune or a

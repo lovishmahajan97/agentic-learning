@@ -5,7 +5,7 @@ name: Spans
 kind: concept
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 agent_relevance: core
 lesson_type: lab
 related:

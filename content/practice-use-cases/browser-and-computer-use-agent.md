@@ -5,7 +5,8 @@ name: browser and computer-use agent (forms, web tasks, safety)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/computer-use
@@ -39,6 +40,63 @@ portals that have no API.
   screenshots.
 - **What you can skip.** Building your own vision model or a general desktop agent. Start with one site,
   one task and DOM-based actions.
+
+## Decision case
+### Scenario
+An insurance broker's operations team submits about 400 policy renewals a week through three carrier
+portals with no API. A clerk copies each one from the CRM in about 12 minutes, so 400 x 12 = 4,800
+minutes, or 80 clerk hours a week. All figures are illustrative planning numbers.
+- **Carrier A, 250 a week:** a stable portal whose layout changed once last year.
+- **Carrier B, 100 a week:** redesigned every few months, with a new banner or pop-up each time.
+- **Carrier C, 50 a week:** a legacy app served through a remote desktop, so there is no DOM to read.
+- **Binding submissions:** every submit commits the client, so a clerk approves each one from a
+  screenshot, in about 2 minutes.
+- **Data:** client names, addresses and policy numbers; no payments on the portals. Clerks' portal
+  passwords must never reach a model, and legal has confirmed the carriers' terms allow broker
+  automation.
+- **Team and budget:** two engineers for 10 weeks; model cost under $0.50 per renewal.
+
+### Options
+| Option | How it works | Carrier A | Carrier B | Carrier C | Upkeep and cost |
+|---|---|---|---|---|---|
+| A. Playwright scripts everywhere | Fixed selectors, no model | works, cheap | breaks on each redesign | cannot read the remote desktop | high upkeep on B; no model cost |
+| B. DOM agent everywhere | Model picks actions from the accessibility tree | works, but pays for adaptability it rarely needs | adapts to redesigns | fails: no DOM | up to 400 x $0.50 = $200 a week |
+| C. Hybrid behind one policy gate | Script for A, DOM agent for B, C stays manual until a screenshot agent passes its replay suite | script | agent | manual for now | agent cost up to 100 x $0.50 = $50 a week |
+| D. Stay manual, ask carriers for APIs | No automation | manual | manual | manual | 80 clerk hours a week |
+
+### Decision
+**Option C, the hybrid, with every path behind the same gate.** Each portal gets the cheapest control
+that survives its rate of change: a script where the layout is stable, an agent where it moves.
+Screenshot control waits, because pixels are the costliest and least reliable observation.
+- **Shared guardrails:** the domain allowlist, a credential vault that fills logins outside the model,
+  forbidden fields, a step budget, and approval with a screenshot before every submit.
+- **Human time, assuming 90% success on A and B (the replay-suite target):** 315 approvals x 2 minutes
+  = 630, plus 35 hand-offs x 12 = 420, plus 50 Carrier C renewals x 12 = 600. That is 1,650 minutes,
+  27.5 hours, down from 80.
+
+**What would change it.** A carrier API moves that carrier to a typed tool at once. Two script breaks on
+Carrier A in a quarter move it to the agent. A Carrier C screenshot agent reaching 90% on its replay
+suite, with zero unsafe actions, adds it.
+
+### Trade-offs accepted
+- **Two code paths to maintain.** Scripts and the agent share the gate but not the logic. Alert on any
+  script failure and track success per carrier weekly.
+- **Approvals cap throughput.** 10.5 clerk hours a week go to approving submits. Watch approval queue age;
+  relax only for a carrier with a long clean record and reversible submits.
+- **Portal text can carry injected instructions.** Carrier notices are untrusted data. The gate, not the
+  prompt, blocks the effect; keep injected test pages in the replay suite.
+- **Carrier C stays manual.** Its 10 hours a week remain until the screenshot agent proves itself.
+
+### Review rubric
+- **Observation matched to each site:** the write-up picks DOM, pixels or a script per site from its
+  structure and change rate.
+- **Savings computed:** human time before and after is calculated from volume, success rate, approval
+  time and hand-offs.
+- **Irreversible steps gated:** every binding action has a named approver and a screenshot in the audit
+  trail.
+- **Secrets kept out of the model:** sign-in uses a vault or pre-authenticated session, stated explicitly.
+- **Promotion criteria numeric:** a new site or a relaxed approval needs a stated replay-suite pass rate.
+- **Exit to APIs:** the write-up says when a browser step is replaced by a typed tool.
 
 ## Why it exists
 - **Many workflows live behind web UIs with no API.** Supplier portals, government forms, legacy admin

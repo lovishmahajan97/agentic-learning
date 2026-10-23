@@ -5,7 +5,7 @@ name: Optimizers (Adam, AdamW)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -171,7 +171,8 @@ flowchart TD
   is divided by √v̂, so large-gradient weights are barely regularised. `torch.optim.AdamW` shrinks every
   weight by the same factor (1 − ηλ) per step.
 - **"A learning rate is a learning rate, whatever the optimizer."** Adam moves each parameter by about η
-  per step regardless of gradient scale, so SGD's 0.1 diverges at once. LoRA and full fine-tuning also
+  per step regardless of gradient scale, so SGD's 0.1 would move every weight by about 0.1 a step and wreck a
+  pre-trained model. LoRA and full fine-tuning also
   need different ranges, around 1e-4 to 3e-4 versus 1e-5 to 5e-5 (illustrative).
 - **"If the bf16 weights fit, the fine-tune fits."** Full AdamW in mixed precision is about 16 bytes per
   parameter, 112 GB for 7B before activations; m and v alone are 56 GB. LoRA keeps state only for the

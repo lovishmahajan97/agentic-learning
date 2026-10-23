@@ -188,8 +188,9 @@ describe("runAgent", () => {
 ```
 
 On the starter all five fail: four with `not implemented: scripted fake`, and the budget test with
-`promise resolved "{ text: '', steps: 50 }" instead of rejecting`. After YOUR CODE 3 alone, the two
-error-result tests fail on the crash (`upstream down`, and `opts.tools[call.name] is not a function`).
+`promise resolved "{ text: '', steps: 50 }" instead of rejecting`. After YOUR CODE 3 alone, three
+still fail: the budget test the same way, and the two error-result tests on the crash (`upstream down`,
+and `opts.tools[call.name] is not a function`).
 
 ### Failure scenarios
 - **Inject a live-array fake:** push `history` instead of `structuredClone(history)` into `seen`. The

@@ -5,7 +5,7 @@ name: KV-cache memory estimation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -178,8 +178,8 @@ flowchart TD
   ~132 requests at a 3k p50 holds about 20 agents at the end of a 10-step run and about 9 at a 25-step
   p95 run.
 - **"Adding tensor parallelism always shrinks per-GPU cache."** It divides KV heads across GPUs only until
-  *T* reaches `n_kv_heads`. With 8 KV heads, TP 16 replicates heads and per-GPU cache stays at 40 KB per
-  token.
+  *T* reaches `n_kv_heads`. For the 70B-class shape with 8 KV heads, per-GPU cache bottoms out at 40 KB
+  per token at TP 8; TP 16 replicates heads and saves nothing more.
 - **"One formula fits every model."** MLA models store one compressed latent per layer (~70 KB per token
   for DeepSeek-V3), and sliding-window layers cap at *W* tokens. Read the architecture and trust the
   engine's startup log.

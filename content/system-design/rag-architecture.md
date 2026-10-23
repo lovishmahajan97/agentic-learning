@@ -5,7 +5,7 @@ name: RAG architecture
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -63,6 +63,10 @@ over its wiki, tickets and HR policies. All figures are illustrative.
 
 Single lookups in option B take two model calls (3,000 then 4,000 input tokens), hence 7,000.
 
+- **C with a near-free router** (rules or a small classifier) averages the 8,340 in the table.
+- **C with escalate-after-try** runs single-shot first and escalates on a failed grounding check, so a
+  multi-hop question pays both paths (30,400): 0.85 × 5,400 + 0.15 × 30,400 = 9,150, still below B.
+
 ### Decision
 Choose **C on pgvector**, because:
 - **It meets the quality bar where A cannot:** 15% of real questions are multi-hop, and a single
@@ -73,9 +77,12 @@ Choose **C on pgvector**, because:
   EU region, the team knows it, and the ACL predicate sits in the same `WHERE` clause as the similarity
   order.
 
-**What would change it:** a multi-hop share above roughly 40% makes the router overhead not worth it
-(go agent-first, B); a corpus 10-100 times larger makes a dedicated vector database worth its operations
-cost; a corpus that shrinks to a few hundred stable pages makes long context with prompt caching simpler.
+**What would change it:**
+- **Multi-hop share.** With escalate-after-try routing, a multi-hop share p above about 23% erases C's
+  cost advantage (5,400 + 25,000p exceeds B's 7,000 + 18,000p), so one agent-first path (B) is simpler.
+  With a near-free classifier C stays cheaper, and B wins only if routing errors cost more than that.
+- **Corpus size.** A corpus 10-100 times larger makes a dedicated vector database worth its operations
+  cost; one that shrinks to a few hundred stable pages makes long context with prompt caching simpler.
 
 ### Trade-offs accepted
 - **Misrouted questions.** A multi-hop question sent down the single-shot path gets a partial answer.

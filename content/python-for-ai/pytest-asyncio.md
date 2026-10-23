@@ -179,8 +179,9 @@ async def test_cancelling_the_step_cancels_every_tool():
 
 ### Failure scenarios
 - **Inject: `time.sleep(0.05)` in `search`.** The cap test reports `peak == 1` even with a correct
-  semaphore, because the blocking call stops task switching. Debug: run with `python -X dev` and look for
-  the slow-callback warning; restore `await asyncio.sleep`.
+  semaphore, because the blocking call stops task switching. Debug: run with `python -X dev`; a 0.05 s
+  block is under the default 0.1 s `loop.slow_callback_duration`, so set it to 0.01 to see "Executing
+  <Task ...> took 0.05 seconds", then restore `await asyncio.sleep`.
 - **Inject: remove `@pytest.mark.asyncio` from one test.** Recent pytest fails it with "async def
   functions are not natively supported" instead of running it. Debug: read the failure text, then decide whether the suite
   should set `asyncio_mode` explicitly in config.

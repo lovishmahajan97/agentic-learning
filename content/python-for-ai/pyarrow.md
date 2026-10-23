@@ -5,7 +5,7 @@ name: pyarrow
 kind: tool
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -166,9 +166,11 @@ On the starter all 4 fail: the schema assertion (`list<item: double>`), then `No
 - **Inject dropping `existing_data_behavior`.** The rerun in `test_hive_partitions` raises because the
   directory is not empty. Note that `overwrite_or_ignore` replaces same-named files but keeps a partition
   you no longer write, so delete stale tenants explicitly.
-- **Inject a write with `model="embed-v2"` into the same root.** Old and new vectors now share a
-  dataset and similarity scores are meaningless. Read `dset.schema.metadata` in the loader, and write each
-  model version to its own root.
+- **Inject a write of one tenant with `model="embed-v2"` into the same root.** That tenant's
+  `part-0.parquet` is replaced while the others keep `embed-v1`, so similarity scores across them are
+  meaningless. `dset.schema.metadata` comes from a single file and can still say `embed-v1`; check
+  `physical_schema.metadata` on each fragment of `dset.get_fragments(filter=...)`, and write each model
+  version to its own root.
 - **Inject a read without `columns=`.** Results are identical, but the chunk text is decoded too. Compare
   `t.nbytes` with and without the projection on a 100,000-chunk table.
 

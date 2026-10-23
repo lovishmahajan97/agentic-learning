@@ -5,7 +5,7 @@ name: httpx
 kind: tool
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -71,7 +71,7 @@ async def call_tool(client: httpx.AsyncClient, name: str, args: dict,
     """POST /tools/<name>. Return the body text on 2xx. Never raise; return "ERROR: ..." text:
     - the whole call, retries included, gets deadline_s -> "ERROR: <name> took longer than <deadline_s>s"
     - retry 429 and 5xx up to max_attempts calls in total, sleeping Retry-After seconds when present
-      (else 0.1 * 2**attempt); after the last attempt -> "ERROR: <name> returned <status>"
+      (else 0.1 * 2**attempt, attempt counting from 1); after the last attempt -> "ERROR: <name> returned <status>"
     - other 4xx are not retried -> "ERROR: <name> returned <status>: <first 200 chars of body>"
     - network failures -> "ERROR: <name> unreachable (<exception class name>)" """
     raise NotImplementedError("YOUR CODE")
@@ -116,7 +116,7 @@ ERROR: get_invoices took longer than 1.0s
 step took under 1.5 s: True, calls: {'search_docs': 1, 'get_customer': 2, 'get_invoices': 1}
 ```
 The step costs the slowest call's deadline (1.0 s), not the sum, and the 429 was absorbed by one retry.
-`pytest -q test_executor.py` reports `6 passed`.
+`pytest -q test_executor.py` reports `7 passed`.
 
 ### Tests
 ```python
@@ -143,10 +143,10 @@ async def call(handler, **kw):
 
 
 def test_429_is_retried_after_retry_after():
-    handler, seen = scripted((429, {"Retry-After": "0.2"}), (200, {}))
+    handler, seen = scripted((429, {"Retry-After": "0.5"}), (200, {}))
     t0 = time.perf_counter()
     assert asyncio.run(call(handler)) == "ok" and len(seen) == 2
-    assert time.perf_counter() - t0 >= 0.2                         # honoured the header
+    assert time.perf_counter() - t0 >= 0.5                         # honoured the header
 
 
 def test_persistent_503_stops_at_max_attempts():
@@ -166,6 +166,14 @@ def test_hanging_tool_fails_at_its_deadline():
     t0 = time.perf_counter()
     out = asyncio.run(call(handler, deadline_s=0.3))
     assert out == "ERROR: search_docs took longer than 0.3s" and time.perf_counter() - t0 < 1.0
+
+
+def test_deadline_covers_retries():
+    handler, seen = scripted((503, {"Retry-After": "0.25"}))       # each attempt is fast
+    t0 = time.perf_counter()
+    out = asyncio.run(call(handler, deadline_s=0.3, max_attempts=3))
+    assert out == "ERROR: search_docs took longer than 0.3s"       # the sleeps count too
+    assert len(seen) == 2 and time.perf_counter() - t0 < 0.45
 
 
 def test_network_error_becomes_text():
@@ -190,16 +198,18 @@ def test_step_runs_calls_in_parallel():
   which takes about 0.9 s, the sum of three 0.3 s calls. Debug by timing the step; switch to
   `asyncio.gather` over the same client.
 - **Rely on the client's `read=10.0` instead of `asyncio.timeout`.** The hanging-tool test waits the
-  full 30 s and fails: `MockTransport` applies no httpx timeouts, and against a real server a trickling
+  full 30 s and fails (so does the retry-deadline test): `MockTransport` applies no httpx timeouts, and against a real server a trickling
   response never trips the read timeout either. Debug by logging elapsed time per call.
-- **Put the deadline around each attempt instead of the whole loop.** A tool that times out three times
-  burns three deadlines, so one agent step can exceed its budget threefold. Debug by counting attempts
-  inside a deadline failure.
-- **Ignore `Retry-After`.** The 429 test fails its 0.2 s timing assertion; against a real provider the
+- **Put the deadline around each attempt instead of the whole loop.** `test_deadline_covers_retries`
+  fails: three fast 503s with 0.25 s `Retry-After` sleeps take about 0.5 s and return `returned 503`
+  instead of stopping at 0.3 s. A tool that times out three times burns three deadlines, so one agent
+  step can exceed its budget threefold. Debug by counting attempts inside a deadline failure.
+- **Ignore `Retry-After`.** The 429 test fails its 0.5 s timing assertion (the fallback backoff sleeps
+  only 0.2 s); against a real provider the
   retry lands inside the rate-limit window and fails again.
 
 ### Submission
-- **`executor.py`** passing all six tests unmodified, with `make_client` unchanged.
+- **`executor.py`** passing all seven tests unmodified, with `make_client` unchanged.
 - **The `pytest -q` output** and the `python executor.py` output matching Expected output.
 - **A short log** from the demo showing per-call attempts and elapsed time.
 - **A note of 3-5 lines:** which calls you would refuse to retry automatically (non-idempotent tools) and

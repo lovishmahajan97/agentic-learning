@@ -5,7 +5,7 @@ name: DPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -154,8 +154,8 @@ flowchart TD
   and weights each pair by how wrong the current ranking is, so well-separated pairs contribute almost
   nothing. SFT on chosen alone learns nothing about the wrong tool choice.
 - **"No reward model means no KL leash."** The leash is inside the loss: reference log-probs appear in
-  every pair, and β sets how far the policy may move. At β = 0.1 reaching a 0.9 preference needs about 22
-  nats of drift; at β = 0.5, about 4.4.
+  every pair, and β sets how far the policy may move. At β = 0.1 reaching a 0.9 preference needs a
+  log-ratio margin (chosen minus rejected) of about 22 nats; at β = 0.5, about 4.4.
 - **"A growing margin means good responses are getting more likely."** The margin can grow while both
   log-probs fall, as long as rejected falls faster. Plot chosen log-prob beside the margin to catch
   likelihood displacement.

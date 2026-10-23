@@ -5,7 +5,7 @@ name: Few-shot prompting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -164,9 +164,9 @@ flowchart TD
 - **"Order and label mix do not matter if each example is correct."** Majority-label and recency bias
   are measured effects, and order alone can swing accuracy on the same set. Balance labels and choose the
   order by eval.
-- **"The instruction wins if it conflicts with an example."** The demonstrated pattern usually wins: an
-  instruction for one sentence loses to three paragraph-long examples. Every example must obey every
-  rule.
+- **"The instruction wins if it conflicts with an example."** The demonstrated pattern usually wins: "respond in
+  one sentence" with examples that answer in three usually gets three, by a margin that varies by model.
+  Every example must obey every rule.
 - **"Realistic example values make demonstrations better."** The model copies surface details, so a
   realistic order ID can leak into a real tool call. Use obvious placeholders such as `ORDER-EXAMPLE-1`
   and block calls that carry them.

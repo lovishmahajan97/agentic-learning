@@ -5,7 +5,7 @@ name: Multi-hop retrieval
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement

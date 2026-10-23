@@ -5,7 +5,7 @@ name: Continuous batching
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -140,9 +140,10 @@ flowchart TD
 ```
 
 ## Misconceptions
-- **"Continuous batching makes each request faster."** It raises aggregate throughput. A lone request
-  still decodes at the bandwidth floor, and in a busy batch each user's TPOT rises, because every step
-  reads more cache.
+- **"Continuous batching makes each request faster."** It raises aggregate throughput and cuts queue
+  wait, since newcomers join the next step instead of waiting for a batch to drain. It does not speed up
+  decode: a lone request still runs at the bandwidth floor, and in a busy batch each user's TPOT rises,
+  because every step reads more cache.
 - **"It is dynamic batching with a timeout, as in classic model servers."** Those still run a batch as
   one unit until its longest member finishes. Here membership changes every decode step: a finished
   sequence frees its slot and blocks at once and a waiting one joins the next step.

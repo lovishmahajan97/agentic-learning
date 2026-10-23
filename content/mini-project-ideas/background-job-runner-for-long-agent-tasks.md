@@ -5,7 +5,8 @@ name: Background job runner for long agent tasks
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - backend-fundamentals/background-jobs-durable-workers
@@ -36,6 +37,237 @@ minute-long runs.
   processing all run longer than an HTTP request should stay open.
 - **What you can skip.** Building a full workflow engine. The point is to understand what Temporal,
   Celery, arq or a managed queue do for you, by building the smallest version that works.
+
+## Lab
+### Task
+Harden a job runner for a research agent that writes a company brief and emails it. Fix the three gaps
+that crash recovery exposes: a stale worker can overwrite the new owner's checkpoint, a resumed job sends
+the email twice, and a job whose tool is down is retried forever.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** background jobs and durable workers, idempotency keys, and idempotent tool
+  execution; this lesson's state diagram and starter code.
+- **Runs offline:** an in-memory SQLite table, a fake `Clock` you advance by hand (so lease expiry and
+  backoff need no sleeping), and an `Outbox` that honours idempotency keys. A worker "dies" by raising
+  `SystemExit` after the email is sent but before the checkpoint.
+- **Needs:** Python 3.10+ with SQLite 3.35+ (for `RETURNING`) and `pip install pytest`; checked with
+  Python 3.12 and pytest 9.1.1.
+
+### Starter code
+```python
+# jobs_lab.py: fenced checkpoints, idempotent side effects and dead letters for agent jobs, offline
+import json, sqlite3, uuid
+
+SCHEMA = """CREATE TABLE jobs(
+  id TEXT PRIMARY KEY, status TEXT, payload TEXT, checkpoint TEXT, attempts INTEGER DEFAULT 0,
+  lease_until REAL DEFAULT 0, run_after REAL DEFAULT 0, cancel INTEGER DEFAULT 0,
+  result TEXT, error TEXT, created REAL)"""
+
+class LeaseLost(Exception):
+    """This worker's claim is stale: another worker owns the job now."""
+
+class Clock:
+    def __init__(self): self.t = 0.0
+    def __call__(self): return self.t
+
+class JobStore:
+    def __init__(self, clock, lease_s=30, max_attempts=3):
+        self.db = sqlite3.connect(":memory:", isolation_level=None)
+        self.db.execute(SCHEMA)
+        self.clock, self.lease_s, self.max_attempts = clock, lease_s, max_attempts
+
+    def submit(self, jid, payload):
+        self.db.execute("INSERT INTO jobs(id, status, payload, checkpoint, created) VALUES (?,?,?,?,?)",
+                        (jid, "queued", json.dumps(payload), "{}", self.clock()))
+        return jid
+
+    def claim(self):
+        now = self.clock()
+        return self.db.execute(
+            "UPDATE jobs SET status='running', attempts=attempts+1, lease_until=? WHERE id=("
+            " SELECT id FROM jobs WHERE (status='queued' AND run_after<=?) OR (status='running' AND lease_until<?)"
+            " ORDER BY created LIMIT 1) RETURNING id, payload, checkpoint, attempts",
+            (now + self.lease_s, now, now)).fetchone()
+
+    def _fenced(self, set_sql, args, jid, attempt):
+        # YOUR CODE 1: only the current claim may write. Add "AND attempts=?" with `attempt`, and
+        # raise LeaseLost(jid) when no row matched, so a stale worker cannot overwrite the new owner
+        self.db.execute(f"UPDATE jobs SET {set_sql} WHERE id=?", (*args, jid))
+
+    def checkpoint(self, jid, attempt, state):
+        self._fenced("checkpoint=?, lease_until=?", (json.dumps(state), self.clock() + self.lease_s), jid, attempt)
+        return bool(self.db.execute("SELECT cancel FROM jobs WHERE id=?", (jid,)).fetchone()[0])
+
+    def finish(self, jid, attempt, status, result=None, error=None):
+        self._fenced("status=?, result=?, error=?", (status, json.dumps(result), error), jid, attempt)
+
+    def retry_or_dead(self, jid, attempt, error):
+        # YOUR CODE 3: after max_attempts the job must end as "dead" with its error kept for a human
+        self._fenced("status='queued', run_after=?, error=?", (self.clock() + 2 ** attempt, error), jid, attempt)
+
+    def get(self, jid):
+        cols = ("status", "checkpoint", "attempts", "result", "error")
+        return dict(zip(cols, self.db.execute(f"SELECT {', '.join(cols)} FROM jobs WHERE id=?", (jid,)).fetchone()))
+
+class Outbox:
+    """A fake email API that honours idempotency keys, like most payment and messaging APIs."""
+    def __init__(self): self.sent = {}
+    def send(self, key, body): self.sent.setdefault(key, body)
+
+def work_once(store, steps):
+    job = store.claim()
+    if job is None:
+        return False
+    jid, payload, ckpt, attempt = job
+    state = json.loads(ckpt) or {"step": 0, "input": json.loads(payload), "notes": []}
+    try:
+        while state["step"] < len(steps):
+            # YOUR CODE 2: derive the key from the job id and step index, so a re-run reuses it
+            key = str(uuid.uuid4())
+            state = steps[state["step"]](state, key)
+            state["step"] += 1
+            if store.checkpoint(jid, attempt, state):
+                store.finish(jid, attempt, "cancelled", result=state); return True
+        store.finish(jid, attempt, "succeeded", result=state)
+    except LeaseLost:
+        pass                                   # a newer claim owns the job: stop without writing
+    except Exception as e:
+        store.retry_or_dead(jid, attempt, repr(e))
+    return True
+
+OUTBOX = Outbox()
+def research(s, key): s["notes"].append("research"); return s
+def draft(s, key): s["notes"].append("draft"); return s
+def send_brief(s, key): OUTBOX.send(key, f"brief for {s['input']['company']}"); s["notes"].append("sent"); return s
+def flaky_search(s, key): raise RuntimeError("search API down")
+STEPS = [research, draft, send_brief]
+
+def killed_after(step):
+    def run(s, key):
+        step(s, key)
+        raise SystemExit("worker killed after the side effect, before the checkpoint")
+    return run
+
+def main():
+    clock = Clock()
+    st = JobStore(clock)
+    st.submit("job1", {"company": "ACME"})
+    try:
+        work_once(st, [research, draft, killed_after(send_brief)])
+    except SystemExit:
+        pass
+    clock.t += 31                                              # the dead worker's lease expires
+    work_once(st, STEPS)
+    r = json.loads(st.get("job1")["result"])
+    print("job1:", st.get("job1")["status"], r["notes"], "| emails sent:", len(OUTBOX.sent))
+
+    st.submit("job2", {"company": "Globex"})
+    _, _, _, stale = st.claim()                                # worker A claims, then stalls
+    clock.t += 31
+    work_once(st, STEPS)                                       # worker B takes over and finishes
+    try:
+        st.checkpoint("job2", stale, {"step": 1, "notes": ["stale"]})
+        print("job2: stale write accepted")
+    except LeaseLost:
+        print("job2: stale write rejected")
+    print("job2:", st.get("job2")["status"], "attempts", st.get("job2")["attempts"])
+
+    st.submit("job3", {"company": "Initech"})
+    for _ in range(5):
+        work_once(st, [flaky_search])
+        clock.t += 100
+    j = st.get("job3")
+    print("job3:", j["status"], "after", j["attempts"], "attempts:", j["error"])
+
+if __name__ == "__main__":
+    main()
+```
+
+As given it prints `emails sent: 2`, `job2: stale write accepted` and `job3: queued after 5 attempts`:
+a duplicate email to the customer, a zombie overwrite and a retry loop with no end.
+
+### Expected output
+```
+job1: succeeded ['research', 'draft', 'sent'] | emails sent: 1
+job2: stale write rejected
+job2: succeeded attempts 2
+job3: dead after 3 attempts: RuntimeError('search API down')
+```
+
+Job 1 resumes at step index 2, the last checkpoint, so research and draft are not repeated; only the
+email step runs again, and its key `job1:2` matches the first attempt. Job 3 waits 2 s after attempt 1
+and 4 s after attempt 2, then is dead-lettered at attempt 3.
+
+### Tests
+```python
+# test_jobs_lab.py: run with `pytest -q`
+import json
+import pytest
+import jobs_lab as m
+
+@pytest.fixture
+def env():
+    clock = m.Clock()
+    return clock, m.JobStore(clock)
+
+def test_stale_worker_cannot_overwrite(env):
+    clock, st = env
+    st.submit("j", {"company": "Globex"})
+    _, _, _, stale = st.claim()
+    clock.t += 31
+    _, _, _, fresh = st.claim()
+    st.checkpoint("j", fresh, {"step": 1, "notes": ["fresh"]})
+    with pytest.raises(m.LeaseLost):
+        st.checkpoint("j", stale, {"step": 1, "notes": ["stale"]})
+    assert json.loads(st.get("j")["checkpoint"])["notes"] == ["fresh"]
+
+def test_resumed_side_effect_is_not_repeated(env):
+    clock, st = env
+    outbox = m.Outbox()
+    def send(s, key): outbox.send(key, "brief"); return s
+    st.submit("j", {"company": "ACME"})
+    with pytest.raises(SystemExit):
+        m.work_once(st, [m.research, m.draft, m.killed_after(send)])
+    clock.t += 31
+    m.work_once(st, [m.research, m.draft, send])
+    assert st.get("j")["status"] == "succeeded"
+    assert len(outbox.sent) == 1                       # same key on the re-run, so one email
+
+def test_always_failing_job_is_dead_lettered(env):
+    clock, st = env
+    st.submit("j", {"company": "Initech"})
+    runs = 0
+    while m.work_once(st, [m.flaky_search]) and runs < 10:
+        runs += 1
+        clock.t += 100                                 # past every backoff (2, 4 seconds)
+    j = st.get("j")
+    assert (j["status"], j["attempts"], runs) == ("dead", 3, 3)
+    assert "search API down" in j["error"]
+```
+
+All three fail on the starter. Checkpoints cannot prevent the duplicate email on their own: the crash
+lands between the side effect and the checkpoint, so only a stable idempotency key makes the re-run safe.
+
+### Failure scenarios
+- **Fence the checkpoint but not `finish`.** A zombie that wakes after its lease can still mark a job
+  `succeeded` with stale results. Debug by logging the claim's attempt number on every write and
+  alerting when a write's attempt is lower than the row's.
+- **Use a random key per run.** Customers report duplicate emails after deploys, because deploys kill
+  workers mid-step. Debug by counting outbox sends per job id and step; more than one means the key is
+  not stable.
+- **Set the lease shorter than the slowest step.** Healthy workers lose their jobs and every long step
+  runs twice. Debug by comparing p99 step duration with `lease_s`, and renew from a heartbeat.
+- **Drop the dead-letter branch.** Queue depth and token spend climb while nothing finishes. Debug with a
+  retries-per-job histogram and the oldest queued job age.
+
+### Submission
+- **Repo** with `jobs_lab.py` and the unchanged tests; `pytest -q` shows 3 passed.
+- **Program output** matching the expected block.
+- **A timeline** for job 1 (claim, two checkpoints, crash, lease expiry, re-claim, finish) with the
+  attempt number on each write.
+- **A short note** naming one real side effect in your agent (payment, ticket, email), the key you would
+  send with it, and how the receiving API deduplicates.
+- **Evaluated on** tests passing, every write fenced, keys derived from job and step, and `dead` jobs
+  keeping their error.
 
 ## Why it exists
 - **Agent runs outlive requests.** A 10-step research agent can take 5 minutes; proxies, browsers and

@@ -5,7 +5,7 @@ name: Lifespan (load model / client once)
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:

@@ -5,7 +5,7 @@ name: Webhook signature verification & replay protection
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -82,7 +82,8 @@ def verify(headers: dict, raw: bytes, secrets: list[str], now: float) -> str:
     "malformed headers"  (webhook-id, webhook-timestamp or webhook-signature missing or unparsable)
     "timestamp outside tolerance"  (|now - timestamp| > TOLERANCE_S)
     "bad signature"  (no "v1,<sig>" entry in the space-separated header matches ANY active secret)
-    Sign the raw bytes exactly as received and compare in constant time."""
+    Sign the raw bytes exactly as received and compare in constant time with hmac.compare_digest
+    (the tests check that it is called)."""
     msg_id, ts = headers["webhook-id"], headers["webhook-timestamp"]
     body = json.dumps(json.loads(raw)).encode()         # BUG: re-serialised, not the signed bytes
     expected = sign(secrets[0], msg_id, int(ts), body)  # BUG: only the first secret

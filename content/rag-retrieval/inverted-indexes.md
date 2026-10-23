@@ -5,7 +5,7 @@ name: Inverted indexes
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: background
 mastery: implement
@@ -167,9 +167,10 @@ flowchart TD
 - **"Deleting a document removes it from the index."** A delete sets a bit in the segment's live-docs
   bitset; postings and document-frequency statistics stay until a merge rewrites the segment, so size
   does not shrink and scores drift on high-churn indexes.
-- **"A new analyzer applies to the whole index at once."** Old segments keep tokens from the old rules,
-  so identical documents match differently by age. An analyzer change needs a full re-index behind an
-  alias.
+- **"A new analyzer applies to the whole index at once."** Analysis runs at write time, so documents
+  already indexed keep tokens from the old rules and identical documents would match differently by age
+  (Elasticsearch refuses to change an existing field's analyzer for this reason). An analyzer change
+  needs a full re-index behind an alias.
 
 ## Examples
 ### A tiny index by hand

@@ -5,7 +5,7 @@ name: Prompt templates
 kind: practice
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -167,18 +167,19 @@ flowchart TD
 - **"A prompt template is the model's chat template."** They are two layers. Yours turns variables into
   message content; the chat template (applied server-side, or by `apply_chat_template` when self-hosting)
   turns role-tagged messages into tokens with role markers.
-- **"Templating user text is safe because the engine escapes it."** It is safe only when the text is a
-  value. Feeding user text in as template source is template injection; a value can also contain your
-  closing delimiter, so escape or reject it.
+- **"Templating user text is safe because the engine escapes it."** The engine escapes nothing for
+  prompts; it inserts a value verbatim without re-parsing it, which is safe only while the text is a
+  value. Feeding user text in as template source is template injection, and a value can still contain
+  your closing delimiter, so escape or reject it yourself.
 - **"Any per-tenant or per-request setting can go in the static zone."** Each distinct static rendering
   is its own cache entry. Low-cardinality settings are fine; a per-request word limit took 10,000
   requests from 100 prefixes to 8,730 and best-case reuse from 99% to 13%.
 - **"Whitespace and formatting in a template do not matter."** Every byte of the prefix is a cache key;
   reformatting a template or leaking blank lines changes bytes on every request. Control whitespace and
   snapshot-test the output.
-- **"A missing variable will just render empty."** Without strict undefined handling it can render as
-  "None" or nothing, and the model politely answers the broken prompt. Validate with a schema and fail
-  at render time.
+- **"A missing variable is harmless: at worst it renders empty."** An empty slot or a literal "None"
+  is a broken prompt, and the model politely answers it instead of anything raising an error. Use
+  `StrictUndefined` and a schema so it fails at render time.
 - **"Re-rendering the agent's history each step is cleaner."** It invalidates the cache from the first
   changed byte onward. Render static and per-run zones once, then append the trajectory.
 

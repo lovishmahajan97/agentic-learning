@@ -5,7 +5,7 @@ name: HyDE (Hypothetical Document Embeddings)
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
@@ -142,7 +142,7 @@ flowchart TD
   the generator, or letting an agent's draft sit in the transcript as if it were fact, is how invented
   numbers get cited.
 - **"HyDE always improves recall."** Instruction-tuned embedders trained on query-passage pairs have
-  largely closed the shape gap, so the gain can be zero or negative while every search pays a generation.
+  substantially narrowed the shape gap, so the gain can be zero or negative while every search pays a generation.
   Try query and passage prefixes first, and measure recall@k with and without HyDE.
 - **"Any embedder will do for the hypothetical."** It must be embedded with the corpus encoder in passage
   mode, because the comparison is passage-to-passage in one space. A different encoder defeats the method.

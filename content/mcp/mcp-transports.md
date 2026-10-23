@@ -5,7 +5,8 @@ name: MCP transports (stdio, Streamable HTTP, legacy SSE)
 kind: decision
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - mcp/mcp-architecture
@@ -37,6 +38,71 @@ failure modes.
   address, `Origin` checks and auth in front of the endpoint.
 - **What you can skip.** Writing a custom transport. The spec allows them, but stdio and Streamable HTTP
   cover nearly every agent deployment.
+
+## Decision case
+### Scenario
+A platform team of two Python engineers must ship one MCP server for the company helpdesk in six weeks.
+It has two kinds of consumer. About 250 engineers use IDE agents on laptops. A hosted support-agent
+service runs 40 workers on Kubernetes and peaks at 30 tool calls per second. All figures here are
+illustrative planning numbers, not benchmarks.
+- **Security:** no long-lived helpdesk API tokens on laptops; users authenticate with company SSO (OAuth).
+- **Data residency:** ticket data stays in the EU cloud region; laptops see only what a tool returns.
+- **Platform:** the cluster load balancer is round-robin and the platform team will not enable sticky
+  sessions. The corporate proxy kills idle HTTP streams after 60 seconds.
+- **Reliability:** a rolling deploy must be able to remove any one of the replicas without failed calls.
+  Load tests suggest one replica handles about 20 calls per second.
+- **Compatibility:** 15% of hosted traffic (about 4.5 of the 30 calls per second) comes from a vendor host
+  that speaks 2025-06-18 Streamable HTTP and upgrades in about six months.
+- **Workload:** most tools answer in under a second; `export_report` takes up to 90 seconds.
+
+### Options
+| Option | How it works | Laptop tokens and residency | Round-robin LB and deploys | Legacy 2025-06-18 host | 90 s report vs 60 s proxy | Fit for 2 engineers in 6 weeks |
+|---|---|---|---|---|---|---|
+| A. stdio everywhere | Each IDE and each worker spawns the server as a subprocess | Fails: every laptop needs a helpdesk token and calls the API directly | No LB, but 40 subprocesses each hold service credentials | Not applicable | No proxy on the pipe | Simple, but breaks security |
+| B. Session-based Streamable HTTP | One endpoint with `Mcp-Session-Id`, sessions in replica memory | Passes with OAuth at a gateway | Fails: without sticky routing, later requests hit replicas that do not know the session; deploys drop sessions | Works natively | SSE stream dies at 60 s unless progress keeps it alive | Familiar, but needs a shared session store to survive the LB |
+| C. Stateless Streamable HTTP, JSON responses, job handle for reports | `stateless_http=True`, `json_response=True`, 3 replicas behind a gateway with OAuth and `Origin` checks; `export_report` returns a handle and a second tool polls it | Passes: tokens stay server-side, IDE agents connect by URL | Passes: any replica serves any request; 2 replicas give about 40 calls/s, above the 30 peak | Works: 2025-06-18 clients still initialize, they just get no session id | Passes: no call stays open near 60 s | Smallest change from the Examples code |
+| D. Legacy HTTP+SSE | GET stream plus POST endpoint (2024-11-05) | Passes with OAuth | Fails: long-lived streams pin clients to replicas | Not needed by this host | Fails: idle streams die at 60 s | Deprecated; not for new servers |
+
+### Decision
+Choose **C**, the only option that passes every hard constraint. Tokens and ticket data stay in the EU
+region behind the gateway. Stateless requests suit the round-robin load balancer.
+
+Capacity: 3 replicas at about 20 calls per second give about 60; with one out during a deploy, 2 give
+about 40, above the 30 peak. Python SDK 1.x in stateless mode still serves the 2025-06-18 vendor host.
+
+The 90-second export becomes `helpdesk_start_report` (returns a handle) plus `helpdesk_get_report`, so
+no request stays open near the 60-second proxy limit; polling every 10 seconds costs about 9 polls.
+A fails on laptop tokens alone; B needs sticky routing or a shared session store.
+
+**What would change it:**
+- Per-user OAuth tokens allowed on laptops make a stdio build for IDE agents attractive.
+- A tool that truly needs mid-call elicitation brings back B with a shared session store, or an SDK on
+  2026-07-28, where elicitation arrives as an `input_required` result.
+- The vendor host's share reaching zero lets you drop the handshake-era path.
+
+### Trade-offs accepted
+- **No server-initiated requests.** Stateless mode cannot send `elicitation/create` mid-call, so write
+  confirmations live in the host's approval gate. Watch: requests from product owners for in-tool prompts.
+- **Polling instead of streamed progress for reports.** Agents pay a few extra calls per report. Watch:
+  polls per report and report latency p95.
+- **Network hop for IDE agents.** Every call crosses the network instead of a local pipe. Watch: call
+  latency p95 by consumer, and complaints from IDE users.
+- **Retries can repeat writes.** A dropped request is re-sent with a new id. Watch: duplicate-write rate,
+  and require idempotency keys on every write tool.
+- **Dual-era code path for six months.** Watch: traffic share per protocol version, with an alert when the
+  legacy share stops falling.
+
+### Review rubric
+- Every hard constraint (tokens on laptops, residency, no sticky routing, one replica out, 60-second proxy,
+  legacy host) is named, and each option is marked pass or fail against it.
+- Capacity is recomputed from the stated numbers, including the deploy case with one replica out.
+- The long-running tool has an explicit design (job handle, progress or timeout change) tied to the proxy
+  limit.
+- The write-up says what the chosen transport cannot do (here: server-initiated requests) and where that
+  responsibility moved.
+- At least two concrete triggers say what would change the decision, such as token policy, LB policy,
+  legacy traffic share or SDK support for 2026-07-28.
+- Every trade-off has a metric someone will actually watch.
 
 ## Why it exists
 - **Local tools need zero network setup.** A subprocess over stdin and stdout needs no port, TLS or auth,

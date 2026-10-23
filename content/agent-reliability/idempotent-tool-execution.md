@@ -5,7 +5,8 @@ name: Idempotent tool execution
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -44,6 +45,184 @@ dedupe downstream or locally, and gate unkeyable effects behind approvals or an 
   model, and which tools sit behind an approval gate.
 - **What you can skip.** Chasing exactly-once delivery. Accept at-least-once execution and make the effect
   idempotent instead.
+
+## Lab
+### Task
+Make `create_ticket` retry-safe against a ticketing API with no idempotency header, the case the
+example's release-on-exception rule cannot cover. Claim a SQLite dedup row with an argument hash, write
+the key into the ticket as `external_ref`, and reconcile lost responses and stale `in_flight` rows by
+searching for it. Time box: 60-90 min.
+- **Prerequisites:** Tool calling; Durable execution & checkpointing; Conversation / execution
+  identifiers; the wrapper and worked trace in this lesson.
+- **Setup:** Python 3.10+ with SQLite 3.24 or newer (for `ON CONFLICT ... DO NOTHING`) and
+  `pip install pytest`. Checked with Python 3.13 (SQLite 3.53) and pytest 9.1. Save the starter as
+  `lab.py` and the tests as `test_lab.py`.
+- **No external service:** `TicketAPI` is a fake that can create a ticket and then lose the response;
+  time is passed in as `now` so the in-flight timeout is deterministic.
+
+### Starter code
+```python
+"""Lab: make create_ticket retry-safe when the ticket API has no idempotency key, only an
+external_ref field you can search by. Run: python lab.py"""
+import hashlib, json, sqlite3
+
+class KeyReuse(Exception): pass          # same key, different arguments: a bug, never a replay
+class InFlight(Exception): pass          # another worker may still be running it: retry later
+class Crash(Exception): pass
+
+class Dedup:
+    def __init__(self):
+        self.db = sqlite3.connect(":memory:", isolation_level=None)
+        self.db.execute("""create table tool_executions (key text primary key, args_hash text not null,
+                           status text not null, result text, started real not null)""")
+
+    def begin(self, key, args_hash, now):
+        """Claim the key with INSERT ... ON CONFLICT (key) DO NOTHING (status 'in_flight').
+        Return None if this call inserted the row, else the existing row as a dict
+        {"status", "result", "started"}. Raise KeyReuse if the stored args_hash differs."""
+        # YOUR CODE HERE
+        raise NotImplementedError
+
+    def finish(self, key, result):
+        self.db.execute("update tool_executions set status = 'done', result = ? where key = ?",
+                        (json.dumps(result), key))
+
+def args_hash(args: dict) -> str:
+    return hashlib.sha256(json.dumps(args, sort_keys=True).encode()).hexdigest()
+
+class TicketAPI:                         # no idempotency key; tickets carry an external_ref
+    def __init__(self):
+        self.tickets, self.lose_next_response = [], False
+    def create(self, title, external_ref):
+        self.tickets.append({"id": f"T-{len(self.tickets) + 1}", "title": title, "ref": external_ref})
+        if self.lose_next_response:      # created, but the caller never hears back
+            self.lose_next_response = False
+            raise TimeoutError("response lost")
+        return {"id": self.tickets[-1]["id"]}
+    def search(self, external_ref):
+        return next(({"id": t["id"]} for t in self.tickets if t["ref"] == external_ref), None)
+
+def create_ticket(store, api, args, key, now, timeout=30, crash_after_effect=False):
+    """1. row = store.begin(key, args_hash(args), now)
+    2. done -> {**result, "replayed": True}
+    3. in_flight and younger than timeout -> raise InFlight; older -> reconcile (step 5)
+    4. we own the key -> api.create(title, external_ref=key); if crash_after_effect, raise Crash
+       right after the effect (the row stays in_flight); on TimeoutError -> reconcile
+    5. reconcile: api.search(external_ref=key); found -> store it, return {**found, "reconciled": True};
+       not found -> create again with the same external_ref
+    Every successful path stores the result with store.finish(key, result)."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    store, api = Dedup(), TicketAPI()
+    fix = {"title": "Fix login"}
+    print("first call:   ", create_ticket(store, api, fix, "k1", now=0))
+    print("harness retry:", create_ticket(store, api, fix, "k1", now=1))
+    api.lose_next_response = True
+    print("lost response:", create_ticket(store, api, {"title": "Rotate keys"}, "k2", now=2))
+    try:
+        create_ticket(store, api, {"title": "Page on-call"}, "k3", now=3, crash_after_effect=True)
+    except Crash:
+        print("crash after effect: worker died, row left in_flight")
+    for now in (10, 60):
+        try:
+            print(f"resume at t={now}:", create_ticket(store, api, {"title": "Page on-call"}, "k3", now=now))
+        except InFlight:
+            print(f"resume at t={now}: in_flight, retry later")
+    try:
+        create_ticket(store, api, {"title": "Fix logout"}, "k1", now=70)
+    except KeyReuse:
+        print("same key, new args: KeyReuse")
+    print("tickets:", [t["id"] for t in api.tickets])
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+first call:    {'id': 'T-1'}
+harness retry: {'id': 'T-1', 'replayed': True}
+lost response: {'id': 'T-2', 'reconciled': True}
+crash after effect: worker died, row left in_flight
+resume at t=10: in_flight, retry later
+resume at t=60: {'id': 'T-3', 'reconciled': True}
+same key, new args: KeyReuse
+tickets: ['T-1', 'T-2', 'T-3']
+```
+
+- **Read it:** three logical calls (`k1`, `k2`, `k3`), three tickets, no duplicate. The `t=10` refusal is the bounded
+  wait: under the 30-second timeout the first worker may still be mid-call, so a search could miss a
+  ticket that is about to exist.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution
+passes all 5 (Python 3.13, pytest 9.1).
+
+```python
+import pytest
+from lab import Crash, Dedup, InFlight, KeyReuse, TicketAPI, args_hash, create_ticket
+
+FIX = {"title": "Fix login"}
+
+def test_begin_claims_once_and_rejects_changed_args():
+    d = Dedup()
+    assert d.begin("k", args_hash(FIX), now=0) is None
+    row = d.begin("k", args_hash(FIX), now=1)
+    assert row["status"] == "in_flight" and row["started"] == 0
+    with pytest.raises(KeyReuse):
+        d.begin("k", args_hash({"title": "other"}), now=2)
+
+def test_repeat_replays_the_first_result():
+    d, api = Dedup(), TicketAPI()
+    assert create_ticket(d, api, FIX, "k1", now=0) == {"id": "T-1"}
+    assert create_ticket(d, api, FIX, "k1", now=1) == {"id": "T-1", "replayed": True}
+    assert len(api.tickets) == 1
+
+def test_lost_response_is_reconciled_by_external_ref():
+    d, api = Dedup(), TicketAPI()
+    api.lose_next_response = True
+    assert create_ticket(d, api, FIX, "k2", now=0) == {"id": "T-1", "reconciled": True}
+    assert create_ticket(d, api, FIX, "k2", now=1) == {"id": "T-1", "replayed": True}
+    assert len(api.tickets) == 1
+
+def test_crash_between_effect_and_record():
+    d, api = Dedup(), TicketAPI()
+    with pytest.raises(Crash):
+        create_ticket(d, api, FIX, "k3", now=0, crash_after_effect=True)
+    with pytest.raises(InFlight):
+        create_ticket(d, api, FIX, "k3", now=10)                 # may still be running
+    assert create_ticket(d, api, FIX, "k3", now=60) == {"id": "T-1", "reconciled": True}
+    assert len(api.tickets) == 1
+
+def test_stale_row_with_no_ticket_creates_exactly_one():
+    d, api = Dedup(), TicketAPI()
+    d.begin("k4", args_hash(FIX), now=0)                         # claimed, then died before the call
+    assert create_ticket(d, api, FIX, "k4", now=60) == {"id": "T-1"}
+    assert api.tickets[0]["ref"] == "k4" and len(api.tickets) == 1
+```
+
+### Failure scenarios
+- **Release the row and re-create on `TimeoutError`** (the example's rule, without downstream dedup).
+  The lost-response line creates a second ticket for `k2` and the reconcile test fails on two tickets.
+  Search the API by `external_ref` and count tickets per key.
+- **Skip the argument-hash comparison in `begin`.** "Fix logout" comes back as `{'id': 'T-1',
+  'replayed': True}`: the intended ticket is never created and nobody is told. Log args-hash mismatches
+  on every key hit.
+- **Reconcile an `in_flight` row at once, ignoring its age.** The `t=10` line returns a result and the
+  `InFlight` test fails; with real concurrency a second worker searches before the first worker's create
+  lands, finds nothing and creates a duplicate. Alert on `in_flight` rows younger than the timeout that
+  were reconciled.
+
+### Submission
+- **`lab.py`** with `Dedup.begin` and `create_ticket` implemented; the fake API unchanged.
+- **A green run** of `pytest -q test_lab.py` (5 passed) and the output of `python lab.py`.
+- **A randomized trial** of your own: 100 runs that randomly lose responses and crash after the effect,
+  ending with exactly one ticket per key.
+- **A short note:** what this adapter should return to the model on `InFlight` so it does not issue a
+  reworded second `create_ticket`.
+- **Evaluated on:** one ticket per logical call on every path, replays flagged `replayed`, lookups
+  flagged `reconciled`, and a raised error on key reuse with new arguments.
 
 ## Why it exists
 - **A timeout is ambiguous.** `send_invoice(customer, amount)` times out after thirty seconds. Lost

@@ -5,7 +5,8 @@ name: sales and CRM agent (lead research, enrichment, email drafts)
 kind: practice
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - practice-use-cases/deep-research-agent
@@ -38,6 +39,62 @@ per rep hour without spam or wrong CRM data.
   task), a scoring step, a rep-facing approval inbox and traces per lead.
 - **What you can skip at first.** Fully autonomous sequences and send scheduling. Drafts in a queue are
   the right first slice.
+
+## Decision case
+### Scenario
+A B2B software company's lead agent has run in draft-only mode for a month. Marketing now wants faster
+first responses to inbound demo requests and asks for auto-send. All figures are illustrative and come
+from the pilot.
+- **Volume:** 3,000 inbound leads a month; 40% pass suppression and fit, so 1,200 drafts.
+- **Speed goal:** first response to an inbound demo request within 1 hour; today the median wait for rep
+  approval is 6 hours.
+- **Fact accuracy:** 98% of drafts have every referenced fact right, so 1,200 x 0.02 = 24 drafts a month
+  carry a wrong fact. Reps catch about 95% of those when reviewing.
+- **Brand limit:** at most 2 emails a month with a wrong fact may reach prospects.
+- **Rep time:** 25 reps at about 2 minutes per draft: 1,200 x 2 = 2,400 minutes = 40 hours, 1.6 hours
+  per rep a month.
+- **Consent:** only contacts who submitted the form and are not suppressed may be emailed without a rep.
+
+### Options
+| Option | How it works | First response | Wrong-fact emails a month | Fits? |
+|---|---|---|---|---|
+| Draft-only (today) | Rep approves every personalised draft | about 6 h median | 24 x 0.05 = 1.2 | no: speed |
+| Auto-send personalised | Agent sends its draft directly | minutes | 24 | no: brand |
+| Instant acknowledgement plus approved draft | A fixed template with no prospect facts and a booking link goes out within 5 minutes to consented, non-suppressed form fills; the personalised follow-up stays draft-and-approve | about 5 min | 1.2, the template states no facts | yes |
+
+### Decision
+**Auto-send only the fixed acknowledgement; keep every personalised email behind rep approval.** The
+risk sits in the invented or wrong facts, and the acknowledgement contains none, so automating it meets
+the 1-hour goal without adding wrong-fact emails. Personalised outreach stays at about 1.2 wrong-fact
+emails a month, under the limit of 2.
+- **Template is reviewed once by legal and brand,** not each send; changes go through the same review.
+- **Send is gated in code:** form-fill source, consent flag, suppression check and a per-domain cap,
+  checked again at send time.
+- **Kill switch:** marketing can stop acknowledgements without a deploy.
+
+**What would change it.**
+- **Fact accuracy rises:** at 99.9% across 1,200 drafts, auto-sent personalised emails would carry
+  about 1,200 x 0.001 = 1.2 wrong facts a month, inside the limit; start with one narrow segment.
+- **Volume doubles:** 2,400 drafts give 48 wrong-fact drafts and about 2.4 escaping rep review, over the
+  limit; improve the fact checker before scaling, and rep time grows to 80 hours.
+- **Consent rules tighten:** if a region requires prior opt-in even for replies, exclude it from
+  auto-send.
+
+### Trade-offs accepted
+- **Personalised follow-up still waits hours.** Track time from acknowledgement to the rep's send and the
+  share of leads who book from the template alone.
+- **Template replies feel generic.** Watch reply and booking rates on acknowledgements versus drafts.
+- **Rep time is unchanged at about 40 hours a month.** Measure edit distance and acceptance per rep to
+  see where drafts cost the most time.
+
+### Review rubric
+- **Risk located precisely:** the write-up says which part of the message carries the risk (facts,
+  tone, consent) and automates only what is free of it.
+- **Error arithmetic shown:** wrong facts per month with and without human review, from stated rates.
+- **Consent and suppression in code:** gates run before every automated send, not only at draft time.
+- **Speed goal measured:** first-response time is tracked against the target after launch.
+- **Reversible:** a kill switch and a template review process exist.
+- **Graduation criteria stated:** the accuracy and volume numbers that would allow more autonomy.
 
 ## Why it exists
 - **The user problem.** Reps spend much of their time researching accounts, updating CRM fields and

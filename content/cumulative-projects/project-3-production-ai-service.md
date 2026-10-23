@@ -5,7 +5,8 @@ name: "Project 3: production AI service"
 kind: practice
 difficulty: advanced
 est_minutes: 30
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -51,6 +52,61 @@ observable, tested in CI, cost-tracked per tenant, failing cleanly, and deployed
   failures return 503 versus 500, cost attribution, and the release gate.
 - **What you can skip.** Kubernetes and multi-region. One container on a managed platform with a health
   check and a database teaches every production concern here.
+
+## Decision case
+### Scenario
+A platform team is putting the Project 1 assistant (`/ask`) and the Project 2 agent (`/runs`) behind one
+service for three internal teams: a web UI, a Slack bot and a nightly batch job. All figures are
+illustrative planning numbers taken from traces, not benchmarks.
+- **Latency from traces:** `/ask` has p95 3 s. Agent runs have p50 8 s, mean 14 s, p95 45 s and p99
+  110 s; 3% of runs take longer than 60 s.
+- **Load:** agent runs peak at 2 per second, so by Little's law about 2 x 14 = 28 runs are in flight at
+  peak. A run costs about $0.04 in tokens.
+- **Constraints:** the corporate API gateway cuts every request at 60 s total, not on idle time, and
+  cannot be changed this quarter. The SLO is that 99% of accepted runs finish or fail with a clear status.
+  The team has 2 engineers, 3 weeks, PostgreSQL from M2 and no Kubernetes.
+
+### Options
+| Option | How it works | Runs that hit the 60 s cut | Client impact | Build effort |
+|---|---|---|---|---|
+| Synchronous for both | POST waits for the answer | 3%: 2 x 3,600 x 0.03 = 216 runs per peak hour, about $8.64 of tokens wasted | None for clients | Lowest; already built |
+| Synchronous with SSE streaming | Stream tokens as the run progresses | Still 3%: a total timeout ignores streaming | Faster first token | Low |
+| Job API for both | POST returns 202 and a run id; clients poll or get a webhook | 0% | Web UI pays a polling delay on 3 s answers | Medium: queue, workers, status endpoint |
+| Split by endpoint | `/ask` stays synchronous; `/runs` becomes a job API on a PostgreSQL table | 0% | Only agent clients change | Medium, in the database the team already runs |
+
+### Decision
+**Split by endpoint.** Both synchronous options break the SLO by design: 97% completion is below the 99%
+target, and the gateway, not the code, causes the 3% loss. Of the two job designs, the split keeps the web
+UI's 3 s answers synchronous, since a p95 of 3 s sits far inside the 60 s cut.
+- **Queue in PostgreSQL:** workers claim jobs with `SELECT ... FOR UPDATE SKIP LOCKED`, so no new broker
+  is needed in 3 weeks.
+- **Worker sizing:** 5 containers x 8 concurrent runs = 40 slots for 28 in flight at peak, 70%
+  utilisation, with room for one container to restart.
+
+**What would change it.**
+- **The gateway limit moves:** at a 300 s total timeout and a p99 of 110 s, synchronous calls for both
+  endpoints would be simpler and would meet the SLO.
+- **Volume grows about tenfold:** at 280 runs in flight, polling and row locking load the database;
+  move the queue to a dedicated broker then.
+
+### Trade-offs accepted
+- **Two API styles to document and test.** One error envelope and one run-status model cover both; a
+  contract test pins each.
+- **Polling adds latency for agent clients,** about half the poll interval on average. Track time from
+  run completion to the client's fetch.
+- **Jobs can be orphaned** if a worker dies mid-run. A lease timeout returns the job to the queue, and the
+  Project 2 idempotency keys stop a retried run from repeating a write.
+
+### Review rubric
+- **The binding constraint is found:** the write-up spots that a total gateway timeout, not code speed,
+  limits synchronous calls.
+- **Losses are computed:** failed runs per hour and wasted cost come from the latency distribution and
+  peak load.
+- **Capacity is sized with Little's law** or an equivalent, with headroom stated as a utilisation figure.
+- **Client impact is per consumer:** each of the three teams' integration changes is named.
+- **Failure handling is designed:** orphaned jobs, retries and duplicate writes have an answer.
+- **Reversal conditions are named,** such as the gateway limit or volume that would bring back a simpler
+  design or a dedicated broker.
 
 ## Why it exists
 - **Model calls fail differently from code.** Providers time out, rate-limit and return malformed output;

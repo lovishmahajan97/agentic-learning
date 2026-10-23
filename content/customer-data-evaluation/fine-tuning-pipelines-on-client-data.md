@@ -5,7 +5,7 @@ name: Fine-tuning pipelines on client data
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -74,8 +74,10 @@ Choose **C**, for step one only:
   contained the record.
 
 What would change it:
-- **Volume.** Below a few thousand conversations a day, the serving node costs more than prompting saves,
-  so A wins.
+- **Volume.** Below about 5,000 conversations a day ($100 ÷ $0.02), the serving node costs more than
+  prompting saves, so A wins.
+- **A smaller prompted model that holds the floor.** If it measures within 2 points at under $0.01 per
+  conversation and under 1 second, A meets the constraints with no pipeline to run; measure it first.
 - **A flat learning curve below the floor.** If the 25%, 50% and 100% points flatten under 88%, more
   traces will not help; keep the prompted step.
 - **An EU-hosted provider option that the agreement allows.** Then B is worth a cost comparison, accepting

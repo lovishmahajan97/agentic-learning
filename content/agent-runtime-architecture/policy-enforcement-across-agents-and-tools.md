@@ -5,7 +5,8 @@ name: Policy enforcement across agents & tools
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agent-runtime-architecture/approval-and-authorization-boundaries
@@ -39,6 +40,71 @@ agent's authority from its parent's.
   fails closed.
 - **What you can skip.** XACML itself and per-value information-flow tracking such as CaMeL. Coarse labels
   plus attenuation already stop read-then-exfiltrate; know the finer designs exist.
+
+## Decision case
+### Scenario
+An internal AI platform team hosts agents for 5 product teams. Tools are exposed by 14 tool servers and
+MCP servers written in Python, TypeScript and Go, and a supervisor agent spawns research sub-agents that
+read the public web. All figures are illustrative planning numbers.
+- **Load:** about 30 tool calls a second on average and 150 at peak; a long run makes up to 40 tool calls
+  in sequence.
+- **Latency budget:** policy may add at most 10 ms at p99 per tool call, so at most 40 × 10 ms = 0.4 s to
+  the longest run.
+- **Change speed:** security edits policy about weekly and needs a change live everywhere within 5
+  minutes, without redeploying any agent.
+- **Audit:** every decision must be reproducible later, which means logging it with the policy version.
+- **Team:** the platform team is 3 engineers; product teams will not adopt anything that needs per-language
+  policy code.
+
+### Options
+| Option | How it works | p99 added per call | Change in 5 min | Coverage and audit | Ops cost |
+|---|---|---|---|---|---|
+| Per-agent checks (today) | `if` statements in each agent and tool server | ~0 | no: redeploy every agent | drifts; no single log | hidden in every team |
+| Central remote PDP | every PEP calls one policy service over the network | a network hop each call; can exceed 10 ms across zones | yes | one log | one service, but on every hot path |
+| OPA sidecar per PEP | each tool server and the dispatcher query a local OPA; signed bundles pushed from the security repo | about a millisecond over localhost | yes: bundle polling of about a minute | decision logs carry the bundle revision | a sidecar per service |
+| Engine embedded per language | a policy library linked into each service | lowest | only if every service reloads policy safely | one corpus, three runtimes to keep in step | version skew across languages |
+
+### Decision
+**One policy corpus in the security repo, evaluated by an OPA sidecar next to every enforcement point,
+with a signed run context in a header and `attenuate` on every spawn.**
+- **Latency:** a localhost query stays well inside the 10 ms p99 budget, where a cross-zone hop to a
+  central service may not.
+- **Change speed:** signed bundles with about a minute of polling meet the 5-minute target with no agent
+  redeploy.
+- **Language-neutral:** the sidecar speaks HTTP, so Python, TypeScript and Go tool servers enforce the
+  same policy without porting it.
+- **Audit:** decision logs record the bundle revision, so "why was this allowed" is answerable.
+- **Fail mode:** deny on sidecar timeout, with an explicit fail-open list for read-only in-tenant actions,
+  and a cache of a few seconds keyed on policy version.
+- **Label merge at the join:** the supervisor unions each child's labels, so a web-reading sub-agent cannot
+  launder taint into an external send.
+
+**What would change it.**
+- **A single language and one service:** embed the engine and skip the sidecar.
+- **Decisions needing large live data** such as per-record sharing: keep the sidecar for rules and
+  add a policy information point rather than shipping the data in bundles.
+- **Policy edits several times a day:** add bundle activation alerts and a staged rollout per service.
+
+### Trade-offs accepted
+- **A sidecar on every service.** We template it in the deployment chart and alert on bundle activation
+  errors.
+- **Minutes of policy skew.** During a rollout two services may run different bundle revisions; decision
+  logs show the revision, and we chart revision spread.
+- **Fail closed means policy outages are agent outages.** We monitor PDP-unavailable denials and keep the
+  fail-open list short and reviewed.
+- **Sticky labels.** Once a run reads the web, every external send needs approval; we split research and
+  action into separate runs and track approvals triggered by inherited labels.
+
+### Review rubric
+- **Every path to a tool is listed:** dispatcher, tool servers, MCP servers and direct internal callers,
+  each with its enforcement point.
+- **Latency is budgeted end to end:** added p99 per call times calls per run, compared with a stated limit.
+- **Change propagation is measured:** how long a policy edit takes to be live everywhere, and how the
+  version is logged.
+- **Fail mode is chosen per action class,** not globally, with the fail-open list written down.
+- **Delegation and provenance are handled:** attenuation on spawn and label merge on receipt are both
+  shown.
+- **Flip conditions are named:** language count, data size or change rate that would change the choice.
 
 ## Why it exists
 - **One agent gets away with an `if` per tool; the second agent breaks it.** The orchestrator was told never

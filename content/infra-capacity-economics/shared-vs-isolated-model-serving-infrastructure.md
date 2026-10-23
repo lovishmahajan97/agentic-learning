@@ -5,7 +5,7 @@ name: Shared vs isolated model-serving infrastructure
 kind: decision
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -59,7 +59,7 @@ per-tenant metrics.
 |---|---|---|---|---|---|
 | A. Isolate everyone | Each team 1 replica + 1 spare (8 × 2 = 16), legal 2, eval ceil(100 / 48) = 3 | 21 | Met | Isolated | Met |
 | B. One shared pool, no exceptions | Daytime peak 120 + 30 = 150, so ceil(150 / 48) = 4, plus a spare | 5 | Broken | Fair only with caps; legal shares the batch | Met: 100 + 20 = 120 of 240 slots at night |
-| C. Shared pool with logical isolation, legal dedicated | 8 teams and evals share ceil(120 / 48) = 3 + 1 = 4 replicas behind per-tenant in-flight caps, evals tagged batch; legal gets 2 replicas on its own node pool | 6 | Met | Caps and fair-share admission at the gateway | Met: 100 + 20 = 120 of 192 slots at night |
+| C. Shared pool with logical isolation, legal dedicated | 8 teams and evals share ceil(120 / 48) = 3 + 1 = 4 replicas behind per-tenant in-flight caps and a tenant-salted prefix cache, evals tagged batch; legal gets 1 + 1 spare replicas on its own node pool | 6 | Met | Caps and fair-share admission at the gateway | Met: 100 + 20 = 120 of 192 slots at night |
 | D. As C plus a dedicated batch pool | Evals move to their own 3 replicas | 9 | Met | Best | Met |
 
 ### Decision
@@ -70,7 +70,7 @@ Choose **C**, because:
   peak-of-sum saving.
 - **The eval sweep fits the night trough:** 120 of 192 slots, so a separate batch pool would buy little
   while costing 3 replicas.
-- **Legal is an exception with a documented reason,** at level 4 rather than a separate cluster,
+- **Legal is an exception with a documented reason,** at level 4 (a dedicated node pool) rather than a level-5 separate cluster,
   because the rule names GPUs and nodes, not the control plane.
 
 **What would change it:**

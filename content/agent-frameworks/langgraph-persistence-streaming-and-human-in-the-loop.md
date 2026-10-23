@@ -5,7 +5,7 @@ name: LangGraph persistence, streaming and human-in-the-loop (checkpointers, int
 kind: tool
 difficulty: advanced
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

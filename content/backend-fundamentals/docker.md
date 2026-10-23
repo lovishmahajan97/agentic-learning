@@ -5,7 +5,7 @@ name: Docker
 kind: tool
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -113,7 +113,9 @@ if __name__ == "__main__":
     print("sandbox env passed in:", any(a in ("-e", "--env", "--env-file") for a in argv))
 ```
 
-As given, `lint` finds nothing in `BAD` and the sandbox has full network access.
+As given, `lint` finds nothing in `BAD` and the sandbox has full network access. `GOOD` is a lint
+fixture trimmed from the Examples Dockerfile, not a buildable file: building it for real also needs
+the `uv` binary copied in, a `useradd` for `app` and the venv on `PATH`, as in that example.
 
 ### Expected output
 ```

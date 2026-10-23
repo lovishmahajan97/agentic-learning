@@ -5,7 +5,7 @@ name: Tracing
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: typed
+status: typed-verified
 agent_relevance: core
 lesson_type: lab
 related:

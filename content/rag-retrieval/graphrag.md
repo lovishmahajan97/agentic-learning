@@ -5,7 +5,7 @@ name: GraphRAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
@@ -145,8 +145,8 @@ flowchart TD
   questions. Lookups answerable from one chunk do no better than hybrid search with reranking, so the
   indexing bill buys nothing there; route by question type.
 - **"The graph database and Leiden clustering are the expensive parts."** Both are cheap. The bill is LLM
-  extraction over every chunk plus element and community summaries, about 21 million LLM tokens for a
-  4-million-token corpus in the estimator below.
+  extraction over every chunk plus element and community summaries; extraction alone is about 21 million
+  LLM tokens for a 4-million-token corpus in the estimator below, before any summaries.
 - **"A global search is one cheap call."** It maps over every community report at the chosen level
   whatever the question, about 41 LLM calls for 40 reports, so cap it per run and fix its level.
 - **"Community reports are evidence you can cite."** They are paraphrases the indexing model wrote, and

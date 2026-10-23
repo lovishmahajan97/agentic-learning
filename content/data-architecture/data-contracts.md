@@ -5,7 +5,7 @@ name: Data contracts
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -64,7 +64,7 @@ Constraints (figures illustrative):
 | Option | How it works | Time to detect | Attribution | Producer effort | Semantic changes |
 |---|---|---|---|---|---|
 | **A. Consumer-side checks only** | AI team validates on ingestion and in tool wrappers | About an hour, after bad data is written | Late: AI team chases the producer | None | Missed unless the AI team guesses the rule |
-| **B. Producer contracts on the 3 high-risk crossings** | Registry `FORWARD` on the topic, quality suite and breaker on the CRM partition, response schema on the orders API; consumers validate the same contracts | At write or at registration, minutes | Correct: the producer's CI or gate fails | One sprint each | Caught when units and taxonomy versions are in the contract |
+| **B. Producer contracts on the 3 high-risk crossings** | Registry `FORWARD` on the topic, quality suite and breaker on each hourly ticket partition and the CRM partition, response schema on the orders API; consumers validate the same contracts | At write or at registration, minutes | Correct: the producer's CI or gate fails | One sprint each | Caught when units and taxonomy versions are in the contract |
 | **C. Company-wide contract programme** | Contracts for all 6 crossings and the wider warehouse | Minutes | Correct | Months, many teams | Caught |
 | **D. AI-team sign-off on every upstream change** | Producers wait for review | Before release | Correct | High ongoing cost | Depends on reviewers |
 

@@ -5,7 +5,7 @@ name: Jupyter
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -117,7 +117,7 @@ audit: cell 3 output contains a secret
 stale cells: [2]
 ```
 Cell 2 saved `1` from the old filter; a clean run gives `3`. The kernel may also print a warning on
-stderr. `pytest -q test_nbgate.py` reports `4 passed`.
+stderr. `pytest -q test_nbgate.py` reports `5 passed`.
 
 ### Tests
 ```python
@@ -155,6 +155,13 @@ def test_audit_flags_cells_that_never_ran():
     assert "1 code cell(s) never ran" in audit(nb)
 
 
+def test_new_execution_counts_alone_are_not_stale():
+    nb = clean_notebook()                                        # saved from a longer session
+    nb.cells[1].execution_count = 7
+    nb.cells[3].execution_count = nb.cells[3].outputs[0].execution_count = 8
+    assert stale_cells(nb) == []                                 # same values, different counts
+
+
 def test_stale_output_is_found_without_touching_the_original():
     nb = demo_notebook()
     before = copy.deepcopy(nb)
@@ -163,18 +170,20 @@ def test_stale_output_is_found_without_touching_the_original():
 ```
 
 ### Failure scenarios
-- **Execute `nb` itself instead of a deep copy.** The last test fails on `nb == before`, and in CI you
+- **Snapshot the saved outputs, then execute `nb` itself instead of a deep copy.** The last test fails
+  on `nb == before` (skip the snapshot and it fails earlier, finding no stale cells), and in CI you
   would overwrite the evidence you were checking. Debug by diffing the notebook before and after.
-- **Count empty code cells in the order check.** The clean notebook fails with a "never ran" message,
-  because empty cells never get a count. Debug by printing the counts list you built.
+- **Count empty code cells as cells that should have run.** The clean notebook fails with a "never
+  ran" message (or a `None` in the order message), because empty cells never get a count. Debug by printing the counts list you built.
 - **Compare raw output dicts instead of `output_text`.** A fresh `execute_result` carries a new
-  execution count, so cells with results look stale even when the value matches. Debug by printing one
+  execution count, so cells with results look stale even when the value matches:
+  `test_new_execution_counts_alone_are_not_stale` gets `[3]` instead of `[]`. Debug by printing one
   saved and one fresh output side by side.
 - **Point the kernel at another environment.** `NoSuchKernel` or a `ModuleNotFoundError` inside the
   run, the same interpreter mismatch as `!pip`. Debug with `jupyter kernelspec list`.
 
 ### Submission
-- **`nbgate.py`** passing the four tests unmodified.
+- **`nbgate.py`** passing the five tests unmodified.
 - **The `pytest -q` output** and the `python nbgate.py` output matching Expected output.
 - **A real notebook of yours** (an eval or trace analysis) run through both checks, with the problems found
   and how you fixed them.

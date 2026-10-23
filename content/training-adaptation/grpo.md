@@ -5,7 +5,7 @@ name: GRPO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -166,7 +166,7 @@ flowchart TD
 ## Misconceptions
 - **"GRPO is a new kind of RL objective."** It is PPO's clipped surrogate with the value model replaced
   by the group's reward mean and spread. With one gradient step per batch every ratio is 1 and it reduces
-  to REINFORCE with a group-mean baseline plus the KL term.
+  to REINFORCE with the group-normalised reward as the advantage, plus the KL term.
 - **"A verifiable reward cannot be hacked."** It cannot be flattered, but it can be gamed: hard-coded
   visible test outputs, empty reasoning tags, or a "done" tool call that leaves the state the checker does
   not inspect unchanged. Test the reward against known hacks and track an independent held-out verifier.

@@ -147,6 +147,7 @@ unknown finish reasons: {'pause_turn': 1}
 ### Tests
 Save as `test_lab.py` and run `python -m pytest -q`. On the starter four tests fail with
 `NotImplementedError`, and the checker test fails because no `assert_never` guards the router yet.
+Install mypy first: without it the checker test is skipped, not passed.
 
 ```python
 import json, pathlib, shutil, subprocess, sys

@@ -5,7 +5,7 @@ name: Request-scoped vs application-scoped resources
 kind: decision
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -62,17 +62,20 @@ figures below are illustrative planning numbers, not measurements.
 | Option | How it works | Privacy | DB connections at peak | Multi-turn and deploys |
 |---|---|---|---|---|
 | A. Stateful agent on `app.state`, sticky sessions | one agent per worker keeps `messages` on `self`; memory lives in the worker | fails: concurrent runs interleave at each `await` and share history | none | follow-ups on another worker, or after a deploy, lose all context |
-| B. Request-scoped session, one transaction per run | `yield` dependency opens a session; the transaction spans read, 4 steps and write | passes | 18 per worker needed, 15 per worker by default (`pool_size=5`, `max_overflow=10`): ceiling 15 ÷ 24 s = 0.625 runs/s per worker, 5 runs/s in total, below the 6 runs/s peak | memory in Postgres survives; queued runs fail after `pool_timeout` (30 s) |
+| B. Request-scoped session, one transaction per run | `yield` dependency opens a session; the transaction spans read, 4 steps and write | passes | 18 per worker needed, 15 per worker by default (`pool_size=5`, `max_overflow=10`): ceiling 15 ÷ 24 s = 0.625 runs/s per worker, 5 runs/s in total, below the 6 runs/s peak | memory in Postgres survives between turns; a run killed by a deploy rolls back all its steps; queued runs fail after `pool_timeout` (30 s) |
 | C. Stateless agent in lifespan, run state per request, checkpoints in Postgres | shared clients and agent definition built once; messages and budget created per run; a checkpoint row keyed by `thread_id`, written in short transactions | passes | about 6 short transactions × 5 ms = 30 ms per run, so 6 × 0.03 = 0.18 connections busy on average | any worker resumes any thread; a run cut by a deploy resumes from its last step |
 | D. Like C, memory in Redis | same scoping; checkpoints in Redis | passes | Postgres only for profile and reply | works, but adds a datastore the constraints rule out |
 
 ### Decision
 Choose **C**.
-- **Privacy:** it is the only option that meets privacy and uses only Postgres, because run state never
-  lives on a shared object and memory is keyed by `thread_id`.
-- **Database:** connection use stops scaling with LLM latency. B needs 144 connections at peak (18 per
-  worker × 8); raising the pool to 20 per worker fits the 200 budget at 160, but leaves no headroom for
-  slower models or a third pod.
+- **Privacy:** B and C are the only options that meet privacy with Postgres alone (A shares history,
+  D adds a datastore), because run state never lives on a shared object and memory is keyed by
+  `thread_id`.
+- **Database:** C's connection use stops scaling with LLM latency. B needs 144 connections at peak (18
+  per worker × 8); raising the pool to 20 per worker fits the 200 budget at 160, but leaves no headroom
+  for slower models or a third pod.
+- **Deploys:** a daily rolling deploy that kills a B run rolls back all of its steps; C resumes the
+  run from its last checkpoint.
 - **Delivery:** it fits the team: SQLAlchemy sessions they know, plus a checkpoint table.
 - **What would change it:** a Redis cluster already run by the platform team (choose D for lower
   checkpoint latency), or a single-worker internal tool with no follow-ups (a request-scoped B is

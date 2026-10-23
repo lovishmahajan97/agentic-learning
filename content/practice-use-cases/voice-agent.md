@@ -5,7 +5,8 @@ name: voice agent (speech in, tools, speech out, latency budget)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - multimodal/speech-to-text
@@ -39,6 +40,71 @@ without a queue.
   text-to-speech, often orchestrated by Pipecat or LiveKit Agents.
 - **What you can skip.** Training speech models. Use hosted or open STT and TTS and spend your effort on
   the turn loop, tools and evals.
+
+## Decision case
+### Scenario
+A group of 12 outpatient clinics in the EU wants a phone agent for booking, rescheduling and cancelling
+appointments, with transfer to reception for anything else. All figures are illustrative planning
+numbers, not vendor quotes.
+- **Volume:** about 3,000 calls a month at 3 minutes each, so 9,000 call minutes, with a Monday-morning
+  peak of about 20 concurrent calls.
+- **Latency:** p95 voice-to-voice under 1.8 s, the target from the examples.
+- **Data:** callers give names, dates of birth and symptoms. Transcripts must be redacted before storage,
+  audio and text must stay in the EU, and every vendor must sign the clinics' data processing terms.
+- **Accuracy:** under 5% word error rate on names and dates, with read-back before any booking.
+- **Team and time:** two Python backend engineers with no speech experience; pilot at 2 clinics in 8
+  weeks.
+- **Budget:** a ceiling of $0.20 per call minute all-in, so 9,000 x $0.20 = $1,800 a month.
+
+### Options
+| Option | How it works | Latency | Redaction and residency | Team fit | Cost shape |
+|---|---|---|---|---|---|
+| A. Cascaded, hosted streaming STT, LLM and TTS | Pipecat or LiveKit Agents wiring three in-region vendors | planned p50 about 1.15 s (see below); p95 must be measured | text in the middle: redact before storage, log every turn | good: Python orchestration, swappable vendors | sum of three per-minute prices plus telephony |
+| B. Speech-to-speech realtime model | One model takes and returns audio, with tool calls | often lower, fewer hops | depends on one vendor's region, terms and transcript output; check current docs | good: simplest pipeline | per audio minute or token |
+| C. Cascaded, self-hosted open STT and TTS on own GPUs | Same pipeline, models run in the clinics' cloud account | depends on GPU sizing and warm capacity | full control | poor: needs GPU operations and speech tuning | fixed GPU cost even at night |
+
+The latency plan for A picks a point in the lower half of each stage range above: 300 ms endpointing + 150 STT + 300 LLM
+first token + 150 first sentence + 150 TTS first audio + 100 network = 1,150 ms.
+
+### Decision
+**Option A, cascaded with hosted in-region vendors.** The data constraints decide it: redaction before
+storage and a full text audit trail need text between stages, and A lets the team pick each vendor for
+EU hosting and signed terms.
+
+C fails the team-skills and 8-week constraints. B could be faster, but its compliance depends on a
+single vendor meeting every term at once.
+- **Latency headroom:** the 1,150 ms plan leaves 650 ms under the 1.8 s p95 target for tail stages;
+  the pilot must confirm it with per-stage timestamps.
+- **Cost check:** the team prices the three vendors plus telephony per minute before signing, against
+  the $0.20 ceiling.
+
+**What would change it.** If a realtime vendor offers EU hosting, signed terms, text transcripts and tool
+calls, run B against the same replay suite and switch if task success matches and p95 is lower.
+
+If measured p95 stays above 1.8 s after tuning, test B for the conversational turns. If volume grows to
+steady high concurrency and the team hires speech engineers, re-cost C.
+
+### Trade-offs accepted
+- **Less natural turn-taking than speech-to-speech.** Watch barge-in correctness (target 95%) and
+  callers who hang up in the first 30 seconds.
+- **Three vendors, three failure points.** Keep a backup STT and TTS and a fixed apology plus transfer;
+  watch per-stage timeout rates per day.
+- **Short endpointing cuts off slow speakers.** At 300 ms, callers who pause while reading a date get
+  interrupted. Watch interruptions per call, and use a turn-detection model on date and number questions.
+- **Cost can creep.** Longer calls or a premium voice push past the ceiling; chart cost per call minute
+  weekly.
+
+### Review rubric
+- **Latency budget summed:** the write-up adds per-stage budgets and compares the total with the p95
+  target, stating the headroom.
+- **Compliance mapped to architecture:** each data rule is tied to a property (where text exists, where
+  data lives, who signs terms).
+- **Team and deadline used to cut options:** at least one option is rejected on skills or time, with the
+  reason.
+- **Pilot can overturn it:** a replay suite, p95 latency and task success are named as the evidence that
+  would switch the choice.
+- **Fallback designed:** vendor timeout handling and human transfer are specified.
+- **Cost computed from volume:** monthly cost follows from call minutes and the per-minute ceiling.
 
 ## Why it exists
 - **Phone queues are expensive and slow.** Many calls are routine (opening hours, booking changes, order

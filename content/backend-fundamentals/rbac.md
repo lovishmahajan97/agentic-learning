@@ -5,7 +5,7 @@ name: RBAC
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -166,8 +166,10 @@ def test_alice_keeps_her_legitimate_access():
     assert call_tool("support", "alice", "edit_doc", {"doc_id": 101, "project": "project:42"})["ok"]
 ```
 
-Five fail on the starter with `AssertionError`. Two pass already and are guards: the allowlist test
-passes only because the draft never walks up to root's org-level admin, so it fails the moment you fix
+Five fail on the starter with `AssertionError` (the deny test fails on its `documents:write` line,
+because the draft never inherits root's org-level admin; its deny line bites once inheritance works).
+
+Two pass already and are guards: the allowlist test passes only because the draft never walks up to root's org-level admin, so it fails the moment you fix
 inheritance without adding the allowlist, and Alice's own edit must stay allowed.
 
 ### Failure scenarios

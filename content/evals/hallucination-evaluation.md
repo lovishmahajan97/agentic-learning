@@ -5,7 +5,7 @@ name: Hallucination evaluation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: evaluate
@@ -167,8 +167,8 @@ flowchart TD
   support by the trace, not truth in the world. A true fact absent from the tool results still counts as
   unsupported, and a stale KB passage makes a false claim look supported.
 - **"High claim precision means few users see wrong answers."** Precision is per claim, exposure is per
-  response. At 98% precision and about 10 claims per answer, roughly 18% of answers can contain an error,
-  so report the response-level rate next to it.
+  response. At 98% precision and about 10 claims per answer, if errors fall independently,
+  1 − 0.98^10 ≈ 18% of answers contain one, so report the response-level rate next to it.
 - **"An LLM judge can verify action claims like 'I issued the refund'."** A judge reading text can only
   guess. Whether a call succeeded is a fact in the tool-call log, so action claims are checked
   deterministically against successful calls, on all traffic.

@@ -161,7 +161,7 @@ flowchart TD
   The signal came from running code, not rereading it.
 - **"A review step is cheap insurance on every task."** An always-on LLM critic adds at least one call even
   when the first attempt was right: at a 90% one-shot pass rate it costs about +120% calls versus about
-  +20% for a gated loop that reflects only on failures.
+  +20% for a loop gated on a deterministic check that reflects only on failures.
 - **"A free-text verdict like 'looks good overall' is enough."** It cannot drive the revise step or a
   stopping rule. Make the critic return a pass flag and a structured list of issues.
 

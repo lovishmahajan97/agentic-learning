@@ -5,7 +5,7 @@ name: Scalability
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -57,7 +57,7 @@ up from 0.5 today. Limits are illustrative, not quotes.
 |---|---|---|---|---|
 | A. More workers plus a quota request | Scale the stateless tier, wait for a raise to 6M TPM | 0.69 tasks/s until approved; 100,000 ÷ 48,000 ≈ 2.08 after | 216% before, 72% after | Approval is outside the team's control |
 | B. Two regions, same prompts | Hash each run id to one region | 66,667 ÷ 48,000 ≈ 1.39 tasks/s | 108%: fails | Low, but not enough |
-| C. Trim tool results to ~5,000 tokens per call, plus two regions | 30,000 tokens per task across two 2M TPM pools | 66,667 ÷ 30,000 ≈ 2.22 tasks/s | 68% | Medium: needs an eval pass |
+| C. Trim tool results so each call is ~5,000 tokens, plus two regions | 30,000 tokens per task across two 2M TPM pools | 66,667 ÷ 30,000 ≈ 2.22 tasks/s | 68% | Medium: needs an eval pass |
 | D. Second provider for overflow | Route overflow runs to another vendor's model | Adds a separate quota | Depends on its quota | High: new prompts, evals, residency review |
 
 ### Decision

@@ -5,7 +5,8 @@ name: LLM-as-judge eval harness for a small agent
 kind: practice
 difficulty: core
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - evals/llm-as-a-judge
@@ -34,6 +35,132 @@ plus a calibrated LLM judge, and gates changes in CI. It proves you can measure 
 - **Why it matters for agents.** Agents change with every prompt, tool description and model swap; without a harness,
   each change is a guess and regressions ship silently.
 - **What you can skip.** A hosted eval platform. A JSONL file, a script and a CI job are enough.
+
+## Lab
+### Task
+Build the trust layer of the harness: a verdict parser that survives messy judge output, Cohen's kappa
+against human labels, pairwise judging that cancels position bias by swapping order, and the CI gate that
+blocks a pass-rate drop beyond a margin. Time box: 45-60 min.
+- **Prerequisites:** LLM-as-a-judge; Judge calibration and bias; Inter-annotator agreement; Regression tests.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.12, pytest 9.1). Save the starter
+  as `lab.py` and the tests as `test_lab.py`.
+- **No judge model:** two fake judges stand in. `first_slot_judge` always prefers whichever answer it sees
+  first (pure position bias); `fact_judge` prefers the answer that states the reference fact.
+
+### Starter code
+```python
+"""Lab: verdict parsing, kappa, position-swapped pairwise judging and a CI gate. Run: python lab.py"""
+import json
+import re
+from collections import Counter
+
+def parse_verdict(raw: str) -> dict:
+    # YOUR CODE HERE: judges sometimes wrap JSON in markdown code fences or add a sentence before it.
+    # Take the first {...} object in raw, json.loads it, and require "correct" and "grounded" to be
+    # "pass" or "fail"; otherwise raise ValueError(f"bad verdict: {raw[:80]}")
+    raise NotImplementedError
+
+def cohen_kappa(a: list[str], b: list[str]) -> float:
+    # YOUR CODE HERE: (observed - expected) / (1 - expected), where expected agreement comes from
+    # each rater's label frequencies; return 1.0 when expected == 1
+    raise NotImplementedError
+
+def pairwise(question: str, answer_1: str, answer_2: str, judge) -> str:
+    """judge(question, first, second) returns "first" or "second". Ask twice with the order
+    swapped. Return "1" or "2" only if both orders agree on the same answer, else "tie"."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def gate(baseline: list[bool], candidate: list[bool], margin: float = 0.05) -> bool:
+    # YOUR CODE HERE: True (merge allowed) unless the candidate pass rate is more than `margin`
+    # below the baseline pass rate
+    raise NotImplementedError
+
+FENCE = "`" * 3                                         # a markdown code fence
+
+def first_slot_judge(question, first, second):          # a judge with pure position bias
+    return "first"
+
+def fact_judge(question, first, second):                # prefers the answer stating the fact
+    return "first" if "30 days" in first else "second"
+
+if __name__ == "__main__":
+    print(parse_verdict(f'Sure! {FENCE}json\n{{"reasoning": "matches", "correct": "pass", "grounded": "fail"}}\n{FENCE}'))
+    human = ["pass", "pass", "fail", "pass", "fail", "pass", "fail", "pass"]
+    judge_labels = ["pass", "pass", "fail", "pass", "pass", "pass", "fail", "pass"]
+    print(f"kappa={cohen_kappa(human, judge_labels):.2f}")
+    long_wrong = "Refunds are possible in many cases, depending on several policy factors. " * 3
+    short_right = "You can return items within 30 days."
+    print(pairwise("Refund window?", long_wrong, short_right, first_slot_judge),
+          pairwise("Refund window?", long_wrong, short_right, fact_judge))
+    base = [True] * 36 + [False] * 14                      # 72% on 50 cases
+    print(gate(base, [True] * 35 + [False] * 15), gate(base, [True] * 32 + [False] * 18))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly the lines below. The biased judge produces a tie
+once the order is swapped, and the gate allows 72% to 70% but blocks 72% to 64%.
+
+```
+{'reasoning': 'matches', 'correct': 'pass', 'grounded': 'fail'}
+kappa=0.71
+tie 2
+True False
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 4 fail with `NotImplementedError`; a correct solution passes
+all 4.
+
+```python
+import pytest
+from lab import FENCE, cohen_kappa, fact_judge, first_slot_judge, gate, pairwise, parse_verdict
+
+def test_parse_verdict_handles_fences_and_rejects_junk():
+    v = parse_verdict(f'{FENCE}json\n{{"reasoning": "ok", "correct": "pass", "grounded": "pass"}}\n{FENCE}')
+    assert v["correct"] == "pass" and v["grounded"] == "pass"
+    assert parse_verdict('Verdict: {"correct": "fail", "grounded": "pass"}')["correct"] == "fail"
+    for bad in ['{"correct": "yes", "grounded": "pass"}', "I think it passes.", '{"correct": "pass"}']:
+        with pytest.raises(ValueError):
+            parse_verdict(bad)
+
+def test_kappa_matches_hand_computation():
+    human = ["pass", "pass", "fail", "pass", "fail", "pass", "fail", "pass"]
+    judge = ["pass", "pass", "fail", "pass", "pass", "pass", "fail", "pass"]
+    assert cohen_kappa(human, judge) == pytest.approx(0.7143, abs=1e-4)   # (0.875 - 0.5625) / 0.4375
+    assert cohen_kappa(["pass"] * 4, ["pass"] * 4) == 1.0
+    assert cohen_kappa(["pass", "fail"] * 2, ["fail", "pass"] * 2) == pytest.approx(-1.0)
+
+def test_pairwise_cancels_position_bias():
+    assert pairwise("q", "a", "b", first_slot_judge) == "tie"
+    assert pairwise("q", "about 30 days", "no idea", fact_judge) == "1"
+    assert pairwise("q", "no idea", "about 30 days", fact_judge) == "2"
+
+def test_gate_blocks_drops_beyond_margin():
+    base = [True] * 36 + [False] * 14                     # 0.72
+    assert gate(base, [True] * 34 + [False] * 16)         # 0.68: drop of 0.04, allowed
+    assert not gate(base, [True] * 33 + [False] * 17)     # 0.66: drop of 0.06, blocked
+    assert gate(base, [True] * 40 + [False] * 10)         # improvements always pass
+```
+
+### Failure scenarios
+- **Ask the pairwise judge once.** `first_slot_judge` then reports a clear win for whichever version you
+  list first, and the bias test fails. Log both orderings per case and count how often they disagree; that
+  rate is your judge's position bias.
+- **Parse with `json.loads(raw)` directly.** The fenced verdict raises `JSONDecodeError` and one malformed
+  reply crashes the whole run. Store every raw verdict, and count parse failures as their own metric.
+- **Accept any truthy label** (`"yes"`, `"PASS"`, `"partially"`). Pass rates drift with judge phrasing.
+  The junk test fails; validate against the exact two labels and re-prompt or drop the case.
+- **Report agreement instead of kappa.** With 90% pass labels, a judge that always says pass agrees 90% of
+  the time and has kappa 0. Print both numbers next to each other on the calibration set.
+
+### Submission
+- **`lab.py`** with the four functions done and both fake judges unchanged.
+- **A green test run** (4 passed) and the output of `python lab.py`.
+- **A calibration table** from your own agent: 30 runs, your labels, the judge's labels, agreement and kappa.
+- **A CI log** showing the gate failing on a deliberately broken prompt.
+- **Evaluated on:** tests passing, both orders asked in pairwise mode, and kappa reported beside every
+  judge score.
 
 ## Why it exists
 - **Agents fail in ways exact-match cannot see.** A correct answer can be phrased many ways, and a correct answer

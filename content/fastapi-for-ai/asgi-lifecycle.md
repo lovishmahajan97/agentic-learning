@@ -5,7 +5,7 @@ name: ASGI lifecycle
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -109,6 +109,7 @@ async def http_call(app, chunks: list[bytes], disconnect_after: int | None = Non
     pending = [{"type": "http.request", "body": c, "more_body": i < len(chunks) - 1}
                for i, c in enumerate(chunks)]
     async def receive():
+        await asyncio.sleep(0)                      # a real server yields here too
         if pending: return pending.pop(0)
         await gone.wait()
         return {"type": "http.disconnect"}
@@ -192,8 +193,9 @@ def test_disconnect_stops_the_agent_loop():
   pass, but `len(asyncio.all_tasks())` printed after each `http_call` in the demo grows by one per run;
   under Uvicorn each finished run leaves a task parked on `receive()`. Debug: print the task count and
   `asyncio.all_tasks()` after every call.
-- **Read the body inside the watcher too.** Start the watcher before the body loop. Observe: chunks are
-  stolen, so the JSON is truncated or the call hangs. Debug: log each `receive()` result with the caller
+- **Read the body inside the watcher too.** Start the watcher before the body loop. Observe: the watcher
+  takes a body chunk, the body loop waits forever, and the split-body test fails with `TimeoutError`
+  after 5 s. Debug: log each `receive()` result with the caller
   that took it; a message is delivered only once.
 
 ### Submission

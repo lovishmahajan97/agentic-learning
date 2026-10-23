@@ -5,7 +5,7 @@ name: AI / solution architecture
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -61,7 +61,7 @@ Each step takes about 0.5 s of prefill, decodes at about 50 tokens/s and spends 
 ### Options
 | Option | How it works | Budget | Latency | Data and risk | Team and deadline |
 |---|---|---|---|---|---|
-| **A. Hardened prototype** | one frontier call with account data pasted in, about 12,000 in and 800 out | 4,500 × 0.076 ≈ 342 a day: fails | one call ≈ 17 s, no progress until it ends | no retrieval ACL, no approval gate: fails | fastest |
+| **A. Hardened prototype** | one frontier call with account data pasted in, about 12,000 in and 800 out | 4,500 × 0.076 ≈ 342 a day: fails | one call ≈ 0.5 + 800 ÷ 50 ≈ 17 s; streaming the memo would show progress | no retrieval ACL, no approval gate: fails | fastest |
 | **B. Six layers as modules in one service** | agent loop, open-source gateway, ACL-aware retrieval, control layer with approval on the CRM tool, traces and a golden set | 4,500 × 0.016 = 72 a day on the mid tier | 5 × (0.5 + 6 + 0.4) ≈ 34.5 s, progress streamed per step | filters at retrieval, gate on writes | fits ten weeks |
 | **C. One service per layer plus a managed agent runtime** | same layers as B, deployed separately, loop hosted by a vendor | same tokens as B, plus runtime fees | B plus a network hop per step | depends on the vendor's EU region and trace export | the most to build and run |
 

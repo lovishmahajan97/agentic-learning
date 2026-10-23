@@ -5,7 +5,7 @@ name: Inference clusters
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -47,9 +47,11 @@ bursty) is exactly what breaks round-robin and CPU autoscaling.
 A fintech self-hosts a 70B planner model for its customer-support agent because transcripts may not
 leave its cloud account. All figures are illustrative, from the team's own load tests.
 - **Demand:** peak 6,000 output tok/s from about 200 concurrent agent runs of 8 steps each; a nightly
-  eval sweep replays 5,000 recorded runs against the same model.
+  eval sweep replays 5,000 recorded runs against the same model. Each run shares a 6k-token system
+  prompt (cached on every replica) and adds ~1k session tokens per step.
 - **Replica shape:** a TP=2 replica sustains ~1,500 tok/s within the latency budget; the reserved GPU
-  capacity comes only as 8-GPU nodes, so one node hosts 4 replicas.
+  capacity comes only as 8-GPU nodes, so one node hosts 4 replicas. House policy is 30% headroom over
+  peak (7,800 tok/s), which must still hold after a failure.
 - **Constraints:** TTFT p95 under 2 s for live sessions; survive the loss of one node with no budget
   breach; at most 24 GPUs (3 nodes); a team of three who run Kubernetes well but have not operated LLM
   serving; first production traffic in 6 weeks.

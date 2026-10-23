@@ -5,7 +5,7 @@ name: ReAct (reason + act)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -150,8 +150,8 @@ sequenceDiagram
 - **"A tool exception should end the run."** Returned as an error-flagged observation, it lets the model
   retry differently; swallowed or fatal, the agent loses its main recovery path.
 - **"Each step costs about the same."** Every call re-sends the whole trajectory, so total input grows
-  quadratically with steps, and one untruncated 10,000-token observation makes an 8-step run about 7×
-  more expensive.
+  quadratically with steps: a tool returning raw 10,000-token observations instead of 1,000-token ones
+  takes an 8-step run from about 40,600 to 292,600 input tokens, about 7× more.
 - **"Observations are just data, so they are safe."** A fetched page can contain text addressed to the
   agent. Treat results as untrusted and gate consequential actions with permissions outside the model.
 

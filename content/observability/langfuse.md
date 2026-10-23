@@ -5,7 +5,7 @@ name: Langfuse
 kind: tool
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -151,6 +151,7 @@ def test_dated_snapshot_matches_the_pattern():
 
 def test_unmatched_alias_is_none_not_zero():
     assert price(gen("t2", "support-gpt4o-mini-eu", 4000, 50), PRICES) is None
+    assert price(gen("t9", "my-gpt-4o-mini-ft", 1000, 100), PRICES) is None   # a fine-tune: full match only
 
 def test_custom_definition_covers_the_alias_only():
     prices = PRICES + CUSTOM_MODELS
@@ -176,7 +177,8 @@ input and 50 output tokens ($0.00063 each, $0.00252), and `t3` is the $0.0003495
 - **Write the custom pattern as `.*gpt.*`.** The alias is priced, but so is `gpt-4o`, at mini prices.
   Debug: the `gpt-4o` assertion catches over-broad patterns; anchor names exactly.
 - **Use `re.search` instead of `re.fullmatch`.** `my-gpt-4o-mini-ft` is priced as the base model, although a
-  fine-tune is billed differently. Debug: list distinct model names per definition and read them.
+  fine-tune is billed differently. Debug: the fine-tune assertion in the tests catches it; in production,
+  list distinct model names per definition and read them.
 - **Forget the sample rate.** The monthly cost estimate is four times too low. Debug: compare the trace
   count in the export with the request count in your gateway logs.
 - **Count matched share over all observations.** `TOOL` observations dilute it. Debug: only generations

@@ -5,7 +5,7 @@ name: Regression
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -149,7 +149,7 @@ flowchart TD
   residuals. Agent run lengths and latencies are skewed, so fit the 0.95 quantile directly.
 - **"Fitting on log(cost) and exponentiating gives the expected cost."** It gives the geometric mean,
   which is biased low; summed budgets come out short until you apply a correction such as smearing.
-- **"A near-perfect offline R² means a great predictor."** It is the signature of leakage, such as
+- **"A near-perfect offline R² means a great predictor."** Far more often it is the signature of leakage, such as
   output token count used to predict latency. Only features known before the run starts are allowed.
 - **"An average judge score that rose from 3.2 to 3.4 shows the agent improved."** 1–5 judge scores are
   ordinal, so the mean has no fixed meaning; compare pass rates at a rubric threshold or pairwise wins.

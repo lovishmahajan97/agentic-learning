@@ -5,7 +5,7 @@ name: Multi-model architecture
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -69,14 +69,16 @@ Choose **B**.
   version.
 - **Why not C:** an inline frontier verifier would buy little that the citation check does not, at 15
   units and 3 s per task.
-- **Why not D:** the new reranker could be adopted later through the canary process once its review is
-  complete.
+- **Why not D:** an 8-week review leaves two weeks to integrate and evaluate a stage on the critical
+  path, and B already meets the limits. The new reranker could be adopted later through the canary
+  process once its review is complete.
 
 **What would change it:** if the regulator asks for model verification of every answer, add a small
 inline verifier (1 unit, 0.8 s), giving about 36.4 units and 10.5 s, still inside both limits.
 
-If the end-to-end eval shows small executors filling arguments badly, move one executor class to the frontier
-model and re-cost; each executor step moved adds 14 units.
+If the end-to-end eval shows small executors filling arguments badly, re-cost before moving any to the
+frontier model: each executor step moved adds 14 units and 2.2 s, so even one (about 49.4 units) breaks
+the 45-unit budget. Try a stronger small model, or a schema-gated escalation on that step, first.
 
 ### Trade-offs accepted
 - **More moving parts.** Five model classes (frontier, small, guard, embedder, reranker) need a

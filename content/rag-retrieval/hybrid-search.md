@@ -5,7 +5,7 @@ name: Hybrid search (BM25 + dense)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: evaluate
@@ -173,7 +173,7 @@ sequenceDiagram
 
 ## Misconceptions
 - **"Merge the two lists and sort by score."** BM25 is an unbounded sum, often single or double digits,
-  while cosine sits in a narrow model-specific band. Sorting the union just returns the BM25 list
+  while cosine sits in a narrow model-specific band. Sorting the union typically returns the BM25 list
   followed by the dense list.
 - **"Min–max normalizing each arm makes the scores comparable."** It stretches whatever spread the arm
   had to [0, 1]. A weak BM25 near-tie of 2.1, 2.0 and 1.9 becomes 1.0, 0.5 and 0.0, as decisive as a

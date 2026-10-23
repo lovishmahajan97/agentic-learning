@@ -5,7 +5,8 @@ name: Secrets & credential isolation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - backend-fundamentals/secrets-management
@@ -39,6 +40,68 @@ per-tenant credential at call time and never returns it.
   before they re-enter the context.
 - **What you can skip.** Running your own KMS or writing a secret scanner from scratch. Use a managed vault
   and a simple pattern scrubber, and spend the effort on process separation.
+
+## Decision case
+### Scenario
+A developer-tools startup runs a coding agent that edits customer repositories: it clones a repo, runs
+generated code and tests in a sandbox, pushes a branch and opens a pull request. Today a personal access
+token for each customer org sits in the sandbox environment. All figures are illustrative planning
+numbers.
+- **Volume:** 300 customer orgs, about 4,000 runs a day, runs of 20 minutes on average and up to 3 hours.
+- **Security questionnaires:** customers require per-org attribution of every write, no credential
+  readable by generated code, and revocation that stops all agent access within 15 minutes.
+- **Team and deadline:** 2 platform engineers, 6 weeks before an enterprise contract starts.
+- **Sandbox needs:** package installs from a mirror and running tests; generated code has no legitimate
+  need to call GitHub itself.
+
+### Options
+| Option | How it works | Secret reachable by generated code | Attribution and revocation | Effort in 6 weeks |
+|---|---|---|---|---|
+| Org token in the sandbox (today) | a long-lived token in the environment | yes, and long-lived | per org at best; revocation means rotating a token the customer issued | none |
+| Installation token in the sandbox | a GitHub App installation token per run, restricted to one repo | yes, for up to an hour; a 3-hour run needs 3 tokens | per installation; a leaked token lives until it expires | low |
+| Git operations in the tool worker | sandbox has no GitHub access; `clone_repo`, `push_branch` and `open_pr` tools run in the worker, which mints an installation token per call | no | per run, recorded by the broker; revocation stops new mints at once | moderate |
+| Egress proxy injecting auth | sandbox calls GitHub through a TLS-terminating proxy that adds the token and enforces method and path rules | no, but usable through allowed paths | per run | highest: TLS interception, CA in the image, path rules |
+
+### Decision
+**Move all git and GitHub operations into tool-worker tools, keep the sandbox with no route to GitHub,
+and mint a repo-scoped installation token from the broker for each call.**
+- **Meets "no credential readable by generated code":** the sandbox holds nothing and can reach only the
+  package mirror, so "print your environment" returns nothing useful.
+- **Meets attribution:** the broker records run, org and repo for each mint; 4,000 runs with about 2
+  write calls each is about 8,000 mints a day, under 0.1 a second.
+- **Meets 15-minute revocation:** when an org disconnects, the broker refuses new mints at once, and no
+  token ever left the worker, so none is outstanding in a sandbox.
+- **Fits the deadline:** it avoids TLS interception, which is the riskiest part of the proxy option.
+- **The model sees references:** tools take a repo name from the runtime-bound set for this tenant, never
+  a token or URL.
+
+**What would change it.**
+- **Generated code needs to call GitHub APIs** (for example integration tests against the API): add the
+  egress proxy with method and path rules, such as no `POST /gists`.
+- **Customers demand that writes appear as the user,** not the app: switch to per-user OAuth grants held
+  in the vault.
+- **Runs that never write:** a read-only token is still minted in the worker, never in the sandbox.
+
+### Trade-offs accepted
+- **Less flexible sandboxes.** Code that wants to `git push` itself fails; the tools cover clone, push and
+  pull request, and we count tool-missing errors to see what else is needed.
+- **Broker on the hot path.** A broker outage stops pushes; tokens are cached per run and repo for their
+  lifetime, and broker availability is part of the tool's SLO.
+- **Worker holds tokens briefly.** The worker logs without auth headers, and the scrubber pages on any hit
+  in tool results.
+- **App-attributed writes.** Commits come from the app, not the user; the pull request body names the
+  requesting user from the run context.
+
+### Review rubric
+- **Zones are drawn:** the write-up says what the loop, the worker and the sandbox each hold.
+- **Each option is rated on reachability:** whether generated code can read the secret, and whether it can
+  still use it through an allowed path.
+- **Revocation is timed end to end,** from customer action to the last successful use, against the stated
+  limit.
+- **Credential lifetime and scope are specific:** per repo, per call, with mint volume recomputed.
+- **Exfiltration through allowed hosts is addressed,** either by no route or by method and path rules.
+- **Flip conditions are concrete:** what workload or customer demand would require the proxy or user
+  grants.
 
 ## Why it exists
 - **Agents call real systems, which need credentials:** API keys, OAuth tokens, database passwords, cloud

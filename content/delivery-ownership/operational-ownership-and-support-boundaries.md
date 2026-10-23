@@ -5,7 +5,8 @@ name: Operational ownership & support boundaries
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - delivery-ownership/incident-severity-and-escalation
@@ -34,6 +35,65 @@ data, so without them incidents bounce between teams unfixed.
   tool"), what evidence a ticket must carry (run ID, step, tool), and the hypercare exit criteria.
 - **What you can skip.** Formal ITIL process detail; a boundary table, a catalog and a tested escalation
   route cover what an agent team needs.
+
+## Decision case
+### Scenario
+The IT-helpdesk agent from the worked ticket resets passwords, checks laptop orders and files tickets
+through three other teams' APIs. It was built by an FDE who still answers most issues by direct
+message. Hypercare ends in 4 weeks and the FDE moves to the next deployment. All figures are
+illustrative.
+- **Hypercare evidence:** 60 tickets in 8 weeks: 25 tool API faults (42%), 15 agent behaviour such as
+  wrong tool or bad answer (25%), 12 how-to or known issues (20%), 8 permissions or source-data issues
+  (13%).
+- **Team:** the agent team has 4 engineers; identity, procurement and the ITSM team each already run an
+  on-call rotation for their APIs.
+- **Security constraint:** the agent team may not hold write access to identity or procurement systems.
+- **Coverage:** password resets are needed 24x7; the rest is business hours.
+
+### Options
+| Option | How it works | Who can act on each ticket | Load on the agent team |
+|---|---|---|---|
+| Agent team owns everything | One pager for the agent and every tool behind it | 33 of 60 (55%) need access the team lacks, so it can only forward them | All 60, about 7.5 a week |
+| Central operations team first line | Ops is paged for all runtime issues; agent team is tier 3 in business hours | Ops can act on infrastructure, not on prompts, evals or tool APIs | Lower, but agent-behaviour fixes wait for business hours |
+| FDE stays first line | Keep the direct messages | Only while the FDE is here | Hidden; breaks at the 4-week exit |
+| One Accountable per layer | Tier 1 resolves known issues from runbooks; tool faults page the tool owner; agent team owns task success, wrappers, evals and detection; security owns permissions | Each ticket lands with a team that has pager, access and authority | Agent-behaviour tickets only, about 15 / 8 ≈ 1.9 a week |
+
+### Decision
+**One Accountable per layer, enforced by the RACI validator before hypercare exit.** It is the only
+option where every owner has pager, access and authority together.
+- **Why not the agent team owning everything:** the security constraint means 55% of tickets would page
+  people who can only open tickets elsewhere.
+- **Why not a central operations team:** a quarter of tickets are agent behaviour, which only prompt and
+  eval owners can fix, so routing them through ops adds a hop and a business-hours wait.
+- **Coverage fits:** password-reset faults page identity's existing 24x7 rotation, and the agent team's
+  business-hours rotation covers task success.
+- **Crossing points:** tickets carry run ID, step and tool name, so tier 1 or the agent on-call can
+  route a tool fault in minutes.
+
+**What would change it.** If a tool were a thin service only this agent uses, its row moves to the agent
+team. If several agents come to share one runtime, a platform team should own the serving layer.
+
+### Trade-offs accepted
+- **More hand-offs between teams.** Track tickets bounced between parties and time to route an issue to
+  its owner.
+- **Tool teams do not see agent-only failures,** such as an empty list with HTTP 200. The agent team owns
+  contract tests and an empty-result alert for each tool.
+- **Tool owners may deprioritise agent issues.** Each tool's catalog entry states a response target by
+  severity, reviewed when it is missed.
+- **Exit takes real work in 4 weeks.** Runbooks for the 20% known issues must be validated by tier 1;
+  watch pages to the FDE after the exit date, which should be near zero.
+
+### Review rubric
+- **Ownership is complete:** every layer, including agent behaviour, each tool, permissions and
+  reversal of actions, has exactly one Accountable, checked by a validator.
+- **Pager, access and authority align:** the write-up shows that no owner is paged for something it
+  cannot change, against the stated security constraint.
+- **Load is computed from evidence:** ticket shares and weekly load per option follow from the
+  hypercare data and are recomputed.
+- **Crossing points defined:** required evidence, channel and response targets are named for tickets
+  that cross a boundary.
+- **Exit criteria dated:** the handover names its criteria, its date and how pages to the builder are
+  measured afterwards.
 
 ## Why it exists
 - **A deployed AI system is a stack with many owners:** the model provider's API, your platform and

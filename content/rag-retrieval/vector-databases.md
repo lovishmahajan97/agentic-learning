@@ -5,7 +5,7 @@ name: Vector databases (pgvector, Qdrant, Pinecone, Weaviate, Milvus, Chroma)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 mastery: evaluate
@@ -135,6 +135,10 @@ recall: ['prefers invoices in EUR', 'timezone is Europe/Berlin', 'billing contac
 forgot: 3
 after:  [] 300
 ```
+
+The last two recall hits share no word with the query and both score 0.0, so their order is the store's
+tie-break; with qdrant-client 1.20.0 it is the order shown, whatever id scheme you use. The first hit
+must be `'prefers invoices in EUR'`.
 
 ### Tests
 Save next to `memory_store.py` and run `pytest -q` (checked with pytest 9.1.1). On the starter all five

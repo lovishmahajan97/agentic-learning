@@ -5,7 +5,7 @@ name: Chunking strategies (fixed, recursive, semantic)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement
@@ -169,7 +169,7 @@ flowchart TD
   paragraphs, recursive splitting already cuts at topic boundaries for free. Semantic chunking adds one
   embedding per sentence and a tuned threshold, and pays off mainly on structureless prose such as transcripts.
 - **"`chunk_size=1000` means 1,000 tokens."** Many splitters count characters by default, so 1,000
-  means roughly 250 English tokens and far more tokens for code or CJK text. Build the splitter from the
+  means roughly 250 English tokens, somewhat more for code and far more for CJK text. Build the splitter from the
   embedder's tokenizer so the limit means what the encoder sees.
 - **"A chunk over the encoder limit just embeds a bit worse."** Local encoders truncate silently, so
   everything past the limit never reaches the vector and cannot be retrieved by any query.

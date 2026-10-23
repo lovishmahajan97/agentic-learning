@@ -5,7 +5,8 @@ name: "Project 5: end-to-end business solution"
 kind: practice
 difficulty: advanced
 est_minutes: 35
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -52,6 +53,65 @@ the baseline.
   failure behaviour, rollout pace and how the outcome is measured.
 - **What you can skip.** A general platform. Solve one workflow for one team; generalise only after the
   outcome is proven.
+
+## Decision case
+### Scenario
+The invoice-matching pilot from the running example has finished 4 weeks of limited rollout with one AP
+team, and the sponsor asks at M6 whether to scale to the other two teams. All figures are illustrative
+planning numbers, not results.
+- **Baseline:** 2,000 invoices a week at 6.0 minutes each, 200 clerk hours a week. The signed target
+  is 50% fewer hours.
+- **Pilot, measured:** 55% straight-through (1,100 invoices a week). The 900 exceptions take 4.5 minutes
+  each, not the assumed 3, and clerks still re-check 30% of auto-approved invoices at 2 minutes each.
+  Hours are (900 x 4.5 + 330 x 2) / 60 = 78.5 a week, 61% fewer.
+- **Guardrail breach:** in week 4 one invoice was paid twice ($8,400) because extraction misread the
+  invoice number, so the duplicate check missed it. The rule signed at M1 says any duplicate payment
+  pauses auto-approval.
+- **Constraints:** finance freezes changes in the last week of the quarter, 5 weeks away; clerk time costs
+  about $45 an hour; the system costs about $0.08 an invoice.
+
+### Options
+| Option | How it works | Guardrail rule | Hours and value | Time to scale |
+|---|---|---|---|---|
+| Scale now | Turn on auto-approval for all 3 teams (6,000 invoices a week) | Breaks it; 3,300 auto approvals a week against 1 duplicate in 4,400 means about 0.75 expected duplicates a week | Fastest saving | Now |
+| Pause, fix, replay, then scale | Shadow mode; key duplicates on supplier, amount and invoice date as well as invoice number; replay the 8,000 pilot invoices and all known past duplicates | Kept | Each week of delay forgoes about 2 x 121.5 = 243 hours, about $10,935 | After the freeze, about week 6 |
+| Narrow the band and scale | Auto-approve only invoices under $1,000 | Still broken: smaller duplicates get through the same flaw | Smaller saving | Now |
+| Stop and buy a vendor product | End the pilot and run a procurement | Not tested | None for months | 4 months or more |
+
+### Decision
+**Pause, fix the duplicate check, replay, then scale after the freeze.** The guardrail rule was agreed
+before the build so that this call would not be renegotiated under pressure, and scaling would expect
+about 0.75 duplicates a week. The cause is narrow and known, and the fix fits the 4 working weeks before
+the freeze.
+
+The outcome case is strong enough to wait for: 121.5 hours a week saved per team is worth about $5,468 a
+week against $160 of system cost.
+- **Report the real numbers:** 61% fewer hours, not the 78% estimate, because exceptions take 4.5 minutes
+  and clerks still re-check auto-approvals.
+
+**What would change it.**
+- **The replay misses any known duplicate:** stay in shadow mode and treat duplicate detection as its
+  own milestone before scaling.
+- **Finance formally changes the rule,** for example to accept duplicates under a value that supplier
+  credit recovers within 30 days; scaling now with that change would then be a decision on record.
+
+### Trade-offs accepted
+- **About 243 clerk hours a week forgone** while the other two teams wait, plus the pilot team returning
+  to manual work during the pause. Report this cost to the sponsor; do not hide it.
+- **A stricter duplicate key may flag real repeat invoices** (monthly fixed fees). Track the false
+  duplicate rate in shadow mode; those cases go to the human queue, not to rejection.
+- **Re-checking at 30% eats part of the saving.** Run the sample audit, publish its error rate to clerks,
+  and track the re-check share weekly.
+
+### Review rubric
+- **Outcome is recomputed from measured inputs,** not from the business-case assumptions, and the gap is
+  explained.
+- **Pre-agreed guardrails are honoured,** or changing them is raised as an explicit decision for the
+  owner.
+- **Risk of each option is quantified,** such as expected duplicates a week at the scaled volume.
+- **The cost of waiting is stated** in hours and money, so the sponsor sees both sides.
+- **Calendar constraints are checked,** such as freezes, against the plan's timeline.
+- **Exit criteria for the pause are concrete:** what the replay must show before scaling.
 
 ## Why it exists
 - **Most AI pilots stall after the demo.** They lack a baseline, so nobody can say whether the pilot

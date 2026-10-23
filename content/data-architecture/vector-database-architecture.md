@@ -5,7 +5,7 @@ name: Vector database architecture
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -60,16 +60,18 @@ Constraints:
 | Option | How it works | Filtered recall across tenant sizes | Write visibility and deletes | Isolation | Ops load |
 |---|---|---|---|---|---|
 | **A. pgvector on the OLTP primary** | Vector columns beside the app tables | Plausible with iterative scans | Transactional: visible at commit | Row-level security | Low, but breaks the platform rule |
-| **B. Dedicated pgvector instance** | Separate Postgres; knowledge list-partitioned with the 5 largest orgs in their own partitions, HNSW plus iterative scans; memory searched exactly through a B-tree on `user_id` | Whales and the long tail are fine; mid-sized orgs must be benchmarked | Transactional: visible at commit | Row-level security | Low: known tooling |
+| **B. Dedicated pgvector instance** | Separate Postgres; knowledge list-partitioned with the 5 largest orgs in their own partitions; the shared partition uses HNSW plus iterative scans for mid-sized orgs and an exact scan through a B-tree on `org_id` for small ones; memory searched exactly through a B-tree on `user_id` | Whales and the long tail are fine; mid-sized orgs must be benchmarked | Transactional: visible at commit | Row-level security | Low: known tooling |
 | **C. Existing OpenSearch log cluster** | k-NN fields beside the log indices | Filtered k-NN supported; mid range must be benchmarked | Visible after a refresh interval | Index or filter per tenant, in application code | Medium; competes with log ingestion |
-| **D. Dedicated vector engine** | For example Qdrant with tenant-marked payload indexes, int8 quantization with rescoring, whales on their own shards | Strongest planner for every selectivity | Eventual: visible after the write lands in a segment | Filter applied in a retrieval service | High: new system plus sync from Postgres |
+| **D. Dedicated vector engine** | For example Qdrant with tenant-marked payload indexes, int8 quantization with rescoring, whales on their own shards | Strongest planner for every selectivity | Searchable once an upsert with `wait=true` is acknowledged, but memories also live in Postgres, so each save and forget must reach both stores | Filter applied in a retrieval service | High: new system plus sync from Postgres |
 
 ### Decision
 Choose **B**, because the team's binding constraints are write visibility, isolation and operating skill, and B meets them without a new system:
 - **Memory needs no ANN index.** One user is about 200 of 20 million points (0.001%). A B-tree on `user_id`
   returns their rows, and an exact distance sort over about 400 KB (2 KB each at half precision) is cheap.
 - **Commits give write-then-read and forget for free.** A saved memory is visible at commit, and a deleted one disappears in the same transaction.
-- **Whales and minnows are separated.** The 5 largest organisations get their own partitions and HNSW indexes; the long tail shares one with iterative scans.
+- **Whales and minnows are separated.** The 5 largest organisations get their own partitions and HNSW indexes; the long tail shares one.
+  A median org is 1,500 of its 4.8 million chunks (0.03%), too selective for a graph walk, so small orgs get
+  an exact scan via the `org_id` B-tree (about 3 MB at half precision).
 - **It fits one machine.** At half precision the knowledge vectors are about 16 GB, and only they need an HNSW index in RAM, so a mid-sized instance has headroom.
 - **Isolation sits in the database.** Row-level security scopes every query by organisation and user from the session.
 

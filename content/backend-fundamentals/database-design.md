@@ -5,7 +5,7 @@ name: Database design
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -173,7 +173,7 @@ def test_replay_returns_same_key_and_one_row(db):
 
 def test_ordered_read_uses_index_without_sort(db):
     plan = " | ".join(r[-1] for r in db.execute("EXPLAIN QUERY PLAN " + STEPS_QUERY, ("r1",)))
-    assert "INDEX" in plan and "TEMP B-TREE" not in plan, plan
+    assert plan.startswith("SEARCH agent_steps USING") and "TEMP B-TREE" not in plan, plan
 ```
 
 ### Failure scenarios
@@ -187,8 +187,11 @@ def test_ordered_read_uses_index_without_sort(db):
 - **Inject: remove `PRAGMA foreign_keys = ON`.** The cross-tenant test fails with `DID NOT RAISE` even
   though the composite FK is declared. Debug: `PRAGMA foreign_keys` returns 0; SQLite (unlike PostgreSQL)
   enforces FKs per connection only when asked.
-- **Inject: index `(step_no, run_id)` and drop the unique key.** The plan shows a scan or a temp B-tree
-  again. Debug: read the plan line; equality column first, sort column last.
+- **Inject: index `(step_no, run_id)` and drop the unique key.** The plan reads `SCAN agent_steps USING
+  INDEX ...`: no sort step, but it walks the whole index instead of seeking one run, so the plan test
+  fails; `record_step` also raises `OperationalError: ON CONFLICT clause does not match any PRIMARY KEY
+  or UNIQUE constraint`. Debug: read the plan line; you want `SEARCH`, with the equality column first and
+  the sort column last.
 
 ### Submission
 - **Your fixed `agent_schema.py`**, with the given tests unchanged.

@@ -5,7 +5,7 @@ name: OpenTelemetry instrumentation
 kind: tool
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -221,7 +221,8 @@ def test_max_steps_marks_the_run_red():
     assert root.status.description == "max_steps reached"
 ```
 
-All five fail on the starter: `3 == 1` traces, then `KeyError` for spans that do not exist yet.
+All five fail on the starter: `3 == 1` traces, then `KeyError` (or `min()` of an empty sequence) for
+spans that do not exist yet.
 
 ### Failure scenarios
 - **Inject: call `inject(headers)` before entering the `execute_tool` span.** Observe: one trace, but
@@ -230,8 +231,9 @@ All five fail on the starter: `3 == 1` traces, then `KeyError` for spans that do
 - **Inject: catch `ToolError` inside the `execute_tool` span.** Observe: the tool span is no longer red
   and the failure is invisible in the trace. Debug: let the exception leave the span (it records the
   exception event and the error status), or set the status yourself before handling it.
-- **Inject: start the tool span with `tracer.start_span(...)` and never end it.** Observe: the span is
-  missing from the exporter and the server span's parent id points at nothing. Debug: count started
+- **Inject: start the tool span with `tracer.start_span(...)`, inject from it with
+  `trace.set_span_in_context(span)`, and never end it.** Observe: the span is missing from the exporter
+  and the server span's parent id points at nothing. Debug: count started
   vs finished spans; use `start_as_current_span` as a context manager.
 
 ### Submission

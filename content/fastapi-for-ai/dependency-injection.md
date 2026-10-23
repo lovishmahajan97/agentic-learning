@@ -5,7 +5,7 @@ name: Dependency injection (Depends)
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -194,7 +194,7 @@ def test_spend_is_recorded_even_when_the_budget_is_exceeded(fake):
   `yield` in `try/finally`.
 - **Turn off the per-request cache.** Use `Depends(get_budget, use_cache=False)` on the route. Observe:
   the route reports `"tokens": 0`, because it gets a second `Budget` while `metered_llm` charges the
-  first. Debug: print `id(budget)` in both places; one request should see one instance.
+  first, and the spend log gets two rows per run (`('u1', 0), ('u1', 500)`). Debug: print `id(budget)` in both places; one request should see one instance.
 - **Override the wrong callable.** Override `RealLLM` or `metered_llm` instead of `get_llm`. Observe:
   the real client still runs, or the budget wrapper disappears. Debug: overrides are keyed by the exact
   function passed to `Depends`; grep for it.

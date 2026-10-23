@@ -5,7 +5,8 @@ name: Task completion rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -42,6 +43,176 @@ segmented by task type, beside pass^k for unattended use.
   segments you report.
 - **What you can skip.** Elaborate partial-credit scores as the headline. Keep success binary per task
   and track partial progress as a diagnostic.
+
+## Lab
+### Task
+Turn 100 recorded runs of a support-and-coding agent into the completion report a release review needs.
+Success comes from a verifier that queries the system of record, one bucketing function applies the
+denominator policy, and the gate reads the Wilson lower bound per segment. Ten runs claim "done" but
+never finished. Time box: 45-75 min.
+- **Prerequisites:** Task-specific acceptance criteria; pass@k; the two examples in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13 and pytest 9.1). Save the
+  starter as `lab.py` and the tests as `test_lab.py`.
+- **No services:** `make_suite` builds the runs and a fake system of record (a refund ledger and CI
+  results) so the verifier has something real to check.
+- **You implement three functions:** `verify`, `bucket` and `report`. `wilson` is given.
+
+### Starter code
+```python
+"""Lab: an honest task completion report with verified outcomes and one denominator policy.
+Run: python lab.py"""
+from math import sqrt
+
+def wilson(c: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    if n == 0:
+        return (0.0, 0.0)
+    p = c / n; d = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / d
+    half = z * sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return (max(0.0, centre - half), min(1.0, centre + half))
+
+def make_suite():
+    """Recorded runs plus the system of record a verifier can query (refund ledger and CI results)."""
+    runs, sor = [], {"refunds": {}, "ci": {}}
+    def add(segment, count, *, claimed, verified, declined=False, awaiting_user=False, human_fixed=False):
+        for _ in range(count):
+            i = len(runs)
+            if segment == "billing":
+                check = ("refunds", f"o-{i}", 40)
+                if verified:
+                    sor["refunds"][f"o-{i}"] = 40
+            else:
+                check = ("ci", f"pr-{i}", "passed")
+                sor["ci"][f"pr-{i}"] = "passed" if verified else "failed"
+            runs.append({"id": i, "segment": segment, "claimed_done": claimed, "declined": declined,
+                         "awaiting_user": awaiting_user, "human_fixed": human_fixed, "check": check})
+    add("billing", 45, claimed=True, verified=True)
+    add("billing", 5, claimed=True, verified=True, human_fixed=True)
+    add("billing", 4, claimed=True, verified=False)              # said done, refund never posted
+    add("billing", 3, claimed=False, verified=False)
+    add("billing", 2, claimed=False, verified=False, declined=True)
+    add("billing", 1, claimed=False, verified=False, awaiting_user=True)
+    add("code", 26, claimed=True, verified=True)
+    add("code", 6, claimed=True, verified=False)                 # said the PR is ready, CI failed
+    add("code", 5, claimed=False, verified=False)
+    add("code", 3, claimed=False, verified=False, awaiting_user=True)
+    return runs, sor
+
+def verify(run: dict, sor: dict) -> bool:
+    """True only if the system of record shows the expected end state: sor[kind].get(key) == expected,
+    where (kind, key, expected) = run["check"]. Never look at run["claimed_done"]."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def bucket(run: dict, verified: bool, unattended: bool = False) -> str:
+    """The written denominator policy, in this order: declined -> "declined"; awaiting_user ->
+    "abandoned" (but "failed" when unattended, because nobody will answer); not verified -> "failed";
+    human_fixed -> "assisted"; else "unassisted"."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def report(runs: list[dict], sor: dict, bar: float = 0.65, unattended: bool = False) -> dict:
+    """Per segment (sorted by name), return a dict with:
+    attempted = unassisted + assisted + failed
+    unassisted, assisted (rates over attempted: unassisted / attempted, (unassisted + assisted) / attempted)
+    lower, upper = wilson(unassisted count, attempted)
+    claimed = share of attempted runs with claimed_done; gap = claimed - (unassisted + assisted) / attempted
+    scope, abandonment = declined / all runs, abandoned / all runs in the segment
+    ship = lower >= bar (gate on the lower bound of the unassisted rate, not the point estimate)
+    Round every float to 3 places."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    runs, sor = make_suite()
+    for mode in (False, True):
+        print("unattended" if mode else "attended")
+        for seg, r in report(runs, sor, unattended=mode).items():
+            print(f"  {seg:<8} n={r['attempted']} unassisted={r['unassisted']} CI=[{r['lower']}, {r['upper']}] "
+                  f"assisted={r['assisted']} claimed={r['claimed']} gap={r['gap']} "
+                  f"scope={r['scope']} abandon={r['abandonment']} ship={r['ship']}")
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+attended
+  billing  n=57 unassisted=0.789 CI=[0.667, 0.875] assisted=0.877 claimed=0.947 gap=0.07 scope=0.033 abandon=0.017 ship=True
+  code     n=37 unassisted=0.703 CI=[0.542, 0.825] assisted=0.703 claimed=0.865 gap=0.162 scope=0.0 abandon=0.075 ship=False
+unattended
+  billing  n=58 unassisted=0.776 CI=[0.653, 0.864] assisted=0.862 claimed=0.931 gap=0.069 scope=0.033 abandon=0.0 ship=True
+  code     n=40 unassisted=0.65 CI=[0.495, 0.779] assisted=0.65 claimed=0.8 gap=0.15 scope=0.0 abandon=0.0 ship=False
+```
+
+Check the arithmetic: billing attempts 60 − 2 declined − 1 abandoned = 57, with 45 unassisted (45/57 =
+0.789) and 50 verified (50/57 = 0.877). Code's point estimate of 0.703 clears the 0.65 bar, but its lower
+bound of 0.542 does not.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution
+passes all 5 (Python 3.13, pytest 9.1).
+
+```python
+from lab import bucket, make_suite, report, verify
+
+RUNS, SOR = make_suite()
+
+def run(**kw):
+    base = {"id": 0, "segment": "billing", "claimed_done": True, "declined": False, "awaiting_user": False,
+            "human_fixed": False, "check": ("refunds", "o-x", 40)}
+    return {**base, **kw}
+
+def test_verify_reads_the_system_of_record_not_the_claim():
+    assert verify(run(), {"refunds": {"o-x": 40}}) is True
+    assert verify(run(), {"refunds": {"o-x": 20}}) is False
+    assert verify(run(), {"refunds": {}}) is False                       # claimed done, nothing posted
+    assert verify(run(check=("ci", "pr-1", "passed")), {"ci": {"pr-1": "failed"}}) is False
+
+def test_bucket_applies_the_policy_in_order():
+    assert bucket(run(declined=True, awaiting_user=True), True) == "declined"
+    assert bucket(run(awaiting_user=True), False) == "abandoned"
+    assert bucket(run(awaiting_user=True), False, unattended=True) == "failed"
+    assert bucket(run(), False) == "failed"
+    assert bucket(run(human_fixed=True), True) == "assisted"
+    assert bucket(run(), True) == "unassisted"
+
+def test_report_separates_autonomy_containment_and_the_claim_gap():
+    billing = report(RUNS, SOR)["billing"]
+    assert billing["attempted"] == 57 and billing["unassisted"] == 0.789 and billing["assisted"] == 0.877
+    assert billing["claimed"] == 0.947 and billing["gap"] == 0.07
+    assert billing["scope"] == 0.033 and billing["abandonment"] == 0.017
+
+def test_gate_uses_the_lower_bound_not_the_point_estimate():
+    code = report(RUNS, SOR)["code"]
+    assert code["unassisted"] == 0.703 and code["unassisted"] > 0.65      # point estimate clears the bar
+    assert (code["lower"], code["upper"]) == (0.542, 0.825) and code["ship"] is False
+    assert report(RUNS, SOR)["billing"]["ship"] is True
+
+def test_unattended_counts_unanswered_questions_as_failures():
+    code = report(RUNS, SOR, unattended=True)["code"]
+    assert code["attempted"] == 40 and code["unassisted"] == 0.65 and code["abandonment"] == 0.0
+```
+
+### Failure scenarios
+- **Use `claimed_done` as success.** Billing jumps to 54/57 = 0.947 and code to 32/37 = 0.865, and code
+  ships. Sample ten "done" runs and query the system of record by hand; the gap column is that sample
+  automated.
+- **Count assisted runs as unassisted.** Billing autonomy reads 0.877 instead of 0.789, and the number
+  falls the week the reviewers stop fixing runs. Keep `human_fixed` as its own bucket and report both.
+- **Gate on the point estimate.** Code ships at 0.703 although the suite cannot rule out 0.542. Print the
+  interval beside every rate and require the lower bound to clear the bar.
+- **Exclude unanswered questions for an unattended deployment.** Code's denominator drops from 40 to 37
+  and the rate rises from 0.65 to 0.703 with no change in the agent. Pick the mode from how the agent is
+  deployed, and write it into the metric definition.
+
+### Submission
+- **`lab.py`** with `verify`, `bucket` and `report` implemented; `make_suite` and `wilson` unchanged.
+- **A green test run** (5 passed) and the printed output of `python lab.py`.
+- **One extra test** of your own: a segment with 0 attempted runs must not crash the report.
+- **A one-paragraph verdict** per segment that cites the lower bound, the claim gap and the mode.
+- **Evaluated on:** outcomes from the system of record, one shared bucketing function, autonomy and
+  containment reported separately, and a gate on the lower bound.
 
 ## Why it exists
 - **It is the output metric.** An agent product lives or dies on whether it actually finishes the job.

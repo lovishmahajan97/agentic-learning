@@ -5,7 +5,8 @@ name: Memory layer for a chat agent (summaries, facts, deletion)
 kind: practice
 difficulty: core
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/agent-memory
@@ -35,6 +36,196 @@ and truly deletes on request. It proves your agent remembers what matters and fo
   tutoring, coding agents with project notes, personal assistants.
 - **What you can skip.** A vector database at first. One user's facts usually fit in the prompt; add
   embeddings and top-k recall only when a user has hundreds of facts.
+
+## Lab
+### Task
+Fix a chat agent's memory layer so a moved user gets the new city, another user's facts never reach the
+context, and "forget my city" leaves no copy in any store. A deletion audit, `leaks(value)`, searches
+every table, which is the evidence a privacy review asks for.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** agent memory, memory retrieval, update and deletion policies, and context
+  compaction.
+- **Runs offline:** `fake_llm` stands in for fact extraction and summarising; the summary keeps
+  fact-like sentences, as a real summariser tends to, so a deleted fact can survive inside it.
+- **Small numbers on purpose:** `fold_after=4` and `keep_recent=2`, so a 7-turn script folds twice.
+- **Needs:** Python 3.10+ (stdlib `sqlite3`) and `pip install pytest`; checked with Python 3.12 and
+  pytest 9.1.1.
+
+### Starter code
+```python
+# mem_lab.py: supersession, isolation and deletion that reaches every store, offline
+import json, sqlite3
+
+SCHEMA = """
+CREATE TABLE messages(id INTEGER PRIMARY KEY, user_id TEXT, role TEXT, content TEXT);
+CREATE TABLE summaries(user_id TEXT PRIMARY KEY, text TEXT, upto_id INTEGER);
+CREATE TABLE facts(id INTEGER PRIMARY KEY, user_id TEXT, key TEXT, value TEXT,
+                   source_msg_id INTEGER, superseded_by INTEGER);
+"""
+
+def fake_llm(task, text):
+    """Recorded stand-in: extracts city and pet facts; the summary keeps fact-like sentences."""
+    if task == "extract_facts":
+        if "live in" in text:
+            return json.dumps([{"key": "city", "value": text.split("live in ")[1].strip(". ")}])
+        if "dog is called" in text:
+            return json.dumps([{"key": "dog", "value": text.split("called ")[1].strip(". ")}])
+        return "[]"
+    keep = [s for line in text.splitlines() for s in line.removeprefix("SUMMARY: ").split("; ")
+            if "live in" in s or "called" in s]
+    return "SUMMARY: " + "; ".join(keep)
+
+class Memory:
+    def __init__(self, llm=fake_llm, keep_recent=2, fold_after=4):
+        self.db = sqlite3.connect(":memory:")
+        self.db.executescript(SCHEMA)
+        self.llm, self.keep_recent, self.fold_after = llm, keep_recent, fold_after
+
+    def add(self, user_id, role, content):
+        cur = self.db.execute("INSERT INTO messages(user_id, role, content) VALUES (?,?,?)",
+                              (user_id, role, content))
+        if role == "user":
+            self._extract_facts(user_id, cur.lastrowid, content)
+        self._maybe_summarize(user_id)
+
+    def _extract_facts(self, user_id, msg_id, text):
+        for f in json.loads(self.llm("extract_facts", text)):
+            # YOUR CODE 1: if this user already has an active value for the key, point the old
+            # row's superseded_by at the new row, so exactly one value per key stays active
+            self.db.execute("INSERT INTO facts(user_id, key, value, source_msg_id) VALUES (?,?,?,?)",
+                            (user_id, f["key"], f["value"], msg_id))
+
+    def _summary(self, user_id):
+        row = self.db.execute("SELECT text, upto_id FROM summaries WHERE user_id=?", (user_id,)).fetchone()
+        return row or ("", 0)
+
+    def _maybe_summarize(self, user_id):
+        prev, upto = self._summary(user_id)
+        rows = self.db.execute("SELECT id, role, content FROM messages WHERE user_id=? AND id>? ORDER BY id",
+                               (user_id, upto)).fetchall()
+        if len(rows) < self.fold_after:
+            return
+        fold = rows[:-self.keep_recent]
+        text = self.llm("summarize", prev + "\n" + "\n".join(f"{r}: {c}" for _, r, c in fold))
+        self.db.execute("INSERT INTO summaries VALUES (?,?,?) ON CONFLICT(user_id) DO UPDATE "
+                        "SET text=excluded.text, upto_id=excluded.upto_id", (user_id, text, fold[-1][0]))
+
+    def context(self, user_id):
+        summary, upto = self._summary(user_id)
+        # YOUR CODE 2: this query is missing a filter, so it leaks other users' facts
+        facts = self.db.execute("SELECT key, value FROM facts WHERE superseded_by IS NULL").fetchall()
+        recent = self.db.execute("SELECT role, content FROM messages WHERE user_id=? AND id>? ORDER BY id",
+                                 (user_id, upto)).fetchall()
+        return {"summary": summary, "facts": dict(facts), "recent": recent}
+
+    def forget_fact(self, user_id, key):
+        # YOUR CODE 3: delete every version of the fact and its source turns, then drop the
+        # summary and rebuild it from the remaining log (never patch it)
+        self.db.execute("DELETE FROM facts WHERE user_id=? AND key=? AND superseded_by IS NULL",
+                        (user_id, key))
+
+    def leaks(self, value):
+        """Every table that still contains `value` anywhere: the deletion audit."""
+        cols = {"messages": "content", "summaries": "text", "facts": "value"}
+        return [t for t, c in cols.items()
+                if self.db.execute(f"SELECT 1 FROM {t} WHERE {c} LIKE ?", (f"%{value}%",)).fetchone()]
+
+SCRIPT = ["I live in Berlin.", "My dog is called Pixel.", "chat 1", "chat 2", "chat 3",
+          "I live in Lisbon.", "chat 4"]
+
+def main():
+    m = Memory()
+    for text in SCRIPT:
+        m.add("u1", "user", text)
+    m.add("u2", "user", "I live in Paris.")
+    ctx = m.context("u1")
+    print("facts:", ctx["facts"])
+    print("summary:", ctx["summary"])
+    m.forget_fact("u1", "city")
+    ctx = m.context("u1")
+    print("after forget:", ctx["facts"], "|", ctx["summary"])
+    print("leaks:", {v: m.leaks(v) for v in ("Berlin", "Lisbon")})
+
+if __name__ == "__main__":
+    main()
+```
+
+As given, user u1's context says `'city': 'Paris'`, which is u2's city, and after the forget request
+Berlin is still in `messages` and `summaries`.
+
+### Expected output
+```
+facts: {'dog': 'Pixel', 'city': 'Lisbon'}
+summary: SUMMARY: user: I live in Berlin.; user: My dog is called Pixel.
+after forget: {'dog': 'Pixel'} | SUMMARY: user: My dog is called Pixel.
+leaks: {'Berlin': [], 'Lisbon': []}
+```
+
+Read the second line closely: before the forget, the summary still says Berlin while the facts say
+Lisbon. That is summary drift, and it is why facts, not the summary, carry current values.
+
+### Tests
+```python
+# test_mem_lab.py: run with `pytest -q`
+import json
+from mem_lab import Memory, SCRIPT
+
+def loaded():
+    m = Memory()
+    for text in SCRIPT:
+        m.add("u1", "user", text)
+    return m
+
+def test_new_value_supersedes_old():
+    m = loaded()
+    rows = m.db.execute("SELECT id, value, superseded_by FROM facts WHERE user_id='u1' AND key='city' "
+                        "ORDER BY id").fetchall()
+    (old_id, old, old_by), (new_id, new, new_by) = rows
+    assert (old, new) == ("Berlin", "Lisbon")
+    assert old_by == new_id and new_by is None          # history kept, one active value
+    assert m.context("u1")["facts"] == {"city": "Lisbon", "dog": "Pixel"}
+
+def test_context_is_isolated_per_user():
+    m = loaded()
+    m.add("u2", "user", "I live in Paris.")
+    assert "Paris" not in json.dumps(m.context("u1"))
+    assert m.context("u2")["facts"] == {"city": "Paris"}
+
+def test_forget_reaches_every_store():
+    m = loaded()
+    m.forget_fact("u1", "city")
+    assert m.leaks("Berlin") == [] and m.leaks("Lisbon") == []
+    assert m.context("u1")["facts"] == {"dog": "Pixel"}  # unrelated memory survives
+
+def test_summary_is_rebuilt_from_remaining_turns():
+    m = loaded()
+    m.forget_fact("u1", "city")
+    ctx = m.context("u1")
+    assert ctx["summary"] == "SUMMARY: user: My dog is called Pixel."
+    assert ctx["recent"] == [("user", "chat 3"), ("user", "chat 4")]
+```
+
+All four fail on the starter. The last test pins the rebuild: after messages 1 and 6 are deleted, five
+turns remain, so the fold summarises the oldest three and keeps "chat 3" and "chat 4" verbatim.
+
+### Failure scenarios
+- **Delete only the active row.** Context looks clean, but `leaks("Berlin")` still lists `facts`, because
+  the superseded row holds the old value. Debug by selecting every row for the key, active or not.
+- **Delete the fact but keep its source turns.** The next fold writes the value back into the summary.
+  Debug by running `leaks` after a fold, not only right after the delete.
+- **Patch the summary with a string replace.** "Berlin" goes, but "the German capital" or a misspelling
+  stays. Debug by rebuilding from the log and diffing against the patched text.
+- **Drop the `user_id` filter in one query.** One user's answer quotes another user's city. Debug with a
+  planted, distinctive value per user and a test that greps each assembled context for the others.
+
+### Submission
+- **Repo** with `mem_lab.py` and the unchanged tests; `pytest -q` shows 4 passed.
+- **Program output** matching the expected block.
+- **A deletion log line** your `forget_fact` writes (user, key, rows deleted per table, time), with the
+  sample from one run.
+- **A short note** listing every other place a real deployment must reach on deletion (vector index,
+  caches, traces, backups) and how you would audit each.
+- **Evaluated on** tests passing, superseded history kept, and `leaks` returning empty for both values.
 
 ## Why it exists
 - **Context windows fill up.** A long conversation plus tool results outgrows the window or the budget, so

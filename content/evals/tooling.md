@@ -5,7 +5,7 @@ name: Tooling (Promptfoo, RAGAS, DeepEval, Braintrust, LangSmith, Langfuse)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 mastery: evaluate

@@ -5,7 +5,7 @@ name: Synchronous vs asynchronous execution
 kind: decision
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -87,6 +87,9 @@ sufficient.
   from a background task. Watch: runs claimed by two workers, and steps re-executed after resume.
 - **Batch can starve interactive users.** Separate queues with interactive claimed first. Watch: queue
   wait p95 per queue during the nightly window.
+- **Tool keys only help if the receiver honours them.** If the document system ignores idempotency keys,
+  tag each comment with its `{run_id}:{step}` key and look it up before posting on resume. Watch: comments
+  found already present on resume.
 - **Polling and retention costs.** Watch: polls per submit, and enforce a 30-day result TTL on the job
   table.
 

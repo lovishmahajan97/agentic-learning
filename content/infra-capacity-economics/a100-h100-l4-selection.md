@@ -5,7 +5,7 @@ name: A100 / H100 / L4 selection
 kind: decision
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -63,7 +63,7 @@ Batch per card is the largest batch whose floor, `(16 GB + B × 0.54 GB) ÷ band
 Choose **C**.
 - **Latency gate:** the L4 is out at any price, because bandwidth, not memory, fails it.
 - **Cost over the reservation:** B is $2/h cheaper today but $2/h dearer at forecast. The crossover sits
-  where the A100 fleet reaches five cards, above about 2,830 tokens/s (4 × 710); the forecast passes it.
+  where the A100 fleet reaches five cards, above about 2,840 tokens/s (4 × 710); the forecast passes it.
 - **Headroom:** two H100s carry up to ≈ 6,460 tokens/s, so a forecast miss upward needs no new
   procurement. The A100 fleet already runs at 71% of a bandwidth ceiling real engines do not reach.
 - **Future levers:** fp8 on H100 halves weight bytes per step; the A100 has no fp8 tensor cores.
@@ -79,7 +79,7 @@ Choose **C**.
 ### Trade-offs accepted
 - **Paying for idle capacity in year one.** C runs near 23% of its ceiling today; track utilisation
   against the plan monthly.
-- **A forecast-dependent choice.** Record the 2,830 tokens/s crossover in the capacity plan and compare
+- **A forecast-dependent choice.** Record the 2,840 tokens/s crossover in the capacity plan and compare
   real peak demand with it each quarter.
 - **Concentrated hardware.** Two big cards mean one failure halves capacity; keep the spare quota ready
   and watch per-replica error rates.

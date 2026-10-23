@@ -5,7 +5,7 @@ name: Rubrics
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement
@@ -185,8 +185,8 @@ flowchart TD
   leaves every level boundary undefined. A rubric needs observable anchors that a second grader, or a
   judge, can apply and reproduce.
 - **"A 1–5 scale captures more than yes/no."** Five levels give four boundaries to disagree on, so
-  agreement drops and the extra resolution is mostly noise. Add more binary criteria instead of more
-  levels.
+  agreement typically drops and much of the extra resolution is grader noise. Add more binary criteria
+  instead of more levels, and keep a three-level anchored scale for genuinely continuous qualities.
 - **"A criterion that did not apply can count as a pass."** That adds free points: 2 of 3 real checks
   plus 3 inapplicable ones reports 5/6 instead of 2/3. Mark N/A and keep it out of the denominator.
 - **"A weighted average is the fairest overall score."** Averaging lets a 4-out-of-5 reply with a

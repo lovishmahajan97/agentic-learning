@@ -5,7 +5,7 @@ name: Retrieval failure diagnosis
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: evaluate
@@ -159,9 +159,10 @@ flowchart TD
 ```
 
 ## Misconceptions
-- **"Wrong answers mean we need a better embedding model."** The embedding only owns recall at depth.
-  If recall@100 is 91% and recall@5 is 62%, most misses are ranking, and a reranker or better fusion is
-  the targeted fix; a re-embed moves aggregate scores by noise.
+- **"Wrong answers mean we need a better embedding model."** Count where gold is lost first. If
+  recall@100 is 91% and recall@5 is 62%, 29 of the 38 points of misses are gold found but ranked too
+  low, so a reranker or better fusion over the candidates is the targeted fix; a costly re-embed is a
+  bet that may not move those queries, and it cannot help parsing, filtering or generation losses.
 - **"An LLM judge score tells us what to fix."** It gives the failure rate, not the location. Only
   tracing gold evidence stage by stage separates a parser bug from a ranking or prompt problem.
 - **"Gold missing from the prompt means the retriever never found it."** It may have been filtered
@@ -177,8 +178,8 @@ flowchart TD
 
 ## Examples
 ### Agent scenario: first loss across an agent's tool calls
-An agent run may call `search` several times. This checks the agent-specific stages first, then hands the
-best call to the pipeline-stage check below.
+An agent run may call `search` several times. This checks the agent-specific stages first; a run that
+ends in the "retrieval" bucket is then traced inside one call with the pipeline-stage check below.
 
 ```python
 def agent_first_loss(gold_doc: str, gold_span: str, run: dict, retrieve) -> str:

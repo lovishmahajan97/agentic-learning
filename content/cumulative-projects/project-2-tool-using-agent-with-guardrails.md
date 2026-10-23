@@ -5,7 +5,8 @@ name: "Project 2: tool-using agent with guardrails"
 kind: practice
 difficulty: advanced
 est_minutes: 30
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -51,6 +52,59 @@ retried safely, logged and, if risky, approved by a human, then prove each guard
   how often they retry, how many steps a run gets, and which actions wait for a person.
 - **What you can skip.** Multi-agent orchestration and planning frameworks. One loop with a hardened
   dispatcher teaches every guardrail; frameworks wrap the same ideas.
+
+## Decision case
+### Scenario
+An online retailer's support agent can now issue refunds through the `refund` tool. The open question is
+which refunds wait for a human (M3). All figures are illustrative planning numbers, not benchmarks.
+- **Volume:** 3,000 refund requests a day. 80% are under $50 (average $22), 15% are $50-$200 (average
+  $95) and 5% are over $200 (average $310), so the overall average is about $47.
+- **Measured error rate:** in shadow mode the agent proposed 10 wrong refunds in 2,000 decisions, 0.5%.
+  With only 10 errors, the upper end of a 95% interval is about 0.9%.
+- **Reviewers:** 4 supervisors, 8 hours a day, about 1 minute per approval, so at most
+  4 x 8 x 60 = 1,920 reviews a day.
+- **Constraints:** finance tolerates at most $500 a day of wrong refunds; customers get a decision within
+  30 minutes; the refund API honours idempotency keys.
+
+### Options
+| Option | How it works | Human reviews a day | Wrong-refund exposure a day (at 0.5%) | At 0.9% | Fits? |
+|---|---|---|---|---|---|
+| Approve everything | Every refund waits for a supervisor | 3,000 | about $0 | about $0 | No: 3,000 is above 1,920, so the backlog grows by 1,080 a day |
+| Fully autonomous | Agent refunds anything that passes validation | 0 | 15 x $47 = about $705 | about $1,270 | No: over $500 even at the measured rate |
+| Auto under $50 | Under $50 runs on its own; the rest wait | 600 | 12 x $22 = $264 | 21.6 x $22 = about $475 | Yes, with margin at both rates |
+| Auto under $200 | Under $200 runs on its own; the rest wait | 150 | 14.25 x about $33.5 = about $478 | about $860 | Only at the measured rate, with no margin |
+
+### Decision
+**Auto-approve refunds under $50; send the rest to a supervisor, plus a 5% audit of auto refunds.** It is
+the only option that stays under the $500 limit at the pessimistic error rate as well as the measured one,
+which matters because 10 errors is a small sample.
+- **Reviewer load fits:** 600 approvals plus a 120-item daily audit is 720 minutes, 12 of the 32
+  supervisor hours, which leaves room to meet the 30-minute target at peak.
+- **The audit measures the error rate** the threshold depends on, so the next decision is made on data.
+
+**What would change it.**
+- **A lower measured rate:** if four weeks of audits show 0.3% or less, raise the line to $200, where
+  exposure is 2,850 x 0.003 x $33.5 = about $287 a day.
+- **Errors concentrated in one reason code:** block that code from auto-approval rather than lowering the
+  dollar line for everyone.
+
+### Trade-offs accepted
+- **Supervisors still review 20% of refunds.** Track approval latency and minutes per review; if review
+  time climbs, the approval request is hiding the evidence.
+- **Small wrong refunds still happen,** about 12 a day at the measured rate. Track daily wrong-refund
+  dollars from the audit against the $500 limit.
+- **A dollar line is easy to game,** for example by splitting one refund into two. Validation sums refunds
+  per order before checking the line, and a test proves it.
+
+### Review rubric
+- **Exposure is computed per option** as volume x error rate x average amount, not asserted as low or high.
+- **Uncertainty in the error rate is used:** the write-up checks each option at a pessimistic rate, not
+  only at the point estimate.
+- **Reviewer capacity is checked** against the human-review volume each option creates.
+- **The chosen policy is enforced in the dispatcher,** with a test that a refund above the line cannot
+  execute without a recorded approver.
+- **A measurement loop is built in,** such as an audit sample, so the threshold can move on evidence.
+- **Reversal conditions are numeric:** the error rate that would raise or lower the line is stated.
 
 ## Why it exists
 - **Models make bad calls at a steady rate.** Wrong argument types, out-of-range amounts and invented

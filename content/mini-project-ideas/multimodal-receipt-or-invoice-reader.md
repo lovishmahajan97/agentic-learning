@@ -5,7 +5,8 @@ name: Multimodal receipt or invoice reader
 kind: practice
 difficulty: core
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - multimodal/vision-language-models
@@ -36,6 +37,190 @@ extraction.
   all start by turning a picture into a typed record a tool can act on.
 - **What you can skip.** Training a layout model. Current VLMs read most receipts well; your work is the
   schema, the checks and the eval.
+
+## Lab
+### Task
+Stop an expense agent's receipt reader from filing wrong totals. Three bugs let errors through silently:
+the totals check is skipped when a receipt prints no subtotal, retries resend the same prompt without the
+errors, and an exhausted retry loop returns an unvalidated guess as `ok`.
+
+You finish when the error rate of auto-accepted receipts, the number finance actually feels, is zero on
+the recorded batch.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** vision-language models, structured outputs, and the Pydantic extraction pipeline
+  mini project.
+- **Runs offline:** `FakeVLM` replays recorded JSON answers for three receipts and moves to its next
+  answer only when the last turn says what was wrong, which is how error feedback helps a real VLM. No
+  image or API key is needed.
+- **Needs:** `pip install pydantic pytest`; checked with Python 3.12, Pydantic 2.14.1 and pytest 9.1.1.
+
+### Starter code
+```python
+# receipt_lab.py: validate VLM receipt JSON, retry with errors, route failures to review, offline
+import json
+from decimal import Decimal
+from typing import List, Optional
+from pydantic import BaseModel, Field, ValidationError, model_validator
+
+TOL = Decimal("0.02")
+
+class LineItem(BaseModel):
+    description: str
+    amount: Decimal
+
+class Receipt(BaseModel):
+    merchant: str
+    currency: str = Field(pattern=r"^[A-Z]{3}$")
+    items: List[LineItem] = []
+    subtotal: Optional[Decimal] = None
+    tax: Decimal = Decimal("0")
+    tip: Decimal = Decimal("0")
+    total: Decimal
+
+    @model_validator(mode="after")
+    def totals_add_up(self):
+        # YOUR CODE 1: receipts without a printed subtotal skip every check here. Use the item sum
+        # as the base instead, so the total is always checked
+        if self.subtotal is None:
+            return self
+        items_sum = sum((i.amount for i in self.items), Decimal("0"))
+        if self.items and abs(items_sum - self.subtotal) > TOL:
+            raise ValueError(f"line items sum to {items_sum}, subtotal is {self.subtotal}")
+        if abs(self.subtotal + self.tax + self.tip - self.total) > TOL:
+            raise ValueError(f"subtotal + tax + tip = {self.subtotal + self.tax + self.tip}, total is {self.total}")
+        return self
+
+def rec(merchant, items, total, **kw):
+    return json.dumps({"merchant": merchant, "currency": "EUR", "total": total,
+                       "items": [{"description": d, "amount": a} for d, a in items], **kw})
+
+# Recorded VLM answers per receipt: [first answer, answer after an error-feedback turn, ...]
+RECORDED = {
+    "r1": [rec("Cafe Lume", [("flat white", "3.50"), ("croissant", "2.80")], "6.80",
+               subtotal="6.30", tax="0.50")],
+    "r2": [rec("FreshMart", [("apples", "5.00"), ("coffee beans", "8.40")], "18.40"),     # 1 misread as 8
+           rec("FreshMart", [("apples", "5.00"), ("coffee beans", "8.40")], "13.40")],
+    "r3": [rec("City Taxi", [], "25.00", subtotal="20.00", tip="3.00"),                  # blurry photo
+           rec("City Taxi", [], "26.00", subtotal="20.00", tip="3.00")],
+}
+GOLD_TOTAL = {"r1": Decimal("6.80"), "r2": Decimal("13.40"), "r3": Decimal("23.00")}
+
+class FakeVLM:
+    """Replays recorded answers. It moves to the next answer only when told what was wrong."""
+    def __init__(self, answers):
+        self.answers, self.i, self.calls = answers, 0, 0
+
+    def complete(self, messages):
+        self.calls += 1
+        if self.calls > 1 and "Fix these problems" in str(messages[-1]["content"]):
+            self.i = min(self.i + 1, len(self.answers) - 1)
+        return self.answers[self.i]
+
+def read_receipt(client, image_ref, retries=2):
+    messages = [{"role": "system", "content": "Extract the receipt as JSON. Copy amounts exactly; never guess."},
+                {"role": "user", "content": [{"type": "text", "text": "Extract this receipt."},
+                                             {"type": "image_ref", "ref": image_ref}]}]
+    for _ in range(retries + 1):
+        raw = client.complete(messages)
+        try:
+            return Receipt.model_validate_json(raw), "ok"
+        except ValidationError as e:
+            # YOUR CODE 2: append the model's raw answer and a user turn starting with
+            # "Fix these problems and return the full JSON: " plus the validation errors
+            pass
+    # YOUR CODE 3: an unvalidated guess must never be filed; return (None, "needs_review")
+    return Receipt.model_construct(**json.loads(raw)), "ok"
+
+def run_batch():
+    out = {}
+    for rid, answers in RECORDED.items():
+        client = FakeVLM(answers)
+        receipt, status = read_receipt(client, rid)
+        out[rid] = (receipt, status, client.calls)
+    return out
+
+def report(out):
+    accepted = [rid for rid, (_, s, _) in out.items() if s == "ok"]
+    wrong = [rid for rid in accepted if Decimal(out[rid][0].total) != GOLD_TOTAL[rid]]
+    rate = round(len(wrong) / len(accepted), 3) if accepted else 0.0
+    return {"auto_accepted": len(accepted), "review": len(out) - len(accepted), "accepted_error_rate": rate}
+
+def main():
+    out = run_batch()
+    for rid, (receipt, status, calls) in out.items():
+        print(f"{rid}: {status} total={receipt.total if receipt else None} calls={calls}")
+    print(report(out))
+
+if __name__ == "__main__":
+    main()
+```
+
+As given, all three receipts are accepted and the report shows `'accepted_error_rate': 0.667`: r2 is
+filed at 18.40 instead of 13.40, and r3 at 25.00 although 20.00 + 3.00 is 23.00.
+
+### Expected output
+```
+r1: ok total=6.80 calls=1
+r2: ok total=13.40 calls=2
+r3: needs_review total=None calls=3
+{'auto_accepted': 2, 'review': 1, 'accepted_error_rate': 0.0}
+```
+
+Check r1 by hand: 3.50 + 2.80 = 6.30, and 6.30 + 0.50 tax = 6.80. For r2 the items sum to 13.40, so
+the misread 18.40 is off by 5.00, far outside the 0.02 tolerance.
+
+### Tests
+```python
+# test_receipt_lab.py: run with `pytest -q`
+from decimal import Decimal
+import pytest
+from pydantic import ValidationError
+import receipt_lab as m
+
+def test_total_is_checked_without_a_subtotal():
+    with pytest.raises(ValidationError, match="total is 18.40"):
+        m.Receipt.model_validate_json(m.RECORDED["r2"][0])
+    assert m.Receipt.model_validate_json(m.RECORDED["r2"][1]).total == Decimal("13.40")
+
+def test_retry_feeds_the_errors_back():
+    client = m.FakeVLM(m.RECORDED["r2"])
+    receipt, status = m.read_receipt(client, "r2")
+    assert (status, receipt.total, client.calls) == ("ok", Decimal("13.40"), 2)
+
+def test_unfixable_receipt_goes_to_review():
+    client = m.FakeVLM(m.RECORDED["r3"])
+    assert m.read_receipt(client, "r3") == (None, "needs_review")
+    assert client.calls == 3                               # one try plus two retries, then stop
+
+def test_no_wrong_total_is_auto_accepted():
+    assert m.report(m.run_batch()) == {"auto_accepted": 2, "review": 1, "accepted_error_rate": 0.0}
+```
+
+All four fail on the starter. Fixing only the validator is not enough: r2 then fails three times with
+the same answer (`calls=3`), so the retry test still fails until the errors reach the model.
+
+### Failure scenarios
+- **Skip the check when a field is missing.** Receipts without a subtotal, often the cheapest ones,
+  are filed unchecked. Debug by counting accepted receipts per validation path and alerting on any path
+  that never fails.
+- **Retry without the errors.** Every retry costs another image call and returns the same JSON. Debug by
+  logging a hash of each raw answer; identical hashes across attempts mean the feedback is missing.
+- **Return a best-effort object on exhaustion.** `model_construct` skips validation, so the filing tool
+  sees a normal `Receipt`. Debug by grepping for `model_construct` and asserting the filing tool only
+  accepts `status == "ok"`.
+- **Use floats for amounts.** Change the fields to `float` and the sum that starts at `Decimal("0")`
+  raises `TypeError`; switch that to floats too and sums such as 0.1 + 0.2 come out as
+  0.30000000000000004. Debug by printing the repr of the computed base next to the printed total.
+
+### Submission
+- **Repo** with `receipt_lab.py` and the unchanged tests; `pytest -q` shows 4 passed.
+- **Program output** matching the expected block.
+- **The review record** for r3: raw answers, the exact validation errors and the image reference, as a
+  reviewer would see it.
+- **A short note** explaining why the review share going from 0 to 1 of 3 is an improvement, using the
+  accepted error rate.
+- **Evaluated on** tests passing, the total checked on every path, and no `model_construct` on the
+  output path.
 
 ## Why it exists
 - **Documents arrive as pictures.** Phone photos, scanned PDFs and screenshots are where most business data

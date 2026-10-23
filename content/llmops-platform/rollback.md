@@ -5,7 +5,7 @@ name: Rollback
 kind: practice
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -60,31 +60,36 @@ are illustrative.
 | **A. Cold from object storage** | `kubectl rollout undo`; nodes pull old weights | $0 | 5 + 2 × 22 = 49 min: fails | half for 44 min: fails at peak |
 | **B. Warm pool for the whole bake** | second 8-GPU pool serves the previous manifest for 48 h | 8 × 48 × $2.50 × 4 = $3,840: fails | 5 + 1 = 6 min | full |
 | **C. Previous weights on local disk** | rolling undo, one replica at a time, from NVMe | $0 | 5 + 2 × 4 = 13 min | half for 8 min: fails at peak |
-| **D. Warm pool for the first 8 h, then C** | pool covers the peak shift after promotion, then is released | 8 × 8 × $2.50 × 4 = $640 | 6 min in the first 8 h, 13 min after | full at peak, half for 8 min off-peak |
+| **D. Warm pool for the bake window's peak shifts, then C** | pool serves the previous manifest during both 09:00-17:00 shifts inside the 48 h (16 h), released overnight | 8 × 16 × $2.50 × 4 = $1,280 | 6 min at peak, 13 min off-peak | full at peak, half for 8 min off-peak |
 
 ### Decision
 Choose **D**, because it is the only option that meets the MTTR, capacity and budget constraints together.
-- **MTTR:** 6 minutes during the first shift and 13 after, both under 15. A's 49 minutes is the whole
+- **MTTR:** 6 minutes during the two peak shifts and 13 off-peak, both under 15. A's 49 minutes is the whole
   incident.
-- **Capacity:** the warm pool covers 09:00-17:00 on release day, when C's half-capacity reload would queue
-  claims. After that, rollbacks happen off-peak or on the next day, inside the 48 h window.
-- **Budget:** $640 fits under $1,500. B buys the same 6 minutes for the remaining 40 hours at $3,200 more.
+- **Capacity:** a 48 h bake promoted at 09:00 spans two peak shifts (release day and the next day). The
+  warm pool covers both, when C's half-capacity reload would queue claims; off-peak, C's 8 minutes at half
+  capacity are acceptable.
+- **Budget:** $1,280 fits under $1,500. B buys the same 6 minutes for the 32 off-peak hours at $2,560
+  more.
 - **Risk shape:** breaches caused by a release tend to appear in its first hours of real traffic (the
-  lesson's incident fired at T+3 h), which is where D spends its money.
+  lesson's incident fired at T+3 h), which falls inside D's first warm shift.
 
 **What would change it:**
-- **Releases promoted off-peak** (for example 20:00): C alone meets every constraint at $0.
+- **Peak load that one replica can carry** (for example after a smaller or quantised model halves the
+  load): C alone meets every constraint at $0. Promoting off-peak does not help, because any 48 h bake
+  still spans two peak shifts.
 - **An MTTR target under 13 minutes for the whole bake window:** B, with a budget raise.
-- **Breaches seen late in the bake window in your release history:** extend the warm pool, at $80 a
-  month per extra hour.
+- **Off-peak breaches that need 6-minute recovery** in your release history: extend the warm pool into
+  those hours, at $80 a month per extra hour.
 
 ### Trade-offs accepted
-- **Hours 9-48 recover in 13 minutes, not 6.** Track every rollback's measured restore time against
+- **The 32 off-peak hours recover in 13 minutes, not 6.** Track every rollback's measured restore time against
   the 15-minute target; two misses in a quarter reopen the decision.
 - **Local disk is a single copy of the previous weights.** Verify its checksum in the pre-release
   readiness check, and fail promotion if it is missing.
-- **The warm pool adds $640 a month of mostly idle GPUs.** Report its cost next to the incidents it
-  shortened.
+- **The warm pool adds $1,280 a month of mostly idle GPUs**, and it must be re-warmed from local disk
+  before day two's shift. Check that it serves the previous manifest before 09:00, and report its cost
+  next to the incidents it shortened.
 - **Rollback restores behaviour, not actions.** In-flight runs restart by manifest id, and claims notes
   written by the bad version are found through the audit log. That reconciliation is outside the MTTR.
 

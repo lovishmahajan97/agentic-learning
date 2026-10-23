@@ -5,7 +5,7 @@ name: Model monitoring
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -54,32 +54,35 @@ groundedness judge. All figures are illustrative.
     promise per-tenant quality reviews;
   - at most a couple of false pages a week, or on-call mutes the channel;
   - proxies (steps per task, search-call rate, citation presence) already run on 100% of traffic.
-- **Detection floor:** a daily drop is detectable when it exceeds 2 standard errors of the difference,
-  2 × √(2 × 0.64 / n). That reaches 0.4 at n = 32 judged runs per tenant per side; a floor of 50 gives
-  2 × 0.16 = 0.32.
+- **Alert rule:** a tenant alerts when its daily drop exceeds 2 standard errors of the difference,
+  se = √(2 × 0.64 / n).
+- **Detection floor:** "detect" means a real 0.4 drop alerts on at least 80% of days. That needs
+  n ≈ 16 σ² / δ² = 16 × 0.64 / 0.4² = 64 judged runs per tenant per side, where the threshold is
+  2 × 0.141 ≈ 0.28. At n = 32 the threshold is exactly 0.4, so a 0.4 drop alerts only half the time;
+  the worked example's floor of 50 (threshold 0.32) catches it on about 7 days in 10.
 
 ### Options
 | Option | How it works | Judged a day | Cost a month | Smallest tenant judged a day | Meets the 0.4 target |
 |---|---|---|---|---|---|
-| **A. Uniform 1%** | judge 1 in 100 runs | 1,000 | 1,000 × 30 × $0.01 = $300 | 300 × 1% = 3 | no: 2 se ≈ 1.3 |
-| **B. Uniform 5%** | judge 1 in 20 runs | 5,000 | $1,500: fails | 15 | no: 2 se ≈ 0.58 |
-| **C. 1% plus a per-tenant floor of 50** | 1% everywhere, topped up to 50 a day per tenant | 4 × 150 + 36 × 50 = 2,400 | $720 | 50 | yes: 2 se = 0.32 |
+| **A. Uniform 1%** | judge 1 in 100 runs | 1,000 | 1,000 × 30 × $0.01 = $300 | 300 × 1% = 3 | no: threshold 2 se ≈ 1.3 |
+| **B. Uniform 5%** | judge 1 in 20 runs | 5,000 | $1,500: fails | 15 | no: threshold 2 se ≈ 0.58 |
+| **C. 1% plus a per-tenant floor of 64** | 1% everywhere, topped up to 64 a day per tenant | 4 × 150 + 36 × 64 = 2,904 | 2,904 × 30 × $0.01 ≈ $871 | 64 | yes: threshold 0.28, 80% of 0.4 drops caught |
 | **D. Judge everything** | every run scored | 100,000 | $30,000: fails | 300 | yes |
 
 ### Decision
 Choose **C, stratified sampling with a per-tenant floor**, because it is the only option that meets the
 per-tenant detection target inside the budget.
-- **Detection:** every tenant gets 50 judged runs a day, so a 0.32-point drop is visible; A and B leave
-  small tenants at 3 and 15, where only drops of 1.3 and 0.58 show.
-- **Budget:** $720 fits under $1,000, leaving $280 for the review queue's re-judging.
-- **Where the money goes:** 1,800 of the 2,400 daily judgments go to small tenants, the slices uniform
+- **Detection:** every tenant gets 64 judged runs a day, so a real 0.4-point drop alerts on 80% of days;
+  A and B leave small tenants at 3 and 15, where the alert threshold alone is 1.3 and 0.58.
+- **Budget:** about $871 fits under $1,000, leaving about $129 for the review queue's re-judging.
+- **Where the money goes:** 2,304 of the 2,904 daily judgments go to small tenants, the slices uniform
   sampling starves. The four large tenants already clear the floor at 1%.
 - **Noise:** 40 tenants checked daily at a 5% false rate would give about 2 false alerts a day, so a judge
   drop opens a ticket and needs two consecutive days to escalate. Only proxy SLO burn rates page.
 
 **What would change it:**
 - **The contract drops per-tenant quality reviews:** A at $300 covers the aggregate.
-- **Slicing by tenant and 5 intents (200 slices):** the floor would cost 10,000 judged a day, $3,000 a
+- **Slicing by tenant and 5 intents (200 slices):** the floor would cost 12,800 judged a day, $3,840 a
   month. Floor the tenants and let intents share the sample instead.
 - **Judge cost falls tenfold:** D becomes affordable at about $3,000 a month only if the budget grows.
 

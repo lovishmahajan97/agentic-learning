@@ -5,7 +5,8 @@ name: multi-agent workflow (planner, specialists, reviewer)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/multi-agent-patterns
@@ -40,6 +41,63 @@ due-diligence packs, release checks) done in parallel with a quality gate.
   or vendors.
 - **What you can skip.** Free-form agents chatting with each other. Start with a fixed planner, a few
   specialists and one reviewer, wired by code.
+
+## Decision case
+### Scenario
+A venture firm's platform team builds vendor due-diligence briefs covering financials, product, security
+posture, legal exposure and customer sentiment. Analysts write about 200 a month at 6 hours each. The
+team ran four designs on a 20-brief eval set; all figures are illustrative pilot numbers.
+- **Speed:** partners want a brief within 15 minutes of asking.
+- **Cost:** under $2 a brief, the target from the examples.
+- **Quality:** the rubric score must beat the single-agent baseline by 15 points or more, with under 1
+  unsupported claim per brief.
+- **Inputs vary:** a private company has no filings but a large security questionnaire; a public one is
+  the reverse, so the needed research differs per brief.
+- **Team and time:** two engineers for 6 weeks.
+
+### Options
+| Option | How it works | Rubric (of 100) | Unsupported claims | Wall-clock | Cost a brief |
+|---|---|---|---|---|---|
+| A. Single agent, 25 tools | One loop, one context | 62 (baseline) | 3 | 22 min | $0.60 |
+| B. Fixed pipeline, 5 stages | One stage per topic, no planner | 74 (+12) | 1.2 | 11 min | $1.20 |
+| C. Supervisor with planner, specialists and reviewer | Planner picks specialists per brief, 2 review rounds at most | 79 (+17) | 0.6 | 9 min | $1.70 |
+| D. Group chat | Agents debate until one says done | 70 (+8) | 1.5 | 25 min | $1.50 to $6, unbounded |
+
+### Decision
+**Option C, the supervisor design.** It is the only option that meets every constraint: 9 minutes
+against 15, $1.70 against $2, +17 points against +15, and 0.6 unsupported claims against 1.
+- **Why not A:** it misses the 15-minute limit and the claim target, and traces show tool confusion with
+  25 tools in one context.
+- **Why not B:** it is close, but runs every stage on every brief and falls 3 points short, because it
+  cannot add a security deep dive only where needed.
+- **Why not D:** its cost has no ceiling, which fails the budget by design.
+- **Monthly cost:** 200 x $1.70 = $340, against $120 for A; small next to 1,200 analyst hours (200 x 6).
+
+**What would change it.** A 17-point gap on 20 briefs is a small sample, so re-run A and C on 50 before
+rollout and keep C only if the gap holds above 15.
+
+If a single agent with a tool router and 8 tools
+scores 75 or more in under 15 minutes, prefer it. If the needed research stops varying, B is simpler.
+
+### Trade-offs accepted
+- **About 2.8 times the cost of one agent** ($1.70 against $0.60). Alert on runs above the p95 cost and
+  keep the specialists on a cheaper model tier.
+- **Hand-off loss.** The synthesiser sees only structured findings. Tag reviewer fixes that trace to
+  missing context and widen the findings schema when they recur.
+- **A reviewer that drifts lenient.** Calibrate it monthly against a human-scored sample of briefs.
+- **More moving parts to debug.** One trace across planner, specialists and reviewer is a launch
+  requirement, not a later addition.
+
+### Review rubric
+- **Baseline first:** the write-up measures a single-agent design on the same eval set before proposing
+  a split.
+- **Every option scored on every constraint,** with the numbers in one table.
+- **The split is justified by the input:** it names what varies per task that a fixed pipeline cannot
+  handle.
+- **Loops and cost bounded:** review rounds, steps and tokens have caps, and no option without a ceiling
+  is chosen.
+- **Sample size questioned:** the write-up says how many eval cases back the decision and when to re-run.
+- **Reversal conditions stated:** the score or cost result that would bring back a simpler design.
 
 ## Why it exists
 - **Some tasks are wide.** A market brief needs pricing, competitors, regulation and customer sentiment;

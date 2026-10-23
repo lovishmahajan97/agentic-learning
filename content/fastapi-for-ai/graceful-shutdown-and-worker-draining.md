@@ -5,7 +5,7 @@ name: Graceful shutdown & worker draining
 kind: practice
 difficulty: advanced
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -209,8 +209,8 @@ def test_kill_mid_tool_call_does_not_duplicate_the_side_effect():
     assert llm.calls == 3                                     # the saved plan was replayed, not re-asked
 ```
 
-On the starter all three fail: the first two because the flag is ignored (`'done' == 'interrupted'`), the
-third because the resumed run creates a second ticket. Each LAB item is tested on its own: keys without
+On the starter all three fail: the first two because the flag is ignored (the run ends in `'done'`
+instead of `'resume'`), the third because the resumed run creates a second ticket. Each LAB item is tested on its own: keys without
 the early checkpoint still fail on `llm.calls == 4`, and the checkpoint without keys duplicates the ticket.
 
 ### Failure scenarios
@@ -229,7 +229,7 @@ the early checkpoint still fail on `llm.calls == 4`, and the checkpoint without 
 - The fixed `lab_drain.py` and a `pytest -q` run showing 3 passed.
 - Your output of `python lab_drain.py`, matching the expected output.
 - A grace budget for this agent with steps of about 6 s: `terminationGracePeriodSeconds` from the
-  formula above, with each term named.
+  formula in How it works, with each term named.
 - A short note: what still goes wrong if a tool backend ignores idempotency keys, and how you would
   detect it from logs.
 

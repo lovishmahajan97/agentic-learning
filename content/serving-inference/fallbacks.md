@@ -5,7 +5,7 @@ name: Fallbacks
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -181,7 +181,7 @@ flowchart TD
   cheaper or different model.
 - **"Any error should fail over."** A 400 or context-length overflow fails identically on an equivalent
   target, and auth or billing faults need a human. Only transient capacity errors and latency over budget
-  justify the next rung.
+  justify the next rung, plus a context overflow routed deliberately to a larger-window model.
 - **"A circuit breaker should open after N failures in a row."** At a 20% independent error rate five in
   a row happen about once in 3,125 windows, and at 60% the breaker flaps. Use a failure rate over a
   window with a minimum call count.

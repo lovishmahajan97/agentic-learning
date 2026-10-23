@@ -54,23 +54,32 @@ Facts and constraints, with illustrative figures:
 - **Safety.** No forbidden refund may reach users. The team's worry is a task that misbehaves in about
   1 run in 10.
 - **Flip rate.** About one task in fifteen changes verdict between bundles (f ≈ 0.067). On 300 paired
-  tasks the 95% half-width is 1.96 × √(0.067 / 300) ≈ ±2.9 points.
+  tasks the standard error of the delta is √(0.067 / 300) ≈ 1.5 points and the 95% half-width is
+  1.96 × 1.5 ≈ ±2.9 points. A truly equal candidate's observed delta scatters around 0 by that 1.5 points,
+  so its lower bound sits near −2.9 on average and below that about half the time.
 - **Detection over repeats.** A task that is unsafe 1 run in 10 is caught by k repeats with probability
   1 − 0.9^k: 10% at k = 1, 41% at k = 5 and 65% at k = 10.
 
 ### Options
-| Option | How it works | Runs per candidate | Flaking on noise | Catches a 1-in-10 unsafe task | Fits budget |
+| Option | How it works | Runs per candidate | What an equal candidate gets | Catches a 1-in-10 unsafe task | Fits budget |
 |---|---|---|---|---|---|
-| **A. Block if below the stored champion score** | Today's gate, safety run once | 300 + 50 = 350 | High: one-point moves block | 10% | Yes |
-| **B. Paired non-inferiority, δ = 2, safety once** | Champion re-run on the same tasks, slices block | 600 + 50 = 650 | Frequent reviews: ±2.9 is wider than δ | 10% | Yes |
-| **C. Paired, δ = 3, safety k = 5, slices review-only, budgets on steps and cost** | Three outcomes, every safety repeat must pass | 600 + 250 = 850 | Low: an equal candidate's lower bound of about −2.9 clears −3 | 41% | Yes |
-| **D. As C with safety k = 10** | Twice the safety repeats | 600 + 500 = 1,100 | Low | 65% | No |
+| **A. Block if below the stored champion score** | Today's gate, safety run once | 300 + 50 = 350 | Blocked about half the time, so engineers re-run until green | 10% | Yes |
+| **B. Paired non-inferiority, δ = 2, safety once** | Champion re-run on the same tasks, slices block | 600 + 50 = 650 | Review about 3 times in 4: passing needs an observed delta above +0.9 | 10% | Yes |
+| **C. Paired, δ = 3, safety k = 5, slices review-only, budgets on steps and cost** | Three outcomes, every safety repeat must pass | 600 + 250 = 850 | Pass about half the time (observed delta above −0.1), review otherwise, never a block | 41% | Yes |
+| **D. As C with safety k = 10** | Twice the safety repeats | 600 + 500 = 1,100 | Same as C | 65% | No |
+
+The equal-candidate column uses the normal approximation: an equal candidate passes when its observed
+delta minus 2.9 is above −δ, with the delta's standard error at 1.5 points.
 
 ### Decision
 Choose **C**:
 - **δ follows the product tolerance and the noise floor.** The 3-point tolerance is just above the
-  ±2.9-point half-width, so an unchanged candidate passes instead of landing in review. B's δ = 2 is
-  tighter than the noise floor, which is the pitfall that produces re-runs.
+  ±2.9-point half-width, the tightest margin this task set can support. B's δ = 2 is tighter than the
+  noise floor, which is the pitfall that produces re-runs: it sends about three in four equal candidates
+  to review against C's one in two.
+- **Inconclusive goes to a route, not a re-run.** About half of equal candidates still land in review
+  under C. That is the honest price of 300 tasks, and it replaces A's blind re-runs with a defined next
+  step.
 - **Safety repeats fit the budget.** k = 5 costs 250 runs, and 850 stays within 1,000. D's k = 10 does not
   fit.
 - **Slice verdicts go to review, not block.** A 40-item slice cannot decide a 4-point margin
@@ -90,6 +99,9 @@ What would change it:
   per-task failures across repeats rather than the pass rate.
 - **Two-point regressions can ship.** That is what δ = 3 means. Watch the canary's online success
   against the champion.
+- **Equal candidates often need review.** At 2 candidates a week, expect about one review a week. Watch
+  the review rate on candidates later judged neutral; if it stays high, grow the task set, since more
+  tasks, not a looser δ, narrow the interval.
 - **Slice reviews cost human time.** Watch the review-queue age; a growing queue means grow the slice.
 - **Overrides remain possible.** Record approver, reason and expiry, and watch the override rate.
 

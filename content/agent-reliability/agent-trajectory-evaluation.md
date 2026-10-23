@@ -5,7 +5,8 @@ name: Agent trajectory evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -44,6 +45,198 @@ over many runs per task, so you learn where and why the agent fails.
   taxonomy you label against.
 - **What you can skip.** Exact-match trajectory baselines and leaderboard chasing. Outcome on end state,
   ordered required actions, policy checks and enough repeats beat clever scoring.
+
+## Lab
+### Task
+Score ten recorded runs of a refund agent (two tasks, five runs each) and make the release decision from
+the trajectories, not from the agent's final message. Every run ends with "Done, the refund is
+processed", including the ones that never refunded. Time box: 60-90 min.
+- **Prerequisites:** Eval harness; pass@k; Structured event streams; the scorer example in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest` (checked with Python 3.13 and pytest 9.1, stdlib
+  `math.comb`). Save the starter as `lab.py` and the tests as `test_lab.py`.
+- **No model:** `record` is a fake environment plus recorder that turns scripted tool calls into a
+  trajectory and an end state, so every run is reproducible.
+- **You implement four functions:** `score_run`, `failure_class`, `wilson` and `gate`.
+
+### Starter code
+```python
+"""Lab: score recorded agent trajectories and decide a release. Run: python lab.py"""
+import json
+from collections import Counter
+from math import comb, sqrt
+
+def ok_subsequence(actions: list[str], required: list[str]) -> bool:
+    """Required actions appear in order; other actions may be interleaved."""
+    it = iter(actions)
+    return all(any(a == r for a in it) for r in required)
+
+def record(order_id: str, *calls):
+    """A fake environment plus recorder: runs (name, args) calls, returns (trajectory, end_state)."""
+    trajectory, refunded = [], 0
+    for name, args in calls:
+        trajectory.append({"type": "tool.call.requested", "name": name, "arguments": args})
+        if name == "refund" and args["order_id"] == order_id:
+            refunded += args["amount"]
+        trajectory.append({"type": "tool.call.result", "name": name, "ok": True})
+    trajectory.append({"type": "run.completed", "answer": "Done, the refund is processed."})  # always claims success
+    return trajectory, {"orders": {order_id: {"refunded": refunded}}}
+
+LOOKUP = lambda o: ("lookup_order", {"order_id": o})
+REFUND = lambda o, amt: ("refund", {"order_id": o, "amount": amt})
+
+TASKS = {
+    "A1-full": {"order": "A1", "amount": 40}, "A2-half": {"order": "A2", "amount": 20},
+}
+for spec in TASKS.values():
+    spec.update(required_order=["lookup_order", "refund"], forbidden_tools={"delete_order"},
+                write_tools={"refund", "delete_order"}, reference_steps=2)
+    spec["success"] = (lambda o, amt: lambda s: s["orders"][o]["refunded"] == amt)(spec["order"], spec["amount"])
+
+RUNS = {   # 5 recorded runs per task
+    "A1-full": [record("A1", LOOKUP("A1"), REFUND("A1", 40)),
+                record("A1", LOOKUP("A1"), ("search", {"q": "refund policy"}), REFUND("A1", 40)),
+                record("A1", REFUND("A1", 40), LOOKUP("A1")),
+                record("A1", LOOKUP("A1"), ("delete_order", {"order_id": "A1"}), REFUND("A1", 40)),
+                record("A1", LOOKUP("A1"), LOOKUP("A1"), REFUND("A1", 40))],
+    "A2-half": [record("A2", LOOKUP("A2"), REFUND("A2", 20)),
+                record("A2", LOOKUP("A2"), REFUND("A2", 40)),
+                record("A2", LOOKUP("A2")),
+                record("A2", LOOKUP("A2"), REFUND("A2", 20)),
+                record("A2", LOOKUP("A2"), REFUND("A2", 20))],
+}
+
+def score_run(trajectory: list[dict], task: dict, end_state: dict) -> dict:
+    """Return {"success", "violations", "order_ok", "steps", "efficiency", "redundant_calls"}.
+    - success: task["success"](end_state) AND zero violations AND order_ok (for this task class the
+      required order is part of success). Never read the agent's own answer.
+    - violations: number of calls to task["forbidden_tools"]
+    - order_ok: ok_subsequence(actions, task["required_order"])
+    - steps: number of tool calls; efficiency: reference_steps / max(steps, 1), rounded to 2 places
+    - redundant_calls: repeats of the same (name, arguments) with NO call to a write tool in between"""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def failure_class(trajectory: list[dict], task: dict, end_state: dict) -> str | None:
+    """None for a successful run; otherwise the first matching rule:
+    "policy_violation" (a forbidden tool was called), "gave_up" (the last required action never ran),
+    "wrong_order" (required actions present but out of order), else "wrong_arguments"."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def wilson(c: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """95% Wilson score interval for c successes in n runs, each bound rounded to 3 places."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+def gate(scores: dict[str, list[dict]], k: int = 3, min_pass_hat_k: float = 0.6) -> dict:
+    """Release gate. Return {"pass_rate", "interval", "pass_hat_k", "violation_runs", "ship"}:
+    pass_rate over all runs (3 places); interval = wilson over all runs; pass_hat_k = mean over tasks of
+    comb(c, k) / comb(n, k) (3 places; never pass_rate ** k); violation_runs = runs with violations > 0;
+    ship only if violation_runs == 0 and pass_hat_k >= min_pass_hat_k."""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    scores, classes = {}, Counter()
+    for name, runs in RUNS.items():
+        task = TASKS[name]
+        scores[name] = [score_run(t, task, s) for t, s in runs]
+        for i, ((t, s), sc) in enumerate(zip(runs, scores[name]), 1):
+            cls = failure_class(t, task, s)
+            if cls:
+                classes[cls] += 1
+            print(f"{name} run {i}: success={sc['success']!s:<5} steps={sc['steps']} "
+                  f"redundant={sc['redundant_calls']} class={cls}")
+    print("histogram:", dict(sorted(classes.items())))
+    print("gate:", gate(scores))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+A1-full run 1: success=True  steps=2 redundant=0 class=None
+A1-full run 2: success=True  steps=3 redundant=0 class=None
+A1-full run 3: success=False steps=2 redundant=0 class=wrong_order
+A1-full run 4: success=False steps=3 redundant=0 class=policy_violation
+A1-full run 5: success=True  steps=3 redundant=1 class=None
+A2-half run 1: success=True  steps=2 redundant=0 class=None
+A2-half run 2: success=False steps=2 redundant=0 class=wrong_arguments
+A2-half run 3: success=False steps=1 redundant=0 class=gave_up
+A2-half run 4: success=True  steps=2 redundant=0 class=None
+A2-half run 5: success=True  steps=2 redundant=0 class=None
+histogram: {'gave_up': 1, 'policy_violation': 1, 'wrong_arguments': 1, 'wrong_order': 1}
+gate: {'pass_rate': 0.6, 'interval': (0.313, 0.832), 'pass_hat_k': 0.1, 'violation_runs': 1, 'ship': False}
+```
+
+Each task has 3 successes in 5 runs, so pass^3 per task is C(3, 3) / C(5, 3) = 1/10 = 0.1. A final-answer
+check would have scored all ten runs as passes.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (Python 3.13, pytest 9.1).
+
+```python
+from lab import LOOKUP, REFUND, RUNS, TASKS, failure_class, gate, record, score_run, wilson
+
+A1 = TASKS["A1-full"]
+
+def test_outcome_comes_from_end_state_not_the_agents_claim():
+    t, s = record("A1", LOOKUP("A1"))                     # claims "Done" but never refunded
+    assert t[-1]["answer"].startswith("Done") and score_run(t, A1, s)["success"] is False
+    t, s = record("A1", LOOKUP("A1"), ("search", {"q": "x"}), REFUND("A1", 40))
+    sc = score_run(t, A1, s)
+    assert sc["success"] is True and sc["order_ok"] is True and sc["steps"] == 3 and sc["efficiency"] == 0.67
+
+def test_a_policy_violation_zeroes_a_correct_outcome():
+    t, s = record("A1", LOOKUP("A1"), ("delete_order", {"order_id": "A1"}), REFUND("A1", 40))
+    assert A1["success"](s) is True
+    sc = score_run(t, A1, s)
+    assert sc["success"] is False and sc["violations"] == 1
+
+def test_redundant_calls_reset_after_a_write():
+    t, s = record("A1", LOOKUP("A1"), LOOKUP("A1"), REFUND("A1", 40), LOOKUP("A1"))
+    assert score_run(t, A1, s)["redundant_calls"] == 1       # the re-check after the refund is legitimate
+
+def test_failure_classes_follow_the_first_matching_rule():
+    labels = [failure_class(t, A1, s) for t, s in RUNS["A1-full"]]
+    assert labels == [None, None, "wrong_order", "policy_violation", None]
+    labels = [failure_class(t, TASKS["A2-half"], s) for t, s in RUNS["A2-half"]]
+    assert labels == [None, "wrong_arguments", "gave_up", None, None]
+
+def test_wilson_interval():
+    assert wilson(6, 10) == (0.313, 0.832)
+    assert wilson(50, 50)[1] == 1.0 and wilson(50, 50)[0] > 0.9
+
+def test_gate_averages_pass_hat_k_per_task_and_blocks_on_violations():
+    scores = {name: [score_run(t, TASKS[name], s) for t, s in runs] for name, runs in RUNS.items()}
+    g = gate(scores)
+    assert g == {"pass_rate": 0.6, "interval": (0.313, 0.832), "pass_hat_k": 0.1,
+                 "violation_runs": 1, "ship": False}
+    perfect = {"x": [{"success": True, "violations": 0}] * 5, "y": [{"success": False, "violations": 0}] * 5}
+    assert gate(perfect)["pass_hat_k"] == 0.5 and gate(perfect, min_pass_hat_k=0.5)["ship"] is True
+```
+
+### Failure scenarios
+- **Score the `run.completed` answer.** Every run passes, including the one that never refunded and the
+  one that refunded 40 instead of 20. Sample passing runs and check the end state; the claim and the
+  state must agree.
+- **Count violations only when the outcome is wrong.** Run 4 of A1 passes and the gate ships an agent
+  that deletes orders. A violation must zero the run before any other score is read.
+- **Count every repeated signature as redundant.** The re-check after a refund is flagged, and an
+  efficiency push teaches the agent to skip verification. Reset the seen set whenever a write tool runs.
+- **Compute pass^3 as `pass_rate ** 3`.** You get 0.216 instead of 0.1 here, and on a mixed suite the
+  pooled number can be off in either direction. Keep the per-task table next to the suite figure.
+
+### Submission
+- **`lab.py`** with the four functions implemented; `record`, `TASKS` and `RUNS` unchanged.
+- **A green test run** (6 passed) and the printed output of `python lab.py`.
+- **One extra recorded run** of your own that reaches the right end state by a shorter valid path, with
+  the score it gets and why.
+- **A three-line release note:** ship or block, citing the violation count, pass^3 and the interval,
+  and the failure class you would fix first.
+- **Evaluated on:** outcomes read from end state, violations that zero a run, failure classes assigned
+  by rule, and a gate that uses per-task pass^k with an interval.
 
 ## Why it exists
 - **An agent produces a trajectory, not an output.** Single-turn evaluation compares an output to a

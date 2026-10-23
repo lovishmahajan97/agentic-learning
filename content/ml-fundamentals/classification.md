@@ -5,7 +5,7 @@ name: Classification
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -158,8 +158,8 @@ flowchart TD
   0.8 means right 80% of the time. Check a reliability curve, and calibrate before a threshold uses it.
 - **"99% accuracy means the guardrail works."** With 1% positives, flagging nothing also scores 99%.
   Look at the confusion matrix and per-class recall at the deployed threshold.
-- **"The LLM told me it is 90% sure, so I have a confidence score."** Verbal confidence has little
-  relation to observed accuracy. Read the label tokens' log-probabilities over a closed label set,
+- **"The LLM told me it is 90% sure, so I have a confidence score."** Verbalised confidence is poorly
+  calibrated and usually overconfident against observed accuracy. Read the label tokens' log-probabilities over a closed label set,
   normalise and calibrate them.
 - **"Softmax works for any set of labels."** It forces classes to compete for a total of one, so a
   reply that violates two policies cannot get both tags. Use an independent sigmoid per tag.

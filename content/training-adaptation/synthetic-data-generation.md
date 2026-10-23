@@ -5,7 +5,7 @@ name: Synthetic data generation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -172,8 +172,9 @@ flowchart TD
 - **"A stronger generator is what makes synthetic data good."** Generation is cheap and errors are the
   norm; the verifier deciding which samples survive sets the quality. For agent tasks, an executed end
   state or a construction-first label beats any generator upgrade.
-- **"Turn up the temperature to get diversity."** A sampled generator collapses onto its favourite names,
-  openings and structures at any temperature. Diversity comes from seeds with a novelty filter, evolution
+- **"Turn up the temperature to get diversity."** Temperature adds token-level noise and errors long
+  before it adds new topics or task structures, so a sampled generator still collapses onto its favourite
+  names, openings and structures. Diversity comes from seeds with a novelty filter, evolution
   axes, personas and grounding in real artefacts, measured with distinct-n.
 - **"An LLM judge reading the transcript can verify an agent task."** A judge accepts a confident "refund
   issued" message; only checking the sandbox's end state shows whether there was no refund, or two.

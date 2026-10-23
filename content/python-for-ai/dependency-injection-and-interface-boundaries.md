@@ -5,7 +5,7 @@ name: Dependency injection & interface boundaries
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -46,7 +46,7 @@ milliseconds and swap providers in one file.
 Implement a tool-calling agent loop that receives its model, tools and clock from outside, plus the
 composition root that picks the real adapter from config. The goal is an agent whose routing, error
 handling and step budget are proven in CI with no key, no network and no flaky text. Time box: 45-60 min.
-- **Prerequisites:** Protocols, generics & structural typing; Test doubles, mocks & fixtures.
+- **Prerequisites:** Protocols, generics and structural typing; Test doubles, mocks & fixtures.
 - **Setup:** Python 3.10+ and `pip install pytest`. Save the starter as `lab.py` and the tests as
   `test_lab.py` in one folder.
 - **Rules:** fill in the two `YOUR CODE HERE` functions only; `lab.py` must import cleanly with no
@@ -91,7 +91,8 @@ class Agent:
         # - transcript starts as [{"role": "user", "content": task}]
         # - read self.clock() once at the start and once just before returning
         # - final answer (tool_call is None): return RunResult(answer, tools_called, elapsed_s)
-        # - tool call: append {"role": "tool", "name": name, "content": result}
+        # - tool call: record name in tools_called (unknown names too), then append
+        #   {"role": "tool", "name": name, "content": result}
         # - unknown tool, or a tool that raises: content is "error: <message>", the run continues
         # - after max_steps model calls without an answer: raise StepBudgetExceeded
         raise NotImplementedError

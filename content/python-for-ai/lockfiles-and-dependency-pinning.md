@@ -5,7 +5,7 @@ name: Lockfiles & dependency pinning
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -220,9 +220,9 @@ def test_unchanged_lock_needs_nothing():
   `Version(v).release[0] == 0` before deciding.
 - **Keep the project's own entry.** `support-agent 0.4.0 -> 0.5.0` shows up as a dependency change on
   every release. Print each package's `source` table; the project has `editable` (or `virtual`).
-- **Fingerprint the parsed dict instead of the file bytes.** Two locks that differ only in hashes or
-  markers get the same fingerprint, so an eval result points at the wrong environment. Hash the exact
-  bytes you commit.
+- **Fingerprint the `packages()` dict instead of the file bytes.** The review test's fingerprint
+  assertion fails, and two locks that differ only in hashes, markers or sources get the same
+  fingerprint, so an eval result points at the wrong environment. Hash the exact bytes you commit.
 
 ### Submission
 - **`lab.py`** with `packages`, `classify` and `review` implemented.

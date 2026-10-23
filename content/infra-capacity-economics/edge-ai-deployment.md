@@ -5,7 +5,7 @@ name: Edge AI deployment
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -45,7 +45,8 @@ decode, so keep tools few and escalate hard tasks.
 A logistics firm gives warehouse technicians a rugged handheld with a diagnostic agent that reads the
 device's scan logs and opens tickets. All device figures are illustrative and match the calculator
 below.
-- **Device:** the app may use 3 GB; memory bandwidth ~50 GB/s; prefill ~300 tokens per second.
+- **Device:** the app may use 3 GB; memory bandwidth ~50 GB/s; prefill ~300 tokens per second; a
+  2,048-token context costs ~0.23 GB of KV cache for the 3B model shape in the calculator.
 - **Task shape:** a typical diagnosis is 5 steps, each adding ~200 tokens of tool result and emitting a
   ~40-token tool call; the cloud agent's system prompt and schemas are 1,200 tokens.
 - **Constraints:** many sites have no signal in the loading bays; scan logs must not leave the device

@@ -5,8 +5,8 @@ name: Eval harness
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: typed
-lesson_type: concept
+status: typed-verified
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -43,6 +43,284 @@ repeatable artifact with the status of a test suite.
   budgets, what goes in the run manifest, the graders, sample count *k*, and which runs block merges.
 - **What you can skip.** Building dashboards before the basics. Pinning, stored raw outputs and
   trajectories, error reporting and a paired diff against a baseline matter far more.
+
+
+## Lab
+### Task
+Build the core of a harness for a tool-calling agent, in five parts:
+- **Runner:** retries only provider errors and records a budget overrun once, as a failure.
+- **Cache:** keyed on configuration, item and sample, and never storing an error.
+- **Grading pass** over the stored records.
+- **Per-slice report** that keeps errors visible next to the pass rate.
+- **CI gate** that compares against a baseline on the same items and a measured noise floor.
+
+The agent is a local fake (`ToyAgent`) that rate-limits one task, times out on another, loops on a
+third under the new prompt, and varies between runs like a hosted model at temperature 0. No API key or
+network is needed. Time box: 75-100 minutes.
+- **Prerequisites:** Model evaluation and Golden dataset; this lesson's How it works and, under
+  Examples, the minimal harness and the CI gate.
+- **Agent goal:** after this, a LangSmith, Braintrust or Inspect runner is your `run_eval` with someone
+  else's storage, and you know which of its settings decide whether the score can be trusted.
+- **Setup:** Python 3.9+ standard library for the starter, plus `pip install pytest` (checked on Python
+  3.9.6 and 3.12 with pytest 8.4.2). Save the starter as `lab_harness.py` and the tests as
+  `test_lab_harness.py` in the same folder.
+- **Done:** `python lab_harness.py` prints the expected output and `pytest -q` shows 8 passed.
+
+### Starter code
+```python
+"""Lab: a small agent eval harness (checked on Python 3.9 and 3.12, stdlib only).
+
+items -> run every item k times (retries, budgets, cache) -> stored records -> grade -> per-slice
+summary with errors reported -> paired gate against a baseline and a measured noise floor.
+The agent is a local fake, so no API key or network is needed.
+"""
+import hashlib, json, math, random
+from collections import Counter
+
+
+class TransientError(Exception):
+    """Rate limit or timeout from the provider: retry it."""
+
+
+class BudgetExceeded(Exception):
+    """The agent hit its step budget: an agent failure, never retried."""
+
+
+def task(i, slc, amount):
+    return {"id": f"t{i:02d}", "slice": slc, "input": f"refund order {i}",
+            "expected_refund": amount, "max_steps": 8}
+
+
+DATASET = [task(i, "refund", 20.0 + i) for i in range(1, 7)] + [task(i, "shipping", 0.0) for i in range(7, 13)]
+SUCCESS = {("v1", "refund"): 0.85, ("v1", "shipping"): 0.80, ("v2", "refund"): 0.70, ("v2", "shipping"): 0.95}
+
+
+class ToyAgent:
+    """Stand-in for your agent loop. Varies with run_seed, like a hosted model that is not
+    deterministic at temperature 0. Counts every call so you can see retries and cache hits."""
+
+    def __init__(self):
+        self.calls = Counter()
+
+    def __call__(self, item, config, sample):
+        self.calls[(item["id"], sample)] += 1
+        n = self.calls[(item["id"], sample)]
+        if item["id"] == "t07" and n % 3:
+            raise TransientError("429 rate limited")          # succeeds on every third attempt
+        if item["id"] == "t11":
+            raise TransientError("timeout after 60s")         # the long task the provider never finishes
+        if item["id"] == "t04" and config["prompt_version"] == "v2":
+            raise BudgetExceeded("max_steps=8: lookup_order called in a loop")
+        rng = random.Random(f"{item['id']}|{config['prompt_version']}|{config['run_seed']}|{sample}")
+        ok = rng.random() < SUCCESS[(config["prompt_version"], item["slice"])]
+        refund = item["expected_refund"] if ok else item["expected_refund"] + 5.0
+        return {"refund": refund, "steps": rng.randint(3, 7)}
+
+
+def sha(obj) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def grade_state(output, item) -> bool:
+    """Provided grader: final state correct and within the step budget."""
+    return output["refund"] == item["expected_refund"] and output["steps"] <= item["max_steps"]
+
+
+def wilson(k, n, z=1.96):
+    """Provided: 95% Wilson interval, sane at 0/n and n/n."""
+    if n == 0:
+        return None
+    p, d = k / n, 1 + z * z / n
+    c, h = (p + z * z / (2 * n)) / d, z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return (round(c - h, 3), round(c + h, 3))
+
+
+def run_one(target, item, config, sample, retries=3) -> dict:
+    """LAB 1: call target(item, config, sample) at most `retries` times in total, retrying only
+    TransientError (no sleep needed here). Return {"id", "slice", "sample", "output", "error",
+    "budget_exceeded"}: on success output is the result; when retries run out, output is None and
+    error is repr() of the last exception; BudgetExceeded is caught once, not retried, and recorded
+    with budget_exceeded=True, output None and error None."""
+    raise NotImplementedError
+
+
+def run_eval(items, target, config, k=3, cache=None) -> dict:
+    """LAB 2: run every item k times (sample = 0..k-1) and return
+    {"manifest": {"config_sha", "dataset_sha", "k", **config}, "records": [one record per run]}.
+    config_sha = sha(config), dataset_sha = sha(items). If cache (a dict) is given, key it on
+    (config_sha, item id, sample): reuse a hit without calling target, and never cache an error."""
+    raise NotImplementedError
+
+
+def grade(run, items) -> dict:
+    """LAB 3: return {(id, sample): {"slice", "pass"}} for every record of the run: pass is None for
+    an error, False for a budget overrun, otherwise grade_state(output, item) for the matching item."""
+    raise NotImplementedError
+
+
+def summarize(graded) -> dict:
+    """LAB 4: per slice (sorted) {"n": graded runs, "errors": errored runs, "pass": rate over graded
+    runs rounded to 3 places, "ci95": wilson(passes, n)}. Errors are reported, never silently dropped."""
+    raise NotImplementedError
+
+
+def gate(base_run, cand_run, items, noise_floor, slice_floors, max_error_rate=0.10):
+    """LAB 5: raise ValueError naming the field if dataset_sha or k differ. Compare grade() results on
+    the same (id, sample) pairs where both have a verdict; return (problems, (gained, lost)).
+    problems lists, in this order: "error rate <errored>/<runs>" if the candidate's error share is above
+    max_error_rate, "flips <= noise floor" if gained + lost <= noise_floor, and each slice whose
+    summarize() pass rate is below its floor as "slice <name>: <rate> below <floor>"."""
+    raise NotImplementedError
+
+
+if __name__ == "__main__":
+    agent = ToyAgent()
+    cache = {}
+    base = run_eval(DATASET, agent, {"model": "toy-2026-09-01", "prompt_version": "v1", "run_seed": 1}, cache=cache)
+    first = sum(agent.calls.values())
+    run_eval(DATASET, agent, {"model": "toy-2026-09-01", "prompt_version": "v1", "run_seed": 1}, cache=cache)
+    print(f"agent calls: first run {first}, cached re-run {sum(agent.calls.values()) - first}")
+    rerun = run_eval(DATASET, ToyAgent(), {"model": "toy-2026-09-01", "prompt_version": "v1", "run_seed": 2})
+    cand = run_eval(DATASET, ToyAgent(), {"model": "toy-2026-09-01", "prompt_version": "v2", "run_seed": 3})
+    for name, run in (("base", base), ("cand", cand)):
+        for slc, s in summarize(grade(run, DATASET)).items():
+            print(name, slc, s)
+    _, (g, l) = gate(base, rerun, DATASET, noise_floor=0, slice_floors={})
+    print("noise floor (v1 vs v1):", g + l, "flips")
+    problems, flips = gate(base, cand, DATASET, noise_floor=g + l, slice_floors={"refund": 0.75, "shipping": 0.75})
+    print("candidate vs base (gained, lost):", flips)
+    print("gate:", "BLOCK" if problems else "PASS", problems)
+```
+
+As given, the script stops with `NotImplementedError` in `run_eval`, and every test fails with
+`NotImplementedError` until the five LAB items are done. Do not change `ToyAgent`, `DATASET`,
+`SUCCESS`, `sha`, `grade_state` or `wilson`.
+
+### Expected output
+```
+agent calls: first run 48, cached re-run 9
+base refund {'n': 18, 'errors': 0, 'pass': 0.778, 'ci95': (0.548, 0.91)}
+base shipping {'n': 15, 'errors': 3, 'pass': 0.8, 'ci95': (0.548, 0.93)}
+cand refund {'n': 18, 'errors': 0, 'pass': 0.556, 'ci95': (0.337, 0.754)}
+cand shipping {'n': 15, 'errors': 3, 'pass': 0.933, 'ci95': (0.702, 0.988)}
+noise floor (v1 vs v1): 8 flips
+candidate vs base (gained, lost): (7, 9)
+gate: BLOCK ['slice refund: 0.556 below 0.75']
+```
+
+- **Calls:** the first run makes 48 agent calls, 36 runs plus two extra attempts on each of the 6
+  rate-limited or timed-out runs. The cached re-run makes 9, because only the errored task is retried.
+- **Errors stay visible:** the `shipping` slice shows 15 graded runs and 3 errors, not 15 out of 15.
+- **Noise floor:** the unchanged prompt on a new run seed flips 8 runs, so the candidate's 16 flips are
+  above the floor.
+- **Verdict:** the candidate wins on shipping but loses on refund, partly to the looping task, and the
+  refund floor blocks it.
+
+### Tests
+```python
+import pytest
+import lab_harness as lab
+
+V1 = {"model": "toy-2026-09-01", "prompt_version": "v1", "run_seed": 1}
+V2 = {"model": "toy-2026-09-01", "prompt_version": "v2", "run_seed": 3}
+ITEM = {it["id"]: it for it in lab.DATASET}
+
+
+def test_transient_errors_are_retried_until_success():
+    agent = lab.ToyAgent()
+    r = lab.run_one(agent, ITEM["t07"], V1, sample=0, retries=3)
+    assert agent.calls[("t07", 0)] == 3
+    assert r["error"] is None and r["output"] is not None and r["budget_exceeded"] is False
+
+
+def test_exhausted_retries_become_an_error_record():
+    agent = lab.ToyAgent()
+    r = lab.run_one(agent, ITEM["t11"], V1, sample=0, retries=3)
+    assert agent.calls[("t11", 0)] == 3
+    assert r["output"] is None and "timeout" in r["error"]
+
+
+def test_budget_overrun_is_a_failure_and_never_retried():
+    agent = lab.ToyAgent()
+    r = lab.run_one(agent, ITEM["t04"], V2, sample=0, retries=3)
+    assert agent.calls[("t04", 0)] == 1
+    assert r["budget_exceeded"] is True and r["error"] is None
+    graded = lab.grade(lab.run_eval([ITEM["t04"]], lab.ToyAgent(), V2, k=3), [ITEM["t04"]])
+    assert [v["pass"] for v in graded.values()] == [False, False, False]
+
+
+def test_errors_are_reported_not_dropped():
+    s = lab.summarize(lab.grade(lab.run_eval(lab.DATASET, lab.ToyAgent(), V1), lab.DATASET))
+    assert s["shipping"]["errors"] == 3 and s["shipping"]["n"] == 15
+    assert s["refund"] == {"n": 18, "errors": 0, "pass": 0.778, "ci95": (0.548, 0.91)}
+
+
+def test_manifest_pins_config_and_dataset():
+    run = lab.run_eval(lab.DATASET, lab.ToyAgent(), V1, k=3)
+    m = run["manifest"]
+    assert m["k"] == 3 and m["prompt_version"] == "v1" and m["model"] == "toy-2026-09-01"
+    assert m["config_sha"] == lab.sha(V1) and m["dataset_sha"] == lab.sha(lab.DATASET)
+    assert len(run["records"]) == 36
+
+
+def test_cache_keys_on_config_and_sample_and_never_stores_errors():
+    agent, cache = lab.ToyAgent(), {}
+    first = lab.run_eval(lab.DATASET, agent, V1, cache=cache)
+    before = sum(agent.calls.values())
+    again = lab.run_eval(lab.DATASET, agent, V1, cache=cache)
+    assert sum(agent.calls.values()) - before == 9                 # only t11 is called again, 3 x 3
+    assert [r["output"] for r in again["records"]] == [r["output"] for r in first["records"]]
+    t01 = [r["output"] for r in first["records"] if r["id"] == "t01"]
+    assert len({str(o) for o in t01}) > 1                          # k samples are distinct, not one output x3
+    before = sum(agent.calls.values())
+    lab.run_eval(lab.DATASET, agent, {**V1, "prompt_version": "v2"}, cache=cache)
+    assert sum(agent.calls.values()) - before >= 36                # a changed config misses the cache
+
+
+def test_gate_measures_flips_and_blocks_on_the_slice_floor():
+    base = lab.run_eval(lab.DATASET, lab.ToyAgent(), V1)
+    rerun = lab.run_eval(lab.DATASET, lab.ToyAgent(), {**V1, "run_seed": 2})
+    cand = lab.run_eval(lab.DATASET, lab.ToyAgent(), V2)
+    _, (g, l) = lab.gate(base, rerun, lab.DATASET, noise_floor=0, slice_floors={})
+    assert g + l == 8
+    problems, flips = lab.gate(base, cand, lab.DATASET, noise_floor=8,
+                               slice_floors={"refund": 0.75, "shipping": 0.75})
+    assert flips == (7, 9)
+    assert problems == ["slice refund: 0.556 below 0.75"]
+
+
+def test_gate_refuses_runs_on_different_datasets():
+    base = lab.run_eval(lab.DATASET, lab.ToyAgent(), V1)
+    smaller = lab.run_eval(lab.DATASET[:-1], lab.ToyAgent(), V2)
+    with pytest.raises(ValueError, match="dataset_sha"):
+        lab.gate(base, smaller, lab.DATASET, noise_floor=0, slice_floors={})
+```
+
+### Failure scenarios
+- **Inject: grade errored records as failures (`pass = False`).** Observe: base `shipping` drops from
+  0.8 to 0.667 on 18 runs with 0 errors, and `test_errors_are_reported_not_dropped` fails. Debug: compare
+  `n + errors` with items times *k*, then read the error strings; a provider timeout has entered a
+  quality metric.
+- **Inject: skip errored records in `grade` instead of marking them `None`.** Observe: `shipping` still
+  reads 0.8, but with 0 errors on 15 runs, so the outage has vanished from the report. Debug: the same
+  `n + errors` check; it must equal 36.
+- **Inject: catch `BudgetExceeded` together with `TransientError`.** Observe: `t04` is called 3 times
+  per sample, the candidate's refund slice rises to 0.667 on 15 runs because the looping task left the
+  denominator, and the gate reports 6 of 36 errors. Debug: count agent calls per (id, sample) and read
+  the exception type behind each error.
+- **Inject: drop the sample index from the cache key.** Observe: the first run makes 22 calls instead
+  of 48, base `refund` shows n = 6, and the noise floor falls to 2 flips. Debug: list the outputs for
+  one item across samples; identical outputs mean *k* = 3 was one sample served three times.
+
+### Submission
+- **Code:** `lab_harness.py` with LAB 1-5 done and the provided agent, data and helpers unchanged.
+- **Test run:** `pytest -q` showing 8 passed, plus script output that matches Expected output exactly.
+- **One mutation log:** apply one injected fault above, paste the failing test name and the changed
+  output lines, then revert it.
+- **A short note (3-5 sentences):** why the candidate is blocked even though its flips beat the noise
+  floor, and what you would change before re-running it.
+- **Evaluation:** a reviewer runs your file against the unmodified tests and diffs the output; any
+  edit to the provided parts, or an output that differs, fails the submission.
 
 ## Why it exists
 - **The notebook loop works once.** Iterate over a CSV, call the model, eyeball outputs, count passes.
@@ -153,23 +431,6 @@ sequenceDiagram
     H->>H: per-slice pass rate with interval, paired diff vs baseline
     H-->>CI: exit code from thresholds and slice floors
 ```
-
-## Misconceptions
-- **"Items that error out should be left out of the score."** Timeouts hit the hardest, longest items,
-  so dropping them makes the score rise on the day the provider has an outage. Report errors, retry
-  transient ones, and never shrink the denominator silently.
-- **"Temperature 0 makes one run per item a measurement."** Hosted models often return different text at
-  temperature 0 and treat seeds as best-effort. Run the unchanged baseline twice, count the flips, and
-  gate on beating that noise floor.
-- **"Grading inside the run loop is simpler and just as good."** Running is the expensive part and
-  graders change often. Store raw outputs and trajectories first, so a rubric fix is a cheap re-grade
-  instead of a full re-run.
-- **"Retries make agent runs robust."** Retry only provider errors. A looping agent that hits its step
-  budget is an agent failure; retrying it triples the cost and hides the bug, so record it once as a
-  failure.
-- **"Pinning the model name is enough to reproduce a run."** An alias such as `latest` can move, and so
-  can the prompt, retrieval index, tool descriptions, dataset and grader versions. The manifest pins all
-  of them, so a diff between two manifests explains a diff between two scores.
 
 ## Examples
 ### A minimal harness in one file

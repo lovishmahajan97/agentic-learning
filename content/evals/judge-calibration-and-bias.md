@@ -5,7 +5,7 @@ name: Judge calibration & bias
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: evaluate
@@ -199,7 +199,7 @@ flowchart TD
   by TPR + TNR − 1. At TPR 0.95 and TNR 0.70 a real 10-point gap shows as 6.5 points, so small real gains
   fall into noise.
 - **"The strongest model is an unbiased judge."** Stronger judges show the same biases, only less, and
-  are more likely to share a family with the agent under test, which adds self-preference.
+  when the agent also runs on a frontier model they often share its family, which adds self-preference.
 - **"Judge-versus-majority above human-versus-human means the judge beats humans."** A majority label is
   less noisy than one annotator, so the comparison is not like for like. Labels written by humans cannot
   show a judge is better than them.

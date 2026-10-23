@@ -5,7 +5,7 @@ name: asyncio vs threads vs multiprocessing
 kind: decision
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:

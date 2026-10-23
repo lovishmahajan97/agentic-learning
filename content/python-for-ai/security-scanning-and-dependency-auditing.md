@@ -5,7 +5,7 @@ name: Security scanning & dependency auditing (pip-audit, Bandit)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -92,6 +92,7 @@ def load_exceptions(toml_text: str) -> dict[str, dict]:
 def gate(report: dict, exceptions: dict[str, dict], today: dt.date) -> tuple[int, list[str]]:
     # YOUR CODE HERE: return (exit_code, sorted action lines)
     # - de-duplicate findings by (package, id); an exception matches a finding by id or by any alias
+    # - in defer/expired lines, <id> is the exception's own id (the one the team wrote)
     # - exception with review_by >= today: "defer <id> until <review_by>: <reason>"   (passes)
     # - exception past review_by:          "expired <id> (review by <review_by>)"     (fails)
     # - unexcepted findings with fixes:    one "upgrade <pkg> <version> -> <highest fix>" per package

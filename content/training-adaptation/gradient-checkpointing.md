@@ -5,7 +5,7 @@ name: Gradient checkpointing
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 agent_relevance: useful
 lesson_type: concept
 related:

@@ -5,7 +5,7 @@ name: Function / tool calling
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -142,8 +142,9 @@ sequenceDiagram
 
 ## Misconceptions
 - **"The model calls the function."** It emits a `tool_use` block with an id, a name and JSON arguments
-  and stops; nothing runs until your code validates and executes it (server-side tools are declared
-  separately). An agent that says "I have sent the email" may have run nothing.
+  and stops; nothing runs until your code validates and executes it (server-side tools such as web
+  search are the exception: the provider runs those). An agent that says "I have sent the email" may
+  have run nothing.
 - **"A rule in the system prompt or tool description is enforced."** Prompt text guides; injection or a
   jailbreak can override it. A limit like "never refund more than $50" must be checked in the executor.
 - **"If the model has a tool, it will use it when it needs a fact."** Selection is a generation decision;

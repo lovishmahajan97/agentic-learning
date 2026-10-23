@@ -5,7 +5,8 @@ name: MCP architecture (hosts, clients, servers, JSON-RPC lifecycle, capability 
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/model-context-protocol
@@ -38,6 +39,246 @@ agreed, lets you debug and scale MCP-backed agents.
   protocol versions you accept, and how server failures are isolated from the agent loop.
 - **What you can skip.** Hand-writing JSON-RPC framing. The SDKs do it; you need to read a wire trace,
   not produce one.
+
+## Lab
+### Task
+Build the connection layer of an agent host: the client side of the handshake-era lifecycle,
+capability-aware discovery, and a connect step that isolates a hung server. This is the fix for the
+Check yourself scenario (one vendor server stalling every turn).
+
+The fake servers speak JSON-RPC as Python dicts, so you see every message without a subprocess or a model.
+
+Time box: 45-60 min.
+- **Prerequisites:** this lesson's How it works; `agents/model-context-protocol`; basic `asyncio`.
+- **Setup:** Python 3.10+ and `pip install pytest`; no MCP SDK needed (checked with Python 3.13, pytest
+  9.1). Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **You implement:** `Client.initialize` (version check, then `notifications/initialized`),
+  `Client.list_tools` (skip undeclared capabilities, follow `nextCursor`) and `connect_all` (concurrent
+  connects, each inside its own timeout).
+
+### Starter code
+```python
+"""Lab: the connection layer of an MCP host, against fake servers. Run: python lab.py"""
+import asyncio
+import itertools
+
+SUPPORTED = ("2025-11-25", "2025-06-18")   # protocol versions this host accepts, newest first
+CLIENT_CAPS: dict = {}                       # headless host: no elicitation, sampling or roots
+CONNECT_TIMEOUT = 0.5                        # seconds per server
+
+
+class ProtocolError(Exception):
+    def __init__(self, code: int, message: str):
+        super().__init__(f"{code} {message}")
+        self.code = code
+
+
+class VersionMismatch(Exception):
+    pass
+
+
+class FakeServer:
+    """Speaks handshake-era MCP as JSON-RPC dicts; stands in for a stdio subprocess."""
+
+    def __init__(self, name, versions, tools=(), prompts=False, page_size=2, connect_delay=0.0):
+        self.name, self.versions, self.tools = name, versions, list(tools)
+        self.prompts, self.page_size, self.connect_delay = prompts, page_size, connect_delay
+        self.seen: list[str] = []            # every method received, in order
+        self.ready = False
+
+    def caps(self) -> dict:
+        c = {}
+        if self.tools: c["tools"] = {"listChanged": False}
+        if self.prompts: c["prompts"] = {}
+        return c
+
+    async def handle(self, msg: dict) -> dict | None:
+        self.seen.append(msg["method"])
+        if "id" not in msg:                                   # a notification: no reply
+            if msg["method"] == "notifications/initialized": self.ready = True
+            return None
+        rid, method, params = msg["id"], msg["method"], msg.get("params", {})
+        if method == "initialize":
+            await asyncio.sleep(self.connect_delay)
+            asked = params["protocolVersion"]
+            version = asked if asked in self.versions else self.versions[0]
+            return {"jsonrpc": "2.0", "id": rid, "result": {
+                "protocolVersion": version, "capabilities": self.caps(),
+                "serverInfo": {"name": self.name, "version": "1.0"}}}
+        if not self.ready:
+            return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32600, "message": "not initialized"}}
+        if method == "tools/list" and self.tools:
+            start = int(params.get("cursor") or 0)
+            page = self.tools[start:start + self.page_size]
+            result = {"tools": [{"name": t, "inputSchema": {"type": "object"}} for t in page]}
+            if start + self.page_size < len(self.tools):
+                result["nextCursor"] = str(start + self.page_size)
+            return {"jsonrpc": "2.0", "id": rid, "result": result}
+        return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": f"no method {method}"}}
+
+
+class Client:
+    """One MCP client: exactly one connection to one server."""
+
+    def __init__(self, server: FakeServer):
+        self.server = server
+        self._ids = itertools.count(1)
+        self.version: str | None = None
+        self.server_caps: dict = {}
+        self.server_name: str | None = None
+
+    async def request(self, method: str, params: dict | None = None) -> dict:
+        rid = next(self._ids)                                 # unique among in-flight requests
+        resp = await self.server.handle({"jsonrpc": "2.0", "id": rid, "method": method, "params": params or {}})
+        assert resp["id"] == rid, "response correlated to the wrong request"
+        if "error" in resp:
+            raise ProtocolError(resp["error"]["code"], resp["error"]["message"])
+        return resp["result"]
+
+    async def notify(self, method: str, params: dict | None = None) -> None:
+        await self.server.handle({"jsonrpc": "2.0", "method": method, "params": params or {}})
+
+    async def initialize(self) -> None:
+        # YOUR CODE HERE: send "initialize" with protocolVersion SUPPORTED[0], capabilities CLIENT_CAPS
+        # and clientInfo {"name": "lab-host", "version": "0.1"}. If the returned protocolVersion is not
+        # in SUPPORTED, raise VersionMismatch(f"version {v} not supported"). Otherwise store version,
+        # server_caps and server_name, then send the "notifications/initialized" notification.
+        raise NotImplementedError
+
+    async def list_tools(self) -> list[str]:
+        # YOUR CODE HERE: return [] without any request if the server did not declare "tools";
+        # otherwise call "tools/list" and follow nextCursor until it is absent; return the names.
+        raise NotImplementedError
+
+
+async def connect_all(servers: list[FakeServer], timeout: float = CONNECT_TIMEOUT):
+    """Connect every server concurrently, each inside its own timeout.
+
+    Returns (clients, failed): clients maps server name -> initialized Client; failed maps
+    server name -> reason, "connect timeout after {timeout}s" or the VersionMismatch message.
+    """
+    # YOUR CODE HERE: one Client per server, asyncio.wait_for(client.initialize(), timeout) for each,
+    # all run together (asyncio.gather), so one hung server costs at most `timeout`, not a whole turn.
+    raise NotImplementedError
+
+
+def demo_servers() -> list[FakeServer]:
+    return [
+        FakeServer("tickets", ("2025-11-25", "2025-06-18"), tools=["search", "get", "create"]),
+        FakeServer("docs", ("2025-06-18",), tools=["lookup"]),
+        FakeServer("notes", ("2025-11-25",), prompts=True),
+        FakeServer("legacy", ("2024-11-05",), tools=["old_search"]),
+        FakeServer("vendor", ("2025-11-25",), tools=["crm_find"], connect_delay=30),
+    ]
+
+
+async def main():
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    clients, failed = await connect_all(demo_servers())
+    model_tools = []
+    for name, c in clients.items():
+        tools = [f"{name}__{t}" for t in await c.list_tools()]    # prefix: names stay unique
+        model_tools += tools
+        print(f"connected {c.server_name} {c.version} caps={sorted(c.server_caps)} tools={tools}")
+    for name, reason in failed.items():
+        print(f"failed {name}: {reason}")
+    print(f"model tool list: {len(model_tools)} tools, within budget: {loop.time() - t0 < 2}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+connected tickets 2025-11-25 caps=['tools'] tools=['tickets__search', 'tickets__get', 'tickets__create']
+connected docs 2025-06-18 caps=['tools'] tools=['docs__lookup']
+connected notes 2025-11-25 caps=['prompts'] tools=[]
+failed legacy: version 2024-11-05 not supported
+failed vendor: connect timeout after 0.5s
+model tool list: 4 tools, within budget: True
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 in well under a second.
+
+```python
+import asyncio
+import pytest
+from lab import Client, FakeServer, VersionMismatch, connect_all
+
+def run(coro):
+    return asyncio.run(coro)
+
+def test_handshake_order_and_version():
+    s = FakeServer("tickets", ("2025-11-25", "2025-06-18"), tools=["search"])
+    c = Client(s)
+    run(c.initialize())
+    assert s.seen == ["initialize", "notifications/initialized"]
+    assert (c.version, c.server_name, c.server_caps) == ("2025-11-25", "tickets", {"tools": {"listChanged": False}})
+
+def test_accepts_older_supported_version():
+    c = Client(FakeServer("docs", ("2025-06-18",), tools=["lookup"]))
+    run(c.initialize())
+    assert c.version == "2025-06-18"
+
+def test_rejects_unsupported_version():
+    with pytest.raises(VersionMismatch, match="2024-11-05"):
+        run(Client(FakeServer("legacy", ("2024-11-05",), tools=["x"])).initialize())
+
+def test_list_tools_follows_cursor():
+    async def go():
+        c = Client(FakeServer("t", ("2025-11-25",), tools=["a", "b", "c", "d", "e"], page_size=2))
+        await c.initialize()
+        return await c.list_tools(), c.server.seen.count("tools/list")
+    assert run(go()) == (["a", "b", "c", "d", "e"], 3)
+
+def test_list_tools_respects_capabilities():
+    async def go():
+        c = Client(FakeServer("notes", ("2025-11-25",), prompts=True))
+        await c.initialize()
+        return await c.list_tools(), c.server.seen
+    tools, seen = run(go())
+    assert tools == [] and "tools/list" not in seen
+
+def test_hung_server_is_isolated():
+    async def go():
+        loop = asyncio.get_running_loop()
+        t0 = loop.time()
+        ok, failed = await connect_all([FakeServer("a", ("2025-11-25",), tools=["x"]),
+                                        FakeServer("slow", ("2025-11-25",), tools=["y"], connect_delay=30)],
+                                       timeout=0.2)
+        return sorted(ok), failed, loop.time() - t0
+    ok, failed, elapsed = run(go())
+    assert ok == ["a"] and failed == {"slow": "connect timeout after 0.2s"} and elapsed < 1
+```
+
+### Failure scenarios
+- **Skip the `notifications/initialized` notification.** `list_tools` raises `ProtocolError` `-32600 not
+  initialized`. Print `server.seen` to compare the message order with the lifecycle in How it works; the
+  same symptom with a real SDK is a host that connects but never gets a tool list.
+- **Read only the first page of `tools/list`.** The tickets server shows two tools instead of three and
+  `test_list_tools_follows_cursor` reports one `tools/list` call. Log `nextCursor` on every page; a
+  "tool missing in production but not in tests" ticket often has exactly this cause.
+- **Connect servers one after another** (a `for` loop with `await`). With a 30-second `connect_delay` and
+  no timeout the run takes 30 seconds; with `wait_for` but no `gather` the timeouts add up. Time each
+  connect and check they overlap; the failed server's tools must simply be absent from the model's list.
+- **Call `tools/list` on a server that declared only `prompts`.** You get `-32601` from a peer that never
+  offered tools. Branch on `server_caps`, which is the capability rule in How it works.
+
+### Submission
+- `lab.py` with the three `YOUR CODE HERE` stubs implemented and no changes to `FakeServer` or `main`.
+- A `pytest -q` run showing 6 passed, plus the `python lab.py` output matching Expected output exactly.
+- A connect log from your own run with one line per server (name, version, capabilities, tools, or the
+  failure reason), the shape the Production patterns ask for.
+- A short note (5-8 lines): which failure scenario you reproduced, what you saw, and how the same bug would
+  look with `ClientSession` over stdio.
+- Evaluation: tests and output pass, connects overlap in time, and no request is sent for an undeclared
+  capability.
 
 ## Why it exists
 - **N agents times M systems is a lot of glue.** Before MCP, every agent framework wrapped every API in its

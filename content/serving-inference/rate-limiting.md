@@ -5,7 +5,7 @@ name: Rate limiting
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -181,9 +181,10 @@ flowchart TD
 - **"You cannot limit what you cannot count yet."** Output length is unknown, but `max_tokens` bounds it:
   reserve prompt tokens plus an estimate at admission, then settle on the reported usage, refunding or
   debiting the difference.
-- **"Each replica can keep its own counter."** Read-decide-write across replicas lets each one admit the
-  last unit, so overshoot grows with replica count. Use one atomic check-and-reserve in Redis, or
-  partition the quota explicitly.
+- **"Each replica can keep its own counter."** Independent counters each sized to the provider quota let
+  N replicas spend up to N times it, and even a shared counter updated by read-decide-write lets two
+  replicas both admit the last unit. Use one atomic check-and-reserve in Redis, or partition the quota
+  explicitly (each replica gets 1/N).
 - **"Per-request limits contain a runaway agent."** Every call in a tool cycle looks normal; the
   transcript just grows each step. Only a per-run step and token budget keyed on the run id sees that
   twenty calls are one runaway.

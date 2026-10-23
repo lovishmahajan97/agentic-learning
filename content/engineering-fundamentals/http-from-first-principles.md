@@ -5,7 +5,8 @@ name: HTTP from first principles
 kind: concept
 difficulty: core
 est_minutes: 20
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -41,6 +42,212 @@ connection reuse decide how your agent waits, retries and fails.
   keys on writes, and which headers (request ids, rate-limit counters) you log.
 - **What you can skip.** Writing your own HTTP parser or TLS. Read the wire format once so the SDK stops
   being magic, then use a real client.
+
+## Lab
+### Task
+Finish the HTTP layer an agent puts under every model and tool call: route by status code, honour
+`Retry-After`, back off with a cap, and send one stable idempotency key so a retried `POST /tickets`
+creates one ticket, not two. Time box: 45-75 min.
+- **Prerequisites:** Command line and environment basics; the status-code and idempotency tables in
+  How it works; the raw-socket example below.
+- **Setup:** Python 3.9+ and `pip install pytest` (checked with Python 3.9.6 and pytest 8.4.2). Save the
+  starter as `lab.py` and the tests as `test_lab.py`. Stdlib only: `FakeUpstream` is a local server
+  that plays the provider and the ticket tool, so no key or network is needed.
+- **The trap in the fake:** `/tickets` commits the ticket and then answers 504, like a proxy that gave
+  up while the upstream finished. Only server-side deduplication by key makes the retry safe.
+
+### Starter code
+```python
+"""Lab: a status-aware HTTP client for an agent's model and tool calls. Run: python lab.py"""
+import hashlib, http.client, json, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class FakeUpstream(BaseHTTPRequestHandler):
+    """Plays a model provider and a ticket tool. SCRIPT maps a path to the statuses it returns, in order."""
+    protocol_version = "HTTP/1.1"               # keep-alive: one TCP connection serves every attempt
+    SCRIPT, HITS, TICKETS, SEEN = {}, [], [], {}
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        key = self.headers.get("Idempotency-Key")
+        FakeUpstream.HITS.append(self.path)
+        queue = FakeUpstream.SCRIPT.setdefault(self.path, [])
+        status, extra = (queue.pop(0) if queue else 200), {}
+        if self.path == "/tickets":
+            if key in FakeUpstream.SEEN:        # server-side dedup: return the original result
+                status, payload = 200, FakeUpstream.SEEN[key]
+            else:                               # the write commits even when a proxy answers 504
+                FakeUpstream.TICKETS.append(body["title"])
+                payload = {"id": f"T-{len(FakeUpstream.TICKETS)}"}
+                if key:
+                    FakeUpstream.SEEN[key] = payload
+        elif status == 200:
+            payload = {"content": "echo: " + body["messages"][-1]["content"]}
+        else:
+            payload = {"error": status}
+        if status == 429:
+            extra["Retry-After"] = "2"
+        data = json.dumps(payload).encode()
+        self.send_response(status)
+        for k, v in {"Content-Type": "application/json", "Content-Length": str(len(data)), **extra}.items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *a):
+        pass
+
+def start_upstream():
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), FakeUpstream)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+def send_once(conn, path, payload, headers):
+    """One POST on an open connection. Returns (status, lower-cased headers, parsed JSON body)."""
+    body = json.dumps(payload).encode()
+    conn.request("POST", path, body=body, headers={"Content-Type": "application/json", **headers})
+    resp = conn.getresponse()
+    data = json.loads(resp.read())              # read the whole body, or the connection cannot be reused
+    return resp.status, {k.lower(): v for k, v in resp.getheaders()}, data
+
+RETRYABLE = {408, 429, 500, 502, 503, 504, 529}
+
+def should_retry(status: int) -> bool:
+    # YOUR CODE HERE: True only for the transient codes in RETRYABLE; never for other 4xx
+    raise NotImplementedError
+
+def wait_seconds(attempt: int, headers: dict, base=0.5, cap=8.0) -> float:
+    # YOUR CODE HERE: honour a numeric Retry-After header when present; otherwise
+    # base * 2**attempt (attempt 0 is the first retry), capped at cap. No jitter here,
+    # so the tests stay deterministic; add it in production.
+    raise NotImplementedError
+
+def idempotency_key(run_id: str, step: int, tool: str) -> str:
+    # YOUR CODE HERE: the same logical tool action must always give the same key
+    # (sha256 hex of "run_id:step:tool", first 32 characters)
+    raise NotImplementedError
+
+def call(conn, path, payload, idem_key=None, max_attempts=3, sleep=lambda s: None):
+    """Returns {"status", "body", "attempts", "waits"}."""
+    # YOUR CODE HERE: send with send_once (add an Idempotency-Key header when idem_key is set,
+    # identical on every attempt); stop on success or a non-retryable status; otherwise record
+    # and sleep wait_seconds(...) and try again, at most max_attempts sends in total.
+    raise NotImplementedError
+
+def reset(script):
+    FakeUpstream.SCRIPT = {k: list(v) for k, v in script.items()}
+    FakeUpstream.HITS, FakeUpstream.TICKETS, FakeUpstream.SEEN = [], [], {}
+
+if __name__ == "__main__":
+    srv = start_upstream()
+    conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+    chat = {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
+    reset({"/v1/chat": [429, 200], "/v1/bad": [400] * 3, "/v1/down": [503] * 5, "/tickets": [504]})
+
+    r = call(conn, "/v1/chat", chat)
+    print("chat:", r["status"], f"attempts={r['attempts']} waits={r['waits']}", r["body"]["content"])
+    r = call(conn, "/v1/bad", chat)
+    print("bad:", r["status"], f"attempts={r['attempts']} server_hits={FakeUpstream.HITS.count('/v1/bad')}")
+    r = call(conn, "/v1/down", chat)
+    print("down:", r["status"], f"attempts={r['attempts']} waits={r['waits']}")
+    key = idempotency_key("run-42", 3, "create_ticket")
+    r = call(conn, "/tickets", {"title": "refund order o7"}, idem_key=key)
+    print("ticket:", r["status"], f"attempts={r['attempts']} tickets_created={len(FakeUpstream.TICKETS)}",
+          r["body"]["id"])
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly (the demo records waits instead of sleeping;
+pass `sleep=time.sleep` for real use):
+
+```
+chat: 200 attempts=2 waits=[2.0] echo: hi
+bad: 400 attempts=1 server_hits=1
+down: 503 attempts=3 waits=[0.5, 1.0]
+ticket: 200 attempts=2 tickets_created=1 T-1
+```
+
+- **Read the lines:** the 429 waits the server's 2 s, not the 0.5 s backoff; the 400 is sent once; the
+  outage stops after 3 sends with two waits of 0.5 × 2⁰ and 0.5 × 2¹; the 504 retry returns the first
+  ticket's id because the key matched.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (Python 3.9.6, pytest 8.4.2).
+
+```python
+import http.client
+import pytest
+from lab import FakeUpstream, call, idempotency_key, reset, should_retry, start_upstream, wait_seconds
+
+CHAT = {"model": "demo", "messages": [{"role": "user", "content": "hi"}]}
+
+@pytest.fixture(scope="module")
+def conn():
+    srv = start_upstream()
+    c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+    yield c
+    c.close()
+    srv.shutdown()
+
+def test_retry_only_transient_codes():
+    assert all(should_retry(c) for c in (408, 429, 500, 502, 503, 504, 529))
+    assert not any(should_retry(c) for c in (200, 400, 401, 403, 404, 422))
+
+def test_wait_honours_retry_after_then_backs_off_with_a_cap():
+    assert wait_seconds(0, {"retry-after": "2"}) == 2.0
+    assert [wait_seconds(a, {}) for a in range(6)] == [0.5, 1.0, 2.0, 4.0, 8.0, 8.0]
+
+def test_rate_limit_is_retried_after_the_hint(conn):
+    reset({"/v1/chat": [429, 200]})
+    slept = []
+    r = call(conn, "/v1/chat", CHAT, sleep=slept.append)
+    assert (r["status"], r["attempts"], r["waits"], slept) == (200, 2, [2.0], [2.0])
+    assert r["body"] == {"content": "echo: hi"}
+
+def test_client_error_is_sent_once(conn):
+    reset({"/v1/bad": [400] * 3})
+    r = call(conn, "/v1/bad", CHAT)
+    assert (r["status"], r["attempts"], FakeUpstream.HITS) == (400, 1, ["/v1/bad"])
+
+def test_outage_gives_up_after_max_attempts(conn):
+    reset({"/v1/down": [503] * 5})
+    r = call(conn, "/v1/down", CHAT)
+    assert (r["status"], r["attempts"], r["waits"]) == (503, 3, [0.5, 1.0])
+    assert len(FakeUpstream.HITS) == 3
+
+def test_retried_write_creates_one_ticket(conn):
+    reset({"/tickets": [504]})
+    key = idempotency_key("run-42", 3, "create_ticket")
+    assert key == idempotency_key("run-42", 3, "create_ticket") and len(key) == 32
+    assert key != idempotency_key("run-42", 4, "create_ticket")
+    r = call(conn, "/tickets", {"title": "refund order o7"}, idem_key=key)
+    assert (r["status"], r["attempts"], r["body"]) == (200, 2, {"id": "T-1"})
+    assert FakeUpstream.TICKETS == ["refund order o7"]
+```
+
+### Failure scenarios
+- **Drop the `Idempotency-Key` header.** The last line becomes `tickets_created=2 T-2`: the first write
+  committed behind the 504 and the retry wrote again. Debug it as in Pitfalls: list server writes for
+  one run and step, and look for two with the same arguments.
+- **Retry on any status `>= 400`.** The second line becomes `bad: 400 attempts=3 server_hits=3`: an
+  invalid payload was sent three times and burned the step budget. Group attempts by status code; a
+  repeated identical 4xx is the tell.
+- **Ignore `Retry-After`.** The first line shows `waits=[0.5]`, so against a real provider the retry
+  lands inside the rate-limit window and earns another 429. Log the header beside each wait you chose.
+- **Forget to read the error body.** Skip `resp.read()` on a non-200 and the next request on the same
+  connection fails with `http.client.ResponseNotReady`; keep-alive needs each response fully consumed.
+
+### Submission
+- **`lab.py`** with the four functions implemented; `FakeUpstream`, `send_once` and the main block
+  unchanged.
+- **A green run** of `pytest -q test_lab.py` (6 passed) and the output of `python lab.py` matching the
+  block above.
+- **A table** of the four scenarios: status, attempts, waits, server hits, recomputed by hand.
+- **A note** (3-5 sentences): where the key comes from in your agent (run id, step, tool), and which of
+  your real tools must never be retried without one.
+- **Evaluated on:** no non-retryable code is sent twice; total sends never exceed `max_attempts`; the
+  retried write produces exactly one ticket.
 
 ## Why it exists
 - **Programs on different machines need a shared contract.** HTTP fixes the shape of a request (method,

@@ -5,7 +5,7 @@ name: TTFT (time to first token)
 kind: metric
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -156,7 +156,8 @@ flowchart TD
   connection. The two large, variable terms are the admission queue and prefill over every prompt token.
 - **"The first token is one decode step."** It falls out of the prefill pass itself, so its cost scales
   with the whole prompt (about `2 × N × n_prompt` FLOPs), not with output length.
-- **"Speculative decoding or KV quantisation will fix slow TTFT."** Those target decode. TTFT moves with
+- **"Speculative decoding or KV quantisation will fix slow TTFT."** Both target decode; KV quantisation
+  helps TTFT only indirectly, by freeing memory so fewer requests wait for admission. TTFT moves with
   fewer prompt tokens, prefix caching, capacity and admission control, and (since prefill is
   compute-bound) faster GPUs or tensor parallelism.
 - **"An agent pays TTFT once per run."** It pays it on every step, over a transcript that keeps growing,

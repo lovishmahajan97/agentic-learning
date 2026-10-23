@@ -5,7 +5,7 @@ name: Vector store sizing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -65,15 +65,15 @@ Per-replica RAM is (vectors + HNSW links at `M = 16` + payload) × 1.5 headroom;
 |---|---|---|---|---|---|
 | **A. float32, text in engine** | 49.2 + 1.0 + 18.4 GB | ≈ 103 GB | 4 | 8: fails the budget | None |
 | **B. int8 in RAM, float32 on disk, text in engine** | 12.3 + 1.0 + 18.4 GB | ≈ 48 GB | 2 | 4: at the budget limit | Low, with rescoring |
-| **C. int8 in RAM, float32 on disk, text in Postgres** | 12.3 + 1.0 + 1.6 GB | ≈ 22 GB | 2 | 2 | Low, with rescoring |
-| **D. Binary in RAM, text in Postgres** | 1.5 + 1.0 + 1.6 GB | ≈ 6 GB | 2 | 2 | Higher: needs heavy oversampling |
+| **C. int8 in RAM, float32 on disk, text in Postgres** | 12.3 + 1.0 + 2.4 GB | ≈ 24 GB | 2 | 2 | Low, with rescoring |
+| **D. Binary in RAM, text in Postgres** | 1.5 + 1.0 + 2.4 GB | ≈ 7 GB | 2 | 2 | Higher: needs heavy oversampling |
 
 The QPS bound is ceil(250 / 400) = 1 node per replica, so memory binds in every option.
 
 ### Decision
 Choose **C**, because it is the cheapest option that keeps the migration inside the budget at low recall risk:
 - **The migration decides it.** A doubles to 8 nodes and B to the full budget of 4; C holds both model versions
-  at about 45 GB per replica, still one 64 GB node each.
+  at about 47 GB per replica, still one 64 GB node each.
 - **Text was the biggest line after quantization.** In B, 18.4 GB of payload outweighs the 12.3 GB of int8 vectors.
   The text already sits in Postgres, so moving it costs one keyed fetch for the final k per call.
 - **D saves RAM but no nodes.** Two replicas need two nodes either way, so binary codes would buy recall risk for nothing.
@@ -87,7 +87,7 @@ What would change it:
 ### Trade-offs accepted
 - **An extra hop for text.** Each tool call fetches k chunk texts from Postgres. Watch p99 per tool call against the 100 ms budget.
 - **Quantization error.** Measure recall@10 against exact float32 search on a labelled query set before launch and after each model change.
-- **Thin headroom during migration.** About 45 of 64 GB per node. Alarm when steady-state RAM crosses about two thirds of node memory.
+- **Thin headroom during migration.** About 47 of 64 GB per node. Alarm when steady-state RAM crosses about two thirds of node memory.
 - **Two copies on disk.** Quantized and full-precision vectors both persist; track disk per replica with snapshots included.
 
 ### Review rubric

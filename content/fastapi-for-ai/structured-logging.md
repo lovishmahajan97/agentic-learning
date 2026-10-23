@@ -5,7 +5,7 @@ name: Structured logging
 kind: practice
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -213,7 +213,8 @@ All five fail on the starter: no `run_id` or `step` on any line, the email appea
 ### Failure scenarios
 - **Inject: keep `run_in_executor` but fix everything else.** Observe: only `crm_request` loses
   `run_id`, `step` and `tool`, which in production looks like an orphan CRM line nobody can attribute.
-  Debug: compare which paths copy context (table above); switch to `asyncio.to_thread`.
+  Debug: compare which paths copy context (the table in "Where context does not follow"); switch to
+  `asyncio.to_thread`.
 - **Inject: use `bind_contextvars(tool=...)` without unbinding.** Observe: step 2's
   `llm_call_finished` claims `tool=search_kb`. Debug: the leak test fails; use the
   `bound_contextvars` context manager so values reset when the block exits.
@@ -225,7 +226,7 @@ All five fail on the starter: no `run_id` or `step` on any line, the email appea
 - The fixed `lab_logs.py` and a `pytest -q` run showing 5 passed.
 - Your output of `python lab_logs.py`.
 - One log-platform query (in the syntax you use) that finds runs where the same `arg_hash` repeats more
-  than 3 times, as in the looping-agent scenario.
+  than 3 times, as in the looping-agent scenario in Examples.
 - A short note: one field you would add to `tool_call_finished` for your own agent, and why it is safe
   to log.
 

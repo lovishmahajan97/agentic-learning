@@ -5,7 +5,7 @@ name: Cost modeling (cost per request, token economics)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -55,11 +55,11 @@ $0.0975 on average. Prices and tool rates are the illustrative ones used in the 
 | Option | How it works | Mean cost per run | Margin at $0.15 | Runaway share of spend | Effect on success |
 |---|---|---|---|---|---|
 | A. No cap | Forecast from the trace mean: 0.80 × 0.0837 + 0.15 × 0.1370 + 0.05 × 0.3213 | $0.1036 | 30.9%: fails | 15.5% | None |
-| B. Turn cap 16 plus a $0.16 per-run cost cap | Runaways stop at 16 turns: 0.80 × 0.0837 + 0.15 × 0.1370 + 0.05 × 0.1567 | $0.0954 | 36.4% | 8.2% | None: 14-turn runs fit |
+| B. Turn cap 16 plus a $0.16 per-run cost cap | Runaways stop at 16 turns: 0.80 × 0.0837 + 0.15 × 0.1370 + 0.05 × 0.1567 | $0.0953 | 36.4% | 8.2% | None: 14-turn runs fit |
 | C. Turn cap 10 | Long runs and runaways stop at 10: 0.80 × 0.0837 + 0.20 × 0.1005 | $0.0871 | 41.9% | None left | 15% of runs, the valuable ones, now fail |
 
 ### Decision
-Choose **B**, and correct the forecast to $0.0954 per run (about $19,076 a month at 200,000 runs).
+Choose **B**, and correct the forecast to $0.0953 per run (about $19,070 a month at 200,000 runs).
 - **Margin:** A fails the 35% bar once the tail is counted; the sales figure of 44% came from the
   typical run, not the mean. B clears the bar with 1.4 points to spare.
 - **Success:** the cap sits above the 14 turns successful long runs need, so it only stops loops that were

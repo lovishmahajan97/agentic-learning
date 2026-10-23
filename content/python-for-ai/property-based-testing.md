@@ -142,7 +142,7 @@ def test_wrong_type_for_days_is_an_error_not_a_coercion(city, days):
   `days=False`, because `bool` is a subclass of `int`. Debug: read the falsifying example, then compare
   types exactly for JSON scalars.
 - **Inject: `st.text().filter(lambda s: s.startswith('{"city'))`.** Hypothesis raises
-  `FailedHealthCheck` after 50 filtered inputs and 0 kept. Debug: build the valid shape directly with
+  `FailedHealthCheck` (`filter_too_much`): 50 inputs filtered out, at most one or two kept. Debug: build the valid shape directly with
   `st.builds` or `json.dumps` of a dictionary strategy instead of filtering.
 - **Inject: pin `@example("[" * 100_000)`.** Your parser crashes with `RecursionError`, not
   `JSONDecodeError`, on deeply nested input. Debug: catching only the decode error is not total; decide

@@ -5,7 +5,7 @@ name: Grouped-query attention (GQA)
 kind: concept
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -146,8 +146,8 @@ flowchart TD
 
 ## Misconceptions
 - **"GQA cuts attention compute by sharing work across heads."** Only keys and values are shared; every
-  query head still attends, so attention FLOPs are unchanged. The saving is cache memory and bytes read
-  per decode step, both down by h/g.
+  query head still attends, so attention FLOPs are unchanged. The saving is cache memory and cache bytes
+  read per decode step, both down by h/g.
 - **"A GQA model makes every agent step faster."** Prefill is compute-bound, so ingesting a large tool
   result and time-to-first-token barely change; the gain shows in decode throughput and resident
   sessions.

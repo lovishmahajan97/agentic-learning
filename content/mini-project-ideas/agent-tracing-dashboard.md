@@ -5,7 +5,8 @@ name: agent tracing dashboard (OpenTelemetry or Langfuse)
 kind: practice
 difficulty: core
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - observability/tracing
@@ -34,6 +35,172 @@ Jaeger, and build a dashboard of latency, tokens, cost and tool errors. It prove
 - **Why it matters for agents.** An agent's failure lives in step 7 of 12: a wrong tool argument or a 9-second tool.
   Logs per request cannot show that; a trace tree can.
 - **What you can skip.** Metrics pipelines and alerting rules. Spans and one dashboard come first.
+
+## Lab
+### Task
+Instrument a small agent loop so one run produces one trace: a root `invoke_agent` span, a `chat` span per
+model call with token usage, an `execute_tool` span per tool call with errors recorded, and content capture
+off by default. Then turn the finished spans into the numbers a dashboard shows. Time box: 45-60 min.
+- **Prerequisites:** Tracing; OpenTelemetry; Token cost tracking; the tool-calling CLI assistant project.
+- **Setup:** Python 3.10+, `pip install opentelemetry-sdk pytest` (checked with opentelemetry-sdk 1.45.1,
+  pytest 9.1, Python 3.12). Save the starter as `lab.py` and the tests as `test_lab.py`.
+- **No backend and no model:** spans go to the SDK's `InMemorySpanExporter` and the model is a recorded
+  script. Swap in the JSONL or OTLP exporter from Examples when the tests pass.
+
+### Starter code
+```python
+"""Lab: trace an agent run with OpenTelemetry spans and turn them into numbers. Run: python lab.py"""
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import Status, StatusCode
+
+class ScriptedModel:
+    """Recorded model turns: a tool request or a final answer, each with token usage."""
+    def __init__(self, steps):
+        self.steps = list(steps)
+    def __call__(self, messages):
+        return self.steps.pop(0)
+
+def make_tracer():
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))   # Batch in production
+    return provider.get_tracer("agent"), exporter
+
+def run_agent(question, model, tools, tracer, session_id, capture_content=False, max_steps=6):
+    # YOUR CODE HERE: one root span "invoke_agent" with attribute "session.id"; set
+    # "agent.question" on it ONLY when capture_content is True. Inside it, loop up to max_steps:
+    # - each model call is a child span "chat" with "gen_ai.operation.name" = "chat",
+    #   "gen_ai.usage.input_tokens" and "gen_ai.usage.output_tokens" from the step's "in" and "out"
+    # - a step with "answer" ends the run: return the answer
+    # - a step with "tool" runs tools[name](**args) in a child span f"execute_tool {name}" with
+    #   "gen_ai.tool.name"; on an exception call span.record_exception(e), set an ERROR status and
+    #   feed f"error: {e}" back to the model instead of crashing
+    raise NotImplementedError
+
+def summarize(spans) -> dict:
+    # YOUR CODE HERE: return {"model_calls": n, "input_tokens": n, "output_tokens": n,
+    #   "tools": {tool_name: {"calls": n, "errors": n}}} over all finished spans
+    raise NotImplementedError
+
+def tree(spans) -> list[str]:
+    by_parent = {}
+    for s in spans:
+        by_parent.setdefault(s.parent.span_id if s.parent else None, []).append(s)
+    lines = []
+    def walk(pid, depth):
+        for s in sorted(by_parent.get(pid, []), key=lambda s: s.start_time):
+            lines.append("  " * depth + s.name + (" [ERROR]" if s.status.status_code == StatusCode.ERROR else ""))
+            walk(s.context.span_id, depth + 1)
+    walk(None, 0)
+    return lines
+
+def read_file(path):
+    if path != "README.md":
+        raise FileNotFoundError(path)
+    return "# cli-assistant"
+
+if __name__ == "__main__":
+    tracer, exporter = make_tracer()
+    model = ScriptedModel([
+        {"tool": "read_file", "args": {"path": "READM.md"}, "in": 812, "out": 40},
+        {"tool": "read_file", "args": {"path": "README.md"}, "in": 860, "out": 38},
+        {"answer": "It is a CLI assistant.", "in": 905, "out": 21},
+    ])
+    print(run_agent("What is this repo? My key is sk-123", model, {"read_file": read_file}, tracer, "demo-1"))
+    spans = exporter.get_finished_spans()
+    print("\n".join(tree(spans)))
+    print(summarize(spans))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly the lines below (812 + 860 + 905 = 2577 input
+tokens, 40 + 38 + 21 = 99 output tokens):
+
+```
+It is a CLI assistant.
+invoke_agent
+  chat
+  execute_tool read_file [ERROR]
+  chat
+  execute_tool read_file
+  chat
+{'model_calls': 3, 'input_tokens': 2577, 'output_tokens': 99, 'tools': {'read_file': {'calls': 2, 'errors': 1}}}
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution passes
+all 5.
+
+```python
+from opentelemetry.trace import StatusCode
+from lab import ScriptedModel, make_tracer, read_file, run_agent, summarize, tree
+
+def two_step_model():
+    return ScriptedModel([
+        {"tool": "read_file", "args": {"path": "nope.md"}, "in": 100, "out": 10},
+        {"tool": "read_file", "args": {"path": "README.md"}, "in": 120, "out": 12},
+        {"answer": "done", "in": 150, "out": 5},
+    ])
+
+def run(capture=False):
+    tracer, exporter = make_tracer()
+    answer = run_agent("secret question sk-999", two_step_model(), {"read_file": read_file}, tracer,
+                       "s-1", capture_content=capture)
+    return answer, exporter.get_finished_spans()
+
+def test_span_tree_has_root_and_children():
+    answer, spans = run()
+    assert answer == "done"
+    assert tree(spans) == ["invoke_agent", "  chat", "  execute_tool read_file [ERROR]", "  chat",
+                           "  execute_tool read_file", "  chat"]
+    root = [s for s in spans if s.parent is None]
+    assert len(root) == 1 and root[0].attributes["session.id"] == "s-1"
+    assert len({s.context.trace_id for s in spans}) == 1
+
+def test_tool_error_is_recorded_not_raised():
+    _, spans = run()
+    failed = [s for s in spans if s.status.status_code == StatusCode.ERROR]
+    assert len(failed) == 1 and failed[0].attributes["gen_ai.tool.name"] == "read_file"
+    assert any(e.name == "exception" for e in failed[0].events)
+
+def test_summary_numbers():
+    _, spans = run()
+    assert summarize(spans) == {"model_calls": 3, "input_tokens": 370, "output_tokens": 27,
+                                "tools": {"read_file": {"calls": 2, "errors": 1}}}
+
+def test_content_capture_is_off_by_default():
+    _, spans = run()
+    assert not any("sk-999" in str(v) for s in spans for v in (s.attributes or {}).values())
+    _, spans = run(capture=True)
+    assert any("sk-999" in str(v) for s in spans for v in (s.attributes or {}).values())
+
+def test_step_budget_ends_a_looping_run():
+    tracer, exporter = make_tracer()
+    looping = ScriptedModel([{"tool": "read_file", "args": {"path": "README.md"}, "in": 1, "out": 1}] * 10)
+    run_agent("q", looping, {"read_file": read_file}, tracer, "s-2", max_steps=3)
+    assert summarize(exporter.get_finished_spans())["model_calls"] == 3
+```
+
+### Failure scenarios
+- **Use `tracer.start_span` without making it current.** Children get no parent, the tree test shows six
+  roots and the backend shows six one-span traces. Print `span.parent` for a `chat` span; it must point at
+  the root's `span_id`.
+- **Catch the tool exception but skip the status.** The run survives, but the error test fails and every
+  dashboard error rate reads zero. Filter spans by `status.status_code` before trusting a tool's error rate.
+- **Put the user question on every span by default.** The capture test fails on `sk-999`; in production
+  secrets and personal data land in a third-party backend. Gate content behind a flag and grep exported
+  spans for a planted canary in CI.
+- **Read the exporter before the spans end.** With `BatchSpanProcessor` spans arrive later, so counts come
+  up short. Call `provider.force_flush()` or `shutdown()` before reading, as the Examples starter does.
+
+### Submission
+- **`lab.py`** with `run_agent` and `summarize` done; `tree` and the fakes unchanged.
+- **A green test run** (5 passed) and the output of `python lab.py`.
+- **A screenshot** of the same run in Jaeger or Langfuse after swapping in the OTLP exporter.
+- **A short note:** which GenAI attribute names you used and the conventions version you checked them against.
+- **Evaluated on:** tests passing, one trace per run, errors visible as span status, content off by default.
 
 ## Why it exists
 - **Agents are trees, not requests.** One user question becomes a run with several model calls and tool calls, often

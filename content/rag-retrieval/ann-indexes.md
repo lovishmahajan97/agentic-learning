@@ -5,7 +5,7 @@ name: ANN indexes (HNSW, IVF)
 kind: concept
 difficulty: core
 est_minutes: 19
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
@@ -194,8 +194,8 @@ flowchart TD
 - **"ANN returns the exact top k, maybe slightly reordered."** It can drop true neighbors outright.
   Recall depends on your data and knobs: the random-data sweep below gets HNSW recall@10 of 0.28 at
   `efSearch` 16. Measure overlap with brute force on real agent queries.
-- **"A metadata filter just narrows the ANN result."** HNSW collects about `ef_search` global neighbors and
-  the filter runs over those. A user filter keeping 0.005% of rows leaves zero to two memories, and the
+- **"A metadata filter just narrows the ANN result."** In pgvector without iterative scans, HNSW collects
+  about `ef_search` global neighbors and the filter runs over those. A user filter keeping 0.005% of rows leaves zero to two memories, and the
   agent concludes it never knew the fact.
 - **"`LIMIT 100` returns 100 rows."** In pgvector, `hnsw.ef_search` (default 40) caps the candidate list,
   so the query can quietly yield 40 unless you raise it or enable iterative scans (0.8).

@@ -50,10 +50,10 @@ caller through the agent to its tools before the first enterprise launch. All fi
 - **Tools:** four internal tool services (doc search, tickets, CRM read, refunds), plus Gmail for some
   tenants through stored OAuth grants.
 - **Scale:** 120,000 runs per day, about 8 tool calls per run, peaks at 5x the daily average.
-- **Constraints:** a prompt-injected run must never reach another tenant's data; a stolen credential
-  must stop working within 15 minutes; auth may add at most 5 ms p99 per tool hop; launch in 8 weeks;
-  nobody on the team has operated an authorization server, and the budget allows no new paid product
-  beyond the existing managed IdP.
+- **Constraints:** a prompt-injected run must never reach another tenant's data; a credential reported
+  stolen must stop working within 15 minutes without cutting off other callers; auth may add at most
+  5 ms p99 per tool hop; launch in 8 weeks; nobody has operated an authorization server; no new paid
+  product beyond the existing managed IdP.
 
 Recomputed load: 120,000 / 86,400 s ≈ 1.39 runs/s on average, so about 7 runs/s at peak and
 7 × 8 = 56 tool calls/s. Counting the run's own check, that is about 63 credential checks/s at peak.
@@ -61,28 +61,31 @@ Recomputed load: 120,000 / 86,400 s ≈ 1.39 runs/s on average, so about 7 runs/
 ### Options
 | Option | How it works | Tenant isolation under injection | Stolen credential dies in 15 min | ≤ 5 ms per hop | 8 weeks, current team |
 |---|---|---|---|---|---|
-| **A. Shared service key** | agent holds one static key per tool and sends `X-User-Id` / `X-Tenant-Id` | fails: the tool trusts headers the agent sets, and the key reaches every tenant | fails: the key lives until someone rotates it | yes: one hash lookup | yes, easiest |
-| **B. Forward the user's JWT** | tools verify the IdP token issued for the agent API | partial: tenant comes from claims, but every tool accepts the same `aud` | only if every customer IdP issues tokens of 15 min or less | yes: local verify with cached JWKS | yes |
-| **C. Per-tool downscoped JWTs** | executor exchanges the user's token (RFC 8693) for a token per tool audience and scope; API keys stay for customer backends | yes: one audience and one scope per call, tenant from claims | yes: 5-minute tokens; API keys revoke instantly by lookup | yes: local verify; at most 4 × 7 = 28 exchanges/s at peak, cached per run | yes, if the IdP supports token exchange |
-| **D. Opaque tokens, introspected per hop** | every tool asks the authorization server about each token | yes | yes: instant | fails: about 63 network calls/s at peak, each a full round trip | risky: the team must run or buy an introspection service |
+| **A. Shared service key** | agent holds one static key per tool and sends `X-User-Id` / `X-Tenant-Id` | fails: the tool trusts headers the agent sets, and the key reaches every tenant | fails: revoking the one key cuts off every tenant until all services rotate | yes: one hash lookup | yes, easiest |
+| **B. Forward the user's JWT** | tools verify the IdP token issued for the agent API | partial: tenant comes from claims, but every tool accepts the same `aud` | only if access tokens last 15 min or less: a JWT lives until it expires | yes: local verify with cached JWKS | yes |
+| **C. Per-tool downscoped JWTs** | executor exchanges the user's token (RFC 8693) for a token per tool audience and scope; API keys stay for customer backends | yes: one audience and one scope per call, tenant from claims | yes: 5-minute tokens; API keys revoke instantly by lookup | yes: local verify; exchanges run once per run at run start, off the hop (at most 4 × 7 = 28/s at peak) | yes, if the IdP supports token exchange |
+| **D. Opaque tokens, introspected per hop** | every tool asks the authorization server about each token | yes | yes: instant | fails: a network round trip on all 63 checks/s at peak; caching answers gives up instant revocation | risky: needs IdP introspection at that rate, or a service the team has never run |
 
 ### Decision
 Choose **C**, keeping hashed API keys for the 40 customer backends and adding introspection only on
 the refunds tool.
 - **Isolation constraint:** only C and D give each tool call a credential that cannot be replayed at
   another tool or tenant, and in C the model never sees or chooses it.
-- **Latency constraint:** C verifies locally, while D puts a network call on all 63 checks per second.
+- **Latency constraint:** C verifies locally and exchanges at run start; D puts a network call on all
+  63 checks per second.
 - **Revocation constraint:** 5-minute tool tokens beat 15 minutes; API keys are looked up each request,
   so revoking one is immediate.
 - **Refunds exception:** refunds are rare and high-risk, so an introspection call there costs little
   and gives instant revocation where money moves.
 - **What would change it:** if the IdP cannot do token exchange, the team runs a small internal signer
-  (ES256) that issues the same per-tool tokens. If a regulator demands instant revocation on every
-  tool, D wins and the latency budget must grow.
+  (ES256) for the same per-tool tokens, a new operating burden. If a regulator demands instant
+  revocation on every tool, D wins and the latency budget must grow.
 
 ### Trade-offs accepted
-- **The IdP is on the tool path.** An exchange outage blocks new tool tokens. Watch exchange error rate
+- **The IdP is on the run path.** An exchange outage blocks new tool tokens. Watch exchange error rate
   and latency, and cache each token for its lifetime per run and audience.
+- **The refunds hop exceeds 5 ms.** Introspection is a round trip; refunds are rare, so track that
+  hop's p99 separately.
 - **Tokens expire mid-run.** Runs longer than 5 minutes re-exchange. Watch 401s by tool and step, which
   should be near zero.
 - **More configuration.** Each tool needs its own audience and scope mapping. Contract tests assert

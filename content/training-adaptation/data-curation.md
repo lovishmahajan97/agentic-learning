@@ -5,7 +5,7 @@ name: Data curation
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -205,7 +205,8 @@ flowchart TD
 ## Misconceptions
 - **"More logged runs make a better fine-tune."** The model learns whatever is in the batch, loops and
   failed runs included; LIMA got competitive results from about a thousand curated pairs. In the
-  coding-agent funnel only 16,200 of 50,000 runs deserve imitation.
+  illustrative coding-agent funnel only 18,000 of 50,000 logged runs survive the outcome, loop, schema
+  and dedup filters, and 16,200 of those go to training after a by-repository eval hold-out.
 - **"Exact-hash dedup is enough."** Support macros with a name swapped, templated bot prompts and
   paraphrases survive hashing; MinHash with LSH (and an embedding pass for paraphrases) removes far more.
 - **"Clean the data, then split it however you like."** Split before dedup, or by run, and near-copies of

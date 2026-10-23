@@ -5,7 +5,7 @@ name: Context managers / resource cleanup
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -146,21 +146,33 @@ def reset():
 def closes():
     return [line for line in lab.LOG if line.startswith("close")]
 
+# Each scenario checks OPEN inside the running loop, right after agent_run ends: a long-lived agent
+# server never reaches asyncio.run's shutdown, which would finalise abandoned generators for you.
+
 def test_success_closes_newest_first():
-    asyncio.run(lab.agent_run("triage", ["github", "jira"]))
-    assert lab.OPEN == set()
-    assert closes() == ["close mcp:jira", "close mcp:github", "close sandbox:py", "close span:triage"]
+    async def scenario():
+        await lab.agent_run("triage", ["github", "jira"])
+        return sorted(lab.OPEN), closes()
+    still_open, closed = asyncio.run(scenario())
+    assert still_open == []
+    assert closed == ["close mcp:jira", "close mcp:github", "close sandbox:py", "close span:triage"]
 
 def test_tool_error_closes_everything_and_propagates():
-    with pytest.raises(RuntimeError, match="malformed"):
-        asyncio.run(lab.agent_run("triage", ["github", "jira"], fail=True))
-    assert lab.OPEN == set(), f"leaked: {sorted(lab.OPEN)}"
-    assert closes() == ["close mcp:jira", "close mcp:github", "close sandbox:py", "close span:triage"]
+    async def scenario():
+        with pytest.raises(RuntimeError, match="malformed"):
+            await lab.agent_run("triage", ["github", "jira"], fail=True)
+        return sorted(lab.OPEN), closes()
+    still_open, closed = asyncio.run(scenario())
+    assert still_open == [], f"leaked: {still_open}"
+    assert closed == ["close mcp:jira", "close mcp:github", "close sandbox:py", "close span:triage"]
 
 def test_failed_connect_closes_what_was_opened():
-    with pytest.raises(ConnectionError):
-        asyncio.run(lab.agent_run("triage", ["github", "broken"]))
-    assert lab.OPEN == set(), f"leaked: {sorted(lab.OPEN)}"
+    async def scenario():
+        with pytest.raises(ConnectionError):
+            await lab.agent_run("triage", ["github", "broken"])
+        return sorted(lab.OPEN)
+    still_open = asyncio.run(scenario())
+    assert still_open == [], f"leaked: {still_open}"
 
 def test_stop_button_closes_everything():
     async def scenario():
@@ -169,8 +181,9 @@ def test_stop_button_closes_everything():
         t.cancel()
         with pytest.raises(asyncio.CancelledError):
             await t
-    asyncio.run(scenario())
-    assert lab.OPEN == set(), f"leaked: {sorted(lab.OPEN)}"
+        return sorted(lab.OPEN)
+    still_open = asyncio.run(scenario())
+    assert still_open == [], f"leaked: {still_open}"
 ```
 
 ### Failure scenarios
@@ -179,7 +192,9 @@ def test_stop_button_closes_everything():
   stack calls each exit. Debug: raise inside a bare `async with resource(...)` block and check `OPEN`.
 - **Fix only `resource` and keep the manual `__aenter__` loop.** The span and sandbox now close, but MCP
   sessions still leak on a tool error, a failed connect and Stop, because nothing calls their
-  `__aexit__`. Debug: compare the `LOG` opens and closes per key.
+  `__aexit__`. A check made after `asyncio.run` returns can miss this, because loop shutdown finalises
+  abandoned async generators; the tests check inside the loop for that reason. Debug: compare the `LOG`
+  opens and closes per key.
 - **Inject `stack.pop_all()` before returning** (to keep sessions for the next turn). Even the success
   test fails with all four resources open. Debug: a lifetime longer than the block needs an owner, such
   as a session manager with an idle timeout, that closes it later.

@@ -6,7 +6,8 @@ kind: practice
 difficulty: advanced
 est_minutes: 40
 agent_relevance: core
-status: agentic-verified
+status: typed
+lesson_type: decision
 related:
   - agents/model-context-protocol
   - agents/mcp-authentication-authorization-transport-security
@@ -40,6 +41,58 @@ proves you can build agent infrastructure others depend on.
   annotations, authorization scopes, rate limits, and what gets logged.
 - **What you can skip.** Writing the protocol by hand. The official SDKs handle JSON-RPC, capability
   negotiation and transports; spend your time on tool design and security.
+
+## Decision case
+### Scenario
+An engineering org of 80 people uses three MCP hosts (an IDE, a desktop assistant and an in-house agent)
+and wants shared tools for docs, ticketing, GitHub and the metrics database. A two-person platform team
+must choose the hub topology. Incident hours are illustrative, from last quarter's logs, not benchmarks.
+- **Security rule:** no long-lived downstream credentials on laptops; offboarding must cut access centrally.
+- **Availability:** 99.5%+ a month for the docs, ticketing and GitHub tools (the target above).
+- **Known risk:** the metrics database has slow-query incidents about 4 hours a month; in a shared process,
+  those calls hold workers and stall every tool.
+- **Operations capacity:** the team can run and be on call for about 3 deployments.
+- **Deadline:** the 3-week phased plan above.
+
+### Options
+| Option | How it works | Credentials on laptops | Deployments | Availability of stable tools |
+|---|---|---|---|---|
+| Local stdio servers | Each engineer runs the 4 servers locally | 80 x 4 = 320 long-lived tokens | 0, but 80 machines to upgrade | per laptop, unmeasured |
+| One remote hub | All tools in one Streamable HTTP server | none | 1 | 1 - 4 / 730 = 99.45%, under target |
+| Gateway plus one server per integration | Gateway routes to 4 separate servers | none | 5, over capacity | isolated from metrics incidents |
+| Gateway plus 2 servers | Stable tools in one hub, metrics DB in its own server behind the gateway | none | 3 | isolated from metrics incidents |
+
+### Decision
+**A gateway in front of two servers: one hub for docs, ticketing and GitHub, and a separate server for the
+metrics database.** Isolation follows the measured risk, not the number of integrations.
+- **Stdio fails the security rule:** 320 long-lived tokens on laptops, and offboarding means chasing every
+  machine.
+- **One hub misses availability:** the metrics incidents alone take it to 99.45%, before any other outage.
+- **One server per integration isolates everything** but needs 5 deployments, more than two people can
+  operate. Docs, ticketing and GitHub have no history of incidents, so splitting them buys little.
+- **Hosts see one URL and one OAuth flow** through the gateway, so the split stays invisible to users.
+
+**What would change it.** If another integration shows its own incident pattern, move it behind the
+gateway as a separate server, which is the reason for having the gateway. If the metrics database gets
+query timeouts and its incidents stop, fold it back into the hub to save a deployment.
+
+### Trade-offs accepted
+- **The gateway is a new single point of failure.** Run two replicas behind a health check, and track
+  gateway availability separately from each server's.
+- **Shared failure inside the main hub.** A bug in the ticketing tool can still affect docs and GitHub.
+  Watch per-tool error rate and p95, and split any tool whose errors spill over.
+- **Metrics tools are still down 4 hours a month.** Return clear errors that tell the agent the tool is
+  unavailable, and alert on the metrics server separately.
+
+### Review rubric
+- **Security constraint checked first:** credential locations and offboarding are compared for each
+  topology before availability or effort.
+- **Availability computed from incident data:** the write-up turns measured incident hours into a monthly
+  percentage per topology.
+- **Isolation tied to risk:** components are split where incidents or sensitivity justify it, not by
+  default.
+- **Operations capacity respected:** the number of deployments fits the team that runs them.
+- **Change triggers stated:** which new incident pattern or fix would split or merge servers.
 
 ## Why it exists
 - **Every agent re-implements the same integrations.** Without a hub, each team writes its own Jira,

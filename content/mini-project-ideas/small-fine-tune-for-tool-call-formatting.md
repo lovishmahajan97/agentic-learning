@@ -5,7 +5,8 @@ name: Small fine-tune for tool-call formatting (LoRA)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - training-adaptation/peft
@@ -37,6 +38,184 @@ and prove the gain on a held-out eval. It shows you can measure and fix an SLM's
   tool-call format; a small adapter is how teams fix that for a fixed tool set.
 - **What you can skip.** Full fine-tuning, multi-GPU training and RLHF. One GPU with 16 GB (or a free
   notebook GPU) is enough at this size.
+
+## Lab
+### Task
+Decide whether a trained LoRA adapter may replace the base model in a weather agent, using recorded
+outputs so no GPU is needed.
+
+Training is the easy part; this lab fixes the three things that make an
+adapter look better than it is: training data that leaks test templates, one averaged score that hides a
+no-tool regression, and a release gate that checks only the parse rate.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** PEFT and LoRA, synthetic data generation, and evaluating SLMs on your agent tasks;
+  this lesson's scorer.
+- **Runs offline:** `TEST` holds 8 held-out prompts (5 need a call, 3 do not) with outputs recorded from a
+  base 0.5B model and its adapter, in Qwen2.5-style `<tool_call>` tags. Rerun with your own recorded
+  generations after you train.
+- **Needs:** `pip install jsonschema pytest`; checked with Python 3.12, jsonschema 4.26.0 and pytest 9.1.1.
+
+### Starter code
+```python
+# toolcall_eval.py: leak-free data, a sliced tool-call eval and a release gate for a LoRA adapter, offline
+import json, re
+from jsonschema import ValidationError, validate
+
+SCHEMAS = {"get_weather": {"type": "object", "required": ["city"], "additionalProperties": False,
+                           "properties": {"city": {"type": "string"}, "unit": {"type": "string", "enum": ["c", "f"]}}}}
+CALL = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)       # Qwen2.5-style tags
+
+TEMPLATES = {                                    # id -> (request template, unit or None for no tool)
+    "t1": ("What's the weather in {city}?", ""),
+    "t2": ("Is it cold in {city}, in fahrenheit?", "f"),
+    "t3": ("Weather for {city} please", ""),
+    "t4": ("Tell me a joke about {city}", None),
+    "t5": ("Thanks, that's all for {city}!", None),
+}
+CITIES = ["Oslo", "Lima", "Pune", "Accra", "Quito"]
+
+def tc(args):
+    return '<tool_call>\n{"name": "get_weather", "arguments": ' + json.dumps(args) + '}\n</tool_call>'
+
+# Held-out test set with RECORDED outputs from the base model and the trained adapter (no GPU needed).
+TEST = [
+    {"t": "t3", "user": "Weather for Accra please", "gold": {"city": "Accra"},
+     "base": "Sure! " + tc({"city": "Accra"}), "adapter": tc({"city": "Accra"})},
+    {"t": "t3", "user": "Weather for Quito please", "gold": {"city": "Quito"},
+     "base": '<tool_call>{"name": "get_weather", "arguments": {"city": "Quito"}</tool_call>',
+     "adapter": tc({"city": "Quito"})},
+    {"t": "t6", "user": "Quito weather in fahrenheit", "gold": {"city": "Quito", "unit": "f"},
+     "base": '{"name": "get_weather", "arguments": {"city": "Quito", "unit": "f"}}',
+     "adapter": tc({"city": "Quito", "unit": "f"})},
+    {"t": "t7", "user": "How warm is Hanoi in celsius", "gold": {"city": "Hanoi", "unit": "c"},
+     "base": tc({"city": "Hanoi", "unit": "celsius"}), "adapter": tc({"city": "Hanoi", "unit": "c"})},
+    {"t": "t8", "user": "Hanoi forecast", "gold": {"city": "Hanoi"},
+     "base": tc({"city": "Hanoi"}).replace("get_weather", "weather"),
+     "adapter": tc({"city": "Hanoi", "unit": "c"})},
+    {"t": "t4", "user": "Tell me a joke about Accra", "gold": None,
+     "base": "Why did the cloud stay in Accra? It liked the sunshine.", "adapter": tc({"city": "Accra"})},
+    {"t": "t9", "user": "Thanks, bye!", "gold": None, "base": "Bye!", "adapter": "Goodbye!"},
+    {"t": "t10", "user": "What can you do?", "gold": None,
+     "base": "I can look up the weather.", "adapter": "I can look up the weather for any city."},
+]
+
+def make_train_rows():
+    # YOUR CODE 1: never train on a template the test set uses; drop every template id found in TEST
+    rows = []
+    for tid, (text, unit) in TEMPLATES.items():
+        for city in CITIES:
+            gold = None if unit is None else {"city": city, **({"unit": unit} if unit else {})}
+            rows.append({"t": tid, "user": text.format(city=city), "gold": gold})
+    return rows
+
+def score(output, gold):
+    m = CALL.search(output)
+    if gold is None:
+        return {"parsed": True, "valid": True, "correct": m is None}
+    if not m:
+        return {"parsed": False, "valid": False, "correct": False}
+    try:
+        call = json.loads(m.group(1))
+        validate(call["arguments"], SCHEMAS[call["name"]])
+    except json.JSONDecodeError:
+        return {"parsed": False, "valid": False, "correct": False}
+    except (KeyError, TypeError, ValidationError):
+        return {"parsed": True, "valid": False, "correct": False}
+    return {"parsed": True, "valid": True, "correct": call["name"] == "get_weather" and call["arguments"] == gold}
+
+def report(test, who):
+    rows = [(r["gold"], score(r[who], r["gold"])) for r in test]
+    # YOUR CODE 2: averaging tool and no-tool prompts together hides regressions. Return
+    # {"tool": {"parsed", "valid", "correct"} over prompts with a gold call,
+    #  "no_tool": {"no_call_accuracy"} over prompts whose gold is None}, each rounded to 3 places
+    return {k: round(sum(s[k] for _, s in rows) / len(rows), 3) for k in ("parsed", "valid", "correct")}
+
+def gate(base, adapter):
+    """Return (ship, reasons). Bar: tool parse rate >= 0.98, exact match >= base + 0.20,
+    no-tool accuracy >= base. Every failed check adds a reason."""
+    # YOUR CODE 3: check all three criteria on the sliced report, not only the parse rate
+    return adapter["parsed"] >= 0.98, []
+
+def main():
+    train = make_train_rows()
+    leaked = {r["user"] for r in train} & {r["user"] for r in TEST}
+    print("train rows:", len(train), "| leaked test prompts:", len(leaked))
+    base, adapter = report(TEST, "base"), report(TEST, "adapter")
+    print("base:   ", base)
+    print("adapter:", adapter)
+    print("ship:", *gate(base, adapter))
+
+if __name__ == "__main__":
+    main()
+```
+
+As given it prints `leaked test prompts: 3` and `ship: True []`. The averaged adapter score of 0.75 looks
+like a clear win over the base model's 0.5, which is exactly how the regression hides.
+
+### Expected output
+```
+train rows: 15 | leaked test prompts: 0
+base:    {'tool': {'parsed': 0.6, 'valid': 0.2, 'correct': 0.2}, 'no_tool': {'no_call_accuracy': 1.0}}
+adapter: {'tool': {'parsed': 1.0, 'valid': 1.0, 'correct': 0.8}, 'no_tool': {'no_call_accuracy': 0.667}}
+ship: False ['no-tool accuracy 0.667 < base 1.0']
+```
+
+Recompute the slices: the base parses 3 of 5 tool outputs (a missing brace and a missing tag fail) and
+only 1 of 5 is schema-valid, because `celsius` breaks the enum and `weather` is an invented tool.
+
+The adapter gets 4 of 5 exact (it adds an unasked `unit`) but calls a tool on 1 of 3 no-tool prompts.
+
+### Tests
+```python
+# test_toolcall_eval.py: run with `pytest -q`
+import copy
+import toolcall_eval as m
+
+def test_training_data_does_not_leak_test_templates():
+    train = m.make_train_rows()
+    assert {r["t"] for r in train} == {"t1", "t2", "t5"}
+    assert len(train) == 15
+    assert not {r["user"] for r in train} & {r["user"] for r in m.TEST}
+
+def test_report_slices_tool_and_no_tool_prompts():
+    assert m.report(m.TEST, "base") == {"tool": {"parsed": 0.6, "valid": 0.2, "correct": 0.2},
+                                        "no_tool": {"no_call_accuracy": 1.0}}
+    assert m.report(m.TEST, "adapter") == {"tool": {"parsed": 1.0, "valid": 1.0, "correct": 0.8},
+                                           "no_tool": {"no_call_accuracy": 0.667}}
+
+def test_gate_blocks_a_no_tool_regression():
+    base, adapter = m.report(m.TEST, "base"), m.report(m.TEST, "adapter")
+    assert m.gate(base, adapter) == (False, ["no-tool accuracy 0.667 < base 1.0"])
+    fixed = copy.deepcopy(adapter)
+    fixed["no_tool"]["no_call_accuracy"] = 1.0
+    assert m.gate(base, fixed) == (True, [])
+    fixed["tool"]["correct"] = 0.3                     # only +0.10 over the base model
+    assert m.gate(base, fixed)[0] is False
+```
+
+All three fail on the starter. With 3 no-tool prompts one false call moves the slice by 0.333, so a real
+gate needs the lesson's 200-prompt test set; the small set here keeps every number checkable by hand.
+
+### Failure scenarios
+- **Paraphrase training data from the test set.** Exact match jumps on the test set and falls on live
+  traffic. Debug by intersecting train and test on template id and on normalised text, as the first test
+  does, before every training run.
+- **Report one blended score.** The adapter "wins" while calling tools on small talk. Debug by always
+  printing the no-tool slice next to the tool slice, and the false-call count.
+- **Change the chat template between training and eval.** Parse rate drops to near zero although loss
+  looked fine. Debug by printing one rendered training row and one raw generation side by side.
+- **Gate on parse rate alone.** A model that always emits a valid call passes. Debug by adding a
+  deliberately bad candidate to CI and checking that the gate rejects it.
+
+### Submission
+- **Repo** with `toolcall_eval.py` and the unchanged tests; `pytest -q` shows 3 passed.
+- **Program output** matching the expected block, and the same table rerun on your own adapter's
+  recorded generations if you trained one.
+- **An error-analysis list** grouping every failed test prompt for both models (parse, schema, wrong
+  argument, false call).
+- **A short note** with the targeted training examples you would add to fix the false call, and how you
+  keep them out of the test templates.
+- **Evaluated on** tests passing, zero leaked prompts, and a gate that names every failed criterion.
 
 ## Why it exists
 - **Small models fumble tool calls.** They emit broken JSON, invent tool names, skip required arguments or

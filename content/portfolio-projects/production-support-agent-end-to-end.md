@@ -6,7 +6,8 @@ kind: practice
 difficulty: advanced
 est_minutes: 35
 agent_relevance: core
-status: agentic-verified
+status: typed
+lesson_type: decision
 related:
   - practice-use-cases/customer-support-agent
   - agents/agent-loop
@@ -40,6 +41,59 @@ agent with evals, traces, SLOs and a rollback plan.
   SLOs. The model is swappable; those decisions are the project.
 - **What you can skip.** A custom UI framework and a real payments provider. A minimal chat page and a
   fake order database are enough, because the reviewer is judging the agent and its operations.
+
+## Decision case
+### Scenario
+An online retailer is launching the support agent from this lesson and must decide how much the agent
+may refund without a human. All figures are illustrative planning numbers, not benchmarks.
+- **Volume:** 6,000 conversations a week; 15% ask for a refund, so 900 refund requests a week.
+- **Refund mix:** 70% (630) are $50 or less, averaging $20; 22% (198) are $50-$200, averaging $110;
+  8% (72) are over $200.
+- **Human capacity:** the support lead can give the approval queue 15 hours a week; one approval takes
+  about 3 minutes, so 15 x 60 / 3 = 300 approvals a week at most.
+- **Finance constraint:** at most $15,000 a week may be refunded with no human review until the audit
+  log has 4 weeks of history.
+- **Deadline:** the 3-week phased plan above; there is no fraud-scoring service yet.
+
+### Options
+| Option | How it works | Approvals a week (hours) | Unreviewed refunds a week | Fits both constraints? |
+|---|---|---|---|---|
+| Every refund approved | `issue_refund` always returns `pending_approval` | 900 (45 h) | $0 | no: three times the queue capacity |
+| Fixed limit of $50 | Code-enforced `REFUND_LIMIT = 50.0`, larger amounts to the queue | 198 + 72 = 270 (13.5 h) | 630 x $20 = $12,600 | yes, with 1.5 h of queue slack |
+| Fixed limit of $200 | Same, with the limit raised | 72 (3.6 h) | $12,600 + 198 x $110 = $34,380 | no: over the $15,000 cap |
+| Risk-tiered limit | $50 for everyone, $200 for low-risk accounts (about 60% of the middle bucket) | 72 + 79 = 151 (7.6 h) | $12,600 + 0.6 x $21,780 = $25,668 | no: over the cap, and needs a risk signal that does not exist yet |
+
+### Decision
+**A fixed, code-enforced limit of $50, with everything above it routed to the approval queue.** It is the
+only option that fits both the 300-approval capacity and the $15,000 unreviewed cap, and it needs no new
+service before the deadline.
+- **The limit lives in the tool,** as in the skeleton above, so no prompt or injection can raise it.
+- **The queue runs at 90% utilisation** (13.5 of 15 hours), so queue age is alerted from day one and a
+  status message goes to any customer whose request waits past the agreed window.
+- **Approval outcomes are logged** in the audit trail, which is the evidence needed to revisit the limit.
+
+**What would change it.** After 4 weeks of audit data, if humans approve nearly every $50-$200 request and
+finance raises the cap above about $26,000, the risk-tiered option becomes viable. If refund volume grows
+by about 11%, approvals pass 300 a week, so add approver hours or revisit the limit before then.
+
+### Trade-offs accepted
+- **Customers with $50-$200 refunds wait for a human.** Resolution rate is lower than with a $200 limit.
+  Watch queue age and customer satisfaction on pending refunds per week.
+- **A thin capacity margin.** 270 of 300 approvals leaves little room for a holiday spike. Watch weekly
+  approvals against capacity and agree a fallback approver in the runbook.
+- **Small refunds are unreviewed.** An injection or a confused turn can still refund $50 at a time. Watch
+  refunds per customer per day and alert on repeated small refunds to one account.
+
+### Review rubric
+- **Capacity math shown:** the write-up turns volume and the amount mix into approvals per week and hours,
+  and compares them with the people actually available.
+- **Exposure math shown:** unreviewed refund value per week is computed per option and checked against a
+  stated finance limit.
+- **Enforcement in code:** the limit is enforced inside the tool, not in the prompt, and identity comes
+  from the session.
+- **Monitoring named:** each accepted trade-off has a metric (queue age, refunds per account) and an owner.
+- **Exit criteria stated:** the write-up says which data or volume change would move the limit, and in
+  which direction.
 
 ## Why it exists
 - **Support is the most common first agent in industry.** Ticket volume is high, answers are mostly

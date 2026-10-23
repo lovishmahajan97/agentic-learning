@@ -5,7 +5,8 @@ name: Git and code review workflow
 kind: practice
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -39,6 +40,183 @@ assistant writes much of the diff.
   hard you review generated code before it merges.
 - **What you can skip.** Git's plumbing commands and exotic workflows. Master snapshots, branches,
   rebase versus merge, `revert`, `bisect` and `reflog`.
+
+## Lab
+### Task
+A coding assistant opened `feat/invoice` against your agent repo.
+
+Write the pre-merge gate that reads the branch with real git and reports the AI-code checklist from
+this lesson as findings: unlisted
+imports, `shell=True`, broad `except`, a prompt change with no eval change, a secret anywhere in the
+branch history, and unsquashed `fixup!` commits. Time box: 45-75 min.
+- **Prerequisites:** Command line and environment basics (exit codes, subprocess); the review checklist
+  and Pitfalls in this lesson; the bisect example below.
+- **Setup:** Python 3.9+, git 2.28+ (for `init -b`) and `pip install pytest` (checked with Python
+  3.9.6, git 2.56 and pytest 8.4.2). Save the starter as `lab.py` and the tests as `test_lab.py`. Each
+  run builds a throwaway repo in a temp directory with your personal git config ignored.
+- **The trap:** the assistant committed a key and then "removed" it in a later commit, so the final
+  diff is clean. Only the history shows it.
+
+### Starter code
+```python
+"""Lab: a pre-merge review gate for an AI-written branch, driven by real git. Run: python lab.py"""
+import os, re, subprocess, tempfile
+
+ENV = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1",
+           GIT_AUTHOR_NAME="demo", GIT_AUTHOR_EMAIL="demo@example.com",
+           GIT_COMMITTER_NAME="demo", GIT_COMMITTER_EMAIL="demo@example.com")
+STDLIB = {"json", "os", "re", "subprocess", "pathlib", "typing", "dataclasses"}
+
+def git(repo, *args):
+    return subprocess.run(["git", "-C", repo, *args], env=ENV, check=True,
+                          capture_output=True, text=True).stdout
+
+def commit(repo, files, msg):
+    for path, text in files.items():
+        full = os.path.join(repo, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text)
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", msg)
+
+def make_demo_repo(repo):
+    git(repo, "init", "-q", "-b", "main")
+    commit(repo, {"requirements.txt": "httpx==0.28.1\n", "prompts/router.md": "Pick one tool.\n",
+                  "evals/router.jsonl": '{"q": "refund?", "tool": "refunds"}\n'}, "Initial agent")
+    git(repo, "switch", "-qc", "feat/invoice")           # the coding assistant's branch
+    commit(repo, {"tools/invoice.py": (
+        "import json\nimport subprocess\nimport billing_sdk\n\n"
+        "def fetch_invoice(path):\n    try:\n"
+        "        out = subprocess.run(f\"pdftotext {path}\", shell=True, capture_output=True)\n"
+        "        return json.loads(out.stdout)\n    except Exception:\n        return {}\n")},
+        "Add fetch_invoice tool")
+    commit(repo, {"prompts/router.md": "Pick one tool. Prefer fetch_invoice for billing.\n"}, "Tune router prompt")
+    commit(repo, {"config.py": 'API_KEY = "sk-test-FAKE123"\n'}, "fixup! Add fetch_invoice tool")
+    commit(repo, {"config.py": 'import os\nAPI_KEY = os.environ["API_KEY"]\n'}, "Read key from env")
+    git(repo, "switch", "-qc", "feat/clean", "main")      # a well-formed change for comparison
+    commit(repo, {"prompts/router.md": "Pick exactly one tool.\n",
+                  "evals/router.jsonl": '{"q": "refund?", "tool": "refunds"}\n{"q": "two tools?", "tool": "refunds"}\n'},
+           "Tighten router prompt, add eval case")
+
+def changed_files(repo, base, head):
+    return git(repo, "diff", "--name-only", f"{base}...{head}").split()
+
+def subjects(repo, base, head):
+    return git(repo, "log", "--format=%s", f"{base}..{head}").splitlines()
+
+def added_lines(repo, base, head):
+    """[(path, line text)] for every line the branch adds, parsed from `git diff -U0 base...head`."""
+    # YOUR CODE HERE: '+++ b/<path>' starts a file; lines starting with '+' (but not '+++') are added
+    raise NotImplementedError
+
+def review(repo, base, head):
+    """Sorted list of (where, rule) findings. Rules:
+    - (path, "unlisted-import"): a .py file adds an import whose top-level name is neither in STDLIB
+      nor a package pinned in requirements.txt at head (compare names lower-cased, '-' as '_')
+    - (path, "shell-true"): an added line contains shell=True
+    - (path, "broad-except"): an added line is `except Exception:` or a bare `except:`
+    - ("prompts/<f>", "eval-missing"): a prompt changed but nothing under evals/ changed
+    - ("history", "secret"): any commit in base..head adds or removes the text 'sk-'
+      (hint: `git log -S`), even if the final diff no longer contains it
+    - ("branch", "fixup"): a commit subject in base..head starts with 'fixup!'"""
+    # YOUR CODE HERE
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    with tempfile.TemporaryDirectory() as repo:
+        make_demo_repo(repo)
+        print("changed:", changed_files(repo, "main", "feat/invoice"))
+        print("added in tools/invoice.py:", sum(p == "tools/invoice.py" for p, _ in added_lines(repo, "main", "feat/invoice")))
+        for where, rule in review(repo, "main", "feat/invoice"):
+            print(f"  {rule:16} {where}")
+        print("clean branch findings:", review(repo, "main", "feat/clean"))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+changed: ['config.py', 'prompts/router.md', 'tools/invoice.py']
+added in tools/invoice.py: 10
+  fixup            branch
+  secret           history
+  eval-missing     prompts/router.md
+  broad-except     tools/invoice.py
+  shell-true       tools/invoice.py
+  unlisted-import  tools/invoice.py
+clean branch findings: []
+```
+
+- **Read the lines:** `config.py` shows up as changed, but its final content reads the key from the
+  environment; the `secret` finding comes from the history, which is where a leaked key still lives
+  after "removing" it. The clean branch changes a prompt and an eval together, so the gate passes it.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution
+passes all 5 (Python 3.9.6, git 2.56, pytest 8.4.2).
+
+```python
+import pytest
+from lab import added_lines, commit, git, make_demo_repo, review
+
+@pytest.fixture
+def repo(tmp_path):
+    make_demo_repo(str(tmp_path))
+    return str(tmp_path)
+
+def test_added_lines_come_from_the_diff_not_the_history(repo):
+    lines = added_lines(repo, "main", "feat/invoice")
+    assert ("tools/invoice.py", "import billing_sdk") in lines
+    assert ("config.py", 'API_KEY = os.environ["API_KEY"]') in lines
+    assert not any("sk-" in text for _, text in lines)          # the final diff hides the key
+
+def test_ai_branch_findings(repo):
+    assert review(repo, "main", "feat/invoice") == [
+        ("branch", "fixup"),
+        ("history", "secret"),
+        ("prompts/router.md", "eval-missing"),
+        ("tools/invoice.py", "broad-except"),
+        ("tools/invoice.py", "shell-true"),
+        ("tools/invoice.py", "unlisted-import"),
+    ]
+
+def test_clean_branch_passes(repo):
+    assert review(repo, "main", "feat/clean") == []
+
+def test_pinned_and_stdlib_imports_are_not_flagged(repo):
+    git(repo, "switch", "-q", "feat/clean")
+    commit(repo, {"tools/web.py": "import json\nimport httpx\nfrom pathlib import Path\n"}, "Add web tool")
+    assert review(repo, "main", "feat/clean") == []
+
+def test_squashing_removes_fixup_but_not_the_leaked_key(repo):
+    git(repo, "switch", "-q", "feat/invoice")
+    git(repo, "-c", "sequence.editor=:", "rebase", "-q", "-i", "--autosquash", "main")
+    found = review(repo, "main", "feat/invoice")
+    assert ("branch", "fixup") not in found and ("history", "secret") in found
+```
+
+### Failure scenarios
+- **Scan only the final diff for secrets.** `review` misses `("history", "secret")` and the branch looks
+  clean. Run `git log -p -S'sk-' main..feat/invoice` and you see the commit that added the key and the
+  one that removed it; the fix is rotating the key, then rewriting history.
+- **Diff with two dots** (`main..head`) after a commit lands on `main`. The branch "deletes" files it
+  never touched, because two dots compare the two tips; three dots compare against the merge base,
+  which is what a review needs. Check with `git diff --stat` both ways.
+- **Treat autosquash as a cleanup of the leak.** The last test shows it: the fixup commit is folded
+  away, yet the key is still in the rewritten commit. Squashing changes commit boundaries, not content.
+- **Clear `unlisted-import` by pinning the name.** The gate goes green, but `billing_sdk` was invented by
+  the assistant and could be a squatted package. The fix is the existing internal client, so a reviewer
+  reads the lockfile diff, not just the gate result.
+
+### Submission
+- **`lab.py`** with `added_lines` and `review` implemented; the helpers and demo repo unchanged.
+- **A green run** of `pytest -q test_lab.py` (5 passed) and the output of `python lab.py`.
+- **A written review** of `feat/invoice` in the table format of the worked scenario: finding, why it
+  matters for the agent, requested change.
+- **A note** (3-5 sentences): which rules you would make blocking in CI and which only comment, and why.
+- **Evaluated on:** every rule fires on the AI branch and none on the clean one; the secret is found
+  from history; diffs use the merge base.
 
 ## Why it exists
 - **Change needs history.** Without versioned snapshots you cannot answer "what changed between the

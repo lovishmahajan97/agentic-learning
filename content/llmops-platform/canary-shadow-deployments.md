@@ -5,7 +5,7 @@ name: Canary / shadow deployments
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -52,7 +52,7 @@ swaps in a different model family. Offline evals show v13 slightly ahead. All fi
   - refunds are real money, so the refund tool can never run in a mirrored arm;
   - two engineers; the gateway already hashes users, but dry-run tool adapters take about 3 days to build.
 - **Sample sizes (n ≈ 16 · σ² / δ²):** schema failures 0.5% → 5% need 212 per arm; a 0.1-point judge
-  shift needs 1,024; a refund rate doubling from 3% to 6% needs 16 × 0.045 × 0.955 / 0.03² ≈ 764.
+  shift (σ ≈ 0.8) needs 16 × 0.64 / 0.01 = 1,024; a refund rate doubling from 3% to 6% needs 16 × 0.045 × 0.955 / 0.03² ≈ 764.
 
 ### Options
 | Option | How it works | Extra spend | Exposure before a quality verdict | Calendar (one fix-and-retry) | Refund risk |
@@ -76,7 +76,8 @@ with nobody exposed.
   instead of a rollback.
 
 **What would change it:**
-- **Retirement in under about 12 days:** go to B with the steps held only to their minimum samples.
+- **Retirement in under 22 days** (C with one fix-and-retry no longer fits): go to B, 13 days with a
+  retry, with the steps held only to their minimum samples.
 - **A patch release of the same model family** with clean offline evals: B alone is enough.
 - **Shadow budget above $1,860:** D covers rare intents and tenants faster.
 

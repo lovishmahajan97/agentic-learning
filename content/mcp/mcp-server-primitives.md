@@ -5,7 +5,8 @@ name: MCP server primitives (tools, resources, prompts)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - mcp/mcp-architecture
@@ -39,6 +40,193 @@ control and what your agent spends tokens on.
   resource URIs and templates, and prompt arguments.
 - **What you can skip.** Content annotations for display ordering and audience until a host actually uses
   them.
+
+## Lab
+### Task
+Refactor the Check yourself anti-pattern for real: a server whose only tool, `get_manual()`, pushes the
+whole manual into context. Split it into the three primitives so the model gets one small read-only
+search tool, the host reads only the sections a question needs, and the user gets a prompt that starts
+the workflow.
+
+Time box: 45-75 min.
+- **Prerequisites:** this lesson's How it works and first example; `mcp/mcp-architecture`.
+- **Setup:** Python 3.10+, `pip install "mcp>=1.10,<2" pytest` (checked with mcp 1.30.0, pytest 9.1,
+  Python 3.13). Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **No subprocess, no model:** the lab connects client and server in memory with
+  `create_connected_server_and_client_session` from `mcp.shared.memory`, the helper the SDK's own tests
+  use. It is not a documented public API, so if it moves in your version, run the server over stdio as in
+  the Examples.
+- **You implement:** `build_server` (tool, resource template, prompt) and `load_context` (the host-side
+  retrieval step).
+
+### Starter code
+```python
+"""Lab: move a manual out of one giant tool into the right MCP primitives. Run: python lab.py"""
+import asyncio
+from pydantic import BaseModel
+from mcp import ClientSession
+from mcp.server.fastmcp import FastMCP
+from mcp.shared.memory import create_connected_server_and_client_session as connect
+from mcp.types import ToolAnnotations
+
+MANUAL = {   # section_id -> (title, body); imagine 300 pages of this
+    "vpn-setup": ("Setting up the VPN", "Install the client, then sign in with SSO."),
+    "vpn-errors": ("VPN error codes", "Error 809 means UDP 500 and 4500 are blocked."),
+    "printer": ("Printer setup", "Add the printer by its queue name, for example PRN-3."),
+}
+
+
+class Hit(BaseModel):
+    section_id: str
+    title: str
+
+
+def build_legacy_server() -> FastMCP:
+    """The anti-pattern: one tool that pushes the whole manual into context on every call."""
+    mcp = FastMCP("manual-legacy")
+
+    @mcp.tool()
+    def get_manual() -> str:
+        """Return the full product manual."""
+        return "\n\n".join(f"# {t}\n\n{b}" for t, b in MANUAL.values())
+
+    return mcp
+
+
+def build_server() -> FastMCP:
+    mcp = FastMCP("manual")
+    # YOUR CODE HERE, three primitives and no get_manual tool:
+    # 1. Tool manual_search(query: str) -> list[Hit], annotated readOnlyHint=True. It matches `query`
+    #    case-insensitively against title or body and returns ids and titles only, in MANUAL order.
+    # 2. Resource template "manual://{section_id}" with mime_type "text/markdown" returning
+    #    "# {title}\n\n{body}". Unknown ids raise
+    #    ValueError(f"Unknown section {section_id}. Use a section_id from manual_search.")
+    # 3. Prompt answer_from_manual(question: str) returning exactly
+    #    f"Answer {question!r} from the manual: call manual_search, then read manual://<section_id> for each hit."
+    raise NotImplementedError
+
+
+async def load_context(session: ClientSession, query: str) -> list[str]:
+    """Host-side retrieval: search with the tool, then read only the matching resources."""
+    # YOUR CODE HERE: call manual_search, take the hits from structuredContent["result"], read
+    # manual://{section_id} for each and return the text of each resource, in hit order.
+    raise NotImplementedError
+
+
+async def main():
+    async with connect(build_server()) as s:
+        tools = (await s.list_tools()).tools
+        print("tools:", [(t.name, t.annotations.readOnlyHint) for t in tools])
+        print("templates:", [t.uriTemplate for t in (await s.list_resource_templates()).resourceTemplates])
+        context = await load_context(s, "vpn")
+        print("context:", [c.splitlines()[0] for c in context])
+        p = await s.get_prompt("answer_from_manual", {"question": "Why error 809?"})
+        print("prompt:", p.messages[0].role, "|", p.messages[0].content.text)
+    async with connect(build_legacy_server()) as s:
+        dump = (await s.call_tool("get_manual", {})).content[0].text
+    print(f"chars into context: legacy {len(dump)}, scoped {sum(map(len, context))}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly this on stdout (the SDK also logs lines such as
+`Processing request of type ListToolsRequest` to stderr):
+
+```
+tools: [('manual_search', True)]
+templates: ['manual://{section_id}']
+context: ['# Setting up the VPN', '# VPN error codes']
+prompt: user | Answer 'Why error 809?' from the manual: call manual_search, then read manual://<section_id> for each hit.
+chars into context: legacy 202, scoped 128
+```
+
+With three sections the saving is small; it grows with the manual, because the scoped path pays only for
+the sections a query hits.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (mcp 1.30.0).
+
+```python
+import asyncio
+import pytest
+from mcp.shared.exceptions import McpError
+from mcp.shared.memory import create_connected_server_and_client_session as connect
+from lab import build_server, load_context
+
+def run(fn):
+    async def go():
+        async with connect(build_server()) as s:
+            return await fn(s)
+    return asyncio.run(go())
+
+def test_only_a_small_read_only_tool():
+    async def fn(s):
+        return (await s.list_tools()).tools
+    tools = run(fn)
+    assert [t.name for t in tools] == ["manual_search"]
+    assert tools[0].annotations.readOnlyHint is True and tools[0].outputSchema is not None
+
+def test_search_returns_ids_not_bodies():
+    async def fn(s):
+        return await s.call_tool("manual_search", {"query": "ERROR"})
+    res = run(fn)
+    assert not res.isError
+    assert res.structuredContent == {"result": [{"section_id": "vpn-errors", "title": "VPN error codes"}]}
+
+def test_resource_template_reads_one_section():
+    async def fn(s):
+        tpl = (await s.list_resource_templates()).resourceTemplates
+        doc = await s.read_resource("manual://printer")
+        return tpl, doc.contents[0]
+    tpl, c = run(fn)
+    assert [t.uriTemplate for t in tpl] == ["manual://{section_id}"]
+    assert c.mimeType == "text/markdown" and c.text.startswith("# Printer setup")
+
+def test_unknown_section_is_an_error_with_next_step():
+    async def fn(s):
+        with pytest.raises(McpError, match="manual_search"):
+            await s.read_resource("manual://nope")
+        return True
+    assert run(fn)
+
+def test_prompt_is_a_user_message():
+    async def fn(s):
+        return await s.get_prompt("answer_from_manual", {"question": "Why error 809?"})
+    m = run(fn).messages
+    assert len(m) == 1 and m[0].role == "user" and "'Why error 809?'" in m[0].content.text
+
+def test_load_context_reads_only_hits():
+    async def fn(s):
+        return await load_context(s, "vpn")
+    ctx = run(fn)
+    assert [c.splitlines()[0] for c in ctx] == ["# Setting up the VPN", "# VPN error codes"]
+```
+
+### Failure scenarios
+- **Drop the return type on `manual_search`.** FastMCP emits no `outputSchema`, `structuredContent` is
+  `None`, and `load_context` dies with `TypeError: 'NoneType' object is not subscriptable`. Print
+  `tools[0].outputSchema` and the raw result; the typed return is what produces structured output.
+- **Name the template variable differently from the parameter** (`manual://{id}` with `section_id`).
+  `build_server` fails at decoration with `ValueError: Mismatch between URI parameters`. Read the two sets
+  in the message and make them match.
+- **Let an unknown id fall through to a bare `KeyError`.** The client gets an `McpError` whose message is
+  just `'nope'`, and `test_unknown_section_is_an_error_with_next_step` fails. The agent cannot recover from
+  that text; raise with a message that names the tool that returns valid ids.
+- **Forget `readOnlyHint`.** `t.annotations` is `None` and `main` raises `AttributeError`. A host that
+  auto-approves only read-only tools from trusted servers would now ask for approval on every search.
+
+### Submission
+- `lab.py` with both `YOUR CODE HERE` stubs implemented and `build_legacy_server` and `main` unchanged.
+- A `pytest -q` run showing 6 passed and the stdout of `python lab.py` matching Expected output.
+- The primitive table from the worked scenario filled in for your three capabilities, with one line each on
+  who controls it (model, application or user).
+- A short note: one failure scenario you reproduced, the symptom and how you found it.
+- Evaluation: tests pass, the model-facing tool list is exactly one read-only tool, and resources are read
+  only for search hits.
 
 ## Why it exists
 - **Different capabilities need different controllers.** "Search tickets" is a model decision, "attach

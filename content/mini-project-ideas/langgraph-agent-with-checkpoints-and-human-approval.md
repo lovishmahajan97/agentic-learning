@@ -5,7 +5,8 @@ name: LangGraph agent with checkpoints and human approval
 kind: practice
 difficulty: core
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agent-frameworks/langgraph-fundamentals
@@ -32,6 +33,172 @@ from a durable checkpoint and resumes exactly once. It proves you can make agent
 - **Why it matters for agents.** Any agent that sends email, merges code or refunds money needs a pause point a
   person controls and state that outlives the process holding it.
 - **What you can skip.** Multi-agent supervisors and LangGraph Platform deployment. One graph, one approval.
+
+## Lab
+### Task
+Build the refund path of the support-triage agent: refunds over 50 dollars pause for a human who can approve,
+reject or edit the amount, the thread resumes from a checkpoint in a fresh graph object, and the payment
+happens exactly once even when the run is retried. Time box: 60-90 min.
+- **Prerequisites:** LangGraph fundamentals; LangGraph persistence, streaming and human-in-the-loop;
+  Idempotent tool execution.
+- **Setup:** Python 3.10+, `pip install langgraph pytest` (checked with langgraph 1.2.16,
+  langgraph-checkpoint 4.3.0, pytest 9.1, Python 3.12). Save the starter as `lab.py`, the tests as
+  `test_lab.py`.
+- **No model and no payments provider:** `draft_action` is a stub and `payments_api_refund` only records
+  its calls. Each test compiles a new graph over the same saver to stand in for a restarted process; a real
+  restart needs the SQLite saver from milestone 4, because `InMemorySaver` lives in one process.
+
+### Starter code
+```python
+"""Lab: a refund agent that pauses for approval and refunds exactly once. Run: python lab.py"""
+from typing import TypedDict
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
+
+APPROVAL_THRESHOLD = 50          # refunds above this many dollars need a human
+PAYMENTS: list[tuple[str, int]] = []      # every call that reached the (fake) payments API
+LEDGER: dict[str, int] = {}               # idempotency key -> amount already refunded
+
+def payments_api_refund(key: str, amount: int) -> str:
+    PAYMENTS.append((key, amount))
+    return f"refund {amount} USD ok"
+
+class State(TypedDict, total=False):
+    ticket_id: str
+    amount: int
+    decision: str
+    result: str
+
+def draft_action(state: State) -> dict:
+    return {}                    # in the real project an LLM reads the ticket and proposes the amount
+
+def human_approval(state: State) -> dict:
+    # YOUR CODE HERE:
+    # - amounts <= APPROVAL_THRESHOLD: return {"decision": "approve"} without pausing
+    # - otherwise answer = interrupt({"ticket_id": ..., "amount": ..., "question": "Approve refund?"})
+    #   where answer is {"action": "approve"}, {"action": "reject"} or {"action": "edit", "amount": n}
+    # - return the decision, plus the new amount for an edit (an edit counts as approval)
+    # Do NOT call the payments API here: this node re-runs from its first line on resume.
+    raise NotImplementedError
+
+def route(state: State) -> str:
+    return "execute" if state["decision"] == "approve" else END
+
+def execute(state: State) -> dict:
+    # YOUR CODE HERE: key = f"{ticket_id}:refund". If the key is in LEDGER, return
+    # {"result": "already refunded"} without calling the API; otherwise call payments_api_refund,
+    # record LEDGER[key] = amount and return {"result": <the API's reply>}
+    raise NotImplementedError
+
+def build(checkpointer):
+    g = StateGraph(State)
+    g.add_node("draft_action", draft_action)
+    g.add_node("human_approval", human_approval)
+    g.add_node("execute", execute)
+    g.add_edge(START, "draft_action")
+    g.add_edge("draft_action", "human_approval")
+    g.add_conditional_edges("human_approval", route, ["execute", END])
+    g.add_edge("execute", END)
+    return g.compile(checkpointer=checkpointer)
+
+if __name__ == "__main__":
+    saver = InMemorySaver()                     # SqliteSaver in milestone 4; same API
+    cfg = {"configurable": {"thread_id": "ticket-42"}}
+    out = build(saver).invoke({"ticket_id": "T42", "amount": 120}, cfg)
+    print(out["__interrupt__"][0].value)
+    print(build(saver).get_state(cfg).next)     # a new graph object: the "restarted" process
+    print(build(saver).invoke(Command(resume={"action": "edit", "amount": 80}), cfg)["result"])
+    again = build(saver).invoke({"ticket_id": "T42", "amount": 30}, {"configurable": {"thread_id": "retry-1"}})
+    print(again["result"], "| payments:", PAYMENTS)
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+{'ticket_id': 'T42', 'amount': 120, 'question': 'Approve refund?'}
+('human_approval',)
+refund 80 USD ok
+already refunded | payments: [('T42:refund', 80)]
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError` raised inside the
+`human_approval` node; a correct solution passes all 5.
+
+```python
+import itertools
+import pytest
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
+import lab
+
+ids = itertools.count()
+
+@pytest.fixture(autouse=True)
+def clean():
+    lab.PAYMENTS.clear(); lab.LEDGER.clear()
+
+def start(saver, ticket, amount):
+    cfg = {"configurable": {"thread_id": f"t-{next(ids)}"}}
+    return cfg, lab.build(saver).invoke({"ticket_id": ticket, "amount": amount}, cfg)
+
+def test_small_refund_runs_without_pausing():
+    _, out = start(InMemorySaver(), "A1", 20)
+    assert "__interrupt__" not in out and out["result"] == "refund 20 USD ok"
+    assert lab.PAYMENTS == [("A1:refund", 20)]
+
+def test_large_refund_pauses_before_any_payment():
+    saver = InMemorySaver()
+    cfg, out = start(saver, "B1", 120)
+    assert out["__interrupt__"][0].value["amount"] == 120
+    assert lab.build(saver).get_state(cfg).next == ("human_approval",)
+    assert lab.PAYMENTS == []
+
+def test_approve_after_restart_pays_once():
+    saver = InMemorySaver()
+    cfg, _ = start(saver, "C1", 120)
+    final = lab.build(saver).invoke(Command(resume={"action": "approve"}), cfg)   # new graph object
+    assert final["result"] == "refund 120 USD ok" and lab.PAYMENTS == [("C1:refund", 120)]
+
+def test_reject_pays_nothing_and_edit_changes_amount():
+    saver = InMemorySaver()
+    cfg, _ = start(saver, "D1", 90)
+    rejected = lab.build(saver).invoke(Command(resume={"action": "reject"}), cfg)
+    assert rejected["decision"] == "reject" and "result" not in rejected
+    cfg2, _ = start(saver, "D2", 90)
+    edited = lab.build(saver).invoke(Command(resume={"action": "edit", "amount": 60}), cfg2)
+    assert edited["amount"] == 60 and lab.PAYMENTS == [("D2:refund", 60)]
+
+def test_retried_run_for_same_ticket_is_a_no_op():
+    saver = InMemorySaver()
+    start(saver, "E1", 30)
+    _, again = start(saver, "E1", 30)                  # a retry on a new thread
+    assert again["result"] == "already refunded"
+    assert lab.PAYMENTS == [("E1:refund", 30)]
+```
+
+### Failure scenarios
+- **Call `payments_api_refund` in `human_approval` before `interrupt`.** The pause test fails because a
+  payment exists before anyone approved, and on resume the node runs again for a second payment. Count
+  `PAYMENTS` after the first `invoke`; it must be empty.
+- **Compile without a checkpointer.** The first `invoke` still returns `__interrupt__`, but nothing was
+  saved, so the resume raises `RuntimeError: Cannot use Command(resume=...) without checkpointer` (langgraph
+  1.2.16). Check that `build` passes the saver to `compile`.
+- **Resume with a different `thread_id`.** That thread has no pending interrupt, so the graph starts from
+  `START` with empty state and fails with `KeyError: 'amount'`. Print `get_state(cfg).next` for the config
+  you resume with before sending `Command`.
+- **Key the ledger by thread id.** The retry test fails with two payments, because a retry runs on a new
+  thread. Key side effects by the business object (`ticket_id`), not by the run.
+
+### Submission
+- **`lab.py`** with both `YOUR CODE HERE` parts done and the graph wiring unchanged.
+- **A green test run** (5 passed) and the output of `python lab.py`.
+- **A restart test with `SqliteSaver`:** pause in one Python process, resume in a second, one payment.
+- **A short note:** where the ledger lives in production and what happens if the process dies between the
+  payment call and the ledger write.
+- **Evaluated on:** tests passing, no side effect before approval, and exactly-once refunds across retries.
 
 ## Why it exists
 - **Approval in a `while` loop does not survive restarts.** An `input()` prompt dies with the process; a pending

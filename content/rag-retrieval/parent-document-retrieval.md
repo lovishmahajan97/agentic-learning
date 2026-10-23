@@ -5,7 +5,7 @@ name: Parent-document retrieval
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement
@@ -155,8 +155,9 @@ flowchart TD
   use contextual retrieval for matching.
 - **"Overlap gives you the same context."** Overlap smears a few sentences across a boundary. It cannot
   carry a table header 1,000 tokens back to the row that needs it; a pointer to the parent can.
-- **"Embed the parents too, for good measure."** Parents are never searched, so their vectors waste space,
-  and their averaged topics blur the key. Embed children only and keep parents in a key-value store.
+- **"Embed the parents too, for good measure."** Parents are never searched, so their vectors waste space
+  and tempt someone to search them, where a section's averaged topics score middling against pinpoint
+  queries. Embed children only and keep parents in a key-value store.
 - **"Rank parents by how many children hit."** Count favours big sections: a parent with 30 children has
   more chances to land hits than one with 4. Max child suits pinpoint questions, fraction removes the
   size bias but rewards one lucky hit on a tiny parent; pick by question type and measure.

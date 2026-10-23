@@ -5,7 +5,7 @@ name: Token / cost tracking
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 agent_relevance: core
 lesson_type: lab
 related:

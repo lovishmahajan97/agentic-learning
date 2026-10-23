@@ -5,7 +5,7 @@ name: Context engineering
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -157,8 +157,9 @@ flowchart TD
   middle of a long context is used worst and irrelevant tokens lower accuracy, so an agent can degrade
   at step 40 without ever overflowing.
 - **"Context cost grows linearly with steps."** A loop re-sends the whole history every turn, so a
-  linearly growing context produces a quadratically growing bill unless the prefix is cached and
-  consumed tool results are cleared.
+  linearly growing context produces a quadratically growing bill. Caching the prefix cuts the rate on
+  re-sent tokens to about a tenth but the sum stays quadratic; only bounding the context (clearing
+  consumed tool results, compaction) keeps per-step cost flat.
 - **"Pruning old tool results always saves money."** In a cached loop an edit mid-history re-writes
   everything after it: stubbing a 30k result at 20k in a 100k history costs about 58k token-equivalents
   once and saves about 3k a turn, roughly 19 turns to pay back. Prune in batches for attention and

@@ -5,7 +5,7 @@ name: Distributed tracing across services
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 agent_relevance: useful
 lesson_type: lab
 related:
@@ -204,9 +204,10 @@ its client, the consumer has no parent, and the root's parent is the public clie
 - **Inject: call `inject(carrier)` before opening the `queue.publish` span.** Observe: the consumer's
   parent is `agent.run`, not the producer. Debug: compare the consumer's parent span id with the
   producer's; inject inside the span that should be the parent.
-- **Inject: keep the starter's edge and send flags `00` instead of `01`.** Observe: `agent.run`, the
-  tool `CLIENT` span and `queue.publish` vanish from the exporter, because the parent-based sampler
-  obeys the client. Debug: count spans per request; a public caller should never decide your sampling.
+- **Inject: keep the starter's edge and send flags `00` instead of `01`.** Observe: the exporter is
+  empty (`traces: 0`). The parent-based sampler obeys the client, so `agent.run` is not sampled, and
+  your fixed tool server and worker inherit the unsampled flag through `traceparent`. Debug: count
+  spans per request; a public caller should never decide your sampling.
 
 ### Submission
 - **Code:** your `lab_propagation.py` with LAB 1-3 done and every `# BUG` line fixed.

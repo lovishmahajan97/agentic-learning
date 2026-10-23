@@ -5,7 +5,7 @@ name: Python
 kind: tool
 difficulty: intro
 est_minutes: 10
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

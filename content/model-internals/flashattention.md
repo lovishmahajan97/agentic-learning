@@ -5,7 +5,7 @@ name: FlashAttention
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -175,7 +175,7 @@ flowchart TD
 - **"FlashAttention is an approximation, like sparse or low-rank attention."** It is exact: online softmax
   rescales earlier partial sums by `exp(m − m_new)`, so outputs differ from eager only by fp16 or bf16
   rounding.
-- **"It makes long context cheap."** FLOPs stay quadratic; it removes the n² memory and traffic, so long
+- **"It makes long context cheap."** FLOPs stay quadratic; it removes the n² score memory and most HBM traffic, so long
   transcripts fit, but beyond roughly 100k tokens you still need windowing, sparsity or retrieval.
 - **"Attention is a small share of FLOPs, so a faster kernel cannot matter much."** Naive attention is
   memory-bound: softmax and masking do about one FLOP per byte, so HBM round-trips of the scores set the

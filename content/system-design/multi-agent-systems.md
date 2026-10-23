@@ -5,7 +5,7 @@ name: Multi-agent systems
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -70,11 +70,14 @@ Choose **C**, because:
   is filed by code from the validated synthesis.
 - **Tokens fit the cap:** about 205k per review against 300k.
 
-A quorum join is rejected here: a 3-of-5 quorum would lift success to about 99.1%, but it would ship
-reviews missing an area, which the coverage constraint forbids.
+A quorum join is rejected here. A 3-of-5 quorum with no retries scores about 99.1% only by counting a
+review with up to two areas missing as a success.
+
+A review is complete only when all five areas are covered, so the all-five join with one retry is the
+right measure. An area that still fails is marked missing and routed to a human, never silently dropped.
 
 **What would change it:** a single agent with a narrowed tool set reaching 90% on the eval set; a token
-cap under roughly 100k per review; or areas that turn out dependent (legal scope set by the finance
+cap below C's roughly 205k per review; or areas that turn out dependent (legal scope set by the finance
 finding), which would favour a short pipeline with validators between stages.
 
 ### Trade-offs accepted

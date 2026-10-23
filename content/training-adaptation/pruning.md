@@ -5,7 +5,7 @@ name: Pruning
 kind: concept
 difficulty: advanced
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: background
 related:
@@ -170,8 +170,9 @@ flowchart TD
 - **"Pruning is the way to make a model smaller."** For most agent teams quantization comes first: INT4
   weights are about 26% of bf16 with no training run, while pruning needs a strong parent and a
   distillation phase to recover.
-- **"Removing attention heads shrinks the KV cache."** Pruning query heads leaves the cache unchanged;
-  only removing KV heads or whole layers reduces it.
+- **"Removing attention heads shrinks the KV cache."** Only if K and V go with them. Most current LLMs use
+  grouped-query attention, where several query heads share one KV head, so pruning query heads leaves the
+  cache unchanged; only removing whole KV heads (with their query group) or whole layers reduces it.
 
 ## Examples
 ### Wanda vs magnitude pruning on one layer

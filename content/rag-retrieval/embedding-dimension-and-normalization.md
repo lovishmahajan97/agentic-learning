@@ -5,7 +5,7 @@ name: Embedding dimension & normalization
 kind: concept
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: implement
@@ -155,8 +155,8 @@ flowchart TD
   compare time and graph memory grow linearly with `d`. Measure recall@10 at smaller sizes before
   paying for 3072.
 - **"You can truncate any embedding to its first k dimensions."** Only Matryoshka-trained models put the
-  important information first; truncating a standard model discards a random slice of meaning. Either
-  way, the prefix must be renormalized.
+  important information first; a standard model spreads information across every dimension, so cutting
+  its tail throws away meaning no less important than what you keep. Either way, renormalize the prefix.
 - **"A similarity score of 0.8 means the same thing for every model."** Anisotropy puts unrelated texts
   well above zero by a model-specific amount. Recalibrate your agent's "nothing relevant" cut-off on
   labelled pairs whenever the model changes.

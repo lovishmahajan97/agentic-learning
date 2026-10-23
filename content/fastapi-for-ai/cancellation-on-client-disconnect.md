@@ -5,7 +5,7 @@ name: Cancellation on client disconnect
 kind: pattern
 difficulty: advanced
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -190,27 +190,41 @@ def test_cancellation_propagates_and_usage_survives_a_second_cancel():
     agent, t = asyncio.run(main())
     assert t.cancelled()                                          # CancelledError not swallowed
     assert agent.usage == [("r1", "cancelled")]                   # shielded write completed
+
+def test_one_cancel_during_the_model_call_stops_the_run():
+    async def main():
+        agent = lab.Agent()
+        t = asyncio.create_task(lab.run_agent(agent, lab.FakeRequest(None), "r1"))
+        await asyncio.sleep(0.05); t.cancel()                     # lands inside llm0
+        await asyncio.gather(t, return_exceptions=True)
+        await asyncio.sleep(0.5)
+        return agent, t
+    agent, t = asyncio.run(main())
+    assert t.cancelled() and agent.events == ["llm0 cancelled"]   # no tool, no email after it
+    assert agent.usage == [("r1", "cancelled")]
 ```
 
-All four fail on the starter (`NotImplementedError`, the email sent after disconnect, no usage
-record); a correct solution passes all four.
+All five fail on the starter (`NotImplementedError`, the email sent after disconnect, no usage
+record); a correct solution passes all five.
 
 ### Failure scenarios
-- **Keep the bare `create_task` + `asyncio.wait`.** The disconnect test fails on `search-A done`:
-  cancelling the run cancelled only the `wait`, not the children. Debug by logging task names still
+- **Keep the bare `create_task` + `asyncio.wait`.** The disconnect test fails: the events show
+  `search-A done` and `search-B done` instead of `cancelled`, because cancelling the run cancelled only
+  the `wait`, not the children. Debug by logging task names still
   pending with `asyncio.all_tasks()` after the run returns.
 - **Record usage without `asyncio.shield`.** Only the second-cancel test fails, with `usage == []`: a
   shutdown cancel arriving during the billing write kills it. In production, compare provider token
   totals against your usage table.
-- **Catch `BaseException` around the model call and continue.** `t.cancelled()` is false and the run goes
-  on to send the email, which is a ghost action. Debug by searching for bare `except:` and
-  `except BaseException` that do not re-raise.
+- **Catch `BaseException` around the model call and continue.** The one-cancel test fails:
+  `t.cancelled()` is false and the run goes on to call both tools and send the email, a ghost action.
+  (The second-cancel test misses it, because its second cancel lands in the tool step and propagates.)
+  Debug by searching for bare `except:` and `except BaseException` that do not re-raise.
 - **Check for disconnect only at the top of each step.** The cancel-point test fails: the client left
   during `llm1` and the email still went out. Place the check immediately before every side effect.
 
 ### Submission
 - `lab.py` with the four lab steps done, and `test_lab.py` unchanged.
-- A `pytest -q` run showing 4 passed, plus `python lab.py` matching the expected output.
+- A `pytest -q` run showing 5 passed, plus `python lab.py` matching the expected output.
 - The finished `run_unless_disconnected` wired into a real FastAPI endpoint, with a log line showing a
   499 after you close `curl` mid-run.
 - Evaluation: no child task outlives a cancelled run, no side effect starts after a disconnect, and every

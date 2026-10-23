@@ -5,7 +5,8 @@ name: deploying remote MCP servers (OAuth, sessions, hosting, scaling)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/mcp-authentication-authorization-transport-security
@@ -35,6 +36,178 @@ sessions, and running it behind proxies that do not break streaming.
   routing, timeouts for streamed responses, rate limits per client and logs per tool call.
 - **What you can skip.** Writing your own authorization server. Use an existing identity provider and keep
   the MCP server a resource server that only validates tokens.
+
+## Lab
+### Task
+Write the resource-server gate in front of a remote MCP endpoint: the Host check, the public Protected
+Resource Metadata route, token validation for this server's audience, and the `401` and `403`
+challenges that let a client like claude.ai or an OpenAI Agents SDK agent discover how to get a token.
+Time box: 45-60 min.
+- **Prerequisites:** MCP transports; MCP authentication, authorization and transport security; the
+  first two examples in this lesson.
+- **Setup:** Python 3.10+ and `pip install pytest`; stdlib only otherwise (checked with Python 3.13 and
+  pytest 9.1). Save the starter as `lab.py` and the tests as `test_lab.py`.
+- **No IdP or network:** `mint()` plays the authorization server with an HS256 JWT. In production the SDK's
+  `AuthSettings` plus your verifier do this against the IdP's keys; the decisions are the same.
+
+### Starter code
+```python
+"""Lab: the resource-server checks in front of a remote MCP endpoint. Run: python lab.py"""
+import base64, hashlib, hmac, json
+
+PUBLIC_URL = "https://mcp.example.com/mcp"                  # canonical URL = expected audience
+ISSUER = "https://auth.example.com"
+ALLOWED_HOSTS = {"mcp.example.com"}
+METADATA_PATH = "/.well-known/oauth-protected-resource/mcp"
+TOOL_SCOPES = {"get_ticket": "tickets:read", "close_ticket": "tickets:write"}
+KEY = b"stand-in for the IdP signing key"                  # real servers verify against the IdP's JWKS
+
+def b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+def mint(**claims) -> str:
+    """Plays the authorization server: an HS256 JWT. Never part of a real MCP server."""
+    head, body = b64(b'{"alg":"HS256","typ":"JWT"}'), b64(json.dumps(claims).encode())
+    sig = hmac.new(KEY, f"{head}.{body}".encode(), hashlib.sha256).digest()
+    return f"{head}.{body}.{b64(sig)}"
+
+def decode(token: str) -> tuple[dict, bool]:
+    """Returns (claims, signature_ok). Raises ValueError on a malformed token."""
+    head, body, sig = token.split(".")
+    good = hmac.compare_digest(b64(hmac.new(KEY, f"{head}.{body}".encode(), hashlib.sha256).digest()), sig)
+    return json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))), good
+
+def metadata() -> dict:
+    """RFC 9728 Protected Resource Metadata, served without auth."""
+    return {"resource": PUBLIC_URL, "authorization_servers": [ISSUER],
+            "scopes_supported": sorted(set(TOOL_SCOPES.values())), "bearer_methods_supported": ["header"]}
+
+def verify_token(token: str, now: int) -> dict | None:
+    # YOUR CODE HERE (1): return the claims only if the token decodes, the signature is good, iss == ISSUER,
+    # aud == PUBLIC_URL (a token minted for another API must fail) and now < exp. Else None.
+    raise NotImplementedError
+
+def handle(req: dict, now: int) -> tuple[int, dict, str]:
+    """req: {"path", "headers", "tool"}. Returns (status, response headers, body)."""
+    # YOUR CODE HERE (2), in this order:
+    # - Host header not in ALLOWED_HOSTS -> 421 (DNS rebinding guard)
+    # - path == METADATA_PATH -> 200 with json.dumps(metadata()), no token needed
+    # - no "Bearer " Authorization header or verify_token fails -> 401 with
+    #   WWW-Authenticate: Bearer error="invalid_token", resource_metadata="<origin of PUBLIC_URL><METADATA_PATH>"
+    #   (built from configuration, never from the Host header a proxy rewrote)
+    #   (an Mcp-Session-Id header is NOT authentication)
+    # - token lacks TOOL_SCOPES[tool] in its space-separated "scope" claim -> 403 with
+    #   WWW-Authenticate: Bearer error="insufficient_scope", scope="<needed>", resource_metadata="..."
+    # - otherwise 200 with body f"ran {tool} for {sub}"
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    now = 1_000
+    good = dict(iss=ISSUER, aud=PUBLIC_URL, sub="user-42", scope="tickets:read", exp=now + 300)
+    cases = [
+        ("no token", {"Host": "mcp.example.com", "Mcp-Session-Id": "abc"}, "get_ticket"),
+        ("valid read", {"Host": "mcp.example.com", "Authorization": "Bearer " + mint(**good)}, "get_ticket"),
+        ("other audience", {"Host": "mcp.example.com",
+                            "Authorization": "Bearer " + mint(**{**good, "aud": "https://crm.example.com"})}, "get_ticket"),
+        ("expired", {"Host": "mcp.example.com", "Authorization": "Bearer " + mint(**{**good, "exp": now})}, "get_ticket"),
+        ("needs write", {"Host": "mcp.example.com", "Authorization": "Bearer " + mint(**good)}, "close_ticket"),
+        ("rebinding", {"Host": "evil.example", "Authorization": "Bearer " + mint(**good)}, "get_ticket"),
+    ]
+    for label, headers, tool in cases:
+        status, hdrs, body = handle({"path": "/mcp", "headers": headers, "tool": tool}, now)
+        print(f"{label:15} {status} {hdrs.get('WWW-Authenticate', body)}")
+    print(handle({"path": METADATA_PATH, "headers": {"Host": "mcp.example.com"}, "tool": None}, now)[0])
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly (the 421 body text is your choice; the tests
+check only the status):
+
+```
+no token        401 Bearer error="invalid_token", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+valid read      200 ran get_ticket for user-42
+other audience  401 Bearer error="invalid_token", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+expired         401 Bearer error="invalid_token", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+needs write     403 Bearer error="insufficient_scope", scope="tickets:write", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+rebinding       421 Misdirected Request
+200
+```
+
+- **Read the lines:** the CRM token is perfectly valid at the IdP, yet it gets the same `401` as no token,
+  because its audience is another API. The `403` tells the client which scope to step up to.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (Python 3.13, pytest 9.1).
+
+```python
+import json
+from lab import ISSUER, METADATA_PATH, PUBLIC_URL, handle, mint, verify_token
+
+NOW = 1_000
+GOOD = dict(iss=ISSUER, aud=PUBLIC_URL, sub="user-42", scope="tickets:read", exp=NOW + 300)
+CHALLENGE = ('Bearer error="invalid_token", '
+             'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"')
+
+def req(tool="get_ticket", host="mcp.example.com", token=None, **extra):
+    headers = {"Host": host, **extra}
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    return {"path": "/mcp", "headers": headers, "tool": tool}
+
+def test_verify_checks_signature_issuer_audience_and_expiry():
+    assert verify_token(mint(**GOOD), NOW)["sub"] == "user-42"
+    assert verify_token(mint(**{**GOOD, "aud": "https://crm.example.com"}), NOW) is None
+    assert verify_token(mint(**{**GOOD, "iss": "https://other-idp.example"}), NOW) is None
+    assert verify_token(mint(**{**GOOD, "exp": NOW}), NOW) is None
+    head, body, _ = mint(**GOOD).split(".")
+    assert verify_token(f"{head}.{body}.forged", NOW) is None
+    assert verify_token("not-a-jwt", NOW) is None
+
+def test_missing_token_gets_the_discovery_challenge_even_with_a_session_id():
+    status, headers, _ = handle(req(**{"Mcp-Session-Id": "abc"}), NOW)
+    assert (status, headers["WWW-Authenticate"]) == (401, CHALLENGE)
+
+def test_token_for_another_audience_is_401():
+    status, headers, _ = handle(req(token=mint(**{**GOOD, "aud": "https://crm.example.com"})), NOW)
+    assert (status, headers["WWW-Authenticate"]) == (401, CHALLENGE)
+
+def test_missing_scope_is_403_insufficient_scope():
+    status, headers, _ = handle(req("close_ticket", token=mint(**GOOD)), NOW)
+    assert status == 403
+    assert headers["WWW-Authenticate"].startswith('Bearer error="insufficient_scope", scope="tickets:write"')
+
+def test_valid_token_runs_the_tool():
+    token = mint(**{**GOOD, "scope": "tickets:read tickets:write"})
+    assert handle(req("close_ticket", token=token), NOW) == (200, {}, "ran close_ticket for user-42")
+
+def test_host_check_runs_before_auth_and_metadata_is_public():
+    assert handle(req(host="evil.example", token=mint(**GOOD)), NOW)[0] == 421
+    status, _, body = handle({"path": METADATA_PATH, "headers": {"Host": "mcp.example.com"}, "tool": None}, NOW)
+    assert status == 200 and json.loads(body)["resource"] == PUBLIC_URL
+```
+
+### Failure scenarios
+- **Skip the audience check.** The CRM-token test returns `200`: any service that can get a token from
+  your IdP can now call your tools. Debug by decoding a rejected and an accepted token side by side and
+  comparing `aud` with `PUBLIC_URL`.
+- **Build `resource_metadata` from the `Host` header.** Behind a proxy that rewrites Host to an internal
+  name, clients are sent to an unreachable metadata URL and discovery fails. Reproduce by sending
+  `Host: mcp-internal:8000` after adding it to `ALLOWED_HOSTS`; the challenge must not change.
+- **Put the metadata route behind auth.** Every client loops on `401` because it cannot read where to get
+  a token. Probe with the unauthenticated `curl` from the examples.
+- **Check the scope as a substring of the claim.** A token with `scope="tickets:writer-preview"` now
+  passes as `tickets:write`. The suite does not catch this, so write the test that does: split the claim
+  on spaces and compare whole scopes.
+
+### Submission
+- **`lab.py` and `test_lab.py`** with `pytest -q` showing 6 passed.
+- **The `python lab.py` output** matching the expected block.
+- **A short mapping note** from each check to the Python SDK setting that does it in production
+  (`validate_token_resource`, `required_scopes`, `TransportSecuritySettings(allowed_hosts=...)`).
+- **One extra test** for a case you thought of, for example a token with no `exp` claim.
+- **Evaluated on:** green tests, challenges that match the spec format byte for byte, and no token value
+  in any response or log line.
 
 ## Why it exists
 - **Local stdio does not share.** A stdio server runs on one machine for one user; a team or a public

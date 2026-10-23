@@ -5,7 +5,7 @@ name: Inter-annotator agreement
 kind: metric
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: implement
@@ -186,9 +186,9 @@ flowchart TD
   those people still cannot demonstrate it is better than them.
 - **"A correlation of 0.9 means two raters' scores are interchangeable."** Pearson and Spearman ignore a
   constant offset: a rater always one point higher still gets r = 1. Use ICC for absolute agreement.
-- **"κ = 0.7 on a 30-item pilot settles whether a criterion can gate."** At that size the 95% interval
-  spans roughly 0.26–0.86. Bootstrap it, enlarge the pilot, and compute it per criterion rather than
-  pooled.
+- **"κ = 0.7 on a 30-item pilot settles whether a criterion can gate."** At that size a κ near 0.6 has
+  a 95% interval of roughly 0.26–0.86, so 0.7 on one batch and 0.45 on the next is no evidence of change.
+  Bootstrap it, enlarge the pilot, and compute it per criterion rather than pooled.
 
 ## Examples
 ### The kappa paradox, by hand

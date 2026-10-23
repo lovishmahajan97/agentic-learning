@@ -5,7 +5,7 @@ name: numpy
 kind: tool
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -179,9 +179,10 @@ rows, and `NotImplementedError` for search.
 - **Inject `np.linalg.norm(arr, axis=1)` without `keepdims` or `[:, None]` in the division.** With `n`
   rows of `dim` columns it raises a broadcast error (or, when `n == dim`, silently divides columns).
   Print the shape of the norm array next to `arr.shape`.
-- **Inject `q /= np.linalg.norm(q)`.** The caller's query vector changes after search, so the next
-  agent step searches with a different vector. The untouched-query test catches it; `np.shares_memory`
-  confirms the alias.
+- **Inject `q = np.asarray(query)` then `q /= np.linalg.norm(q)`.** `asarray` hands back the caller's
+  float64 array itself, so the query vector changes after search and the next agent step searches with a
+  different vector. The untouched-query test catches it; `np.shares_memory` confirms the alias. (A
+  `dtype=np.float32` conversion copies a float64 query, which is why the same line can look harmless.)
 - **Inject `np.argpartition(-sc, k)` with `k == len(ids)`.** It raises "kth out of bounds". Clamp `k`
   first and use `k - 1` as the partition index.
 - **Inject returning `sc[i]` instead of `sc[i].item()`.** `json.dumps` raises `TypeError` for `float32`

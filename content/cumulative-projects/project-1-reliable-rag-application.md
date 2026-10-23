@@ -5,7 +5,8 @@ name: "Project 1: reliable RAG application"
 kind: practice
 difficulty: advanced
 est_minutes: 30
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 mastery: evaluate
 code_tested: yes
@@ -51,6 +52,62 @@ refuses when the answer is absent, and proves all three with a golden set you re
   abstention threshold, and what counts as a correct citation.
 - **What you can skip.** Fine-tuning embeddings and GraphRAG. A well-chunked hybrid index with a measured
   recall number beats an exotic pipeline you cannot evaluate.
+
+## Decision case
+### Scenario
+An insurer's claims-support team of 40 staff wants a policy assistant that later becomes the
+`search_docs` tool of their agent. All figures are illustrative planning numbers, not benchmarks.
+- **Corpus:** 350 policy documents, about 1.4M tokens in total, split across 3 product lines of about
+  120k tokens each; about 10 documents change each week.
+- **Traffic:** 40 staff x 50 questions a day = 2,000 questions a day. Many questions quote clause codes
+  such as `4.2.1` verbatim.
+- **Golden set (M2):** 120 questions, 100 in scope with labelled chunk ids and 20 out of scope.
+- **Constraints:** compliance needs a clickable citation on every answer; p95 under 4 s end to end;
+  abstention on at least 90% of out-of-scope questions; hit@5 of at least 0.90; 2 engineers for 4 weeks.
+
+### Options
+| Option | How it works | hit@5 (of 100) | p95 | Citations and abstention | Cost and effort |
+|---|---|---|---|---|---|
+| Long-context per product line | Pick the product line, put its ~120k tokens in the prompt | n/a, no retrieval step | slowest: long prefill per question | Document-level only; no score to abstain on | 120k x 2,000 = 240M input tokens a day; misses cross-line questions |
+| Dense only | Embeddings, top 5 | 82 | 1.9 s | Chunk ids, threshold possible | Low; misses exact clause codes |
+| Hybrid (BM25 + dense, RRF) | Fuse both rankings | 91 | 2.1 s | Chunk ids, threshold possible | Low; one extra index |
+| Hybrid + reranker | Rerank the top 20 fused chunks with a cross-encoder | 95 | 2.8 s | Chunk ids, reranker score as threshold | Medium; one more model call per query |
+
+### Decision
+**Hybrid plus a reranker, with threshold abstention on the reranker score.** It is the only option with
+margin on the recall floor (95 against 90) while staying inside the latency budget (2.8 s leaves 1.2 s of
+the 4 s). Hybrid alone passes at 91, but two more misses per hundred would fail the floor.
+- **Long-context is rejected on the constraints,** not on taste: it cannot give the chunk-level citations
+  compliance asks for, it has no retrieval score to abstain on, and 240M input tokens a day is a large
+  bill for questions that need one paragraph.
+- **The threshold is tuned on both sets:** on the golden set it refuses 19 of 20 out-of-scope questions
+  (95%) and 4 of 100 answerable ones; the 4 are logged as recall work, not hidden.
+
+**What would change it.**
+- **Latency under real load:** if measured p95 passes 4 s, drop the reranker and ship plain hybrid at 91,
+  then raise recall by fixing chunking on the 9 misses.
+- **A smaller or frozen corpus:** if the assistant is narrowed to one product line that rarely changes,
+  long-context with prompt caching becomes the simpler design, provided compliance accepts document-level
+  citations.
+
+### Trade-offs accepted
+- **One more model in the path.** The reranker is a second thing to version and monitor; trace its span
+  and alert if its share of p95 grows.
+- **Some answerable questions are refused.** 4% in-scope refusals is the price of 95% abstention; track
+  it weekly and add each refused question to the golden set once fixed.
+- **Weekly re-ingestion work.** 10 changed documents a week need delete-by-document-id; a CI test checks
+  that no superseded version is retrievable.
+
+### Review rubric
+- **Constraints are numbers:** recall floor, latency budget, abstention rate and team time are stated
+  before any option is scored.
+- **Every option is measured on the same golden set,** with hit@5 and p95 in one table, not quoted from
+  a blog.
+- **Margin is discussed:** the write-up says how far each passing option sits from each floor.
+- **Abstention is scored on both sides:** out-of-scope refusals and in-scope refusals are both reported.
+- **Rejected options are rejected by a constraint,** such as citations or cost, not by preference.
+- **Reversal conditions are named:** the measured value that would remove the reranker or bring back
+  long-context is written down.
 
 ## Why it exists
 - **Demos hide retrieval bugs.** A RAG demo answers the five questions its author tried. Real users ask

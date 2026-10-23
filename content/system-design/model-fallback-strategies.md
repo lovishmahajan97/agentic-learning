@@ -5,7 +5,7 @@ name: Model fallback strategies
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -75,7 +75,8 @@ Choose **C**, with the EU region as a cheap first rung in front of it, and hand 
 - **Ladder discipline:** per-target breakers (5 failures, 60 s cooldown) and per-rung timeouts of
   `min(rung_timeout, remaining)` inside the 10 s step deadline.
 - **Side effects:** checkpoint after every step and use idempotency keys on the fare-hold and email
-  tools, so a failover at step 7 never repeats steps 5 or 9.
+  tools, so a failover at step 7 never repeats the step-5 fare hold, and one at step 10 never resends
+  the step-9 email.
 
 **What would change it:** if vendor B is approved for passenger data, D adds independence, but only
 after its tool calls pass the same eval on recorded runs. If the cloud platform starts lagging vendor

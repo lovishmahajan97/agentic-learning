@@ -5,7 +5,7 @@ name: Distributed systems
 kind: concept
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -196,7 +196,7 @@ flowchart TD
   the request may have been processed and the reply lost. Retry a side-effecting tool only with the same
   idempotency key, or query the receiver by key first.
 - **More retries at more layers make the agent more reliable.** Retries multiply: five layers retrying
-  three times each turn one failure into up to 4⁵ ≈ 1,024 attempts on a dependency that is already
+  three times each turn one failure into up to 4⁵ = 1,024 attempts on a dependency that is already
   struggling. Retry at one layer, with jitter, a budget and the run's remaining deadline.
 - **A lock with an expiry guarantees one holder at a time.** A worker that pauses past its lease still
   believes it holds it and writes late. Only a fencing token, checked by the resource being written,

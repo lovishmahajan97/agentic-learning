@@ -41,6 +41,64 @@ what UAT missed; it ends on written exit criteria and a handoff, not reassignmen
 - **What you can skip.** Building new features. Hypercare is for fixing what real traffic exposes, and
   anything else waits until it ends.
 
+## Decision case
+### Scenario
+A manufacturer launches a procurement agent to 1,200 buyers in India, the UK and the US. It answers
+supplier and policy questions and can draft and submit purchase orders through a
+`create_purchase_order` write tool. The team must choose the hypercare coverage model at the readiness
+review. All figures are illustrative planning numbers.
+- **Hours:** across the three regions, buyers work over a span of about 18 hours a day, 5 days a week.
+- **Vendor team:** 4 engineers, all UK-based, budgeted for 4 weeks of hypercare: 4 x 40 = 160 hours
+  a week, 640 in total.
+- **Response rule:** the contract requires a response to a severity-1 within 30 minutes at any hour
+  buyers are working.
+- **Customer desk:** the customer's service desk is new to the agent and will own support after exit.
+- **Risk:** a wrong purchase order commits real money, and procurement staff abandon tools quickly when
+  early answers are wrong.
+
+### Options
+| Option | How it works | Vendor watch hours a week | Hours left for fixes a week | Severity-1 within 30 min at all hours | Desk learns before exit |
+|---|---|---|---|---|---|
+| Vendor watches all hours | Vendor engineers in rotating shifts watch dashboards and traces for all 18 hours | 18 x 5 = 90 | 160 - 90 = 70 | yes | weakly: the vendor handles everything |
+| UK-hours watch, desk first line, pager | Vendor watches 8 UK hours; the desk takes first line in other hours with runbooks; a vendor on-call carries a severity-1 pager; purchase orders are approval-only outside vendor hours | 8 x 5 = 40 | 160 - 40 = 120 | yes, by pager | yes: the desk leads off-hours tickets from day 1 |
+| Standard support only | Tickets enter the normal queue with a 5-day response; no daily triage | 0 | not reserved | no | yes, but with no route to fix prompts, tools or retrieval |
+
+### Decision
+**UK-hours watch with the desk as first line in other hours, a vendor severity-1 pager, and purchase
+orders approval-only outside vendor hours.**
+- **It meets the response rule** through the pager rather than by watching dashboards at night.
+- **It leaves the most time for fixes.** About 120 hours a week, against 70 when watching all hours,
+  and fixes are what hypercare is for.
+- **It fences the costly action.** When no vendor engineer is watching, every agent-drafted purchase
+  order needs a buyer's approval, so a regression cannot commit money unseen.
+- **It trains the future owner.** The desk works off-hours tickets with the runbooks from day 1, which
+  feeds the exit criterion that the desk resolves tickets without vendor escalation.
+- **Why not standard support:** it fails the response rule and cannot tell a prompt regression from a
+  training gap while adoption is still fragile.
+
+**What would change it.**
+- **Severity-1s clustering outside UK hours:** add a watch shift in that region, for example from a
+  partner team.
+- **Approval-only slowing procurement badly** (for example, India-hours orders waiting until the next
+  day): extend watched hours instead of keeping the fence.
+- **A read-only agent:** without the write tool, the desk plus pager could cover more hours alone.
+
+### Trade-offs accepted
+- **Off-hours issues wait for triage.** Non-severity-1 issues raised in India or US hours are triaged
+  the next UK morning. Watch: time from report to triage by region, and thumbs-down rate by region.
+- **Approval friction off-hours.** Buyers outside UK hours confirm every order. Watch: approval rejection
+  rate (an early sign of wrong proposals) and order lead time by region.
+- **Pager load on one engineer at a time.** Watch: out-of-hours pages per week; more than a few means
+  the desk needs more runbooks or the agent needs a fix.
+
+### Review rubric
+- **Hours recomputed:** watch hours and fix hours per option follow from coverage span and team size.
+- **Contract rules mapped:** each response obligation is met by a named mechanism (watch, pager, desk).
+- **Write actions fenced when unwatched:** the plan says what the agent may do with no expert watching.
+- **Ownership transfer built in:** the customer's desk handles real tickets before the exit date.
+- **Exit criteria measurable:** written before go-live, normalised by active users.
+- **Flip conditions stated:** the incident pattern or friction level that would change the model.
+
 ## Why it exists
 - **Production is the full distribution; UAT only sampled it.** Every user, document type, odd workflow
   and integration under real load arrives at once.

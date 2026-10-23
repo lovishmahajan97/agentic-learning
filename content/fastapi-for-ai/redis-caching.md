@@ -5,7 +5,7 @@ name: Redis caching
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -174,30 +174,52 @@ def test_concurrent_misses_share_one_provider_call():
     results = run(burst())
     assert emb.calls == 1 and all(v == results[0] for v in results)
     assert c.inflight == {}
+
+class ProviderDown(Exception):
+    pass
+
+def test_provider_error_reaches_every_waiter():
+    class Boom(FakeEmbedder):
+        async def embed(self, model, text):
+            self.calls += 1
+            await asyncio.sleep(0.01)
+            raise ProviderDown("provider 503")
+    emb = Boom()
+    c = EmbeddingCache(FakeRedis(), emb)
+    async def burst():
+        return await asyncio.wait_for(asyncio.gather(
+            *(c.embed("t1", "embed-x", "hot") for _ in range(5)), return_exceptions=True), 2)
+    results = run(burst())                     # a waiter left hanging times out here
+    assert all(isinstance(e, ProviderDown) for e in results), results
+    assert emb.calls == 1 and c.inflight == {}
 ```
 
-On the starter all five tests fail with `NotImplementedError`; a correct solution passes all five.
+On the starter all six tests fail on `NotImplementedError` (the last one collects it as the gathered
+result); a correct solution passes all six.
 
 ### Failure scenarios
-- **Drop the tenant from the key.** `test_hit_skips_provider_and_tenants_never_share` fails with one
-  provider call instead of two: tenant `t2` was served `t1`'s cached vector. Debug by printing the two
+- **Drop the tenant from the key.** Besides the key test, `test_hit_skips_provider_and_tenants_never_share`
+  fails with one provider call instead of two: tenant `t2` was served `t1`'s cached vector. Debug by printing the two
   keys; in production, grep cache keys for a tenant segment.
 - **Let `RedisError` escape from `GET`.** `test_fails_open_when_redis_is_down` errors with
   `RedisError: connection refused`, the same outage an agent would hit. Debug by reading the traceback:
   the cache call, not the provider call, is the raising frame.
-- **Forget to pop the in-flight entry, or pop it before the result is set.** Either later calls await a
-  stale future forever, or the burst makes 20 provider calls. Debug by logging `len(self.inflight)` after
-  the burst and counting `emb.calls`.
+- **Get the single-flight bookkeeping wrong.** Never pop the in-flight entry and the map keeps one
+  finished future per key forever (the burst test fails on `c.inflight == {}`); pop it before the
+  provider call returns and the other callers miss it, so the burst makes 20 provider calls; set the
+  future's result but not its exception and, when the provider fails, the waiters hang forever
+  (`test_provider_error_reaches_every_waiter` times out). Debug by logging `len(self.inflight)` after
+  the burst, counting `emb.calls`, and dumping pending tasks with `asyncio.all_tasks()`.
 - **Remove the jitter.** The TTL test still passes, but every key written in one burst expires in the
   same second; check `set(r.ttls.values())` in a burst and expect many distinct values.
 
 ### Submission
 - `lab.py` with the three lab steps done and the starter's fakes and `demo()` unchanged.
-- A `pytest -q` run showing 5 passed, plus the `python lab.py` output matching the expected block.
+- A `pytest -q` run showing 6 passed, plus the `python lab.py` output matching the expected block.
 - A short note (5-8 lines): which agent calls in your own stack you would put behind this cache, which
   you would never cache, and the key fields each needs.
 - Evaluation: tests pass, no `RedisError` can reach a caller, the key carries version and tenant, and
-  the single-flight map is empty after every burst.
+  the single-flight map is empty after every burst, including one where the provider fails.
 
 ## Why it exists
 - **Model calls are slow and billed.** A hosted model, embedding API or reranker takes hundreds of

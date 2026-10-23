@@ -6,7 +6,8 @@ kind: practice
 difficulty: advanced
 est_minutes: 35
 agent_relevance: core
-status: agentic-verified
+status: typed
+lesson_type: decision
 related:
   - rag-retrieval/agentic-rag
   - rag-retrieval/hybrid-search
@@ -39,6 +40,66 @@ and cost in production.
   sets and the thresholds that block a release.
 - **What you can skip.** Training embedding models and building a vector database. Use an existing
   embedding API and Postgres with pgvector, or a hosted vector store.
+
+## Decision case
+### Scenario
+A 3,000-person company runs this platform as its internal knowledge assistant and must choose how much
+agentic search to run per question. All figures are illustrative results from the team's own golden set
+(grown to 200 questions), not benchmarks.
+- **Traffic:** 20,000 questions a month; 70% are simple lookups, 30% are multi-part or vague.
+- **Quality bar:** 80%+ of golden questions answered correctly with valid citations (or a correct "not
+  found").
+- **Latency:** p95 under 6 s for simple lookups; multi-part questions may take up to 15 s if progress
+  is streamed.
+- **Budget:** $500 a month for model and rerank calls.
+- **Measured per configuration:** single-shot hybrid search costs about $0.01 an answer, the agent loop
+  (up to 4 searches) about $0.03, a decomposition call plus parallel searches about $0.015, and a small
+  router classifier $0.001 and 90% accuracy on labelled questions.
+
+### Options
+| Option | How it works | Quality (simple, multi-part, overall) | Cost a month | p95 simple / multi-part |
+|---|---|---|---|---|
+| Single-shot | One hybrid search and rerank, then answer | 82%, 55%, 73.9% | $200 | 3 s / 3 s |
+| Always agentic | Every question goes through the search loop | 86%, 80%, 84.2% | $600 | 5 s / 11 s |
+| Routed | Classifier sends simple questions to single-shot, the rest to the loop | 80.9% overall | $356 | 3 s / 11 s |
+| Decompose once | One call splits the question, searches run in parallel, no loop | 84%, 65%, 78.3% | $300 | 4 s / 4 s |
+
+Routed quality: 63% of traffic is simple and routed right (82%), 7% simple sent to the loop (86%), 27%
+multi-part routed right (80%) and 3% multi-part sent to single-shot (55%), giving 80.9%. Its cost per
+answer is 0.34 x $0.03 + 0.66 x $0.01 + $0.001 = $0.0178.
+
+### Decision
+**Route: single-shot for simple lookups, the agent loop for multi-part questions.** It is the only option
+that clears the 80% bar inside the $500 budget and both latency limits.
+- **Always agentic is best on quality** (84.2%) but costs $600, over budget, and spends the loop on
+  questions one search already answers.
+- **Single-shot and decompose-once are cheap and fast,** but miss the quality bar because multi-part
+  questions need a search that depends on what the first one found.
+- **The router is evaluated like any component:** its confusion matrix on labelled traces goes on the
+  dashboard next to recall@5 and faithfulness.
+
+**What would change it.** At $0.03 an answer, always agentic fits $500 below about 16,700 questions a
+month, or if the budget rises to $600; it then wins by 3.3 points. If multi-part traffic grows, recompute:
+routed cost rises toward always agentic, and the router's value falls.
+
+### Trade-offs accepted
+- **Misrouted multi-part questions get weak answers.** About 3% of traffic hits single-shot at 55%. Watch
+  thumbs-down and "not found" rates on single-shot answers, and add those traces to router training data.
+- **One more component to break.** A router regression degrades quality silently. Run the router's
+  labelled set in CI and alert when its predicted multi-part share moves by more than a few points.
+- **The margin is small.** 80.9% against an 80% bar is about 2 questions on 200. Re-run the decision when
+  the golden set grows, and treat a drop below the bar as a release blocker.
+
+### Review rubric
+- **Quality per traffic segment:** the write-up measures each option on simple and hard questions
+  separately and weights by the real traffic mix.
+- **Cost recomputed from unit costs:** monthly cost is derived from per-answer cost and volume, including
+  the router's own cost.
+- **Latency per segment:** p95 limits are checked per question type, not as one blended number.
+- **Router error counted:** misrouting is included in the quality estimate, not assumed away.
+- **Statistical humility:** the write-up states the golden-set size and whether the margin is larger than
+  a few questions.
+- **Change triggers stated:** volume, budget or traffic-mix thresholds that would flip the choice.
 
 ## Why it exists
 - **Single-shot RAG fails on real questions.** Multi-part or vague questions need query rewriting,

@@ -5,7 +5,7 @@ name: LangChain (LCEL, chat models, tools, retrievers)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -44,8 +44,9 @@ Build the retrieval layer of a support agent in LangChain: an LCEL chain that pu
 prompt, falls back to a backup model only on rate limits, and a `search_help` tool the agent can call for
 agentic RAG. Time box: 45-60 min.
 - **Prerequisites:** Tool calling; Choosing an agent framework; the Examples in this lesson.
-- **Setup:** Python 3.10+, `pip install langchain-core pytest` (checked with langchain-core 1.7.0, Python
-  3.13). Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **Setup:** Python 3.10+, `pip install langchain-core numpy pytest` (checked with langchain-core 1.7.0,
+  Python 3.13; `InMemoryVectorStore` needs numpy for cosine similarity and raises `ImportError` without
+  it). Save the starter as `lab.py`, the tests as `test_lab.py`.
 - **No keys and no network:** embeddings are a toy bag of words and both models are `RunnableLambda` fakes
   that record the prompt they receive.
 
@@ -185,8 +186,8 @@ def test_search_help_is_a_described_tool():
   `Exception`, so the `ValueError` case silently answers from the backup. In production a prompt bug looks
   like a healthy fallback rate; log which model answered and alert when fallbacks rise.
 - **Pipe the retriever straight into the prompt** (no `format_docs`). The prompt shows a list of
-  `Document(...)` reprs and the `[policy.md]` assertion fails. Print `seen[0][1]` to read the exact prompt
-  the model got.
+  `Document(...)` reprs with no `[policy.md]` tag, so the model cites nothing and the prompt test fails on
+  `'primary: see []'`. Print `seen[0][1]` to read the exact prompt the model got.
 - **Use `retriever` for both dict branches.** The question slot receives documents instead of the user's
   text; the prompt test fails on the missing question. `RunnablePassthrough()` forwards the raw input.
 - **Leave the docstring vague.** The tool test fails; with a real model, vague descriptions show up as

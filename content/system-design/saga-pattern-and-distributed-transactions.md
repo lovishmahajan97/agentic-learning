@@ -5,7 +5,7 @@ name: Saga pattern & distributed transactions
 kind: pattern
 difficulty: advanced
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -72,8 +72,9 @@ supplier order as the pivot, then capture payment, asset record and email retrie
   must be enforced in one tool layer, not spread across services as in B.
 - **Authorise-then-capture makes rejections invisible.** 400 × 30% × 10% = 12 rejected orders a day end
   in a void, not 12 refunds on statements; the p99 wait of 3 days leaves 4 days before the 7-day lapse.
-- **Volume is small.** About 8 compensations and 2 reconciliations a day fit a Postgres log and a reaper
-  the team can build in 10 weeks.
+- **Volume is small.** About 20 compensations a day (8 business failures plus 12 rejections, each a void
+  and a released reservation) and 2 reconciliations fit a Postgres log and a reaper the team can build in
+  10 weeks.
 
 **What would change it:** a second and third workflow of this kind, or waits that approach the 7-day
 authorisation window, make D's timers and history worth learning; a supplier that offers holds would let

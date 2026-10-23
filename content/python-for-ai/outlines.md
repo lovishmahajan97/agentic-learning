@@ -5,7 +5,7 @@ name: Outlines
 kind: tool
 difficulty: advanced
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -158,7 +158,8 @@ def test_running_out_of_tokens_raises_truncated():
   fails with `{"ticket_id":0,"tool":"get_ticket"}`: sorting reordered the properties, so the regex now
   forces `ticket_id` first. Debug by printing the regex; field order is generation order.
 - **Pick from all tokens and only check validity afterwards.** `Sure` wins every step and
-  `get_next_state` returns `None` for it. Debug by asserting the pick is in
+  `get_next_state` returns `None` for it, so the next `get_allowed_tokens(None)` raises `TypeError`
+  (three tests fail). Debug by asserting the pick is in
   `index.get_allowed_tokens(state)` before advancing.
 - **Return the partial text when the loop ends.** The truncation test fails, and in an agent the
   caller gets unclosed JSON despite the constraint. Raise `Truncated` and alert on it, the same signal

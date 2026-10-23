@@ -5,7 +5,8 @@ name: Running SLMs locally (Ollama, llama.cpp, vLLM)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -41,6 +42,172 @@ GPU servers with many concurrent agents.
   whether native tool-call parsing is turned on.
 - **What you can skip.** Kernels and schedulers (see `serving-inference/engines`); you need the commands,
   agent-relevant flags, and when to switch.
+
+## Lab
+### Task
+Build the preflight check an agent runs against a local engine before its first step, so a misconfigured
+server fails loudly instead of degrading the agent. Time box: 45-60 minutes. Prerequisites: the tool-calling
+lesson (`agents/tool-calling`) and this lesson's Settings that matter to agents.
+- The starter ships a fake OpenAI-compatible engine with four modes that reproduce real local failures:
+  `ok`, `text_tools` (template without tool support), `truncating` (an Ollama model left at a 2048
+  context) and `loading` (port open, model not ready).
+- You implement three checks and `preflight()`: a real completion, structured `tool_calls`, and an
+  untruncated long prompt judged by `usage.prompt_tokens`.
+- No GPU, model download or network is needed; checked on Python 3.12 with the standard library and pytest 9.
+
+### Starter code
+```python
+# preflight.py -- Python 3.12, standard library only. Run: python preflight.py
+import json, threading, urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# ---- Fake OpenAI-compatible engine (stands in for Ollama, llama-server or vLLM) ----
+def count_tokens(messages):
+    """The fake engine's tokenizer: one token per whitespace-separated word."""
+    return sum(len(str(m.get("content") or "").split()) for m in messages)
+
+def make_handler(mode):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if mode == "loading":                      # port open, model not ready yet
+                return self._send(503, {"error": {"message": "model is loading"}})
+            prompt = count_tokens(body["messages"])
+            if mode == "truncating":                   # like an Ollama model left at num_ctx 2048
+                prompt = min(prompt, 2048)
+            msg = {"role": "assistant", "content": "ok"}
+            if body.get("tools"):
+                call = {"name": "get_stock", "arguments": json.dumps({"sku": "A-17"})}
+                if mode == "text_tools":               # template without tool support
+                    msg["content"] = json.dumps(call)
+                else:
+                    msg["content"] = None
+                    msg["tool_calls"] = [{"id": "call_1", "type": "function", "function": call}]
+            self._send(200, {"choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
+                             "usage": {"prompt_tokens": prompt, "completion_tokens": 1}})
+        def _send(self, code, obj):
+            data = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+    return Handler
+
+def start_fake(mode):
+    """Start a fake engine in a thread; mode is ok, text_tools, truncating or loading."""
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(mode))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{srv.server_port}/v1"
+
+def post_chat(base_url, payload):
+    """POST payload to {base_url}/chat/completions. Returns (HTTP status, parsed JSON body)."""
+    req = urllib.request.Request(f"{base_url}/chat/completions", json.dumps(payload).encode(),
+                                 {"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        return e.code, json.load(e)
+
+# ---- Your preflight checks ----
+TOOLS = [{"type": "function", "function": {
+    "name": "get_stock", "description": "Units in stock for a product SKU",
+    "parameters": {"type": "object", "properties": {"sku": {"type": "string"}}, "required": ["sku"]}}}]
+LONG_PROMPT = "stock " * 6000          # 6000 tokens on the fake tokenizer
+
+def check_completion(base_url, model):
+    """None if a real completion returns non-empty content, else 'completion: <reason>'."""
+    raise NotImplementedError  # LAB: send one short message; report HTTP status and error text
+
+def check_tool_calls(base_url, model):
+    """None if the reply has structured tool_calls naming get_stock, else 'tool_calls: <reason>'.
+    When content holds the call as JSON text instead, the reason must say 'returned as text'."""
+    raise NotImplementedError  # LAB: send TOOLS with a stock question; inspect message fields
+
+def check_context(base_url, model, min_ratio=0.95):
+    """None if usage.prompt_tokens >= min_ratio * count_tokens(messages), else 'context: <reason>'
+    naming both numbers."""
+    raise NotImplementedError  # LAB: send LONG_PROMPT and compare the server's count with yours
+
+def preflight(base_url, model):
+    """Run the three checks in order and return the list of failure strings ([] means ready).
+    If the completion check fails, return just that failure."""
+    raise NotImplementedError  # LAB: combine the checks
+
+if __name__ == "__main__":
+    for mode in ["ok", "text_tools", "truncating", "loading"]:
+        try:
+            fails = preflight(start_fake(mode), "qwen2.5:7b")
+            print(f"{mode:11} {'PASS' if not fails else 'FAIL ' + '; '.join(fails)}")
+        except NotImplementedError:
+            print(f"{mode:11} not implemented")
+```
+
+### Expected output
+The starter prints `not implemented` for every mode. A correct solution prints these lines; the text after each
+check name may be worded differently, but the check name, the numbers and the PASS or FAIL must match.
+```text
+ok          PASS
+text_tools  FAIL tool_calls: returned as text in content
+truncating  FAIL context: prompt_tokens 2048 < 5700 (truncated)
+loading     FAIL completion: HTTP 503 model is loading
+```
+
+### Tests
+```python
+# test_preflight.py -- run: python -m pytest -q test_preflight.py
+from preflight import start_fake, preflight, check_context, check_tool_calls
+
+def test_healthy_engine_passes():
+    assert preflight(start_fake("ok"), "m") == []
+
+def test_tool_calls_as_text_is_detected():
+    fails = preflight(start_fake("text_tools"), "m")
+    assert len(fails) == 1
+    assert fails[0].startswith("tool_calls:") and "returned as text" in fails[0]
+
+def test_structured_tool_call_passes():
+    assert check_tool_calls(start_fake("ok"), "m") is None
+
+def test_truncation_is_detected_with_numbers():
+    fails = preflight(start_fake("truncating"), "m")
+    assert len(fails) == 1
+    assert fails[0].startswith("context:") and "2048" in fails[0] and "5700" in fails[0]
+
+def test_ratio_is_respected():
+    assert check_context(start_fake("truncating"), "m", min_ratio=0.3) is None   # 2048 >= 1800
+
+def test_loading_model_stops_after_completion_check():
+    fails = preflight(start_fake("loading"), "m")
+    assert len(fails) == 1
+    assert fails[0].startswith("completion:") and "503" in fails[0]
+```
+On the starter all 6 tests fail with `NotImplementedError`.
+
+### Failure scenarios
+- **Check only that the port answers.** Replace `check_completion` with a TCP connect: `loading` now
+  passes the first check, and the failure surfaces later as a 503 on a tool or context request, or on
+  the agent's first real step. Debug by printing the status and body of the first request; a health
+  check must be a real completion.
+- **Trust `content` when `tool_calls` is empty.** The `text_tools` engine then passes, and a real agent
+  would print JSON to the user. Log both message fields for one request, then fix the engine (`--jinja`,
+  a vLLM tool parser, or a model whose template supports tools).
+- **Compare against a hard-coded 6000.** `test_ratio_is_respected` fails, and the check breaks the
+  moment the prompt changes. Compute the expected count from the messages you sent.
+- **Point it at a real engine.** Run `preflight("http://localhost:11434/v1", "qwen2.5:7b")` against
+  Ollama with a 2048 context: the real tokenizer differs from the fake, so set `min_ratio` from one
+  measured run, not from the fake's word count.
+
+### Submission
+- `preflight.py` with the four functions implemented and the fake engine unchanged.
+- The output of `python preflight.py`, matching Expected output line for line.
+- The pytest run showing 6 passed.
+- A note of 3-5 sentences on how you would wire `preflight()` into agent startup and which failure should
+  block start versus only warn.
+- Optional: the same script's output against one real local engine, with the engine and version named.
 
 ## Why it exists
 - **Hosted APIs are not always allowed or affordable.** Regulated data, air-gapped sites and high call volume

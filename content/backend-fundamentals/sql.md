@@ -5,7 +5,7 @@ name: SQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -204,7 +204,7 @@ def test_thread_tokens_counts_known_side_of_null_rows(db):
 - **Inject: `COUNT(output_tokens)` in a "messages billed" report.** It says 5, `COUNT(*)` says 6.
   Debug: run both side by side; the gap is the NULL rows, which is the same bug class as Exercise 3.
 - **Inject: one `JOIN` of messages to tool_calls without grouping.** Message 4 appears twice and
-  message 1 disappears with an inner join. Debug: the shape test fails; group in Python, or use a left
+  messages 1, 3 and 5 (no tool calls) disappear with an inner join. Debug: the shape test fails; group in Python, or use a left
   join and collapse rows by message id.
 
 ### Submission

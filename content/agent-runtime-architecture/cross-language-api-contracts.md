@@ -5,7 +5,8 @@ name: Cross-language API contracts
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - agents/typed-tool-contracts
@@ -39,6 +40,69 @@ JSON's ambiguities (int64, dates, null vs absent, enums) and for safe evolution.
   checkpoints, and a generate-and-diff CI step.
 - **What you can skip.** Choosing a neutral IDL on day one. Start with JSON Schema emitted from your primary
   language's models and promote when a third consumer appears.
+
+## Decision case
+### Scenario
+An agent product has a Python executor using Pydantic, TypeScript tool servers and web UI using Zod,
+and 35 tools offered to two model providers. A Go billing worker joins in 3 months. All figures are
+illustrative planning numbers.
+- **The incident:** after a field rename, the tool-argument rejection rate rose from 1% to 6% of about
+  200,000 tool calls a day, from 2,000 to 12,000 failed calls, so 10,000 extra retries a day.
+- **Traffic:** the step event stream peaks at about 400 events a second of roughly 1 KB each, about
+  400 KB a second, so wire size is not a constraint.
+- **Hard constraints:** model-facing schemas must be JSON Schema with a projection per provider; the
+  browser reads JSON; checkpoints written today must load after next month's deploys.
+- **Team:** 6 engineers, mostly Python; one owns the TypeScript side; nobody owns Go yet.
+- **Deadline:** stop the drift within 4 weeks, before the Go worker starts.
+
+### Options
+| Option | How it works | Stops drift | Fits the model edge | Ready for Go | Effort |
+|---|---|---|---|---|---|
+| Hand-written types (today) | each language keeps its own models | no: this caused the incident | by hand | another copy to drift | none now, recurring later |
+| Pydantic first | Python models emit JSON Schema; TypeScript types generated from it | yes, for two languages | yes | Python becomes the owner Go must follow | low |
+| Neutral JSON Schema in `contracts/` | schemas are the source; Pydantic, TypeScript and Go types generated; per-provider projections from the same files | yes, for all three | yes: the schema the model sees comes from the same file | yes | moderate |
+| Protobuf everywhere | `.proto` files with gRPC between services; converted to JSON Schema for models and browser | yes, with `buf breaking` | needs a conversion step | yes | highest, and buys wire efficiency we do not need |
+
+### Decision
+**A neutral JSON Schema source in `contracts/`, generating Pydantic, TypeScript and Go types, with a
+per-provider projection and a generate-and-diff step in CI.**
+- **It closes the incident's cause:** the schema the model sees, the executor's validator and the tool
+  server's types all derive from one file, so a rename fails CI instead of production.
+- **It matches the model edge:** tool definitions already are JSON Schema, so there is no conversion step.
+- **The third consumer is already scheduled:** with Go 3 months away, the lesson's rule to promote on the
+  third consumer applies now, not after another migration.
+- **Protobuf loses on need:** about 400 KB a second needs no binary encoding, and both edges would need
+  conversion back to JSON Schema.
+- **Rules travel with it:** ids as strings, offset-aware datetimes, `extra="forbid"` on model arguments,
+  tolerant readers with `schema_version` on events and checkpoints.
+
+**What would change it.**
+- **The Go worker is cancelled:** Pydantic first is enough for two languages.
+- **Internal RPC grows to tens of thousands of messages a second,** or needs streaming RPC: move the
+  executor-to-worker hop to Protobuf and keep JSON Schema at the model and browser edges.
+- **External customers consume the events:** add consumer-driven contract tests.
+
+### Trade-offs accepted
+- **Verbose schemas.** JSON Schema is harder to read than Pydantic; we keep schemas small per surface and
+  review them like code.
+- **Generator quirks per language.** Generated Go and TypeScript can differ on optional and nullable
+  fields; we pin generator versions and run the same golden fixtures in all three CIs.
+- **Weak evolution discipline.** JSON Schema has no built-in breaking-change check; additive-only rules
+  and `schema_version` are enforced in review, and we chart runtime validation failures per boundary.
+- **CI friction.** An uncommitted regeneration fails the build; we accept it as drift caught early and
+  count those failures.
+
+### Review rubric
+- **Every contract surface is listed:** tool arguments and results, events, checkpoints, internal RPC and
+  run context, each with its consumers.
+- **The model is treated as a consumer:** a per-provider projection is planned and tested from the same
+  fixtures.
+- **The choice follows from stated constraints:** language count, timeline and traffic, with the traffic
+  number used to accept or reject Protobuf.
+- **Representation rules are explicit:** int64, datetimes, null versus absent, enums and unknown fields.
+- **Evolution is planned:** versioning, a migration for stored checkpoints and a CI check that catches
+  drift.
+- **A production signal is named:** tool-argument rejection rate per tool, provider and schema version.
 
 ## Why it exists
 - **Every arrow is a contract, written down or not.** Python sends the model a tool definition as JSON

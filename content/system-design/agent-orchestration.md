@@ -5,7 +5,7 @@ name: Agent orchestration
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -71,9 +71,11 @@ Choose **B**, because:
 - **Hours-long approvals hold no worker:** the approval node checkpoints with `waiting_approval` and an
   event resumes it; the credit node carries an idempotency key from run id and node.
 
-**What would change it:** a much larger share of open-ended tickets (the loop's cost then dominates and
-A's simplicity wins back); or a cheaper loop that matches the chain on billing, which would justify
-collapsing paths.
+**What would change it:**
+- **More open-ended tickets.** A bug-report share b above about 36% pushes B past the 80M cap (6,000 ×
+  (6.5 + 19b)k tokens a day), forcing a cheaper loop or a bigger budget. If the budget rose and most
+  tickets became open-ended, A's single path would win back on simplicity.
+- **A cheaper loop** that matches the chain on billing would justify collapsing paths.
 
 ### Trade-offs accepted
 - **Router errors are a new failure mode.** A bug report routed to the how-to chain gets a shallow

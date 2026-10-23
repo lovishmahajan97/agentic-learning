@@ -5,7 +5,7 @@ name: Tenant isolation
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -58,7 +58,7 @@ questionnaire. All figures are illustrative.
 |---|---|---|---|---|
 | A. App filter plus tests | Every query adds `WHERE tenant_id = ...`; unit tests check it | 1: fails the questionnaire | Lowest | Fine |
 | B. Run-bound tools, mandatory client filter, RLS | Tenant from the run, never a tool argument; required tenant parameter in the retrieval client; `FORCE ROW LEVEL SECURITY` with `SET LOCAL`; canary probe | 2 (client filter and RLS), plus run binding | One policy per table, 6 in total | Works with transaction pooling; small tenants may get fewer than k rows from HNSW |
-| C. Schema per tenant with per-tenant roles | 1,200 schemas, each with its own database role | 2, and survives a compromised app | 1,200 × 6 = 7,200 tables, 1,200 migrations per release, 1,200 roles | Pools are per role: even 1 server connection each needs 1,200, over the 500 limit |
+| C. Schema per tenant with per-tenant roles | 1,200 schemas, each with its own database role | 2, and survives SQL injection, since each session holds only one tenant's role | 1,200 × 6 = 7,200 tables, 1,200 migrations per release, 1,200 roles | Pools are per role: even 1 server connection each needs 1,200, over the 500 limit |
 
 ### Decision
 Choose **B, with dedicated partitions for the 50 large tenants**, because:
@@ -71,9 +71,11 @@ Choose **B, with dedicated partitions for the 50 large tenants**, because:
 - **Recall is solved structurally:** partitioning the 50 large tenants keeps HNSW search inside their
   own data, while the 1,150 small tenants use iterative index scans (pgvector 0.8 and later).
 
-**What would change it:** a contract that must withstand SQL injection or full application compromise
-would justify C or a silo for that tenant only, with its own credentials. An agent tool that runs
-free-form SQL would also force per-tenant credentials.
+**What would change it:** a contract that must withstand SQL injection would justify per-tenant
+credentials (C) for that tenant only. One that must withstand full application compromise needs a silo
+with its own deployment and credentials, because an app holding every tenant's role can use any of them.
+
+An agent tool that runs free-form SQL would also force per-tenant credentials.
 
 ### Trade-offs accepted
 - **RLS trusts the setting.** A compromised app can name another tenant. Watch: roles holding

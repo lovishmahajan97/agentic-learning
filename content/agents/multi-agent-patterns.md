@@ -174,9 +174,10 @@ flowchart TD
 ```
 
 ## Misconceptions
-- **"Several smaller agents are cheaper than one big one, since each context is smaller."** Parallelism
-  improves, not the token count: each worker re-reads its own growing context, and the system does more
-  work. One vendor's research write-up reports about 15x the tokens of a chat turn for its multi-agent
+- **"Several smaller agents are cheaper than one big one, since each context is smaller."** For the
+  same tool calls, split contexts do re-read less; the bill rises because the system does more work: a
+  brief per worker, more searches in parallel, and a synthesis pass. Parallelism improves, not the token
+  count: one vendor's research write-up reports about 15x the tokens of a chat turn for its multi-agent
   system versus about 4x for a single agent.
 - **"Multi-agent is the more advanced, therefore better, architecture."** Split only when one loop's
   context, tool list or permissions break. Every boundary loses context and adds coordination bugs, so one

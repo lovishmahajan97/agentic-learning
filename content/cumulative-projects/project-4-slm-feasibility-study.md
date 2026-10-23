@@ -5,7 +5,8 @@ name: "Project 4: SLM feasibility study"
 kind: practice
 difficulty: advanced
 est_minutes: 30
-status: mastery-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 mastery: evaluate
 code_tested: yes
@@ -53,6 +54,64 @@ SLM is viable.
   constraints, hardware and the acceptance gate.
 - **What you can skip.** Fine-tuning, at first. Prompted, constrained small models often pass narrow
   tasks; fine-tune only when the study shows a gap worth closing.
+
+## Decision case
+### Scenario
+A support platform's agent first routes each ticket to one of 12 queues, and that call sits on the
+critical path of every run. The study (M1-M5) is done; the lead needs the M6 decision. All figures are
+illustrative, not benchmarks or vendor prices.
+- **Volume:** 300,000 routing tasks a day, an average of about 3.5 a second and a peak of about
+  10.4 a second (3x average).
+- **Hosted model:** about 600 input and 20 output tokens a task at an assumed $3 and $15 per million,
+  so $0.0018 + $0.0003 = $0.0021 a task, $2.10 per 1,000 and $630 a day.
+- **Self-hosted SLM:** one GPU at an assumed $1.20 an hour serves 20 tasks a second; two GPUs for
+  redundancy cost 2 x 24 x $1.20 = $57.60 a day.
+- **Golden set results:** hosted 94.0%; 8-bit SLM 93.1% with 99.9% valid JSON under grammar
+  constraints; 4-bit SLM 91.2%; rules baseline 81.0%.
+- **Constraints:** p95 under 300 ms for this step; quality within 2 points of hosted and 99.5% valid
+  output; one ML engineer who has run GPU services before.
+
+### Options
+| Option | How it works | Quality gate | p95 at peak | Cost a day |
+|---|---|---|---|---|
+| Stay hosted | Every task goes to the large model | Reference, 94.0% | 900 ms with network: fails | $630 |
+| Rules baseline | Keyword rules | 81.0%: fails | under 5 ms | near zero |
+| Replace with the 8-bit SLM | Every task goes to the SLM | 93.1%, 0.9 points below: passes | 180 ms | $57.60 |
+| 8-bit SLM with fallback | Invalid or low-confidence output (3% in shadow) is re-sent to the hosted model | 93.8% on the golden set | about 190 ms; p99 about 1.1 s | $57.60 + 0.03 x $630 = $76.50 |
+
+### Decision
+**Adopt the 8-bit SLM behind a router with hosted fallback.** It passes all three gates, saves about
+$630 - $76.50 = $553.50 a day, and keeps headroom for edge cases the golden set missed.
+
+Replacing the model outright is cheaper by $18.90 a day but has no answer for the long tail. The 4-bit variant fails the
+quality gate at 2.8 points below the reference.
+- **Fallback must stay rare:** only 3% of tasks take the slow path, so p95 stays on the SLM. Above 5%,
+  the slow path enters the p95 and the latency gate fails.
+- **Volume has margin:** break-even against hosted is about $57.60 / (0.97 x $0.0021), roughly 28,000
+  tasks a day, far below 300,000.
+
+**What would change it.**
+- **Sensitivity:** at half volume the router costs $57.60 + $9.45 = $67.05 against $315 hosted. At double
+  volume the 20.8-a-second peak needs 3 GPUs, so $86.40 + $37.80 = $124.20 against $1,260. Both keep
+  the decision.
+- **Reverse it** if the fallback rate stays above 5%, if new queues arrive weekly (prompt-only changes
+  favour hosted), or if the engineer who runs the GPUs leaves with no replacement.
+
+### Trade-offs accepted
+- **GPU operations are now ours:** upgrades, capacity planning and on-call. They are not in the cost
+  figures; track the hours spent each month against the $553.50-a-day saving.
+- **A 0.2-point quality gap to hosted** (93.8% against 94.0%). Track per-queue accuracy on a weekly
+  sample; one queue can degrade while the average holds.
+- **A slow p99** of about 1.1 s on fallback tasks. Track the fallback rate daily as the leading signal.
+
+### Review rubric
+- **Every option faces the same three gates:** quality, valid output and latency at peak, from one harness.
+- **Cost is recomputed from inputs:** tokens x price for hosted, hardware ÷ throughput with redundancy for
+  self-hosted, each input labelled as measured or assumed.
+- **The fallback's effect on tail latency is checked,** not only its cost.
+- **Break-even and a sensitivity row** at half and double volume are shown.
+- **Excluded costs are named,** such as operations effort, rather than silently left out.
+- **Reversal conditions are measurable:** fallback rate, category churn or staffing.
 
 ## Why it exists
 - **"Use a small model" is a claim, not a plan.** Without a golden set, teams either never try SLMs or

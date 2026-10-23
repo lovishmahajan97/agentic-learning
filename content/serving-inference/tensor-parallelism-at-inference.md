@@ -5,7 +5,7 @@ name: Tensor parallelism at inference
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:

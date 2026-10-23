@@ -5,7 +5,7 @@ name: Loss functions (cross-entropy, contrastive)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -168,11 +168,11 @@ flowchart TD
 ```
 
 ## Misconceptions
-- **"A falling loss means the agent is getting better."** The loss is a surrogate. Without an
-  assistant-only mask, 5,800 of 6,000 tokens in a trajectory are inputs, so the loss collapses while
-  tool-call accuracy stays flat. Track the task metric next to the loss.
-- **"Squared error on probabilities is fine for classes."** Through a sigmoid its gradient carries a
-  p(1 − p) factor: at p = 0.01 for the true class it is about −0.0098 against −0.99 for cross-entropy, so
+- **"A falling loss means the agent is getting better."** The loss is a surrogate. In the example
+  6,000-token trajectory below, 5,800 tokens are inputs; without an assistant-only mask they dominate the loss,
+  which drops fast while tool-call accuracy stays flat. Track the task metric next to the loss.
+- **"Squared error on probabilities is fine for classes."** Through a sigmoid, ½(p − y)² has a logit
+  gradient with a p(1 − p) factor: at p = 0.01 for the true class it is about −0.0098 against −0.99 for cross-entropy, so
   it stalls exactly when the model is confidently wrong.
 - **"Contrastive learning is a different kind of objective from classification."** InfoNCE is
   cross-entropy over a softmax of similarities divided by τ, where the correct class is the positive

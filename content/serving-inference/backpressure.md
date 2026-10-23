@@ -5,7 +5,7 @@ name: Backpressure
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -166,9 +166,10 @@ flowchart TD
 - **"A bigger queue absorbs the spike."** By Little's law, while arrivals exceed service rate the wait
   grows every second; past the client timeout every queued request is wasted GPU work plus a retry.
   Bound queue time and reject the excess fast instead.
-- **"High GPU utilisation means we are overloaded."** Utilisation sits near 95% whether the queue is
-  empty or exploding. Queue wait time, the engine's waiting gauge and preemptions are the pressure
-  signals, so alert and autoscale on those.
+- **"High GPU utilisation means we are overloaded."** A busy engine can sit near 95% utilisation both
+  with an empty queue (healthy) and with a queue growing every second (minutes from collapse), so the
+  number cannot tell them apart. Queue wait time, the engine's waiting gauge and preemptions are the
+  pressure signals, so alert and autoscale on those.
 - **"Rejecting requests is the failure; serving everything is the goal."** Under overload, serving
   everything means serving everyone late, and goodput collapses. Fast 503s with `Retry-After` keep the
   admitted share at normal latency while autoscaling catches up.

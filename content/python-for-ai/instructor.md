@@ -5,7 +5,7 @@ name: Instructor
 kind: tool
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -177,12 +177,15 @@ def test_escalates_after_max_attempts_instead_of_raising():
   requests, not 2: this release stops after `max_retries + 1` attempts. Debug by counting
   `fake.requests` and reading the "Total attempts" line Instructor logs; older releases counted
   differently, which is why you pin and test.
-- **Drop `context={"tools": TOOLS}` from the call.** Every `call_tool` reply now fails with an empty
-  registry, so even the valid first reply is reasked until escalation. Debug by printing
-  `info.context` inside the validator.
-- **Write the validator message as just "invalid".** Tests still pass, but print the second request's
-  last message: the model gets no hint of the legal tool names, which is what makes real reasks
-  converge.
+- **Drop `context={"tools": TOOLS}` from the call.** `info.context` is now `None`. A validator that
+  indexes `info.context["tools"]` crashes with `TypeError: 'NoneType' object is not subscriptable`,
+  and no reask happens (Pydantic only turns `ValueError` and `AssertionError` into validation errors).
+  One that falls back to an empty registry fails every `call_tool` reply, so even the valid first reply
+  is reasked until escalation. Debug by printing `info.context` inside the validator.
+- **Write the validator message as just "invalid".** The reask still happens, but
+  `test_unknown_tool_is_reasked_with_the_error` fails on its `"unknown tool"` assertion. Print the
+  second request's last message: the model gets no hint of the legal tool names, and that hint is
+  what makes real reasks converge.
 - **Let `InstructorRetryException` escape.** The escalation test errors instead of failing an
   assertion, the same crash an agent run would suffer on one stubborn step.
 

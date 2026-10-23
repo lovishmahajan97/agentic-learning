@@ -5,7 +5,7 @@ name: Freshness, document deletion and index consistency
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: implement
@@ -198,7 +198,8 @@ flowchart TD
   manifest of indexed `doc_id`s against a complete listing.
 - **"The delete call succeeded, so the text is gone."** Many ANN engines delete lazily, and the vector
   index is one of several derived stores (BM25, parent store, answer caches, agent memory, traces).
-  Only a probe for distinctive text, run against every retrieval leg, proves removal.
+  Only a probe for distinctive text, run against every retrieval leg, proves it is no longer
+  retrievable; physical erasure also needs compaction and a repeat probe.
 - **"The model will prefer the current passage if both are retrieved."** Two near-identical policy
   paragraphs look equally authoritative. Enforce the version guard and archive filter in the tool code;
   `modified_at` in the result is supporting evidence, not the control.

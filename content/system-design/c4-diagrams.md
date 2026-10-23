@@ -5,7 +5,7 @@ name: C4 diagrams
 kind: practice
 difficulty: intro
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: background
 related:
@@ -67,7 +67,8 @@ Choose **C, one Structurizr DSL workspace rendered in CI**, because:
 - **The reviewers' questions map to views:** Context for egress, Container for technology, Deployment
   for the VPC boundary, a Dynamic view of one run for write actions and the approval step.
 - **The element budget holds:** Context is 1 system, 2 people and 8 external systems, 11 elements;
-  Container adds 6 containers, 16 in total, under the roughly twenty ceiling.
+  Container replaces the system box with its 6 containers, 2 + 8 + 6 = 16, under the roughly twenty
+  ceiling.
 - **There is an owner:** the architect owns the model, and a code-owner rule on the architecture folder
   routes every change to them.
 - **The deadline is realistic:** the DSL is small and line-based, and the 7 views come from one model

@@ -186,8 +186,9 @@ def test_trace_keeps_outputs():
 ```
 
 ### Failure scenarios
-- **Dump args without `sort_keys=True`.** the same arguments in key order `q, k` and `k, q` give different text, so the
-  two steps compare unequal and the loop goes unnoticed. Print both `args_json` values side by side.
+- **Dump args without `sort_keys=True`.** The same arguments in key order `q, k` and `k, q` give
+  different text, so the two steps compare unequal and the loop goes unnoticed. Print both `args_json`
+  values side by side.
 - **Store `args: dict[str, object]` on the frozen step.** Construction works, but `{a, b}` raises
   `TypeError: unhashable type: 'dict'`, because the generated hash covers every field. The traceback
   points at the set or `Counter`, not the class.

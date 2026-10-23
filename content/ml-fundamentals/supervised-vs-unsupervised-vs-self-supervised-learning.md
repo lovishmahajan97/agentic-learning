@@ -5,7 +5,7 @@ name: Supervised vs unsupervised vs self-supervised learning
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -159,7 +159,8 @@ flowchart TD
 ## Misconceptions
 - **"Self-supervised is just another name for unsupervised."** Next-token prediction is cross-entropy
   against a specific known target per position, so the supervised toolkit applies; only the source of the
-  label differs. Unsupervised objectives score a global property and have no per-example target.
+  label differs. Classical unsupervised objectives such as k-means or PCA score a global property and
+  have no per-example target.
 - **"Clustering can sort data into my categories without labels."** k-means groups by whatever
   similarity dominates the embedding space, which need not match your taxonomy, and gives no accuracy
   number. Clusters tell you what to label and how to sample, not what is correct.

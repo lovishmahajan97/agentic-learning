@@ -5,7 +5,7 @@ name: Model selection
 kind: decision
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -84,8 +84,9 @@ on routine steps would only lower D's cost further.
   parse failures and run success are tracked per step type.
 - **A thin margin.** D clears the bar by about 3 points; the eval grows from 300 to more tasks as
   production failures are labelled, which also narrows the interval.
-- **B as the fallback costs more.** An outage of C's provider moves routine steps to B and spend
-  towards 644 a day; fallback share and daily spend have alerts.
+- **B as the fallback costs more.** An outage of C's provider moves routine steps to B: six B steps
+  cost 6 × 0.0046 × 20,000 ≈ 552 a day, over the 400 budget; fallback share and daily spend have
+  alerts.
 
 ### Review rubric
 - Applies the hard-constraint filter before any quality comparison, and says which candidate it removed.

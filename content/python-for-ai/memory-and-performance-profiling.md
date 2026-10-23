@@ -5,7 +5,7 @@ name: Memory & performance profiling
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:

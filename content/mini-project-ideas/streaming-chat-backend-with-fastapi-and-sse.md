@@ -5,7 +5,8 @@ name: Streaming chat backend with FastAPI and SSE
 kind: practice
 difficulty: core
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - fastapi-for-ai/server-sent-events
@@ -36,6 +37,200 @@ disconnects and persists the final message. It proves you can ship the backend e
   while a tool runs; that is an event stream, not a single JSON response.
 - **What you can skip.** WebSockets, unless you need the client to talk mid-stream; SSE is one-way, plain
   HTTP and enough for almost every chat agent. Frontend frameworks are optional; a curl client works.
+
+## Lab
+### Task
+Fix a chat agent's SSE endpoint so a browser can parse it, a closed tab stops the model, and every turn
+is saved. The endpoint streams a `tool_call`, a `tool_result` and the answer tokens from a recorded fake
+model, so you can test disconnects deterministically.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** server-sent events, StreamingResponse, and cancellation on client disconnect.
+- **Runs offline:** `FakeModel` replays one tool call and five tokens and counts the chunks it produced,
+  which is how the tests see tokens wasted after a disconnect.
+- **Needs:** `pip install fastapi httpx pytest`; checked with Python 3.12, FastAPI 0.161.1, Starlette
+  1.9.0, httpx 0.28.1 and pytest 9.1.1.
+
+### Starter code
+```python
+# sse_chat.py: an SSE chat endpoint with tool events, disconnects and persistence, offline
+import asyncio, json
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+app = FastAPI()
+DB = {}                     # message_id -> {"text", "status"}; stands in for SQLite or Postgres
+
+class ChatIn(BaseModel):
+    conversation_id: str
+    message: str
+
+def sse(event: str, data: dict, eid: int) -> str:
+    # YOUR CODE 1: an SSE event must end with an empty line; this one does not
+    return f"id: {eid}\nevent: {event}\ndata: {json.dumps(data)}\n"
+
+def parse(stream_text: str):
+    """Client side: split the stream into (id, event, data) tuples."""
+    out = []
+    for block in stream_text.split("\n\n"):
+        fields = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
+        if "event" in fields:
+            out.append((int(fields["id"]), fields["event"], json.loads(fields["data"])))
+    return out
+
+class FakeModel:
+    """Recorded upstream stream: one tool call, then tokens. Counts chunks to expose wasted work."""
+    def __init__(self, tokens=("The ", "weather ", "is ", "sunny", ".")):
+        self.tokens, self.produced, self.closed = list(tokens), 0, False
+
+    async def stream(self, messages):
+        try:
+            yield {"tool_call": {"name": "get_weather", "args": {"city": "Paris"}}}
+            for t in self.tokens:
+                self.produced += 1
+                await asyncio.sleep(0)
+                yield {"token": t}
+        finally:
+            self.closed = True
+
+def run_tool(call):
+    return {"city": call["args"]["city"], "forecast": "sunny"}
+
+async def events(model, messages, message_id, is_disconnected):
+    eid, parts, status = 0, [], "interrupted"     # stays interrupted unless the loop finishes
+    upstream = model.stream(messages)
+    yield sse("start", {"message_id": message_id}, eid)
+    try:
+        async for chunk in upstream:
+            # YOUR CODE 2: stop as soon as the client has gone (await is_disconnected())
+            eid += 1
+            if "tool_call" in chunk:
+                yield sse("tool_call", chunk["tool_call"], eid)
+                eid += 1
+                yield sse("tool_result", run_tool(chunk["tool_call"]), eid)
+            else:
+                parts.append(chunk["token"])
+                yield sse("token", {"text": chunk["token"]}, eid)
+        else:
+            status = "complete"
+    except Exception:
+        status = "error"
+        yield sse("error", {"code": "upstream_failed"}, eid + 1)
+    finally:
+        # YOUR CODE 3: close the upstream stream, then save "".join(parts) and status
+        # to DB[message_id], so a disconnect still leaves an interrupted message
+        pass
+    if status == "complete":
+        yield sse("done", {"chars": sum(map(len, parts))}, eid + 1)
+
+@app.post("/chat")
+async def chat(body: ChatIn, request: Request):
+    messages = [{"role": "user", "content": body.message}]
+    gen = events(FakeModel(), messages, f"{body.conversation_id}-a1", request.is_disconnected)
+    return StreamingResponse(gen, media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+async def collect(model, message_id, disconnect_after=None):
+    """Drive events() like a client that leaves after `disconnect_after` token events."""
+    seen = []
+    async def gone():
+        return disconnect_after is not None and seen.count("token") >= disconnect_after
+    text = ""
+    async for raw in events(model, [{"role": "user", "content": "weather?"}], message_id, gone):
+        text += raw
+        seen = [e for _, e, _ in parse(text)]
+    return parse(text), model.closed       # read before asyncio.run finalises leftover generators
+
+def main():
+    for label, cut in (("complete", None), ("disconnect", 2)):
+        model, mid = FakeModel(), f"c-{label}"
+        evs, closed = asyncio.run(collect(model, mid, cut))
+        print(f"{label}:", " ".join(e for _, e, _ in evs))
+        print("  saved:", DB.get(mid), "| upstream chunks:", model.produced, "| closed:", closed)
+
+if __name__ == "__main__":
+    main()
+```
+
+As given, both runs print only `done`: without the blank line the client sees one merged event. The
+disconnect run also reports `upstream chunks: 5` and `saved: None`, so the tab that left still paid for
+every token and left a gap in the history.
+
+### Expected output
+```
+complete: start tool_call tool_result token token token token token done
+  saved: {'text': 'The weather is sunny.', 'status': 'complete'} | upstream chunks: 5 | closed: True
+disconnect: start tool_call tool_result token token
+  saved: {'text': 'The weather ', 'status': 'interrupted'} | upstream chunks: 3 | closed: True
+```
+
+The third chunk is produced before the disconnect check sees the client has gone, which is what "stops
+within one chunk" means in the acceptance tests.
+
+### Tests
+```python
+# test_sse_chat.py: run with `pytest -q`
+import asyncio
+from fastapi.testclient import TestClient
+import sse_chat as m
+
+def test_each_frame_ends_with_a_blank_line():
+    two = m.sse("token", {"text": "a"}, 1) + m.sse("token", {"text": "b"}, 2)
+    assert two.endswith("\n\n")
+    assert [d["text"] for _, _, d in m.parse(two)] == ["a", "b"]
+
+def test_endpoint_streams_typed_events_in_order():
+    with TestClient(m.app) as c:
+        r = c.post("/chat", json={"conversation_id": "c1", "message": "weather?"})
+    assert r.headers["content-type"].startswith("text/event-stream")
+    evs = m.parse(r.text)
+    assert [e for _, e, _ in evs] == ["start", "tool_call", "tool_result"] + ["token"] * 5 + ["done"]
+    ids = [i for i, _, _ in evs]
+    assert ids == sorted(set(ids))                       # strictly increasing
+
+def test_disconnect_stops_and_closes_upstream():
+    model = m.FakeModel()
+    evs, closed = asyncio.run(m.collect(model, "c2", disconnect_after=2))
+    assert [e for _, e, _ in evs][-1] == "token"         # no done after a disconnect
+    assert model.produced <= 3                           # stopped within one chunk
+    assert closed                                        # closed by us, not by garbage collection
+
+def test_partial_answer_saved_as_interrupted():
+    asyncio.run(m.collect(m.FakeModel(), "c3", disconnect_after=2))
+    assert m.DB["c3"] == {"text": "The weather ", "status": "interrupted"}
+
+def test_complete_answer_saved():
+    asyncio.run(m.collect(m.FakeModel(), "c4"))
+    assert m.DB["c4"] == {"text": "The weather is sunny.", "status": "complete"}
+```
+
+All five fail on the starter. The `closed` check is the subtle one: breaking out of `async for` does not
+close the upstream generator, garbage collection does it later, and a real provider connection keeps
+streaming until then. Fixing only the `break` still fails this test.
+
+### Failure scenarios
+- **Drop the blank line from `sse`.** `curl -N` shows text but the browser `EventSource` fires nothing,
+  and `parse` returns one event. Debug by dumping the raw bytes with `curl -N | od -c` and checking for
+  `\n\n` after each `data:` line.
+- **Break without `aclose()`.** Tokens stop reaching the client, but provider usage per interrupted turn
+  stays near a full answer. Debug by counting chunks produced upstream versus events sent, and log when
+  the upstream stream closes.
+- **Save after the loop instead of in `finally`.** Complete turns are stored, interrupted ones vanish,
+  because a server that stops iterating closes the generator at a `yield` and code after the loop never
+  runs. Debug by disconnecting mid-stream and querying the stored status.
+- **Block the event loop in a tool.** Replace `run_tool` with one that calls `time.sleep(2)`, and every
+  other open stream freezes. Debug with asyncio debug mode, which logs slow callbacks, or by timing two
+  concurrent requests.
+
+### Submission
+- **Repo** with `sse_chat.py` and the unchanged tests; `pytest -q` shows 5 passed.
+- **Program output** matching the expected block.
+- **A raw stream capture** from `curl -N -X POST` against `uvicorn sse_chat:app`, showing the blank line
+  after each event.
+- **A short note** on why `aclose()` matters with a real provider SDK, and what you log per interrupted
+  turn.
+- **Evaluated on** tests passing, ids strictly increasing, `interrupted` turns persisted, and no `done`
+  after a disconnect.
 
 ## Why it exists
 - **Waiting 20 seconds for a full answer feels broken.** Streaming usually shows the first token within a

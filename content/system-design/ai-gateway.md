@@ -5,7 +5,7 @@ name: AI gateway (LiteLLM proxy, Portkey)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -92,6 +92,8 @@ hosted Portkey next quarter. If only one team used models, B would be lighter.
 - **Lagging provider features.** Replay the agents' tool-calling eval through the gateway on every
   upgrade and pin the version that passed.
 - **Prompt logs become sensitive data.** Set retention and redaction before the first team migrates.
+- **Overspend while budgets fail open.** During a Postgres outage, budgets are not enforced, so the
+  agents' per-run caps are the only bound. Alert on database health and on the reconciled overspend.
 
 ### Review rubric
 - Quantifies the failure that motivates the gateway (burn rate, blast radius) and shows how the design

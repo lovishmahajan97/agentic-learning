@@ -5,7 +5,7 @@ name: RLHF
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: background
 related:

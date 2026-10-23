@@ -5,7 +5,8 @@ name: OpenTelemetry instrumentation
 kind: practice
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - observability/opentelemetry
@@ -38,6 +39,232 @@ agent step and tool call.
   whether prompt content is recorded, sampling (keep every failed run), and flushing on shutdown.
 - **What you can skip.** Collector internals and writing your own exporters. Use the Node SDK,
   auto-instrumentation and a collector config someone else maintains.
+
+## Lab
+### Task
+Make one agent request produce one trace. The first draft of the span helper starts spans that are
+never active and never end on errors, and the queue hop carries no context. In a backend you would
+see seven unrelated one-span traces, no trace of the failed CRM call, and a worker span nobody can
+link to the request.
+- **Agent goal:** a single waterfall shows the request, the run, each step, each tool (failures in
+  red) and the worker that picked up the follow-up job.
+- **Time box:** 45-60 minutes.
+- **Prerequisites:** this lesson's "Context propagation in a process", "Context propagation across
+  processes" and the BullMQ carrier example; BullMQ & durable jobs for the queue side.
+- **Needs:** Node 20+ with `npm i @opentelemetry/api@1.9.1 @opentelemetry/sdk-trace-node@2.12.0
+  @opentelemetry/sdk-trace-base@2.12.0` and `npm i -D tsx vitest`. The real SDK runs; spans go to an
+  in-memory exporter instead of a collector. Checked with those versions on Node 24.21, tsx 4.23 and
+  vitest 5.0.5. In SDK 2.x a span's parent is `parentSpanContext`, not the 1.x `parentSpanId`.
+
+### Starter code
+```ts
+// otel-lab.ts: one trace per agent run, across an in-process loop and a queue hop
+// Real OpenTelemetry SDK; spans go to an in-memory exporter instead of a collector.
+import { context, propagation, trace, SpanKind, SpanStatusCode, ROOT_CONTEXT, type Span } from "@opentelemetry/api";
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { InMemorySpanExporter, SimpleSpanProcessor, type ReadableSpan } from "@opentelemetry/sdk-trace-base";
+
+export const exporter = new InMemorySpanExporter();
+const started = new Map<string, number>();                 // start order, for printing only
+const order = { onStart: (s: Span) => { started.set(s.spanContext().spanId, started.size); }, onEnd() {},
+                forceFlush: async () => {}, shutdown: async () => {} };
+const provider = new NodeTracerProvider({ spanProcessors: [order, new SimpleSpanProcessor(exporter)] });   // Simple: tests only
+provider.register();                         // AsyncLocalStorage context manager and W3C propagator
+const tracer = trace.getTracer("agent-lab");
+
+type Attrs = Record<string, string | number>;
+
+// YOUR CODE 1: the first draft. Make the span ACTIVE while fn runs (so spans started inside become its
+// children), record the exception and set ERROR status when fn throws (then rethrow), and end the
+// span on every path.
+export async function inSpan<T>(name: string, attrs: Attrs, fn: (s: Span) => Promise<T>, kind = SpanKind.INTERNAL): Promise<T> {
+  const span = tracer.startSpan(name, { attributes: attrs, kind });
+  const out = await fn(span);
+  span.end();
+  return out;
+}
+
+export type Turn = { toolCalls: string[]; tokens: number };
+export type Tools = Record<string, () => Promise<string>>;
+
+// Finished: the agent loop. Tool failures become results the model sees; the run continues.
+export async function runAgent(runId: string, tenant: string, turns: Turn[], tools: Tools) {
+  return inSpan("agent.run", { "app.run_id": runId, "app.tenant": tenant }, async (run) => {
+    let total = 0;
+    for (const [step, turn] of turns.entries()) {
+      await inSpan("agent.step", { "app.step": step, "app.step_tokens": turn.tokens }, async () => {
+        for (const name of turn.toolCalls) {
+          try { await inSpan(`tool.${name}`, { "app.tool": name }, () => tools[name]()); }
+          catch { /* reported to the model as an error result */ }
+        }
+      });
+      total += turn.tokens;
+    }
+    run.setAttribute("app.total_tokens", total);
+    return total;
+  });
+}
+
+// A queue whose worker runs jobs later, in a fresh context, as a separate worker process would.
+export type QueueJob = { runId: string; otel?: Record<string, string> };
+export class FakeQueue {
+  jobs: QueueJob[] = [];
+  async add(job: QueueJob) { this.jobs.push(structuredClone(job)); }   // only JSON survives the hop
+  async drain(fn: (job: QueueJob) => Promise<void>) {
+    for (const job of this.jobs.splice(0)) await context.with(ROOT_CONTEXT, () => fn(job));
+  }
+}
+
+// YOUR CODE 2: the first drafts. The producer must inject the active context into job.otel; the
+// consumer must extract it and start "run.process" (kind CONSUMER, attribute app.run_id) inside it,
+// so the worker's spans join the request's trace.
+export async function enqueueSummary(queue: FakeQueue, runId: string) {
+  await queue.add({ runId });
+}
+export async function processJob(job: QueueJob) {
+  await inSpan("run.process", { "app.run_id": job.runId }, async () => {
+    await inSpan("tool.summarize", { "app.tool": "summarize" }, async () => "ok");
+  });
+}
+
+export function printTree(spans: ReadableSpan[]) {
+  spans = [...spans].sort((a, b) => started.get(a.spanContext().spanId)! - started.get(b.spanContext().spanId)!);
+  const ids = new Set(spans.map((s) => s.spanContext().spanId));
+  const roots = spans.filter((s) => !s.parentSpanContext || !ids.has(s.parentSpanContext.spanId));
+  const traces = new Set(spans.map((s) => s.spanContext().traceId)).size;
+  const walk = (s: ReadableSpan, depth: number) => {
+    const flag = s.status.code === SpanStatusCode.ERROR ? " ERROR" : "";
+    console.log(`${"  ".repeat(depth)}${s.name} [${SpanKind[s.kind]}]${flag}`);
+    for (const c of spans.filter((x) => x.parentSpanContext?.spanId === s.spanContext().spanId)) walk(c, depth + 1);
+  };
+  roots.forEach((r) => walk(r, 0));
+  console.log(`spans ${spans.length}, traces ${traces}`);
+}
+
+export async function demo() {
+  const queue = new FakeQueue();
+  const tools: Tools = { search: async () => "3 hits", crm: async () => { throw new Error("crm 503"); } };
+  await inSpan("POST /runs", { "http.route": "/runs" }, async () => {
+    await runAgent("r1", "acme", [{ toolCalls: ["search", "crm"], tokens: 900 }, { toolCalls: [], tokens: 300 }], tools);
+    await enqueueSummary(queue, "r1");
+  }, SpanKind.SERVER);
+  await queue.drain(processJob);
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  await demo();
+  printTree(exporter.getFinishedSpans());
+}
+```
+
+Run it with `npx tsx otel-lab.ts`. As given it prints seven flat spans and `spans 7, traces 7`:
+nothing nests, and `tool.crm` is missing because a span that throws is never ended, so never exported.
+
+### Expected output
+```
+POST /runs [SERVER]
+  agent.run [INTERNAL]
+    agent.step [INTERNAL]
+      tool.search [INTERNAL]
+      tool.crm [INTERNAL] ERROR
+    agent.step [INTERNAL]
+  run.process [CONSUMER]
+    tool.summarize [INTERNAL]
+spans 8, traces 1
+```
+
+### Tests
+```ts
+// otel-lab.test.ts: run with `npx vitest run`
+import { beforeEach, describe, expect, it } from "vitest";
+import { SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import type { ReadableSpan } from "@opentelemetry/sdk-trace-base";
+import { demo, enqueueSummary, exporter, FakeQueue, inSpan } from "./otel-lab";
+
+const byName = (spans: ReadableSpan[], name: string) => spans.filter((s) => s.name === name);
+const parentOf = (s: ReadableSpan) => s.parentSpanContext?.spanId;
+const id = (s: ReadableSpan) => s.spanContext().spanId;
+beforeEach(() => exporter.reset());
+
+describe("inSpan", () => {
+  it("returns fn's value and nests spans started inside it", async () => {
+    const out = await inSpan("outer", {}, () => inSpan("inner", {}, async () => 42));
+    const spans = exporter.getFinishedSpans();
+    expect(out).toBe(42);
+    expect(parentOf(byName(spans, "inner")[0])).toBe(id(byName(spans, "outer")[0]));
+  });
+  it("ends a failing span with ERROR status and the exception, then rethrows", async () => {
+    await expect(inSpan("tool.crm", {}, async () => { throw new Error("crm 503"); })).rejects.toThrow("crm 503");
+    const [span] = exporter.getFinishedSpans();
+    expect(span?.status.code).toBe(SpanStatusCode.ERROR);
+    expect(span.events.map((e) => e.name)).toContain("exception");
+  });
+});
+
+describe("agent run trace", () => {
+  it("is one tree: request, run, steps, tools", async () => {
+    await demo();
+    const spans = exporter.getFinishedSpans();
+    const [req] = byName(spans, "POST /runs"), [run] = byName(spans, "agent.run");
+    const steps = byName(spans, "agent.step");
+    expect(parentOf(run)).toBe(id(req));
+    expect(steps.map(parentOf)).toEqual([id(run), id(run)]);
+    const step0 = steps.find((s) => s.attributes["app.step"] === 0)!;
+    expect(byName(spans, "tool.search").map(parentOf)).toEqual([id(step0)]);
+    expect(new Set(spans.map((s) => s.spanContext().traceId)).size).toBe(1);
+  });
+  it("exports the failed tool span and keeps the run going", async () => {
+    await demo();
+    const spans = exporter.getFinishedSpans();
+    expect(byName(spans, "tool.crm")[0]?.status.code).toBe(SpanStatusCode.ERROR);
+    expect(byName(spans, "agent.run")[0].attributes["app.total_tokens"]).toBe(1_200);
+  });
+});
+
+describe("queue hop", () => {
+  it("carries a W3C traceparent in the job data", async () => {
+    const q = new FakeQueue();
+    await inSpan("POST /runs", {}, () => enqueueSummary(q, "r9"));
+    expect(q.jobs[0].otel?.traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+  });
+  it("makes the worker's CONSUMER span a child of the request", async () => {
+    await demo();
+    const spans = exporter.getFinishedSpans();
+    const [req] = byName(spans, "POST /runs"), [proc] = byName(spans, "run.process");
+    expect(proc.kind).toBe(SpanKind.CONSUMER);
+    expect(proc.spanContext().traceId).toBe(req.spanContext().traceId);
+    expect(parentOf(proc)).toBe(id(req));
+  });
+});
+```
+
+All 6 fail on the starter: the nesting tests with `expected undefined to be '<span id>'` (no parent),
+the error tests because the failing span was never exported, the carrier test with a `TypeError`
+(`otel` is undefined), and the consumer test on its kind (`INTERNAL`, 0, instead of `CONSUMER`, 4).
+
+### Failure scenarios
+- **Inject `context.with(ROOT_CONTEXT, ...)` around the tool call,** as a pooled or batching client
+  that runs callbacks from its own continuation does. The tool span becomes its own root trace while
+  the run looks fine. Debug by comparing trace ids of a parent and the span that should be its child;
+  fix with `context.bind(context.active(), fn)` where the callback is handed over.
+- **Inject a `finally { span.end() }` but drop `setStatus`.** The CRM span exports green, so a
+  tail-sampling rule that keeps error traces drops this run. Query for spans with an `exception`
+  event but `UNSET` status.
+- **Inject the `extract` without `context.with`.** The carrier parses, but `run.process` still starts
+  a new trace because the extracted context was never made active. Log `trace.getActiveSpan()` inside
+  the worker before starting a span.
+- **Inject a run id into a span name** (`agent.run.r1`). Nothing breaks here, but every run becomes a
+  new operation name in the backend and dashboards fragment. Names stay fixed; ids go in attributes.
+
+### Submission
+- **Your `otel-lab.ts`** with both `YOUR CODE` parts done; `runAgent`, the queue and the printer
+  unchanged.
+- **A `npx vitest run` log** showing 6 passed.
+- **The `npx tsx otel-lab.ts` output**, matching the expected tree.
+- **A note of 3-5 sentences:** what changes when you swap `SimpleSpanProcessor` for a
+  `BatchSpanProcessor` in production, and where `sdk.shutdown()` belongs.
+- **Evaluated on:** active spans that always end, ERROR status plus an exception event on failure,
+  a `traceparent` carried in job data, and a `CONSUMER` span parented to the request.
 
 ## Why it exists
 - **Agent requests fan out across processes.** An HTTP handler calls a planner model, which calls three

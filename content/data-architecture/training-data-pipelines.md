@@ -5,7 +5,7 @@ name: Training data pipelines
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -66,7 +66,7 @@ Constraints:
 | **A. Export JSONL and train** | Dump all runs, random 90/10 split, provider-style formatting at load time | Fails unless scrubbed separately | Fails: retries and eval-period tickets leak across splits | Yes, in days |
 | **B. Single-node staged pipeline** | Outcome filter, exact and MinHash dedup by task, decontaminate against the 600 tasks, PII scrub, offline template render with serving tool schemas and role masks, packed shards plus manifest hash | Pass: scrub is a blocking stage in-region | Pass: group split by task after clustering | Yes: 360 million tokens fit on one machine |
 | **C. Distributed pretraining-style pipeline** | `datatrove` on a cluster, a model-based quality classifier, streaming shards | Pass | Pass | No: cluster setup eats the deadline for data that fits on one node |
-| **D. Do not fine-tune yet** | Fix prompts and tool descriptions on the large model | Pass | Not applicable | Yes, but the per-call price of the large model is the cost problem, so it cannot meet the goal |
+| **D. Do not fine-tune yet** | Move to the small open-weight model as is, with tightened tool descriptions and a few in-context examples per tool | Pass: no training data leaves the logs | Pass: nothing is trained, so nothing leaks; it is the baseline the constraint names | Yes, in days, and it cuts cost as much as B; it wins outright if it already holds up on held-out tasks |
 
 ### Decision
 Choose **B**, because the binding constraints are validity and privacy, not scale:
@@ -80,6 +80,8 @@ Choose **B**, because the binding constraints are validity and privacy, not scal
 - **The rename is handled in the data.** Runs older than 5 weeks are re-rendered with the current schema or dropped,
   so the model never learns the old argument name.
 - **The eval is protected.** Splitting by task and decontaminating against the 600 tasks is what lets the go or no-go mean something.
+- **D is run first, as the baseline.** Week 1 scores the prompted small model on the held-out tasks. B goes ahead
+  only if that score misses the bar, which is also the number the tuned model must beat.
 
 What would change it:
 - **Much more data.** At billions of tokens or many sources, the dedup and quality stages outgrow one node: move toward C.

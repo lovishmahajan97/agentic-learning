@@ -5,7 +5,8 @@ name: MCP ecosystem (registries, popular servers, when not to use MCP)
 kind: decision
 difficulty: core
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: useful
 related:
   - agents/model-context-protocol
@@ -35,6 +36,77 @@ simpler, faster and cheaper.
   whether a capability goes through MCP at all.
 - **What you can skip.** Chasing every directory. Pick servers published by the vendor that owns the API,
   or ones your team reviewed, and ignore the long tail.
+
+## Decision case
+### Scenario
+A 40-engineer B2B SaaS company wants a triage agent for its support engineers. The agent reads an error
+in Sentry, looks up the affected customer's order, and files a GitHub issue. A platform team of 3 owns
+it.
+
+Today the agent is the only consumer of the order tools; a billing agent that needs them is planned for
+next quarter.
+- **Capabilities:** GitHub (6 tools needed), Sentry (3 tools needed), and 4 order tools over the
+  internal orders database (look up, list by customer, refund status, escalate).
+- **What `tools/list` showed (this scenario's measurements):** the vendor-official GitHub server lists 40
+  tools and the Sentry server 20. A registry search for "orders" returns a community server with 12
+  tools that needs read access to the database.
+- **Context budget:** at most 5k tool-definition tokens per model call. Assume about 250 tokens per tool
+  definition (illustrative; measure your own).
+- **Security review:** the security team can review 2 new MCP servers per month.
+- **Deadline:** in production within 6 weeks.
+- **Data residency:** order data must stay in the company's EU infrastructure.
+- **Latency:** order lookups add at most 300 ms p95 to an agent step.
+
+### Options
+| Option | How it works | Context (≤5k tokens) | Reviews (2/month) | 6-week deadline | Residency and latency |
+|---|---|---|---|---|---|
+| A. Take what the registry offers | GitHub and Sentry servers with all tools, plus the community orders server | 40 + 20 + 12 = 72 tools × 250 = 18,000: fails | 3 servers, one of them unknown code holding database credentials: fails | Fast to wire | Data stays in EU if run locally, but trust fails |
+| B. Vendor servers, allowlisted, plus native order tools | Allowlist 6 GitHub and 3 Sentry tools; the 4 order tools are functions in the agent service | 6 + 3 + 4 = 13 × 250 = 3,250: fits | 2 vendor servers: fits | Days for the native tools | In-process, in the EU service |
+| C. Build our own MCP servers for everything | Thin internal servers wrapping the GitHub, Sentry and orders APIs | 13 × 250 = 3,250: fits | Internal review of 3 servers, plus OAuth and deploys | 3 servers to build, secure and run: high risk | Hosted in the EU; one extra hop per call |
+| D. Vendor servers, allowlisted, plus an internal orders MCP server now | As B, but orders behind a remote MCP server | 3,250: fits | 2 vendor + 1 internal = 3 in the first month: over | Adds auth, deploy and versioning | EU-hosted; one extra hop, well inside 300 ms if co-located (illustrative) |
+
+### Decision
+Choose **B**: the vendor-official GitHub and Sentry servers, pinned and allowlisted to the 9 tools the
+agent needs, and the 4 order tools as native functions.
+- **Context:** 3,250 tokens per call against a 5k budget. On a 20-step run that is 65,000 definition
+  tokens instead of the 360,000 (18,000 × 20) of option A.
+- **Review:** exactly 2 servers, both published by the API owner, fits this month's review capacity.
+- **Deadline and latency:** native order tools ship in days, run in-process and keep order data in the
+  EU service, so both the 6-week deadline and the 300 ms budget are safe.
+- **Why not D yet:** the orders server has one consumer today, so its auth, deploy and versioning buy
+  nothing until the billing agent arrives, and it would push review over capacity.
+
+**What would change it:**
+- **A second consumer of the order tools** (the billing agent, an IDE, a chat connector) moves the
+  order tools to an internal MCP server, option D. Write them now with typed inputs and clear
+  descriptions so that move is packaging, not a rewrite.
+- **A vendor server's descriptions lowering the correct-tool rate** on the eval set means wrapping or
+  forking that server.
+- **Residency rules extended to error data** means running the Sentry server in the EU, or dropping it
+  for direct API calls.
+
+### Trade-offs accepted
+- **No reuse for the order tools yet.** The billing agent will need a migration. Watch: the planned
+  agent's start date; begin the MCP server 4 weeks before it.
+- **Vendor release cadence.** Tool definitions can change under us. Watch: fingerprint the 9 allowlisted
+  definitions and block any tool whose hash changes until it is re-reviewed.
+- **Vendor-designed tool descriptions.** We inherit their wording. Watch: correct-tool rate on a
+  30-task eval set before launch and on every server version bump.
+- **Two kinds of tools to operate.** MCP and native tools trace differently. Watch: one span format for
+  both, with tool name, latency and error flag.
+
+### Review rubric
+- **Constraints are explicit and numeric:** the write-up states the context budget, review capacity,
+  deadline, residency rule and latency budget before comparing options.
+- **The arithmetic is shown and correct:** tools × tokens per tool for each option, and per-run totals,
+  with every estimated figure labelled.
+- **Provenance is checked:** each server is identified by registry namespace and repository, and any
+  community server holding credentials is either rejected or given a review plan.
+- **The decision follows from the constraints:** each rejected option names the constraint it fails.
+- **A reversal trigger is concrete:** for example "a second consumer of the order tools", not "if
+  needs change".
+- **Trade-offs have monitors:** every accepted cost names the metric or check that would show it going
+  wrong.
 
 ## Why it exists
 - **Integrations are the bottleneck.** Every agent needs tools, and each SaaS API has its own auth and

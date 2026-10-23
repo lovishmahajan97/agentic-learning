@@ -5,7 +5,7 @@ name: Supervised fine-tuning (SFT)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -155,8 +155,8 @@ flowchart TD
 - **"Fine-tuning on our transcripts teaches the model our facts."** SFT teaches the style of stating
   facts, not the facts: demonstrations the base cannot ground teach confident invention. Put facts in a
   tool result or retrieved context inside the trace, so the model learns to answer from it.
-- **"Low training loss means the fine-tune worked."** Unmasked prompts, memorised rows and a broken
-  template all give low loss. Gate on held-out task success and valid tool-call rate, with held-out
+- **"Low training loss means the fine-tune worked."** Unmasked prompts and memorised rows give low
+  loss, and a train/serve template mismatch never shows in training loss at all. Gate on held-out task success and valid tool-call rate, with held-out
   examples split by intent or tool sequence, not by row.
 - **"Train on the whole trace so the model learns the full interaction."** Supervising user turns and
   tool results teaches the agent to write them itself, so it invents a tool result instead of waiting

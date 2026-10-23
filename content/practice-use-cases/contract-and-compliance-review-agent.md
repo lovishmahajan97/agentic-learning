@@ -5,7 +5,8 @@ name: contract and compliance review agent (clauses, risk flags, citations)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - rag-retrieval/citation-correctness
@@ -39,6 +40,65 @@ first-pass review that a lawyer can trust and check.
   highlights cited spans.
 - **What you can skip.** Training a legal model. Strong general models plus a precise playbook and
   verified citations go a long way; spend the effort on evals with lawyers.
+
+## Decision case
+### Scenario
+A SaaS company's in-house legal team (4 lawyers) reviews about 120 NDAs and 30 MSAs a month. Sales
+complains that NDAs take 3 business days and wants 1. The question is how much of review the agent should
+take over. All figures are illustrative planning numbers.
+- **Current load:** an NDA first pass takes 30 minutes and an MSA 3 hours, so 120 x 0.5 + 30 x 3 = 60 +
+  90 = 150 lawyer hours a month.
+- **Policy:** the General Counsel requires a lawyer to sign off anything sent to a counterparty.
+- **Confidentiality:** enterprise API terms with no training on inputs, EU hosting for EU customers'
+  contracts, access by matter.
+- **Evidence available:** lawyers will label 50 NDAs and 20 MSAs as the golden set; no position-accuracy
+  numbers exist yet.
+- **Team and time:** one engineer for 8 weeks.
+
+### Options
+| Option | How it works | Lawyer hours a month | Sign-off policy | Main risk |
+|---|---|---|---|---|
+| A. Verified flags, lawyer reviews all | Per-issue extraction, citation verifier, lawyer accepts or rejects each flag | 40% less (midpoint of the 30-50% target): 150 x 0.6 = 90 | met | false flags waste attention |
+| B. Flags plus suggested redlines | A, plus drafted fallback language per flag | possibly lower, unmeasured | met if lawyers approve each redline | over-reliance on unproven positions |
+| C. Auto-clear "all standard" NDAs | NDAs with every issue standard and verified skip the lawyer | lowest | violated | a missed clause goes out unreviewed |
+| D. Regex rules, no model | Keyword patterns per issue | small gain | met | misses drafting variety |
+
+### Decision
+**Option A now, with B for NDAs as a measured next step.** A frees about 60 lawyer hours a month, which
+the GC can put toward a same-day NDA queue, while keeping the sign-off policy intact.
+
+NDA review drops from 30 to 18
+minutes and MSA review from 180 to 108 (120 x 18 + 30 x 108 = 5,400 minutes, 90 hours).
+- **Why not B yet:** redlines are only as good as position accuracy, and there is no number for it until
+  the golden set is labelled.
+- **Why not C:** it breaks the sign-off policy, and a wrong "standard" on a liability clause is the
+  costliest error.
+- **Why not D:** regexes miss equivalent drafting, as the lesson shows.
+
+**What would change it.** Position accuracy of 85%+ and high-severity recall of 90%+ on the golden set,
+held across two playbook versions, unlocks B for NDAs. A GC policy change allowing a sampled-audit fast
+lane would reopen C for NDAs only. A measured review-time cut under 20% means the tool is not paying off.
+
+### Trade-offs accepted
+- **Lawyers still read every contract,** so savings are capped. Track review minutes per contract
+  against the 30-minute and 3-hour baselines.
+- **False flags cost attention.** At the 80% precision target, 1 flag in 5 is wrong. Track acceptance
+  rate per issue and fix or retire issues lawyers keep rejecting.
+- **Missed clauses are silent.** Recall on high-severity issues is measured on the golden set on every
+  prompt, model or playbook change, and dropped-quote rates are watched per issue.
+- **One engineer maintains parser and playbook.** Version the playbook so a lawyer, not the engineer, owns
+  position changes.
+
+### Review rubric
+- **Baseline computed:** current reviewer hours come from volume and time per contract type.
+- **Policy treated as a constraint:** any option that skips human sign-off is rejected or tied to an
+  explicit policy change.
+- **Automation tied to measured accuracy:** each step up names the golden-set metric and threshold that
+  unlocks it.
+- **Error costs ranked:** the write-up says which error (missed clause, false flag, invented quote) costs
+  most and designs for it.
+- **Citations verified in code,** not trusted from the model.
+- **Payback test:** a review-time reduction below which the project is reconsidered.
 
 ## Why it exists
 - **First-pass review is slow and repetitive.** Lawyers and contract managers check the same 20-40 issues

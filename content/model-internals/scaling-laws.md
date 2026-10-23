@@ -5,7 +5,7 @@ name: Scaling laws
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: background
 related:
@@ -153,9 +153,9 @@ flowchart TD
 ```
 
 ## Misconceptions
-- **"Scaling laws say bigger is always better."** At a fixed budget they say the opposite: Gopher (280B
-  on about 300B tokens) lost to Chinchilla (70B on 1.4T) at similar compute, because parameters that
-  never see enough data are wasted.
+- **"Scaling laws say bigger is always better."** At a fixed budget they say there is an optimal size,
+  and going past it loses: Gopher (280B on about 300B tokens) lost to Chinchilla (70B on 1.4T) at
+  similar compute, because parameters that never see enough data are wasted.
 - **"Compute-optimal is the size you should deploy."** Compute-optimal minimises training cost for a
   loss and ignores serving. With lifetime compute of `6ND + 2NT`, a widely used model is cheaper overall
   when smaller and over-trained, which is why Llama 3 8B saw close to 2,000 tokens per parameter.
@@ -170,39 +170,6 @@ flowchart TD
   from 70B to 8B.
 
 ## Examples
-### Agent scenario: 2N FLOPs per token, applied to a 12-step agent
-The serving side of the compute identity, applied to an agent: a 6k-token prefix, ~1.5k tokens appended
-per step, 300 generated tokens per step. It ignores attention cost, which grows with context.
-
-```python
-def agent_tokens(steps=12, prefix=6_000, per_step=1_500, out=300, prefix_cache=False):
-    """Tokens the model processes for one agent task (prompt tokens plus generated tokens)."""
-    total = 0
-    for s in range(steps):
-        context = prefix + per_step * s              # transcript grows every step
-        new = context if (s == 0 or not prefix_cache) else per_step
-        total += new + out
-    return total
-
-for cache in (False, True):
-    t = agent_tokens(prefix_cache=cache)
-    for name, n in [("8B", 8e9), ("70B", 70e9)]:
-        flops = 2 * n * t                            # about 2N FLOPs per processed token
-        print(f"cache={cache!s:5} {name:>3}: {t:>7,} tokens/task  {flops:.1e} FLOPs/task  "
-              f"{flops * 1e6:.1e} FLOPs per million tasks")
-```
-
-| Setup | Tokens per task | 8B FLOPs per task | 70B FLOPs per task |
-|---|---|---|---|
-| Re-process the transcript every step | 174,600 | 2.8 × 10¹⁵ | 2.4 × 10¹⁶ |
-| Append-only with prefix caching | 26,100 | 4.2 × 10¹⁴ | 3.7 × 10¹⁵ |
-
-- **Reading.** Model size scales cost linearly (70B is ~9× the 8B); transcript handling scales it by ~7×.
-  Both levers matter as much as each other, and only an agent eval can say whether the 8B finishes enough
-  tasks.
-- **At a million tasks a month** the gap between the worst and best row is about 2.4 × 10²² versus
-  4.2 × 10²⁰ FLOPs, roughly 57×.
-
 ### Three ways to spend a 10²⁴ FLOP budget
 Take a 10²⁴ FLOP training budget and a model that will serve 10¹³ tokens over its life (both
 illustrative). Use Chinchilla's published fit as a stand-in for the curve, and compare the
@@ -248,6 +215,39 @@ Three lessons sit in those rows:
 
 The decision then moves to a question the law cannot answer: does 0.02 nats of loss matter on the tasks
 you care about? That is measured with task evals, not predicted.
+
+### Agent scenario: 2N FLOPs per token, applied to a 12-step agent
+The serving side of the compute identity, applied to an agent: a 6k-token prefix, ~1.5k tokens appended
+per step, 300 generated tokens per step. It ignores attention cost, which grows with context.
+
+```python
+def agent_tokens(steps=12, prefix=6_000, per_step=1_500, out=300, prefix_cache=False):
+    """Tokens the model processes for one agent task (prompt tokens plus generated tokens)."""
+    total = 0
+    for s in range(steps):
+        context = prefix + per_step * s              # transcript grows every step
+        new = context if (s == 0 or not prefix_cache) else per_step
+        total += new + out
+    return total
+
+for cache in (False, True):
+    t = agent_tokens(prefix_cache=cache)
+    for name, n in [("8B", 8e9), ("70B", 70e9)]:
+        flops = 2 * n * t                            # about 2N FLOPs per processed token
+        print(f"cache={cache!s:5} {name:>3}: {t:>7,} tokens/task  {flops:.1e} FLOPs/task  "
+              f"{flops * 1e6:.1e} FLOPs per million tasks")
+```
+
+| Setup | Tokens per task | 8B FLOPs per task | 70B FLOPs per task |
+|---|---|---|---|
+| Re-process the transcript every step | 174,600 | 2.8 × 10¹⁵ | 2.4 × 10¹⁶ |
+| Append-only with prefix caching | 26,100 | 4.2 × 10¹⁴ | 3.7 × 10¹⁵ |
+
+- **Reading.** Model size scales cost linearly (70B is ~9× the 8B); transcript handling scales it by ~7×.
+  Both levers matter as much as each other, and only an agent eval can say whether the 8B finishes enough
+  tasks.
+- **At a million tasks a month** the gap between the worst and best row is about 2.4 × 10²² versus
+  4.2 × 10²⁰ FLOPs, roughly 57× from the rounded figures (58.5× unrounded).
 
 ### Worked scenario: sanity-checking model cards
 Tokens per parameter is a quick proxy for how well-trained a model is. All figures come from this lesson.

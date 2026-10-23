@@ -5,7 +5,7 @@ name: KV-cache paging & eviction
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -157,7 +157,7 @@ flowchart TD
 ## Misconceptions
 - **"Paging means spilling the cache to CPU memory, like OS swap."** Paging is indirection inside VRAM: a
   block table maps logical positions to fixed-size physical blocks. Copying blocks to host memory is a
-  separate preemption mode (swap), used only when the pool runs out.
+  separate mechanism (swap preemption, or a host tier for evicted prefixes), used only when VRAM runs out.
 - **"Paged KV memory eliminates waste."** It bounds it: only each sequence's last block can be partly
   empty, so waste is under one block per sequence (8 slots for a 600-token request in 16-token blocks)
   instead of most of an 8,192-token reservation.

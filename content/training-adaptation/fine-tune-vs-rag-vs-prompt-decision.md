@@ -5,7 +5,7 @@ name: Fine-tune vs RAG vs prompt decision
 kind: decision
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 agent_relevance: core
 lesson_type: decision
 related:
@@ -55,7 +55,8 @@ A review of 150 failed traces gives three piles:
   and product and are revised every quarter.
 - **70 behaviour failures:** dates in the wrong format, a missing `policy_number`, or `create_claim`
   called before the customer confirmed. Field-level accuracy is 94% against a 99% target.
-- **20 economics complaints:** finance flags the 1.44 billion input tokens a month (240,000 × 6,000).
+- **20 economics failures:** correct runs over the latency budget; finance also flags the 1.44
+  billion input tokens a month (240,000 × 6,000).
 
 Constraints:
 - **Compliance:** every coverage answer must cite the policy clause and version, and retired wordings
@@ -68,10 +69,10 @@ Constraints:
 ### Options
 | Option | How it works | Citations and freshness | Field accuracy | Cost and team fit |
 |---|---|---|---|---|
-| A. Prompt only | Paste the relevant product's wording (~40k tokens) into every call | Cites, but every quarterly revision is a prompt redeploy per product | Unchanged by the extra text | 46k tokens × 240,000 ≈ 11B tokens a month, 7.7× today; lost-in-the-middle risk |
-| B. Retrieval tool plus prompt and schema fixes | `search_policy` filtered by brand, product and version; strict tool schemas and a confirm-before-create rule | Clause-level citations; re-index quarterly, delete retired versions | Fixed by schema and prompt, then measured | Prompt stays 6,000 tokens; fits the team and the deadline |
+| A. Prompt only | Paste the relevant product's wording (~40k tokens) into every call | Cites, but every quarterly revision is a prompt redeploy per product | Unchanged by the extra text | 46k tokens × 240,000 ≈ 11B tokens a month, 7.7× today; caching the per-product prefix discounts the price, not the 46k context or its latency; lost-in-the-middle risk |
+| B. Retrieval tool plus prompt and schema fixes | `search_policy` filtered by brand, product and version; strict tool schemas and a confirm-before-create rule | Clause-level citations; re-index quarterly, delete retired versions | Fixed by schema and prompt, then measured | Prompt stays 6,000 tokens; retrieved clauses add ~1,500 tokens to the one coverage call per claim, +60M a month (+4%), offset by caching the stable prefix; fits the team and the deadline |
 | C. B plus a LoRA for the extraction step | Fine-tune an open-weights model for the 2 extraction calls per claim, prompt cut to 1,500 tokens | Same as B | Highest ceiling, if the prompt plateaus | Saves 360M tokens a month; needs GPUs in the EU and ML skills |
-| D. Fine-tune on policy documents and traces | Train wordings and behaviour into the weights | No citations, no deletion, stale after each revision | May improve format | Fails the compliance constraint outright |
+| D. Fine-tune on policy documents and traces | Train wordings and behaviour into the weights | No citations, no deletion, stale after each revision | May improve format | Shortest prompts of all, which is why it gets requested; fails the compliance constraint outright |
 
 ### Decision
 **Ship B now; hold C behind an eval gate.**
@@ -83,7 +84,7 @@ Constraints:
   that inside 10 weeks.
 - **C fails the cost test today.** Removing 4,500 tokens from 80,000 extraction calls saves 360M
   tokens a month: $1,080 at a placeholder $3 per million. Over 6 months that is $6,480, under the
-  $15,000 cycle cost, before any GPU bill.
+  $15,000 cycle cost, before any GPU bill, and less still once B caches that prefix.
 
 What would change it:
 - **A plateau:** if field accuracy stalls below 99% after two prompt and schema iterations, with the

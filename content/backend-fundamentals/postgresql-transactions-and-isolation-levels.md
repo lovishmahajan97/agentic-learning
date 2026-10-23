@@ -5,7 +5,7 @@ name: PostgreSQL transactions & isolation levels
 kind: concept
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -240,8 +240,10 @@ def test_crash_during_call_leaves_the_claim(dbs):
 - **Inject: catch the `IntegrityError` and keep using the transaction.** In PostgreSQL every later
   statement fails with `current transaction is aborted`. Debug: use `ON CONFLICT DO NOTHING` and check
   the affected row count, or roll back to a savepoint.
-- **Inject: forget the second `COMMIT` in settle.** The demo looks right on connection A while worker B
-  still reads `('claimed',)`. Debug: read from the other connection, or check `a.in_transaction`.
+- **Inject: forget the second `COMMIT` in settle.** Connection A prints `step 7: done`, but A still holds
+  its write lock, so worker B's claim waits out the 5 s busy timeout and fails with `OperationalError:
+  database is locked` (the second-claim test fails the same way). In PostgreSQL B would block on A's row
+  lock while A sits `idle in transaction`. Debug: check `a.in_transaction` after `run_step` returns.
 
 ### Submission
 - **Your fixed `agent_budget.py`**, with the given tests unchanged.

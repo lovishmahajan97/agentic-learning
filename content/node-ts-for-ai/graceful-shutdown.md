@@ -5,7 +5,8 @@ name: Graceful shutdown
 kind: practice
 difficulty: core
 est_minutes: 15
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - fastapi-for-ai/graceful-shutdown-and-worker-draining
@@ -38,6 +39,247 @@ deploys truncate streams, re-run tool calls and lose traces.
   streaming client is told, and the close order of worker, Redis, pool and telemetry.
 - **What you can skip.** Kernel signal details beyond "PID 1 needs a handler or `tini`", and Kubernetes
   internals past the SIGTERM-to-SIGKILL timeline.
+
+## Lab
+### Task
+Replace the naive `server.close(() => process.exit(0))` handler of an agent API that also runs an
+agent worker. With the draft, requests that arrive during endpoint propagation are refused, an agent run
+in flight keeps going through all 10 steps, and Redis, the pool and the exporter are never closed.
+
+You write the orchestrator and make the worker yield at a step boundary.
+- **Agent goal:** a deploy costs no repeated step, no refused request and no lost spans, and the
+  process exits before SIGKILL even when something hangs.
+- **Time box:** 45-75 minutes.
+- **Prerequisites:** this lesson's "The sequence inside Node", "Agent runs: stop at a step boundary"
+  and "Close order and exit"; BullMQ & durable jobs for what `worker.close()` waits for.
+- **Needs:** Node 20+ with `npm i -D tsx vitest`. The HTTP server is real `node:http`; the worker,
+  Redis, pool and exporter are small fakes, and `exit` is injected so tests can read the code.
+  Checked with Node 24.21, tsx 4.23 and vitest 5.0.5.
+
+### Starter code
+```ts
+// shutdown-lab.ts: drain an agent API plus worker on SIGTERM, in order, under a deadline
+// A real node:http server; Redis, the pool and telemetry are fakes that log when they close.
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+export type Resource = { close(): Promise<void> };
+export type Deps = {
+  server: http.Server; setReady(ready: boolean): void;
+  worker: Resource; redis: Resource; pool: Resource; telemetry: Resource;
+  exit(code: number): void; log: string[];
+  drainDelayMs: number; deadlineMs: number; telemetryCapMs: number;
+};
+
+// YOUR CODE 1: the first draft is the naive handler from "Why it exists". Make it:
+// 1. on a second call: log "second signal" and exit(1) at once;
+// 2. setReady(false), log `${signal}: draining`, wait drainDelayMs while still serving;
+// 3. start a deadline timer (unref'd) that logs "drain timeout" and exits 1;
+// 4. close the HTTP server and the worker in parallel, then redis, then the pool, then telemetry
+//    capped at telemetryCapMs; log "closed http+worker", "closed redis", "closed pool", "flushed telemetry";
+// 5. clear the deadline and exit(0); on any error log "shutdown error" and exit(1).
+export function createShutdown(d: Deps) {
+  return async (signal: string) => {
+    d.server.close(() => d.exit(0));
+  };
+}
+
+// An agent worker: each run is a list of steps; checkpoint() records a finished step.
+export class AgentWorker implements Resource {
+  stopping = new AbortController();
+  active = new Set<Promise<unknown>>();
+  checkpoints: string[] = [];
+  requeued: string[] = [];
+  constructor(private stepMs = 40) {}
+  start(runId: string, steps: number, from = 0) {
+    const p = this.runSteps(runId, steps, from).finally(() => this.active.delete(p));
+    this.active.add(p);
+    return p;
+  }
+  // YOUR CODE 2: the first draft runs every step to the end. Check this.stopping.signal between steps:
+  // when it is aborted, push `${runId}@${next step}` to this.requeued and return "yielded".
+  async runSteps(runId: string, steps: number, from: number): Promise<"done" | "yielded"> {
+    for (let s = from; s < steps; s++) {
+      await sleep(this.stepMs);                        // one model turn plus its tool calls
+      this.checkpoints.push(`${runId}#${s}`);
+    }
+    return "done";
+  }
+  async close() { this.stopping.abort(); await Promise.all(this.active); }   // like worker.close(): wait for active jobs
+}
+
+export const fake = (log: string[], name: string, ms = 5): Resource => ({ close: async () => { await sleep(ms); log.push(`closed ${name}`); } });
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  let ready = true;
+  const server = http.createServer(async (req, res) => {
+    if (req.url === "/ready") { res.writeHead(ready ? 200 : 503); return res.end(); }
+    if (req.url === "/live") { res.writeHead(200); return res.end(); }
+    await sleep(100); res.writeHead(200); res.end("slow answer");          // an in-flight request
+  });
+  await new Promise<void>((r) => server.listen(0, r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const log: string[] = [];
+  const worker = new AgentWorker();
+  const exits: number[] = [];
+  const shutdown = createShutdown({ server, setReady: (v) => { ready = v; }, worker,
+    redis: fake(log, "redis"), pool: fake(log, "pool"),
+    telemetry: { close: async () => { await sleep(500); log.push("flushed telemetry"); } },   // a slow exporter
+    exit: (c) => { if (!exits.length) { exits.push(c); log.push(`exit ${c}`); } },
+    log, drainDelayMs: 150, deadlineMs: 1_000, telemetryCapMs: 100 });
+
+  console.log("ready before:", (await fetch(`${base}/ready`)).status);
+  const run = worker.start("r1", 10);
+  const slow = fetch(`${base}/slow`).then((r) => r.status);
+  await sleep(60);
+  const done = shutdown("SIGTERM");
+  await sleep(10);
+  const status = (path: string) => fetch(`${base}${path}`).then((x) => x.status, (e) => e.cause?.code ?? e.message);
+  console.log("during drain: ready", await status("/ready"), "| live", await status("/live"));
+  console.log("slow request:", await slow, "| run r1:", await run, "| requeued:", worker.requeued.length === 1);
+  await done;
+  await sleep(600);                                    // anything still running would log now
+  console.log(log.join("\n"));
+}
+```
+
+Run it with `npx tsx shutdown-lab.ts`. As given, `/ready` and `/live` both get `ECONNREFUSED` during
+the drain, run `r1` finishes all 10 steps (`done`, nothing requeued), and the log is empty: nothing
+was closed, and `exit 0` fires seconds later, once the client drops the slow request's idle socket.
+
+### Expected output
+```
+ready before: 200
+during drain: ready 503 | live 200
+slow request: 200 | run r1: yielded | requeued: true
+SIGTERM: draining
+closed http+worker
+closed redis
+closed pool
+exit 0
+flushed telemetry
+```
+
+The last line is the slow exporter finishing after the 100 ms cap; in a real process `exit 0` has
+already ended it, which is the point of the cap.
+
+### Tests
+```ts
+// shutdown-lab.test.ts: run with `npx vitest run`
+import { describe, expect, it } from "vitest";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+import { AgentWorker, createShutdown, fake, type Deps, type Resource } from "./shutdown-lab";
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+async function setup(over: Partial<Deps> = {}) {
+  let ready = true;
+  const server = http.createServer((req, res) => { res.writeHead(req.url === "/ready" && !ready ? 503 : 200); res.end(); });
+  await new Promise<void>((r) => server.listen(0, r));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const log: string[] = [], exits: number[] = [];
+  const d: Deps = { server, setReady: (v) => { ready = v; }, worker: fake(log, "worker-internal", 1),
+    redis: fake(log, "redis"), pool: fake(log, "pool"), telemetry: { close: async () => { log.push("flushed telemetry"); } },
+    exit: (c) => { if (!exits.length) { exits.push(c); log.push(`exit ${c}`); } },
+    log, drainDelayMs: 30, deadlineMs: 1_000, telemetryCapMs: 50, ...over };
+  return { d, log, exits, url, shutdown: createShutdown(d), isReady: () => ready };
+}
+
+describe("createShutdown", () => {
+  it("closes in order and exits 0", async () => {
+    const { log, shutdown } = await setup();
+    await shutdown("SIGTERM");
+    expect(log.filter((l) => l !== "closed worker-internal")).toEqual(
+      ["SIGTERM: draining", "closed http+worker", "closed redis", "closed pool", "flushed telemetry", "exit 0"]);
+  });
+  it("fails readiness first but keeps serving during the drain delay", async () => {
+    const { shutdown, url, isReady } = await setup({ drainDelayMs: 100 });
+    const done = shutdown("SIGTERM");
+    expect(isReady()).toBe(false);
+    expect((await fetch(`${url}/ready`)).status).toBe(503);
+    expect((await fetch(`${url}/live`)).status).toBe(200);
+    await done;
+  });
+  it("caps a slow telemetry flush", async () => {
+    const slow: Resource = { close: () => sleep(500) };
+    const { shutdown, exits } = await setup({ telemetry: slow });
+    const t0 = Date.now();
+    await shutdown("SIGTERM");
+    expect(exits).toEqual([0]);
+    expect(Date.now() - t0).toBeLessThan(300);
+  });
+  it("exits 1 when draining outlives the deadline", async () => {
+    const stuck: Resource = { close: () => new Promise(() => {}) };
+    const { shutdown, log, exits } = await setup({ worker: stuck, deadlineMs: 100 });
+    void shutdown("SIGTERM");
+    await sleep(250);
+    expect(exits).toEqual([1]);
+    expect(log).toContain("drain timeout");
+  });
+  it("forces exit on a second signal", async () => {
+    const stuck: Resource = { close: () => new Promise(() => {}) };
+    const { shutdown, log, exits } = await setup({ worker: stuck });
+    void shutdown("SIGTERM");
+    await shutdown("SIGINT");
+    expect(exits).toEqual([1]);
+    expect(log).toContain("second signal");
+  });
+  it("exits 1 when a close step fails", async () => {
+    const broken: Resource = { close: async () => { throw new Error("pool already ended"); } };
+    const { shutdown, log, exits } = await setup({ pool: broken });
+    await shutdown("SIGTERM");
+    expect(exits).toEqual([1]);
+    expect(log).toContain("shutdown error");
+  });
+});
+
+describe("AgentWorker", () => {
+  it("yields at the next step boundary and resumes without repeating a step", async () => {
+    const w = new AgentWorker(20);
+    const run = w.start("r1", 10);
+    await sleep(50);
+    const t0 = Date.now();
+    await w.close();
+    expect(Date.now() - t0).toBeLessThan(60);                    // one step, not the whole run
+    expect(await run).toBe("yielded");
+    const next = w.checkpoints.length;
+    expect(next).toBeLessThan(10);
+    expect(w.requeued).toEqual([`r1@${next}`]);
+    const resumed = new AgentWorker(1);
+    await resumed.start("r1", 10, next);
+    expect(new Set([...w.checkpoints, ...resumed.checkpoints]).size).toBe(10);
+  });
+});
+```
+
+All 7 fail on the starter with `AssertionError`: an empty log, readiness still `true`, no exit code
+recorded, `exit 0` instead of 1 when the worker hangs (the HTTP close finished and nothing else was
+awaited), and a worker `close()` that waited about 160 ms for the whole run instead of one step.
+
+### Failure scenarios
+- **Inject `await d.pool.close()` before the worker closes.** The order test fails; in production
+  the step finishing during drain cannot checkpoint and its transaction errors with a closed pool, so
+  the step re-runs after the deploy. Log each close with a timestamp and compare against in-flight work.
+- **Inject `await d.telemetry.close()` without the race.** The cap test fails: exit waits the full
+  500 ms. With an unreachable collector the exporter's own timeout can eat the grace period. Record
+  shutdown duration per deploy and how much of it the flush took.
+- **Inject `server.close()` with no drain delay and no `preStop` sleep.** The readiness test's
+  fetch gets `ECONNREFUSED`, the 502 window from "Closing the 502 window". Count refused connections
+  at the balancer during a rolling deploy; it should be zero.
+- **Inject a slow request that is still in flight when `close()` runs.** With Node's `fetch` as the
+  client, `close()` waits after the response until the client drops its idle keep-alive socket
+  (seconds in this demo). Keep `keepAliveTimeout` short or call `server.closeIdleConnections()` once
+  in-flight requests finish.
+
+### Submission
+- **Your `shutdown-lab.ts`** with both `YOUR CODE` parts done; the demo and fakes unchanged.
+- **A `npx vitest run` log** showing 7 passed, run three times in a row.
+- **The `npx tsx shutdown-lab.ts` output**, matching the expected lines.
+- **A note of 3-5 sentences:** your `deadlineMs`, `drainDelayMs` and telemetry cap for a 30 s grace
+  period with a 5 s `preStop`, and why each fits.
+- **Evaluated on:** readiness before intake, parallel intake close, reverse dependency order,
+  a capped flush, an unref'd deadline, a second-signal force exit, and a worker that yields at a step.
 
 ## Why it exists
 - **Processes are killed constantly:** deploys, autoscaling, node drains, out-of-memory kills.

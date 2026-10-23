@@ -165,6 +165,7 @@ flaky_lookup: ORD-1: shipped after 3 attempts
 ### Tests
 Save as `test_lab.py` and run `python -m pytest -q`. On the starter all five fail: four on
 `NotImplementedError` or a missing retry, and the checker test because mypy reports an untyped decorator.
+Install mypy first: without it the checker test is skipped, not passed.
 
 ```python
 import inspect, pathlib, shutil, subprocess, sys

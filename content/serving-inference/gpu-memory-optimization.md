@@ -5,7 +5,7 @@ name: GPU memory optimization (VRAM math)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -173,8 +173,9 @@ flowchart TD
 - **"An MoE model needs memory for its active parameters."** Every expert must be resident even though
   only a few run per token. A 47B-total, 13B-active model needs 94 GB of bf16 weights, not 26 GB.
 - **"Activation memory adds up across layers and grows with the prompt."** It is one layer's transient,
-  reused layer after layer: about 0.94 GB for the 70B-class gate and up projections at T = 8,192. Chunked
-  prefill caps T per step, so a huge tool result does not raise the peak.
+  reused layer after layer, and it scales with the tokens in one step, T: about 0.94 GB for the 70B-class
+  gate and up projections at T = 8,192. Chunked prefill caps T per step, so a huge tool result does not
+  raise the peak; without it, a long prompt does.
 
 ## Examples
 ### Worked plan: Llama-3-70B-class on two 80 GB GPUs

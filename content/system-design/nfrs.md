@@ -5,7 +5,7 @@ name: NFRs (non-functional requirements)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -89,7 +89,8 @@ target.
   flakiness across reruns of one build.
 - **Retries add latency and cost.** Watch: retry rate per step and its effect on p95 run time and cost
   per successful task.
-- **The step cap bounds hard contracts.** Watch: share of runs hitting the 12-call cap.
+- **The step cap bounds hard contracts.** With about 12 calls on a typical run, the cap must sit above
+  that, for example at 20 calls. Watch: share of runs hitting the cap, and task success on those runs.
 
 ### Review rubric
 - **Every NFR has metric, target, method, condition and enforcement point**, with the priority order

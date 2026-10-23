@@ -5,7 +5,7 @@ name: Benchmarking (MMLU, HumanEval, SWE-bench, GPQA)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
@@ -218,8 +218,9 @@ flowchart TD
 - **"The highest resolved rate picks the coding agent's model."** A model that resolves 3 more points
   but costs $1.90 per resolved issue against $0.82 may lose on what your budget sees. Report cost per
   resolved task next to the rate.
-- **"Higher scores on a saturated benchmark still separate the best models."** Near the ceiling, label
-  errors and contamination dominate, so the gap shows which models agree with the mistakes. Shortlist on
+- **"Higher scores on a saturated benchmark still separate the best models."** Near the ceiling, the items
+  still missed are mostly label errors and ambiguous questions, so a 1-point gap may only show which
+  model matches the flawed labels. Shortlist on
   benchmarks, then decide on your own golden tasks.
 
 ## Examples

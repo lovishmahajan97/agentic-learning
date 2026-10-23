@@ -5,7 +5,7 @@ name: Shared httpx AsyncClient
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -200,7 +200,8 @@ def test_upstream_error_releases_connection_before_502(app):
 ```
 
 On the starter all five fail: five clients built instead of one, a raw `PoolTimeout`, and
-`NotImplementedError` from the relay. A correct solution passes all five.
+`NotImplementedError` from the unfinished `get_http` dependency on both `/stream` tests (the mid-stream
+test reports it as 0 closes). A correct solution passes all five.
 
 ### Failure scenarios
 - **Delete the relay's `finally`.** Only `test_mid_stream_failure_still_releases_connection` fails

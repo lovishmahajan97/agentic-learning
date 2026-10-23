@@ -5,7 +5,7 @@ name: Node.js / TypeScript
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -129,7 +129,7 @@ export function slowSink(highWaterMark: number, stats: { maxBuffered: number }):
 }
 
 export async function* tokens(n: number): AsyncGenerator<string> {
-  for (let i = 0; i < n; i++) yield "data: {\"token\":\"abcdefg\"}\n\n";  // 32 bytes per event
+  for (let i = 0; i < n; i++) yield "data: {\"token\":\"abcdefg\"}\n\n";  // 27 bytes per event
 }
 
 async function show(label: string, p: Promise<unknown>) {
@@ -228,7 +228,7 @@ describe("relay", () => {
   it("honours backpressure from a slow client", async () => {
     const stats = { maxBuffered: 0 };
     await relay(tokens(200), slowSink(64, stats));
-    expect(stats.maxBuffered).toBeLessThanOrEqual(96);   // high-water mark plus one 32-byte event
+    expect(stats.maxBuffered).toBeLessThanOrEqual(96);   // 64-byte high-water mark plus one 27-byte event, with slack
   });
 });
 ```

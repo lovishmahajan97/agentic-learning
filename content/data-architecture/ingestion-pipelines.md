@@ -5,7 +5,7 @@ name: Ingestion pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -62,16 +62,19 @@ Constraints:
 ### Options
 | Option | How it works | Freshness (60 s orders, 1 h docs) | Deletes within 12 h | Confluence calls a day | Team load |
 |---|---|---|---|---|---|
-| **A. Nightly full re-crawl** | Fetch and embed everything every night | Fails both: up to 24 h | Only if the index is rebuilt from scratch | 150,000 fetches, about 4.2 h at the full 10 per second | Low |
-| **B. Cursor poll plus reconcile everywhere** | 15-minute Confluence cursor and a 30-second `updated_at` poll on orders, both with overlap; snapshot diffs every 12 h | Docs pass; orders mostly pass but miss late-committed rows until the next poll or reconcile | Pass, but a 2-million-row snapshot diff of orders twice a day | About 2,800 | Low |
-| **C. Push and CDC everywhere** | Confluence webhooks plus Debezium on orders | Pass | Webhooks are lossy, so docs still need a reconcile | About 2,800 plus webhook handling | High: two streaming paths |
-| **D. Tiered by source** | Confluence on B's cursor plus 12-hourly reconcile; orders on Debezium CDC with an initial snapshot | Pass: docs 15 min, orders in seconds | Pass: tombstones for docs, delete events for orders | About 2,800 | Medium: one CDC path |
+| **A. Nightly full re-crawl** | Fetch and embed everything every night | Fails both: up to 24 h | Only if the index is rebuilt from scratch | 150,000 fetches: 4.2 h at the full 10 per second, or about 16.7 h inside the quarter allowed | Low |
+| **B. Cursor poll plus reconcile everywhere** | 15-minute Confluence cursor and a 30-second `updated_at` poll on orders, both with overlap; snapshot diffs every 6 h | Docs pass; orders mostly pass but miss late-committed rows until the next poll or reconcile | Pass, but a 2-million-row snapshot diff of orders four times a day | About 4,000 | Low |
+| **C. Push and CDC everywhere** | Confluence webhooks plus Debezium on orders | Pass | Webhooks are lossy, so docs still need a reconcile | About 3,900 plus webhook handling | High: two streaming paths |
+| **D. Tiered by source** | Confluence on B's cursor plus 6-hourly reconcile; orders on Debezium CDC with an initial snapshot | Pass: docs 15 min, orders in seconds | Pass: tombstones for docs within about 6 h, delete events for orders | About 4,000 | Medium: one CDC path |
 
-Call counts for B and D: 1,500 changed pages fetched, 96 polls, and two listings of 600 calls each.
+Call counts for B and D: 1,500 changed pages fetched, 96 polls, and four listings of 600 calls each (3,996). C drops the polls (3,900).
+
+Why not reconcile every 12 h: a page deleted just after one listing is caught only by the next, so the worst
+case is 12 h plus the run, past the deadline.
 
 ### Decision
 Choose **D**, because the two sources face different binding constraints:
-- **Confluence is bound by quota, not freshness.** 2,800 calls a day uses about 0.3% of 864,000 calls a day at
+- **Confluence is bound by quota, not freshness.** 4,000 calls a day uses about 0.5% of 864,000 calls a day at
   10 per second, far inside the quarter allowed. A full crawl would use the whole limit for 4.2 hours. A 15-minute poll beats the 1-hour target fourfold.
 - **Orders are bound by correctness.** The refunds agent acts on status, and a timestamp cursor misses hard
   deletes and late commits, so the ordered, delete-inclusive stream from CDC is worth one streaming path.
@@ -82,13 +85,13 @@ Choose **D**, because the two sources face different binding constraints:
 What would change it:
 - **No replication slot.** If the DBA refuses, use B for orders, and have the refund tool re-read the order row from a
   replica before acting, so ingestion lag cannot cause a wrong refund.
-- **A tighter delete deadline.** At 1 hour, reconcile Confluence hourly: 14,400 listing calls a day, still under 2% of the limit.
+- **A tighter delete deadline.** At 1 hour, reconcile Confluence every 30 minutes: 28,800 listing calls a day, about 3% of the limit.
 - **A source with a change feed.** If the wiki moves to SharePoint, Graph delta queries report deletes and the reconcile becomes a safety net.
 
 ### Trade-offs accepted
 - **A replication slot on the primary.** A stalled consumer retains WAL and can fill the disk. Watch slot lag in
   `pg_replication_slots` and page before disk reaches a set threshold.
-- **Deleted pages can linger up to 12 hours.** Watch tombstones emitted per reconcile; a rising count means the cursor misses deletes the source should report.
+- **Deleted pages can linger up to about 6 hours.** Watch tombstones emitted per reconcile; a rising count means the cursor misses deletes the source should report.
 - **Every raw version is kept.** Storage grows with edits; review it monthly and keep the last N versions of large binaries.
 - **Docs are up to 15 minutes stale.** Return `fetched_at` and a stale flag so the policy agent can say so.
 

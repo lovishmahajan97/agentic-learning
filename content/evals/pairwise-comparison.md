@@ -5,7 +5,7 @@ name: Pairwise comparison
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
@@ -276,6 +276,7 @@ print(comparisons_needed(0.60, 0.035))                  # 753: halving the inter
 | Is 57/100 a win? | interval ≈ 48–66% includes 50%: not yet |
 | Comparisons to resolve a five-point difference | ≈ 381 |
 | Cost of halving the interval | about 4× the comparisons, because SE scales with 1/√n |
+
 ## Production patterns
 - **Anchor every candidate to the production agent.** Keep a frozen task set with production runs, and
   judge each new agent variant against them in both orders on every pull request. Monitor win rate with

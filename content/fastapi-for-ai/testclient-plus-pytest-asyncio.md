@@ -5,7 +5,7 @@ name: TestClient + pytest-asyncio
 kind: tool
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -169,6 +169,7 @@ def test_tool_result_reaches_model_and_loop_stops():
     assert r.json() == {"answer": "It is 18C in Oslo.", "steps": 3}
     assert llm.seen[1][-1] == {"role": "tool", "content": "18C"}   # appended before turn 2
     assert len(llm.seen) == 2
+    assert llm.seen[0] == [{"role": "user", "content": "Weather in Oslo?"}]  # a copy, not a reference
 
 def test_runaway_tool_loop_hits_step_limit():
     llm = use(ScriptedLLM([TOOL]))                  # only ever asks for tools
@@ -209,11 +210,13 @@ passes all five.
   `run_agent`'s dependency callables, or by blocking network in CI so the miss fails fast.
 - **Drop the `with` around `TestClient`.** The endpoint fails with `AttributeError` on
   `app.state.memory`, because lifespan never ran.
-- **Remove the `autouse` cleanup fixture and reorder tests.** A later test inherits an earlier fake,
-  so results depend on order. Detect it by running the suite in random order with the
+- **Remove the `autouse` cleanup fixture, then add a test that forgets to call `use()`.** Every test
+  here sets its own override, so nothing changes until then; the new test inherits whichever fake ran
+  last and passes or fails depending on order. Detect it by running the suite in random order with the
   pytest-randomly plugin.
-- **Drop `@pytest.mark.asyncio` from the async test.** In strict mode the coroutine never runs and
-  pytest reports it as failed or skipped, depending on version, with no assertion executed.
+- **Drop `@pytest.mark.asyncio` from the async test.** In strict mode pytest-asyncio does not run the
+  coroutine: pytest 8.4 and later fail it with "async def functions are not natively supported" (older
+  versions skipped it with a warning), and no assertion executes.
 
 ### Submission
 - `lab.py` with the three lab steps done, and `test_lab.py` unchanged.

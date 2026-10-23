@@ -5,7 +5,7 @@ name: Perplexity
 kind: metric
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -180,7 +180,8 @@ flowchart TD
   forward pass over the real text; no sampling happens, so temperature plays no role unless you rescale
   the logits yourself.
 - **"A good enough model drives perplexity toward 1."** Text has irreducible entropy H(P), so perplexity
-  cannot fall below e^H(P); gains shrink near that floor, and a fluent false sentence can still score low.
+  cannot fall below e^H(P), and gains shrink near that floor. The gap between two models on the same
+  text is a difference in KL to the true distribution, not progress toward 1.
 
 ## Examples
 ### Agent scenario: gate a tool call on its own perplexity

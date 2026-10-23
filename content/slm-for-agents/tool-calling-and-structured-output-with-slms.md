@@ -5,7 +5,8 @@ name: Tool calling and structured output with SLMs
 kind: concept
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -104,7 +105,37 @@ flowchart TD
     T -->|"result appended"| U
 ```
 
+## Misconceptions
+- **"Constrained decoding makes small-model tool calls reliable."** It guarantees output that parses and
+  matches the schema, not the right tool or true values. In the worked scenario it took syntax to 100%
+  but correct calls only from 78% to 81%; narrowing tools and validating against real data did the rest.
+- **"95% per call is good enough."** Per-call errors multiply across a task: six calls at 0.95 succeed
+  together about 74% of the time. Reliability targets belong per call, sized from the number of calls.
+- **"Richer tool descriptions help a small model choose."** Long descriptions eat context and blur the
+  choice, and accuracy falls as the tool list grows. Show 1-5 relevant tools per step, with one short
+  sentence each.
+- **"Tool calls arriving as text mean the model cannot call tools."** Usually the engine is not using the
+  model's tool format: llama.cpp without `--jinja`, or vLLM without auto tool choice and a matching
+  `--tool-call-parser`. Fix the configuration before switching models.
+- **"Just retry until it validates."** At temperature 0 the same prompt usually gives the same output, so a retry
+  only helps when the validation error is appended. Each retry is a full call; after one or two, escalate.
+- **"Forcing JSON from the first token costs nothing."** It can lower quality on steps that need
+  reasoning. Add a short reasoning field before the answer fields, or reason in a separate call.
+
 ## Examples
+### Worked scenario: making a 3B agent reliable
+A field-service agent on a 3B model calls 12 tools. Rates per tool call on 200 golden cases (illustrative).
+
+| Change | Valid syntax | Correct tool and args | Task success (5 calls) |
+|---|---|---|---|
+| Prompt "reply with JSON", all 12 tools | 90% | 78% | about 29% |
+| + constrained decoding | 100% | 81% | about 35% |
+| + router narrows to 3 tools, flat enum schemas | 100% | 91% | about 62% |
+| + Pydantic checks, 1 retry, escalation on failure | 100% | 98% (2% escalated) | about 90% |
+
+Constrained decoding alone fixed syntax but barely moved task success; tool narrowing and validation did
+most of the work.
+
 ### Structured output from a local SLM with Ollama and Pydantic
 Ollama's `format` takes a JSON schema and constrains decoding to it; Pydantic then checks meaning.
 
@@ -180,19 +211,6 @@ def plan_call(request, model="Qwen/Qwen2.5-7B-Instruct"):
 
 print(plan_call("Where is my order ORD-123456?"))
 ```
-
-### Worked scenario: making a 3B agent reliable
-A field-service agent on a 3B model calls 12 tools. Rates per tool call on 200 golden cases (illustrative).
-
-| Change | Valid syntax | Correct tool and args | Task success (5 calls) |
-|---|---|---|---|
-| Prompt "reply with JSON", all 12 tools | 90% | 78% | about 29% |
-| + constrained decoding | 100% | 81% | about 35% |
-| + router narrows to 3 tools, flat enum schemas | 100% | 91% | about 62% |
-| + Pydantic checks, 1 retry, escalation on failure | 100% | 98% (2% escalated) | about 90% |
-
-Constrained decoding alone fixed syntax but barely moved task success; tool narrowing and validation did
-most of the work.
 
 ## Production patterns
 - **Constrain everything the code parses.** Use Ollama `format`, llama.cpp JSON schema or vLLM structured

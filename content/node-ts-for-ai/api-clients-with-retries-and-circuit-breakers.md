@@ -5,7 +5,8 @@ name: API clients with retries & circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - serving-inference/retry-strategies
@@ -39,6 +40,249 @@ while a provider or tool is down.
   keys for side-effecting tools, the run's deadline, and what the model sees when a tool fails.
 - **What you can skip.** Writing your own retry loop around the vendor SDK, and shared-state breakers
   across the fleet. Per-process breakers and SDK retries cover most agent services.
+
+## Lab
+### Task
+Build the call path one agent tool goes through: classified retries with full jitter, a
+consecutive-failure breaker with a single half-open probe, and a wrapper that turns every failure into
+a tool result. The first draft retries everything, including a 400 and a ticket-creating POST, and
+lets a down CRM crash every agent step.
+- **Agent goal:** a transient blip is absorbed, a wrong request fails once, a non-idempotent tool is
+  never repeated, and a dead dependency costs milliseconds while the model is told why.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** this lesson's "Classify before retrying", "Exponential backoff with full jitter",
+  "Circuit breaker" and "In an agent loop: failures become tool results"; AbortController &
+  cancellation for the per-attempt timeout you would add in production.
+- **Needs:** Node 20+ with `npm i -D tsx vitest`. A fake clock replaces timers, so backoff is
+  deterministic and the tests take milliseconds. Checked with Node 24.21, tsx 4.23 and vitest 5.0.5.
+
+### Starter code
+```ts
+// retry-lab.ts: classified retries, a circuit breaker and tool failures the model can read
+// A fake clock replaces timers, so every backoff is deterministic and the demo runs instantly.
+export type Clock = { now(): number; sleep(ms: number): Promise<void> };
+export function fakeClock() {
+  const c = { t: 0, sleeps: [] as number[], now: () => c.t, async sleep(ms: number) { c.sleeps.push(ms); c.t += ms; } };
+  return c;
+}
+
+// What SDKs and fetch wrappers surface: an HTTP status (maybe with Retry-After) or a socket error code.
+export type CallError = Error & { status?: number; retryAfterSec?: number; code?: string };
+export const httpError = (status: number, retryAfterSec?: number): CallError =>
+  Object.assign(new Error(`HTTP ${status}`), { status, retryAfterSec });
+export const netError = (code: string): CallError => Object.assign(new Error(code), { code });
+
+export const RETRYABLE = new Set([408, 429, 500, 502, 503, 504, 529]);
+export const NEVER_SENT = ["ECONNREFUSED", "UND_ERR_CONNECT_TIMEOUT"];       // safe for any request
+export const MAYBE_SENT = ["ECONNRESET", "ETIMEDOUT", "UND_ERR_SOCKET"];     // idempotent requests only
+
+export type Policy = { attempts: number; baseMs: number; capMs: number; deadline: number;
+                       random: () => number; clock: Clock };
+
+// YOUR CODE 1: the first draft retries every error after a fixed delay. Make it:
+// - retry only RETRYABLE statuses, NEVER_SENT codes, and MAYBE_SENT codes when `idempotent`;
+// - wait Retry-After seconds when the error carries one, else full jitter:
+//   random() * min(capMs, baseMs * 2 ** n) for retry n = 0, 1, 2, ...;
+// - never sleep past `deadline` (clock time): rethrow the last error instead.
+export async function retry<T>(fn: () => Promise<T>, p: Policy, idempotent: boolean): Promise<T> {
+  for (let n = 0; ; n++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (n + 1 >= p.attempts) throw e;
+      await p.clock.sleep(p.baseMs);
+    }
+  }
+}
+
+export class BreakerOpenError extends Error {}
+
+// YOUR CODE 2: a consecutive-failure breaker. Closed: count failures, reset on success. At `threshold`
+// failures it opens: calls throw BreakerOpenError without running fn, until resetMs of clock time has
+// passed. Then exactly one probe runs (half-open): success closes it, failure re-opens it.
+export class Breaker {
+  state: "closed" | "open" | "half-open" = "closed";
+  failures = 0;
+  openedAt = 0;
+  constructor(private clock: Clock, private threshold = 3, private resetMs = 30_000) {}
+  async call<T>(fn: () => Promise<T>): Promise<T> {
+    throw new Error("not implemented: Breaker.call");
+  }
+}
+
+export type ToolSpec = { name: string; idempotent: boolean; run: (args: unknown, key: string) => Promise<string> };
+export type ToolResult = { content: string; isError: boolean };
+
+// YOUR CODE 3: the first draft lets failures escape and crash the agent step. Run the tool through
+// its breaker (one per tool name, kept in `breakers`, created as new Breaker(p.clock, 2, 30_000))
+// around retry(), and turn every failure into
+// { isError: true, content: "Tool <name> failed: <message>" }, or "Tool <name> is temporarily
+// unavailable" when the breaker is open, so the loop can hand it back to the model.
+export const breakers = new Map<string, Breaker>();
+export async function callTool(spec: ToolSpec, args: unknown, key: string, p: Policy): Promise<ToolResult> {
+  return { content: await retry(() => spec.run(args, key), p, spec.idempotent), isError: false };
+}
+
+export function failing(errors: CallError[], ok = "ok") {      // fails with each error in turn, then succeeds
+  const t = { calls: 0, run: async () => { const e = errors[t.calls++]; if (e) throw e; return ok; } };
+  return t;
+}
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const clock = fakeClock();
+  const p = (): Policy => ({ attempts: 3, baseMs: 100, capMs: 1_000, deadline: clock.now() + 10_000, random: () => 0.5, clock });
+  const cases: [string, boolean, CallError[]][] = [
+    ["search", true, [httpError(503), httpError(503)]],
+    ["quota", true, [httpError(429, 2)]],
+    ["lookup", true, [httpError(400), httpError(400), httpError(400)]],   // the request is wrong every time
+    ["create_ticket", false, [netError("ECONNRESET")]],
+  ];
+  for (const [name, idempotent, errors] of cases) {
+    const t = failing(errors, `${name} done`);
+    clock.sleeps = [];
+    try {
+      const r = await callTool({ name, idempotent, run: t.run }, {}, `run-1-step-0-${name}`, p());
+      console.log(`${name}: ${r.isError ? "error" : "ok"} "${r.content}" attempts ${t.calls} sleeps [${clock.sleeps}]`);
+    } catch (e) { console.log(`${name}: threw ${(e as Error).message}`); }
+  }
+  const down = failing(Array(20).fill(httpError(503)));
+  for (let i = 1; i <= 4; i++) {
+    try {
+      const r = await callTool({ name: "crm", idempotent: true, run: down.run }, {}, `k${i}`, { ...p(), attempts: 2 });
+      console.log(`crm call ${i}: "${r.content}" total attempts ${down.calls}`);
+    } catch (e) { console.log(`crm call ${i}: threw ${(e as Error).message}`); }
+  }
+}
+```
+
+Run it with `npx tsx retry-lab.ts`. As given, `create_ticket` is retried after a reset (two tickets
+if the first POST landed), `lookup` throws its 400 at the agent, and all four CRM calls throw.
+
+### Expected output
+```
+search: ok "search done" attempts 3 sleeps [50,100]
+quota: ok "quota done" attempts 2 sleeps [2000]
+lookup: error "Tool lookup failed: HTTP 400" attempts 1 sleeps []
+create_ticket: error "Tool create_ticket failed: ECONNRESET" attempts 1 sleeps []
+crm call 1: "Tool crm failed: HTTP 503" total attempts 2
+crm call 2: "Tool crm failed: HTTP 503" total attempts 4
+crm call 3: "Tool crm is temporarily unavailable" total attempts 4
+crm call 4: "Tool crm is temporarily unavailable" total attempts 4
+```
+
+### Tests
+```ts
+// retry-lab.test.ts: run with `npx vitest run`
+import { beforeEach, describe, expect, it } from "vitest";
+import { Breaker, BreakerOpenError, breakers, callTool, failing, fakeClock, httpError, netError, retry,
+         type Policy } from "./retry-lab";
+
+let clock = fakeClock();
+const policy = (o: Partial<Policy> = {}): Policy =>
+  ({ attempts: 3, baseMs: 100, capMs: 1_000, deadline: 60_000, random: () => 0.5, clock, ...o });
+beforeEach(() => { clock = fakeClock(); breakers.clear(); });
+
+describe("retry", () => {
+  it("retries transient statuses with full jitter", async () => {
+    const t = failing([httpError(503), httpError(529)]);
+    expect(await retry(t.run, policy(), true)).toBe("ok");
+    expect(clock.sleeps).toEqual([50, 100]);                    // 0.5 x 100, 0.5 x 200
+  });
+  it("caps the exponential term", async () => {
+    const t = failing([httpError(500), httpError(500), httpError(500)]);
+    await retry(t.run, policy({ attempts: 4, capMs: 150, random: () => 1 }), true);
+    expect(clock.sleeps).toEqual([100, 150, 150]);
+  });
+  it("honours Retry-After", async () => {
+    await retry(failing([httpError(429, 2)]).run, policy(), true);
+    expect(clock.sleeps).toEqual([2_000]);
+  });
+  it("never retries a request that is wrong", async () => {
+    for (const s of [400, 401, 404, 422]) {
+      const t = failing([httpError(s), httpError(s)]);
+      await expect(retry(t.run, policy(), true)).rejects.toThrow(`HTTP ${s}`);
+      expect(t.calls).toBe(1);
+    }
+  });
+  it("retries ambiguous socket errors only for idempotent calls", async () => {
+    await expect(retry(failing([netError("ECONNRESET")]).run, policy(), false)).rejects.toThrow("ECONNRESET");
+    expect(await retry(failing([netError("ECONNRESET")]).run, policy(), true)).toBe("ok");
+    expect(await retry(failing([netError("ECONNREFUSED")]).run, policy(), false)).toBe("ok");
+  });
+  it("stops before sleeping past the deadline", async () => {
+    const t = failing([httpError(503), httpError(503), httpError(503)]);
+    await expect(retry(t.run, policy({ deadline: 250, random: () => 1 }), true)).rejects.toThrow("HTTP 503");
+    expect([t.calls, clock.sleeps]).toEqual([2, [100]]);         // the next wait (200) would end at 300
+  });
+});
+
+describe("Breaker", () => {
+  it("opens at the threshold, fails fast, then lets one probe through", async () => {
+    const b = new Breaker(clock, 2, 1_000);
+    const down = failing(Array(10).fill(httpError(503)));
+    for (let i = 0; i < 2; i++) await expect(b.call(down.run)).rejects.toThrow("HTTP 503");
+    await expect(b.call(down.run)).rejects.toBeInstanceOf(BreakerOpenError);
+    expect(down.calls).toBe(2);
+    await clock.sleep(1_000);
+    await expect(b.call(down.run)).rejects.toThrow("HTTP 503");  // the probe fails: open again
+    expect([b.state, down.calls]).toEqual(["open", 3]);
+    await clock.sleep(1_000);
+    expect(await b.call(async () => "back")).toBe("back");
+    expect(b.state).toBe("closed");
+  });
+  it("rejects other callers while the probe is in flight", async () => {
+    const b = new Breaker(clock, 1, 1_000);
+    await expect(b.call(failing([httpError(500)]).run)).rejects.toThrow();
+    await clock.sleep(1_000);
+    let release!: (v: string) => void;
+    const probe = b.call(() => new Promise<string>((r) => { release = r; }));
+    await expect(b.call(async () => "second")).rejects.toBeInstanceOf(BreakerOpenError);
+    release("probe ok");
+    expect(await probe).toBe("probe ok");
+  });
+});
+
+describe("callTool", () => {
+  it("returns failures as error results the model can read", async () => {
+    const r = await callTool({ name: "lookup", idempotent: true, run: failing([httpError(400)]).run }, {}, "k", policy());
+    expect(r).toEqual({ isError: true, content: "Tool lookup failed: HTTP 400" });
+  });
+  it("keeps one breaker per tool and reports it open", async () => {
+    const down = failing(Array(20).fill(httpError(503)));
+    const spec = { name: "crm", idempotent: true, run: down.run };
+    for (let i = 0; i < 2; i++) await callTool(spec, {}, `k${i}`, policy({ attempts: 2 }));
+    expect(await callTool(spec, {}, "k3", policy())).toEqual({ isError: true, content: "Tool crm is temporarily unavailable" });
+    expect(down.calls).toBe(4);
+    const other = await callTool({ name: "search", idempotent: true, run: async () => "hits" }, {}, "k4", policy());
+    expect(other).toEqual({ isError: false, content: "hits" });
+  });
+});
+```
+
+All 10 fail on the starter: the retry tests with `AssertionError` (fixed 100 ms waits, a 400 and a
+reset retried, no deadline check), the breaker tests on `not implemented: Breaker.call`, and the
+`callTool` tests because errors escape (`HTTP 503`) or a 400 is retried into a success.
+
+### Failure scenarios
+- **Inject the breaker inside `retry`** (wrap each attempt, not the whole sequence). The CRM opens after
+  one logical call instead of two, as the lesson's layering table predicts. Log breaker transitions
+  with the attempt number; each logical call should count once.
+- **Inject `Math.random` instead of `p.random`.** The jitter tests flake and the demo's sleeps change
+  per run. Every source of non-determinism the code reads (clock, randomness) belongs in the policy.
+- **Inject a half-open state that lets every caller through.** The in-flight-probe test fails: after a
+  reset, all queued agent steps hit the recovering CRM at once. Count calls that reach the dependency
+  while the state is `half-open`; it must be one.
+- **Inject the deadline check after `sleep`.** The deadline test sees a 200 ms sleep that ends at
+  300 ms against a 250 ms budget; in a run this is how a queue job outlives its lock.
+
+### Submission
+- **Your `retry-lab.ts`** with the three `YOUR CODE` parts done; the fakes and demo unchanged.
+- **A `npx vitest run` log** showing 10 passed.
+- **The `npx tsx retry-lab.ts` output**, matching the expected lines.
+- **A note of 3-5 sentences:** the worst-case added wall-clock time of one `callTool` with the demo
+  policy, and which layer (SDK, this wrapper or the queue) owns retries in your real agent.
+- **Evaluated on:** classification by status and code, full jitter with a cap and Retry-After, a
+  deadline that is never overrun, one probe at a time, and no exception escaping `callTool`.
 
 ## Why it exists
 - **Unbounded latency.** A naive client does `await fetch(url)`. A provider that accepts the TCP

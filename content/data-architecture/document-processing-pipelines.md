@@ -5,7 +5,7 @@ name: Document processing pipelines
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -62,12 +62,13 @@ Constraints:
 | **A. Native extraction only** | One library for every page | About $0 | Fails: 25% of pages are scans and come back empty | Pass | Pass |
 | **B. Vision LLM on every page** | Every page to an in-region vision model | Fails: 2 million × $0.01 = $20,000 a month | Likely good, but re-runs differ | Fails for 40 pages inside one tool call | Pass only with an in-region endpoint |
 | **C. Layout model on every page** | Self-hosted Docling-style layout extraction for all pages | No per-page fee, but a GPU fleet for 2 million pages a month | Good on born-digital tables; weak on handwriting | Borderline for 40 pages | Pass |
-| **D. Per-page tier ladder** | Native, then OCR, then layout, then vision, each gated by a quality score; cheap tiers inline, the rest in the background | 5% of pages reach vision: 100,000 × $0.01 = $1,000 a month | Pass if the gold-set gate holds per tier | Pass: native and OCR inline, `pending_pages` for the rest | Pass with an in-region vision endpoint |
+| **D. Per-page tier ladder** | Native, then OCR, then layout, then vision, each gated by a quality score; cheap tiers inline, the rest in the background | 5% of pages reach vision: 100,000 × $0.01 = $1,000 a month, plus the layout tier's GPU time, which must fit in the remaining $4,000 | Pass if the gold-set gate holds per tier | Pass: native and OCR inline, `pending_pages` for the rest | Pass with an in-region vision endpoint |
 
 ### Decision
 Choose **D**, because it is the only option that meets budget, latency and accuracy together:
-- **Budget.** Vision spend tracks the 5% residue, $1,000 a month, leaving $4,000 of headroom for re-runs after
-  a parser change and for growth.
+- **Budget.** Vision spend tracks the 5% residue, $1,000 a month, leaving $4,000 for the layout tier's GPU
+  time, re-runs after a parser change and growth. Price the layout tier from a measured pages-per-GPU-hour
+  figure before committing; if it does not fit, the budget, not the ladder, is what fails.
 - **Latency.** Native extraction and OCR run inline on the packet, so the agent answers from readable pages
   in one tool call and names the pages still pending.
 - **Accuracy.** Table-heavy statements escalate to the layout tier, and the gold set of 60 statements gates every parser change.
@@ -84,6 +85,8 @@ What would change it:
 - **Crude quality scores.** A word-ratio gate can pass a page with a wrong table. Keep the separate table checks and track cell accuracy per document class.
 - **Vision output is non-deterministic.** Cache it by page hash, model and prompt version, and watch the cache hit rate after changes.
 - **Some answers arrive in two turns.** The agent says which pages are pending. Watch the share of answers given while pages were pending.
+- **A first GPU service for the team.** The layout tier is new operational ground. Watch its queue depth and
+  per-page latency, and if it is down, mark the affected pages `needs_review` rather than serving OCR text as complete.
 
 ### Review rubric
 - **The page mix is quantified.** The write-up estimates the share of born-digital, scanned and hard pages and where each goes.

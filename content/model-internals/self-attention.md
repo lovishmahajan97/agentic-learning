@@ -5,7 +5,7 @@ name: Self-attention
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: background
 related:
@@ -153,10 +153,10 @@ flowchart TD
 
 ## Misconceptions
 - **"Attention is always the expensive part of a layer."** The core-to-projection ratio is n/(2d): at
-  d = 4096 it is 0.5 at 4k tokens, so linear layers dominate, and only around 32k (ratio 4) does the
-  quadratic core take over.
+  d = 4096 it is 0.5 at 4k tokens and 1 at 8k. With the MLP's linear work added, the quadratic core
+  matches all linear work near 24k and dominates by 32k (ratio 4).
 - **"Every generated token pays the n² cost again."** Decode has one query row against cached keys and
-  values, O(n·d) per head and bandwidth-bound; the n² case is prefill, which a big new tool result
+  values, O(n·d) per layer and bandwidth-bound; the n² case is prefill, which a big new tool result
   triggers.
 - **"Self-attention knows the order of the tokens."** Without positions it is permutation equivariant;
   the causal mask leaks only a rough count of preceding tokens, so models add an explicit scheme.

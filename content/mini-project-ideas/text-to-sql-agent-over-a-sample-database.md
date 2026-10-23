@@ -5,7 +5,8 @@ name: Text-to-SQL agent over a sample database
 kind: practice
 difficulty: core
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/tool-calling
@@ -35,6 +36,210 @@ SQL and fixing its own errors, behind a read-only sandbox. It proves safe tool d
   orders all generate queries against real databases.
 - **What you can skip.** Fine-tuning a SQL model. A capable general model with good tools and a few
   examples is the baseline teams start from.
+
+## Lab
+### Task
+Make a text-to-SQL agent loop self-correct and measure it honestly. The sandbox is done; the three bugs
+are in what surrounds it: tool errors the model cannot act on, a loop that drops tool results, and an
+eval that compares SQL text instead of results.
+- **Time box:** 60-90 minutes.
+- **Prerequisites:** tool calling, tool permissions and least privilege, SQL joins, and golden datasets.
+- **Runs offline:** a mini Chinook (4 tables, 3 artists) is built in a temp file, and `fake_model` is a
+  recorded policy that reacts to tool results the way a tool-calling model does: it follows a hint in an
+  error, retries blindly without one, and one question makes it explore forever.
+- **Needs:** Python 3.10+ (stdlib `sqlite3`) and `pip install pytest`; checked with Python 3.12 and
+  pytest 9.1.1.
+
+### Starter code
+```python
+# sql_agent.py: a self-correcting text-to-SQL loop over a sandboxed mini Chinook, offline
+import sqlite3, statistics, tempfile, time
+from pathlib import Path
+
+def build_db(path):
+    c = sqlite3.connect(path)
+    c.executescript("""
+    CREATE TABLE Artist(ArtistId INTEGER PRIMARY KEY, Name TEXT);
+    CREATE TABLE Album(AlbumId INTEGER PRIMARY KEY, Title TEXT, ArtistId INTEGER REFERENCES Artist);
+    CREATE TABLE Genre(GenreId INTEGER PRIMARY KEY, Name TEXT);
+    CREATE TABLE Track(TrackId INTEGER PRIMARY KEY, Name TEXT, AlbumId INTEGER, GenreId INTEGER);
+    INSERT INTO Artist VALUES (1,'AC/DC'),(2,'Accept'),(3,'Aerosmith');
+    INSERT INTO Album VALUES (1,'For Those About To Rock We Salute You',1),(2,'Let There Be Rock',1),
+                             (3,'Balls to the Wall',2);
+    INSERT INTO Genre VALUES (1,'Rock'),(2,'Jazz');
+    INSERT INTO Track VALUES (1,'Go Down',2,1),(2,'Whole Lotta Rosie',2,1),(3,'Balls to the Wall',3,1);
+    """)
+    c.commit(); c.close()
+
+ALLOWED = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION}
+
+def open_readonly(path):
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    db.set_authorizer(lambda action, *a: sqlite3.SQLITE_OK if action in ALLOWED else sqlite3.SQLITE_DENY)
+    return db
+
+def list_tables(db):
+    return [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+
+def describe_table(db, table):
+    row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return row[0] if row else f"unknown table {table!r}; call list_tables"
+
+def run_sql(db, sql, max_rows=50, timeout_s=3.0):
+    deadline = time.monotonic() + timeout_s
+    db.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
+    try:
+        cur = db.execute(sql)
+        rows = cur.fetchmany(max_rows + 1)
+        return {"rows": rows[:max_rows], "truncated": len(rows) > max_rows}
+    except (sqlite3.Error, sqlite3.Warning) as e:
+        # YOUR CODE 1: make errors actionable for the model: "no such table" -> add "; call list_tables",
+        # "no such column" -> add "; call describe_table", "not authorized" -> add "; this tool is read-only"
+        return {"error": str(e)}
+    finally:
+        db.set_progress_handler(None, 0)
+
+TOOLS = {"list_tables": list_tables, "describe_table": describe_table, "run_sql": run_sql}
+
+def fake_model(question, transcript):
+    """Recorded policy standing in for a tool-calling LLM. transcript: [(action, observation)]."""
+    last = transcript[-1][1] if transcript else None
+    if "genre" in question.lower():
+        return {"tool": "list_tables", "args": {}}               # an explorer that never commits
+    k = "artists" if "artists" in question.lower() else "albums"
+    first = {"artists": "SELECT COUNT(*) FROM Artists",
+             "albums": "SELECT Album.Title FROM Album JOIN Artist ON Album.Artist = Artist.Name "
+                       "WHERE Artist.Name = 'AC/DC'"}
+    fixed = {"artists": "SELECT COUNT(*) FROM Artist",
+             "albums": "SELECT Album.Title FROM Album JOIN Artist ON Album.ArtistId = Artist.ArtistId "
+                       "WHERE Artist.Name = 'AC/DC'"}
+    if last is None:
+        return {"tool": "run_sql", "args": {"sql": first[k]}}
+    if isinstance(last, dict) and "rows" in last:
+        return {"answer": str(last["rows"]), "sql": transcript[-1][0]["args"]["sql"]}
+    if isinstance(last, dict) and "error" in last:
+        if "call list_tables" in last["error"]:
+            return {"tool": "list_tables", "args": {}}
+        if "call describe_table" in last["error"]:
+            return {"tool": "describe_table", "args": {"table": "Album"}}
+        return transcript[-1][0]                                  # blind retry of the same call
+    return {"tool": "run_sql", "args": {"sql": fixed[k]}}        # after a schema look-up
+
+def run_agent(question, db, model=fake_model, max_steps=8):
+    transcript = []
+    for _ in range(max_steps):
+        action = model(question, transcript)
+        if "answer" in action:
+            return {"answer": action["answer"], "sql": action["sql"], "tool_calls": len(transcript)}
+        obs = TOOLS[action["tool"]](db, **action["args"])
+        # YOUR CODE 2: the model can only self-correct if it sees what the tool returned
+        transcript.append((action, None))
+    return {"answer": "could not determine", "sql": None, "tool_calls": len(transcript)}
+
+GOLDEN = [
+    ("How many artists are there?", "SELECT COUNT(*) FROM Artist"),
+    ("Which albums does AC/DC have?",
+     "SELECT Title FROM Album WHERE ArtistId = (SELECT ArtistId FROM Artist WHERE Name = 'AC/DC')"),
+    ("Which genre has the most tracks?",
+     "SELECT g.Name FROM Genre g JOIN Track t ON t.GenreId = g.GenreId GROUP BY g.GenreId "
+     "ORDER BY COUNT(*) DESC LIMIT 1"),
+]
+
+def evaluate(db, golden, agent=run_agent):
+    results = [(gold, agent(q, db)) for q, gold in golden]
+    # YOUR CODE 3: score by execution match (same rows; order matters only if gold has ORDER BY),
+    # not by comparing SQL text; a None sql is wrong
+    norm = lambda s: " ".join(s.lower().split())
+    correct = sum(r["sql"] is not None and norm(r["sql"]) == norm(gold) for gold, r in results)
+    calls = [r["tool_calls"] for _, r in results]
+    return {"accuracy": round(correct / len(golden), 3), "median_tool_calls": statistics.median(calls)}
+
+def main():
+    with tempfile.TemporaryDirectory() as d:
+        build_db(Path(d) / "chinook_mini.db")
+        db = open_readonly(Path(d) / "chinook_mini.db")
+        for q, _ in GOLDEN:
+            r = run_agent(q, db)
+            print(f"{q} -> {r['answer']} ({r['tool_calls']} tool calls)")
+        print("delete:", run_sql(db, "DELETE FROM Track")["error"])
+        print("eval:", evaluate(db, GOLDEN))
+        db.close()
+
+if __name__ == "__main__":
+    main()
+```
+
+As given, every question ends in `could not determine (8 tool calls)` and the eval prints an accuracy of
+`0.0`: the model never sees an error, so it repeats its first query until the step cap.
+
+### Expected output
+```
+How many artists are there? -> [(3,)] (3 tool calls)
+Which albums does AC/DC have? -> [('For Those About To Rock We Salute You',), ('Let There Be Rock',)] (3 tool calls)
+Which genre has the most tracks? -> could not determine (8 tool calls)
+delete: not authorized; this tool is read-only
+eval: {'accuracy': 0.667, 'median_tool_calls': 3}
+```
+
+The AC/DC answer is right although its SQL is a join and the gold SQL is a subquery, so a string
+comparison scores 1 of 3 (0.333) and execution match scores 2 of 3 (0.667). Tool calls are 3, 3 and 8,
+so the median is 3.
+
+### Tests
+```python
+# test_sql_agent.py: run with `pytest -q`
+import pytest
+import sql_agent as m
+
+@pytest.fixture
+def db(tmp_path):
+    m.build_db(tmp_path / "t.db")
+    conn = m.open_readonly(tmp_path / "t.db")
+    yield conn
+    conn.close()
+
+def test_errors_name_the_next_step(db):
+    assert m.run_sql(db, "SELECT * FROM Artists")["error"].endswith("; call list_tables")
+    assert m.run_sql(db, "SELECT Artist FROM Album")["error"].endswith("; call describe_table")
+    assert m.run_sql(db, "DELETE FROM Track")["error"].endswith("; this tool is read-only")
+    assert m.run_sql(db, "SELECT COUNT(*) FROM Track")["rows"] == [(3,)]   # reads still work
+
+def test_agent_self_corrects_from_errors(db):
+    r = m.run_agent("How many artists are there?", db)
+    assert r == {"answer": "[(3,)]", "sql": "SELECT COUNT(*) FROM Artist", "tool_calls": 3}
+    r = m.run_agent("Which albums does AC/DC have?", db)
+    assert r["tool_calls"] == 3 and "Let There Be Rock" in r["answer"]
+
+def test_step_cap_stops_an_explorer(db):
+    r = m.run_agent("Which genre has the most tracks?", db)
+    assert r == {"answer": "could not determine", "sql": None, "tool_calls": 8}
+
+def test_eval_uses_execution_match(db):
+    assert m.evaluate(db, m.GOLDEN) == {"accuracy": 0.667, "median_tool_calls": 3}
+```
+
+Three of the four fail on the starter, one per bug. The step-cap test already passes: it is a guard, so
+your loop changes cannot remove the cap that bounds cost on a question the agent cannot answer.
+
+### Failure scenarios
+- **Return the raw database error.** Traces show the same `run_sql` call repeated until the cap. Debug by
+  grouping trace steps by identical arguments; repeats after an error mean the error gave no next step.
+- **Append the action but not the observation.** Every question costs the full 8 calls even when the
+  first query worked. Debug by printing the transcript the model receives at step 2.
+- **Score by SQL text.** Accuracy drops when the model's style changes, with no change in answers. Debug
+  by listing failures whose result rows equal the gold rows.
+- **Widen `ALLOWED` to make an error go away.** Adding `SQLITE_INSERT` or `SQLITE_ATTACH` silently
+  breaks the sandbox. Debug by keeping the delete line in the output as a check, and add the lesson's
+  safety suite to CI.
+
+### Submission
+- **Repo** with `sql_agent.py` and the unchanged tests; `pytest -q` shows 4 passed.
+- **Program output** matching the expected block.
+- **One trace** of the AC/DC question: each step's action and observation, showing the error, the
+  `describe_table` call and the corrected join.
+- **A short note** on why the genre question fails and which fix (a forced `run_sql` after N schema calls,
+  or a worked join example) you would try first, measured how.
+- **Evaluated on** tests passing, errors that name the next tool, and accuracy computed from result sets.
 
 ## Why it exists
 - **Everyone wants to ask their database questions.** It is one of the most requested agent features, and

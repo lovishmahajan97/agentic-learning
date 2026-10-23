@@ -5,7 +5,7 @@ name: Retrieval granularity
 kind: decision
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 mastery: evaluate
@@ -50,7 +50,11 @@ return the parent, or let the agent expand hits.
 A legal-ops team runs a contract-review agent over 12,000 customer contracts, about 15,000 tokens each,
 so 180M tokens. Today it matches and returns 1,024-token chunks (about 176,000 vectors). Pointed
 questions ("what is the liability cap?") are 70% of traffic and often get the clause with the number at
-rank four. Constraints (illustrative figures):
+rank four.
+
+On the 60-question golden set, 18 of the 42 pointed questions miss at k = 3, and in 7 of those 18 the
+right chunk is not even in the top 20, because each 1,024-token chunk mixes the cap with indemnity and
+termination text. Constraints (illustrative figures):
 - **Evidence budget:** at most 4,000 tokens per search call; tasks average three searches.
 - **Index cap:** the current vector-store plan holds 2M vectors; a bigger plan needs a budget request
   that would land after the deadline.
@@ -61,17 +65,22 @@ rank four. Constraints (illustrative figures):
 ### Options
 | Option | How it works | Index size | Evidence per call | Latency | Fit to constraints |
 |---|---|---|---|---|---|
-| A. Keep 1,024-token chunks, add a reranker | rerank top 20 chunks, return top 3 | ~176k vectors | 3 × 1,024 = 3,072 tokens | +1 rerank call | cheap, but the diluted cap clause must first reach the top 20 |
-| B. Small-to-big | 128-token children with `parent_id`; return clause parents capped at 1,000 tokens, deduped, max-child scoring | 180M / 128 ≈ 1.41M vectors | ≤ 4 × 1,000 = 4,000 tokens | no extra model step | fits the cap, budget and deadline |
-| C. Sentence snippets plus `read_section` | ~25-token sentences; agent reads parents on demand | 180M / 25 = 7.2M vectors | ~150-token snippets + ~500 per read | +1 model step per read, up to +3 per task | breaks the 2M cap and risks the p95 |
+| A. Keep 1,024-token chunks, add a reranker | rerank top 20 chunks, return top 3 | ~176k vectors | 3 × 1,024 = 3,072 tokens | +1 rerank call | cheap; ~730 chunks/day to re-embed; can fix at most the 11 of 18 misses already in the top 20 |
+| B. Small-to-big | 128-token children with `parent_id`; return clause parents capped at 1,000 tokens, deduped, max-child scoring | 180M / 128 ≈ 1.41M vectors | ≤ 4 × 1,000 = 4,000 tokens | no extra agent step (+1 rerank call if a cross-encoder is kept) | fits the cap, budget and deadline; ~5,900 children/day to re-embed |
+| C. Sentence snippets plus `read_section` | ~25-token sentences; agent reads parents on demand | 180M / 25 = 7.2M vectors | ~150-token snippets + ~500 per read | +1 model step per read, up to +3 per task | breaks the 2M cap and risks the p95; ~30,000 sentences/day to re-embed |
 | D. Proposition retrieval | LLM rewrites the corpus into standalone facts | well above C | small | none at query time | an LLM pass over 180M tokens and on every daily change; too slow to build in three weeks |
 
 ### Decision
 Ship **B**, with max-child scoring for pointed questions and a cross-encoder over the deduped parents.
 - **Why it fits:** 128-token children sharpen matching on the cap sentence, and 1.41M vectors stays under
   the 2M cap. Returning bounded clauses keeps exceptions next to the number at ≤ 4,000 tokens a call,
-  and ≤ 12,000 a task over three searches. It adds no model step, so the p95 is unchanged.
-- **Why not A:** a reranker can only reorder what the diluted vectors retrieve; it treats the symptom.
+  and ≤ 12,000 a task over three searches.
+- **Latency and freshness:** B adds no agent model step; the cross-encoder over a dozen or so deduped
+  parents is the same one rerank call A would add, so p95 moves only by that call's measured latency.
+  The 50 changed contracts are about 5,900 children a day (50 × 15,000 / 128), a small same-day re-embed.
+- **Why not A:** a reranker can only reorder what the diluted vectors retrieve, so on the golden set it
+  can fix at most 11 of the 18 pointed misses; the other 7 never reach its top 20. Its cross-encoder
+  survives as B's second stage.
 - **Why not C:** 7.2M vectors is 3.6 times the cap, and three reads would add about 3-6 seconds.
 - **What would change it:** an approved larger plan and a model that reliably reads before quoting
   makes C attractive (about 650 tokens per searched-and-expanded hit). Explanatory traffic above

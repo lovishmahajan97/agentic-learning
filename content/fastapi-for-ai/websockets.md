@@ -166,8 +166,10 @@ def test_bad_token_is_refused_with_policy_violation():
   Debug: grep for every `send_` call; only the generation task (or one sender queue) may send.
 - **Accept, then check the token.** The client gets a working socket for a moment and the test sees a
   successful handshake. Debug: move the check above `accept()` and raise `WebSocketException`.
-- **Forget the `finally` cancel.** Closing the client mid-answer leaves the task streaming into a dead
-  socket. Debug: log in `model_stream` after the client disconnects; lines should stop at once.
+- **Forget the `finally` cancel.** Closing the client mid-answer leaves the task running: the model
+  keeps generating until the next send into the dead socket raises, and the log shows a token after the
+  disconnect plus "Task exception was never retrieved". Debug: log in `model_stream` after the client
+  disconnects; with the cancel in place, lines stop at once.
 
 ### Submission
 - **Code:** `lab_ws.py` with the four YOUR CODE steps done and the protocol unchanged.

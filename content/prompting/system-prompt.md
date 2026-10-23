@@ -5,7 +5,7 @@ name: System prompt
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -157,9 +157,10 @@ sequenceDiagram
   terms.
 - **"The system prompt is private, so it can hold secrets."** A determined user can extract it. Assume
   it is public and keep keys, internal URLs and customer data out of it.
-- **"Adding the date or user name to line 1 is harmless."** Any byte that changes per request breaks the
-  cached prefix: every call becomes a cache write and can cost more than no caching at all. Put dynamic
-  values after the static block.
+- **"Adding the current time or a request ID to line 1 is harmless."** Any byte that changes per
+  request breaks the cached prefix: every call becomes a cache write and can cost more than no caching at
+  all (375M against 300M token equivalents in the scenario below). Put dynamic values after the static
+  block.
 - **"Telling the agent to ignore instructions in tool results makes it safe."** The instruction
   hierarchy makes injection less likely, not impossible; consequential tools like `send_email` still
   need a gate that holds when the prior fails.

@@ -42,6 +42,63 @@ turns one slow LLM provider or tool into a total outage.
 - **What you can skip.** Health-checking every tool on each probe. Report tool and provider health
   through metrics, alerts and the synthetic check, never through restart or routing probes.
 
+## Decision case
+### Scenario
+An agent service runs on Kubernetes with 12 replicas. Runs call an LLM provider, a vector store and
+several tools; about 4% of runs take longer than 2 minutes and the slowest (p99) take about 6 minutes.
+All figures are illustrative planning numbers, not measurements of any provider.
+- **Startup:** each pod loads its model in about 90 seconds, up to 4 minutes on a cold node.
+- **Deploys:** 3 a week, as a rolling update replacing 3 pods at a time (4 waves, no surge), and each
+  deploy must finish inside a 20-minute change window.
+- **No lost runs:** product requires that a deploy never cuts off an in-flight agent run.
+- **Provider blips:** the LLM provider has had about 2 short outages a month (around 90 seconds), and
+  during them the agent must still answer from a fallback model.
+- **Team:** 2 engineers, with about 2 weeks available for this work.
+
+### Options
+| Option | How it works | Behaviour in a 90-second provider blip | Deploy time (4 waves of drain plus 90 s startup) | Runs lost on deploy |
+|---|---|---|---|---|
+| Deep readiness | Readiness also checks the provider and vector store | all 12 replicas go unready together: zero endpoints, the fallback cannot serve | depends on grace period | depends on grace period |
+| Local probes, long grace | Local-only probes, golden-task synthetic check, `terminationGracePeriodSeconds: 420` to outlast p99 runs | pods stay ready and serve the fallback | 4 x (420 + 90) = 2,040 s, about 34 min: over the window | none up to 7 min |
+| Local probes, checkpoint and resume | Local-only probes, synthetic check, 120-second grace; runs still going at shutdown checkpoint and resume on another replica | pods stay ready and serve the fallback | 4 x (120 + 90) = 840 s, 14 min | none, if resume works |
+
+### Decision
+**Local-only probes, a golden-task synthetic check, and checkpoint and resume with a 120-second grace
+period.**
+- **It survives provider blips.** No probe calls the provider, so replicas stay ready, the fallback
+  model serves, and the blip shows up in metrics and the synthetic check, which page through a runbook.
+- **It fits the change window.** About 14 minutes per deploy against 34 for the long-grace option.
+- **It meets "no lost runs" without a huge grace period.** The 96% of runs that finish within 2
+  minutes complete during drain; the rest checkpoint state at a step boundary and resume elsewhere.
+- **It fits the team.** Checkpointing at step boundaries is about 2 engineer-weeks; deep readiness
+  would be cheaper but fails the blip requirement outright.
+
+**What would change it.**
+- **All runs finishing within about 2 minutes:** a 120-second grace alone meets the requirement, and
+  checkpointing is not worth building.
+- **Agent state that cannot be serialised** (an open browser session, a held lock on a customer
+  system): resume is not safe, so use long grace with smaller waves or a wider change window.
+- **A per-instance dependency** such as a local GPU: that one belongs in readiness.
+
+### Trade-offs accepted
+- **Cold nodes can break the window.** With 4-minute loads a wave takes 120 + 240 = 360 seconds, so a
+  deploy takes about 24 minutes. Watch: startup duration percentiles per deploy; pre-pull images and
+  weights before deploys.
+- **Resume is new code that can fail.** A resumed run might repeat a tool call. Watch: resumed-run
+  success rate and duplicate write calls per deploy; write tools carry idempotency keys.
+- **Green probes during a dependency outage.** Operators may see healthy pods while users get fallback
+  answers. Watch: synthetic pass rate and fallback rate on the same dashboard as probe status.
+
+### Review rubric
+- **Each check tied to its action:** the write-up says what restarts, what routes away and what only
+  alerts, and keeps shared dependencies out of restart and routing probes.
+- **Timing derived:** grace period, startup window and deploy duration are computed from measured run
+  and load times.
+- **Blip walked through:** the write-up states what each option does during a short provider outage.
+- **Long runs handled:** a stated plan for runs that outlast the grace period, with its failure mode.
+- **Worst case named:** cold-node or peak behaviour is computed, not only the typical case.
+- **Flip conditions stated:** run lengths or state types at which another option wins.
+
 ## Why it exists
 - **Infrastructure cannot see inside an instance.** Without checks, traffic keeps flowing to a process
   that has deadlocked, run out of GPU memory, or is still loading a multi-gigabyte model, while every

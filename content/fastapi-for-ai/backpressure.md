@@ -5,7 +5,7 @@ name: Backpressure
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:

@@ -5,7 +5,8 @@ name: Designing MCP tools for agents (naming, schemas, errors, pagination, token
 kind: practice
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - mcp/mcp-server-primitives
@@ -39,6 +40,223 @@ the right tool and finish tasks.
   errors guide the next step, and how big results can get.
 - **What you can skip.** Mirroring every REST endpoint. Agents need task-shaped tools, not a full API
   surface.
+
+## Lab
+### Task
+Redesign a tool that a generator produced from a REST API, `get_tickets(filters: dict, limit=1000)`,
+into one agent-ready search tool. Then write the CI lint from Production patterns, which catches the
+legacy tool's problems automatically. The example in this lesson shows the patterns for orders; here
+you apply them to a new tool and make them enforceable.
+
+Time box: 60-90 min.
+- **Prerequisites:** this lesson's How it works and first example; `mcp/building-an-mcp-server-end-to-end`;
+  `mcp/mcp-server-primitives`.
+- **Setup:** Python 3.10+, `pip install "mcp>=1.10,<2" pytest` (checked with mcp 1.30.0, pydantic 2.14,
+  pytest 9.1, Python 3.13). Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **In memory:** client and server connect through `create_connected_server_and_client_session` from
+  `mcp.shared.memory` (the helper the SDK's own tests use; not a documented public API).
+- **You implement:** `build_server` (the redesigned tool) and `lint_tools`. A model-in-the-loop eval is the
+  next step, in the Mini project.
+
+### Starter code
+```python
+"""Lab: redesign a REST-shaped tool for agents, and lint tool definitions. Run: python lab.py"""
+import asyncio
+import re
+from typing import Literal
+from pydantic import BaseModel, Field
+from mcp import types
+from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.shared.memory import create_connected_server_and_client_session as connect
+from mcp.types import ToolAnnotations
+
+SERVICE = "helpdesk"
+TICKETS = [{"id": f"H-{i}", "title": ("VPN drops on wifi" if i % 3 == 0 else "Printer offline") + f" #{i}",
+            "status": "closed" if i % 4 == 0 else "open", "body": "Long description. " * 40,
+            "comments": ["looked at it"] * 6} for i in range(1, 61)]
+
+
+def build_legacy_server() -> FastMCP:
+    """What a generator made from the REST API: one vague tool, free-form filters, full records."""
+    mcp = FastMCP("helpdesk-legacy")
+
+    @mcp.tool()
+    def get_tickets(filters: dict, limit: int = 1000) -> list[dict]:
+        """Get tickets."""
+        return [t for t in TICKETS if all(t.get(k) == v for k, v in filters.items())][:limit]
+
+    return mcp
+
+
+class TicketPage(BaseModel):
+    tickets: list[dict]
+    total_matches: int
+    next_cursor: str | None
+
+
+def build_server() -> FastMCP:
+    mcp = FastMCP("helpdesk")
+    # YOUR CODE HERE: one read-only tool, helpdesk_search_tickets, returning TicketPage, with
+    #   query: str (case-insensitive substring of the title)
+    #   status: Literal["open", "closed", "any"] = "any"
+    #   limit: int = Field(10, ge=1, le=25)
+    #   cursor: str | None = None   (opaque; encode the offset however you like)
+    #   response_format: Literal["concise", "detailed"] = "concise"
+    # - concise rows hold only id, title and status; detailed rows are the full record
+    # - next_cursor is None on the last page; total_matches counts all matches
+    # - no matches: ToolError(f"No tickets match {query!r}. Try a shorter query or status='any'.")
+    # - a cursor you cannot decode: ToolError("Invalid cursor. Pass next_cursor unchanged, or omit it.")
+    # - a description of at least 40 characters saying what it returns and when to use detailed
+    raise NotImplementedError
+
+
+def lint_tools(tools: list[types.Tool]) -> list[str]:
+    """Return one problem string per violation, in tool order then this rule order:
+    f"{name}: invalid name"              name not 1-128 chars of ASCII letters, digits, _ - .
+    f"{name}: missing service prefix"    name does not start with f"{SERVICE}_"
+    f"{name}: description too short"     description missing or under 40 characters
+    f"{name}: free-form object '{p}'"    an inputSchema property of type "object" without "properties"
+    f"{name}: unbounded integer '{p}'"   an inputSchema property of type "integer" without "maximum"
+    """
+    # YOUR CODE HERE (properties are in tool.inputSchema["properties"], in declaration order)
+    raise NotImplementedError
+
+
+async def walk(session, **args) -> list[list[dict]]:
+    """Follow next_cursor the way an agent would; returns the pages."""
+    pages, cursor = [], None
+    while True:
+        res = await session.call_tool("helpdesk_search_tickets", {**args, **({"cursor": cursor} if cursor else {})})
+        page = res.structuredContent
+        pages.append(page["tickets"])
+        cursor = page["next_cursor"]
+        if cursor is None:
+            return pages
+
+
+async def main():
+    async with connect(build_legacy_server()) as s:
+        print("lint legacy:", lint_tools((await s.list_tools()).tools))
+    async with connect(build_server()) as s:
+        print("lint redesigned:", lint_tools((await s.list_tools()).tools))
+        pages = await walk(s, query="vpn", limit=8)
+        ids = [t["id"] for p in pages for t in p]
+        print("pages:", [len(p) for p in pages], "unique ids:", len(set(ids)))
+        print("first row:", pages[0][0])
+        for args in ({"query": "fax"}, {"query": "vpn", "cursor": "not-a-cursor"}, {"query": "vpn", "limit": 500}):
+            res = await s.call_tool("helpdesk_search_tickets", args)
+            text = res.content[0].text.removeprefix("Error executing tool helpdesk_search_tickets: ")
+            print("error:", res.isError, "|", text.splitlines()[2].strip() if "validation error" in text else text)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly this on stdout (SDK request logs go to stderr; the
+last line is pydantic's validation message and may be worded differently in other pydantic versions):
+
+```
+lint legacy: ['get_tickets: missing service prefix', 'get_tickets: description too short', "get_tickets: free-form object 'filters'", "get_tickets: unbounded integer 'limit'"]
+lint redesigned: []
+pages: [8, 8, 4] unique ids: 20
+first row: {'id': 'H-3', 'title': 'VPN drops on wifi #3', 'status': 'open'}
+error: True | No tickets match 'fax'. Try a shorter query or status='any'.
+error: True | Invalid cursor. Pass next_cursor unchanged, or omit it.
+error: True | Input should be less than or equal to 25 [type=less_than_equal, input_value=500, input_type=int]
+```
+
+The numbers check out against the data: 20 of the 60 tickets mention VPN (every third id), read as pages
+of 8, 8 and 4.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail with `NotImplementedError`; a correct solution
+passes all 6 (mcp 1.30.0).
+
+```python
+import asyncio
+from mcp import types
+from mcp.shared.memory import create_connected_server_and_client_session as connect
+from lab import TICKETS, build_legacy_server, build_server, lint_tools, walk
+
+def with_session(server, fn):
+    async def go():
+        async with connect(server) as s:
+            return await fn(s)
+    return asyncio.run(go())
+
+async def tools(s):
+    return (await s.list_tools()).tools
+
+def test_lint_flags_every_legacy_problem():
+    assert lint_tools(with_session(build_legacy_server(), tools)) == [
+        "get_tickets: missing service prefix", "get_tickets: description too short",
+        "get_tickets: free-form object 'filters'", "get_tickets: unbounded integer 'limit'"]
+
+def test_lint_name_rule():
+    bad = types.Tool(name="helpdesk search!", description="x" * 40, inputSchema={"type": "object", "properties": {}})
+    assert lint_tools([bad]) == ["helpdesk search!: invalid name", "helpdesk search!: missing service prefix"]
+
+def test_redesigned_server_passes_lint_and_is_read_only():
+    ts = with_session(build_server(), tools)
+    assert [t.name for t in ts] == ["helpdesk_search_tickets"] and lint_tools(ts) == []
+    assert ts[0].annotations.readOnlyHint is True
+    assert ts[0].inputSchema["properties"]["status"]["enum"] == ["open", "closed", "any"]
+
+def test_pagination_covers_every_match_once():
+    pages = with_session(build_server(), lambda s: walk(s, query="vpn", status="open", limit=4))
+    ids = [t["id"] for p in pages for t in p]
+    expected = [t["id"] for t in TICKETS if "VPN" in t["title"] and t["status"] == "open"]
+    assert ids == expected and len(pages) == -(-len(expected) // 4)
+
+def test_concise_by_default_detailed_on_request():
+    async def fn(s):
+        a = await s.call_tool("helpdesk_search_tickets", {"query": "printer", "limit": 1})
+        b = await s.call_tool("helpdesk_search_tickets", {"query": "printer", "limit": 1, "response_format": "detailed"})
+        return a.structuredContent, b.structuredContent
+    concise, detailed = with_session(build_server(), fn)
+    assert set(concise["tickets"][0]) == {"id", "title", "status"} and concise["total_matches"] == 40
+    assert "comments" in detailed["tickets"][0]
+
+def test_errors_say_what_to_do_next():
+    async def fn(s):
+        out = []
+        for args in ({"query": "fax"}, {"query": "vpn", "cursor": "not-a-cursor"}, {"query": "vpn", "limit": 26}):
+            r = await s.call_tool("helpdesk_search_tickets", args)
+            out.append((r.isError, r.content[0].text))
+        return out
+    (e1, t1), (e2, t2), (e3, t3) = with_session(build_server(), fn)
+    assert e1 and "Try a shorter query" in t1
+    assert e2 and "Pass next_cursor unchanged" in t2
+    assert e3 and "less than or equal to 25" in t3
+```
+
+### Failure scenarios
+- **Use `str(offset)` as the cursor and decode it with a bare `int()`.** A tampered cursor still returns
+  `isError`, but the text is `invalid literal for int()`, so the errors test fails and an agent has
+  nothing to act on. Read the raw `isError` text the model would see and map the failure to a message
+  with a next step.
+- **Always return a `next_cursor`, even on the last page.** `walk` never ends: it keeps fetching empty
+  pages, as an agent would keep paging. Print `total_matches` and the offset per page; return `None` once
+  the offset reaches the match count.
+- **Advance the offset by `limit + 1`.** Pages look plausible but tickets go missing, and the pagination
+  test reports the gap. Compare the walked ids with a direct filter of `TICKETS`, which is the check an
+  agent eval cannot make for you.
+- **Declare `limit: int = 10` without `Field` bounds.** The lint reports `unbounded integer 'limit'`, and
+  `limit: 500` succeeds and returns every match. Read `inputSchema["properties"]["limit"]` to confirm
+  `maximum` is present.
+
+### Submission
+- `lab.py` with `build_server` and `lint_tools` implemented and the legacy server, `walk` and `main`
+  unchanged.
+- A `pytest -q` run showing 6 passed and the stdout of `python lab.py` matching Expected output.
+- A before and after table for one query: schema size (characters of `inputSchema`), result characters
+  for the first call, and whether an agent can tell if more results exist.
+- The lint wired into a CI step (or a pre-commit hook) that fails on the legacy server.
+- Evaluation: tests pass, the lint flags all four legacy problems, and every error message names a next
+  step.
 
 ## Why it exists
 - **The model only sees text.** It cannot read your code; a vague name like `query` or a missing

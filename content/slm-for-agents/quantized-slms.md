@@ -5,7 +5,8 @@ name: Quantized SLMs (GGUF, AWQ, quality vs memory)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: mastery-verified
+status: typed
+lesson_type: concept
 agent_relevance: useful
 mastery: evaluate
 code_tested: partial
@@ -106,6 +107,26 @@ flowchart TD
     V -->|"within tolerance"| S["Ship smallest passing build"]
     V -.->|"fails"| U["Step up bits or size"]
 ```
+
+## Misconceptions
+- **"A 4-bit model needs a quarter of the 16-bit memory."** Only the weights shrink, and a "4-bit" file
+  stores scales too, so it is about 4.5-5 bits per weight. KV cache and overhead stay the same, so total
+  memory for an agent with long contexts and several sessions falls by much less than 4x.
+- **"If perplexity barely moves, the agent is fine."** Perplexity averages over free text, while an agent
+  depends on a few exact tokens: braces, enum values, IDs in tool arguments. Those break first, so the
+  gate is your agent eval (valid JSON, correct tool and arguments, task pass rate).
+- **"Quantized models are slower because weights must be dequantized."** Decode is memory-bandwidth-bound,
+  so reading fewer bytes per token usually outweighs the unpacking work. A 4-bit build often decodes faster
+  than 16-bit on the same hardware.
+- **"GGUF and AWQ are rival quantization algorithms."** GGUF is a file format for llama.cpp and Ollama that
+  holds many quant types plus tokenizer and chat template; AWQ is a 4-bit method served by GPU engines such
+  as vLLM. You pick by engine first, then by bit width.
+- **"At equal memory, the bigger model at fewer bits always wins."** Around 4 bits it often does, but small
+  models lose more per bit removed, and below about 3 bits a smaller model at 8 bits is usually safer.
+  Run both builds on your eval.
+- **"Constrained decoding makes quantization damage irrelevant."** A grammar or JSON schema guarantees
+  valid structure, not correct values. A degraded build still emits wrong IDs and actions inside valid
+  JSON, so measure field accuracy, not only validity.
 
 ## Examples
 ### Sizing calculator: which builds fit your hardware

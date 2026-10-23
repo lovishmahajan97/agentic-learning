@@ -5,7 +5,8 @@ name: MCP client primitives (sampling, roots, elicitation)
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: useful
 related:
   - mcp/mcp-architecture
@@ -37,6 +38,184 @@ input-required results, and sampling and roots are deprecated.
   whether a headless agent declines them so servers fall back.
 - **What you can skip.** New sampling or roots integrations: the current revision deprecates both. Know
   them for existing servers, and prefer tool arguments and direct provider calls in new work.
+
+## Lab
+### Task
+Build the mini project's core as a tested tool: `close_ticket` asks an interactive host to confirm with
+elicitation, handles `accept`, `decline` and `cancel` correctly, and gives a headless agent an
+actionable `isError` instead of a hang. Repeating a close must not close twice or ask again, the property
+MRTR retries depend on.
+
+Time box: 45-60 min.
+- **Prerequisites:** this lesson's Elicitation and Delivery sections; `mcp/mcp-architecture` (capability
+  rule); `agents/human-in-the-loop`.
+- **Setup:** Python 3.10+, `pip install "mcp>=1.10,<2" pytest` (checked with mcp 1.30.0, pytest 9.1,
+  Python 3.13). Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **No UI, no subprocess:** the user is played by an `elicitation_callback`, and client and server connect
+  in memory with `create_connected_server_and_client_session` from `mcp.shared.memory` (the helper the SDK's
+  own tests use; not a documented public API). SDK 1.x speaks the handshake era, so the server sends
+  `elicitation/create` mid-call.
+- **You implement:** the body of `close_ticket`.
+
+### Starter code
+```python
+"""Lab: a write tool that elicits confirmation, with a headless fallback. Run: python lab.py"""
+import asyncio
+from typing import Literal, get_args
+from pydantic import BaseModel, Field
+from mcp import types
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.shared.memory import create_connected_server_and_client_session as connect
+
+Reason = Literal["fixed", "duplicate", "wont_fix"]
+ELICITATION = types.ClientCapabilities(elicitation=types.ElicitationCapability())
+
+
+class Confirm(BaseModel):   # flat primitives only: SDK 1.x rejects Literal fields in elicit schemas
+    reason: str = Field(description="fixed, duplicate or wont_fix")
+    confirm: bool
+
+
+def build_server(tickets: dict[str, str], closes: list[str]) -> FastMCP:
+    """tickets maps id -> "open" | "closed"; closes records every real close (the side effect)."""
+    mcp = FastMCP("tickets")
+
+    @mcp.tool()
+    async def close_ticket(ticket_id: str, ctx: Context, reason: Reason | None = None) -> str:
+        """Close a ticket. Interactive hosts are asked to confirm; headless callers must pass reason."""
+        # YOUR CODE HERE, in this order:
+        # 1. Unknown id: raise ToolError(f"No ticket {ticket_id}.")
+        # 2. Already closed: return f"{ticket_id} already closed." without asking anyone (idempotent).
+        # 3. If the client declared elicitation (ctx.session.check_client_capability(ELICITATION)):
+        #    answer = await ctx.elicit(f"Close {ticket_id}?", schema=Confirm). Proceed only on
+        #    action "accept" with data.confirm True and data.reason in get_args(Reason), then use
+        #    data.reason. Otherwise return f"Not closed ({answer.action})." (so an accepted but
+        #    unconfirmed or invalid answer returns "Not closed (accept).").
+        # 4. Headless: with no reason, raise ToolError(
+        #    "Elicitation unavailable: pass reason explicitly (fixed, duplicate or wont_fix).")
+        # 5. Close: tickets[ticket_id] = "closed", closes.append(ticket_id),
+        #    return f"Closed {ticket_id} as {reason}."
+        raise NotImplementedError("close_ticket is not implemented yet")
+
+    return mcp
+
+
+def answering(action: str, content: dict | None = None, asked: list | None = None):
+    """An elicitation callback that plays the user: accept, decline or cancel."""
+    async def on_elicit(ctx, params: types.ElicitRequestParams):
+        if asked is not None:
+            asked.append(params.message)
+        return types.ElicitResult(action=action, content=content)
+    return on_elicit
+
+
+async def call(server, args, on_elicit=None):
+    async with connect(server, elicitation_callback=on_elicit) as s:   # a callback declares the capability
+        res = await s.call_tool("close_ticket", args)
+        return res.isError, res.content[0].text
+
+
+async def main():
+    tickets, closes, asked = {"T-1": "open", "T-2": "open"}, [], []
+    srv = build_server(tickets, closes)
+    yes = answering("accept", {"reason": "fixed", "confirm": True}, asked)
+    runs = [
+        ("interactive accept", {"ticket_id": "T-1"}, yes),
+        ("interactive repeat", {"ticket_id": "T-1"}, yes),
+        ("interactive decline", {"ticket_id": "T-2"}, answering("decline", asked=asked)),
+        ("interactive cancel", {"ticket_id": "T-2"}, answering("cancel", asked=asked)),
+        ("headless no reason", {"ticket_id": "T-2"}, None),
+        ("headless with reason", {"ticket_id": "T-2", "reason": "duplicate"}, None),
+    ]
+    for label, args, cb in runs:
+        err, text = await call(srv, args, cb)
+        print(f"{label:<21} isError={err!s:<5} | {text}")
+    print(f"questions asked: {len(asked)}, closes: {closes}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly this on stdout (SDK request logs go to stderr):
+
+```
+interactive accept    isError=False | Closed T-1 as fixed.
+interactive repeat    isError=False | T-1 already closed.
+interactive decline   isError=False | Not closed (decline).
+interactive cancel    isError=False | Not closed (cancel).
+headless no reason    isError=True  | Error executing tool close_ticket: Elicitation unavailable: pass reason explicitly (fixed, duplicate or wont_fix).
+headless with reason  isError=False | Closed T-2 as duplicate.
+questions asked: 3, closes: ['T-1', 'T-2']
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 6 fail because every call returns `isError` with
+`close_ticket is not implemented yet`; a correct solution passes all 6 (mcp 1.30.0).
+
+```python
+import asyncio
+from lab import answering, build_server, call
+
+def run(tickets, args, cb=None):
+    closes = []
+    out = asyncio.run(call(build_server(tickets, closes), args, cb))
+    return out, closes
+
+def test_accept_and_confirm_closes_with_elicited_reason():
+    t = {"T-1": "open"}
+    (err, text), closes = run(t, {"ticket_id": "T-1"}, answering("accept", {"reason": "duplicate", "confirm": True}))
+    assert (err, text, closes, t["T-1"]) == (False, "Closed T-1 as duplicate.", ["T-1"], "closed")
+
+def test_decline_cancel_and_unconfirmed_leave_ticket_open():
+    for action, content in [("decline", None), ("cancel", None), ("accept", {"reason": "fixed", "confirm": False}),
+                            ("accept", {"reason": "because", "confirm": True})]:
+        t = {"T-1": "open"}
+        (err, text), closes = run(t, {"ticket_id": "T-1"}, answering(action, content))
+        assert (err, text, closes, t["T-1"]) == (False, f"Not closed ({action}).", [], "open")
+
+def test_headless_without_reason_gets_actionable_error():
+    (err, text), closes = run({"T-1": "open"}, {"ticket_id": "T-1"})
+    assert err and "pass reason explicitly" in text and closes == []
+
+def test_headless_with_reason_closes():
+    (err, text), closes = run({"T-1": "open"}, {"ticket_id": "T-1", "reason": "wont_fix"})
+    assert (err, text, closes) == (False, "Closed T-1 as wont_fix.", ["T-1"])
+
+def test_repeat_is_idempotent_and_asks_nobody():
+    asked = []
+    (err, text), closes = run({"T-1": "closed"}, {"ticket_id": "T-1"}, answering("accept", {"reason": "fixed", "confirm": True}, asked))
+    assert (err, text, closes, asked) == (False, "T-1 already closed.", [], [])
+
+def test_unknown_ticket():
+    (err, text), _ = run({}, {"ticket_id": "T-9"})
+    assert err and "No ticket T-9" in text
+```
+
+### Failure scenarios
+- **Elicit without checking the client's capability.** Both headless runs return `isError` with
+  `Elicitation not supported`, even the one that passed `reason`. Compare what each host declared (the
+  callback is what declares `elicitation`) and branch on `check_client_capability` first.
+- **Read `answer.data` before checking `answer.action`.** Decline and cancel turn into `isError` results
+  such as `'DeclinedElicitation' object has no attribute 'data'`. Print the result type per action;
+  proceed only on `accept`.
+- **Type `Confirm.reason` as the `Reason` literal.** Every interactive run fails with `Elicitation schema
+  field 'reason' must be a primitive type` (SDK 1.30), although the spec allows enums. Read the full
+  `isError` text, keep the form field a string and validate it in the tool.
+- **Ask before the already-closed check.** The repeat run asks a second question (`questions asked: 4`)
+  and `test_repeat_is_idempotent_and_asks_nobody` fails. Under MRTR the tool body re-runs on retry, so do
+  reads and checks first and write only after the answer.
+
+### Submission
+- `lab.py` with `close_ticket` implemented and the helpers and `main` unchanged.
+- A `pytest -q` run showing 6 passed and the stdout of `python lab.py` matching Expected output.
+- A table of accept, decline, cancel and headless outcomes from your run, with the ticket state after each.
+- A short note (5-8 lines): how this tool would change on the 2026-07-28 wire, where the question returns
+  as `input_required` and what you would seal into `requestState`.
+- Evaluation: tests pass, no path closes without an explicit confirmed `accept` or an explicit headless
+  `reason`, and a repeat never closes twice.
 
 ## Why it exists
 - **Tools sometimes need a decision only the user can make.** Guessing "which environment?" from the

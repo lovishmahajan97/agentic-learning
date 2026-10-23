@@ -5,7 +5,7 @@ name: pydantic-settings
 kind: tool
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

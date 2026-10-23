@@ -5,7 +5,7 @@ name: Quality–latency–cost optimization
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -41,8 +41,11 @@ configurations, and choose from the Pareto frontier under hard constraints.
 ## Decision case
 ### Scenario
 A B2B software company runs the 8-step support agent from the first example (4,000-token prefix, ~600
-tool tokens per step) on a large hosted model. All prices, timings and pass rates are illustrative, using
-the same placeholder price table as that example (small model at a tenth of the large one's prices).
+tool tokens per step) on a large hosted model.
+
+All prices, timings and pass rates are illustrative, using the same placeholder price table as that
+example: the small model costs a tenth of the large one's prices and, as a simplification, has the same
+per-token timings.
 - **Volume:** 120,000 runs a month today, forecast 200,000 within two quarters.
 - **Quality floor:** run success of at least 88% on a 300-task eval, each task run twice (600 runs).
 - **Latency:** p95 model time per run of at most 20 s, because users wait on the agent in a chat panel.
@@ -57,7 +60,8 @@ the same placeholder price table as that example (small model at a tenth of the 
 | C. Run-level cascade | whole run on the small model; a verifier sends the 20% that fail to a full B run | 0.89 | about 32 s | $0.0146 | $1,748 | $0.0164 |
 | D. Per-step routing | large model plans and answers (steps 1 and 8), small model runs the six tool steps | 0.88 | 16.0 s | $0.0339 | $4,068 | $0.0385 |
 
-- **C's cost** is `s + e·l` = 0.00486 + 0.20 × 0.0486; its p95 is an escalated run, two runs back to back.
+- **C's cost** is `s + e·l` = 0.00486 + 0.20 × 0.0486, before the verifier's own cost; its p95 is an
+  escalated run, two 16 s runs back to back.
 - **D saves less than expected** because each model keeps its own prompt cache: every switch re-reads the
   transcript at the uncached rate.
 

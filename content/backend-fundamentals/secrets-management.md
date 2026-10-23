@@ -5,7 +5,7 @@ name: Secrets management
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -208,10 +208,11 @@ def test_log_lines_are_redacted_even_after_rotation():
 
 Four fail on the starter with `AssertionError`. Two pass already and are guards: the cache test fails
 if you "fix" rotation by reading the manager on every call, and the no-loop test fails if a 401 retry
-never stops.
+refetches more than once (an unbounded retry hangs it, so run with a timeout).
 
 ### Failure scenarios
-- **Inject `force=True` on every `get`.** Rotation works, but the cache test reports 50 manager reads.
+- **Inject `force=True` on every `get`.** Rotation works, but the cache test reports 51 manager reads
+  (the boot read plus one per call).
   In production that is one audited, billed API call per LLM request and a hard dependency on the
   manager's availability; watch the read counter or the CloudTrail read rate per identity.
 - **Inject a retry loop `while status == 401`.** With a provider that rejects every key the call

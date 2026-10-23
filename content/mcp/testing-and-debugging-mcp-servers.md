@@ -5,7 +5,8 @@ name: testing and debugging MCP servers (MCP Inspector, contract tests)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - mcp/building-an-mcp-server-end-to-end
@@ -36,6 +37,147 @@ and uses its tools correctly.
 - **What you control.** Which tools and schemas are frozen by tests, how errors are shaped, what the server
   logs (on stderr, never stdout for stdio), and which eval tasks gate a release.
 - **What you can skip.** Testing the SDK's JSON-RPC plumbing; test your tools' contract and behaviour.
+
+## Lab
+### Task
+A tickets server that agents depend on shipped three regressions: a debug `print()` on stdout, a raw
+`KeyError` for unknown ids, and a renamed search parameter with its description deleted. Run the
+contract suite through the real SDK client, read each failure, and fix the server until it is green.
+Time box: 45-75 min.
+- **Prerequisites:** Building an MCP server end to end; Using MCP servers inside agents; the contract-test
+  example in this lesson.
+- **Setup:** Python 3.10+ and `pip install mcp pytest` (`anyio` comes with `mcp`). Checked with Python 3.13,
+  pytest 9.1 and both `mcp` 1.30.0 and 2.3.0 (the import fallback picks the right class). Save the starter as
+  `tickets_server.py` and the tests as `test_contract.py` in one folder, and run pytest from it.
+- **No model calls:** every check talks to the server as a stdio subprocess, exactly as a host launches it.
+
+### Starter code
+```python
+"""Lab: a tickets MCP server with three contract bugs. Run: python tickets_server.py (stdio)"""
+import sys
+try:
+    from mcp.server.mcpserver import MCPServer                     # mcp SDK 2.x
+    from mcp.server.mcpserver.exceptions import ToolError
+except ImportError:
+    from mcp.server.fastmcp import FastMCP as MCPServer            # mcp SDK 1.x
+    from mcp.server.fastmcp.exceptions import ToolError
+
+mcp = MCPServer("tickets")
+TICKETS = {"T-1": {"id": "T-1", "status": "open", "title": "Refund not received"},
+           "T-2": {"id": "T-2", "status": "closed", "title": "Login loop on mobile"}}
+
+# YOUR CODE HERE (1): on stdio, stdout IS the JSON-RPC stream. Keep the message, fix where it goes.
+print(f"tickets server loaded {len(TICKETS)} tickets", flush=True)
+
+@mcp.tool()
+def get_ticket(ticket_id: str) -> dict:
+    """Fetch one support ticket by id, for example 'T-1'."""
+    # YOUR CODE HERE (2): an unknown id must come back as an isError result whose text says
+    # "no ticket <id>; ticket ids look like T-1", not as a KeyError.
+    return TICKETS[ticket_id]
+
+@mcp.tool()
+def search_tickets(q: str, status: str = "open") -> list[dict]:
+    # YOUR CODE HERE (3): the parameter was renamed from `query` and the docstring deleted. Agents were
+    # built against required ["query"] and a description under 300 characters: restore both.
+    return [t for t in TICKETS.values() if q.lower() in t["title"].lower() and t["status"] == status]
+
+if __name__ == "__main__":
+    mcp.run()        # stdio by default
+```
+
+### Expected output
+`pytest -q test_contract.py` on a fixed server prints these key lines (the timing varies), and
+launching the server by hand shows the log line on stderr only:
+
+```
+....                                                                     [100%]
+4 passed in 1.95s
+```
+
+- **On the starter, all 4 fail, each for its own reason:** `non-protocol text on stdout: 'tickets server
+  loaded 2 tickets'`; `['q'] == ['query']`; a generic error text (`Error executing tool get_ticket`, plus
+  `: 'nope'` on SDK 1.x); and the search call returned as an error because `q` is missing.
+
+### Tests
+```python
+import json, subprocess, sys
+import anyio, pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+SERVER = StdioServerParameters(command=sys.executable, args=["tickets_server.py"])
+CONTRACT = {"get_ticket": ["ticket_id"], "search_tickets": ["query"]}   # tool -> required params
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+async def session_call(fn):
+    with anyio.fail_after(10):                       # a corrupted stream hangs instead of failing
+        async with stdio_client(SERVER) as (read, write):
+            async with ClientSession(read, write) as s:
+                await s.initialize()
+                # wire-format dict (inputSchema, isError) on SDK 1.x and 2.x alike
+                return (await fn(s)).model_dump(by_alias=True, exclude_none=True)
+
+def test_stdout_carries_only_json_rpc():
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {},
+        "clientInfo": {"name": "contract-test", "version": "0"}}}
+    p = subprocess.run([sys.executable, "tickets_server.py"], input=json.dumps(init) + "\n",
+                       capture_output=True, text=True, timeout=10)
+    lines = [l for l in p.stdout.splitlines() if l.strip()]
+    assert lines, p.stderr
+    for line in lines:
+        assert line.startswith("{") and json.loads(line)["jsonrpc"] == "2.0", \
+            f"non-protocol text on stdout: {line!r}"
+    assert "loaded 2 tickets" in p.stderr               # the log line still exists, on stderr
+
+@pytest.mark.anyio
+async def test_tool_surface_matches_the_contract():
+    tools = await session_call(lambda s: s.list_tools())
+    surface = {t["name"]: t for t in tools["tools"]}
+    assert set(surface) == set(CONTRACT)
+    for name, required in CONTRACT.items():
+        assert surface[name]["inputSchema"].get("required") == required, name
+        assert 0 < len(surface[name].get("description", "")) < 300, f"{name} needs a description"
+
+@pytest.mark.anyio
+async def test_unknown_ticket_is_an_actionable_error():
+    r = await session_call(lambda s: s.call_tool("get_ticket", {"ticket_id": "nope"}))
+    assert r["isError"] is True
+    assert "no ticket nope; ticket ids look like T-1" in r["content"][0]["text"]
+
+@pytest.mark.anyio
+async def test_known_ticket_and_search_still_work():
+    r = await session_call(lambda s: s.call_tool("get_ticket", {"ticket_id": "T-1"}))
+    assert r["isError"] is False and json.loads(r["content"][0]["text"])["status"] == "open"
+    r = await session_call(lambda s: s.call_tool("search_tickets", {"query": "login", "status": "closed"}))
+    assert r["isError"] is False and "T-2" in r["content"][0]["text"]
+```
+
+### Failure scenarios
+- **Drop `flush=True` from the stray `print()`.** Under a pipe the text sits in a buffer, so stdout can
+  look clean while the bug remains; only the stderr assertion still fails. Debug with
+  `python -u tickets_server.py`, which shows the stray line at once. The fix is stderr, not buffering luck.
+- **Leave the `print()` on stdout and watch a session test.** With `mcp` 1.30 and 2.3 the client skips the
+  bad line and carries on, so only the raw-stdout test catches it; stricter hosts hang or mark the server
+  failed. That is why the suite checks stdout directly instead of trusting one client.
+- **Return `{"error": ...}` instead of raising `ToolError`.** The result has `isError` false, so the model
+  treats a failure as data. The actionable-error test fails on `r.isError is True`; inspect the raw
+  result with the Inspector CLI.
+- **Rename the parameter back but keep no docstring.** Required params pass, the description check fails
+  with `search_tickets needs a description`: the model would see a tool with no explanation.
+
+### Submission
+- **The fixed `tickets_server.py`** and `test_contract.py`, with `pytest -q` showing 4 passed.
+- **A failure log from the starter** (the 4 failure lines) with one sentence per failure naming the
+  root cause.
+- **An Inspector CLI transcript** of `--method tools/list` against the fixed server, showing `query` in
+  the schema.
+- **One extra contract test** of your own, for example a snapshot of `tools/list` stored as JSON.
+- **Evaluated on:** green suite, nothing but JSON-RPC on stdout, and error messages a model could act on.
 
 ## Why it exists
 - **The model is the main consumer.** Unlike a REST API, a breaking change here often still "works": calls

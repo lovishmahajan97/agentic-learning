@@ -5,7 +5,7 @@ name: Model integration
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -47,7 +47,8 @@ Constraints (figures illustrative):
   outage, so a hosted fallback is not allowed.
 - **Acceptance.** At least 170 of 200 suite cases (85%) must pass, and every tool call must parse.
 - **Deadline.** Go-live in 6 weeks.
-- **Context.** Prompts pack 10 chunks of 2,000 tokens; the new tokenizer counts about 15% more.
+- **Context.** Prompts pack a 1,500-token system prompt, 4,000 tokens of history and 10 chunks of 2,000
+  tokens, with 4,000 reserved for output (29,500 in all); the new tokenizer counts about 15% more input.
 - **Capacity.** Two GPU nodes, sized for the current median of 4 steps per task.
 
 ### Options
@@ -65,7 +66,7 @@ Choose **B**, because it meets acceptance inside the deadline without touching t
 - **176 / 200 is 88%**, above the 85% bar. The 6 cases below the hosted model's 182 go to the bank as
   paired flips, so it accepts the gap with evidence.
 - **The context budget is recomputed.** At +15% the old pack totals about 33,300 tokens, over the window,
-  so the packer deliberately takes 9 chunks, not 10.
+  so the packer deliberately takes 9 chunks, not 10: about 31,000 tokens, a 1,000-token margin.
 - **The capability check runs at deploy.** No parallel tool calls means the loop is configured for one
   call per turn, which the contract tests cover.
 - **The fallback stays inside the network.** It is a second replica of the same model, with handoff to a

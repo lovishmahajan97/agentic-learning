@@ -5,7 +5,7 @@ name: Engines (vLLM, SGLang, TGI, TensorRT-LLM, Ollama, llama.cpp)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -50,7 +50,8 @@ the deploy gate for that move.
   `base_url` only to engines that pass.
 - **KV plan:** set `--max-model-len` and the concurrent-run cap for 20-step runs on one 80 GB GPU.
 - **Time box:** 45-60 minutes.
-- **Prerequisites:** KV cache, and this lesson's capacity calculator and tool-calling contract test.
+- **Prerequisites:** KV cache memory estimation, and this lesson's capacity calculator and tool-calling
+  contract test.
 - **Runs offline:** the five responses were recorded in OpenAI chat-completions shape, so no GPU, engine
   or API key is needed. Standard library plus `pytest`; checked on Python 3.12 with pytest 9.1.
 - **Done means** the tests pass and the script prints the expected report.
@@ -104,7 +105,7 @@ def kv_plan(gpu_gb, util, weights_gb, activations_gb, n_layers, n_kv_heads, head
       pool_tokens      (gpu_gb * util - weights_gb - activations_gb) * 1e9 // per_token_bytes
       peak_tokens      live tokens at the last step: prefix + (steps - 1) * tokens_per_step
       max_model_len    peak_tokens rounded UP to a multiple of 1024
-      concurrent_runs  how many runs at peak length fit in the pool (floor)
+      concurrent_runs  how many runs at peak length fit in the pool: pool_tokens // peak_tokens
     """
     # YOUR CODE
     raise NotImplementedError("kv_plan")
@@ -194,8 +195,9 @@ All 11 fail on the starter with `NotImplementedError`; a correct solution passes
 - **Inject: round `max_model_len` down (`peak // 1024 * 1024`).** You get 33792, below the 34,500-token
   peak, so the engine would refuse the run's last steps for exceeding the context. Debug by asserting
   `max_model_len >= peak_tokens` before printing flags.
-- **Inject: use 1024³ bytes per GB.** The pool becomes about 426,000 tokens and every capacity number
-  drifts. Debug by matching the unit to the one your engine's startup log reports.
+- **Inject: use 1024³ bytes per GB.** The pool becomes 425,984 tokens and the run cap rises from 11 to
+  12 (33 to 35 for 5-step runs), so both `kv_plan` tests fail and you would over-admit. Debug by matching
+  the unit to the one your engine's startup log reports.
 
 ### Submission
 - **`engine_gate.py`** with the three functions implemented and no edits to `RECORDED` or `TOOLS`.

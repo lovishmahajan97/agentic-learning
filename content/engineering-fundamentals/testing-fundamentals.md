@@ -5,7 +5,8 @@ name: Testing fundamentals
 kind: practice
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -41,6 +42,191 @@ the model and network with test doubles, and leave model quality to evals.
   whether your suite is deterministic enough to trust.
 - **What you can skip.** Coverage-percentage targets as a goal in themselves, and asserting on the exact
   wording of model output; those belong to evals with graded criteria.
+
+## Lab
+### Task
+Test a tool-calling agent loop end to end without spending a token. Build the two doubles the suite
+needs, a scripted model that is both stub and spy, and an in-memory payments fake that deduplicates by
+idempotency key; then fix the retriever's tie order so its test stops depending on load order. Time
+box: 45-75 min.
+- **Prerequisites:** the test-double table and flaky-test causes in How it works; the retriever example
+  below; HTTP from first principles for why idempotency keys exist.
+- **Setup:** Python 3.9+ and `pip install pytest` (checked with Python 3.9.6 and pytest 8.4.2). Save the
+  starter as `lab.py` and the tests as `test_lab.py`. `run_agent` is the code under test: do not change
+  it.
+- **Why a dict, not a set:** the starter's tie bug is made deterministic (insertion order) so you can see
+  it every run; with a set, as in the example below, the same bug flips by hash seed.
+
+### Starter code
+```python
+"""Lab: test an agent loop end to end with zero tokens: stub, spy, fake, and a flaky tie. Run: python lab.py"""
+import json, re
+
+class ScriptedModel:
+    """Stub + spy: returns scripted turns in order and records every messages list it was sent."""
+    def __init__(self, turns):
+        self.turns = list(turns)
+        self.calls = []
+
+    def complete(self, messages):
+        # YOUR CODE HERE: append a COPY of messages to self.calls (the loop keeps mutating its list),
+        # then return the next turn; when the script is used up raise
+        # AssertionError(f"script exhausted after {len(self.calls) - 1} turns")
+        raise NotImplementedError
+
+class FakePayments:
+    """Fake: a working in-memory payments API that deduplicates by idempotency key."""
+    def __init__(self):
+        self.charges = []                       # every charge actually made
+        self._by_key = {}
+
+    def charge(self, customer, cents, key):
+        # YOUR CODE HERE: a key seen before returns the original charge id and charges nothing;
+        # a new key appends (customer, cents) to self.charges and returns f"ch_{len(self.charges)}"
+        raise NotImplementedError
+
+def tokens(text):
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+def search(docs, query, k=2):
+    q = tokens(query)
+    scored = {d: len(q & tokens(t)) for d, t in docs.items()}
+    hits = [d for d in docs if scored[d] > 0]
+    return sorted(hits, key=lambda d: -scored[d])[:k]     # planted bug: ties keep insertion order
+
+def make_tools(docs, payments, run_id):
+    return {
+        "search": lambda query: {"ids": search(docs, query)},
+        "charge": lambda customer, cents: {
+            "charge_id": payments.charge(customer, cents, key=f"{run_id}:{customer}:{cents}")},
+    }
+
+def run_agent(model, tools, task, max_steps=4):
+    """The code under test. Do not change it."""
+    messages = [{"role": "user", "content": task}]
+    for step in range(max_steps):
+        turn = model.complete(messages)
+        if "final" in turn:
+            return {"status": "done", "answer": turn["final"], "steps": step + 1}
+        result = tools[turn["tool"]](**turn["args"])
+        messages.append({"role": "tool", "name": turn["tool"], "content": json.dumps(result)})
+    return {"status": "step_limit", "steps": max_steps}
+
+DOCS = {
+    "refunds": "Refund policy: refunds within 30 days",
+    "shipping": "Shipping policy: ships in 2 days",
+    "returns": "Returns policy: return within 30 days",
+}
+
+if __name__ == "__main__":
+    pay = FakePayments()
+    tools = make_tools(DOCS, pay, run_id="r1")
+    m = ScriptedModel([{"tool": "search", "args": {"query": "refunds"}}, {"final": "Refunds take 30 days."}])
+    out = run_agent(m, tools, "how do refunds work?")
+    sent_back = "refunds" in m.calls[1][-1]["content"]
+    print("run:", out["status"], f"steps={out['steps']}", "| tool result sent back:", sent_back)
+
+    charge = {"tool": "charge", "args": {"customer": "c9", "cents": 4200}}
+    m = ScriptedModel([charge, charge, {"final": "charged"}])
+    run_agent(m, tools, "charge c9 $42")
+    ids = [json.loads(c[-1]["content"])["charge_id"] for c in m.calls[1:]]
+    print("charges:", len(pay.charges), ids)
+
+    m = ScriptedModel([{"tool": "search", "args": {"query": "x"}}] * 5)
+    print("limit:", run_agent(m, tools, "loop")["status"], f"model_calls={len(m.calls)}")
+
+    flipped = dict(reversed(list(DOCS.items())))          # same docs, another replica's load order
+    q = "policy within 30 days"
+    print("search:", search(DOCS, q), search(flipped, q))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+run: done steps=2 | tool result sent back: True
+charges: 1 ['ch_1', 'ch_1']
+limit: step_limit model_calls=4
+search: ['refunds', 'returns'] ['refunds', 'returns']
+```
+
+- **Read the lines:** the spy proves the loop sent the search result back; the model emitted the charge
+  twice and one charge was made; a model that never finishes stops at `max_steps`; `refunds` and
+  `returns` tie at 4 shared tokens and now sort by id whatever the load order.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter, 5 fail with `NotImplementedError` and the tie test fails
+with `AssertionError` (`['returns', 'refunds']` for the flipped load order). A correct solution passes
+all 6 (Python 3.9.6, pytest 8.4.2).
+
+```python
+import json
+import pytest
+from lab import DOCS, FakePayments, ScriptedModel, make_tools, run_agent, search
+
+@pytest.fixture
+def pay():
+    return FakePayments()                       # fresh fake per test: no shared state
+
+def test_loop_sends_the_tool_result_back(pay):
+    m = ScriptedModel([{"tool": "search", "args": {"query": "refunds"}}, {"final": "ok"}])
+    out = run_agent(m, make_tools(DOCS, pay, "r1"), "how do refunds work?")
+    assert out == {"status": "done", "answer": "ok", "steps": 2}
+    assert len(m.calls) == 2 and len(m.calls[0]) == 1          # the spy kept copies, not one list
+    assert m.calls[1][-1] == {"role": "tool", "name": "search", "content": json.dumps({"ids": ["refunds"]})}
+
+def test_repeated_charge_call_is_deduplicated(pay):
+    charge = {"tool": "charge", "args": {"customer": "c9", "cents": 4200}}
+    m = ScriptedModel([charge, charge, {"final": "charged"}])
+    run_agent(m, make_tools(DOCS, pay, "r1"), "charge c9")
+    assert pay.charges == [("c9", 4200)]
+    ids = [json.loads(c[-1]["content"])["charge_id"] for c in m.calls[1:]]
+    assert ids == ["ch_1", "ch_1"]
+
+def test_different_runs_are_separate_charges(pay):
+    for run_id in ("r1", "r2"):
+        make_tools(DOCS, pay, run_id)["charge"](customer="c9", cents=4200)
+    assert len(pay.charges) == 2
+
+def test_step_limit_stops_a_looping_model(pay):
+    m = ScriptedModel([{"tool": "search", "args": {"query": "x"}}] * 5)
+    assert run_agent(m, make_tools(DOCS, pay, "r1"), "loop") == {"status": "step_limit", "steps": 4}
+    assert len(m.calls) == 4
+
+def test_exhausted_script_fails_loudly():
+    m = ScriptedModel([{"final": "only one"}])
+    m.complete([])
+    with pytest.raises(AssertionError, match="script exhausted after 1 turns"):
+        m.complete([])
+
+def test_tie_order_does_not_depend_on_load_order():
+    flipped = dict(reversed(list(DOCS.items())))
+    q = "policy within 30 days"
+    assert search(DOCS, q) == search(flipped, q) == ["refunds", "returns"]
+```
+
+### Failure scenarios
+- **Make the fake ignore the key.** The second line becomes `charges: 2 ['ch_1', 'ch_2']`: the
+  double-charge from the Mastery test, caught by a test that checks the outcome (charges made), which
+  a mock asserting "`charge()` was called" would have passed.
+- **Let the spy store the list itself** (`self.calls.append(messages)`). Every entry becomes the same,
+  final list, so `len(m.calls[0]) == 1` fails; a spy that aliases mutable state reports what the loop
+  ended with, not what the model saw at each step.
+- **Return `None` when the script runs out.** The loop dies with `TypeError: argument of type
+  'NoneType' is not iterable` inside `run_agent`, and you debug the wrong code. A stub should fail at
+  the stub, with a message naming the cause.
+- **Remove the tie-break again.** Only the tie test fails, and with a set instead of a list it would
+  fail on some hash seeds only. Rerun under `PYTHONHASHSEED=0..9` as in the example to prove it.
+
+### Submission
+- **`lab.py`** with `complete`, `charge` and the tie-break implemented; `run_agent` unchanged.
+- **A green run** of `pytest -q test_lab.py` (6 passed), and a second green run in random order with
+  the pytest-randomly plugin installed.
+- **The output** of `python lab.py` matching the block above.
+- **A note** (3-5 sentences): which double each test uses (stub, spy, fake) and one bug each would miss
+  without the others.
+- **Evaluated on:** no test calls a model or the network; each test builds its own fake; the tests check
+  outcomes, not call sequences.
 
 ## Why it exists
 - **Manual checking does not scale.** An agent with 10 tools and 3 retrieval modes has too many paths

@@ -6,7 +6,8 @@ kind: concept
 difficulty: core
 est_minutes: 16
 agent_relevance: core
-status: mastery-verified
+status: typed
+lesson_type: concept
 mastery: evaluate
 code_tested: partial
 prerequisites:
@@ -110,7 +111,41 @@ flowchart TD
     R -->|"no"| F["Failure analysis: prompt, constrain, fine-tune"]
 ```
 
+## Misconceptions
+- **"A higher leaderboard score means a better agent model."** Public benchmarks measure general knowledge
+  and reasoning, not your tool schemas, prompt format or multi-step stability. Use them to shortlist and
+  your own golden set to decide.
+- **"I evaluated the model, so I know how the build will do."** Small models move with quantization,
+  template and decoding settings: in the scorecard below the same 3B drops from 84% to 77% task success
+  going from 8-bit to 4-bit. Evaluate the exact file, engine and settings you serve.
+- **"95% tool accuracy means the agent works."** Errors compound across steps: 0.95^10 ≈ 0.6, so about 60%
+  of 10-step tasks finish fully correct, assuming independent steps. Measure task success in a sandbox as
+  well as call-level metrics.
+- **"A 2-point gap on one run picks the winner."** On 100 cases near 90% success the standard error is about
+  3 points per rate, so the gap is noise until repeated runs show spread smaller than it.
+- **"The model with the cheapest call is the cheapest to run."** A model that fails more pays for retries
+  and escalations; compare cost per successful task, not cost per call.
+
 ## Examples
+### Worked scenario: picking an SLM for an extraction-and-routing agent
+Illustrative scorecard on 600 cases, same prompts and hardware, three runs each.
+
+| Candidate | Parse rate | Tool accuracy | Task success | p95 step latency | Verdict |
+|---|---|---|---|---|---|
+| Large hosted model (baseline) | 100% | 96% | 93% | 1.8 s | reference |
+| 7B, 4-bit | 99.5% | 93% | 89% | 0.9 s | strong candidate |
+| 3B, 8-bit | 98% | 90% | 84% | 0.5 s | good with a cascade |
+| 3B, 4-bit | 95% | 86% | 77% | 0.4 s | quantization hurt; reject |
+| 1B, 8-bit | 88% | 74% | 61% | 0.3 s | too weak for this task |
+
+- **Insight:** the 3B lost 7 task-success points from 8-bit to 4-bit, so the quantized build, not the
+  family, is what you evaluate.
+- **Against the gate:** no SLM alone is within 2 points of the 93% baseline; the 7B 4-bit comes closest at
+  89%.
+- **Decision:** put the 3B 8-bit (or the 7B 4-bit if hardware allows) behind a cascade that escalates on
+  schema failure or verifier reject, and ship only if the cascade as a whole passes the gate on the same
+  600 cases.
+
 ### A minimal tool-call eval across local models
 Compares models on any OpenAI-compatible server (here Ollama) on tool name, argument match and latency.
 
@@ -154,25 +189,6 @@ for m in MODELS:
 
 Before trusting the ranking, grow `CASES` to hundreds, add a schema check and a multi-step sandbox
 suite, and repeat with sampling on.
-
-### Worked scenario: picking an SLM for an extraction-and-routing agent
-Illustrative scorecard on 600 cases, same prompts and hardware, three runs each.
-
-| Candidate | Parse rate | Tool accuracy | Task success | p95 step latency | Verdict |
-|---|---|---|---|---|---|
-| Large hosted model (baseline) | 100% | 96% | 93% | 1.8 s | reference |
-| 7B, 4-bit | 99.5% | 93% | 89% | 0.9 s | strong candidate |
-| 3B, 8-bit | 98% | 90% | 84% | 0.5 s | good with a cascade |
-| 3B, 4-bit | 95% | 86% | 77% | 0.4 s | quantization hurt; reject |
-| 1B, 8-bit | 88% | 74% | 61% | 0.3 s | too weak for this task |
-
-- **Insight:** the 3B lost 7 task-success points from 8-bit to 4-bit, so the quantized build, not the
-  family, is what you evaluate.
-- **Against the gate:** no SLM alone is within 2 points of the 93% baseline; the 7B 4-bit comes closest at
-  89%.
-- **Decision:** put the 3B 8-bit (or the 7B 4-bit if hardware allows) behind a cascade that escalates on
-  schema failure or verifier reject, and ship only if the cascade as a whole passes the gate on the same
-  600 cases.
 
 ## Production patterns
 - **Keep the harness model-agnostic.** Call every candidate through an OpenAI-compatible endpoint (Ollama,

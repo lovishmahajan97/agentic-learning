@@ -5,7 +5,7 @@ name: Capacity planning (tokens/sec, requests/sec, concurrent sessions)
 kind: practice
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -45,7 +45,8 @@ them; a load test sets replica capacity.
 A team self-hosts the research agent from the multi-step example below and must decide what to order.
 All figures are illustrative and reuse that example.
 - **Peak traffic:** 2 runs/sec, 10 steps per run, a 4,000-token prefix growing by 1,000 per step, 200
-  output tokens and 2 s of tool time per step: 20 calls/sec, 136 sequences in flight, 176 live runs.
+  output tokens and 2 s of tool time per step; a model call stays in flight ~6.8 s at peak. So 20
+  calls/sec, 20 × 6.8 = 136 sequences in flight, and 2 × 10 × (6.8 + 2) = 176 live runs (L = λW).
 - **Replica capacity from a load test of recorded runs:** 49 sequences (KV-bound) and ~25,000 prefill
   tokens/sec within the TTFT budget; plans use 70% target utilization and one spare.
 - **Today:** 5 replicas, sized from in-flight calls; p95 TTFT breaches at peak.

@@ -5,7 +5,7 @@ name: Epochs
 kind: concept
 difficulty: intro
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:

@@ -5,7 +5,7 @@ name: NoSQL
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -207,7 +207,8 @@ def test_large_result_is_offloaded(store):
   the own-retry test raises, so every network retry after a lost acknowledgement crashes the run. Debug:
   on `ConditionalCheckFailed`, compare the stored item with yours; equal means your earlier attempt landed.
 - **Inject: blob key `f"{session_id}/{step_no}"`.** A racing worker's large result overwrites the
-  first writer's blob before its conditional put fails, so step 13 now points at the wrong page. Debug:
+  first writer's blob before its conditional put fails, so step 13 now points at the wrong page (and a
+  read-back sees an identical pointer, so the conflict is not even reported). Debug:
   add a racing test with two large results; key blobs by a content hash such as SHA-256.
 - **Inject: pad to 2 digits (`:02d`).** Tests pass, then step 100 sorts before step 99. Debug: list the
   sort keys around the boundary; pad to the widest step number you will ever write, such as 8 digits.

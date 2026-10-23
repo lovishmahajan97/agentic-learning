@@ -5,7 +5,8 @@ name: internal knowledge assistant (enterprise RAG with ACLs)
 kind: practice
 difficulty: core
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - rag-retrieval/acl-aware-retrieval
@@ -40,6 +41,66 @@ faster onboarding without leaking confidential content.
   expose search as a tool to other agents.
 - **What you can skip.** Fine-tuning a model on company documents. Retrieval with ACL filters is cheaper,
   fresher and respects permissions, which fine-tuning cannot.
+
+## Decision case
+### Scenario
+A 4,000-person company is piloting the assistant over Confluence, Google Drive and public Slack
+channels. The open question is where permissions are enforced. All figures are illustrative planning
+numbers, including the API quota.
+- **Load:** a 9 a.m. peak of about 2 questions a second; each query reranks the top 20 chunks.
+- **Sensitivity:** HR, legal and finance folders hold about 5% of chunks, so a typical top 20 contains
+  one sensitive chunk.
+- **Revocation rules from the CISO:** a removed permission must stop answering within 1 hour for all
+  sources and within 5 minutes for sensitive folders.
+- **Latency:** first token under 2 s p95, the target from the examples.
+- **Source limits:** the Drive service account may make about 10 live permission checks a second.
+- **Hard rule:** zero leaks on the ACL test suite; identity comes from SSO, never from the prompt.
+
+### Options
+| Option | How it works | 1-hour rule | 5-minute rule | Live checks at peak | Latency |
+|---|---|---|---|---|---|
+| A. Post-filter with synced ACLs | Retrieve top-k, drop forbidden chunks | met with a 15-minute sync | fails | 0 | fast, but results thin out |
+| B. Pre-filter with synced ACLs | ACL metadata in the index query, synced every 15 minutes | met | fails: up to 15 minutes stale | 0 | fast |
+| C. Pre-filter plus live check on sensitive chunks | B, then re-check sensitive chunks against the source before quoting | met | met | 2 x 1 = 2 a second | slower only when a sensitive chunk is a candidate |
+| D. Live check on every candidate | Source API decides every chunk | met | met | 2 x 20 = 40 a second, 4 times the quota | slow on every query |
+
+### Decision
+**Option C.** Pre-filtering keeps forbidden text out of every candidate list, and the synced ACLs meet
+the 1-hour rule. The live check closes the gap only where the 5-minute rule applies, at about 2 checks a
+second, a fifth of the quota.
+- **Fail closed:** if a live check times out or hits the quota, the sensitive chunk is dropped and the
+  answer may say "not found"; it is never shown unchecked.
+- **Revocation test in CI:** remove a test user from a sensitive group and time how long until search
+  stops returning the document; it must stay under 5 minutes.
+
+**What would change it.** If sensitive content reaches 25% of chunks, live checks hit 2 x 20 x 0.25 = 10
+a second, the whole quota. Then move sensitive sources to their own index with event-driven permission
+sync.
+
+If the sources push permission changes within 5 minutes, drop the live checks for B. If a vendor
+product passes the same leak and revocation tests, re-run build versus buy.
+
+### Trade-offs accepted
+- **Non-sensitive sources can be 15 minutes stale.** That is inside the 1-hour rule. Run the revocation
+  test for one ordinary page weekly and alert on sync lag.
+- **Sensitive hits add latency.** Split p95 by whether a live check ran, so the slow path stays visible
+  against the 2 s target.
+- **Fail-closed answers look like gaps.** Count dropped sensitive chunks per day; a spike means quota
+  trouble, not missing content.
+- **Sensitivity tags can be wrong.** An untagged HR folder gets only the 15-minute sync. Owners review
+  tags quarterly, and new folders under HR, legal or finance default to sensitive.
+
+### Review rubric
+- **Enforcement point named:** the write-up states where the ACL filter runs relative to ranking and
+  generation, and why before is required.
+- **Freshness rules mapped:** each revocation window is matched to a mechanism (sync interval or live
+  check) that meets it.
+- **Quota arithmetic shown:** live-check load is computed from peak queries, candidates and the
+  sensitive share, and compared with the source limit.
+- **Failure mode chosen:** the write-up says whether a failed check fails open or closed.
+- **Leak and revocation tests gate releases,** with a timed revocation test, not just static ACL
+  questions.
+- **Reversal conditions stated:** the share, push support or vendor result that would reopen it.
 
 ## Why it exists
 - **Knowledge is scattered.** Answers live across wikis, drives, tickets and chat threads; people ask

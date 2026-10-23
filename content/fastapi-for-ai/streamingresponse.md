@@ -165,8 +165,10 @@ def test_oversized_prompt_is_rejected_before_streaming():
 - **Drop the `try/except` around the loop.** The failing-tool test sees a truncated stream with neither
   `done` nor `error`, and the server log shows a traceback after a 200. Debug: count runs ending without
   a terminal record.
-- **Yield dicts or forget the `"\n"`.** Records glue together and `json.loads` fails on the client.
-  Debug: print `repr(line)` from `iter_lines()` to see the framing.
+- **Forget the `"\n"`, or yield the dicts unencoded.** Without the newline, records glue together and
+  `json.loads` fails on the client with "Extra data"; a raw dict fails on the server at the first chunk,
+  so the client gets a 200 with an empty body. Debug: print `repr(line)` from `iter_lines()` to see the
+  framing, and check the server log for the encode error.
 - **Make `search_orders` call `time.sleep`.** Tests still pass, but concurrent streams stall each other.
   Debug: run two `curl -N` clients at once and compare first-byte times.
 

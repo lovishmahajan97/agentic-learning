@@ -5,7 +5,7 @@ name: Model routing / cascading
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -49,9 +49,10 @@ frontier model today. Units and latencies are illustrative.
 - **Constraints:** finance wants model cost per task halved (at most 60 units against 120 today); the
   chat UI streams per-step progress, so each step's p95 must stay at or under 4 s; task success must not
   drop; two engineers, four weeks.
-- **Data available:** 2,000 traced tasks but no router labels. Replaying them shows small-model tool
-  steps succeed 0.97 each ungated and fail the schema gate 15% of the time. With the gate, escalated
-  steps behave like the large model's 0.99.
+- **Data available:** 2,000 traced tasks but no router labels. Replaying them shows 15% of small-model
+  tool calls fail the schema gate. Calls that pass succeed 0.99, like the large model. Ungated, the
+  agent's own retry after a tool error rescues most failing calls, so a small tool step succeeds about
+  0.97 overall. With the gate, failing calls escalate and succeed at the large model's 0.99.
 - **Cost of a failed task:** a human hand-off, priced at 300 units.
 
 ### Options

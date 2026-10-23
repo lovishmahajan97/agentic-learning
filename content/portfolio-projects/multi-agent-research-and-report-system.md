@@ -6,7 +6,8 @@ kind: practice
 difficulty: advanced
 est_minutes: 35
 agent_relevance: core
-status: agentic-verified
+status: typed
+lesson_type: decision
 related:
   - practice-use-cases/deep-research-agent
   - agents/multi-agent-patterns
@@ -39,6 +40,61 @@ their cost and evaluate trajectories.
   rubric and the stop conditions.
 - **What you can skip.** A dozen specialised agent personas. One planner, one worker type, one writer
   and one critic cover the pattern; more roles add cost without proof of value.
+
+## Decision case
+### Scenario
+A consulting firm wants vendor-comparison reports for its analysts and must decide whether the
+multi-agent design is worth it. All figures are illustrative measurements on the team's 15 test questions,
+not benchmarks.
+- **Volume:** about 400 reports a month (20 a working day).
+- **Cost cap:** $1 per report, the target in the evals table above.
+- **Latency:** p95 under 5 minutes, because analysts wait for the report in a meeting prep window.
+- **Quality bar:** beat a single-agent baseline (same tools, strong model) on 70%+ of questions, scored
+  by the rubric judge.
+- **Measured baseline:** the single agent costs $0.40 a report but takes p95 11 minutes, because it
+  searches sub-questions one after another.
+- **Measured cost split:** in the all-strong multi-agent run ($1.60), workers use 70% of the spend
+  ($1.12); planner, writer and critic use $0.48.
+
+### Options
+| Option | How it works | Cost a report (a month) | p95 latency | Beats baseline |
+|---|---|---|---|---|
+| Single agent (baseline) | One strong model with search and fetch, serial | $0.40 ($160) | 11 min | n/a, it is the baseline |
+| Single agent, parallel tool calls | One agent issues several searches per step | $0.55 ($220) | 6 min | 8 of 15 (53%) |
+| Multi-agent, strong model everywhere | Planner, 3-6 workers, writer, one critic round | $1.60 ($640) | 4 min | 12 of 15 (80%) |
+| Multi-agent, tiered models | Same graph; workers on a model priced about one fifth per token | $0.48 + $1.12 / 5 = $0.704 ($281.60) | 4.5 min | 11 of 15 (73%) |
+
+### Decision
+**Multi-agent with model tiering by role: strong planner, writer and critic, cheaper workers.** It is the
+only option inside all three constraints.
+- **The single agent fails latency** (11 minutes), and parallel tool calls in one agent still miss both the
+  5-minute target and the quality bar, because one context fills with every sub-question's raw pages.
+- **All-strong multi-agent is best on quality** but costs $1.60, 60% over the cap.
+- **Tiering keeps most of the gain:** workers mostly search and extract quotes, while the judgment-heavy
+  steps (plan, write, critique) keep the strong model.
+
+**What would change it.** If analysts accept 15-minute reports, the $0.40 baseline wins on cost. If the
+cap rises to $1.60, the all-strong graph buys one more winning question in 15. If worker-model scores drop
+on a new domain, move that domain's workers back to the strong model and price it per report.
+
+### Trade-offs accepted
+- **A thin quality margin on a small set.** 11 of 15 is 73%; one flipped question gives 10 of 15 (67%) and
+  fails the bar. Grow the set to 40 questions before launch and re-run the comparison.
+- **Weaker workers can miss caveats.** Watch the unsupported-claim rate and the critic's gap reports per
+  worker model, and sample reports for a human check each week.
+- **More moving parts than one agent.** Four roles mean more prompts and traces. Trace per role with a
+  shared run id and alert on cost per role, not just per report.
+
+### Review rubric
+- **Baseline included:** the write-up compares against a single agent with the same tools, on the same
+  questions, before claiming a multi-agent win.
+- **Cost broken down by role:** spend is split between planner, workers, writer and critic, and the tiering
+  saving is computed from that split.
+- **Every constraint checked per option:** cost, latency and quality are each tested, not traded off
+  silently.
+- **Sample size stated:** the number of test questions is given and the margin over the bar is judged
+  against it.
+- **Change triggers stated:** which latency, budget or domain change would flip the decision.
 
 ## Why it exists
 - **Research questions are wide.** "Compare five vendors on pricing, security and integrations" has

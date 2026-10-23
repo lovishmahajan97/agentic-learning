@@ -6,7 +6,8 @@ kind: practice
 difficulty: advanced
 est_minutes: 40
 agent_relevance: core
-status: agentic-verified
+status: typed
+lesson_type: decision
 related:
   - enterprise-integration/sso-iam-integration
   - backend-fundamentals/oauth-2-0-oidc
@@ -39,6 +40,62 @@ log. It proves you can pass an enterprise security review.
   approval, what the audit record contains and how long it is kept.
 - **What you can skip.** Building an identity provider. Use a free developer tenant of a hosted IdP or a
   local Keycloak, and spend the time on authorization and audit.
+
+## Decision case
+### Scenario
+A 2,000-employee company is building this internal agent with tools over three systems: an ERP for
+invoices, an HR system and an IT ticketing tool. The team must choose how tools authenticate downstream.
+Effort figures are illustrative team estimates, not benchmarks.
+- **Security review rule:** downstream access must follow the signed-in user's own permissions, and any
+  exception must be documented and narrowly scoped.
+- **Revocation:** under 15 minutes from IdP group removal to lost tool access (the target above). Group
+  sync every 5 minutes plus 5-minute access tokens gives a worst case of 10 minutes.
+- **What each system supports:** the ERP accepts tokens issued through IdP token exchange (RFC 8693); the
+  HR system supports per-user OAuth consent; the ticketing tool accepts only API keys.
+- **Data sensitivity:** HR is highly sensitive, ERP moderately, ticketing holds low-sensitivity IT requests.
+- **Deadline:** 15 working days (the 3-week plan), two engineers.
+
+### Options
+| Option | How it works | Follows user permissions downstream? | Build effort | Passes review? |
+|---|---|---|---|---|
+| Shared service account | One super-user key per system, agent-side RBAC only | no | about 2 days | no: one injection reads all HR data |
+| Service account plus app-side record filters | Agent re-implements each system's row-level rules | only as far as the copy is correct | about 5 days per system, 15 days | doubtful: rules drift from the source system |
+| Delegated tokens everywhere | Token exchange or per-user OAuth for all three | yes | blocked: ticketing has no OAuth | n/a |
+| Delegated where supported, scoped exception for ticketing | Token exchange for ERP (3 days), per-user OAuth for HR (4 days), ticketing adapter (2 days) that only creates and reads tickets whose requester is the session user | yes for ERP and HR | 9 days | yes, with a documented exception |
+
+### Decision
+**Delegate where the system supports it, and wrap ticketing in a narrowly scoped adapter as a documented
+exception.** It satisfies the review rule for the two sensitive systems and fits in 9 of 15 days.
+- **ERP and HR keep enforcing their own permissions,** so the agent can never exceed what the user could do
+  by hand, and a permission change in HR applies on the next call.
+- **The ticketing exception is acceptable** because the data is low sensitivity and the adapter stamps the
+  requester from the session server-side and refuses any other ticket. The key lives in the secrets
+  manager, never in a prompt.
+- **The executor re-check and hash-chained audit log apply to all three,** so the exception is visible to
+  auditors.
+
+**What would change it.** If the ticketing tool adds OAuth, migrate the adapter to per-user tokens and
+close the exception. If ticketing starts holding HR cases, the exception no longer holds; block that tool
+until delegation exists.
+
+### Trade-offs accepted
+- **Three auth flows to maintain.** Token exchange, per-user consent and an API key each fail differently.
+  Track token-acquisition failures by system and reason on the auth dashboard.
+- **Users must consent to HR access once.** Some will stall at the consent screen. Watch first-use drop-off
+  for HR tools and add a one-line explanation before the redirect.
+- **The ticketing key is broad.** A bug in the adapter could expose other tickets. Cover it with
+  adversarial tests that request another user's ticket, and alert on any adapter denial.
+
+### Review rubric
+- **Per-system capability mapped:** the write-up lists what each downstream system supports before choosing
+  a pattern.
+- **Exceptions justified by sensitivity:** any non-delegated path is tied to low data sensitivity and a
+  server-side scope check.
+- **Revocation computed:** worst-case lag is derived from sync interval and token lifetime and compared
+  with the target.
+- **Effort fits the deadline:** build estimates per system add up inside the stated time.
+- **Audit coverage:** every path, including the exception, writes audit records.
+- **Exit criteria stated:** what vendor or data change would close or revoke the exception.
 
 ## Why it exists
 - **Enterprise buyers ask security questions first.** "Who can make the agent do what, and can we prove

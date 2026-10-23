@@ -5,7 +5,7 @@ name: Quantization (INT8/INT4, GPTQ, AWQ, GGUF)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -189,8 +189,9 @@ flowchart TD
 
 ## Misconceptions
 - **"Quantization makes every agent step faster."** Weight-only INT4 cuts bytes read per decoded token,
-  but prefill stays compute-bound in 16-bit. Agent steps re-send long prompts and decode short tool calls,
-  so the bigger win is often memory freed for KV cache and more concurrent agents.
+  but prefill stays compute-bound in 16-bit (only W8A8 or FP8 speeds the matmul itself). Agent steps
+  re-send long prompts and decode short tool calls, so the bigger win is often memory freed for KV cache
+  and more concurrent agents.
 - **"A 4-bit model is a quarter of the bf16 size."** Group scales and zero-points add overhead: about 4.16
   bits per weight at group 128, so a 70B model is about 36.4 GB, not 35, before the KV cache.
 - **"If perplexity barely moves, the agent is fine."** Perplexity can shift by 0.1 while JSON tool calls,

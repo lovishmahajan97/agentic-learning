@@ -5,7 +5,7 @@ name: Faithfulness / groundedness
 kind: metric
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement
@@ -164,9 +164,9 @@ flowchart TD
   wrong figure among six correct sentences. Atomic claims localise the failure and give a ratio.
 - **"Higher faithfulness is always better."** "I could not find that" contains no claims and scores 1.
   Read it next to answer relevance, abstention rate and, for agents, task success.
-- **"Unsupported is unsupported."** A claim the context contradicts is worse than one it is silent on;
-  merging them lets a reply that contradicts policy ship at 0.8. Keep three verdicts and gate on
-  contradictions.
+- **"Unsupported is unsupported."** A claim the context contradicts is worse than one it is silent on.
+  Scored only as a ratio, a five-claim reply with one claim contradicting policy still reaches 0.8 and
+  ships. Keep three verdicts and gate on contradictions.
 - **"For an agent, the context is the retrieved chunks."** It is every tool result plus the record of
   tool calls made. "I have issued a $240 refund" is supported only by a successful refund call.
 - **"A strong LLM verifier sticks to the context it is given."** Judges lean on their own knowledge.

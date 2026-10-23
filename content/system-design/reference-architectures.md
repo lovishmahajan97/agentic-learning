@@ -5,7 +5,7 @@ name: Reference architectures
 kind: pattern
 difficulty: intro
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -56,7 +56,7 @@ figures are illustrative.
 | Option | Shapes | Calls a day (Q&A + leave) | Write safety | Latency | Fits team and deadline |
 |---|---|---|---|---|---|
 | **A. One tool-using agent for all three jobs** | 3 | about 4 steps per task: (1,200 + 150) × 4 = 5,400 | depends on the agent calling validation; approval gate needed on every write | variable, several sequential calls per answer | one codebase, but the eval must cover every path the agent might take |
-| **B. Composition** | 1 for Q&A, 4 for leave, 2 for payslips, all on 6 | 1,200 × 1 + 150 × 2 = 1,500 | the leave workflow validates balance and dates in code before any write | Q&A is one retrieval plus one call | three small pipelines with three small golden sets |
+| **B. Composition** | 1 for Q&A, 4 for leave, 2 for payslips, all on 6 | 1,200 × 1 + 150 × 2 (parse the request, draft the confirmation) = 1,500 | the leave workflow validates balance and dates in code before any write | Q&A is one retrieval plus one call | three small pipelines with three small golden sets |
 | **C. B plus memory** | B plus 5 | as B, plus memory writes and reads | as B | as B | adds memory policies and a poisoning risk |
 
 ### Decision

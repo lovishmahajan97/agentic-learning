@@ -5,7 +5,7 @@ name: MCP Python SDK
 kind: tool
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -158,7 +158,8 @@ def test_stdout_is_only_json_rpc_and_logs_go_to_stderr():
   `JSONDecodeError`; stricter hosts drop the connection. Debug by running the raw exchange and reading
   stdout line by line.
 - **Raise `Exception("failed")` for a missing ticket.** The call is still `isError`, but the
-  assertion on `create_ticket` in the message fails; in a live agent the model retries the same id. Debug
+  assertion that the message names the id and `create_ticket` fails (the model sees only
+  `Error executing tool get_ticket: failed`); in a live agent the model retries the same id. Debug
   by printing `text(missing)` exactly as the model would see it.
 - **Type `priority` as plain `str`.** The schema loses its `enum` and `"urgent"` is accepted. Debug by
   printing `inputSchema`, or open it in `mcp dev server.py`.

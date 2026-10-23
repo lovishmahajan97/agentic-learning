@@ -5,7 +5,7 @@ name: Long-context vs RAG
 kind: decision
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 mastery: evaluate
@@ -66,7 +66,7 @@ illustrative.
 ### Options
 | Option | How it works | Daily input cost | Context at step 8 | Permissions and freshness | Delivery risk |
 |---|---|---|---|---|---|
-| A. Preload guide and account notes | guide as cached prefix, the rep's account notes appended per run | ≈ $952 ($0.317/run) | ≈ 113k tokens average; 343k for the largest account, over the window | runtime picks the account, so ACL holds; daily note edits only touch the private part | two code paths, because large accounts need retrieval anyway |
+| A. Preload guide and account notes | guide as cached prefix, the rep's account notes appended per run | ≈ $952 ($0.317/run) | ≈ 113k tokens average; ≈ 351k for the largest account (343k before any transcript), over the window | runtime picks the account, so ACL holds; daily note edits only touch the private part | two code paths, because large accounts need retrieval anyway |
 | B. Preload guide, search account notes | guide as cached prefix; `search_account_notes` tool filtered by the rep's accounts | ≈ $829 ($0.276/run) | ≈ 107k tokens | ACL in the tool; weekly guide edit is one cache rewrite | low for the guide, one index for the notes |
 | C. Search both | 3k prefix; `search` over guide sections and notes, plus `read_section` for whole guide sections | ≈ $243 ($0.081/run) | ≈ 22k tokens | ACL filter on `account_id`; both re-indexed per changed document | an index for both, built in pgvector on the Postgres they run |
 

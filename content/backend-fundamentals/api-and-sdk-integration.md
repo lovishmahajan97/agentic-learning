@@ -5,7 +5,7 @@ name: API & SDK integration
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -166,6 +166,9 @@ auth 401 -> StopRun: HTTP 401: invalid key | attempts=1 keys=1 t=0.0s
 rate limited, Retry-After 30 -> {'error': 'lookup unavailable; try another approach'} | attempts=1 keys=1 t=0.0s
 hung upstream -> {'error': 'lookup unavailable; try another approach'} | attempts=1 keys=1 t=1.0s
 ```
+
+The flaky line prints `t=0.0s` or `t=0.1s` from run to run: its two jittered sleeps are at most 0.05 s
+and 0.1 s. Every other field must match exactly.
 
 ### Tests
 ```python

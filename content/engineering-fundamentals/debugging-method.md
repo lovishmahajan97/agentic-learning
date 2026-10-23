@@ -5,7 +5,8 @@ name: Debugging method
 kind: practice
 difficulty: core
 est_minutes: 18
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -40,6 +41,158 @@ replaying recorded tool calls.
   response), pinning model versions, and turning each fixed bug into a regression test.
 - **What you can skip.** Debugger internals. A `print`, a `breakpoint()` and a disciplined loop beat any
   tool used without a hypothesis.
+
+## Lab
+### Task
+A `search_orders` tool fails in production for one customer. You have the recorded arguments from a
+passing and a failing run and the tool's config at each of the last 16 commits.
+
+Run the four-step loop as code: reproduce from the trace, isolate the fields by one-change probes,
+bisect the history for the commit that broke id handling, and fix at the tool boundary with a
+regression test. Time box: 45-60 min.
+- **Prerequisites:** Reading errors, logs and stack traces; the How it works steps; the differential
+  replay example below.
+- **Setup:** Python 3.9+ and `pip install pytest` (checked with Python 3.9.6 and pytest 8.4.2). Save the
+  starter as `lab.py` and the tests as `test_lab.py`. No model calls: the trace is the input.
+- **The twist:** the failing call has two differences from the passing one, and both matter at HEAD.
+  Only one of them is a regression in history.
+
+### Starter code
+```python
+"""Lab: debug a failing agent tool from its recorded trace, without guessing. Run: python lab.py"""
+import json
+
+ORDERS = {"C-1001": [{"id": f"o{i}", "total": 10 * i} for i in range(1, 9)]}
+
+# The tool's config at each of the last 16 commits. Commit 0 is known good, commit 15 is HEAD.
+# Somewhere a "cleanup" switched off id normalisation; the history is long, so do not read it, search it.
+HISTORY = [{"normalize_ids": i < 11, "max_limit": 50} for i in range(16)]
+
+def make_tool(cfg):
+    def search_orders(customer_id, limit=5, status="any"):
+        cid = customer_id.strip().upper() if cfg["normalize_ids"] else customer_id
+        rows = ORDERS.get(cid)
+        if rows is None:
+            raise LookupError(f"order not found for {customer_id!r}")
+        return rows[:limit]
+    return search_orders
+
+# Step 4 of a passing run and of the failing run, copied byte for byte from the trace.
+GOOD = json.loads('{"customer_id": "C-1001", "limit": 3, "status": "open"}')
+BAD = json.loads('{"customer_id": " c-1001", "limit": "3", "status": "open"}')
+
+def run(tool, args):
+    try:
+        return "ok", tool(**args)
+    except Exception as e:                      # record the failure, do not hide it
+        return "fail", f"{type(e).__name__}: {e}"
+
+def isolate(tool, good, bad):
+    """Fields whose bad value ALONE, swapped into the good call, makes it fail. Sorted."""
+    # YOUR CODE HERE: one change per probe, starting from the good call
+    raise NotImplementedError
+
+def first_bad(n, is_bad):
+    """Binary search over commits 0..n-1, where 0 is good and n-1 is bad.
+    Returns (first bad index, number of is_bad probes you made)."""
+    # YOUR CODE HERE: keep lo good and hi bad; probe the midpoint until they are adjacent
+    raise NotImplementedError
+
+def fixed_tool(cfg):
+    """The fix belongs at the tool boundary: normalise the id, coerce limit, reject garbage clearly."""
+    inner = make_tool(dict(cfg, normalize_ids=True))
+    def search_orders(customer_id, limit=5, status="any"):
+        # YOUR CODE HERE: int(limit) when it is an int or a digit string, else raise
+        # ValueError(f"limit must be an integer, got {limit!r}"); also reject limit > cfg["max_limit"]
+        raise NotImplementedError
+    return search_orders
+
+def replay_is_bad(i):
+    """The reproduction script: exit-code style check on the recorded BAD id with a known-good limit."""
+    status, _ = run(make_tool(HISTORY[i]), dict(BAD, limit=3))
+    return status == "fail"
+
+if __name__ == "__main__":
+    head = make_tool(HISTORY[-1])
+    print("reproduce:", run(head, GOOD)[0], "|", run(head, BAD)[1])
+    print("isolate:", isolate(head, GOOD, BAD))
+    idx, probes = first_bad(len(HISTORY), replay_is_bad)
+    print(f"first bad commit: {idx} after {probes} probes")
+    fix = fixed_tool(HISTORY[-1])
+    print("verify:", run(fix, BAD)[0], len(run(fix, BAD)[1]), "rows | good unchanged:", run(fix, GOOD) == run(make_tool(HISTORY[0]), GOOD))
+    print("regression:", run(fix, dict(BAD, limit="three"))[1])
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+reproduce: ok | LookupError: order not found for ' c-1001'
+isolate: ['customer_id', 'limit']
+first bad commit: 11 after 4 probes
+verify: ok 3 rows | good unchanged: True
+regression: ValueError: limit must be an integer, got 'three'
+```
+
+- **Read the numbers:** 16 commits leave 15 gaps between the known-good and known-bad ends, so binary
+  search needs ⌈log2 15⌉ = 4 probes (commits 7, 11, 9, 10). At commit 0 only `limit` isolates, because
+  ids were still normalised: the id bug is the regression, the string `limit` was always latent.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 8 fail: the first three with `NotImplementedError`, the
+fix tests with an `AssertionError` showing the `NotImplementedError` that `run()` recorded. A correct
+solution passes all 8 (Python 3.9.6, pytest 8.4.2).
+
+```python
+import pytest
+from lab import BAD, GOOD, HISTORY, ORDERS, first_bad, fixed_tool, isolate, make_tool, replay_is_bad, run
+
+HEAD = make_tool(HISTORY[-1])
+
+def test_isolate_finds_both_causes_at_head():
+    assert isolate(HEAD, GOOD, BAD) == ["customer_id", "limit"]
+
+def test_isolate_on_good_commit_finds_only_the_type_bug():
+    assert isolate(make_tool(HISTORY[0]), GOOD, BAD) == ["limit"]
+
+def test_bisect_finds_the_commit_in_log2_probes():
+    assert first_bad(len(HISTORY), replay_is_bad) == (11, 4)
+    seen = []
+    first_bad(1024, lambda i: seen.append(i) or i >= 700)
+    assert len(seen) == 10 and len(set(seen)) == 10
+
+def test_fix_makes_the_recorded_bad_call_pass_and_keeps_good():
+    fix = fixed_tool(HISTORY[-1])
+    assert run(fix, BAD) == run(fix, GOOD) == ("ok", ORDERS["C-1001"][:3])
+
+@pytest.mark.parametrize("limit", ["three", 2.5, None, 51])
+def test_regression_garbage_limits_get_a_clear_error(limit):
+    status, msg = run(fixed_tool(HISTORY[-1]), dict(BAD, limit=limit))
+    assert status == "fail" and msg.startswith("ValueError: limit must be")
+```
+
+### Failure scenarios
+- **Probe from the bad side** (put one good value into the bad call). Every probe still fails and
+  `isolate` returns `[]`, because the two causes mask each other. Start from the passing call, so a
+  single change can only add a failure.
+- **Bisect with the full recorded call** (`run(..., BAD)` instead of the known-good `limit`). It prints
+  `first bad commit: 1 after 3 probes`: the latent `limit` bug fails every commit, so the check no longer
+  separates good from bad. A bisect check must test one hypothesis; confirm commit 0 passes it first.
+- **Fix the symptom in the loop** (catch `LookupError` and return `[]`). The run "passes" with 0 rows and
+  the agent tells the customer they have no orders. `test_fix_makes_...` catches it because it compares
+  rows, not the absence of an exception.
+- **Off-by-one in the search** (return `lo`). The answer is 10, a good commit; check that the commit you
+  name fails the check and its parent passes it.
+
+### Submission
+- **`lab.py`** with `isolate`, `first_bad` and `fixed_tool` implemented; data, `run` and the main block
+  unchanged.
+- **A green run** of `pytest -q test_lab.py` (8 passed) and the output of `python lab.py`.
+- **A debugging log:** four lines, one per step, each with the prediction written before the result.
+- **A note** (3-5 sentences): which of the two causes you would also fix in the tool schema
+  (`"type": "integer"`) and why the boundary check is still needed.
+- **Evaluated on:** probes change one thing each; the named commit fails and its parent passes; the
+  fix sits in the tool, not the agent loop; the regression test covers the recorded input.
 
 ## Why it exists
 - **The failure is rarely where it surfaces.** A `KeyError` in the agent loop may start in an upstream

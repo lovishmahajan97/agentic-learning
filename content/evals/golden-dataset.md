@@ -5,7 +5,7 @@ name: Golden dataset (eval dataset)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement
@@ -174,9 +174,9 @@ flowchart TD
 - **"A random sample of production logs is the most representative eval."** Traffic is long-tailed, so
   uniform sampling yields hundreds of the easy intent and almost none of the rare one that escalates.
   Sample with per-slice quotas and re-weight by traffic for a headline number.
-- **"A logged agent trace is a ready-made test case."** The tool state it ran against has since changed,
-  so it cannot be replayed. A task needs a seed for every backend its tools touch and an expected end
-  state written by a person.
+- **"A logged agent trace is a ready-made test case."** A trace records what the agent did, not what it
+  should have done, and the tool state it ran against has since changed. A task needs a seed for every
+  backend its tools touch and an expected end state written by a person.
 - **"Letting the model write the expected answers saves labeling time."** If the generator also writes
   the references, the eval measures the model's agreement with itself. Synthetic inputs can fill gaps,
   but humans label them and they stay tagged as synthetic.

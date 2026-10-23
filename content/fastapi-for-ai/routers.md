@@ -5,7 +5,7 @@ name: Routers (APIRouter)
 kind: pattern
 difficulty: intro
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -189,7 +189,7 @@ about `httpx` in the test client; it does not affect the results.
   dump the route table, find `/v1/tools/tools/...`, and snapshot the expected paths in CI.
 - **Inject: write the audit to compare dependency names as strings.** Observe: it passes even when a
   look-alike `require_service_token` from another module is used. Debug: compare the callables
-  (`d.call is guard`), as in the CI example above.
+  (`d.call is guard`), as in the CI test in Examples below.
 
 ### Submission
 - The fixed `lab_routers.py`, with each guard declared exactly once, on its router.

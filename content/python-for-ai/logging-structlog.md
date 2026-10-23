@@ -5,7 +5,7 @@ name: logging / structlog
 kind: tool
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -47,7 +47,7 @@ Instrument an async agent loop so every model and tool call is one JSON event bo
 `step`, secrets are redacted in the processor chain, and two concurrent runs never mix their context.
 The agent goal: answer "which run, which step, which tool failed?" with a field query, not a regex.
 Time box: 45-75 min.
-- **Prerequisites:** async / await; Conversation & execution identifiers.
+- **Prerequisites:** async / await; Conversation / execution identifiers.
 - **Setup:** Python 3.10+, `pip install structlog pytest` (checked with structlog 26.1.0). Save the
   starter as `lab.py`, the tests as `test_lab.py`.
 - **Deterministic by design:** no timestamps and `sort_keys=True`, so output can be compared exactly.

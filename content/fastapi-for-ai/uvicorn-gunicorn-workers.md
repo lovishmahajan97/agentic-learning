@@ -5,7 +5,7 @@ name: Uvicorn / Gunicorn workers
 kind: tool
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -152,9 +152,10 @@ All four fail on the starter with `NotImplementedError`. The memory budget is 81
 4 workers need 10,648 MiB and only 2 fit (5,324 MiB).
 
 ### Failure scenarios
-- **Inject: compare `cfg.worker_class` instead of `cfg.worker_class_str`.** Observe: the import of the
-  Gunicorn imports the class, so the check never matches a string, or `RuntimeError` is raised when the
-  `uvicorn-worker` package is not installed. Debug: print both attributes; the `_str` form is the
+- **Inject: compare `cfg.worker_class` instead of `cfg.worker_class_str`.** Observe: reading that
+  attribute makes Gunicorn import the class and return the class object, so a string check never
+  matches; on `FIXED` it raises `RuntimeError: class uri 'uvicorn_worker.UvicornWorker' invalid or not
+  found` when the `uvicorn-worker` package is not installed. Debug: print both attributes; the `_str` form is the
   configured dotted path.
 - **Inject: pass the fixed config to a real `gunicorn` with `--timeout 60` but keep the PDF parse on the
   loop.** Observe: no more worker kills, yet every agent run on that worker stalls for 40 s. Debug: log

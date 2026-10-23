@@ -5,7 +5,7 @@ name: LLM-as-a-judge
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: evaluate

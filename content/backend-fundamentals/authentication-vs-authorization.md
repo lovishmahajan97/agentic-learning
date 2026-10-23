@@ -5,7 +5,7 @@ name: Authentication vs authorization
 kind: concept
 difficulty: intro
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -224,8 +224,9 @@ def test_revocation_takes_effect_on_the_next_tool_call():
   pin the list in code, as the lesson's four checks say.
 - **Inject: check the permission before the tenant.** Alice reading `d2` returns 200 again, because she
   holds `documents:read`. Debug: the tenant row in the test fails; tenant first, then owner, then grant.
-- **Inject: drop `"exp"` from PyJWT's `require` option.** The `no-exp` row returns 200: PyJWT checks
-  expiry only when the claim is present. Debug: run that row alone with `-k no-exp`.
+- **Inject: drop `"exp"` from PyJWT's `require` option.** The `no-exp` row fails with `DID NOT RAISE
+  HTTPError`: the never-expiring token is accepted, because PyJWT checks expiry only when the claim is
+  present. Debug: run that row alone with `-k no-exp`.
 - **Inject: catch `Exception` in `authenticate`.** A typo in your claim mapping (`claims["tenat"]`) now
   turns every request into a 401 instead of a crash in tests. Debug: catch `jwt.PyJWTError` only, so
   programming errors stay loud.

@@ -5,7 +5,7 @@ name: Data consistency
 kind: concept
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:

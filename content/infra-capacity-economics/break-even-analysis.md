@@ -5,7 +5,7 @@ name: Break-even analysis (hosted API vs self-hosting)
 kind: decision
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -74,8 +74,8 @@ open-weight endpoint.
 - **The saving came from the model, not from operating it,** which is the bundling the lesson warns about.
 
 **What would change it:**
-- **More flat volume:** at about 75,000M batch tokens a month, C's 12-month net passes D's (+$22,000), as
-  the fixed `F` amortizes.
+- **More flat volume:** C's 12-month net first edges past D's near 71,000M batch tokens a month and stays
+  ahead from about 76,000M (the replica count is a step function), as the fixed `F` amortizes.
 - **An API price cut to $1:** batch on the hosted API costs $50,000, below both D and C; re-run the sign
   test.
 - **Managed price rises:** above about $1.34 per million, C wins over 12 months.
@@ -89,7 +89,7 @@ open-weight endpoint.
 - **Leaving the cheapest bill (B) on the table:** re-test the open-weight model on the interactive eval at
   each new release.
 - **Not building self-hosting skills yet:** keep the calculator live and re-run it quarterly on actual
-  batch volume against the 75,000M threshold.
+  batch volume against the 76,000M threshold.
 
 ### Review rubric
 - Splits volume by workload and traffic shape, with peak-to-average from logs, not one blended number.

@@ -5,7 +5,7 @@ name: Logging
 kind: practice
 difficulty: intro
 est_minutes: 12
-status: typed
+status: typed-verified
 agent_relevance: core
 lesson_type: lab
 related:
@@ -68,7 +68,8 @@ MAX_CHARS = 200
 
 def redact(logger, method, event):
     """LAB 2: mask SECRET as [REDACTED] and EMAIL as [EMAIL], and cap every string at MAX_CHARS,
-    at ANY depth: tool arguments arrive as nested dicts and lists."""
+    at ANY depth: tool arguments arrive as nested dicts and lists. Build new containers: the
+    nested values are the agent's live tool arguments, so never modify them in place."""
     for k, v in list(event.items()):
         if isinstance(v, str):
             event[k] = EMAIL.sub("[EMAIL]", SECRET.sub("[REDACTED]", v))[:MAX_CHARS]
@@ -182,6 +183,8 @@ def test_nested_tool_arguments_are_redacted(records):
     failed = next(r for r in records if r["event"] == "tool.failed")
     assert failed["args"]["customer"] == {"email": "[EMAIL]", "note": "card on file [REDACTED]"}
     assert failed["args"]["amount"] == 40                      # non-strings are left alone
+    live = lab.REFUND_RUN[1]["args"]["customer"]
+    assert live["email"] == "ana@example.com", "redaction rewrote the agent's live tool arguments"
 
 
 def test_long_values_are_capped_at_any_depth():
@@ -212,6 +215,10 @@ summaries.
 - **Inject: call `clear_contextvars()` at the end of a run instead of the start,** and make a tool
   raise out of the loop. Observe: the next run inherits the crashed run's fields again. Debug: the
   clear must sit at the entry point, where it runs whatever happened before.
+- **Inject: redact nested dicts in place** (`v[k] = clean(x)`) instead of building copies. Observe:
+  the log line looks right, but `REFUND_RUN`'s arguments now read `[EMAIL]`, so a retry of that step
+  would send the masked address to the refund tool. Debug: compare the tool arguments before and after
+  one log call; a logging processor must never write to the objects it was handed.
 
 ### Submission
 - **Code:** your `lab_logging.py` with LAB 1-3 done and every `# BUG` line fixed.

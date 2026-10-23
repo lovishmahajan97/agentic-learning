@@ -5,7 +5,7 @@ name: Model portfolio
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -51,9 +51,11 @@ found only through billing, and three teams depended on that model. All figures 
 - **Constraints:** a platform team of four; each new provider needs a security review of roughly six
   weeks.
 
-Assume cheaper tiers save 60% on the easy non-agent families, and that about 60% of agent calls are
-routine steps (summarising tool results, formatting) that a workhorse at one tenth of the frontier
-price handles at the same step-level eval score, with the same tokens per call.
+Assume all of the non-agent spend is in easy families where a cheaper tier saves 60%, and that both
+agents currently run every step on a frontier model.
+
+Assume also that about 60% of agent calls are routine steps (summarising tool results, formatting)
+that a workhorse at one tenth of the frontier price handles at the same step-level eval score, with the same tokens per call.
 
 ### Options
 | Option | How it works | Monthly spend | Saving | Governance | Platform effort |

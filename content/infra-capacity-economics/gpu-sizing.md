@@ -5,7 +5,7 @@ name: GPU sizing (VRAM math)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -48,8 +48,9 @@ An insurer's claims team runs a self-hosted Llama-3-70B agent (80 layers, 8 KV h
 - **Demand:** 30 × 10k + 6k = 313,344 tokens of KV, about 103 GB in bf16.
 - **Hardware:** four 80 GB H100s in one NVLink node, no more this quarter. Budget per card is 72 GB at
   `gpu_memory_utilization` 0.9, with about 1 GB overhead per card.
-- **Quality:** the claims eval shows fp8 weights within 1 point of bf16; int4 drops task success by 4
-  points (the team's own illustrative numbers). An fp8 KV cache has not been evaluated yet.
+- **Quality:** the bar is at most a 1-point drop in task success against bf16 on the claims eval. fp8
+  weights land within 1 point; int4 drops 4 points (the team's own illustrative numbers). An fp8 KV
+  cache has not been evaluated yet.
 - **Reliability:** losing one card must not take the agent fully offline. `--max-model-len` is 32k.
 
 ### Options

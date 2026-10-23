@@ -5,7 +5,7 @@ name: Middleware ordering
 kind: concept
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -182,9 +182,11 @@ def test_good_run_is_untouched():
   `app.user_middleware` (outermost first) and walk the 500 outward; only layers outside the one that
   sends it can add headers.
 - **Swallow errors after the stream started.** Drop the "response already started" check, then make the
-  route a `StreamingResponse` that yields one step event and raises. Observe: the test client shows a
-  200 with body `step 0`; the late 500 is lost because the status was already on the wire. Debug: track
-  a `started` flag in a wrapped `send` and re-raise when it is set.
+  route a `StreamingResponse` that yields one step event and raises. Observe: the client still gets a
+  200 with body `step 0`, because the status was already on the wire, and `TestClient(app)` (server
+  exceptions raised) fails with `AssertionError: Received multiple "http.response.start" messages.`
+  instead of the real `RuntimeError`. Debug: track a `started` flag in a wrapped `send` and re-raise
+  when it is set.
 - **Raise `HTTPException(401)` from Auth.** Observe: the 401 test gets a 500, because only
   `ExceptionMiddleware`, innermost around the router, converts `HTTPException` into a response. Debug:
   read the traceback's layer names; middleware must send its own rejection messages.

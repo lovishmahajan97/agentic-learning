@@ -5,7 +5,7 @@ name: Serverless GPUs
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -54,7 +54,7 @@ measured cold start, 5-minute scale-down window.
 ### Options
 | Option | How it works | Monthly cost (illustrative) | Steps meeting a cold start | Ops load |
 |---|---|---|---|---|
-| A. Scale to zero everywhere | All containers serverless, `min_containers=0` | 176 busy + 11 cold + 73 idle h = 260 h ≈ $417 | 120 of 6,000 = 2% | Lowest |
+| A. Scale to zero everywhere | All containers serverless, `min_containers=0` | 176 busy + 11 cold + 73 idle + 4 burst-tail h ≈ 264 h ≈ $423 | 120 base + 6 burst = 126 of 6,000 ≈ 2.1% | Lowest |
 | B. Serverless with one warm minimum | One container always warm, bursts serverless | 730 × $1.60 + $141 burst + $7 tails ≈ $1,316 | About 0.1% | Low |
 | C. Dedicated base, serverless burst | One L4 VM 24/7 for the base, overflow to serverless | $584 + $141 + $7 ≈ $732 | 2 burst scale-outs × 3 steps = 6 of 6,000, 0.1% | One VM to patch |
 | D. All dedicated | Three L4 VMs sized for the peak | 3 × $584 = $1,752 | None | Three VMs |
@@ -65,7 +65,7 @@ The burst line is 88 h × $1.60 ≈ $141; its tails are two containers a day, ea
 ### Decision
 Choose **C**.
 - **SLO:** cold starts touch only the two daily scale-outs, about 0.1% of steps, ten times inside the 1%
-  limit. A fails at 2%.
+  limit. A fails at about 2.1%.
 - **Budget:** $732 fits under $800; B and D do not.
 - **Why a dedicated base rather than a warm minimum:** both remove base cold starts, but a warm serverless
   container bills at twice the dedicated rate for the same 730 hours.

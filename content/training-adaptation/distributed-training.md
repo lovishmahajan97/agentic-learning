@@ -5,7 +5,7 @@ name: Distributed training (data / tensor / pipeline parallelism, FSDP, DeepSpee
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: typed
+status: typed-verified
 agent_relevance: background
 lesson_type: concept
 related:
@@ -218,8 +218,8 @@ flowchart TD
   keeps the full 16 bytes per parameter on every GPU, 112 GB for a 7B model on each card; ZeRO-3 or FSDP
   `FULL_SHARD` is what brings it to 14 GB.
 - **"LoRA makes the memory problem go away."** It removes most gradient and optimizer state, but the
-  frozen base still has to live somewhere: a 70B base in bf16 is 140 GB, so even a LoRA on it needs
-  FSDP across GPUs (~17.5 GB each on eight).
+  frozen base still has to live somewhere: a 70B base in bf16 is 140 GB, so a bf16 LoRA on it needs
+  FSDP across GPUs (~17.5 GB each on eight). Only QLoRA's 4-bit base (~35 GB) fits one 80 GB card.
 - **"Adding GPUs is a pure speed-up that leaves the recipe alone."** The global batch is N ×
   micro-batch × accumulation, so moving from 8 to 32 GPUs quadruples it. Re-tune learning rate and
   warmup, or cut accumulation to keep the global batch fixed, or the loss curve changes.

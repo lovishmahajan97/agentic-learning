@@ -5,7 +5,7 @@ name: FastAPI
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -237,9 +237,10 @@ raises `KeyError` until LAB 3 is done). The scripted test passes and guards the 
 - **Inject: drop `dependency_overrides.clear()` from the fixture.** Observe: tests pass alone and fail
   in a different order, because an override leaks into the next test. Debug: run the failing test by
   itself with `pytest -k`, then dump `app.dependency_overrides` at the start of each test.
-- **Inject: let a tool exception propagate.** Observe: the client gets a 200 with a truncated stream
-  and no `[DONE]`; the status was sent with the first event. Debug: errors after streaming starts must
-  travel as events, not as HTTP status codes.
+- **Inject: let a tool exception propagate.** Observe: in pytest the `TestClient` re-raises
+  `TimeoutError`; a real client, or `TestClient(app, raise_server_exceptions=False)`, gets a 200 with a
+  truncated stream and no `[DONE]`, because the status was sent with the first event. Debug: errors
+  after streaming starts must travel as events, not as HTTP status codes.
 
 ### Submission
 - **Code:** your `lab_agent_api.py` with LAB 1-4 done and the planner reaching the handler only through

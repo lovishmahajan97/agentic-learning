@@ -5,7 +5,7 @@ name: Cloud AI architecture (AWS Bedrock, Azure OpenAI, Vertex AI)
 kind: concept
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -45,8 +45,9 @@ compliance; you pay with model lag, per-region quotas and lock-in.
 ### Scenario
 An insurer that runs on AWS is launching a claims agent that reads policy documents and claim photos
 through tools. All prices and volumes are illustrative, not list prices.
-- **Volume:** about 22,000 runs a month at ~55k tokens per run, so ~1.2B tokens a month, with
-  business-hour peaks about 3× the average.
+- **Volume:** about 22,000 runs a month at ~55k tokens per run, so ~1.2B tokens a month, with short
+  business-hour peaks about 3× the average. Replaying a month of traffic against the reservation's rate
+  shows ~0.15B tokens a month arriving above it during those peaks.
 - **Capacity figures from a load test:** a reservation costs $30,000 a month and serves ~1.5B tokens a
   month of this mix at full use; pay-as-you-go costs $40 per million tokens.
 - **Constraints:** claim data must be processed in one named EU region; model spend at most $40,000 a

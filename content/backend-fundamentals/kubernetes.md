@@ -5,7 +5,7 @@ name: Kubernetes
 kind: tool
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -193,8 +193,8 @@ def test_liveness_must_not_reuse_readiness():
     assert run(d) == ["K007"]
 ```
 
-All 8 fail on the starter: most with `AssertionError`, and the ones that mutate `FIXED` with a
-`KeyError` until part 2 gives the manifest a `requests` block. Several tests start from your `FIXED`
+All 8 fail on the starter: seven with `AssertionError`, and the GPU test with a `KeyError` until
+part 2 gives the manifest a `requests` block. Several tests start from your `FIXED`
 manifest, so it must pass every rule before they can isolate one.
 
 ### Failure scenarios

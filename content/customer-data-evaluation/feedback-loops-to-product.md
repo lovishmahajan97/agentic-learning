@@ -5,7 +5,7 @@ name: Feedback loops to product
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:

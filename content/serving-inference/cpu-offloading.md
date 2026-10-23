@@ -5,7 +5,7 @@ name: CPU offloading
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -171,8 +171,8 @@ flowchart TD
 
 ## Misconceptions
 - **"Offloading 10% of the weights costs about 10% of the speed."** Every token re-reads the offloaded
-  bytes over PCIe. On the 24 GB example, 4 GB offloaded adds 160 ms per token against 36 ms resident, a
-  4× slowdown, not 10%.
+  bytes over PCIe. For the 40 GB model in the worked example, 4 GB offloaded makes each token take 160 ms
+  of bus time against about 40 ms fully resident, a 4× slowdown, not 10%.
 - **"Prefetching on a side stream hides the transfer."** Overlap needs compute to hide behind. One decode
   token spends microseconds per layer, so step time is offloaded bytes ÷ PCIe bandwidth. Overlap works for
   long prefills and huge offline batches, FlexGen's regime.

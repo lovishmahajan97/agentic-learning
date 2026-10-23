@@ -5,7 +5,7 @@ name: Open-weight vs proprietary
 kind: decision
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -48,7 +48,8 @@ are illustrative.
 - **Load:** 2,000 runs a day, 6 model calls each: 12,000 calls a day.
 - **Isolation:** about 30% of runs touch design documents covered by defence-customer contracts that
   allow processing only on hosts the company operates. That is architectural isolation. The rest
-  needs EU residency, which a contract and a private network path satisfy.
+  needs EU residency, which a contract and a private network path satisfy; in this scenario only the
+  cloud provider's managed service offers both.
 - **Quality:** run success of at least 0.80 overall on a 200-task agent eval.
 - **Team:** two ML engineers with GPU serving experience.
 - **Licence:** the open-weight model must allow commercial internal use, with acceptable-use terms
@@ -58,12 +59,15 @@ Measured on the eval: the proprietary model succeeds on 0.90 of runs via its pub
 the cloud provider's managed service. The best permissively licensed open-weight model succeeds on
 0.78, since long multi-step tool use is where it trails.
 
+Each rate is assumed to hold on both segments
+of the eval (60 tasks like restricted runs, 140 like the rest).
+
 Costs: an API call is about 0.03 units (0.036 on the managed service), and a GPU node 250 units a day.
 
 ### Options
 | Option | How it works | Run success | Cost per day | Isolation |
 |---|---|---|---|---|
-| **A. Proprietary, public API, everything** | one pinned model for all runs | 0.90 | 12,000 × 0.03 = 360 | restricted runs leave company hosts: fails |
+| **A. Proprietary, public API, everything** | one pinned model for all runs | 0.90 | 12,000 × 0.03 = 360 | restricted runs leave company hosts, and no private path for the rest: fails |
 | **B. Open weights, self-hosted, everything** | three GPU nodes serve all calls | 0.78: fails | 3 × 250 = 750 | passes |
 | **C. Split by data class** | restricted runs entirely on self-hosted open weights (two nodes for availability); the rest on the managed proprietary service over a private endpoint | 0.3 × 0.78 + 0.7 × 0.89 ≈ 0.857 | 500 + 8,400 × 0.036 ≈ 802 | passes |
 | **D. Proprietary via managed service, everything** | private endpoint in the EU region | 0.89 | 12,000 × 0.036 = 432 | inference still on the provider's hosts: fails for restricted runs |

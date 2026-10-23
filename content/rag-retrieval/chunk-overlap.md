@@ -5,7 +5,7 @@ name: Chunk overlap
 kind: concept
 difficulty: intro
 est_minutes: 10
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: implement

@@ -5,7 +5,8 @@ name: Building an MCP server end to end (FastMCP in Python, TypeScript SDK)
 kind: tool
 difficulty: core
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - python-for-ai/mcp-python-sdk
@@ -39,6 +40,236 @@ empty file to an agent using your server.
   resources in the lifespan, transport, packaging and which tools need approval.
 - **What you can skip.** The low-level `Server` API until you need dynamic tool lists or full wire
   control; the high-level APIs cover most servers.
+
+## Lab
+### Task
+Write the last step of the build sequence, the agent bridge, and test it without an API key. Your
+`run_agent` takes the knowledge-base server from the Examples, converts its tools to the Anthropic tool
+format, and runs a step-budgeted loop. It gates the write tool and feeds `isError` back as `is_error`.
+
+The model is a `ScriptedModel` that replays a recorded conversation, so every run is deterministic and
+you can assert on exactly what the model was sent.
+
+Time box: 45-75 min.
+- **Prerequisites:** this lesson's Examples (server and `agent.py`); `mcp/mcp-architecture`;
+  `agents/approval-gates-for-consequential-actions`.
+- **Setup:** Python 3.10+, `pip install "mcp>=1.10,<2" pytest` (checked with mcp 1.30.0, pytest 9.1,
+  Python 3.13). Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **In memory:** client and server connect through `create_connected_server_and_client_session` from
+  `mcp.shared.memory` (the helper the SDK's own tests use; not a documented public API). Swap in
+  `stdio_client` from the Examples to run the same bridge over a subprocess.
+- **You implement:** `to_provider_tools` and `run_agent`. Swapping `ScriptedModel` for a real
+  `messages.create` call is the only change needed for a live run.
+
+### Starter code
+```python
+"""Lab: bridge an MCP server into a tool-calling agent loop, with a scripted model. Run: python lab.py"""
+import asyncio
+import json
+import sqlite3
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Callable
+from pydantic import BaseModel
+from mcp import ClientSession, types
+from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.shared.memory import create_connected_server_and_client_session as connect
+from mcp.types import ToolAnnotations
+
+# ---- the server (the lesson's kb_server.py, given) ----
+@dataclass
+class Deps:
+    db: sqlite3.Connection
+
+@asynccontextmanager
+async def lifespan(server: FastMCP):
+    db = sqlite3.connect(":memory:")
+    db.execute("CREATE TABLE kb (id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+    db.execute("INSERT INTO kb (title, body) VALUES ('Reset VPN token', 'Open the portal, then press Reset.')")
+    try:
+        yield Deps(db=db)
+    finally:
+        db.close()
+
+mcp = FastMCP("kb", lifespan=lifespan)
+
+class Hit(BaseModel):
+    id: int
+    title: str
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def kb_search(query: str, ctx: Context, limit: int = 5) -> list[Hit]:
+    """Search knowledge-base titles. Returns ids and titles; call kb_get_article for the text."""
+    rows = ctx.request_context.lifespan_context.db.execute(
+        "SELECT id, title FROM kb WHERE title LIKE ? LIMIT ?", (f"%{query}%", limit))
+    return [Hit(id=i, title=t) for i, t in rows]
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def kb_get_article(article_id: int, ctx: Context) -> str:
+    """Full text of one article by id (from kb_search)."""
+    row = ctx.request_context.lifespan_context.db.execute(
+        "SELECT body FROM kb WHERE id = ?", (article_id,)).fetchone()
+    if row is None:
+        raise ToolError(f"No article {article_id}. Use an id returned by kb_search.")
+    return row[0]
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False))
+async def kb_create_draft(title: str, body: str, ctx: Context) -> Hit:
+    """Create an unpublished draft article. A human publishes it later."""
+    cur = ctx.request_context.lifespan_context.db.execute(
+        "INSERT INTO kb (title, body) VALUES (?, ?)", (f"[draft] {title}", body))
+    return Hit(id=cur.lastrowid, title=f"[draft] {title}")
+
+# ---- the agent side (yours) ----
+APPROVE = {"kb_create_draft"}                      # write tools need a human yes
+Model = Callable[[list[dict], list[dict]], list[dict]]   # (tools, messages) -> assistant content blocks
+
+
+def to_provider_tools(tools: list[types.Tool]) -> list[dict]:
+    # YOUR CODE HERE: map each MCP tool to {"name", "description" (or ""), "input_schema"}, the
+    # Anthropic Messages API shape, in the server's order.
+    raise NotImplementedError
+
+
+async def run_agent(session: ClientSession, model: Model, task: str,
+                    approve: Callable[[str, dict], bool], max_steps: int = 6) -> tuple[str, list[str]]:
+    """Returns (final answer, trace). One trace line per tool call:
+    f"{name} is_error={is_error}: {short}", where short = " ".join(text.split())[:60]."""
+    # YOUR CODE HERE:
+    # - list tools once and convert them; messages starts as [{"role": "user", "content": task}]
+    # - at most max_steps model calls; append each reply as {"role": "assistant", "content": blocks}
+    # - no tool_use blocks: return the joined text of the "text" blocks and the trace
+    # - for each tool_use: a name in APPROVE that approve(name, input) rejects gives
+    #   ("User denied this action.", True) without calling the server; otherwise call_tool and join
+    #   the text items with "\n", is_error = bool(result.isError)
+    # - send all results back in one user message of {"type": "tool_result", "tool_use_id",
+    #   "content", "is_error"} blocks
+    # - budget spent: return "Stopped: step budget exhausted." and the trace
+    raise NotImplementedError
+
+
+class ScriptedModel:
+    """Stands in for the LLM: replays recorded turns and keeps what it was sent."""
+    def __init__(self, turns: list[list[dict]]):
+        self.turns, self.seen_tools, self.seen_messages = list(turns), None, []
+    def __call__(self, tools, messages):
+        self.seen_tools = tools
+        self.seen_messages.append(json.loads(json.dumps(messages, default=str)))
+        return self.turns.pop(0) if self.turns else [{"type": "tool_use", "id": "loop", "name": "kb_search",
+                                                      "input": {"query": "vpn"}}]
+
+def use(i, name, **args):
+    return {"type": "tool_use", "id": f"t{i}", "name": name, "input": args}
+
+RECORDED = [
+    [use(1, "kb_get_article", article_id=99)],                    # invented id
+    [use(2, "kb_search", query="VPN")],
+    [use(3, "kb_get_article", article_id=1), use(4, "kb_create_draft", title="VPN", body="...")],
+    [{"type": "text", "text": "Open the portal, then press Reset."}],
+]
+
+
+async def main():
+    async with connect(mcp) as session:
+        model = ScriptedModel(RECORDED)
+        answer, trace = await run_agent(session, model, "How do I reset my VPN token?",
+                                        approve=lambda name, args: False)
+    print("tools:", [t["name"] for t in model.seen_tools])
+    for i, line in enumerate(trace, 1):
+        print(f"call {i}: {line}")
+    print("answer:", answer)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly this on stdout (SDK request logs go to stderr):
+
+```
+tools: ['kb_search', 'kb_get_article', 'kb_create_draft']
+call 1: kb_get_article is_error=True: Error executing tool kb_get_article: No article 99. Use an i
+call 2: kb_search is_error=False: { "id": 1, "title": "Reset VPN token" }
+call 3: kb_get_article is_error=False: Open the portal, then press Reset.
+call 4: kb_create_draft is_error=True: User denied this action.
+answer: Open the portal, then press Reset.
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 5 fail with `NotImplementedError`; a correct solution
+passes all 5 (mcp 1.30.0).
+
+```python
+import asyncio
+from mcp.shared.memory import create_connected_server_and_client_session as connect
+from lab import RECORDED, ScriptedModel, mcp, run_agent, to_provider_tools, use
+
+def agent(turns, approve=lambda n, a: False, max_steps=6):
+    async def go():
+        async with connect(mcp) as s:
+            model = ScriptedModel(turns)
+            answer, trace = await run_agent(s, model, "task", approve=approve, max_steps=max_steps)
+            return answer, trace, model
+    return asyncio.run(go())
+
+def test_tool_definitions_pass_schema_through():
+    async def go():
+        async with connect(mcp) as s:
+            return (await s.list_tools()).tools
+    tools = asyncio.run(go())
+    defs = to_provider_tools(tools)
+    assert [d["name"] for d in defs] == ["kb_search", "kb_get_article", "kb_create_draft"]
+    assert all(d["description"] for d in defs)
+    assert defs[1]["input_schema"] == tools[1].inputSchema
+    assert set(defs[0]) == {"name", "description", "input_schema"}
+
+def test_tool_error_reaches_the_model_as_is_error():
+    _, trace, model = agent([[use(1, "kb_get_article", article_id=99)], [{"type": "text", "text": "ok"}]])
+    result = model.seen_messages[1][-1]["content"][0]
+    assert result["tool_use_id"] == "t1" and result["is_error"] is True
+    assert "Use an id returned by kb_search" in result["content"]
+
+def test_denied_write_is_reported_to_the_model():
+    answer, trace, model = agent(RECORDED)
+    assert answer == "Open the portal, then press Reset."
+    assert trace[-1] == "kb_create_draft is_error=True: User denied this action."
+    results = model.seen_messages[3][-1]["content"]
+    assert [r["tool_use_id"] for r in results] == ["t3", "t4"]          # one message, both results
+
+def test_approved_write_runs():
+    _, trace, _ = agent([[use(1, "kb_create_draft", title="VPN", body="x")], [{"type": "text", "text": "done"}]],
+                        approve=lambda n, a: True)
+    assert trace == ['kb_create_draft is_error=False: { "id": 2, "title": "[draft] VPN" }']
+
+def test_step_budget_stops_a_looping_model():
+    answer, trace, model = agent([], max_steps=3)
+    assert answer == "Stopped: step budget exhausted." and len(trace) == 3 and len(model.seen_messages) == 3
+```
+
+### Failure scenarios
+- **Hard-code `is_error: False`.** `test_tool_error_reaches_the_model_as_is_error` fails, and a live model
+  would read "No article 99" as data rather than a failure to correct. Print the `tool_result` blocks the
+  model received; the bridge table in How it works maps `isError` to `is_error`.
+- **Send each `tool_result` in its own user message.** `test_denied_write_is_reported_to_the_model` sees
+  only `t4` in the last message. The Messages API expects every result for one assistant turn in the next
+  user message, so a live run gets a request error. Dump `messages` after a two-call turn and check the
+  roles alternate.
+- **Replace the bounded `for` with `while True`.** The step-budget test never returns because the scripted
+  model calls `kb_search` forever, as a confused live model might. Interrupt it and read the traceback to
+  find `run_agent`; the budget is the guard in Production patterns.
+- **Check approval after calling the tool.** The trace still says denied, but the draft exists: add a
+  `kb_search` for `draft` after the run and it finds a row. Gate before `call_tool`.
+
+### Submission
+- `lab.py` with both functions implemented and the server, `ScriptedModel` and `main` unchanged.
+- A `pytest -q` run showing 5 passed and the stdout of `python lab.py` matching Expected output.
+- One live run (optional if you have a key): replace the scripted model with `messages.create` and attach
+  the trace for the lesson's VPN task.
+- A short note: which failure scenario you reproduced and the log line or test that exposed it.
+- Evaluation: tests pass, a denied write never reaches the server, every tool error reaches the model as
+  `is_error`, and the loop always ends within `max_steps`.
 
 ## Why it exists
 - **Every host wants the same tools.** Without a server, the same Jira or database wrapper is rewritten

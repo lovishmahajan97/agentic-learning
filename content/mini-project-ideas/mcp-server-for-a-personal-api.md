@@ -5,7 +5,8 @@ name: MCP server for a personal API (calendar, GitHub or files)
 kind: practice
 difficulty: core
 est_minutes: 22
-status: agentic-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 related:
   - agents/model-context-protocol
@@ -35,6 +36,195 @@ and a prompt, test it in the Inspector and use it from a real host. It proves yo
 - **Why it matters for agents.** MCP is how one tool implementation reaches many hosts (desktop chat apps, IDEs,
   your own agents). Designing a good server is designing an agent's hands.
 - **What you can skip.** Writing an MCP client from scratch and implementing an OAuth authorization server.
+
+## Lab
+### Task
+Build two task-shaped GitHub tools on `FastMCP`: a read-only issue lister and a gated write tool. Map API
+failures to errors a model can act on, and test everything through an in-memory MCP client, so you see what
+a host sees. Time box: 60-90 min.
+- **Prerequisites:** Model Context Protocol; MCP server primitives; Designing MCP tools for agents; Testing
+  and debugging MCP servers.
+- **Setup:** Python 3.10+, `pip install "mcp>=1.10,<2" pytest` (checked with mcp 1.30.0, pytest 9.1,
+  Python 3.12). Save the starter as `lab.py` and the tests as `test_lab.py`.
+- **No token and no network:** `FakeGitHub` replays recorded responses, and `override` forces a 401, 429 or
+  500. `create_connected_server_and_client_session` from `mcp.shared.memory` runs a real client session in
+  memory; on 2.x check the migration guide for its replacement.
+
+### Starter code
+```python
+"""Lab: a task-shaped GitHub MCP server over a recorded fake API, tested as a host sees it.
+Run: python lab.py"""
+import asyncio
+import logging
+from mcp.server.fastmcp import FastMCP
+from mcp.shared.memory import create_connected_server_and_client_session
+from mcp.types import ToolAnnotations
+
+class FakeResponse:
+    def __init__(self, status: int, body=None, headers: dict | None = None):
+        self.status_code, self.body, self.headers = status, body, headers or {}
+
+ISSUES = [  # recorded GET /repos/me/app/issues; the issues endpoint also returns pull requests
+    {"number": 12, "title": "Login fails on Safari", "html_url": "https://github.com/me/app/issues/12",
+     "labels": [{"name": "bug"}], "body": "x" * 3000},
+    {"number": 11, "title": "Bump httpx", "html_url": "https://github.com/me/app/pull/11",
+     "labels": [], "pull_request": {"url": "..."}},
+    {"number": 9, "title": "Add dark mode", "html_url": "https://github.com/me/app/issues/9",
+     "labels": [{"name": "feature"}, {"name": "ui"}], "body": "please"},
+]
+
+class FakeGitHub:
+    """Replays recorded responses; set `override` to force a status such as 401 or 429."""
+    def __init__(self):
+        self.calls, self.override = [], None
+    def request(self, method: str, path: str, params: dict | None = None, json: dict | None = None):
+        self.calls.append((method, path, params, json))
+        if self.override is not None:
+            return self.override
+        if method == "GET" and path == "/repos/me/app/issues":
+            return FakeResponse(200, ISSUES[: params.get("per_page", 30)])
+        if method == "POST" and path == "/repos/me/app/issues":
+            return FakeResponse(201, {"number": 13, "html_url": "https://github.com/me/app/issues/13"})
+        return FakeResponse(404, {"message": "Not Found"})
+
+github = FakeGitHub()
+mcp = FastMCP("my-github")
+logging.getLogger("mcp").setLevel(logging.WARNING)   # hide per-request INFO lines
+
+def gh(method: str, path: str, params: dict | None = None, json: dict | None = None):
+    r = github.request(method, path, params=params, json=json)
+    # YOUR CODE HERE: map errors to messages a model can act on, raised as ValueError:
+    #   401 -> "GitHub token invalid or expired"
+    #   404 -> f"not found: {path}"
+    #   429 -> f"rate limited, retry after {r.headers.get('retry-after', '60')}s"
+    #   any other status >= 400 -> f"GitHub error {status}"
+    # otherwise return r.body
+    raise NotImplementedError
+
+@mcp.tool()  # YOUR CODE HERE: mark it read-only with annotations=ToolAnnotations(...)
+def list_my_open_issues(repo: str, limit: int = 10) -> list[dict]:
+    """Placeholder."""
+    # YOUR CODE HERE: write a docstring that says what it returns and when to use it; request
+    # per_page=min(limit, 50); drop pull requests; return number, title, labels (names) and url only
+    raise NotImplementedError
+
+@mcp.tool()  # YOUR CODE HERE: mark it as a write: readOnlyHint=False, destructiveHint=False
+def create_issue(repo: str, title: str, body: str = "") -> dict:
+    """Placeholder."""
+    # YOUR CODE HERE: a docstring that says it WRITES to GitHub; POST /repos/{repo}/issues with
+    # title and body; return {"number": ..., "url": ...}
+    raise NotImplementedError
+
+@mcp.prompt()
+def weekly_triage(repo: str) -> str:
+    return f"List open issues in {repo}, group them by label, and propose the top 3 to fix this week."
+
+async def demo():
+    async with create_connected_server_and_client_session(mcp) as client:
+        for t in (await client.list_tools()).tools:
+            print(t.name, "read-only" if t.annotations and t.annotations.readOnlyHint else "writes")
+        res = await client.call_tool("list_my_open_issues", {"repo": "me/app", "limit": 5})
+        print(res.isError, [i["number"] for i in (res.structuredContent or {}).get("result", [])])
+        github.override = FakeResponse(401, {"message": "Bad credentials"})
+        res = await client.call_tool("list_my_open_issues", {"repo": "me/app"})
+        print(res.isError, res.content[0].text)
+
+if __name__ == "__main__":
+    asyncio.run(demo())
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly the lines below. The starter prints `writes` twice,
+`True []` and an empty error, because a `NotImplementedError` inside a tool becomes an error result.
+
+```
+list_my_open_issues read-only
+create_issue writes
+False [12, 9]
+True Error executing tool list_my_open_issues: GitHub token invalid or expired
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 7 fail with `AssertionError`: annotations are missing, the
+descriptions say "Placeholder" and every call returns `isError=True`. A correct solution passes all 7.
+
+```python
+import asyncio
+import json
+import pytest
+import lab
+from lab import FakeResponse, mcp
+from mcp.shared.memory import create_connected_server_and_client_session
+
+@pytest.fixture(autouse=True)
+def fresh_github(monkeypatch):
+    monkeypatch.setattr(lab, "github", lab.FakeGitHub())
+
+def with_client(fn):
+    async def go():
+        async with create_connected_server_and_client_session(mcp) as client:
+            return await fn(client)
+    return asyncio.run(go())
+
+def test_tools_are_described_and_annotated():
+    tools = {t.name: t for t in with_client(lambda c: c.list_tools()).tools}
+    assert set(tools) == {"list_my_open_issues", "create_issue"}
+    for t in tools.values():
+        assert "placeholder" not in t.description.lower() and len(t.description.split()) >= 8
+    assert "return" in tools["list_my_open_issues"].description.lower()
+    assert "writ" in tools["create_issue"].description.lower() or "creat" in tools["create_issue"].description.lower()
+    assert tools["list_my_open_issues"].annotations.readOnlyHint is True
+    assert tools["create_issue"].annotations.readOnlyHint is False
+    assert tools["list_my_open_issues"].inputSchema["required"] == ["repo"]
+
+def test_list_trims_fields_drops_prs_and_caps_page_size():
+    res = with_client(lambda c: c.call_tool("list_my_open_issues", {"repo": "me/app", "limit": 500}))
+    assert not res.isError
+    items = res.structuredContent["result"]
+    assert [i["number"] for i in items] == [12, 9]
+    assert items[1] == {"number": 9, "title": "Add dark mode", "labels": ["feature", "ui"],
+                        "url": "https://github.com/me/app/issues/9"}
+    assert lab.github.calls[0][2]["per_page"] == 50
+
+@pytest.mark.parametrize("resp, message", [
+    (FakeResponse(401), "GitHub token invalid or expired"),
+    (FakeResponse(429, headers={"retry-after": "30"}), "rate limited, retry after 30s"),
+    (FakeResponse(500), "GitHub error 500"),
+])
+def test_api_errors_become_tool_errors(resp, message):
+    lab.github.override = resp
+    res = with_client(lambda c: c.call_tool("list_my_open_issues", {"repo": "me/app"}))
+    assert res.isError and message in res.content[0].text
+
+def test_unknown_repo_is_a_clear_404():
+    res = with_client(lambda c: c.call_tool("list_my_open_issues", {"repo": "me/nope"}))
+    assert res.isError and "not found: /repos/me/nope/issues" in res.content[0].text
+
+def test_create_issue_posts_title_and_body():
+    res = with_client(lambda c: c.call_tool("create_issue", {"repo": "me/app", "title": "Crash", "body": "trace"}))
+    assert not res.isError
+    assert json.loads(res.content[0].text) == {"number": 13, "url": "https://github.com/me/app/issues/13"}
+    assert lab.github.calls == [("POST", "/repos/me/app/issues", None, {"title": "Crash", "body": "trace"})]
+```
+
+### Failure scenarios
+- **Return the raw issue dicts.** The trim test fails on the extra `body` and `pull_request` keys. With a
+  real host the 3,000-character bodies fill context; compare `len(res.content[0].text)` before and after.
+- **Raise one generic error for every status** (for example `RuntimeError(r.status_code)`). The model sees
+  a bare number with no hint what to do. The 401 test fails on the message; read `res.content[0].text`
+  exactly as the host shows it to the model.
+- **Forget the annotations.** The listing test fails, and a host that reads the hints cannot tell the read
+  tool from the write tool. Inspect `list_tools()` output in the MCP Inspector; annotations are only hints,
+  so the host's own approval prompt is still the real gate.
+- **Print debug output to stdout in a stdio server.** Over stdio, stdout carries the protocol, so stray
+  prints corrupt messages and the Inspector disconnects. Log to stderr instead.
+
+### Submission
+- **`lab.py`** with every `YOUR CODE HERE` part done and `FakeGitHub` unchanged.
+- **A green test run** (7 passed) and the output of `python lab.py`.
+- **A screenshot or log** of the same server in the MCP Inspector over stdio, showing both tool schemas.
+- **A short note:** why `create_issue` takes only `title` and `body`, and which GitHub token scope it needs.
+- **Evaluated on:** tests passing, trimmed results, actionable error text, and honest annotations.
 
 ## Why it exists
 - **Tool design is the real skill.** Wrapping 40 REST endpoints one-to-one gives a model too many similar tools;

@@ -5,7 +5,7 @@ name: MCP authentication / authorization / transport security
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement
@@ -194,7 +194,7 @@ sequenceDiagram
 
 ## Misconceptions
 - **"A good system prompt keeps the agent off dangerous tools."** Injected text in a tool result can
-  override any instruction, so the model will eventually call whatever it can reach. Only scopes and
+  override system-prompt instructions, so the model will eventually call whatever it can reach. Only scopes and
   server-side checks on the validated token decide what a call may do.
 - **"A valid signature from our issuer means the token is good here."** Signature and issuer prove who
   minted it, not for whom. Without the audience check, a token a compromised `docs` server captured

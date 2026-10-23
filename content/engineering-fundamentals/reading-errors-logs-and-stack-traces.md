@@ -5,7 +5,8 @@ name: Reading errors, logs and stack traces
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -42,6 +43,181 @@ join logs by trace id.
   failure with a `trace_id`, and keeping the raw tool arguments in the log so the step can be replayed.
 - **What you can skip.** Memorising exception classes. Learn the reading order; the class name and
   message are always printed for you.
+
+## Lab
+### Task
+Build the trace explainer an on-call engineer runs first: parse a messy JSON-lines log, pull one run by
+`trace_id`, name the first error in time and list the rest as consequences, then walk the exception's
+cause chain to the deepest frame in your own code. Time box: 45-60 min.
+- **Prerequisites:** Command line and environment basics; How it works steps 1-4; the wrapped tool
+  error example below.
+- **Setup:** Python 3.9+ and `pip install pytest` (checked with Python 3.9.6 and pytest 8.4.2). Save the
+  starter as `lab.py` byte for byte (the expected line number depends on it) and the tests as
+  `test_lab.py`.
+- **The data:** the worked scenario's run `t-91`, shipped out of time order, interleaved with run
+  `t-92`, plus a stray stderr line, as real log pipelines deliver them.
+
+### Starter code
+```python
+"""Lab: a trace explainer for a failed agent run: logs by trace id, then the cause chain. Run: python lab.py"""
+import json, traceback
+
+# JSON lines as shipped from three services: out of time order, two runs interleaved, one stray stderr line.
+LOG = """\
+{"ts": "12:00:35.060", "trace_id": "t-91", "service": "api", "level": "ERROR", "event": "request timeout after 30 s"}
+{"ts": "12:00:01.120", "trace_id": "t-91", "service": "api", "level": "INFO", "event": "run started"}
+{"ts": "12:00:01.300", "trace_id": "t-92", "service": "api", "level": "INFO", "event": "run started"}
+{"ts": "12:00:05.050", "trace_id": "t-91", "service": "worker", "level": "ERROR", "event": "ToolError: get_invoice failed"}
+{"ts": "12:00:02.480", "trace_id": "t-91", "service": "worker", "level": "WARNING", "event": "model call 429, retry 1 after 2 s"}
+Traceback (most recent call last):
+{"ts": "12:00:04.910", "trace_id": "t-91", "service": "worker", "level": "INFO", "event": "model call 200, tool_call get_invoice"}
+{"ts": "12:00:03.900", "trace_id": "t-92", "service": "worker", "level": "ERROR", "event": "RateLimitError: 429 after 3 retries"}
+{"ts": "12:00:05.030", "trace_id": "t-91", "service": "tool-svc", "level": "ERROR", "event": "KeyError: 'amount_due' in format_invoice"}
+{"ts": "12:00:06.000", "trace_id": "t-92", "service": "api", "level": "ERROR", "event": "run failed"}
+"""
+
+class ToolError(Exception):
+    """Raised at the tool boundary; the model sees this message."""
+
+def format_invoice(inv):
+    return f"{inv['amount_due']:.2f} {inv['currency']}"
+
+def get_invoice(raw):                           # chains deliberately: raise ... from e
+    try:
+        return format_invoice(json.loads(raw))
+    except KeyError as e:
+        raise ToolError("get_invoice failed") from e
+
+def get_invoice_buggy(raw):                     # a second bug inside the except block
+    try:
+        return format_invoice(json.loads(raw))
+    except KeyError as e:
+        return {"error": e.missing_field}       # AttributeError while handling the KeyError
+
+def parse(text):
+    """Returns (records, skipped): every line that is a JSON object, and the count of lines that are not."""
+    # YOUR CODE HERE: never crash on a non-JSON line; count it instead
+    raise NotImplementedError
+
+def explain(records, trace_id):
+    """{"first_error": record, "consequences": [records], "warnings": int} for one trace, in time order."""
+    # YOUR CODE HERE: filter by trace_id, sort by ts, the first ERROR is the lead, later ERRORs are
+    # consequences, count WARNINGs
+    raise NotImplementedError
+
+def cause_chain(err):
+    """[(type name, how)] from the outer exception to the root. how is "raised" for the outer one, then
+    "cause" for `raise ... from` links and "context" for errors raised while handling another."""
+    # YOUR CODE HERE: follow __cause__ first, else __context__ unless __suppress_context__ is set
+    raise NotImplementedError
+
+def deepest_frame(err, filename):
+    """'func:lineno' of the deepest frame in `filename` for the ROOT exception of the chain."""
+    # YOUR CODE HERE: walk to the root as in cause_chain, then traceback.extract_tb(root.__traceback__)
+    raise NotImplementedError
+
+def catch(fn, *args):
+    try:
+        fn(*args)
+    except Exception as e:
+        return e
+
+if __name__ == "__main__":
+    records, skipped = parse(LOG)
+    print(f"parsed: {len(records)} records, skipped {skipped} non-JSON line")
+    story = explain(records, "t-91")
+    first = story["first_error"]
+    print("first error:", first["ts"], first["service"], first["event"])
+    print("consequences:", [f"{r['service']}: {r['event']}" for r in story["consequences"]])
+    print("warnings:", story["warnings"])
+    raw = '{"total": 42.0, "currency": "EUR"}'      # the invoice API renamed amount_due to total
+    err = catch(get_invoice, raw)
+    print("chain:", cause_chain(err))
+    print("root frame:", deepest_frame(err, __file__))
+    print("buggy handler chain:", cause_chain(catch(get_invoice_buggy, raw)))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+parsed: 9 records, skipped 1 non-JSON line
+first error: 12:00:05.030 tool-svc KeyError: 'amount_due' in format_invoice
+consequences: ['worker: ToolError: get_invoice failed', 'api: request timeout after 30 s']
+warnings: 1
+chain: [('ToolError', 'raised'), ('KeyError', 'cause')]
+root frame: format_invoice:22
+buggy handler chain: [('AttributeError', 'raised'), ('KeyError', 'context')]
+```
+
+- **Read the lines:** the KeyError at 12:00:05.030 leads by 20 ms; the 429 stays a warning because it
+  was retried; line 22 is the `inv['amount_due']` lookup, the deepest frame of ours under the wrapper;
+  the buggy handler shows a "context" link, the printed "During handling" case.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 7 fail with `NotImplementedError`; a correct solution
+passes all 7 (Python 3.9.6, pytest 8.4.2).
+
+```python
+import lab
+from lab import LOG, catch, cause_chain, deepest_frame, explain, get_invoice, get_invoice_buggy, parse
+
+RAW = '{"total": 42.0, "currency": "EUR"}'
+
+def test_parse_skips_non_json_lines_without_crashing():
+    records, skipped = parse(LOG + "not json\n[1, 2]\n")
+    assert (len(records), skipped) == (9, 3)
+
+def test_first_error_in_time_is_the_lead_not_the_last_or_loudest():
+    story = explain(parse(LOG)[0], "t-91")
+    assert story["first_error"]["service"] == "tool-svc"
+    assert [r["service"] for r in story["consequences"]] == ["worker", "api"]
+    assert story["warnings"] == 1
+
+def test_other_runs_do_not_leak_in():
+    story = explain(parse(LOG)[0], "t-92")
+    assert story["first_error"]["event"].startswith("RateLimitError")
+    assert len(story["consequences"]) == 1 and story["warnings"] == 0
+
+def test_cause_chain_reaches_the_root():
+    assert cause_chain(catch(get_invoice, RAW)) == [("ToolError", "raised"), ("KeyError", "cause")]
+
+def test_bug_in_handler_is_a_context_link():
+    assert cause_chain(catch(get_invoice_buggy, RAW)) == [("AttributeError", "raised"), ("KeyError", "context")]
+
+def test_suppressed_context_stops_the_chain():
+    def wrap():
+        try:
+            {}["x"]
+        except KeyError:
+            raise ValueError("clean message") from None
+    assert cause_chain(catch(wrap)) == [("ValueError", "raised")]
+
+def test_deepest_frame_is_in_our_code_at_the_bad_line():
+    line = lab.format_invoice.__code__.co_firstlineno + 1
+    assert deepest_frame(catch(get_invoice, RAW), lab.__file__) == f"format_invoice:{line}"
+```
+
+### Failure scenarios
+- **Skip the sort.** The first `ERROR` in file order is the api timeout, the consequence the Pitfalls
+  warn about. Ship times are not event times: sort by `ts` within the trace before reading.
+- **Follow only `__cause__`.** The buggy handler's chain stops at `AttributeError` and the `KeyError`
+  that started it disappears. Print the traceback and look for "During handling of the above
+  exception" to see the link you dropped.
+- **Take frames from the outer exception.** `deepest_frame` returns `get_invoice:28`, the `raise
+  ToolError` line: where the code noticed, not where the bad value broke it. Walk to the root first.
+- **Let `parse` raise on the stderr line.** The explainer crashes on the one log where a process died
+  mid-write, which is the log you most need. Count and skip, and report the count.
+
+### Submission
+- **`lab.py`** with the four functions implemented; the log, tools and main block unchanged.
+- **A green run** of `pytest -q test_lab.py` (7 passed) and the output of `python lab.py`.
+- **A `jq` one-liner** over `LOG` saved to a file that prints run `t-91`'s lines in time order (stray
+  line skipped, for example with `jq -cR 'fromjson? | select(.trace_id == "t-91")'` piped into a
+  `jq -s 'sort_by(.ts)[]'`), with its output.
+- **A note** (3-5 sentences): the root cause of run `t-91` and the fix at the tool boundary.
+- **Evaluated on:** the lead error is the earliest in time; no other run leaks in; the chain reaches
+  the root through both link kinds; the named frame is in your code.
 
 ## Why it exists
 - **The surface is not the cause.** The frame that raises is where the program noticed the problem, often

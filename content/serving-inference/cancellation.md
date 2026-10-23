@@ -5,7 +5,7 @@ name: Cancellation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -156,7 +156,8 @@ sequenceDiagram
   reading. The stop must cross every hop, and each hop must close its own upstream connection, or
   decoding runs to `max_tokens`.
 - **"`task.cancel()` kills the task."** It schedules a `CancelledError` at the next `await`. `finally`
-  blocks run, and one that logs and returns swallows the cancel, so the upstream is never closed.
+  blocks run, so that is where the upstream stream must be closed; a `finally` that returns, or an
+  `except CancelledError` that does not re-raise, swallows the cancel and the run carries on.
 - **"My server knows when the client leaves."** It learns only when it next touches the socket. A
   streaming handler notices within a token; a non-streaming handler awaiting the model never does unless
   you race it against a disconnect watcher.

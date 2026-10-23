@@ -5,7 +5,7 @@ name: Modular monolith vs microservices
 kind: decision
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -59,7 +59,7 @@ are illustrative.
 |---|---|---|---|---|
 | A. Single deployable | Loop, tools, retrieval, memory and code execution in one API process | 15, 0.999¹⁵ ≈ 98.5% | Fails: generated code runs beside the credentials | Simplest, but a 10-minute run blocks an API worker |
 | B. One image, `api` and `worker` entrypoints, plus a sandbox service | Enforced modules in one codebase; runs execute in `worker`; code runs in a separate sandbox over HTTP | 15 + 3 = 18, 0.999¹⁸ ≈ 98.2% | Passes: own network segment and no database credentials | One build, three runtime units, one rotation |
-| C. Microservices per capability | Orchestrator, memory, retrieval, tools and sandbox as services; each step crosses orchestrator to memory and to a tool | 3 per step, 45, 0.999⁴⁵ ≈ 95.6% | Passes | Seven pipelines and contracts for 8 engineers; heavy for a VPC install |
+| C. Microservices per capability | Orchestrator, memory, retrieval, tools and sandbox as services; each step crosses orchestrator to memory and to a tool | 3 per step, 45, 0.999⁴⁵ ≈ 95.6% | Passes | Five pipelines and versioned contracts for 8 engineers; heavy for a VPC install |
 
 At 40,000 runs a day, that is roughly 600 runs (A), 710 runs (B) and 1,760 runs (C) a day that hit at
 least one failed link and must retry or abort.
@@ -72,8 +72,8 @@ Choose **B, one image with `api` and `worker` roles plus a sandbox service**, be
   10-minute runs off the API without a second codebase or versioned contract.
 - **Hop math rules out C:** C turns about 710 failing runs a day into about 1,760, and each extra hop
   is a retry path that needs an idempotency key.
-- **Team and deadline:** one team gains no release independence from seven services, and a customer
-  VPC install with no platform team is three units, not seven.
+- **Team and deadline:** one team gains no release independence from five services, and a customer
+  VPC install with no platform team is three units, not five.
 
 **What would change it:** a second team owning retrieval on its own release cadence, retrieval moving to
 a different data store, or self-hosting the model on GPUs would each justify extracting that one module

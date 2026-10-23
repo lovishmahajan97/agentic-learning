@@ -5,7 +5,7 @@ name: Graceful degradation
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -66,7 +66,8 @@ base and issue refunds. Figures are illustrative.
 Choose **D**.
 - **Budget and SLO:** it is the only option that keeps the cap and the paying SLO at once. The
   projected-burn trigger (`spent + current_rate × hours_left > cap`) sees $3,600 against $2,000 within
-  the first hour of a spike day. Stepping free runs down then holds the day near $1,620.
+  the first hour of a spike day. Stepping free runs down then holds the day near $1,700 ($1,620 plus
+  about $80 for the first hour of free runs at Level 0), under the cap.
 - **Refund safety:** write tools go before read tools. The refund constraint becomes the read-only
   level's trigger rather than a reason to switch the agent off.
 - **On-call:** every level is a runtime flag named in the runbook, so the engineer can mitigate without
@@ -84,6 +85,8 @@ day), the budget or the Level 0 step count must change; no ladder fixes that.
   launch week.
 - **Drafted refunds wait for humans in read-only mode.** Monitor the drafted-action backlog and approval
   latency.
+- **Safety step-downs spend the paying SLO.** A policy-check outage or injection alert moves paying runs
+  to read-only too; count that time against the 99% target and track it separately from budget steps.
 - **Hysteresis keeps users one level down a little longer** after recovery; review the thresholds with
   the SLO.
 

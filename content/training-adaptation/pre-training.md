@@ -5,7 +5,7 @@ name: Pre-training
 kind: concept
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: background
 related:
@@ -184,11 +184,13 @@ flowchart TD
 - **"Tool calling is learned in post-training."** Post-training teaches the format and when to call; the
   ability to read schemas and emit valid JSON comes from the code and structured text in the pre-training
   mix. A base that saw little of either stays a weak tool caller.
-- **"Lower loss means the better base."** Loss is per token, so a coarser tokenizer looks worse while
-  predicting the same text better. Compare candidates on bits per byte over the same corpus.
-- **"Chinchilla's ~20 tokens per parameter is the right amount of training."** It minimises training
-  compute only. Agents spend far more on inference, so a smaller base trained well past the ratio (143
-  tokens per parameter in the 7B example) is the cheaper total.
+- **"Lower loss means the better base."** Loss is per token, so a coarser tokenizer (fewer, more informative
+  tokens) can look worse per token while predicting the same text as well or better per byte. Compare
+  candidates on bits per byte over the same corpus.
+- **"Chinchilla's ~20 tokens per parameter is the right amount of training."** It is the loss-optimal
+  split for a fixed training budget and ignores inference. Agents spend far more on inference, so a
+  smaller base trained well past the ratio (143 tokens per parameter in the 7B example) is often the
+  cheaper total for the same quality.
 - **"Pre-training on our documents will teach it our products."** 200M tokens is orders of magnitude
   short of a corpus; facts belong in retrieval, style in a fine-tune, and continued pre-training only fits
   a large corpus mixed with general data.

@@ -5,7 +5,7 @@ name: Async cancellation & exception propagation
 kind: concept
 difficulty: advanced
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -117,6 +117,13 @@ import asyncio, time
 import pytest
 import lab_cancel as lab
 
+@pytest.fixture(autouse=True)
+def reset():
+    lab.in_flight.clear()
+
+# in_flight is read inside the running loop: asyncio.run cancels leftover tasks when it exits,
+# which would hide a tool left running.
+
 def test_wrapper_lets_cancellation_through():
     async def scenario():
         t = asyncio.create_task(lab.call_tool("llm", 5.0))
@@ -126,30 +133,36 @@ def test_wrapper_lets_cancellation_through():
             await t
         except asyncio.CancelledError:
             pass
-        return t
-    t = asyncio.run(scenario())
+        return t, set(lab.in_flight)
+    t, still_open = asyncio.run(scenario())
     assert t.cancelled(), f"cancelled tool reported a result: {t.result()!r}"
-    assert lab.in_flight == set()
+    assert still_open == set()
 
 def test_ordinary_error_is_returned_to_the_model():
     out = asyncio.run(lab.call_tool("calc", 0.01, ValueError("bad input")))
     assert out == "error: ValueError('bad input')"
 
 def test_turn_deadline_fires():
+    async def scenario():
+        with pytest.raises(TimeoutError):
+            await lab.run_turn([("retriever", 0.05), ("llm", 2.0)], deadline=0.2)
+        return set(lab.in_flight)
     t0 = time.perf_counter()
-    with pytest.raises(TimeoutError):
-        asyncio.run(lab.run_turn([("retriever", 0.05), ("llm", 2.0)], deadline=0.2))
+    still_open = asyncio.run(scenario())
     assert time.perf_counter() - t0 < 0.6
-    assert lab.in_flight == set(), "a tool was left running after the deadline"
+    assert still_open == set(), f"left running after the deadline: {sorted(still_open)}"
 
 def test_fatal_error_cancels_siblings():
+    async def scenario():
+        with pytest.raises(ExceptionGroup) as info:
+            await lab.run_turn([("calc", 0.05, lab.FatalToolError("schema mismatch")),
+                                ("search", 1.0)], deadline=2.0)
+        return info, set(lab.in_flight)
     t0 = time.perf_counter()
-    with pytest.raises(ExceptionGroup) as info:
-        asyncio.run(lab.run_turn([("calc", 0.05, lab.FatalToolError("schema mismatch")),
-                                  ("search", 1.0)], deadline=2.0))
+    info, still_open = asyncio.run(scenario())
     assert info.value.subgroup(lab.FatalToolError) is not None
     assert time.perf_counter() - t0 < 0.5, "siblings ran to completion instead of being cancelled"
-    assert lab.in_flight == set()
+    assert still_open == set(), f"siblings left running: {sorted(still_open)}"
 
 def test_partial_results_still_work():
     out = asyncio.run(lab.run_turn([("retriever", 0.05), ("calc", 0.01, ValueError("x"))], deadline=1.0))

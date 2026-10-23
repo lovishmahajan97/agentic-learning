@@ -5,7 +5,7 @@ name: Prompt versioning
 kind: practice
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:

@@ -5,7 +5,7 @@ name: Self-host vs API
 kind: decision
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -58,7 +58,7 @@ a small-model step extracts clause fields, about 20 calls per contract. All figu
 ### Options
 | Option | How it works | Monthly cost now (at 3×) | Constraints |
 |---|---|---|---|
-| A. API for every step | EU zero-retention endpoint for planner and extractor | $10,160 ($30,480 at 3×, about $14,480 with planner prefix caching) | Meets data, latency and deadline; budget only with caching |
+| A. API for every step | EU zero-retention endpoint for planner and extractor | $10,160 ($30,480 at 3×; about $14,480 if prefix caching cuts the $24,000 planner bill about 3×, as in the worked scenario below) | Meets data, latency and deadline; budget only with caching |
 | B. Hybrid: self-host the extractor | vLLM on 2 GPUs (minimum for redundancy), planner stays on the API | $8,000 + $7,650 = $15,650 | Over budget now; new on-call for a team with no GPU experience |
 | C. Self-host everything | 70B-class planner on two multi-GPU nodes plus the extractor | Far above budget: two 8-GPU nodes alone are $29,200 | Fails the 84% quality bar (71%) and the deadline |
 

@@ -5,7 +5,8 @@ name: Command line and environment basics
 kind: practice
 difficulty: core
 est_minutes: 16
-status: mastery-verified
+status: typed
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: yes
@@ -41,6 +42,165 @@ things being different.
   started and stopped, which port and interface a server binds, and how a tool reports exit codes.
 - **What you can skip.** Shell scripting tricks and advanced `awk`. Master the process model; look up
   syntax as needed.
+
+## Lab
+### Task
+Build the "run a command" tool a coding agent calls, plus two startup checks, so the model and the
+operator see what the OS actually reported. The tool runs an argument list with `shell=False`, passes a
+minimal environment, bounds time and output, and maps every way a process can end to an exit code.
+Time box: 45-75 min.
+- **Prerequisites:** How it works sections 2-4 (environment, exit codes and signals, ports); the bash
+  example below; Reading errors, logs and stack traces is useful but optional.
+- **Setup:** Python 3.9+ on macOS or Linux and `pip install pytest` (checked with Python 3.9.6 and pytest
+  8.4.2 on macOS). Save the starter as `lab.py` and the tests as `test_lab.py`. Signals behave
+  differently on Windows; use WSL there.
+- **Conventions used:** 127 for "command not found" and 128 + N for "killed by signal N", as the shell
+  reports them; 124 for a timeout, as the coreutils `timeout` command does.
+
+### Starter code
+```python
+"""Lab: an agent's run-command tool and startup checks that report what the OS reports. Run: python lab.py"""
+import os, signal, socket, subprocess, sys
+
+PY = sys.executable                              # an absolute interpreter path, never "python" from PATH
+
+def run_tool(argv, allow_env=(), timeout=5.0, max_output=2000):
+    """Run argv with shell=False and a minimal environment. Returns a dict with
+    exit_code (int), signal (name or None), timed_out (bool), stdout, stderr (str)."""
+    # YOUR CODE HERE:
+    # - env = PATH plus only the names in allow_env that the parent has (never the whole os.environ)
+    # - a negative returncode -N means "killed by signal N": exit_code = 128 + N, signal = its name
+    # - a missing program: exit_code 127, stderr = str(the error)
+    # - a timeout: exit_code 124, timed_out True
+    # - stdout longer than max_output: keep max_output chars + f"...[truncated {n} chars]"
+    raise NotImplementedError
+
+def port_in_use(port, host="127.0.0.1"):
+    # YOUR CODE HERE: try to bind (host, port); EADDRINUSE means someone is listening
+    raise NotImplementedError
+
+def missing_config(required, environ=None):
+    # YOUR CODE HERE: names from `required` that are absent or empty in environ (default os.environ),
+    # in the order given; print names only, never values
+    raise NotImplementedError
+
+if __name__ == "__main__":
+    os.environ["MODEL_ID"] = "small"             # exported: children may inherit it
+    os.environ["SECRET_KEY"] = "sk-test-not-for-tools"
+    show = "import os; print('MODEL_ID=%s SECRET_KEY=%s' % (os.environ.get('MODEL_ID'), os.environ.get('SECRET_KEY')))"
+    print("env: child sees", run_tool([PY, "-c", show], allow_env=["MODEL_ID"])["stdout"].strip())
+
+    r = run_tool([PY, "-c", "import sys; sys.exit(3)"])
+    nf = run_tool(["no-such-cmd", "--version"])
+    print("exit:", r["exit_code"], "| not found:", nf["exit_code"], nf["stderr"].split(":")[0])
+    r = run_tool([PY, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"])
+    print("killed:", r["exit_code"], r["signal"])
+    r = run_tool([PY, "-c", "import time; time.sleep(5)"], timeout=0.5)
+    print("timeout:", r["exit_code"], f"timed_out={r['timed_out']}")
+    r = run_tool([PY, "-c", "print('x' * 10000, end='')"])
+    print("stdout kept:", len(r["stdout"].split("...")[0]), "chars +", repr(r["stdout"][2000:]))
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0)); s.listen()
+    port = s.getsockname()[1]
+    before = port_in_use(port)
+    s.close()
+    print("port in use:", before, "-> after close:", port_in_use(port))
+    print("missing config:", missing_config(["MODEL_ID", "LLM_API_KEY"]))
+```
+
+### Expected output
+`python lab.py` with a correct solution prints exactly:
+
+```
+env: child sees MODEL_ID=small SECRET_KEY=None
+exit: 3 | not found: 127 [Errno 2] No such file or directory
+killed: 137 SIGKILL
+timeout: 124 timed_out=True
+stdout kept: 2000 chars + '...[truncated 8000 chars]'
+port in use: True -> after close: False
+missing config: ['LLM_API_KEY']
+```
+
+- **Read the lines:** the secret was exported in the parent but never reached the tool; Python reports a
+  SIGKILL as returncode -9, which the tool turns into the shell's 128 + 9 = 137; 10,000 chars of output
+  became 2,000 plus a marker the model can read.
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 8 fail with `NotImplementedError`; a correct solution
+passes all 8 (Python 3.9.6, pytest 8.4.2, macOS).
+
+```python
+import json, socket
+from lab import PY, missing_config, port_in_use, run_tool
+
+SHOW = "import json, os; print(json.dumps(sorted(os.environ)))"
+
+def test_child_gets_only_allow_listed_env(monkeypatch):
+    monkeypatch.setenv("MODEL_ID", "small")
+    monkeypatch.setenv("SECRET_KEY", "sk-test")
+    monkeypatch.setenv("HOME", "/home/someone")
+    r = run_tool([PY, "-c", SHOW], allow_env=["MODEL_ID", "NOT_SET_ANYWHERE"])
+    keys = json.loads(r["stdout"])                 # the interpreter may add locale vars such as LC_CTYPE
+    assert "MODEL_ID" in keys and "PATH" in keys
+    assert not {"SECRET_KEY", "HOME", "NOT_SET_ANYWHERE"} & set(keys)
+
+def test_exit_codes_are_reported_not_hidden():
+    assert run_tool([PY, "-c", "import sys; sys.exit(3)"])["exit_code"] == 3
+    nf = run_tool(["no-such-cmd"])
+    assert nf["exit_code"] == 127 and "No such file or directory" in nf["stderr"]
+
+def test_killed_by_signal_is_128_plus_n():
+    r = run_tool([PY, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGKILL)"])
+    assert (r["exit_code"], r["signal"]) == (137, "SIGKILL")
+    r = run_tool([PY, "-c", "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"])
+    assert (r["exit_code"], r["signal"]) == (143, "SIGTERM")
+
+def test_timeout_is_bounded_and_flagged():
+    r = run_tool([PY, "-c", "import time; time.sleep(5)"], timeout=0.5)
+    assert (r["exit_code"], r["timed_out"]) == (124, True)
+
+def test_long_output_is_truncated_with_a_marker():
+    r = run_tool([PY, "-c", "print('x' * 10000, end='')"], max_output=2000)
+    assert r["stdout"] == "x" * 2000 + "...[truncated 8000 chars]"
+
+def test_stderr_stays_separate_from_stdout():
+    r = run_tool([PY, "-c", "import sys; print('data'); print('log line', file=sys.stderr)"])
+    assert (r["stdout"], r["stderr"]) == ("data\n", "log line\n")
+
+def test_port_in_use_tracks_a_real_listener():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0)); s.listen()
+    port = s.getsockname()[1]
+    assert port_in_use(port) is True
+    s.close()
+    assert port_in_use(port) is False
+
+def test_missing_config_names_only():
+    env = {"MODEL_ID": "small", "LLM_API_KEY": ""}
+    assert missing_config(["MODEL_ID", "LLM_API_KEY", "DATABASE_URL"], env) == ["LLM_API_KEY", "DATABASE_URL"]
+```
+
+### Failure scenarios
+- **Pass the parent's environment** (`env=os.environ`, or no `env` at all). The first line prints
+  `SECRET_KEY=sk-test-not-for-tools`: every command the model runs can now read and echo your keys.
+  Diagnose by running `env` through the tool and diffing it against the allow-list.
+- **Return `returncode` as is.** The kill line prints `-9 None`; the model and your logs see a negative
+  number no shell or CI system uses. Map it with `signal.Signals(9).name` and 128 + N.
+- **Drop the timeout.** The timeout scenario blocks for the full 5 s, and in an agent a hung `npm
+  install` stalls the whole run. Look for steps whose duration equals the run's deadline.
+- **Merge stderr into stdout** (`stderr=subprocess.STDOUT`). The separation test fails, and on an MCP
+  stdio server the same mix corrupts the protocol channel, as the Mastery test describes.
+
+### Submission
+- **`lab.py`** with the three functions implemented; the main block unchanged.
+- **A green run** of `pytest -q test_lab.py` (8 passed) and the output of `python lab.py`.
+- **A table** of the ending kinds (success, error exit, not found, signal, timeout): the `exit_code`
+  your tool returns, and what a shell prints in `$?` for the same case.
+- **A note** (3-5 sentences): which variables your real agent's command tool would allow, and how you
+  would sandbox it further (container, working directory, no network).
+- **Evaluated on:** no secret reaches the child; every ending maps to the documented code; output is
+  bounded; stderr stays separate.
 
 ## Why it exists
 - **Configuration has to live outside code.** Keys, model ids and base URLs differ per environment;

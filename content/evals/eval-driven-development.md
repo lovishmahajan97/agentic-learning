@@ -5,7 +5,7 @@ name: Eval-driven development
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement
@@ -161,8 +161,8 @@ flowchart TD
 - **"Temperature zero makes the gate deterministic, so assert 100%."** It reduces variance but does not
   remove it, and variance compounds over agent steps. Gate with *k* samples per task, a tolerance band
   sized from repeated baseline runs, and a list of regressed items.
-- **"A higher mean means the change is better."** A 0.81 to 0.83 lift is inside the noise at 200 items:
-  one run's SE is about 0.016 and a difference about 0.023. Count paired flips and run a sign test; 14 up
+- **"A higher mean means the change is better."** A 0.81 to 0.83 lift is inside the noise at 200 items
+  × 3 samples: one run's SE is about 0.016 and a difference about 0.023. Count paired flips and run a sign test; 14 up
   and 4 down gives p ≈ 0.03.
 - **"If task success went up, ship it."** Budgets and hard criteria are part of the spec. A planner
   change that lifts success but writes once without confirmation, or adds steps past the budget, fails

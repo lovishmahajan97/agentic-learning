@@ -6,7 +6,8 @@ kind: practice
 difficulty: advanced
 est_minutes: 40
 agent_relevance: core
-status: agentic-verified
+status: typed
+lesson_type: decision
 related:
   - slm-for-agents/fine-tuning-an-slm-for-an-agent-task
   - slm-for-agents/slm-llm-cascades-and-routing
@@ -38,6 +39,64 @@ agent cost while measuring quality.
   escalation threshold and the quality bar that the SLM must meet.
 - **What you can skip.** Pre-training, full fine-tuning and multi-GPU training. A 1-8B model, LoRA and one
   GPU (or a rented one) are enough.
+
+## Decision case
+### Scenario
+A SaaS company's support agent spends most of its frontier-model budget on the ticket-triage step from
+this lesson. The team has a LoRA adapter that passes the eval gate and must decide how to deploy it. All
+figures are illustrative, from the team's own held-out set and price sheets, not benchmarks.
+- **Volume:** 100,000 triage turns a day, about 3,000,000 a month (3,000 thousand-turn units).
+- **Frontier baseline:** $2.00 per 1k turns, so $6,000 a month, at 94% task accuracy.
+- **Fine-tuned SLM:** 89% accuracy alone; with schema validation it accepts 85% of turns at 93% accuracy
+  and escalates 15%, which the frontier model handles at 94%.
+- **GPU price:** $1.50 an hour for one rented GPU, so $1,095 a month at 730 hours; one GPU handles the
+  measured peak load with headroom.
+- **Constraints:** cut cost by 50%+, stay within 2 points of frontier accuracy, keep triage available if a
+  GPU fails, and only one part-time ML engineer for operations.
+
+### Options
+| Option | How it works | Cost a month (cut) | Accuracy | If the GPU fails |
+|---|---|---|---|---|
+| Frontier only | Every turn to the API | $6,000 (0%) | 94.0% | not affected |
+| SLM only, 2 GPUs | Fine-tuned SLM serves all turns, second GPU for redundancy | $2,190 (63.5%) | 89.0% | second GPU takes over |
+| Routed, 2 GPUs | SLM first, 15% escalated, second GPU for redundancy | $2,190 + $900 = $3,090 (48.5%) | 93.15% | second GPU takes over |
+| Routed, 1 GPU, frontier fallback | SLM first, 15% escalated; if the GPU is down the router sends everything to the API | $1,095 + $900 = $1,995 (66.75%) | 93.15% | all turns go to the API at $2.00 per 1k |
+
+Escalation cost is 0.15 x 3,000 x $2.00 = $900. Routed accuracy is 0.85 x 93% + 0.15 x 94% = 93.15%,
+0.85 points below frontier.
+
+### Decision
+**Routed, one GPU, with the frontier model as the fallback path.** It meets every constraint: a 66.75% cut,
+0.85 points below frontier, and triage keeps working through a GPU failure because the router already
+knows how to send turns to the API.
+- **SLM only fails quality** by 5 points; validation-based escalation is what closes the gap.
+- **A second GPU buys redundancy the API already provides,** and pushes the cut to 48.5%, under target.
+- **The fallback has a price:** each day the GPU is down adds 85,000 turns x $2.00 per 1k = $170. Three
+  bad days in a month cost $510, so the month is $2,505 and still a 58.25% cut.
+
+**What would change it.** If regulated customers require that ticket text never leaves the company's
+network, the API fallback and escalation are out for them, so a second self-hosted tier is needed and the
+cost target must be renegotiated. If volume halves, the GPU sits idle more and the saving shrinks; recompute
+from measured throughput before renewing.
+
+### Trade-offs accepted
+- **Cost spikes during GPU outages.** Watch GPU health and daily spend; alert when the fallback share
+  passes 50% of turns for more than an hour.
+- **Two models to keep in step.** A frontier model upgrade can change the labels the adapter was trained to
+  imitate. Re-run the held-out set on both models when either changes.
+- **Escalation rate is load-bearing.** If it rises from 15% to 25%, escalation cost goes from $900 to $1,500
+  and the cut falls to 56.75%. Track escalation reasons daily and turn the top reason into training data.
+
+### Review rubric
+- **Cost per option recomputed:** GPU hours, escalation share and API price are combined into a monthly
+  figure and a percentage cut.
+- **Accuracy blended correctly:** routed accuracy weights the SLM-accepted and escalated slices by their
+  share of traffic.
+- **Failure mode costed:** the write-up prices the fallback path for a realistic outage, not only the happy
+  path.
+- **Operations sized to the team:** the option fits the stated operations capacity.
+- **Data constraints checked:** the write-up states whether any traffic is barred from the external API.
+- **Change triggers stated:** volume, escalation-rate or residency changes that would flip the choice.
 
 ## Why it exists
 - **Frontier models are expensive for narrow, repetitive steps.** Classification, extraction and

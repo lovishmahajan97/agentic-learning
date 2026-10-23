@@ -5,7 +5,7 @@ name: Shadow-mode validation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -45,18 +45,19 @@ to a model running in its own cloud account, which its data team has already app
 Constraints (figures illustrative):
 - **No exposure before evidence.** The insurer's risk committee will not let any claimant see candidate
   output until it has reviewed evidence from real traffic.
-- **Deadline.** The committee meets in 3 weeks, so evidence must be ready in under 3 weeks.
+- **Deadline.** The committee meets in 3 weeks, so evidence and its readout must be ready within 3 weeks.
 - **SME time.** Two claims handlers can adjudicate about 150 disagreements a week between them.
 - **Budget.** At most $1,000 of extra inference, at an assumed $0.04 per candidate run.
-- **Coverage.** The window must include month-end, when bulk claims arrive.
+- **Coverage.** The window must include month-end, when bulk claims arrive; month-end falls in the
+  second week from now.
 - **No duplicate actions.** No claimant may get a second email or payment.
 
 ### Options
 | Option | How it works | Meets deadline? | Exposure | Cost | Evidence quality |
 |---|---|---|---|---|---|
-| **A. Replay last month's logs** | Run the candidate offline on logged claims with recorded reads | Yes, days | None | About $720 for 18,000 logs | Right distribution, but stale: no live latency, rate limits or this month's new forms |
+| **A. Replay last month's logs** | Run the candidate offline on logged claims with recorded reads | Yes, days | None | About $720 for 18,000 logged claims (2 weeks' worth) | Right distribution, but stale: no live latency, rate limits or this month's new forms |
 | **B. Async shadow on 100% for 2 weeks** | Queue fork after production answers; dry-run writes; 5% self-agreement slice | Yes: 2 weeks plus 1 for readout | None | 18,000 × $0.04 + 900 × $0.04 = $756 | Live traffic, about 1,080 disagreements at 6%, 300 adjudicated |
-| **C. Async shadow on 25% for 4 weeks** | Same fork, sampled | No: 4 weeks | None | 9,000 × $0.04 = $360 | About 540 disagreements, same 300 adjudicated, but late |
+| **C. Async shadow on 25% for 4 weeks** | Same fork, sampled | No: 4 weeks | None | 9,000 × $0.04 = $360 | About 540 disagreements, up to all 540 adjudicated, but the readout lands after the committee |
 | **D. 5% canary straight away** | Candidate answers 5% of claimants, with rollback triggers | Yes | Real claimants | Low | User outcomes, but forbidden by the committee |
 
 ### Decision

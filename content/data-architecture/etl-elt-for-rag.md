@@ -5,7 +5,7 @@ name: ETL / ELT for RAG
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:

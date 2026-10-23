@@ -5,7 +5,7 @@ name: GIL (Global Interpreter Lock)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -131,9 +131,10 @@ def test_gil_releasing_tool_stays_in_threads():
 ### Failure scenarios
 - **Inject `time.time()` for CPU instead of `time.process_time()`.** Every ratio becomes 1.0, so hashing
   is sent to processes. Debug: print both clocks; process CPU time must sum across all threads.
-- **Inject building the blob inside `hash_blob`** (`hashlib.sha256(b"x" * 100_000_000)`). The hashing
-  ratio drops well below 4, because creating the bytes is Python-level work that holds the GIL. Debug:
-  time the allocation and the hash separately.
+- **Inject hashing in 1 KB chunks inside `hash_blob`** (a loop of `h.update(BLOB[i:i + 1024])`). The
+  hashing ratio falls to about 1.0 and `choose_executor` sends it to processes: `hashlib` releases the
+  GIL only for inputs of about 2 KB or more, and the Python loop holds it in between. Debug: compare the
+  1-thread and 4-thread ratios, then raise the chunk size (64 KB) and measure again.
 - **Run the tests on a busy machine or a 2-core CI runner.** The hashing tests fail on timing, not on
   logic. Debug: check `os.cpu_count()` and load; the diagnostic is only meaningful with idle cores.
 - **Measure starting the threads outside the timed region.** Ratios jump around between runs. Debug:

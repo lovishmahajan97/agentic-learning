@@ -5,7 +5,7 @@ name: Embedding versioning / re-indexing strategy
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -54,7 +54,7 @@ Constraints (figures illustrative):
   about 50 hours.
 - **Change rate.** About 2% of chunks (120,000, 60 million tokens) change per day.
 - **Memory.** Nodes have 96 GB of RAM. Raw vectors are 6M × 1536 × 4 bytes ≈ 36.9 GB today and
-  6M × 1024 × 4 bytes ≈ 24.6 GB after, plus under 1 GB of HNSW links per index at `m = 16`.
+  6M × 1024 × 4 bytes ≈ 24.6 GB after, plus roughly 1 GB of HNSW links per index at `m = 16`.
 - **Team.** Two engineers own retrieval; the ingestion service belongs to another team with a 3-week
   release queue. Source tables carry a reliable `updated_at` and a deletes log.
 
@@ -64,7 +64,7 @@ Constraints (figures illustrative):
 | **A. Re-embed in place** | Overwrite vectors as the job runs | About 50 h, no rollback | Yes | One copy | None, but the column changes dimension |
 | **B. Blue-green with dual-write** | Build `docs_v7` beside `docs_v6`; ingestion embeds new chunks under both | None | Tight: waits for the 3-week release queue | ≈ 63 GB, fits | Yes, owned by another team |
 | **C. Blue-green with watermark replay** | Build `docs_v7` beside; record a start watermark; replay changes since | None | Yes: about 2 days build plus catch-up | ≈ 63 GB, fits | None |
-| **D. Adapter now, rebuild later** | Map new-model queries into the v6 space with a learned adapter | None, but lower quality | Fails: new chunks cannot be embedded under v6 after retirement | One copy | None |
+| **D. Adapter now, rebuild later** | Map new-model queries, and after retirement new chunks too, into the v6 space with a learned adapter | None, but lower quality | Meets it only by postponing the rebuild; the adapter must be trained on old-model pairs before retirement | One copy | None |
 
 ### Decision
 Choose **C**, blue-green with watermark replay, gated on evals:
@@ -75,7 +75,8 @@ Choose **C**, blue-green with watermark replay, gated on evals:
 - **The catch-up is small.** 50 hours of edits is about 250,000 chunks, 125 million tokens, so roughly
   2 hours of replay, then a short second pass to close the gap right before the swap. Documents edited
   several times are embedded once in their final state.
-- **D does not solve the problem.** After retirement, new documents still need old-space vectors.
+- **D only postpones the problem.** After retirement every new chunk's v6 vector would also come through
+  the adapter, which recovers only part of the quality, and the full rebuild is still owed.
 - **The swap is gated.** Swap only if recall@5 and MRR on the 400-question eval set are at least as good,
   and 100 replayed agent tasks hold task success and tool calls per task.
 

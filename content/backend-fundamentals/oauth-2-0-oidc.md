@@ -5,7 +5,7 @@ name: OAuth 2.0 / OIDC
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -231,12 +231,13 @@ PyJWT's `InvalidTokenError` subclasses and the IdP's `invalid_grant` response in
   a token minted for another client now logs a user in (token substitution). Debug by decoding the
   rejected token without verification and comparing `aud` with your `client_id`.
 - **Inject a user key built from `claims["email"]`.** `test_two_users_sharing_an_email_get_two_keys`
-  fails with one vault entry for two people. Print the claims of both logins; `sub` differs while
-  `email` does not, so key on `(iss, sub)`.
+  fails with one vault entry for two people, and the happy-path test fails on the returned key. Print
+  the claims of both logins; `sub` differs while `email` does not, so key on `(iss, sub)`.
 - **Inject: delete the `nonce` comparison.** The `replayed` case now passes the callback. Log `session["nonce"]` next to `claims.get("nonce")` on every login; any
   mismatch that still succeeds is the bug.
 - **Inject an early return of the token response "for the agent to use".** The happy-path test fails
-  its no-token-in-output assert; in a real agent that token would reach the transcript and traces.
+  on `assert out == (ISSUER, "u-alice")`: the caller got a dict holding `access_token` and
+  `refresh_token`. In a real agent that token would reach the transcript and traces.
 
 ### Submission
 - **Your `oauth_lab.py`** with both functions implemented and the fake IdP unchanged.

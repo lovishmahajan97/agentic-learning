@@ -5,7 +5,7 @@ name: Unit economics per successful task
 kind: metric
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -53,11 +53,11 @@ Computed with `per_task` from the first example; large model is $0.08 per attemp
 
 | Option | Fully loaded per task | Silent misroutes | Worst-case latency | AI spend per month |
 |---|---|---|---|---|
-| Current: small, k=3, cheap verifier | $2.442 | 11.4%: fails | 3 × 8 = 24 s: fails | $1,780 |
+| Current: small, k=3, cheap verifier | $2.442 | 11.4%: fails | 3 × 8 = 24 s: fails | $1,778 |
 | A. Large, k=1, cheap verifier | $0.805 | 2.0%: fails | 8 s | $4,250 |
 | B. Large, k=2, cheap verifier | $0.549 | 2.2%: fails | 16 s | $4,590 |
 | C. Small, k=3, strong judge | $0.905 | 3.1%: fails | 3 × 9 = 27 s: fails | $3,810 |
-| D. Large, k=2, strong judge | $0.266 | 0.55% | 2 × 9 = 18 s | $6,025 |
+| D. Large, k=2, strong judge | $0.266 | 0.55% | 2 × 9 = 18 s | $6,022 |
 
 ### Decision
 Choose **D**: the large model, the stronger judge and at most 2 attempts.
@@ -65,7 +65,7 @@ Choose **D**: the large model, the stronger judge and at most 2 attempts.
   margin of about $3.73 a ticket against the $4.00 human baseline.
 - **Compliance:** D is the only option under the 1% silent-misroute bar. Detection, not model accuracy,
   moves that number: B and D share a model, and B's silent rate is four times D's.
-- **Latency and budget:** two attempts of 9 s fit inside 20 s; three do not. AI spend of $6,025 fits the
+- **Latency and budget:** two attempts of 9 s fit inside 20 s; three do not. AI spend of $6,022 fits the
   $6,500 cap, with little room.
 - **Why not C:** a better judge on the small model still lets 3.1% through, because the small model fails
   four times as often, and its 3 attempts break the latency target.

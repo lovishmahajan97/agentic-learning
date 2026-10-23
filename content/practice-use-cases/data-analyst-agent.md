@@ -5,7 +5,8 @@ name: data analyst agent (text-to-SQL, charts, guarded queries)
 kind: practice
 difficulty: core
 est_minutes: 20
-status: agentic-verified
+status: typed
+lesson_type: decision
 agent_relevance: core
 related:
   - mini-project-ideas/text-to-sql-agent-over-a-sample-database
@@ -37,6 +38,60 @@ analytics without wrong numbers or runaway queries.
   catalogue the agent can search, a code sandbox for charts, and traces holding every query.
 - **What you can skip at first.** Fine-tuning a text-to-SQL model and semantic layers. A frontier model
   with a good schema description goes a long way on a small database.
+
+## Decision case
+### Scenario
+A sales-operations group wants a self-serve analyst agent over its warehouse. The question is what the
+agent writes SQL against. The pilot scores below come from a 100-question gold set and are illustrative,
+as are all figures here.
+- **Users and volume:** 60 business users, about 900 questions a month; 25% of them (225) are finance
+  metrics such as revenue and margin.
+- **Schema:** 400 tables, but about 85% of questions touch only 35 of them.
+- **Hard constraint:** finance-metric answers must match the finance team's reports; the target is 97%+
+  on the finance slice of the gold set, plus analyst review of every finance answer.
+- **Review capacity:** one analyst with 20 hours a month, about 3 minutes per reviewed answer.
+- **Team and deadline:** one analytics engineer and one agent engineer, live in 8 weeks.
+- **Safety:** read-only role on a replica with a statement timeout in every option.
+
+### Options
+| Option | How it works | Build time | Gold-set accuracy | Wrong answers a month | Fits? |
+|---|---|---|---|---|---|
+| Raw SQL over the warehouse | Retrieve schema slices from all 400 tables per question | about 2 weeks | 71% overall, about 80% on finance | 900 x 0.29 = 261 | no: finance accuracy |
+| Curated views and glossary | 12 documented views over the 35 hot tables, a metric glossary, verified saved queries for finance metrics | about 6 weeks | 86% overall, 97% on finance | 900 x 0.14 = 126 | yes |
+| Semantic layer | Agent may only query defined measures and dimensions | about 14 weeks | 92% on questions it can express | fewer, but out-of-scope questions get no answer | no: deadline |
+
+### Decision
+**Curated views plus a metric glossary, with finance metrics answered from verified saved queries and
+reviewed by the analyst.** It is the only option that meets the finance accuracy bar inside 8 weeks. Raw
+SQL is faster to build but its join mistakes land exactly on the revenue questions that must match.
+- **Review load fits:** 225 finance answers x 3 min = 11.25 hours, plus a 10% spot check of the other 675
+  (about 68 x 3 min = about 3.4 hours), so about 14.6 of the 20 hours.
+- **Agent sees views first:** schema retrieval ranks the 12 views above raw tables, and raw tables stay
+  reachable for the other 15% of questions.
+- **SQL and assumptions shown** on every answer, so users can challenge a number.
+
+**What would change it.**
+- **Accuracy plateaus:** if the views stay below about 85% after the pilot, or most failures are metric
+  definitions, start the semantic layer for the finance domain first.
+- **Finance volume grows:** at 400 finance questions a month, review needs 20 hours on its own; add
+  review capacity or let saved-query answers with a matching question skip review.
+- **Scope widens:** if questions spread well beyond the 35 tables, curated views stop covering them.
+
+### Trade-offs accepted
+- **About 126 wrong answers a month.** Most sit outside finance, where they are still
+  visible to users. Track analyst spot-check disagreement and turn every one into a gold question.
+- **Views are a maintenance cost.** Upstream schema changes break them; run the gold set nightly and
+  alert on view errors.
+- **Reviewed finance answers are slower.** Track time to answer for finance questions and the share
+  users abandon.
+
+### Review rubric
+- **Accuracy target per slice:** the write-up separates high-stakes metrics from general questions.
+- **Volume and review hours computed** from stated inputs and compared with capacity.
+- **Build time checked against the deadline** for each option, not only accuracy.
+- **Execution-based evidence:** accuracy comes from a gold set compared by result sets, not opinions.
+- **Guardrails unchanged by the choice:** read-only role, timeout and row limits apply in every option.
+- **Revisit triggers named:** the accuracy, volume or scope numbers that would move to a semantic layer.
 
 ## Why it exists
 - **The user problem.** Business users wait days for an analyst to answer "what was revenue by region

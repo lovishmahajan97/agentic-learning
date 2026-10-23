@@ -5,7 +5,7 @@ name: Agentic RAG
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement
@@ -177,8 +177,9 @@ flowchart TD
   inject instructions, and a prompt is not a boundary. The runtime injects the user identity and the
   tools apply ACL filters, so no query the model writes can reach a forbidden document.
 - **"Token cost grows linearly with steps."** Each step re-sends the history, so *n* steps cost about
-  `n·b + r·n²/2`. At 6 steps with *b* = 2,000 the exact sum is 57,000 input tokens with raw 3k results against 18,000 with pruned
-  snippets; pruning is a cost control, not tidiness.
+  `n·b + r·n²/2`. At 6 steps with *b* = 2,000 the exact sum is 57,000 input tokens when each step
+  appends 3,000 tokens of raw results, against 18,000 with 400-token pruned snippets; pruning is a
+  cost control, not tidiness.
 - **"More searches means proportionally slower answers."** Independent sub-questions can run as
   parallel tool calls, so wall-clock latency tracks the number of dependent hops, not total searches.
 - **"The framework's recursion limit is the budget."** In LangGraph, hitting `recursion_limit` raises
