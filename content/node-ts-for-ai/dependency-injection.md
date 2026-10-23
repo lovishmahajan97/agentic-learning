@@ -5,7 +5,7 @@ name: Dependency injection
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -50,8 +50,9 @@ the fallback decorator the root wraps around providers.
 - **Time box:** 45-60 minutes.
 - **Prerequisites:** this lesson's "Composing behaviour at the root" and "Scopes" sections, and the
   Vitest lesson if you have not run a TypeScript test before.
-- **Needs:** Node 20+ with `npm i -D tsx vitest`; checked with Node 24.21, tsx 4.23 and vitest 5.0.5.
-  Save the starter as `di-lab.ts` and the tests next to it as `di-lab.test.ts`.
+- **Needs:** Node 20+ and `npm init -y && npm pkg set type=module && npm i -D tsx vitest` (the
+  starter uses top-level `await`, which tsx rejects in a CommonJS package); checked with Node 24.21,
+  tsx 4.23 and vitest 5.0.5. Save the starter as `di-lab.ts` and the tests next to it as `di-lab.test.ts`.
 
 ### Starter code
 ```ts
@@ -205,16 +206,16 @@ tests with `AssertionError` (the cached deps), the rate-limit test with `openai 
 wired), and the unknown tenant with a `TypeError` instead of an error naming `initech`.
 
 ### Failure scenarios
-- **Inject `if (!cached || cached.llm.name !== cfg.provider)`,** a "smarter" cache keyed on provider.
-  The provider test passes and the tool-set test still fails, because acme and a future Azure tenant
-  with refunds would share one map. Debug by logging tenant id next to the identity of the tool map
-  per run; anything shared across tenants must be immutable.
+- **Inject `if (!cached || cached.llm.name !== cfg.provider)` into your fixed root,** a cache keyed
+  on provider. "Builds a fresh tool map per run" fails: two globex runs share one map, so a tool
+  deleted in one run is gone in the next. Log tenant id next to the tool map's identity per run;
+  anything shared across runs must be immutable.
 - **Inject a fallback predicate of `e instanceof Error`.** The 400 test fails: a malformed request is
   silently retried on a second paid provider and the bug hides. Print the status each fallback fired
   on; only 429 and 5xx belong there.
 - **Inject the breaker or fallback inside `runAgent`** instead of at the root. Every tenant now gets
-  fallback, and acme's answer changes provider. Grep the loop for provider names; it should contain
-  none.
+  fallback: when azure returns a 5xx, acme (fallback off) is silently answered by anthropic instead of
+  failing. Grep the loop for provider names; it should contain none.
 
 ### Submission
 - **Your `di-lab.ts`** with only `withFallback` and `createRoot` changed; the loop is untouched.

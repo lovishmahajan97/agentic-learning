@@ -5,7 +5,7 @@ name: Claude Agent SDK (agent loop, tools, MCP, subagents)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -161,8 +161,9 @@ On the starter 9 of 12 fail (every deny case, the reason, the error result and t
 three allow cases pass on purpose: they catch a fix that denies everything.
 
 ### Failure scenarios
-- **Inject a substring match:** allow when `cmd.startswith("ls")`. `lsof -i` and `ls; curl ...` now
-  pass. Split with `shlex.split` and compare whole words, and print the decision for each test command.
+- **Inject a substring match:** allow when `cmd.startswith("ls")`. `lsof -i` now passes, and so does
+  `ls; curl ...` if that check runs before the chaining check. Split with `shlex.split` and compare
+  whole words, and print the decision for each test command.
 - **Inject a quote the parser cannot read:** send `grep "unclosed`. `shlex.split` raises `ValueError`.
   Make the hook deny on a parse failure; a policy that crashes is not a policy you can audit.
 - **Inject the bare tool name:** keep `get_alert` in `allowed_tools`. In a live run the tool is not

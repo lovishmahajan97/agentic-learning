@@ -5,7 +5,7 @@ name: BullMQ & durable jobs
 kind: tool
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -50,7 +50,8 @@ settings imply.
 - **Time box:** 45-75 minutes.
 - **Prerequisites:** this lesson's "Custom job ids and dedup", "Locks and stalled jobs" and "Agent
   scenario: one job per agent step"; PostgreSQL transactions & migrations for why `saveStep` is unique.
-- **Needs:** Node 20+ with `npm i -D tsx vitest`; no Redis. The processor has BullMQ's processor shape,
+- **Needs:** Node 20+ and `npm init -y && npm pkg set type=module && npm i -D tsx vitest` (ESM, for
+  the top-level `await`); no Redis. The processor has BullMQ's processor shape,
   so the same function runs in a real `Worker`; the in-memory queue copies BullMQ's job-id rules.
   Checked with Node 24.21, tsx 4.23 and vitest 5.0.5.
 
@@ -226,12 +227,12 @@ describe("agent step processor", () => {
     expect(keys).toEqual(["run-r1-step-0", "run-r1-step-1"]);
   });
   it("stops a looping run at the step budget", async () => {
-    const { queue, store, processor, job } = setup(2);
+    const { queue, store, f, processor, job } = setup(1);
     await processor(job(0));
-    await processor(job(1));
-    expect(await processor(job(2))).toEqual({ done: true });
-    expect(store.rows.get("r1/2")).toEqual({ status: "budget-exhausted" });
-    expect(queue.jobs.has("run-r1-step-3")).toBe(false);
+    expect(await processor(job(1))).toEqual({ done: true });            // step 1 would send an email
+    expect(store.rows.get("r1/1")).toEqual({ status: "budget-exhausted" });
+    expect(f.emails()).toBe(0);
+    expect(queue.jobs.has("run-r1-step-2")).toBe(false);
   });
 });
 
@@ -244,8 +245,9 @@ describe("backoffDelays", () => {
 ```
 
 All 6 fail on the starter: random ids (`AssertionError` on the job keys), `duplicate key (run_id,
-step)=(r1, 1)` on both redelivery tests, empty idempotency keys, a step-2 row saved as `ok` instead of
-`budget-exhausted`, and `not implemented: backoffDelays`.
+step)=(r1, 1)` on both redelivery tests, and empty idempotency keys. The budget test sets
+`maxSteps: 1`, so the starter runs step 1's email tool and returns `{ next: 2 }` instead of
+`{ done: true }`; the last test stops on `not implemented: backoffDelays`.
 
 ### Failure scenarios
 - **Inject the colon id `run:<runId>:step:<n>`.** The queue throws `invalid custom jobId`, as BullMQ
@@ -257,8 +259,9 @@ step)=(r1, 1)` on both redelivery tests, empty idempotency keys, a step-2 row sa
 - **Inject `if (run.lastStep >= step) return { skipped: true }` without the re-add.** The crash test
   fails: step 1 is committed, step 2 was never enqueued, and nothing will ever enqueue it. This is the
   gap the outbox pattern closes for good.
-- **Inject a tool key built from `job.attemptsMade`.** Each redelivery gets a fresh key and the
-  email goes out twice. Keys must come from the step's identity, never from the attempt.
+- **Inject a tool key built from `job.attemptsMade`.** The key test fails, and a step that crashed
+  after its tool call but before `saveStep` gets a fresh key on redelivery, so the email goes out
+  twice. Keys must come from the step's identity, never from the attempt.
 
 ### Submission
 - **Your `bullmq-lab.ts`** with both `YOUR CODE` parts done and the fakes and fixtures unchanged.

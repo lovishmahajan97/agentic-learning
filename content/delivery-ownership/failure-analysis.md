@@ -5,7 +5,7 @@ name: Failure analysis
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -43,7 +43,8 @@ All figures are illustrative planning numbers.
 - **Evidence:** 150 random failed trajectories coded by first bad step: invented account ID 34%, tool
   error ignored 22%, wrong queue with correct context 18%, should have asked the user 14%, step budget
   hit 12%.
-- **Budget:** cost per run may rise by at most 20%.
+- **Budget:** cost per run may rise by at most 20%; the candidate larger model costs about 3x per run
+  on this workload (illustrative).
 - **Team and deadline:** 2 engineers, 4 weeks, and a measurable drop in the failure rate by then.
 - **Severity:** a ticket filed under an invented account lands in another customer's history, so the
   top category is also the most harmful.
@@ -51,7 +52,7 @@ All figures are illustrative planning numbers.
 ### Options
 | Option | How it works | Categories it can reach | Fits cost and 4 weeks? |
 |---|---|---|---|
-| Larger model | Swap the model, keep the harness | Mainly wrong queue (18%), some spillover | No: raises cost per run on every call |
+| Larger model | Swap the model, keep the harness | Mainly wrong queue (18%), some spillover | No: about 3x cost per run against a 20% cap |
 | Fine-tune on corrected trajectories | Label good runs, train, evaluate | Model-behaviour categories, at most 18% + 14% directly | Risky: labelling and evals eat most of 4 weeks |
 | Stage fixes at the first bad step | Validator rejects account IDs not returned by a prior lookup; structured tool errors and a block on `file_ticket` after a failed lookup | 34% + 22% = 56% of failures | Yes: code in the harness, no cost per run |
 | Classifier first | Build an LLM judge for all five categories, fix later | None in 4 weeks | No fix ships by the deadline |
@@ -65,6 +66,8 @@ efficacy, with guessed efficacies of 0.9 for the validator and 0.8 for structure
   runs a day.
 - **Larger model, fixing half of wrong-queue failures:** 0.09 x 0.18 x 0.5 ≈ 0.8 points (about 32 runs a
   day), while breaking the cost cap.
+- **Fine-tune, even if perfect on both model-behaviour categories:** 0.09 x (0.18 + 0.14) ≈ 2.9 points,
+  below the stage fixes' 4.3, and labelling plus evals leave little of the 4 weeks to ship it.
 - **Uncertainty does not flip the order:** the top share's 95% interval is roughly 26%-42%, and even its
   low end beats the 18% the model can reach.
 

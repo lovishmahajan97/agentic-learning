@@ -5,7 +5,7 @@ name: Redis
 kind: tool
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -50,7 +50,8 @@ next owner's lock.
 - **Time box:** 45-75 minutes.
 - **Prerequisites:** this lesson's "Atomicity: single thread, MULTI, Lua" and "Typical AI-service uses"
   sections, and the run-lock example.
-- **Needs:** Node 20+ with `npm i ioredis ioredis-mock` and `npm i -D tsx vitest`. `ioredis-mock`
+- **Needs:** Node 20+ and `npm init -y && npm pkg set type=module && npm i ioredis ioredis-mock &&
+  npm i -D tsx vitest` (ESM, for the top-level `await`). `ioredis-mock`
   implements the ioredis API in memory, Lua `EVAL` included, so no server is needed; instances in one
   process share data, like replicas sharing one Redis. Checked with Node 24.21, ioredis 5.11.1,
   ioredis-mock 8.13.1, tsx 4.23 and vitest 5.0.5.

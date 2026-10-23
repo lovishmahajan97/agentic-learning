@@ -5,7 +5,7 @@ name: Data profiling & quality assessment
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -50,14 +50,15 @@ are illustrative.
 - **Access:** read-only queries on a replica, allowed at night; full-table aggregates are fine there.
 - **Privacy:** free-text notes may hold undeclared identifiers; nothing leaves the customer's region.
 - **People:** the claims operations lead can give 6 hours to check accuracy.
-- **Expensive checks:** the identifier scan and near-duplicate detection on notes run on a sample only.
+- **Expensive checks:** the identifier scan and near-duplicate detection on notes run on a sample only;
+  the in-region compute can process about 25,000 notes in the week.
 
 ### Options
 | Option | How it works | Per-region detection at 0.1% | Accuracy evidence | Fits the week |
 |---|---|---|---|---|
 | A. One random sample | 2,000 rows overall, every metric on the sample | about 250 rows per region: 1 − 0.999^250 ≈ 22% | none | yes |
-| B. Big stratified sample for everything | 5,000 rows per region (40,000), every metric on the sample | 1 − 0.999^5000 ≈ 99.3% | none | no: expensive checks on 40,000 notes |
-| C. Hybrid | Cheap metrics on the full table per region; 3,000 rows per region for expensive checks; 100 records for SME accuracy | full table: every defect seen; sample: 1 − 0.999^3000 ≈ 95.0% | 100 records checked | yes |
+| B. Big stratified sample for everything | 5,000 rows per region (40,000), every metric on the sample | 1 − 0.999^5000 ≈ 99.3% | none | no: expensive checks on 40,000 notes, over the 25,000 capacity |
+| C. Hybrid | Cheap metrics on the full table per region; 3,000 rows per region for expensive checks; 100 records for SME accuracy | full table: every defect seen; sample: 1 − 0.999^3000 ≈ 95.0% | 100 records checked | yes: 8 × 3,000 = 24,000 notes |
 | D. Skip profiling, use agent evals | Load everything and read failures off the eval scores | depends on eval coverage | indirect | yes, but failures look like model problems |
 
 ### Decision

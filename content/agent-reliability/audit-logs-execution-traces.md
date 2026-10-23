@@ -5,7 +5,7 @@ name: Audit logs / execution traces
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 mastery: implement

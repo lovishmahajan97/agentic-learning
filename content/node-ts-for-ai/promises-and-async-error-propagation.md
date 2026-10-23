@@ -5,7 +5,7 @@ name: Promises & async error propagation
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -224,8 +224,9 @@ with no unhandled errors.
 - **Await the calls one by one after starting them all.** If `lookup` rejects while you are still awaiting
   `search`, nobody is listening yet: Node reports an unhandled rejection. Debug by running with
   `--unhandled-rejections=strict` in tests so the window cannot hide.
-- **Retry inside the abort.** Without the `signal.aborted` check, a cancelled run retries the 503 and bills
-  another call for a user who left. The abort-retry test counts attempts.
+- **Retry inside the abort.** Drop the `signal.aborted` check and wait with a plain `sleep(delayMs)`, and a
+  cancelled run retries the 503 and bills more calls for a user who left. The abort-retry test counts
+  attempts and fails with `expected 4 to be 1`. An abortable sleep alone also stops it, so keep both.
 
 ### Submission
 - **Your `lab.ts`** with the four LAB steps done, and a passing `npx vitest run` (six tests, no unhandled

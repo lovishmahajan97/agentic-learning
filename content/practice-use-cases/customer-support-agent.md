@@ -5,7 +5,7 @@ name: customer support agent (triage, retrieval, refunds with approval)
 kind: practice
 difficulty: core
 est_minutes: 20
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -49,8 +49,8 @@ the tool executes, above it a human approves. All figures are illustrative plann
 - **Volume:** 12,000 tickets a month, 18% of them refund requests, so 12,000 x 0.18 = 2,160 refunds.
 - **Amount mix:** 70% are up to 50 dollars (average 25), 20% are 50-150 dollars (average 90), 10% are
   above 150 dollars.
-- **Shadow mode:** on in-policy refunds the agent disagreed with the human decision 1.5% of the time
-  (for example, it refunded a parcel the carrier shows as delivered). Treat each one as a wrong refund.
+- **Shadow mode:** on in-policy refunds the agent disagreed with the human decision 1.5% of the time,
+  about equally in every amount band (for example, it refunded a parcel the carrier shows as delivered). Treat each one as a wrong refund.
 - **Approval capacity:** two support leads with 40 hours a month for approvals, about 2 minutes each.
 - **Loss budget:** finance accepts up to 800 dollars a month in wrong in-policy refunds.
 - **Deadline:** launch in 6 weeks, with no new hires.

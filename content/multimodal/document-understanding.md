@@ -5,7 +5,7 @@ name: Document understanding
 kind: concept
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:
@@ -188,7 +188,8 @@ flowchart TD
   gets a plausible invented one. Make fields nullable and instruct the model never to guess, so absence
   is representable and checkable.
 - **"Arithmetic checks catch invented amounts."** An invented tax line with a matching total passes
-  subtotal + tax = total. Only provenance, the value appearing verbatim on the page, exposes it.
+  subtotal + tax = total. Provenance, checking that the value appears verbatim on the page, is what
+  exposes it.
 - **"Higher model accuracy is what makes extraction trustworthy."** At 96% field accuracy wrong totals
   still reach the ledger daily if nothing detects them. Validation and review routing make errors
   visible and bounded; report escaped-error rate, not average accuracy.

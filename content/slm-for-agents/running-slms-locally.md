@@ -5,7 +5,7 @@ name: Running SLMs locally (Ollama, llama.cpp, vLLM)
 kind: tool
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 mastery: implement
@@ -129,8 +129,8 @@ def check_tool_calls(base_url, model):
 
 def check_context(base_url, model, min_ratio=0.95):
     """None if usage.prompt_tokens >= min_ratio * count_tokens(messages), else 'context: <reason>'
-    naming both numbers."""
-    raise NotImplementedError  # LAB: send LONG_PROMPT and compare the server's count with yours
+    naming usage.prompt_tokens and the threshold min_ratio * count_tokens(messages)."""
+    raise NotImplementedError  # LAB: send LONG_PROMPT as the only message; compare server count with yours
 
 def preflight(base_url, model):
     """Run the three checks in order and return the list of failure strings ([] means ready).
@@ -195,8 +195,10 @@ On the starter all 6 tests fail with `NotImplementedError`.
 - **Trust `content` when `tool_calls` is empty.** The `text_tools` engine then passes, and a real agent
   would print JSON to the user. Log both message fields for one request, then fix the engine (`--jinja`,
   a vLLM tool parser, or a model whose template supports tools).
-- **Compare against a hard-coded 6000.** `test_ratio_is_respected` fails, and the check breaks the
-  moment the prompt changes. Compute the expected count from the messages you sent.
+- **Compare against a hard-coded 6000 and ignore `min_ratio`.** Both context tests fail:
+  `test_ratio_is_respected` because 2048 < 6000, and the truncation test because the message names 6000,
+  not 5700. The check also breaks the moment the prompt changes. Compute the threshold from the messages
+  you sent.
 - **Point it at a real engine.** Run `preflight("http://localhost:11434/v1", "qwen2.5:7b")` against
   Ollama with a 2048 context: the real tokenizer differs from the fake, so set `min_ratio` from one
   measured run, not from the fake's word count.

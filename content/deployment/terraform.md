@@ -5,8 +5,8 @@ name: Terraform (infrastructure as code)
 kind: tool
 difficulty: core
 est_minutes: 19
-status: typed
-lesson_type: decision
+status: typed-verified
+lesson_type: lab
 agent_relevance: useful
 mastery: implement
 code_tested: partial
@@ -44,67 +44,186 @@ so every environment and customer account is reproducible and reviewable.
 - **What you can skip.** Writing providers and the internals of the dependency graph. Know state, plan,
   the replace hazard, `moved` blocks and how to ship into an isolated account.
 
-## Decision case
-### Scenario
-Your company runs a RAG agent platform. Its infrastructure (private model endpoint, vector store,
-memory tables, KMS key, one IAM role per tool) is Terraform, today one root for your own SaaS. Sales has
-signed customer-VPC deals. All figures are illustrative.
-- **Accounts:** 3 of your own environments (dev, staging, prod) plus 18 customer AWS accounts, so
-  3 + 18 = 21 deployments.
-- **Approval boundaries:** 5 of the 18 customers require their own change board to approve every apply,
-  and forbid your engineers from holding write access.
-- **Secrets in state:** customers' security reviews say state for their account, which holds generated
-  passwords and keys in plain text, must live in their account.
-- **Isolated accounts:** 2 customers cannot reach the public provider registry.
-- **Team:** 4 platform engineers. An internal infra agent drafts HCL changes and may run plan only.
-- **Layering:** each deployment splits into a network state and an application state, so a routine app
-  change cannot plan against the VPC: 21 x 2 = 42 states.
+## Lab
+### Task
+Build the plan guard that sits behind an internal infra agent's `terraform plan` tool. It reads the JSON
+form of a saved plan (`terraform show -json tfplan`) and blocks destroys and replaces of stateful
+resources.
 
-### Options
-| Option | How it works | State in customer account | Matches approval boundaries | Isolated accounts | Load on 4 engineers |
-|---|---|---|---|---|---|
-| One configuration, CLI workspaces | one root, a workspace per deployment, state in your bucket | no | no: same credentials everywhere, one forgotten `terraform workspace select` hits the wrong customer | registry still needed | low at first, risky |
-| Versioned module, a thin root per deployment | shared `rag` module released with versions; each deployment has its own root, backend and credentials | yes: backend in each customer's account | yes: each root's plan goes to that account's approver | ship a provider mirror and module files | medium: 42 plans per module release, automated |
-| Native templates per customer | CloudFormation templates the customer deploys | yes: the service tracks state | yes | no registry needed | high: a second IaC codebase beside your Terraform |
+It also spots a rename that needs a `moved` block, counts the plan like Terraform does, and returns the
+result to the model as a tool error it can act on.
 
-### Decision
-**A versioned module with a thin root per deployment, each with its own backend, credentials and approver.**
-- **The isolation boundary matches the approval boundary.** A plan in one root cannot touch another
-  account, and each of the 5 change boards reviews a saved plan for its own account only.
-- **State stays where the secrets belong:** in each customer's account, under their access controls and
-  locking.
-- **Isolated accounts are the same flow plus files:** a `terraform providers mirror` directory, the
-  committed `.terraform.lock.hcl` and the module as files, with an expected-plan summary.
-- **The agent fits the gate:** it opens a pull request against the module, the pipeline plans every
-  affected root, and the plan guard returns any BLOCK to the agent as a tool error.
+The agent goal is the worked scenario's step 3: the model sees a harmless rename, the guard sees a
+deleted bucket and a replaced memory table in prod, and the agent is told what to fix instead of being
+allowed to ask for apply. Time box: 45-60 min.
+- **Prerequisites:** CI/CD; this lesson's How it works (plan symbols, resource addresses) and the CI
+  guard example.
+- **Setup:** Python 3.10+ standard library, `pip install pytest` (checked with Python 3.12 and pytest 9).
+  Save the starter as `lab.py` and the tests as `test_lab.py`. No Terraform install or cloud account is
+  needed: the fixtures are trimmed `resource_changes` entries in the real JSON shape.
 
-**What would change it.**
-- **All deployments inside your own organization under one approval board:** workspaces become
-  acceptable, though separate roots remain safer.
-- **A customer that mandates native templates:** ship CloudFormation for that customer only, and
-  accept the second codebase as that contract's cost.
-- **Customers outgrowing 4 engineers:** at much larger counts, buy or build a run orchestrator rather
-  than adding roots by hand.
+### Starter code
+```python
+"""Lab: a plan guard behind an infra agent's plan tool. Run: python lab.py"""
+import json
 
-### Trade-offs accepted
-- **42 plans per module release.** Watch: pipeline time per release and roots left on old module
-  versions.
-- **Version skew across customers.** Watch: a register of module and provider versions per root, with a
-  bounded support window.
-- **Less visibility into customer-held state.** Watch: ask each customer to include the nightly
-  `terraform plan -detailed-exitcode` result (exit code 2 means drift) in their support bundle.
-- **Some duplication in thin roots.** Watch: roots contain only backend, provider and module inputs; any
-  resource block in a root is a review finding.
+# Stateful types: replacing or destroying one loses an index, memory or keys.
+PROTECTED = {"aws_s3_bucket", "aws_db_instance", "aws_dynamodb_table", "aws_opensearch_domain", "aws_kms_key"}
 
-### Review rubric
-- **Boundaries mapped first:** the write-up lists accounts, who approves applies in each and where
-  state may live, before choosing a layout.
-- **Counts recomputed:** deployments, states and plans per release follow from stated inputs.
-- **State treated as a secret:** says where it lives, who can read it, and that no agent reads it.
-- **Isolated delivery covered:** provider mirror, lock file and module files for accounts without a
-  registry.
-- **Agent gate explicit:** plan-only credentials, the plan guard, and human approval of the saved plan.
-- **Flip conditions named:** the facts that would make workspaces or native templates the better choice.
+def classify(actions: list) -> str:
+    """Map change.actions from `terraform show -json` to one word:
+    noop, read, create, update, delete or replace (either order of delete and create)."""
+    # YOUR CODE HERE (1)
+    raise NotImplementedError
+
+def guard(plan: dict) -> dict:
+    """Return {"ok", "blocked", "review", "hints", "summary"} for one plan.
+    - Skip data sources (mode "data"); they are reads, not changes.
+    - blocked / review: "REPLACE <address>" or "DESTROY <address>", blocked when the type is PROTECTED,
+      in plan order.
+    - hints: when a type has exactly one pure delete and exactly one pure create, the change is
+      probably a rename: "moved { from = <deleted> to = <created> }".
+    - summary: "N to add, M to change, K to destroy", counted like terraform plan (a replace adds 1
+      and destroys 1).
+    - ok is True only when nothing is blocked."""
+    # YOUR CODE HERE (2)
+    raise NotImplementedError
+
+def plan_tool_result(plan: dict) -> dict:
+    """What the agent's plan tool returns to the model.
+    ok:      {"is_error": False, "content": "PASS: <summary>"}
+    blocked: {"is_error": True, "content": "BLOCKED: " + "; ".join(blocked)}, then one line per hint,
+             then a last line "Do not re-plan unchanged code; fix the configuration first."
+    """
+    # YOUR CODE HERE (3)
+    raise NotImplementedError
+
+# ---- fixtures: trimmed `terraform show -json tfplan` output -----------------------------------------
+def rc(address, actions, mode="managed"):
+    rtype = address.split(".")[-2]
+    return {"address": address, "mode": mode, "type": rtype, "change": {"actions": actions}}
+
+# The agent "tidied" names inside the shared rag module, then re-planned prod.
+PROD_PLAN = {"resource_changes": [
+    rc("data.aws_iam_policy_document.read_contract", ["read"], mode="data"),
+    rc("module.rag.aws_s3_bucket.documents", ["delete"]),
+    rc("module.rag.aws_s3_bucket.docs", ["create"]),
+    rc("module.rag.aws_dynamodb_table.memory", ["delete", "create"]),
+    rc("module.rag.aws_launch_template.gpu", ["create", "delete"]),
+    rc("module.rag.aws_iam_policy.read_contract", ["update"]),
+    rc("module.rag.aws_vpc_endpoint.model_runtime", ["no-op"]),
+]}
+
+# A new staging root calling the same module: three creates, nothing existing touched.
+STAGING_PLAN = {"resource_changes": [
+    rc("module.rag.aws_s3_bucket.documents", ["create"]),
+    rc("module.rag.aws_dynamodb_table.memory", ["create"]),
+    rc("module.rag.aws_vpc_endpoint.model_runtime", ["create"]),
+]}
+
+if __name__ == "__main__":
+    g = guard(PROD_PLAN)
+    for line in g["blocked"]:
+        print("BLOCK ", line)
+    for line in g["review"]:
+        print("review", line)
+    for line in g["hints"]:
+        print("hint  ", line)
+    print("prod:   ", g["summary"], "| ok:", g["ok"])
+    print("staging:", json.dumps(plan_tool_result(STAGING_PLAN)))
+    print("agent sees error:", plan_tool_result(PROD_PLAN)["is_error"])
+```
+
+### Expected output
+On the starter, `python lab.py` stops at the first `guard` call with `NotImplementedError`. A correct
+solution prints exactly:
+
+```
+BLOCK  DESTROY module.rag.aws_s3_bucket.documents
+BLOCK  REPLACE module.rag.aws_dynamodb_table.memory
+review REPLACE module.rag.aws_launch_template.gpu
+hint   moved { from = module.rag.aws_s3_bucket.documents to = module.rag.aws_s3_bucket.docs }
+prod:    3 to add, 1 to change, 3 to destroy | ok: False
+staging: {"is_error": false, "content": "PASS: 3 to add, 0 to change, 0 to destroy"}
+agent sees error: True
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 12 fail with `NotImplementedError`; a correct solution
+passes all 12.
+
+```python
+import pytest
+from lab import PROD_PLAN, STAGING_PLAN, classify, guard, plan_tool_result, rc
+
+@pytest.mark.parametrize("actions, word", [
+    (["no-op"], "noop"), (["read"], "read"), (["create"], "create"), (["update"], "update"),
+    (["delete"], "delete"), (["delete", "create"], "replace"), (["create", "delete"], "replace"),
+])
+def test_classify(actions, word):
+    assert classify(actions) == word
+
+def test_prod_blocks_protected_destroy_and_replace():
+    g = guard(PROD_PLAN)
+    assert g["blocked"] == ["DESTROY module.rag.aws_s3_bucket.documents",
+                            "REPLACE module.rag.aws_dynamodb_table.memory"]
+    assert g["review"] == ["REPLACE module.rag.aws_launch_template.gpu"]
+    assert g["ok"] is False
+
+def test_rename_hint_and_summary():
+    g = guard(PROD_PLAN)
+    assert g["hints"] == ["moved { from = module.rag.aws_s3_bucket.documents "
+                          "to = module.rag.aws_s3_bucket.docs }"]
+    assert g["summary"] == "3 to add, 1 to change, 3 to destroy"
+
+def test_data_sources_and_noops_ignored():
+    g = guard({"resource_changes": [rc("data.aws_kms_key.ext", ["read"], mode="data"),
+                                    rc("aws_kms_key.rag", ["no-op"])]})
+    assert g == {"ok": True, "blocked": [], "review": [], "hints": [],
+                 "summary": "0 to add, 0 to change, 0 to destroy"}
+
+def test_no_hint_when_ambiguous():
+    plan = {"resource_changes": [rc("aws_s3_bucket.a", ["delete"]), rc("aws_s3_bucket.b", ["create"]),
+                                 rc("aws_s3_bucket.c", ["create"])]}
+    assert guard(plan)["hints"] == []
+
+def test_tool_result_for_agent():
+    assert plan_tool_result(STAGING_PLAN) == {"is_error": False,
+                                              "content": "PASS: 3 to add, 0 to change, 0 to destroy"}
+    r = plan_tool_result(PROD_PLAN)
+    assert r["is_error"] is True
+    lines = r["content"].splitlines()
+    assert lines[0] == ("BLOCKED: DESTROY module.rag.aws_s3_bucket.documents; "
+                        "REPLACE module.rag.aws_dynamodb_table.memory")
+    assert lines[1].startswith("moved { from = module.rag.aws_s3_bucket.documents")
+    assert lines[-1] == "Do not re-plan unchanged code; fix the configuration first."
+```
+
+### Failure scenarios
+- **Test `"create" in actions` before checking for delete.** Both replace orders classify as create:
+  the memory table's replace passes silently, the launch template leaves the review list, and the
+  summary says 1 to destroy against Terraform's 3. Debug: print each address with its raw `actions`
+  list next to your label, and diff your summary with the `Plan:` line of `terraform plan`.
+- **Recognise only `["delete", "create"]` as replace.** `create_before_destroy` resources
+  (`["create", "delete"]`) count as plain creates, so the launch template vanishes from review and the
+  summary says 2 to destroy. Debug: the parametrized `classify` case for `["create", "delete"]` fails.
+- **Pair any delete with the first create of its type.** With one delete and two creates the guard
+  invents a `moved` hint; an agent that applies it moves state onto the wrong address. Debug:
+  `test_no_hint_when_ambiguous` fails; only suggest a move when the pairing is unique.
+- **Return the BLOCKED text with `is_error` false.** The model reads it as a successful plan and asks a
+  human to approve the apply, or re-plans the same code. Debug: in the agent trace, look for a
+  plan tool result containing BLOCKED followed by an approval request or an identical plan call.
+
+### Submission
+- **Code:** `lab.py` with the three `YOUR CODE HERE` parts implemented, standard library only, no edits to the fixtures.
+- **Test run:** the output of `pytest -q test_lab.py` showing 12 passed.
+- **Output:** the output of `python lab.py`, matching Expected output line for line.
+- **A real plan:** the guard run on `terraform show -json` from one of your own roots (or a scratch
+  root with a renamed bucket and `prevent_destroy` removed), with the printed lines.
+- **Short note (5-8 sentences):** why a replace counts as both an add and a destroy, why the rename hint
+  is only a hint a human confirms, and where `prevent_destroy` still catches what the guard misses.
+- **Evaluation:** the tests pass unchanged, the output matches, and the note names the agent-facing
+  behaviour (error result, no apply without a human).
 
 ## Why it exists
 - **An AI platform is a lot of infrastructure.** A VPC with private subnets, private endpoints to the

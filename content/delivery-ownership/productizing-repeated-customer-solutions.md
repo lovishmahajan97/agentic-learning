@@ -5,7 +5,7 @@ name: Productizing repeated customer solutions
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -63,7 +63,8 @@ and are planning numbers, not benchmarks.
 1,122 = 694 engineer-hours over the year, and it turns the forced model upgrade into one tuning pass on
 one template instead of seven.
 - **Sequence it around the deprecation:** build the core and migrate the two least-divergent forks first,
-  then do the forced upgrade on the core, so it is done once.
+  then do the forced upgrade on the core, and move the other two forks onto the upgraded core before
+  the old snapshot is retired, so no fork is ever upgraded on its own.
 - **The connector becomes an extension** behind the connector interface, not a reason to keep that
   customer on a fork.
 - **Parity is the gate:** each move ships only when that tenant's regression suite matches the fork's.

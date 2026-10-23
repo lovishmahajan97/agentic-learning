@@ -5,7 +5,7 @@ name: Adoption & value-realization measurement
 kind: metric
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -48,7 +48,7 @@ ranged, net-of-run-cost estimate. All figures are illustrative planning numbers.
 - **Politics:** the sponsor will not keep any region off the agent for more than 6 weeks, and refuses a
   region-level holdout.
 - **Router:** the agent sits behind a ticket router, so a random share of tickets can skip it.
-- **Value at stake:** using the agent example above at 70% completion, about $18,333 a week net over 5,000
+- **Value at stake:** using the agent example in Examples below at 70% completion, about $18,333 a week net over 5,000
   runs, or roughly $3.67 per attempted run.
 - **Data:** 8 weeks of pre-launch handling times per region; reopen rate is the agreed guardrail.
 - **Team:** one analyst, plus the FDE who owns the rollout calendar.
@@ -68,9 +68,11 @@ holdout is the only control still standing when the renewal number is computed.
 - **Why the stagger alone fails the renewal:** after week 6 every region is live, so a 90-day re-check
   would fall back to before/after.
 - **Holdout precision:** from week 7 to week 16 the holdout collects 500 × 10 = 5,000 tickets against
-  95,000 treated. With an illustrative 20-minute spread in handling time, the standard error of the
-  difference is about `20 × sqrt(1/5000 + 1/95000) ≈ 0.29` minutes, far below a 5-minute effect.
-- **Why ticket-level errors are fair here:** the ticket, not the region, is randomised, so claim-level
+  95,000 eligible for the agent. With an illustrative 20-minute spread in handling time, the standard
+  error of the difference is about `20 × sqrt(1/5000 + 1/95000) ≈ 0.29` minutes. The expected
+  intention-to-treat effect is about 3 minutes per eligible ticket (30,500 net minutes ÷ 10,000 tickets),
+  roughly ten standard errors.
+- **Why ticket-level errors are fair here:** the ticket, not the region, is randomised, so ticket-level
   noise is the right noise. The DiD keeps its placebo band.
 - **Cost:** 500 held-out tickets a week at an attempt share of 0.5 is 250 runs × $3.67 ≈ $917 a week,
   5% of the $18,333.

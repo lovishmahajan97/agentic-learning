@@ -5,7 +5,7 @@ name: browser and computer-use agent (forms, web tasks, safety)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -60,7 +60,7 @@ minutes, or 80 clerk hours a week. All figures are illustrative planning numbers
 | Option | How it works | Carrier A | Carrier B | Carrier C | Upkeep and cost |
 |---|---|---|---|---|---|
 | A. Playwright scripts everywhere | Fixed selectors, no model | works, cheap | breaks on each redesign | cannot read the remote desktop | high upkeep on B; no model cost |
-| B. DOM agent everywhere | Model picks actions from the accessibility tree | works, but pays for adaptability it rarely needs | adapts to redesigns | fails: no DOM | up to 400 x $0.50 = $200 a week |
+| B. DOM agent everywhere | Model picks actions from the accessibility tree | works, but pays for adaptability it rarely needs | adapts to redesigns | fails: no DOM | up to 350 x $0.50 = $175 a week, with Carrier C still manual |
 | C. Hybrid behind one policy gate | Script for A, DOM agent for B, C stays manual until a screenshot agent passes its replay suite | script | agent | manual for now | agent cost up to 100 x $0.50 = $50 a week |
 | D. Stay manual, ask carriers for APIs | No automation | manual | manual | manual | 80 clerk hours a week |
 

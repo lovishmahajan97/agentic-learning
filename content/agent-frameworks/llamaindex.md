@@ -5,7 +5,7 @@ name: LlamaIndex (indexes, query engines, agents, workflows)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -177,11 +177,13 @@ raised without a tenant.
 - **Inject a prompt-only filter:** drop the `MetadataFilters` and add "only use acme documents" to the
   question. `test_question_cannot_pick_the_tenant` still fails. Log the retrieved node IDs per run;
   `globex-refund` among the candidates proves the prompt cannot enforce tenancy.
-- **Inject an embedder mismatch:** index with `KeywordEmbedding` but query with a different `VOCAB`
-  order. Every score drops and the refusal fires for valid questions. Print `n.score` for the top nodes
-  and compare the embed model used at ingestion and at query time, as in this lesson's Check yourself.
-- **Inject a threshold of 0:** set `min_score=0.0`. The leave question cites `acme-travel` again.
-  Count refusals on a set of unanswerable questions; a refusal rate of zero means the guard is off.
+- **Inject an embedder mismatch:** index with `KeywordEmbedding` but embed queries with `VOCAB`
+  reversed. The Acme refund question is now answered from `acme-travel` and the Globex one is refused,
+  with no error raised. Print `n.score` for the top nodes and compare the embed model used at
+  ingestion and at query time, as in this lesson's Check yourself.
+- **Inject a threshold of 0:** set `min_score=0.0`. The leave question gets an answer again: the
+  refund text, citing `acme-refund` and `acme-travel`, both at score 0. Count refusals on a set of
+  unanswerable questions; a refusal rate of zero means the guard is off.
 
 ### Submission
 - **Your `policy_rag.py`** with both `YOUR CODE` steps done and nothing else changed.

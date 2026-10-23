@@ -5,7 +5,7 @@ name: ROC-AUC
 kind: metric
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -167,8 +167,8 @@ flowchart TD
   outscores a random negative. It says nothing about accuracy at any threshold; 0.5 is random ranking and
   1.0 perfect separation.
 - **"A high AUC means the detector is ready to ship on rare positives."** AUC ignores prevalence, so it hides
-  alert volume. A vendor's 0.97 AUC at 0.2% positives still produced about 15,900 alerts a day at 5.7%
-  precision. Read the PR curve and TPR at your false-block budget.
+  alert volume. In the illustrative vendor scenario below, a 0.97 AUC at 0.2% positives still yields about
+  15,900 alerts a day at 5.7% precision. Read the PR curve and TPR at your false-block budget.
 - **"High AUC means the probabilities can be trusted."** AUC is a rank statistic, blind to calibration:
   scores all between 0.49 and 0.51 can reach 0.95, and temperature scaling never changes it. Check ECE or
   Brier wherever the score is used as a probability.

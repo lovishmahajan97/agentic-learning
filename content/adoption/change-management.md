@@ -5,7 +5,7 @@ name: Change management
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -61,7 +61,7 @@ figures are illustrative planning numbers, not benchmarks.
 | Option | How it works | Week-12 target | Error exposure | Fits council and team limits? |
 |---|---|---|---|---|
 | Big-bang mandate | All 300 reps must use the agent from week 1 | At risk: KPIs unchanged until week 5, so usage turns into compliance theatre | 300 x 24 = 7,200 eligible tickets a day; at 50% usage, about 36 wrong drafts a day | No: 300 users' feedback swamps 2 engineers |
-| Opt-in for everyone | Agent available to all, no KPI or SOP change | Unlikely: tickets-closed scoring rewards the familiar path during the dip | Low and spread out | Yes, but nothing changes |
+| Opt-in for everyone | Agent available to all, no KPI or SOP change | Unlikely: tickets-closed scoring rewards the familiar path during the dip | Set by uptake: at 20% usage, 7,200 x 0.2 x 1% = about 14 wrong drafts a day | Council yes, since no KPI changes; team no, since any of 300 reps can send feedback, and nothing changes the incentive |
 | Phased pilot with gating | 2 teams (100 reps) in weeks 1-6 with protected targets, router sends only eligible tickets, KPIs updated after notice; other 4 teams join in weeks 7-12 | Reachable on the pilot cohort, which is past its learning period by week 12 | 100 x 24 = 2,400 a day; at 50%, about 12 wrong drafts a day | Yes: 100 users matches triage capacity, KPI change lands at week 5 |
 
 ### Decision
@@ -75,11 +75,11 @@ error exposure stays at about a third of the big-bang figure while the 1% rate i
   which is what turns usage into the measured way of working.
 
 **What would change it.**
-- **A smaller saving:** if the agent saves under about 1 minute per eligible ticket once real
-  verification time is measured (1/8 = 12.5%), the 15% target needs more than 100% adoption, so the plan
-  narrows eligibility instead of expanding.
+- **A smaller saving:** if the agent saves less than 1.2 minutes per eligible ticket once real
+  verification time is measured (1.2/8 = 15%), the 15% target needs more than 100% adoption (at 1
+  minute, 0.15 / 0.125 = 120%), so the plan narrows eligibility instead of expanding.
 - **A proven error rate:** if the wrong-refund rate stays at or below 1 in 200 for six weeks and
-overrides are stable, the remaining teams can join together rather than in sequence.
+  overrides are stable, the remaining teams can join together rather than in sequence.
 
 ### Trade-offs accepted
 - **Slower org-wide value.** Four teams wait 6 weeks. Watch the pilot's eligible-task share weekly; if it

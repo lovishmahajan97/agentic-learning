@@ -5,7 +5,7 @@ name: internal knowledge assistant (enterprise RAG with ACLs)
 kind: practice
 difficulty: core
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -48,7 +48,7 @@ A 4,000-person company is piloting the assistant over Confluence, Google Drive a
 channels. The open question is where permissions are enforced. All figures are illustrative planning
 numbers, including the API quota.
 - **Load:** a 9 a.m. peak of about 2 questions a second; each query reranks the top 20 chunks.
-- **Sensitivity:** HR, legal and finance folders hold about 5% of chunks, so a typical top 20 contains
+- **Sensitivity:** HR, legal and finance folders, all in Drive, hold about 5% of chunks, so a typical top 20 contains
   one sensitive chunk.
 - **Revocation rules from the CISO:** a removed permission must stop answering within 1 hour for all
   sources and within 5 minutes for sensitive folders.

@@ -5,7 +5,7 @@ name: coding agent (repo navigation, edits, tests in a sandbox)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -46,7 +46,7 @@ requests. The platform team must choose where the agent's `run(cmd)` tool execut
 illustrative planning numbers.
 - **Volume:** about 300 issues a month, so 300 / 20 working days = 15 tasks a day, up to 5 at once.
 - **Budget per task:** 30 minutes wall-clock cap, 2 vCPU and 4 GB; worst case 300 x 0.5 h = 150
-  sandbox-hours a month.
+  sandbox-hours a month, and at 5 concurrent tasks a peak of 5 x 2 = 10 vCPU and 5 x 4 = 20 GB.
 - **Untrusted code:** the agent installs third-party packages and runs code it wrote, so treat every
   command as hostile.
 - **Data residency:** source code may not leave the company's own cloud account.
@@ -58,7 +58,7 @@ illustrative planning numbers.
 | Option | How it works | Isolation | Residency | Ops load for 2 people |
 |---|---|---|---|---|
 | Developer laptops | Agent CLI runs commands on the engineer's machine | weak: host files, SSH keys and cloud credentials in reach | yes | none |
-| Plain containers on CI runners | One fresh container per task, `--network none` plus the mirror | shared host kernel; a kernel exploit escapes | yes | low: existing images |
+| Plain containers on CI runners | One fresh container per task on an isolated network that reaches only the mirror | shared host kernel; a kernel exploit escapes | yes | low: existing images |
 | Containers under gVisor on the cluster | Same images, a gVisor `RuntimeClass` (runsc) intercepts syscalls; egress policy allows only the mirror | a user-space kernel sits between the code and the host kernel | yes | moderate: one runtime class, compatibility testing |
 | Hosted sandbox service | Vendor runs microVMs behind an API | strong | no: code leaves the account | low |
 
@@ -76,8 +76,8 @@ hostile by assumption. gVisor keeps the team's images and tooling, so it fits th
   Git push token.
 
 **What would change it.**
-- **Test suite incompatible with gVisor:** if tests need Docker-in-Docker, unusual syscalls or GPUs, move
-  to Firecracker-style microVMs (for example Kata Containers) on the same cluster.
+- **Test suite incompatible with gVisor:** if tests need Docker-in-Docker or syscalls gVisor does not
+  implement, move to a microVM runtime class (for example Kata Containers) on the same cluster.
 - **Residency relaxed:** if code may leave the account, a hosted sandbox removes most of the ops load.
 - **Volume grows:** at 1,500 tasks a month the worst case is 750 sandbox-hours; re-check node capacity.
 

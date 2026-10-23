@@ -5,7 +5,7 @@ name: SCIM provisioning
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -48,7 +48,8 @@ reviews now ask how the directory reaches you. Figures are illustrative.
 - **Leavers:** all access, including running and scheduled agents, ends within 1 hour of deactivation in
   the IdP.
 - **Team moves:** a group change reaches the retrieval filter within 1 hour.
-- **Customer policy:** most customers refuse to give a vendor read credentials to their directory.
+- **Customer policy:** most customers refuse to give a vendor read credentials to their directory, and
+  every new third party that receives identity data needs each customer's own sub-processor approval.
 - **Volume:** the largest group has 5,000 members and changes about 20 times a day.
 - **IdP delivery:** Okta pushes on the change event; Entra's provisioning cycle is assumed at about 40
   minutes for planning.
@@ -75,7 +76,9 @@ option inside both 1-hour bounds that needs no directory credentials and no new 
 - **Why not the hosted service:** 20 separate sub-processor approvals put the review date at risk.
 - **Agent side:** the runtime checks the principal before every tool step, so a run started before
   deactivation stops at its next step.
-- **Join key:** the IdP's immutable user ID sent as `externalId`, shared with the SSO login.
+- **Join key:** the IdP's immutable user ID (Entra object ID, Okta user ID), shared with the SSO login and
+  sent as `externalId` by an explicit attribute mapping agreed per tenant; Entra's default mapping fills
+  `externalId` from `mailNickname`, which can change.
 
 **What would change it.** Many more IdP products with quirks, or no engineers to own per-IdP tests, make
 the hosted service worth its approvals. A tenant whose IdP cannot push SCIM gets short sessions and a

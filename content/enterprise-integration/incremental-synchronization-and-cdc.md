@@ -5,7 +5,7 @@ name: Incremental synchronization & CDC
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -72,7 +72,8 @@ retrieval tool that reports index lag.** It is the only option that sees hard de
 without triggers or tens of millions of key reads, and it keeps re-embeds at about 1,500 a day.
 - **Slot safety:** at 2 GB an hour, a stalled slot fills 50 GB in about 25 hours. Set
   `max_slot_wal_keep_size` to 20 GB (invalidation after about 10 hours) and page at 10 GB retained, about 5
-  hours of stall.
+  hours of stall. That alert protects the disk, not the delete rule, which breaks after 1 hour; page
+  separately on end-to-end consumer lag over about 15 minutes.
 - **Consumer rules:** upsert by key, skip events with an older LSN, keep tombstones, never write the
   unchanged-TOAST placeholder, and update metadata in place when the text hash is unchanged.
 - **Agent side:** each hit carries `source_updated_at`, and when lag exceeds 5 minutes for a status

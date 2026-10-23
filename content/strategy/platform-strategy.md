@@ -5,7 +5,7 @@ name: Platform strategy
 kind: decision
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:

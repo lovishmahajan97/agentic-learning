@@ -5,7 +5,7 @@ name: SSO / IAM integration (Okta, Entra ID)
 kind: practice
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -51,8 +51,9 @@ access. Figures are illustrative.
   being disabled in the IdP; every downstream action is attributable to a person.
 - **Agent behaviour:** about 1,500 nightly tasks run with no browser open; interactive sessions last up to
   8 hours.
-- **IdP facts:** both Entra customers will enable SCIM; measured delivery of a deactivation is about 40
-  minutes; downstream access tokens live about 60 minutes.
+- **IdP facts:** both Entra customers will enable SCIM; the Okta customer has not committed to SCIM before
+  go-live; measured delivery of a deactivation is about 40 minutes; downstream access tokens live about
+  60 minutes.
 - **Team and deadline:** 2 engineers, 6 weeks to the first go-live.
 - **Non-negotiable in every option:** per-tenant `iss` and `tid` checks and users keyed by `tid` plus `oid`
   or issuer plus `sub`.
@@ -61,7 +62,7 @@ access. Figures are illustrative.
 | Option | How tools authenticate | Leaver exposure (worst case) | Per-person audit | Fits 6 weeks |
 |---|---|---|---|---|
 | Shared service account, JIT, 7-day sessions | one app credential per tenant for every tool | up to 7 days in the app; nightly tasks never stop | no, one bot account | easily |
-| Delegated tokens, JIT, 8-hour sessions | on-behalf-of or token exchange per tool call | 8 hours of app session; stored refresh tokens keep tasks alive | yes | yes |
+| Delegated tokens, JIT, 8-hour sessions | on-behalf-of or token exchange per tool call | 8 hours of app session; stored task state, plus any refresh token the IdP does not revoke (for example one Jira issued itself), keeps tasks alive | yes | yes |
 | Delegated tokens plus SCIM revocation | as above; SCIM `active: false` kills sessions, cancels tasks, drops tokens | about 40 minutes | yes | yes, one more endpoint |
 | Per-tenant service account with app-side ACLs | app credential plus your own copy of permissions | ACL sync lag plus session length | partly, in your own logs | no: replicating permissions is the long pole |
 

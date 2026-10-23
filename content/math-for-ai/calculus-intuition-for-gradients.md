@@ -5,7 +5,7 @@ name: Calculus intuition for gradients
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: understand
@@ -120,9 +120,10 @@ flowchart TD
 - **"Backprop is a clever way of nudging each weight."** That is finite differences, one pass per weight.
   Backprop applies the chain rule once from the loss backward, getting every gradient in about one forward
   and one backward pass.
-- **"Oscillating loss means the run is diverging."** On the bowl, lr 0.9 overshoots every step yet
-  converges, because the error factor is −0.8. Divergence is the error growing, as at lr 1.1 with factor
-  −1.2.
+- **"Overshooting the minimum on every step means the run is diverging."** On the bowl, lr 0.9
+  jumps past w = 3 every step yet converges, because the error factor is −0.8 and the loss still
+  shrinks by a factor of 0.64 per step. Divergence is the error growing in size, as at lr 1.1 with
+  factor −1.2.
 - **"Gradient clipping makes any learning rate safe."** Clipping caps the occasional bad step. If it
   fires on most steps, the learning rate is too high and every useful step is being shrunk; lower the
   rate instead.

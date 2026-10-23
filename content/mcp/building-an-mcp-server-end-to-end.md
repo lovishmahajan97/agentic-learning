@@ -5,7 +5,7 @@ name: Building an MCP server end to end (FastMCP in Python, TypeScript SDK)
 kind: tool
 difficulty: core
 est_minutes: 20
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -254,8 +254,9 @@ def test_step_budget_stops_a_looping_model():
   model received; the bridge table in How it works maps `isError` to `is_error`.
 - **Send each `tool_result` in its own user message.** `test_denied_write_is_reported_to_the_model` sees
   only `t4` in the last message. The Messages API expects every result for one assistant turn in the next
-  user message, so a live run gets a request error. Dump `messages` after a two-call turn and check the
-  roles alternate.
+  user message; split results break role alternation, and Anthropic's tool-use docs warn that this
+  pattern teaches the model to stop making parallel calls. Dump `messages` after a two-call turn and check
+  the roles alternate.
 - **Replace the bounded `for` with `while True`.** The step-budget test never returns because the scripted
   model calls `kb_search` forever, as a confused live model might. Interrupt it and read the traceback to
   find `run_agent`; the budget is the guard in Production patterns.

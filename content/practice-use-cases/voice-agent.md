@@ -5,7 +5,7 @@ name: voice agent (speech in, tools, speech out, latency budget)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -47,8 +47,8 @@ A group of 12 outpatient clinics in the EU wants a phone agent for booking, resc
 appointments, with transfer to reception for anything else. All figures are illustrative planning
 numbers, not vendor quotes.
 - **Volume:** about 3,000 calls a month at 3 minutes each, so 9,000 call minutes, with a Monday-morning
-  peak of about 20 concurrent calls.
-- **Latency:** p95 voice-to-voice under 1.8 s, the target from the examples.
+  peak of about 60 calls an hour, or about 3 concurrent calls (60 x 3 / 60).
+- **Latency:** voice-to-voice p50 under 1 s and p95 under 1.8 s, the targets from the examples.
 - **Data:** callers give names, dates of birth and symptoms. Transcripts must be redacted before storage,
   audio and text must stay in the EU, and every vendor must sign the clinics' data processing terms.
 - **Accuracy:** under 5% word error rate on names and dates, with read-back before any booking.
@@ -59,12 +59,13 @@ numbers, not vendor quotes.
 ### Options
 | Option | How it works | Latency | Redaction and residency | Team fit | Cost shape |
 |---|---|---|---|---|---|
-| A. Cascaded, hosted streaming STT, LLM and TTS | Pipecat or LiveKit Agents wiring three in-region vendors | planned p50 about 1.15 s (see below); p95 must be measured | text in the middle: redact before storage, log every turn | good: Python orchestration, swappable vendors | sum of three per-minute prices plus telephony |
+| A. Cascaded, hosted streaming STT, LLM and TTS | Pipecat or LiveKit Agents wiring three in-region vendors | planned p50 about 0.95 s (see below); p95 must be measured | text in the middle: redact before storage, log every turn | good: Python orchestration, swappable vendors | sum of three per-minute prices plus telephony |
 | B. Speech-to-speech realtime model | One model takes and returns audio, with tool calls | often lower, fewer hops | depends on one vendor's region, terms and transcript output; check current docs | good: simplest pipeline | per audio minute or token |
 | C. Cascaded, self-hosted open STT and TTS on own GPUs | Same pipeline, models run in the clinics' cloud account | depends on GPU sizing and warm capacity | full control | poor: needs GPU operations and speech tuning | fixed GPU cost even at night |
 
-The latency plan for A picks a point in the lower half of each stage range above: 300 ms endpointing + 150 STT + 300 LLM
-first token + 150 first sentence + 150 TTS first audio + 100 network = 1,150 ms.
+The latency plan for A keeps each stage in the lower half of its range above, as the budget requires:
+300 ms endpointing + 100 STT + 250 LLM first token + 100 first sentence + 100 TTS first audio + 100
+network = 950 ms.
 
 ### Decision
 **Option A, cascaded with hosted in-region vendors.** The data constraints decide it: redaction before
@@ -73,15 +74,15 @@ EU hosting and signed terms.
 
 C fails the team-skills and 8-week constraints. B could be faster, but its compliance depends on a
 single vendor meeting every term at once.
-- **Latency headroom:** the 1,150 ms plan leaves 650 ms under the 1.8 s p95 target for tail stages;
-  the pilot must confirm it with per-stage timestamps.
+- **Latency headroom:** the 950 ms plan is only 50 ms under the 1 s p50 target and leaves 850 ms
+  under the 1.8 s p95 target for tail stages; the pilot must confirm both with per-stage timestamps.
 - **Cost check:** the team prices the three vendors plus telephony per minute before signing, against
   the $0.20 ceiling.
 
 **What would change it.** If a realtime vendor offers EU hosting, signed terms, text transcripts and tool
 calls, run B against the same replay suite and switch if task success matches and p95 is lower.
 
-If measured p95 stays above 1.8 s after tuning, test B for the conversational turns. If volume grows to
+If measured p50 stays above 1 s or p95 above 1.8 s after tuning, test B for the conversational turns. If volume grows to
 steady high concurrency and the team hires speech engineers, re-cost C.
 
 ### Trade-offs accepted

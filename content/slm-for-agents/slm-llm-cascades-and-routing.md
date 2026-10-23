@@ -6,7 +6,7 @@ kind: concept
 difficulty: core
 est_minutes: 15
 agent_relevance: core
-status: typed
+status: typed-verified
 lesson_type: concept
 mastery: evaluate
 code_tested: partial

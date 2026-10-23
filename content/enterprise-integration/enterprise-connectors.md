@@ -5,7 +5,7 @@ name: Enterprise connectors (Salesforce, SAP, ServiceNow, SharePoint, Confluence
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -54,16 +54,19 @@ figures are illustrative planning numbers, not vendor limits.
   before go-live.
 - **Freshness and deletion:** Slack answers within 15 minutes of a post; legal removals gone from answers
   within 24 hours.
-- **Residency:** content copies must stay in the customer's own Azure subscription.
+- **Residency:** content copies must stay in the customer's own Azure subscription; the two shortlisted
+  connector vendors are SaaS-only.
+- **Latency and ranking:** each retrieval step has a 1.5-second p95 budget, and answers must rank results
+  from all sources together; the customer's measured p95 for SharePoint search as a user is about 2 seconds.
 - **Team and deadline:** 2 engineers, 12 weeks (24 engineer-weeks); pilot on the top 50 sites by week 8.
 
 ### Options
-| Option | How it works | Permission fidelity | Freshness and deletion | Residency | 24 engineer-weeks |
-|---|---|---|---|---|---|
-| Buy a SaaS connector platform | vendor crawls all sources into its cloud | vendor's model; broken inheritance must be proven | vendor's sync cadence | fails if the shortlisted vendor is SaaS-only | fits easily |
-| Build sync for all four | own connectors, one ACL-aware index | full control | delta cursors plus tombstones | passes | tight: ServiceNow scripted ACLs are hard to replicate |
-| Federated live search | agent queries each source's search API as the user | source enforces it natively | current | passes, no copy | fits, but 3 sources per step, no shared ranking |
-| Sync prose, live tools for records | build SharePoint, Confluence, Slack sync; ServiceNow as delegated live tools | full control on prose; ServiceNow checks itself | delta plus Events API | passes | fits |
+| Option | How it works | Permission fidelity | Freshness and deletion | Residency | Latency and ranking | 24 engineer-weeks |
+|---|---|---|---|---|---|---|
+| Buy a SaaS connector platform | vendor crawls all sources into its cloud | vendor's model; broken inheritance must be proven | vendor's sync cadence | fails: both shortlisted vendors are SaaS-only | one index, passes | fits easily |
+| Build sync for all four | own connectors, one ACL-aware index | full control | delta cursors plus tombstones | passes | one index, passes | tight: ServiceNow scripted ACLs are hard to replicate |
+| Federated live search | agent queries each source's search API as the user | source enforces it natively | current | passes, no copy | fails: each step waits on the slowest of 3 searches (SharePoint about 2 s), no shared ranking | fits |
+| Sync prose, live tools for records | build SharePoint, Confluence, Slack sync; ServiceNow as delegated live tools | full control on prose; ServiceNow checks itself | delta plus Events API | passes | one index for prose, passes | fits |
 
 Backfill arithmetic for the build options, at an illustrative 10 requests per second for SharePoint:
 - **Per-file permissions:** 1.2M x 2 = 2.4M calls, 240,000 s, about 2.8 days; with 20% retried after 429,
@@ -73,14 +76,15 @@ Backfill arithmetic for the build options, at an illustrative 10 requests per se
 
 ### Decision
 **Sync prose into an index in the customer's subscription, and expose ServiceNow as live tools called with
-the user's delegated identity.** It is the only option that passes residency, proves broken-inheritance
-handling to security, and fits 24 engineer-weeks.
+the user's delegated identity.** It is the only option that passes residency and the per-step latency
+budget, proves broken-inheritance handling to security, and fits 24 engineer-weeks.
 - **Why not buy:** the residency constraint removes the SaaS-only shortlist; a self-hosted platform would
   flip this.
 - **Why not build all four:** replicating ServiceNow's scripted per-field ACLs is the riskiest work and buys
   nothing, because records must be current and writes must hit the source anyway.
-- **Why not federated:** every retrieval step waits on three source APIs (about 3,000 x 2 x 3 = 18,000
-  search calls a day), and results from three engines cannot be ranked together.
+- **Why not federated:** every retrieval step waits on the slowest of three source APIs (about 3,000 x 2 x
+  3 = 18,000 search calls a day), so SharePoint's 2-second p95 alone breaks the 1.5-second budget, and
+  results from three engines cannot be ranked together.
 - **Order:** crawl the top 50 sites first with per-folder permissions; the full SharePoint backfill of
   about 1.4 to 3.3 days fits well before week 8.
 

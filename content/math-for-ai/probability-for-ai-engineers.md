@@ -5,7 +5,7 @@ name: Probability for AI engineers
 kind: concept
 difficulty: intro
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement

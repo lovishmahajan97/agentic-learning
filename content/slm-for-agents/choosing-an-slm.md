@@ -5,7 +5,7 @@ name: Choosing an SLM (Llama, Qwen, Phi, Gemma, Mistral small models)
 kind: decision
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 mastery: evaluate
@@ -53,7 +53,7 @@ published scores.
 - **Workload:** English and French, 12,288-token prompts (9 tool schemas plus history), 2 concurrent
   sessions, so 24,576 tokens of KV cache.
 - **Quality bar:** at least 90% correct tool and arguments on a 150-case French golden set; failures go
-  to a human scheduler.
+  to a human scheduler. Candidates within 3 points of each other count as tied, so the smaller wins.
 - **License:** Apache 2.0 or MIT are pre-approved; a custom license needs legal review of about 4 weeks.
 - **Deadline:** pilot in 6 weeks. **Team:** three engineers, Ollama already in use.
 

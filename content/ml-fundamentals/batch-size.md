@@ -5,7 +5,7 @@ name: Batch size
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -190,16 +190,17 @@ flowchart TD
   On 3,000 agent traces, an effective batch of 128 leaves 69 optimizer steps over 3 epochs, too few for
   the adapter to learn the tool format.
 - **"Gradient accumulation makes training faster."** It raises the effective batch at the same per-GPU
-  memory, but each step still runs every micro-batch in sequence. Only more data-parallel GPUs shorten
-  the run.
+  memory, but each step still runs every micro-batch in sequence. Among the batch knobs, only more
+  data-parallel GPUs (or a larger micro-batch that keeps the GPU busier) shorten the run.
 - **"Large batches generalize worse by nature."** Most of the early sharp-minima gap closed once learning
   rate, warmup and step count were re-tuned for the larger batch. Copying a small-batch recipe to a large
   batch is what hurts.
 - **"Batch size and learning rate are independent knobs."** A bigger batch gives a more trustworthy
   gradient and justifies a bigger step (linear for SGD, roughly square-root for Adam, then re-tune).
   Changing one without the other compares two different optimizers.
-- **"Batch 64 means the same thing in every run."** The gradient estimate depends on tokens, not rows. At
-  2k vs 8k context, or with agent traces of very different lengths, "64" carries 4× different signal.
+- **"Batch 64 means the same thing in every run."** The gradient estimate and the memory load depend on tokens,
+  not rows. At 2k vs 8k context "64" is 131k vs 524k tokens per step, and agent traces of very different
+  lengths make it vary from step to step.
 - **"The training batch and the serving batch are the same knob."** Serving batches concurrent requests to
   amortize weight reads, and its cost is latency, not gradient noise.
 

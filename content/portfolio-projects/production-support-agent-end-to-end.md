@@ -6,7 +6,7 @@ kind: practice
 difficulty: advanced
 est_minutes: 35
 agent_relevance: core
-status: typed
+status: typed-verified
 lesson_type: decision
 related:
   - practice-use-cases/customer-support-agent
@@ -53,7 +53,7 @@ may refund without a human. All figures are illustrative planning numbers, not b
   about 3 minutes, so 15 x 60 / 3 = 300 approvals a week at most.
 - **Finance constraint:** at most $15,000 a week may be refunded with no human review until the audit
   log has 4 weeks of history.
-- **Deadline:** the 3-week phased plan above; there is no fraud-scoring service yet.
+- **Deadline:** the 3-week phased plan below; there is no fraud-scoring service yet.
 
 ### Options
 | Option | How it works | Approvals a week (hours) | Unreviewed refunds a week | Fits both constraints? |
@@ -67,7 +67,7 @@ may refund without a human. All figures are illustrative planning numbers, not b
 **A fixed, code-enforced limit of $50, with everything above it routed to the approval queue.** It is the
 only option that fits both the 300-approval capacity and the $15,000 unreviewed cap, and it needs no new
 service before the deadline.
-- **The limit lives in the tool,** as in the skeleton above, so no prompt or injection can raise it.
+- **The limit lives in the tool,** as in the skeleton below, so no prompt or injection can raise it.
 - **The queue runs at 90% utilisation** (13.5 of 15 hours), so queue age is alerted from day one and a
   status message goes to any customer whose request waits past the agreed window.
 - **Approval outcomes are logged** in the audit trail, which is the evidence needed to revisit the limit.

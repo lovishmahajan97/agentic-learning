@@ -5,7 +5,7 @@ name: Llama Guard
 kind: tool
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 mastery: evaluate

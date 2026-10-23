@@ -5,8 +5,8 @@ name: Output validation (Pydantic, Instructor, Outlines)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
-lesson_type: concept
+status: typed-verified
+lesson_type: lab
 agent_relevance: core
 mastery: implement
 code_tested: partial
@@ -46,6 +46,245 @@ guaranteed; meaning must be checked.
   and where a failing step goes after retries.
 - **What you can skip.** Building FSM token indexes yourself; know that constrained decoding guarantees
   shape and nothing more, and spend your effort on semantic validators and reference-data checks.
+
+## Lab
+### Task
+Build the two validation chokepoints an agent needs: a decision step that parses model output into a
+strict Pydantic contract and retries with the exact `ValidationError` text, and a tool executor that
+validates arguments and returns errors as tool results instead of crashing the run.
+
+The agent goal is that no unvalidated value reaches a side effect, truncation is never retried, and a
+model that cannot repair itself escalates within a fixed budget. Time box: 45-60 min.
+- **Prerequisites:** Pydantic; Structured outputs (JSON mode); Function / tool calling; the Examples in
+  this lesson.
+- **Setup:** Python 3.10+, `pip install pydantic pytest` (checked with pydantic 2.14.1, pytest 9, Python
+  3.12). Save the starter as `lab.py`, the tests as `test_lab.py`.
+- **No model calls:** `scripted()` is a fake model that returns fixed `(text, stop_reason)` replies and
+  records every request it received, so the tests can see exactly what your retry sent back.
+
+### Starter code
+```python
+"""Lab: validate model output and tool arguments, and repair with the error fed back. Run: python lab.py"""
+import json
+from datetime import date
+from typing import Callable, Literal
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+
+TODAY = date(2026, 10, 1)          # fixed so every run is reproducible
+MAX_RETRIES = 2                    # retries after the first attempt
+MAX_REPAIRS = 2                    # consecutive invalid calls per tool before the run escalates
+Model = Callable[[list], tuple]    # messages -> (text, stop_reason); a provider call in production
+
+class Truncated(Exception):
+    """stop_reason was max_tokens: a budget error that a retry will not fix."""
+
+class NeedsReview(Exception):
+    """Still invalid after the retry budget; the message is the last validation error."""
+
+class RefundDecision(BaseModel):
+    # YOUR CODE HERE (1a): make this model strict, so a "8999" string is reported instead of coerced to 8999.
+    order_id: str = Field(pattern=r"^ORD-\d{6}$")
+    order_date: date
+    reason: str = Field(min_length=10, max_length=300)   # before the verdict: justify, then commit
+    decision: Literal["approve", "deny", "escalate"]
+    amount_cents: int = Field(ge=0)
+    # YOUR CODE HERE (1b): a field_validator that rejects an order_date after TODAY with the message
+    # "order_date cannot be in the future", and a model_validator(mode="after") that rejects
+    # decision "deny" with amount_cents != 0: "a denied refund must have amount_cents == 0".
+
+def decide(model: Model, ticket: str) -> RefundDecision:
+    messages = [{"role": "user", "content": f"Today is {TODAY}. Decide the refund for:\n{ticket}"}]
+    # YOUR CODE HERE (2): call model(messages) at most 1 + MAX_RETRIES times. If stop_reason == "max_tokens", raise
+    # Truncated at once. Parse with RefundDecision.model_validate_json(text). On ValidationError append
+    # {"role": "assistant", "content": text} and a user message
+    # "Fix these validation errors and return the full object:\n<the error>", then call again.
+    # When the budget is spent, raise NeedsReview(str(last_error)).
+    raise NotImplementedError
+
+class IssueRefundArgs(BaseModel):
+    model_config = ConfigDict(strict=True)
+    order_id: str = Field(pattern=r"^ORD-\d{6}$")
+    amount_cents: int = Field(ge=0, le=50_000)            # hard cap: larger refunds need a human
+    reason: str = Field(min_length=10, max_length=300)
+
+SIDE_EFFECTS: list = []                                   # every refund that actually ran
+TOOLS = {"issue_refund": (IssueRefundArgs,
+                          lambda a: SIDE_EFFECTS.append(a) or f"refunded {a.amount_cents} on {a.order_id}")}
+
+def execute(tool_use: dict, repairs: dict) -> dict:
+    """Turn one tool_use block into a tool_result block; never run unvalidated arguments."""
+    # YOUR CODE HERE (3): an unknown tool name returns an is_error result whose content lists sorted(TOOLS).
+    # Validate tool_use["input"] with the tool's model. On ValidationError add 1 to repairs[name]; above
+    # MAX_REPAIRS raise RuntimeError("escalate: ..."); otherwise return {"type": "tool_result",
+    # "tool_use_id": ..., "is_error": True, "content": "Invalid arguments, fix and call again:\n<error>"}.
+    # On success remove name from repairs, run the tool and return its string as the content.
+    raise NotImplementedError
+
+# ---- fixtures: a scripted fake model and the demo run (no API key needed) ----------------------------
+GOOD = {"order_id": "ORD-104233", "order_date": "2026-09-30", "reason": "Blender arrived cracked in transit.",
+        "decision": "approve", "amount_cents": 8999}
+
+def reply(stop_reason: str = "end_turn", **changes) -> tuple:
+    return json.dumps({**GOOD, **changes}), stop_reason
+
+def scripted(*replies):
+    """A fake model: returns the scripted replies in order (repeating the last) and records each request."""
+    def model(messages):
+        model.calls.append([dict(m) for m in messages])
+        return replies[min(len(model.calls), len(replies)) - 1]
+    model.calls = []
+    return model
+
+def run(label: str, model) -> None:
+    try:
+        d = decide(model, "ORD-104233, placed 2026-09-30, blender arrived cracked, paid $89.99.")
+        result = f"{d.decision} {d.amount_cents}"
+    except (Truncated, NeedsReview) as e:
+        result = type(e).__name__
+    print(f"{label:<20} -> {result} after {len(model.calls)} call(s)")
+
+if __name__ == "__main__":
+    run("paid deny, fixed", scripted(reply(decision="deny"), reply(decision="deny", amount_cents=0)))
+    run("truncated", scripted((reply()[0][:40], "max_tokens")))
+    run("future date x3", scripted(reply(order_date="2026-12-24")))
+    run("amount as string", scripted(reply(amount_cents="8999"), reply()))
+    repairs = {}
+    bad = {"id": "t1", "name": "issue_refund",
+           "input": {"order_id": "104233", "amount_cents": "8999", "reason": "cracked on arrival"}}
+    good = {"id": "t2", "name": "issue_refund",
+            "input": {"order_id": "ORD-104233", "amount_cents": 8999, "reason": "cracked on arrival"}}
+    print("tool: bad args       ->", execute(bad, repairs)["is_error"], repairs)
+    print("tool: fixed args     ->", execute(good, repairs)["content"], repairs)
+    print("tool: unknown name   ->", execute({"id": "t3", "name": "refund", "input": {}}, repairs)["is_error"])
+    try:
+        for _ in range(MAX_REPAIRS + 1):
+            execute(bad, repairs)
+    except RuntimeError:
+        print("tool: 3 bad in a row -> RuntimeError (escalate)")
+    print("side effects run     ->", len(SIDE_EFFECTS))
+```
+
+### Expected output
+On the starter, `python lab.py` stops at the first `decide` with `NotImplementedError`. With a correct
+solution it prints exactly:
+
+```
+paid deny, fixed     -> deny 0 after 2 call(s)
+truncated            -> Truncated after 1 call(s)
+future date x3       -> NeedsReview after 3 call(s)
+amount as string     -> approve 8999 after 2 call(s)
+tool: bad args       -> True {'issue_refund': 1}
+tool: fixed args     -> refunded 8999 on ORD-104233 {}
+tool: unknown name   -> True
+tool: 3 bad in a row -> RuntimeError (escalate)
+side effects run     -> 1
+```
+
+### Tests
+Run `pytest -q test_lab.py`. On the starter all 7 fail: the two contract tests with `DID NOT RAISE
+ValidationError` (no validators, lax coercion), the other five with `NotImplementedError`. A correct
+solution passes all 7.
+
+```python
+import json
+import pytest
+from pydantic import ValidationError
+import lab
+from lab import (GOOD, MAX_REPAIRS, MAX_RETRIES, NeedsReview, RefundDecision, Truncated,
+                 decide, execute, reply, scripted)
+
+TICKET = "ORD-104233, blender arrived cracked."
+BAD = {"id": "t1", "name": "issue_refund",
+       "input": {"order_id": "104233", "amount_cents": "8999", "reason": "cracked on arrival"}}
+OK = {"id": "t2", "name": "issue_refund",
+      "input": {"order_id": "ORD-104233", "amount_cents": 8999, "reason": "cracked on arrival"}}
+
+def parse(**changes):
+    return RefundDecision.model_validate_json(json.dumps({**GOOD, **changes}))
+
+@pytest.fixture(autouse=True)
+def no_side_effects():
+    lab.SIDE_EFFECTS.clear()
+
+def test_semantic_rules():
+    assert parse().amount_cents == 8999 and parse(decision="deny", amount_cents=0).decision == "deny"
+    with pytest.raises(ValidationError, match="in the future"):
+        parse(order_date="2026-12-24")
+    with pytest.raises(ValidationError, match="amount_cents == 0"):
+        parse(decision="deny")
+
+def test_strict_money():
+    with pytest.raises(ValidationError, match="amount_cents"):
+        parse(amount_cents="8999")
+
+def test_retry_feeds_the_error_back():
+    m = scripted(reply(decision="deny"), reply(decision="deny", amount_cents=0))
+    d = decide(m, TICKET)
+    assert (d.decision, d.amount_cents, len(m.calls)) == ("deny", 0, 2)
+    assert m.calls[1][-2] == {"role": "assistant", "content": reply(decision="deny")[0]}
+    assert m.calls[1][-1]["role"] == "user" and "amount_cents == 0" in m.calls[1][-1]["content"]
+
+def test_truncation_is_not_retried():
+    m = scripted((reply()[0][:40], "max_tokens"))
+    with pytest.raises(Truncated):
+        decide(m, TICKET)
+    assert len(m.calls) == 1
+
+def test_budget_then_review():
+    m = scripted(reply(order_date="2026-12-24"))
+    with pytest.raises(NeedsReview, match="in the future"):
+        decide(m, TICKET)
+    assert len(m.calls) == 1 + MAX_RETRIES
+
+def test_executor_returns_errors_instead_of_raising():
+    repairs = {}
+    r = execute(BAD, repairs)
+    assert r["is_error"] is True and r["tool_use_id"] == "t1"
+    assert "order_id" in r["content"] and "amount_cents" in r["content"]
+    assert repairs == {"issue_refund": 1} and lab.SIDE_EFFECTS == []
+    unknown = execute({"id": "t3", "name": "refund", "input": {}}, repairs)
+    assert unknown["is_error"] is True and "issue_refund" in unknown["content"]
+
+def test_repair_cap_and_reset():
+    repairs = {}
+    execute(BAD, repairs)
+    ok = execute(OK, repairs)
+    assert ok["content"] == "refunded 8999 on ORD-104233" and not ok.get("is_error")
+    assert "issue_refund" not in repairs and len(lab.SIDE_EFFECTS) == 1
+    for _ in range(MAX_REPAIRS):
+        execute(BAD, repairs)
+    with pytest.raises(RuntimeError):
+        execute(BAD, repairs)
+    assert len(lab.SIDE_EFFECTS) == 1
+```
+
+### Failure scenarios
+- **Drop the `stop_reason` check.** The `truncated` line becomes `NeedsReview after 3 call(s)` and
+  `test_truncation_is_not_retried` fails: three paid calls, each failing with `json_invalid` ("EOF while
+  parsing a value at line 1 column 40"). Group errors by `type`; `json_invalid` clustered on long
+  outputs means a token budget problem, so check `stop_reason` before parsing.
+- **Retry with "Try again." instead of the error text.** The demo still prints `deny 0` because the fake
+  model is scripted, but `test_retry_feeds_the_error_back` fails on the last message; against a real
+  model the same `amount_cents == 0` failure repeats until the budget is spent. Diff the second request
+  against the first: no error text means no feedback.
+- **Leave `RefundDecision` lax.** The `amount as string` line becomes `approve 8999 after 1 call(s)` and
+  `test_strict_money` fails: the model's type error was coerced away and never reached your metrics. Set
+  strict mode on contracts that carry money or ids.
+- **Let `ValidationError` escape the executor.** The demo dies at `tool: bad args` with a traceback
+  naming `order_id` and `amount_cents`, and both executor tests fail: one malformed call killed a run the
+  model could have repaired. Catch it in the executor and return an `is_error` tool result.
+
+### Submission
+- **`lab.py`** with the contract (strict mode and both validators), `decide` and `execute` implemented,
+  and the fixtures below the marked spots left unchanged.
+- **A green test run** (7 passed) and the output of `python lab.py`, matching Expected output exactly.
+- **One injected fault** from the list above, with the failing test name and the line of output that
+  changed.
+- **A short note (5-8 lines):** how you would replace `scripted` with a real provider call, which metric
+  (`loc` and `type` counts, truncation rate, repairs per tool) you would alert on, and why `MAX_RETRIES`
+  stays at 2.
+- **Evaluated on:** tests passing, output matching, truncation never retried, and no side effect running
+  on unvalidated arguments.
 
 ## Why it exists
 - **Downstream code is typed; free text is not.** The failures are mundane and constant: JSON wrapped in
@@ -166,22 +405,6 @@ flowchart TD
     R -->|"yes, send error text"| G
     R -->|"no"| Q["Fallback or review queue"]
 ```
-
-## Misconceptions
-- **"Structured outputs mean the output is valid."** Provider schemas and constrained decoding guarantee
-  shape only. A `deny` with `amount_cents` of 8999, a future date or a well-formed but nonexistent
-  `order_id` all pass; meaning needs Pydantic validators and reference-data checks.
-- **"Constrained decoding makes the model more accurate."** It forces syntax, not truth: a model that does
-  not know a field fills it with something plausible. Allow `null` or an `unknown` value where ignorance
-  is a legitimate answer, and order fields so the model reasons before it commits.
-- **"When validation fails, retry."** A truncated output (`stop_reason` is `max_tokens`) fails again,
-  and a retry without the `ValidationError` text repeats the same mistake. A retry rate past a few
-  percent means fix the prompt or schema, not raise `max_retries`.
-- **"Pydantic's defaults are safe for money and ids."** Lax mode quietly coerces `"8999"` to `8999`,
-  hiding the model's error. Use strict mode where the type carries meaning.
-- **"A bad tool argument should raise an exception."** In an agent, raising kills a run the model could
-  repair. Return the error as an error tool result from the executor, and cap repairs per tool so a stuck
-  model does not burn the step budget.
 
 ## Examples
 ### One contract, three jobs

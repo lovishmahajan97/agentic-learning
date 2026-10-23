@@ -5,7 +5,7 @@ name: SAML SSO
 kind: concept
 difficulty: advanced
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: background
 related:
@@ -73,7 +73,8 @@ approval, and keeps the pen-test risk to configuration you can test.
 - **Why not hand-rolled:** every known SAML attack becomes your code's problem, with one engineer new to
   SAML.
 - **IdP-initiated controls:** a shared Redis replay cache with set-if-absent and a TTL until
-  `NotOnOrAfter`, 5-minute validity, and a fixed landing page instead of an arbitrary RelayState.
+  `NotOnOrAfter` plus the 2-minute skew (an ID evicted earlier could be replayed while skew still
+  accepts it), 5-minute validity, and a fixed landing page instead of an arbitrary RelayState.
 - **Agent principal:** key on (tenant, IdP entity ID, persistent NameID); unmapped groups grant no tools.
 
 **What would change it.** Three or more SAML customers in the pipeline, or a broker already approved by
@@ -351,8 +352,10 @@ last column is what a miss would mean for the agent.
   either, and alert well ahead (for example 30 days) of each expiry date captured from metadata. Monitor
   signature failures per tenant on rotation days.
 - **Shared replay cache with TTL.** Keep seen assertion IDs in a store every app node shares, for example
-  Redis `SET saml:<ID> 1 NX EX <seconds until NotOnOrAfter>`; a failed `NX` means replay. Monitor replay
-  rejections, which should be near zero.
+  Redis `SET saml:<ID> 1 NX EX <seconds until NotOnOrAfter>`; a failed `NX` means replay.
+  Add the allowed skew to that TTL (and pass `not_on_or_after` plus skew to the cache above), because the
+  validator still accepts the assertion until `NotOnOrAfter` plus skew. Monitor replay rejections, which
+  should be near zero.
 - **Clock discipline on every node.** Run NTP everywhere and keep skew allowance small (2 minutes in the
   example). Monitor "not yet valid" errors by node; one node's spike means its clock drifted.
 - **Hardened parser configuration.** Parse with DTDs and external entities disabled (for `lxml`, a parser
@@ -447,7 +450,7 @@ Then still check issuer, audience, recipient, time window and InResponseTo.
 
 ### How do you make replay protection work behind a load balancer with many app nodes?
 - **Use a shared store**, because a per-node in-memory set lets a replay succeed on a different node.
-- **Key by assertion ID with a TTL** until its `NotOnOrAfter`, using an atomic set-if-absent so two nodes
+- **Key by assertion ID with a TTL** until its `NotOnOrAfter` plus the allowed skew, using an atomic set-if-absent so two nodes
   cannot both accept it.
 
 ### Users sign in to your agent product with SAML. How does the agent get credentials to call Salesforce as them?

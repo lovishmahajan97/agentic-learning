@@ -5,7 +5,7 @@ name: AI security
 kind: concept
 difficulty: intro
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -61,16 +61,20 @@ Security must sign off before launch. All figures are illustrative planning numb
 |---|---|---|---|---|
 | Guardrail prompt plus input classifier | One agent with `fetch_url`, `read_crm`, `send_email`; prompt forbids following page instructions | No: both controls are inside the steerable channel | none | yes, but fails the security requirement |
 | One agent, taint plus approval on every send | Reading a page taints the run; each send needs the rep to approve the exact arguments | Yes, via the human | 40 approvals a rep a day, which reps do anyway as rereads | yes |
-| Split sessions plus drafts only | A reader session browses with no CRM and no send tools and returns schema-validated fields; a writer session reads CRM scoped to the rep and can only create a draft in the rep's mailbox | Yes: no single session holds all three legs, and the only exit is a draft a human sends | same rereads, no new clicks | yes, about a week more than option two |
+| Split sessions plus drafts only | A reader session browses with no CRM and no send tools and returns schema-validated fields; a writer session reads CRM scoped to the rep and the one account being researched, and can only create a draft in the rep's mailbox | Yes: the reader has no CRM and no channel; the writer sees only typed fields, cannot send, and cannot choose the recipient, so the only exit is a draft a human sends | same rereads, no new clicks | yes, about a week more than option two |
 
 ### Decision
 **Split sessions with drafts only.** The reader holds untrusted content but no sensitive data and no
 channel out. The writer holds CRM data, but its only output is `create_draft`, sent to the prospect's
 domain from the CRM record, never an address taken from a page.
-- **Why it meets the security requirement:** the break is structural, so it holds even when the reader
-  is fully steered; the worst a poisoned page can do is put false text into a draft a rep reads.
-- **Why not approval on every send:** it relies on 2,400 human checks a day staying careful, while the
-  split removes the leg without asking reps for anything new.
+- **Why it meets the security requirement:** the breaks are in code, so they hold even when the reader
+  is fully steered: the steered session never touches CRM, and the session that does cannot send or pick
+  an address. The writer still reads the free-text summary, so the worst a poisoned page can do is put
+  false text, or CRM details about that same account, into a draft addressed to the prospect, which the
+  rep reads before sending.
+- **Why not approval on every send:** a steered agent there chooses the recipient and body, so keeping
+  CRM data away from an attacker's address rests on 2,400 human checks a day staying careful; the split
+  fixes the recipient in code and asks reps for nothing new.
 - **Why not the guardrail prompt:** it does not change what a steered model can do.
 
 **What would change it.** If the business later wants automatic sequences with no human send, keep the

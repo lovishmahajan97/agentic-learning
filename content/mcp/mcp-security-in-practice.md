@@ -5,7 +5,7 @@ name: MCP security in practice (tool poisoning, injection through tool results, 
 kind: practice
 difficulty: advanced
 est_minutes: 20
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

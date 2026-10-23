@@ -5,7 +5,7 @@ name: PII protection / DLP
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -60,7 +60,7 @@ provider. All figures are illustrative planning numbers, not benchmarks.
 ### Options
 | Option | How it works | Meets DPO rule? | Product works? | Fits team and deadline? |
 |---|---|---|---|---|
-| Block on detection | Refuse any message with identifiers or health terms | yes | no: about 30% of conversations refused | yes |
+| Block on detection | Refuse any message with identifiers or health terms | yes | no: at least the 30% that mention health are refused, plus any booking that names the patient | yes |
 | Pseudonymise at gateway and tool wrapper | Placeholders to the provider, real values only inside `book_appointment`, masking in the trace collector | mostly: the 3% recall gap leaks to a processor under DPA | yes | yes: Presidio plus exact data match on the patient table |
 | Self-host a model in the VPC | Raw text never leaves; traces still masked | yes, by location | yes, if quality holds | no: GPU operations are new to the team |
 | Raw to provider, redact traces only | Rely on the DPA | no | yes | yes |

@@ -5,7 +5,7 @@ name: Pydantic AI (typed agents, dependencies, structured results)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -184,8 +184,8 @@ classes: in 2.60.0 a `ModelRetry` reaches the model as a `ToolReturnPart`, while
 `RetryPromptPart`.
 
 ### Failure scenarios
-- **Inject a check on arguments only:** compare `order_id` against a prefix instead of
-  `ctx.deps.customer_id`. The leak test fails. Print every `ToolReturnPart` the model saw; any
+- **Inject a check on arguments only:** check that `order_id` exists in `ctx.deps.orders` but not
+  that its `customer_id` matches `ctx.deps.customer_id`. The leak test fails. Print every `ToolReturnPart` the model saw; any
   `customer_id` other than the caller's is the bug.
 - **Inject a vague retry message:** raise `ModelRetry("invalid")`. A real model now retries blindly
   and hits `UnexpectedModelBehavior` more often. Count retries per run in traces and make each message

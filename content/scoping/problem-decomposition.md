@@ -5,7 +5,7 @@ name: Problem decomposition
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -50,12 +50,13 @@ labelled emails.
 | Option | How it works | Automated-correct | Silent errors | Escalated per day | Fits risk and capacity |
 |---|---|---|---|---|---|
 | A. One agent, generic tools | `read_email`, `sql`, `send_email`; about 10 model-decided steps at 95% | 0.95¹⁰ ≈ 60% | About 40% | 0 | No: far above 7% |
-| B. Decomposed pipeline, no checks | Five nodes as above, model-drafted acknowledgement | 82.1% | 17.9% | 0 | No: silent errors 2.5 times the limit |
+| B. Decomposed pipeline, no checks | Five nodes as above, model-drafted acknowledgement | 82.1% | 17.9% | 0 | No: silent errors about 2.6 times the limit |
 | C. Decomposed agent with guards | Node-shaped tools, extraction validator catching 80%, intent threshold catching 50%, template acknowledgement | 83.8% | 6.3% | 98 | Yes: under 7% and under 150 |
 | D. Human reviews every record | Model drafts, staff approve all | n/a | Lowest | 1,000 | No: 6.7 times capacity |
 
 - **C's arithmetic:** correct = 0.96 × 0.90 × 0.99 × 0.99 × 0.99 ≈ 83.8%. Escalated = 1 − (1 − 0.04 ×
-  0.5)(1 − 0.10 × 0.8)(0.99)³ ≈ 9.8%, so 98 emails a day. Silent errors are the remaining 6.3%.
+  0.5)(1 − 0.10 × 0.8) = 1 − 0.98 × 0.92 ≈ 9.8%, so 98 emails a day. Silent errors are the remaining
+  1 − 0.838 − 0.098 ≈ 6.3%.
 
 ### Decision
 Choose **C**, the decomposed agent with a validator after extraction, a confidence threshold on intent and
@@ -72,8 +73,9 @@ a template acknowledgement.
 **What would change it:**
 - **The silent-error limit drops to 3%:** C fails; add a second extraction check or review low-confidence
   extractions, and re-check queue capacity.
-- **Intake staff cut to one person (about 50 a day):** C's 98 escalations overflow; lower the intent catch
-  fraction only if silent errors stay under 7%.
+- **Intake staff cut to one person (about 50 a day):** C's 98 escalations overflow, and loosening a check
+  cannot fix it: dropping the intent threshold saves only 20 a day (80 left) and pushes silent errors to
+  about 8.2%; raise extraction accuracy or add reviewer capacity instead.
 - **Email types become open-ended** (new products, multi-claim threads): let the agent plan over the same
   typed tools rather than a fixed order.
 

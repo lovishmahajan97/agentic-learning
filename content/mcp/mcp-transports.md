@@ -5,7 +5,7 @@ name: MCP transports (stdio, Streamable HTTP, legacy SSE)
 kind: decision
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -65,7 +65,7 @@ illustrative planning numbers, not benchmarks.
 
 ### Decision
 Choose **C**, the only option that passes every hard constraint. Tokens and ticket data stay in the EU
-region behind the gateway. Stateless requests suit the round-robin load balancer.
+region; stateless requests suit the round-robin load balancer.
 
 Capacity: 3 replicas at about 20 calls per second give about 60; with one out during a deploy, 2 give
 about 40, above the 30 peak. Python SDK 1.x in stateless mode still serves the 2025-06-18 vendor host.
@@ -75,10 +75,11 @@ no request stays open near the 60-second proxy limit; polling every 10 seconds c
 A fails on laptop tokens alone; B needs sticky routing or a shared session store.
 
 **What would change it:**
-- Per-user OAuth tokens allowed on laptops make a stdio build for IDE agents attractive.
+- Per-user helpdesk API tokens allowed on laptops (C keeps only short-lived SSO tokens there) make a
+  stdio build for IDE agents attractive.
 - A tool that truly needs mid-call elicitation brings back B with a shared session store, or an SDK on
   2026-07-28, where elicitation arrives as an `input_required` result.
-- The vendor host's share reaching zero lets you drop the handshake-era path.
+- Zero vendor-host traffic lets you drop the handshake-era path.
 
 ### Trade-offs accepted
 - **No server-initiated requests.** Stateless mode cannot send `elicitation/create` mid-call, so write

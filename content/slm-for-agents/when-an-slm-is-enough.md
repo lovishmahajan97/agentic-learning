@@ -5,7 +5,7 @@ name: When an SLM is enough (task fit, cost, latency, privacy)
 kind: decision
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 mastery: evaluate
@@ -50,11 +50,13 @@ An insurer's claims-intake agent handles about 4,000 claims a day. Each claim ma
 intent router, 2 field extractions, 2 `create_claim` argument fills, 1 damage summary and 1 coverage
 reasoning step. All prices and latencies are illustrative planning figures, not vendor quotes.
 - **Budget:** model spend under $250 a day.
-- **Latency:** the acknowledgement path (router, then extraction) must finish under 2 s at p95.
+- **Latency:** the acknowledgement path (router, then the two extractions in parallel) must finish under
+  2.5 s at p95.
 - **Privacy:** claim text may go to an in-region hosted provider under the existing data agreement.
 - **Prices:** a large hosted call costs about $0.01, a small hosted call about $0.001, and one
   self-hosted GPU server about $48 a day ($2 an hour).
-- **Latency per short call:** about 1.2 s large, 0.4 s small, at p95.
+- **Latency per short call:** about 1.5 s large, 0.4 s small, at p95. An escalated call pays both: the
+  small attempt fails validation, then the large call runs.
 - **Golden-set results (small vs large):** router 97% vs 98%, extraction 98% vs 99%, argument fill 94% vs
   97%, summary 90% vs 96%, coverage reasoning 71% vs 93%. The team's tolerance is 3 points.
 - **Team:** two backend engineers, no one on GPU on-call.
@@ -65,18 +67,20 @@ Escalation rates from a shadow run: router 2%, extraction 3%, argument fill 8%. 
 
 | Option | How it works | Spend per day | Acknowledgement p95 | Quality |
 |---|---|---|---|---|
-| All large, hosted | Every call to the frontier model | 28,000 x $0.01 = $280, over budget | 2 x 1.2 = 2.4 s, fails | Best |
-| All small, self-hosted | Every call to one GPU server | about $48 | 0.8 s | Fails: coverage reasoning 22 points behind |
-| Per step, self-hosted small | 5 calls small on own GPU, 2 large, validator escalates | $48 + (8,000 + 960) x $0.01 = $137.60 | 0.8 s | Within 3 points on routed steps |
-| Per step, hosted small | Same split, small model behind an in-region API | 20,000 x $0.001 + 8,960 x $0.01 = $109.60 | 0.8 s | Same as above |
+| All large, hosted | Every call to the frontier model | 28,000 x $0.01 = $280, over budget | 2 x 1.5 = 3.0 s, fails | Best |
+| All small, self-hosted | Every call to one GPU server | about $48 | 2 x 0.4 = 0.8 s | Fails: coverage reasoning 22 points behind |
+| Per step, self-hosted small | 5 calls small on own GPU, 2 large, validator escalates | $48 + (8,000 + 960) x $0.01 = $137.60 | 0.8 s; 2.3 s when one call escalates | Within 3 points on routed steps |
+| Per step, hosted small | Same split, small model behind an in-region API | 20,000 x $0.001 + 8,960 x $0.01 = $109.60 | 0.8 s; 2.3 s when one call escalates | Same as above |
 
 ### Decision
 **Per step, with a hosted small model.** Router, extraction and argument fill pass within the 3-point
 tolerance and have validators, so they go small; the summary (6 points behind) and coverage reasoning (22
 points behind) stay large.
 
-This meets the $250 budget with margin, cuts the acknowledgement path to about
-0.8 s, and saves about 61% against all-large ($280 to $109.60).
+This meets the $250 budget with margin and saves about 61% against all-large ($280 to $109.60).
+
+The acknowledgement path takes about 0.8 s; about 8% of claims escalate one acknowledgement call
+(1 - 0.98 x 0.97 x 0.97), so p95 sits on the escalated path, 0.4 + 0.4 + 1.5 = 2.3 s, still under 2.5 s.
 
 Hosting the small model ourselves costs $28 a day more and adds GPU on-call that a two-person team
 cannot staff. Privacy does not force self-hosting here, because the data agreement covers in-region text.
@@ -100,7 +104,8 @@ self-hosted option at any volume, with the large steps moved to the largest mode
   tolerance; no step moves on benchmark scores.
 - **Cost includes escalation and fixed cost:** escalated calls are counted twice, and self-hosting is priced
   as server time, not tokens.
-- **Constraints checked one by one:** budget, latency path and privacy each get a pass or fail per option.
+- **Constraints checked one by one:** budget, latency path (including escalated calls) and privacy each
+  get a pass or fail per option.
 - **Break-even named:** the write-up states the volume or rule at which another option wins.
 - **Fallback and monitoring designed:** validators, escalation alerts and a drift sample are specified.
 

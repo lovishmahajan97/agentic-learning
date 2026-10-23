@@ -5,7 +5,7 @@ name: Technical due diligence
 kind: practice
 difficulty: advanced
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: background
 related:
@@ -55,11 +55,11 @@ invoices" and "60% gross margin". All figures are illustrative.
 - **Constraints:** the board wants signing this quarter; the security policy is not negotiable.
 
 ### Options
-| Option | How it works | Thesis floor | Margin gap | Payee-change red line |
-|---|---|---|---|---|
-| Walk away | Build in-house instead | Not used | Avoided | Avoided |
-| Sign at headline terms, fix after close | Price on 85% and 60%; budget remediation later | Cleared | Paid at full price | Breached from day one of ownership |
-| Condition, adjust and earn-out | Pre-close condition to remove payee rights; price on 51% margin; earn-out on touchless rate | Cleared, with the gap priced | Priced in | Fixed before close |
+| Option | How it works | Thesis floor | Margin gap | Payee-change red line | Signs this quarter |
+|---|---|---|---|---|---|
+| Walk away | Build in-house instead (about 18 months) | Not used | Avoided | Avoided | Nothing to sign |
+| Sign now with a price cut, fix after close | Price on the 51% margin, hold back part of the price until the scope fix ships in the first weeks after close | Cleared | Priced in | Breached from day one of ownership until the fix ships | Yes |
+| Condition, adjust and earn-out | Pre-close condition to remove payee rights; price on 51% margin; earn-out on touchless rate | Cleared, with the gap priced | Priced in | Fixed before close | Likely, if the fix lands in weeks |
 
 ### Decision
 **Condition, adjust and earn-out.** The measured 76% has a lower bound of 71.8%, above the 70% floor, so
@@ -71,8 +71,8 @@ the thesis holds; walking away would trade a working product for 18 months of bu
   end state checked, so the startup is paid for closing the gap it claimed.
 
 **What would change it.**
-- **The lower bound falls below 70%,** for example if a re-run on more invoices lands near 72% (lower bound
-  about 67.6% at 400): renegotiate as a partnership or walk away.
+- **The lower bound falls below 70%,** for example if a re-run lands near 72% (lower bound about 67.6% on
+  400 invoices, 68.9% on 800): renegotiate as a partnership or walk away.
 - **The startup refuses the scope fix before signing:** walk away, since the red line would be breached
   from the first day of ownership.
 - **Pricing passes inference through to customers:** the margin adjustment shrinks.

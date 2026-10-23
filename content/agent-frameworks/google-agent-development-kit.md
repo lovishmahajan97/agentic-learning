@@ -5,7 +5,7 @@ name: Google Agent Development Kit (ADK)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -206,8 +206,9 @@ passes and stays as a regression check.
   `event.actions.state_delta` after the verify call.
 - **Guard by checking the instruction or the model's text.** Tests stay red, because `ScriptedLlm`
   ignores instructions just as a real model sometimes does. The fix belongs in code: the callback.
-- **Return a string from the callback.** ADK expects a dict or `None`; inspect the function response
-  event the model receives and confirm it carries your error dict.
+- **Return a string from the callback.** The tool is still skipped, but ADK wraps the string, so the
+  model sees `{'result': 'identity not verified'}` with no `error` key (google-adk 2.12.0). Inspect the
+  function response event and return a dict so callers can branch on `error`.
 
 ### Submission
 - **Code:** `adk_guard.py` with both `YOUR CODE` parts done; no change to `ScriptedLlm`, `turn` or the tests.

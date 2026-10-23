@@ -5,7 +5,7 @@ name: Runbooks
 kind: practice
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 mastery: implement
@@ -70,9 +70,10 @@ situations with the customer's on-call.**
 
 Provider outage, rate limits, cost runaway, tool misbehaving,
 unsafe write actions and prompt injection get game days; stale index and guardrail-block surge get a
-30-minute tabletop walk-through each and an "untested: escalate early" banner.
-- **It fits both budgets.** About 68 vendor hours plus 1 hour of tabletops is within 80, and 6
-  rehearsals fill the customer's two 3-hour sessions.
+30-minute tabletop walk-through each by the two vendor engineers (about 2 vendor hours, since the
+customer's sessions are full) and an "untested: escalate early" banner.
+- **It fits both budgets.** About 68 vendor hours plus 2 hours of tabletops is about 70, within 80, and
+  6 rehearsals fill the customer's two 3-hour sessions.
 - **Every step can be executed.** With the per-tool flag, read-only mode and tenant cap built, no
   runbook ends in a redeploy the customer cannot perform.
 - **Rehearsal follows risk.** The unsafe-write and injection runbooks protect against irreversible

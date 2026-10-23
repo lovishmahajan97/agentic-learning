@@ -5,7 +5,7 @@ name: Golden dataset strategy
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -89,7 +89,7 @@ What would change it:
 - **No capacity for two sets.** Rotate items into the holdout each version instead of sealing 100 now.
 
 ### Trade-offs accepted
-- **`search_orders` gets no new items.** Its 200 items stay at ±5.5 unpaired. Watch its share of
+- **`search_orders` gets no new items.** Its 200 items stay at ±5.5 points on a single run at p = 0.8. Watch its share of
   production failures, and re-weight next quarter if it rises.
 - **The holdout is coarse.** At 100 items and p = 0.8 its half-width is ±7.8 points, so only a large
   full-versus-holdout gap is visible. Watch the gap at each release, not on each PR.

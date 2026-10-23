@@ -5,7 +5,7 @@ name: Model Context Protocol (MCP)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 mastery: implement
@@ -151,7 +151,7 @@ t3 True server error: server process exited
 import asyncio, sys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.types import Tool
+from mcp.types import CallToolResult, TextContent, Tool
 import lab
 
 def with_session(fn):
@@ -162,9 +162,11 @@ def with_session(fn):
             return await fn(s)
     return asyncio.run(go())
 
-class Recorder:
+class Recorder:                                   # a fake session: records what reached the server
     def __init__(self): self.calls = []
-    async def call_tool(self, name, arguments=None): self.calls.append(name)
+    async def call_tool(self, name, arguments=None):
+        self.calls.append(name)
+        return CallToolResult(content=[TextContent(type="text", text="executed")], isError=False)
 
 SCHEMA = {"type": "object", "properties": {"order_id": {"type": "string"}}}
 
@@ -191,7 +193,8 @@ def test_not_allow_listed_never_reaches_server():
     rec = Recorder()
     r = asyncio.run(lab.call_as_tool_result({"orders": rec}, lab.ALLOW, "t2",
                                             "orders__export_all_customers", {}))
-    assert r["is_error"] is True and rec.calls == []
+    assert rec.calls == []
+    assert r["is_error"] is True
 
 def test_unknown_server_is_an_error_result():
     r = asyncio.run(lab.call_as_tool_result({"orders": Recorder()}, lab.ALLOW, "t5",
@@ -216,9 +219,9 @@ On the starter all six fail with `NotImplementedError`; a correct solution passe
 - **Hard-code `is_error: False`.** `test_tool_failure_is_channel_one` fails, and a model would read
   "Error executing tool..." as order data. Diagnose by counting `isError: true` from the server against
   `is_error` results sent.
-- **Check only the server prefix, not the allow-list.** `Recorder.calls` becomes
-  `['export_all_customers']`: a tool you never showed the model still executes if the model guesses or
-  is injected with its name.
+- **Check only the server prefix, not the allow-list.** `test_not_allow_listed_never_reaches_server`
+  fails with `assert ['export_all_customers'] == []`: a tool you never showed the model still executes
+  if the model guesses or is injected with its name.
 
 ### Submission
 - **`lab.py` with both YOUR CODE stubs implemented** and no other change to the server tools or `main`.

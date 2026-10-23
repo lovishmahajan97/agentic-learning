@@ -5,7 +5,7 @@ name: contract and compliance review agent (clauses, risk flags, citations)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -64,7 +64,8 @@ take over. All figures are illustrative planning numbers.
 | D. Regex rules, no model | Keyword patterns per issue | small gain | met | misses drafting variety |
 
 ### Decision
-**Option A now, with B for NDAs as a measured next step.** A frees about 60 lawyer hours a month, which
+**Option A now, with B for NDAs as a measured next step.** At the planned 40% cut, A frees about 60
+lawyer hours a month (to be confirmed against the pilot baseline), which
 the GC can put toward a same-day NDA queue, while keeping the sign-off policy intact.
 
 NDA review drops from 30 to 18

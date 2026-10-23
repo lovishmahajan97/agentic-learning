@@ -5,7 +5,7 @@ name: "Project 1: reliable RAG application"
 kind: practice
 difficulty: advanced
 est_minutes: 30
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 mastery: evaluate
@@ -57,7 +57,7 @@ refuses when the answer is absent, and proves all three with a golden set you re
 ### Scenario
 An insurer's claims-support team of 40 staff wants a policy assistant that later becomes the
 `search_docs` tool of their agent. All figures are illustrative planning numbers, not benchmarks.
-- **Corpus:** 350 policy documents, about 1.4M tokens in total, split across 3 product lines of about
+- **Corpus:** 350 policy documents, about 360k tokens in total, split across 3 product lines of about
   120k tokens each; about 10 documents change each week.
 - **Traffic:** 40 staff x 50 questions a day = 2,000 questions a day. Many questions quote clause codes
   such as `4.2.1` verbatim.

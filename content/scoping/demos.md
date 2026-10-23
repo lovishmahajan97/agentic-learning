@@ -5,7 +5,7 @@ name: Demos
 kind: practice
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -47,6 +47,7 @@ are illustrative.
   - the meeting runs over the customer's VPN, which added multi-second stalls in one rehearsal;
   - the refund tool must not touch production; it is a sandbox stub;
   - the sales lead wants five tasks shown live, picked from those that "look best";
+  - the COO has asked to see the agent run on a real ticket, not only a video or a report;
   - the meeting must end with a pilot decision and a security sign-off path.
 
 ### Options
@@ -61,6 +62,8 @@ are illustrative.
 Choose **B**, because it is the only option that meets every constraint at once.
 - **Live risk:** one live task at 0.95 with a fallback replaces a 60% chance of a visible failure under A.
 - **VPN:** two segments are recorded and labeled, so a stall costs one segment, not the meeting.
+- **Credibility:** the one live run answers the COO's request to see it work on a real ticket, which C's
+  all-recorded walkthrough and D's report cannot.
 - **Honesty:** quoting the 72% beside three examples keeps the anecdote from standing in for the evidence;
   A's curation would overstate success by about 28 points.
 - **Security:** the trace shows which tools are live and read-only, and the failed task shows the approval

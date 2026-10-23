@@ -5,7 +5,7 @@ name: Deterministic replay & reproducibility
 kind: concept
 difficulty: advanced
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 mastery: implement

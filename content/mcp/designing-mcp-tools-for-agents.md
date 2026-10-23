@@ -5,7 +5,7 @@ name: Designing MCP tools for agents (naming, schemas, errors, pagination, token
 kind: practice
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

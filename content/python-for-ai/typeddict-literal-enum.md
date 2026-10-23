@@ -5,7 +5,7 @@ name: TypedDict, Literal and Enum
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

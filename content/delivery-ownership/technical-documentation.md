@@ -5,7 +5,7 @@ name: Technical documentation
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -57,7 +57,7 @@ customer's operations team takes it over and you rotate to another account. Figu
 |---|---|---|---|---|
 | One wiki at the end | Write everything in the last week on a wiki page | 6 | likely passes | no: nothing ties it to code, it drifts from the first edit |
 | Runbooks plus a recorded walkthrough | 6 runbooks and a screen recording of the system | 2.5 | fails: no data flow or system card | runbooks only, unchecked |
-| Generate only | OpenAPI reference and a system card rendered from the registry | 1.5 | partial: what, never why | yes for reference, no runbooks at all |
+| Generate only | OpenAPI reference and a system card rendered from the registry | 1 | partial: what, never why | yes for reference, no runbooks at all |
 | Minimum set as code, drilled | Generated card and reference, overview plus ADRs, runbooks, ops guide, CI freshness check, two drills | 6 | passes | yes: CI and the PR question force updates |
 
 ### Decision

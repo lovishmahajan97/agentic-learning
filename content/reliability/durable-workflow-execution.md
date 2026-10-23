@@ -5,7 +5,7 @@ name: Durable workflow execution
 kind: pattern
 difficulty: advanced
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:

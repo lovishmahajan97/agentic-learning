@@ -5,7 +5,7 @@ name: Compliance constraints
 kind: concept
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 mastery: implement
@@ -55,7 +55,8 @@ are illustrative planning numbers, not provider SLAs.
 - **Availability target:** 99.5% a month for the agent, so 720 h x 0.005 = 3.6 hours of downtime
   allowed in a 30-day month.
 - **History:** model errors in the primary EU region totalled 4 hours in the worst month of the last
-  quarter, more than the 3.6-hour allowance if there is no fallback.
+  quarter, more than the 3.6-hour allowance if there is no fallback. The provider's other EU region
+  served normally throughout those incidents.
 - **Support:** your on-call rota includes US engineers, who today can open full-content traces.
 - **Quality:** a second provider's model has not been run on your 150-case tool-calling eval set.
 - **Deadline:** the insurer's audit is in 6 weeks.
@@ -74,6 +75,9 @@ degraded mode for when both fail.**
 - **It satisfies the hard constraint.** The gateway policy denies every region outside the two EU ones,
   so a future fallback cannot reintroduce the US by a code change alone, and refusal logs become audit
   evidence.
+- **Find out whether the US route already fired.** Search gateway logs since the release for requests
+  served in a US region. Any hit is processing outside the EU, so report it to the insurer as the
+  contract requires before the audit, rather than letting the audit find it.
 - **It covers the measured risk.** The 4-hour month was a single-region problem, which a second EU
   region absorbs.
 - **No new subprocessor before the audit.** Adding a second provider needs the insurer's approval and

@@ -5,7 +5,7 @@ name: Experiment tracking (MLflow, W&B)
 kind: tool
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -50,7 +50,7 @@ notebooks and Slack.
 Facts and constraints, with illustrative figures:
 - **Data residency.** Traces and eval outputs can contain patient data, so they must stay in the VPC.
   Training nodes have no internet egress.
-- **Budget.** No new per-seat SaaS contract this fiscal year.
+- **Budget.** No new paid software contract this fiscal year, SaaS or self-hosted licence.
 - **Operations.** One platform engineer, part-time, runs shared tooling.
 - **Audit.** Every promoted fine-tune must link to its run, training-set hash, base revision and eval
   evidence.

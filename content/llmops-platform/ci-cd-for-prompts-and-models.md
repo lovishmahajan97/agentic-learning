@@ -5,7 +5,7 @@ name: CI/CD for prompts and models
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -48,7 +48,8 @@ from the registry UI and refund answers broke overnight with a green code pipeli
 
 The workload, with illustrative figures:
 - **About 15 PRs a week touch the bundle,** and each triggers about 2 eval runs (initial push plus a fix).
-- **About 10 prompt edits a week** come from the PMs.
+- **About 5 prompt edits a week** come from the PMs. Each changes the system prompt or a tool
+  description, which is part of every rendered request.
 - **The golden set has 600 tasks.** Each task makes about 6 agent model calls plus 1 judge call, so a full
   run is 600 × 7 = 4,200 calls. At an illustrative $0.01 per call that is $42 a run.
 - **Throughput.** At an illustrative 3 seconds per call and 10 concurrent calls, a full run takes
@@ -66,26 +67,30 @@ Constraints:
 | **A. Full eval on every PR, prompts in repo** | 600 tasks per run, no cache | 30 runs × $42 × 4 = $5,040 | about 21 min | Blocked behind engineer PRs | Yes |
 | **B. Cached smoke per PR, full on release candidates, prompts in repo** | 100-task smoke via the content-addressed cache; full run on 2 candidates a week | $252 + $336 = $588 | 3.5 min cold, about 1 min warm | Blocked | Yes |
 | **C. Registry with UI label moves** | Smoke on code PRs; PMs move `production` themselves | $588 or less | Same as B | Full | No: this is the incident path |
-| **D. Hybrid: registry plus pipeline-only labels** | B, plus a registry webhook runs the same smoke per prompt edit; only the CI account moves `production` | $588 + $84 = $672 | Same as B | Full, gated | Yes |
+| **D. Hybrid: registry plus pipeline-only labels** | B, plus a registry webhook runs the same smoke per prompt edit; only the CI account moves `production` | $588 + $140 = $728 | Same as B | Full, gated | Yes |
 
 How the B and D figures come out:
 - **Smoke run.** 100 tasks × 7 calls = 700 calls, $7 cold and 700 × 3 / 10 = 210 seconds.
 - **Warm cache.** A typical PR changes the requests of about 30 tasks: 30 × 7 = 210 calls, $2.10.
   30 runs × $2.10 × 4 weeks = $252.
-- **Release candidates.** 2 full runs × $42 × 4 weeks = $336 (counted cold to stay conservative).
-- **PM edits in D.** 10 webhook smokes × $2.10 × 4 weeks = $84.
+- **Release candidates.** 2 full runs × $42 × 4 weeks = $336 (counted cold).
+- **PM edits in D run cold.** A system prompt or tool description edit changes every rendered request,
+  so the cache misses on all 100 tasks: 5 webhook smokes × $7 × 4 weeks = $140.
 
 ### Decision
 Choose **D**:
 - **It is the only option that meets all four constraints.** A breaks the budget about six times over
   and the 10-minute limit twice over. B blocks the PMs. C is the deploy path that caused the incident.
 - **The cache does the cost work.** Keying on model, params and the rendered request is what turns $7 smoke
-  runs into $2.10 ones, and a model snapshot bump still pays the full price, as it should.
+  runs into $2.10 ones for a typical code PR. A model snapshot bump or a system prompt edit changes every
+  request and still pays the full price, as it should.
 - **The label permission does the safety work.** PMs keep their editor; the pipeline alone moves
   `production`, after the smoke and the next release-candidate full eval pass.
 
 What would change it:
-- **No PM edits.** If every prompt change came through engineers, B is simpler and costs $84 less.
+- **No PM edits.** If every prompt change came through engineers, B is simpler and costs $140 less.
+- **More PM edits.** At 8 a week (8 × $7 × 4 = $224, total $812) D breaks the budget; batch edits
+  into one smoke per working day.
 - **Smoke misses.** If release-candidate evals keep catching regressions the smoke passed, grow the
   smoke set to 200 tasks ($14 cold) before adding stages.
 - **More concurrency.** At 30 concurrent calls a full run drops to 7 minutes. A would then fit the time

@@ -5,7 +5,7 @@ name: AI roadmap
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -62,9 +62,10 @@ figures are illustrative planning numbers, not benchmarks.
 | Sequenced with gates | Q1: shared foundations + triage (38 ew, including the dispute feasibility eval); Q2: approval UI, credit API and dispute agent in act-with-approval mode (44 ew); summaries parked | 38 + 44 = 82 | Yes: triage live in Q1 | Credits always approved by a human |
 
 ### Decision
-**Sequenced with gates.** It is the only option that fits 104 ew with headroom (22 ew), ships an agent
-before month 6 whatever the dispute eval says, and leaves the gateway, harness and tool layer the dispute
-agent reuses.
+**Sequenced with gates.** Flagship first also fits the 104 ew, but it bets the month-6 deadline on one
+unproven agent. Sequenced is the only option that fits (with 22 ew of headroom) and also ships an agent
+before month 6 whatever the dispute eval says, while building the gateway, harness and tool layer the
+dispute agent then reuses.
 
 The higher-value dispute agent goes second because two of its blockers, low evaluability and
 a missing credit API, are exactly what the feasibility eval and Q2 work are meant to resolve.

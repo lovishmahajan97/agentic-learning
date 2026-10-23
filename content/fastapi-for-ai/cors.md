@@ -5,7 +5,7 @@ name: CORS
 kind: concept
 difficulty: intro
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:

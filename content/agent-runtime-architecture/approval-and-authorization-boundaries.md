@@ -5,7 +5,7 @@ name: Approval & authorization boundaries
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -90,8 +90,9 @@ the compliance rule and the reviewer budget together.
   time-to-confirm per rep.
 - **Fresh approval on any change.** Exact fingerprints mean a corrected amount re-asks; we accept the
   extra prompts and count them.
-- **Expired requests.** About 5% of finance approvals may exceed 3 hours; we track expiries as a share of
-  requests and the refunds that missed the promise.
+- **Expired requests.** About 5% of finance approvals wait past 3 hours, and the slowest of those pass
+  the 4-hour TTL and expire; we track expiries as a share of requests and the refunds that missed the
+  promise.
 
 ### Review rubric
 - **Authorization and approval kept separate:** the write-up says who may refund at all before deciding

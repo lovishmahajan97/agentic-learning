@@ -5,7 +5,7 @@ name: "Project 2: tool-using agent with guardrails"
 kind: practice
 difficulty: advanced
 est_minutes: 30
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 mastery: evaluate
@@ -71,7 +71,7 @@ which refunds wait for a human (M3). All figures are illustrative planning numbe
 |---|---|---|---|---|---|
 | Approve everything | Every refund waits for a supervisor | 3,000 | about $0 | about $0 | No: 3,000 is above 1,920, so the backlog grows by 1,080 a day |
 | Fully autonomous | Agent refunds anything that passes validation | 0 | 15 x $47 = about $705 | about $1,270 | No: over $500 even at the measured rate |
-| Auto under $50 | Under $50 runs on its own; the rest wait | 600 | 12 x $22 = $264 | 21.6 x $22 = about $475 | Yes, with margin at both rates |
+| Auto under $50 | Under $50 runs on its own; the rest wait | 600 | 12 x $22 = $264 | 21.6 x $22 = about $475 | Yes at both rates, though only $25 under the limit at 0.9% |
 | Auto under $200 | Under $200 runs on its own; the rest wait | 150 | 14.25 x about $33.5 = about $478 | about $860 | Only at the measured rate, with no margin |
 
 ### Decision
@@ -83,8 +83,9 @@ which matters because 10 errors is a small sample.
 - **The audit measures the error rate** the threshold depends on, so the next decision is made on data.
 
 **What would change it.**
-- **A lower measured rate:** if four weeks of audits show 0.3% or less, raise the line to $200, where
-  exposure is 2,850 x 0.003 x $33.5 = about $287 a day.
+- **A lower measured rate:** if four weeks of audits put the upper end of the 95% interval at 0.4% or
+  less, raise the line to $200, where even that pessimistic rate gives 2,850 x 0.004 x $33.5 = about
+  $382 a day. Judge the move on the pessimistic rate, as this decision was.
 - **Errors concentrated in one reason code:** block that code from auto-approval rather than lowering the
   dollar line for everyone.
 

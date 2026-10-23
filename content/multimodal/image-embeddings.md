@@ -5,7 +5,7 @@ name: Image embeddings
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -154,9 +154,10 @@ flowchart TD
 - **"Upgrading the encoder improves the existing index."** Vectors from two checkpoints, or two
   preprocessing versions, are not comparable; mixing them degrades retrieval with no error raised. An
   upgrade is a full re-embed into a new index and an alias swap.
-- **"A good semantic encoder is a good duplicate detector."** It scores two different photos of a similar
-  scene above a cropped copy of the same image. Near-duplicate detection needs a perceptual hash or a
-  copy-detection encoder with its own threshold.
+- **"A good semantic encoder is a good duplicate detector."** It can score two different photos of the
+  same scene or product as high as a cropped copy of one image, so no single threshold separates copies
+  from look-alikes. Near-duplicate detection needs a perceptual hash or a copy-detection encoder with its
+  own threshold.
 - **"Embeddings are anonymised, so the index is not sensitive."** Vectors can be matched back to images
   and partly inverted, so they need the same access control, retention and deletion as the originals.
 - **"When the agent answers wrongly, the LLM is to blame."** Retrieval recall caps the agent: an image

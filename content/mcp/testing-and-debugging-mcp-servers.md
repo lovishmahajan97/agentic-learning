@@ -5,7 +5,7 @@ name: testing and debugging MCP servers (MCP Inspector, contract tests)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -158,14 +158,15 @@ async def test_known_ticket_and_search_still_work():
 ```
 
 ### Failure scenarios
-- **Drop `flush=True` from the stray `print()`.** Under a pipe the text sits in a buffer, so stdout can
-  look clean while the bug remains; only the stderr assertion still fails. Debug with
+- **Drop `flush=True` from the stray `print()`.** Under a pipe the text sits in a buffer, and where it
+  lands depends on the SDK: with `mcp` 1.30 it is lost, stdout looks clean and only the stderr assertion
+  fails; with 2.3 it surfaces at exit, after the JSON-RPC reply, so the stdout check fails. Debug with
   `python -u tickets_server.py`, which shows the stray line at once. The fix is stderr, not buffering luck.
 - **Leave the `print()` on stdout and watch a session test.** With `mcp` 1.30 and 2.3 the client skips the
   bad line and carries on, so only the raw-stdout test catches it; stricter hosts hang or mark the server
   failed. That is why the suite checks stdout directly instead of trusting one client.
 - **Return `{"error": ...}` instead of raising `ToolError`.** The result has `isError` false, so the model
-  treats a failure as data. The actionable-error test fails on `r.isError is True`; inspect the raw
+  treats a failure as data. The actionable-error test fails on `r["isError"] is True`; inspect the raw
   result with the Inspector CLI.
 - **Rename the parameter back but keep no docstring.** Required params pass, the description check fails
   with `search_tickets needs a description`: the model would see a tool with no explanation.

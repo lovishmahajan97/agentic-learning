@@ -5,7 +5,7 @@ name: Operational ownership & support boundaries
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -45,8 +45,9 @@ illustrative.
 - **Hypercare evidence:** 60 tickets in 8 weeks: 25 tool API faults (42%), 15 agent behaviour such as
   wrong tool or bad answer (25%), 12 how-to or known issues (20%), 8 permissions or source-data issues
   (13%).
-- **Team:** the agent team has 4 engineers; identity, procurement and the ITSM team each already run an
-  on-call rotation for their APIs.
+- **Team:** the agent team has 4 engineers on a business-hours rotation; identity runs a 24x7 on-call
+  for its API, procurement and the ITSM team run business-hours rotations, and the tier 1 service desk
+  is staffed 24x7.
 - **Security constraint:** the agent team may not hold write access to identity or procurement systems.
 - **Coverage:** password resets are needed 24x7; the rest is business hours.
 
@@ -54,19 +55,20 @@ illustrative.
 | Option | How it works | Who can act on each ticket | Load on the agent team |
 |---|---|---|---|
 | Agent team owns everything | One pager for the agent and every tool behind it | 33 of 60 (55%) need access the team lacks, so it can only forward them | All 60, about 7.5 a week |
-| Central operations team first line | Ops is paged for all runtime issues; agent team is tier 3 in business hours | Ops can act on infrastructure, not on prompts, evals or tool APIs | Lower, but agent-behaviour fixes wait for business hours |
+| Central operations team first line | Ops is paged for all runtime issues; agent team is tier 3 in business hours | Ops can act on infrastructure, not on prompts, evals or tool APIs | Lower, but ops can close only the 12 known issues (20%); 48 of 60 (80%) need a second hop |
 | FDE stays first line | Keep the direct messages | Only while the FDE is here | Hidden; breaks at the 4-week exit |
 | One Accountable per layer | Tier 1 resolves known issues from runbooks; tool faults page the tool owner; agent team owns task success, wrappers, evals and detection; security owns permissions | Each ticket lands with a team that has pager, access and authority | Agent-behaviour tickets only, about 15 / 8 ≈ 1.9 a week |
 
 ### Decision
 **One Accountable per layer, enforced by the RACI validator before hypercare exit.** It is the only
 option where every owner has pager, access and authority together.
-- **Why not the agent team owning everything:** the security constraint means 55% of tickets would page
-  people who can only open tickets elsewhere.
-- **Why not a central operations team:** a quarter of tickets are agent behaviour, which only prompt and
-  eval owners can fix, so routing them through ops adds a hop and a business-hours wait.
-- **Coverage fits:** password-reset faults page identity's existing 24x7 rotation, and the agent team's
-  business-hours rotation covers task success.
+- **Why not the agent team owning everything:** the security constraint and the tool teams' ownership
+  of their APIs mean 55% of tickets would page people who can only open tickets elsewhere.
+- **Why not a central operations team:** tool faults, agent behaviour and permissions are 48 of 60
+  tickets, and ops can change none of them, so 80% of tickets take an extra hop before anyone can act.
+- **Coverage fits:** password-reset tool faults page identity's 24x7 rotation, and the agent team's
+  business-hours rotation covers task success. At night, tier 1 switches resets that the agent gets
+  wrong to the manual identity runbook until the agent team picks them up.
 - **Crossing points:** tickets carry run ID, step and tool name, so tier 1 or the agent on-call can
   route a tool fault in minutes.
 
@@ -76,6 +78,8 @@ team. If several agents come to share one runtime, a platform team should own th
 ### Trade-offs accepted
 - **More hand-offs between teams.** Track tickets bounced between parties and time to route an issue to
   its owner.
+- **Agent-behaviour faults at night wait for morning.** Resets fall back to the manual runbook; track
+  overnight resets handled manually and promote the agent team to 24x7 if they grow.
 - **Tool teams do not see agent-only failures,** such as an empty list with HTTP 200. The agent team owns
   contract tests and an empty-result alert for each tool.
 - **Tool owners may deprioritise agent issues.** Each tool's catalog entry states a response target by

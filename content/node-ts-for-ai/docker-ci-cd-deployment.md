@@ -5,7 +5,7 @@ name: Docker / CI/CD deployment
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -112,7 +112,8 @@ the process at once: curl prints `step 1` and nothing more.
 
 ### Expected output
 With a correct handler, `node server.ts`, then `curl -sN localhost:8787/run` and `kill -TERM <pid>` about
-0.3 s in, print (server and curl output interleaved):
+0.3 s in, print (server and curl output interleaved; `closing listener` lands `PRESTOP_MS` after the
+`SIGTERM` line, so it may swap places with a neighbouring `step` line):
 ```
 listening on 8787
 step 1

@@ -5,7 +5,7 @@ name: Prompt injection (direct, indirect)
 kind: concept
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: evaluate
@@ -171,8 +171,8 @@ flowchart TD
 - **"Delimiters plus a rule not to follow instructions in the data fix it."** The rule is itself text in
   the same stream, and a payload can name and dismiss the delimiters. There is no second channel like a
   prepared statement, so spotlighting lowers the success rate but is not a boundary.
-- **"A detector with 99% recall makes us safe."** An adaptive attacker retries offline: at 1% slip per
-  paraphrase, 100 tries get through about 63% of the time. A recipient allowlist in the executor holds at
+- **"A detector with 99% recall makes us safe."** An adaptive attacker keeps paraphrasing: if each try
+  independently slips past 1% of the time, 100 tries get through about 63% of the time. A recipient allowlist in the executor holds at
   every try because it never reads the words.
 - **"An agent with no send tool cannot leak data."** A markdown image in the answer makes the client
   perform a GET with the data encoded in the URL. Scrubbing output URLs to an allowlist is an injection

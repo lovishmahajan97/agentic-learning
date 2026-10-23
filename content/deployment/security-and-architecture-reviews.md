@@ -5,7 +5,7 @@ name: Security & architecture reviews
 kind: practice
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 mastery: evaluate

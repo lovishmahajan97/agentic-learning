@@ -5,7 +5,7 @@ name: Exec communication
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -78,8 +78,10 @@ day one and gives the CIO the saving she wants on a date she can plan for, inste
 **What would change it.**
 - **Any wrong reset during the gate:** the zero-failure bound no longer applies. Recompute with the
   observed rate and keep review on until the projection fits.
-- **A lower catch rate:** at 90% catch, installs alone send 10,000 x 0.02 x 0.1 = 20 a month to staff, so
-  the gate needs a tighter reset bound or better install checks first.
+- **A lower catch rate:** at 90% catch, installs send 10,000 x 0.02 x 0.1 = 20 a month to staff and
+  reviewed resets up to 15,000 x 0.01 x 0.1 = 15, so 35 breaks the tolerance even before the gate. Better
+  install checks come first; with installs still at 20, the gate would need resets bounded at 5, that is
+  n of at least 3 x 15,000 / 5 = 9,000 failure-free cases.
 
 ### Trade-offs accepted
 - **The saving arrives a week later than the CIO asked.** Report gate progress (failure-free resets so

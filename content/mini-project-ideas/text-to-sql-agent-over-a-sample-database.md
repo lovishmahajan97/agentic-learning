@@ -5,7 +5,7 @@ name: Text-to-SQL agent over a sample database
 kind: practice
 difficulty: core
 est_minutes: 20
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -218,8 +218,11 @@ def test_eval_uses_execution_match(db):
     assert m.evaluate(db, m.GOLDEN) == {"accuracy": 0.667, "median_tool_calls": 3}
 ```
 
-Three of the four fail on the starter, one per bug. The step-cap test already passes: it is a guard, so
-your loop changes cannot remove the cap that bounds cost on a question the agent cannot answer.
+Three of the four fail on the starter. The self-correction test needs two fixes, not one: with the
+observation passed back but raw errors, the model retries the same query blindly until the cap.
+
+The step-cap test already passes: it is a guard, so your loop changes cannot remove the cap that bounds cost
+on a question the agent cannot answer.
 
 ### Failure scenarios
 - **Return the raw database error.** Traces show the same `run_sql` call repeated until the cap. Debug by

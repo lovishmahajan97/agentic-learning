@@ -6,7 +6,7 @@ kind: practice
 difficulty: advanced
 est_minutes: 40
 agent_relevance: core
-status: typed
+status: typed-verified
 lesson_type: decision
 related:
   - enterprise-integration/sso-iam-integration
@@ -48,7 +48,7 @@ invoices, an HR system and an IT ticketing tool. The team must choose how tools 
 Effort figures are illustrative team estimates, not benchmarks.
 - **Security review rule:** downstream access must follow the signed-in user's own permissions, and any
   exception must be documented and narrowly scoped.
-- **Revocation:** under 15 minutes from IdP group removal to lost tool access (the target above). Group
+- **Revocation:** under 15 minutes from IdP group removal to lost tool access (the target in the evals table below). Group
   sync every 5 minutes plus 5-minute access tokens gives a worst case of 10 minutes.
 - **What each system supports:** the ERP accepts tokens issued through IdP token exchange (RFC 8693); the
   HR system supports per-user OAuth consent; the ticketing tool accepts only API keys.

@@ -5,7 +5,7 @@ name: Model cards
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -50,7 +50,9 @@ All figures are illustrative.
 - **Constraints:**
   - the governance team has 2 reviewers with 6 hours a week each for card review, 12 hours in all;
   - a full nine-section review takes about 3 hours, a half-page card about 0.5 hours;
-  - the 4 high-risk agents need EU AI Act technical documentation tied to the deployed version;
+  - the 4 high-risk agents need documentation tied to the deployed version: the 2 credit agents because
+    creditworthiness is an EU AI Act Annex III area (fraud detection is carved out of it), the other 2
+    because internal policy holds the whole high tier to the same standard;
   - 2 platform engineers and 10 weeks until the audit;
   - no version may ship with a tool its card does not declare.
 - **Trigger rate:** a review of last quarter's changes shows about 25% touched tools, intended use or the

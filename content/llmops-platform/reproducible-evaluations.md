@@ -5,7 +5,7 @@ name: Reproducible evaluations
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -63,7 +63,7 @@ Facts and constraints, with illustrative figures:
 | Option | How it works | Runs a month | Resolves 7 points? | Re-derivable? |
 |---|---|---|---|---|
 | **A. Single run vs last month's baseline** | Temperature 0, live tools, cached, baseline from a month ago | 200 | No: two systems a month apart, at a temperature production does not use | No: live tools and an old baseline |
-| **B. Fresh paired single runs** | Champion and candidate re-run now on identical tasks, replayed tools, production temperature | 400 + 200 sentinel = 600 | Barely: ±6.9, and no measured floor | Yes, with a manifest |
+| **B. Fresh paired single runs** | Champion and candidate re-run now on identical tasks, replayed tools, production temperature, and the same weekly sentinel as C | 400 + 200 sentinel = 600 | Barely: ±6.9, and no measured floor | Partly: tools are replayed, but the live clock and shared memory still leak in |
 | **C. Paired, 3 repeats, frozen world, sentinel** | B plus 3 repeats per task, fixed clock, fresh memory per task, a complete manifest, and a weekly cache-off sentinel on 50 tasks | 1,200 + 200 = 1,400 | Yes: averaging repeats per task makes the interval no wider than B's and usually narrower; the bootstrap computes it from the runs | Yes |
 | **D. Bit-exact on self-hosted weights** | Deterministic kernels on an open-weight model | Varies | Measures a model that is not shipped | Yes, for the wrong system |
 
@@ -90,7 +90,8 @@ What would change it:
   cannot see it.
 
 ### Trade-offs accepted
-- **Three times the cost of B.** Watch the per-metric noise floor; when it narrows, cut repeats.
+- **Three times B's comparison runs** (1,200 against 400; 1,400 against 600 with the sentinel). Watch
+  the per-metric noise floor; when it narrows, cut repeats.
 - **Replay freezes the web.** Watch replay misses per run, which mean the agent asked something new.
 - **Re-baselining on every deprecation.** Watch days left on the pinned snapshot.
 - **The sentinel cannot use the cache,** so it is the one run that stays expensive. Watch sentinel drift

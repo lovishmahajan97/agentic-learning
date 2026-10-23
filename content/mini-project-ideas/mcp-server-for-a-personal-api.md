@@ -5,7 +5,7 @@ name: MCP server for a personal API (calendar, GitHub or files)
 kind: practice
 difficulty: core
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -208,11 +208,12 @@ def test_create_issue_posts_title_and_body():
 ```
 
 ### Failure scenarios
-- **Return the raw issue dicts.** The trim test fails on the extra `body` and `pull_request` keys. With a
-  real host the 3,000-character bodies fill context; compare `len(res.content[0].text)` before and after.
+- **Return the raw issue dicts.** The trim test fails first on `[12, 11, 9] == [12, 9]` (the pull request
+  is still listed); drop PRs but keep raw dicts and it fails on the extra `body`, `html_url` and label
+  objects. With a real host the 3,000-character bodies fill context; compare `len(res.content[0].text)`.
 - **Raise one generic error for every status** (for example `RuntimeError(r.status_code)`). The model sees
-  a bare number with no hint what to do. The 401 test fails on the message; read `res.content[0].text`
-  exactly as the host shows it to the model.
+  a bare number with no hint what to do. All four error tests fail with text such as `...: 401`; read
+  `res.content[0].text` exactly as the host shows it to the model.
 - **Forget the annotations.** The listing test fails, and a host that reads the hints cannot tell the read
   tool from the write tool. Inspect `list_tools()` output in the MCP Inspector; annotations are only hints,
   so the host's own approval prompt is still the real gate.

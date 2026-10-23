@@ -5,7 +5,7 @@ name: Frameworks (LangGraph, LangChain, LlamaIndex, Pydantic AI, DSPy)
 kind: tool
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 mastery: evaluate
@@ -185,9 +185,11 @@ def test_rejection_pays_nothing_and_keeps_reason():
 ```
 
 ### Failure scenarios
-- **Compile without a checkpointer.** `start` on B2 raises `ValueError: No checkpointer set` when the
-  graph reaches `interrupt()`, because there is nowhere to save the paused state. Debug by reading the
-  error, then confirm `compile(checkpointer=...)` is set and that every call passes a `thread_id`.
+- **Compile without a checkpointer.** `invoke` on B2 does not fail at `interrupt()`: it sends the
+  email and returns, but nothing is saved, so the pause cannot be resumed. The error surfaces one line
+  later, when `start` calls `app.get_state(cfg)`: `ValueError: No checkpointer set`. Debug by reading the
+  traceback (it points at `get_state`, not the node), then confirm `compile(checkpointer=...)` is set and
+  that every call passes a `thread_id`.
 - **Resume with a different `thread_id`.** The resume starts a new run from START with no input, so
   `lookup` raises `KeyError: 'order_id'`, and B2 never pays. Debug with `app.get_state(cfg).next` for
   both ids: the parked thread still shows `('approval',)`.

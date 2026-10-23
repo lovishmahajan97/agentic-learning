@@ -5,7 +5,7 @@ name: Customer VPC / on-prem / air-gapped deployment
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 mastery: implement
@@ -75,7 +75,11 @@ bank wants it for its legal team. All figures are illustrative planning numbers,
 bundle, with the vendor control plane off by default and offered as an opt-in.**
 - **Why not SaaS:** the rule is about where processing happens, so a DPA does not answer it.
 - **Why not open-weight now:** 81% is 7 points under the bar, and the GPU quota alone takes 8 of the 12
-  weeks. Bedrock keeps a strong tool-calling model inside the bank's account.
+  weeks. Bedrock gives a strong tool-calling model that is called from the bank's account, in its EU
+  region, over the private endpoint its platform team already runs.
+- **Custody check for the managed model:** confirm in the security review that the bank counts Bedrock
+  as inside its custody boundary, since the model runs in the provider's service, not on the bank's
+  instances.
 - **Why a self-contained bundle anyway:** pinned images, an offline licence file, a hash manifest and
   the offline preflight cost a few weeks now and turn the later air-gapped tier into a model swap, not a
   rebuild. The control plane stays optional so the review is not on the critical path.

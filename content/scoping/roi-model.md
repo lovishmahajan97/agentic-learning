@@ -5,7 +5,7 @@ name: ROI model
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -51,21 +51,24 @@ Constraints:
 
 ### Options
 Each option uses a 3-month adoption ramp (a third, two thirds, then full) and an undiscounted 24-month
-horizon.
+horizon. The recurring figure is the full monthly cost, per-attempt spend included; C's starts with its
+launch in month 4.
 
 | Option | How it works (build; recurring) | Payback at capture 0.6 | 24-month net at 0.6 | 24-month net at 0.3 | Fits budget? |
 |---|---|---|---|---|---|
 | **A. Templates and self-service forms** | Access tickets only: 2 minutes saved, 80% adoption ($30k; $1k/month) | month 5 | +$155k | +$50k | Yes |
 | **B. Assistive drafting agent** | All tickets: 3.5 minutes saved net of review, 70% adoption, $0.10 per attempted ticket ($110k; $10k/month) | month 6 | +$563k | +$106k | Yes |
-| **C. Autonomous access resolver** | Access tickets: 70% audited success saves 10 minutes, failures add 2 minutes of review, $0.30 per attempt; starts month 4 after approval ($150k; $11.2k/month) | month 11 | +$342k | −$21k | No |
+| **C. Autonomous access resolver** | Access tickets: 70% audited success saves 10 minutes, failures add 2 minutes of review, $0.30 per attempt; starts month 4 after approval ($150k; $11.2k/month) | month 11 | +$341k | −$22k | No |
 | **D. Templates plus agent on the rest** | A for access tickets, B for the other 65% ($130k; $9.95k/month) | month 7 | +$433k | +$32k | Yes |
 
 ### Decision
-Choose **B**, because it is the only option that clears every constraint with margin:
+Choose **B**. A, B and D all fit the budget, the payback and the downside, and B has the highest
+24-month net at both capture rates:
 - **It wins against the next-best alternative, not against zero.** B's 24-month net is about $408k above
   templates (A), for $80k more build cost.
 - **D shows why combining is worse here.** Templates save 2 minutes at 80% adoption on access tickets,
-  while the agent saves 3.5 minutes at 70%. Giving those tickets to templates lowers the total.
+  while the agent saves 3.5 minutes at 70%: 1.6 against 2.45 minutes per ticket. Giving those tickets
+  to templates lowers the total.
 - **C fails on two constraints.** It is over budget, and the approval delay plus higher run cost turn
   it negative at capture 0.3.
 - **The downside holds.** At capture 0.3, B is still about +$106k over 24 months, although payback slips
@@ -74,11 +77,11 @@ Choose **B**, because it is the only option that clears every constraint with ma
 Break-even values, which the pilot must measure:
 - **Capture.** Payback within 12 months needs a capture rate of at least about 0.32. That is finance's
   call, so get it in writing from the hiring plan.
-- **Minutes saved.** At capture 0.6, a 12-month payback needs about 1.9 minutes saved per ticket. The
+- **Minutes saved.** At capture 0.6, a 12-month payback needs about 1.85 minutes saved per ticket. The
   pilot must measure minutes saved net of review to better than that margin.
 
 What would change it:
-- **Lower measured savings.** If the pilot shows under 1.9 minutes saved, ship templates (A) and revisit.
+- **Lower measured savings.** If the pilot shows under 1.85 minutes saved, ship templates (A) and revisit.
 - **Higher autonomous success.** If security approves writes early and the measured autonomous success
   rate rises well above 70%, re-run C, because full resolution saves 10 minutes per ticket.
 

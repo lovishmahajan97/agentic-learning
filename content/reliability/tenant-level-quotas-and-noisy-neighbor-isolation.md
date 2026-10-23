@@ -5,7 +5,7 @@ name: Tenant-level quotas & noisy-neighbor isolation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -57,7 +57,7 @@ An agent platform serves 60 business tenants through one LLM gateway. All figure
 | Option | How it works | Interactive p95 wait | A's backfill | E's 300k guarantee | Keys and effort |
 |---|---|---|---|---|---|
 | **A. Global limit only** | one bucket at 2M TPM, FIFO queue | fails: a backfill or a loop fills the queue ahead of everyone | 40M ÷ 2M = 20 min | none: E queues like everyone else | no new key, already built |
-| **B. Hard cap per tenant** | E carved out at 300k; the other 59 get 1.7M ÷ 59 ≈ 28,814 TPM each | met: no tenant can exceed its slice | 40M ÷ 28,814 ≈ 1,388 min, about 23 h: fails | met | no new key, about one week |
+| **B. Hard cap per tenant** | E carved out at 300k; the other 59 get 1.7M ÷ 59 ≈ 28,814 TPM each | met: no tenant can exceed its slice | 40M ÷ 28,814 ≈ 1,388 min, about 23 h: fails | partly: reserved at the gateway, but E still shares the vendor's per-key limiter | no new key, about one week |
 | **C. Soft caps plus fair share** | per-tenant Redis bucket of 500k TPM with reserve-then-reconcile, deficit round robin across tenant queues, a batch lane, a 25-step run budget; E on its own 300k key | met: each active tenant gets one fair turn per cycle | at most 500k TPM: 40M ÷ 500k = 80 min | met by the dedicated key | one new key, about three weeks |
 | **D. Dedicated key per tenant** | 60 keys, one per tenant | met | limited by A's own key size | met | 59 new keys: fails procurement |
 

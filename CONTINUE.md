@@ -1,5 +1,16 @@
 # Continuing the lesson build (handoff)
 
+## Status 2026-10-23 (update): three lesson types
+
+- Every lesson has `lesson_type`: 212 concept, 215 lab, 246 decision (SPEC v5). Each gained its type
+  section (Misconceptions / Lab / Decision case), which is the lesson's front view in the app; the rest
+  of the lesson sits in a collapsible Full reference. All 673 are typed-verified.
+- Labs: starter runs, tests fail on the starter and pass on a private solution, verified by running for
+  all 215. Decision cases recomputed and checked for straw-man options.
+- Checks: 673/673 valid; 0 lost data vs tag `pre-typed`; 712/712 diagrams parse.
+- Regenerate with `python3 scripts/make_typed_workflow.py --groups 3` if lessons are added.
+
+
 ## Status 2026-10-23: mastery edition (learner's improvement plan, phases A, B, C, E)
 
 - A. App: mastery is evidence-based (Understand: explain from memory; Implement: exercise without a

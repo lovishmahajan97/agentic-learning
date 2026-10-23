@@ -5,7 +5,7 @@ name: prompt-injection red-team suite for a tool-using agent
 kind: practice
 difficulty: advanced
 est_minutes: 24
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

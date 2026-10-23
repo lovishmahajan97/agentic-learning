@@ -5,7 +5,7 @@ name: Baseline measurement before deployment
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -69,8 +69,9 @@ Choose **D**, because it is the only option that meets every constraint:
   0.94 / 0.02² ≈ 542 audited exceptions. At 5 minutes each that is about 45 hours, inside the 50.
 - **Quarter-end cancels within a week.** In week 7, three teams are live and one is not, so the shared
   close-period effect hits both groups.
-- **Volume is enough per week.** Detecting 3 minutes with a standard deviation of 12 needs about 251
-  exceptions per arm, and one team-week is 600.
+- **Volume is enough per week.** Detecting a 3-minute drop in mean handle time with a standard deviation
+  of 12 (80% power, two-sided 5%) needs about 2 × 2.8² × 12² / 3² ≈ 251 exceptions per arm, and one
+  team-week is 600.
 
 Before trusting the staggered estimate, check that the four teams' weekly medians moved in parallel over
 the last 8 weeks of history.
@@ -86,7 +87,8 @@ What would change it:
   do not let its manager adopt agent-like shortcuts informally.
 - **Staggered order can carry team effects.** Randomise the rollout order of the four teams rather than
   starting with the keenest or the worst-performing one, which invites regression to the mean.
-- **Shadow doubles inference spend for 4 weeks.** Cap it with a step budget per run and stop at week 4.
+- **Shadow pays for inference with no labour saved for 4 weeks.** Every live case is run twice, once by
+  the human and once by the agent. Cap it with a step budget per run and stop at week 4.
 - **A ±2-point audit is not per-segment precise.** Enlarge the audit only for the segment where the agent
   is closest to the human interval.
 

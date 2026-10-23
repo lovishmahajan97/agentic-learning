@@ -6,7 +6,7 @@ kind: concept
 difficulty: advanced
 est_minutes: 17
 agent_relevance: useful
-status: typed
+status: typed-verified
 lesson_type: concept
 mastery: implement
 code_tested: partial
@@ -112,9 +112,9 @@ flowchart TD
 
 ## Misconceptions
 - **"Distillation means matching the teacher's logits."** That is classic distillation and needs the
-  teacher's token probabilities. A closed API returns only text, so agent distillation is mostly
-  sequence-level fine-tuning on filtered trajectories; token-level matching needs an open-weight teacher,
-  usually with a shared tokenizer.
+  teacher's full token distributions. A closed API returns text and at most a few top log-probabilities
+  per token, so agent distillation is mostly sequence-level fine-tuning on filtered trajectories;
+  token-level matching needs an open-weight teacher, usually with a shared tokenizer.
 - **"Every teacher run is good training data."** The teacher fails, loops and wastes calls too, and the
   student copies whatever it sees. In the scenario below only 4,100 of 10,000 runs (41%) survive the
   verifier, dedup and efficiency filters; the filter, not the raw count, sets what the student learns.

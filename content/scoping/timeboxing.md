@@ -5,7 +5,7 @@ name: Timeboxing
 kind: practice
 difficulty: core
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -63,9 +63,10 @@ Choose **C, a spike followed by a PoC box**, because it is the only option that 
   nothing on day 20.
 - **Risk order:** the write scope is tested on days 1-3. If it fails, the team stops after 9 person-days and
   recommends a draft-only agent, instead of learning it on day 8 as B might.
-- **Exit rule, written on day 0:** at least 75% task success on the 150 labeled claims with zero uncaught
-  wrong claim records means pilot; 60-75% means one more box scoped to the largest failure bucket; below
-  60% means stop and recommend agent drafts with a human filing.
+- **Exit rule, written on day 0:** any uncaught wrong claim record, or below 60% task success on the 150
+  labeled claims, means stop and recommend agent drafts with a human filing; otherwise at least 75% means
+  pilot and 60-75% means one more box scoped to the largest failure bucket. Every result maps to exactly
+  one decision.
 - **Noise floor:** at about 70% success on 150 tasks, one standard error is about 3.7 points (the 95%
   half-width about 7.3), so the midpoint check ignores moves of a point or two.
 
@@ -75,8 +76,9 @@ Choose **C, a spike followed by a PoC box**, because it is the only option that 
 - **The board would fund the build whatever the result:** the box buys nothing; shrink it to the spike.
 
 ### Trade-offs accepted
-- **A shorter PoC box.** The spike eats into calendar time, so the PoC gets no extension inside the 20 days.
-  Watch the midpoint arithmetic and cut "could" items early.
+- **No room to extend the PoC box.** Spike plus box use 39 of the 40 person-days, so the PoC cannot be
+  extended before the board even though 7 calendar days remain. Watch the midpoint arithmetic and cut
+  "could" items early.
 - **150 tasks only.** The ±7.3-point half-width makes a result near 75% inconclusive. Report it as such
   rather than rounding up, and size the next box's eval set from it.
 - **One person-day of slack.** 39 of 40 leaves no room for a slipped spike. If API access takes longer than

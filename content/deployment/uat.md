@@ -5,7 +5,7 @@ name: UAT (user acceptance testing)
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 mastery: evaluate
@@ -62,17 +62,19 @@ illustrative planning figures.
 |---|---|---|---|---|
 | Sign off on the point estimate | Record an explicit decision to judge on 88% rather than the interval | 0 | 82.8%: the bar is not shown to be met | ships at 62.5% |
 | Score about 400 more cases | Grow to about 600 cases so the aggregate interval clears the bar | 400 x 6 min = 40: over the 30 available | about 85.2% if the rate holds at 88% | still hidden in the aggregate |
-| Scope by slice, fix and re-test | Launch for typed forms; handwritten forms stay with adjusters until the parser fix passes its own re-test | 100 fresh handwritten cases (10) plus re-running the 40 known ones as regressions (4) = 14 | typed slice alone: about 89.7% from 151 of 160 | released only when its own lower bound clears 85% |
+| Scope by slice, fix and re-test | Launch for typed forms; handwritten forms stay with adjusters until the parser fix passes its own re-test | about 200 fresh handwritten cases (20) plus re-running the 40 known ones as regressions (4) = 24 | typed slice alone: about 89.7% from 151 of 160 | released only when its own lower bound clears 85% |
 
 ### Decision
 **Scope by slice: go live for typed forms now, fix the parser, and release handwritten forms only when
 a fresh re-test clears the bar on its own.**
 - **The typed slice already proves itself.** 151 of 160 gives a Wilson lower bound of about 89.7%,
   above 85%, with no extra scoring.
-- **It fits the adjuster budget.** The re-test costs about 14 of the 30 hours, leaving about 16 hours
-  for a second round if the first fix falls short.
-- **The re-test is sized in advance.** If the fix lifts the slice to about 92%, 100 fresh cases give a
-  lower bound of about 85.0%; at 90% it would need about 196 cases, which still fits one more round.
+- **The re-test is sized in advance.** Fixing all 11 OCR failures would lift the known 40 to 36 of 40
+  (90%), so plan for 90%: 180 of 200 fresh cases gives a lower bound of about 85.1%. At 92%, 100 fresh
+  cases would do (lower bound about 85.0%), but the parser fix alone does not reach 92%.
+- **It fits the adjuster budget, once.** The re-test costs about 24 of the 30 hours, leaving about 6:
+  enough to re-score a few disputed cases, not a second full round. A fix that falls short delays the
+  slice past go-live.
 - **Why not the alternatives:** signing on the point estimate ships a slice that fails more than a
   third of the time, and scoring 400 more cases costs more than the budget while still averaging the
   bad slice away.
@@ -89,6 +91,9 @@ a fresh re-test clears the bar on its own.**
   share of claims routed to adjusters without a recommendation, and adjuster queue times.
 - **Routing must be right.** A handwritten form misdetected as typed reaches the agent untested. Watch:
   a weekly sample of routed forms checked for form type, and the agent's pass rate on any misrouted ones.
+- **One shot at the re-test.** A slice that truly passes at 90% only just clears with 200 cases, so a
+  partial fix fails it. Watch: the parser's error rate on the 40 known cases before spending the 20
+  hours on fresh ones.
 - **Re-test fatigue.** Cases used to debug the parser are no longer fair evidence. Watch: the re-test
   uses only fresh cases, and the 40 known ones go into the regression suite.
 

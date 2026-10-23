@@ -5,7 +5,7 @@ name: Disaster recovery (RPO / RTO)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -61,7 +61,7 @@ min).
 | Option | How it works | RPO | RTO estimate | Cost vs prod | Logical disasters |
 |---|---|---|---|---|---|
 | A. Backup and restore | WAL archived every minute, nightly base backup, index snapshot every 6 h, all rebuilt from IaC | about 1 min | 30 + 45 provision + 90 restore + 20 replay + 40 index + 20 = 245 min | about 5% | yes, by PITR |
-| B. Pilot light | async DB replica and a one-node vector replica in the DR region, images and secrets present, app tier created on failover | seconds | 30 + 5 promote + 30 app tier + 10 index catch-up + 20 = 95 min | about 15% | no: the replica copies the corruption |
+| B. Pilot light | async DB replica and a one-node vector index loaded from each 6 h index snapshot in the DR region, images and secrets present, app tier created on failover | seconds | 30 + 5 promote + 30 app tier + 10 index catch-up + 20 = 95 min | about 15% | no: the replica copies the corruption |
 | C. Warm standby | scaled-down full stack, scaled up on failover | seconds | 30 + 5 + 10 scale-up + 10 + 20 = 75 min | about 35% | no, same reason |
 
 ### Decision
@@ -82,7 +82,7 @@ APIs are congested in a regional event) uses up the margin and moves the choice 
 ### Trade-offs accepted
 - **The app tier is created during the disaster.** That is the riskiest 30 minutes. Pre-pull images and
   pre-grant quota in the DR region, and time this step in every quarterly drill.
-- **The index replica trails by up to 6 hours of documents.** New documents re-embed in the background
+- **The DR index trails by up to 6 hours of documents.** New documents re-embed in the background
   after failover. Track the catch-up backlog in the drill.
 - **Restored checkpoints replay recent steps.** Reminders and emails carry idempotency keys the target
   systems honour, plus an action log in another account. Alert on duplicate keys after any restore.

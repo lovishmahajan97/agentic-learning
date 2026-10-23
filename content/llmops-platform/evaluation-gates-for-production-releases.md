@@ -5,7 +5,7 @@ name: Evaluation gates for production releases
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -77,9 +77,8 @@ Choose **C**:
   ±2.9-point half-width, the tightest margin this task set can support. B's δ = 2 is tighter than the
   noise floor, which is the pitfall that produces re-runs: it sends about three in four equal candidates
   to review against C's one in two.
-- **Inconclusive goes to a route, not a re-run.** About half of equal candidates still land in review
-  under C. That is the honest price of 300 tasks, and it replaces A's blind re-runs with a defined next
-  step.
+- **Inconclusive goes to a route, not a re-run.** About half of equal candidates still land in review;
+  that is the price of 300 tasks.
 - **Safety repeats fit the budget.** k = 5 costs 250 runs, and 850 stays within 1,000. D's k = 10 does not
   fit.
 - **Slice verdicts go to review, not block.** A 40-item slice cannot decide a 4-point margin
@@ -106,7 +105,8 @@ What would change it:
 - **Overrides remain possible.** Record approver, reason and expiry, and watch the override rate.
 
 ### Review rubric
-- **δ is justified twice:** by product tolerance and by a computed half-width it must not undercut.
+- **δ is justified twice:** by product tolerance and by a computed half-width it must not undercut, and
+  the write-up states how often an equal candidate would pass.
 - **Safety detection is quantified** as a probability over repeats, with the backstop for what it misses.
 - **Run counts per option are summed** and checked against the budget.
 - **Inconclusive has a defined route** (bigger run or a human), neither pass nor block.

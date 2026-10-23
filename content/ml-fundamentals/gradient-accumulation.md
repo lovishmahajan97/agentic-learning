@@ -5,7 +5,7 @@ name: Gradient accumulation
 kind: practice
 difficulty: core
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -154,8 +154,8 @@ flowchart TD
   number of trained tokens. With masked agent traces, per-micro-batch means can weight a routing token 30×
   a final-answer token. Divide summed token losses by the window's token count.
 - **"Steps still mean what the dataloader yields."** Warmup, `num_training_steps`, clipping and the
-  scheduler all count optimizer steps. 4,800 micro-batches at `k = 16` are 300 steps, and planning for
-  4,800 means the rate never even reaches its peak.
+  scheduler all count optimizer steps. 4,800 micro-batches at `k = 16` are 300 steps; plan for 4,800
+  with a 10% warmup and the 480-step ramp outlasts the run, so the rate never reaches its peak.
 - **"Accumulation can make one long trace fit."** Peak memory is one micro-batch, but a single sequence
   with a huge tool result still has to fit on its own. That is gradient checkpointing's job.
 - **"`k` micro-batches always equal one big batch."** Not with batch-coupled layers such as BatchNorm, or

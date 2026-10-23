@@ -6,7 +6,7 @@ kind: practice
 difficulty: advanced
 est_minutes: 35
 agent_relevance: core
-status: typed
+status: typed-verified
 lesson_type: decision
 related:
   - practice-use-cases/deep-research-agent
@@ -47,7 +47,7 @@ A consulting firm wants vendor-comparison reports for its analysts and must deci
 multi-agent design is worth it. All figures are illustrative measurements on the team's 15 test questions,
 not benchmarks.
 - **Volume:** about 400 reports a month (20 a working day).
-- **Cost cap:** $1 per report, the target in the evals table above.
+- **Cost cap:** $1 per report, the target in the evals table below.
 - **Latency:** p95 under 5 minutes, because analysts wait for the report in a meeting prep window.
 - **Quality bar:** beat a single-agent baseline (same tools, strong model) on 70%+ of questions, scored
   by the rubric judge.

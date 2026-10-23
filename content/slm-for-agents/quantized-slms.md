@@ -5,7 +5,7 @@ name: Quantized SLMs (GGUF, AWQ, quality vs memory)
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: evaluate

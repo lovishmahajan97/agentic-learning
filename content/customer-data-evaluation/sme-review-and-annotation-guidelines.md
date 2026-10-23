@@ -5,7 +5,7 @@ name: SME review & annotation guidelines
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -50,13 +50,13 @@ and calibrate an LLM judge that will take over weekly review. All figures are il
 Constraints:
 - **Actions matter.** A wrong enrolment change is the costliest error, so an action verdict must be separate.
 - **Judge bar.** The judge may replace SMEs only once human agreement has been measured per criterion,
-  because the judge cannot be shown to beat it.
+  because without a human-to-human figure there is no bar to compare the judge's agreement against.
 - **Governance.** Traces contain employee data and are reviewed inside the customer's tenant.
 
 ### Options
 | Option | How it works | Traces judged in 400 reviews | v13 vs v12: 95% half-width on the difference | Can it calibrate a judge? |
 |---|---|---|---|---|
-| **A. Holistic 1 to 5, unblinded, single** | One reviewer scores each trace | 400 | About ±7.0 points if scores were reliable, but version bias is unmeasured | No: no agreement measured |
+| **A. Holistic 1 to 5, unblinded, single** | One reviewer scores each trace | 400 | About ±7.0 points if scores are cut to pass or fail, but version bias is unmeasured | No: no agreement measured |
 | **B. Card, blind and shuffled, single** | v0.4 card, per-criterion binary labels | 400 | About ±7.0 points | No: still no agreement estimate |
 | **C. Card, blind, shuffled, 20% double, known-answer seeds** | B plus 63 double-labelled traces and 20 known-answer items | 315 | About ±7.9 points | Yes: κ and fail-specific agreement per criterion |
 | **D. Everything double-labelled** | Every trace by two SMEs | 200 | About ±9.9 points | Yes, with the most agreement data |

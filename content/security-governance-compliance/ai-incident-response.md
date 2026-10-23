@@ -5,7 +5,7 @@ name: AI incident response
 kind: practice
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -50,7 +50,9 @@ tenants. Traces show an instruction hidden in pasted ticket text. All figures ar
 - **Levers already built:** flags per tool and tenant in the tool executor, and a degraded mode that
   answers in chat and queues follow-ups for a person.
 - **Constraints:**
-  - the emails may contain personal data, so the GDPR 72-hour clock may already be running;
+  - the emails may contain personal data; the vendor processes tenant data as a GDPR processor, so it
+    must tell the affected tenants without undue delay, and each tenant's own 72-hour clock runs from
+    when it becomes aware;
   - the human team can absorb about 1,500 extra follow-ups a day;
   - nobody yet knows whether the same text sits in other tenants' tickets;
   - legal wants the evidence preserved before anything changes.
@@ -88,14 +90,16 @@ stops the harm while the spread is unknown.
 - **Re-enabling needs evidence, not one clean run.** Before the 3 tenants get email back, re-run the
   injected tickets: 300 clean runs bound the rate below about 1% (rule of three).
 - **Notification depends on the 40 emails' content.** Read the logged bodies to count the people whose data
-  left; legal decides on the 72-hour report from that number, not from the scope estimate.
+  left; send each affected tenant that count so it can decide on its 72-hour report from facts, not from
+  the scope estimate.
 
 ### Review rubric
 - **Containment comes before diagnosis**, and evidence is snapshotted before the first change.
 - **The chosen lever is justified by certainty under unknown scope**, not only by how little it breaks.
 - **Human load from the degraded mode is computed** against capacity, with a time window stated.
 - **A concrete query narrows scope** from the audit trail, with the condition that triggers narrowing.
-- **Legal clocks are started at triage**, and notification is tied to counted affected people.
+- **Legal clocks are started at triage** with the vendor's role (processor or controller) named, and
+  notification is tied to counted affected people.
 - **Re-enabling has a verification bar** sized as a failure rate over many runs.
 
 ## Why it exists

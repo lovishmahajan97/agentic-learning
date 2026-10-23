@@ -5,7 +5,7 @@ name: mypy
 kind: tool
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -133,12 +133,13 @@ refused: unsafe request
 Success: no issues found in 1 source file
 ```
 
-The key lines mypy then prints for the three client snippets (paths shortened):
+The key lines mypy then prints for the three client snippets (paths shortened; each dedented snippet
+starts with a blank line, so the `return` is line 4):
 
 ```text
-client.py:3: error: Item "None" of "str | None" has no attribute "strip"  [union-attr]
-client.py:3: error: TypedDict "SearchArgs" has no key "qeury"  [typeddict-item]
-client.py:9: error: Argument 1 to "assert_never" has incompatible type "Refusal"; expected "Never"  [arg-type]
+client.py:4: error: Item "None" of "str | None" has no attribute "strip"  [union-attr]
+client.py:4: error: TypedDict "SearchArgs" has no key "qeury"  [typeddict-item]
+client.py:10: error: Argument 1 to "assert_never" has incompatible type "Refusal"; expected "Never"  [arg-type]
 ```
 
 ### Tests

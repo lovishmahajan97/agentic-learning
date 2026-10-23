@@ -5,7 +5,7 @@ name: OpenAI / Anthropic Node SDKs
 kind: tool
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -188,8 +188,11 @@ it("treats max_tokens as a failure branch, not a reason to call again", async ()
 ```
 
 On the starter: the first test fails with the 400 above, the second with an uncaught `ZodError` from the
-handler, and the budget and `max_tokens` tests get a 400 instead of their own error (the replay's
-50-request guard fires on a loop that never stops).
+handler, and the budget and `max_tokens` tests get a 400 instead of their own error.
+
+The budget test gets the same pairing 400 on its second request. The `max_tokens` test hits the replay's
+50-request guard (`over 50 requests, the loop never stopped`): the starter keeps calling on a stop reason
+it does not handle.
 
 ### Failure scenarios
 - **Inject split results:** after fixing the echo, push one `user` message per `tool_result`. The replay

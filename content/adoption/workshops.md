@@ -5,7 +5,7 @@ name: Workshops
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -65,12 +65,14 @@ an LLM judge. All figures are illustrative planning numbers.
 still discusses splits live, where tacit rules surface.
 - **Discussion budget is computed, not hoped for:** 15 of 30 items splitting at 5 minutes each is 75
   minutes, which fits session one with 15 minutes for framing and the decision rule.
-- **Labels produced:** 30 first-pass items resolved in discussion plus 15 relabeled items gives 45
-  consensus labels, above the 40 needed.
+- **Labels produced:** 30 first-pass items resolved in discussion plus 15 relabeled items gives up to 45
+  consensus labels. The 5-label margin over the 40 needed absorbs relabel items that still split; those
+  are dropped or settled by the rubric owner and flagged, never counted silently.
 - **The relabel is the check:** unanimous agreement and kappa on the 15 fresh items must rise against the
   first pass; if they do not, escalate to the owner of quality before the judge is built.
-- **Compliance's 30 minutes is booked into session one**, for the criteria that will become
-  deterministic checks rather than judge criteria.
+- **Compliance's 30 minutes is booked into session one**, as the last 30 of the 75 discussion minutes,
+  with the splits that hinge on mandatory criteria ordered last. Those criteria become deterministic checks
+  rather than judge criteria.
 
 **What would change it.**
 - **A higher split rate:** if the pilot shows 70% of items splitting, discussion needs 21 x 5 = 105

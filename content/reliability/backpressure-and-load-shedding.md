@@ -5,7 +5,7 @@ name: Backpressure & load shedding
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -67,8 +67,11 @@ interactive and research inside quota (0.6M + 1.2M = 1.8M), so neither is shed. 
 remaining 0.2M tokens a minute.
 
 Over a 2 hour peak, batch defers 200 × 120 = 24,000 documents, 48M tokens. Off-peak spare capacity is
-2.0M − 1.4M = 0.6M a minute, so the backlog drains in 48 / 0.6 = 80 minutes. The worst batch delay is
-about 2 hours plus 80 minutes, 3 hours 20 minutes, inside 6 hours.
+2.0M − 1.4M = 0.6M a minute, so the backlog drains in 48 / 0.6 = 80 minutes.
+
+The worst case, a document deferred in the first minute of the peak and drained last, waits about
+2 hours plus 80 minutes, 3 hours 20 minutes, inside 6 hours. Draining oldest first keeps most delays
+well below that bound.
 - **Why not A:** the bottleneck is quota, not workers, so the queue converts overload into a 6 minute wait.
 - **Why not B:** random 429s spread across steps burn quota on runs that never finish.
 - **Why not D now:** it cannot land in 3 weeks; it is the fix for growth, not for this launch.

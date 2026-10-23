@@ -5,7 +5,7 @@ name: Data onboarding
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -47,7 +47,7 @@ are illustrative.
 - **Deadline:** a pilot for one region's 60 technicians in 8 weeks.
 - **Residency:** data must stay in the customer's EU cloud region.
 - **Source load:** the work-order system is production for the service desk; bulk reads are allowed only
-  off-peak, about 50,000 records per night.
+  off-peak, about 50,000 records per night, and the owner has not approved any new daytime query load.
 - **People:** two senior technicians as SMEs, 3 hours each per week (6 hours in total).
 - **Permissions:** work orders are visible by site, and the agent must respect that.
 
@@ -56,11 +56,15 @@ are illustrative.
 |---|---|---|---|---|
 | A. Big-bang export | DBA produces a full dump of all regions and years; load it all, then evaluate | after export approval (est. 3 weeks) and a full load | 1.2M / 50,000 = 24 nights | no: about 6.5 weeks before the first review |
 | B. Staged pilot slice | Inventory, stratified sample, profile, map, SME pilot on one region's last 2 years, then backfill and change feed | week 2, on a sample | slice of 180,000 records: 4 nights | yes |
-| C. Federated tools, no ingestion | Agent tools query the source API at question time | week 1 | live calls at peak hours, which the source forbids; no semantic search over manuals | no |
+| C. Federated tools, no ingestion | Agent tools query the source API at question time | week 1 | live calls at peak hours, which the owner has not approved; no semantic search over manuals | no |
 | D. Staged, full scope | Same gates as B, but all regions and years | week 2 | 24 nights plus 150,000 manuals | tight: SMEs cannot review 5 regions |
 
 For A, about 3 weeks of approval plus 24 nights (3.5 weeks) of loading is roughly 6.5 weeks before
-anyone reviews an answer. For B, 180,000 / 50,000 = 3.6, so 4 nights.
+anyone reviews an answer.
+
+Records are not spread evenly: the pilot region is the largest and recent
+years are the busiest, so its last 2 years hold 180,000 records (15% of the total, not the 48,000 an
+even split would give). For B, 180,000 / 50,000 = 3.6, so 4 nights.
 
 ### Decision
 Choose **B**, because it gets the first defects in front of SMEs in week 2 and keeps the backfill at

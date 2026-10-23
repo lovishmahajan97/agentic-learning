@@ -5,7 +5,7 @@ name: Tool-call success rate
 kind: metric
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 mastery: evaluate
@@ -188,9 +188,9 @@ def test_join_to_outcomes_names_the_limiting_tool():
 ```
 
 ### Failure scenarios
-- **Divide every layer by total attempts.** The funnel test fails (`executed` is no longer 0.667), and
-  a tool that rejects most calls at the schema looks healthy on infrastructure. Print
-  the count that reaches each layer next to its rate.
+- **Divide every layer by total attempts.** The funnel test fails (`executed` drops from 0.667 to 0.4),
+  and calls rejected at the schema drag every later layer down, so a prompt problem pages the
+  integration team. Print the count that reaches each layer next to its rate.
 - **Take recovery from the event list order instead of `attempt`.** The reversed-events assertion
   fails; with real streams, out-of-order delivery makes recovery look like a first-attempt success.
   Sort each step's events by `attempt` before reading the first one.

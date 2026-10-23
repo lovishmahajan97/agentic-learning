@@ -5,7 +5,7 @@ name: sales and CRM agent (lead research, enrichment, email drafts)
 kind: practice
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:

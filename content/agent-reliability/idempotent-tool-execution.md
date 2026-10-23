@@ -5,7 +5,7 @@ name: Idempotent tool execution
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 mastery: implement

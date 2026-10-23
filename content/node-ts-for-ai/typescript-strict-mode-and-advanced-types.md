@@ -5,7 +5,7 @@ name: TypeScript strict mode & advanced types
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

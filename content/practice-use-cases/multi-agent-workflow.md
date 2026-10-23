@@ -5,7 +5,7 @@ name: multi-agent workflow (planner, specialists, reviewer)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -68,7 +68,8 @@ team ran four designs on a 20-brief eval set; all figures are illustrative pilot
 against 15, $1.70 against $2, +17 points against +15, and 0.6 unsupported claims against 1.
 - **Why not A:** it misses the 15-minute limit and the claim target, and traces show tool confusion with
   25 tools in one context.
-- **Why not B:** it is close, but runs every stage on every brief and falls 3 points short, because it
+- **Why not B:** it is close, but runs every stage on every brief, falls 3 points short and misses the claim target (1.2 against 1),
+because it
   cannot add a security deep dive only where needed.
 - **Why not D:** its cost has no ceiling, which fails the budget by design.
 - **Monthly cost:** 200 x $1.70 = $340, against $120 for A; small next to 1,200 analyst hours (200 x 6).
@@ -76,8 +77,8 @@ against 15, $1.70 against $2, +17 points against +15, and 0.6 unsupported claims
 **What would change it.** A 17-point gap on 20 briefs is a small sample, so re-run A and C on 50 before
 rollout and keep C only if the gap holds above 15.
 
-If a single agent with a tool router and 8 tools
-scores 75 or more in under 15 minutes, prefer it. If the needed research stops varying, B is simpler.
+If a single agent with a tool router and 8 tools scores 77 or more (the old baseline plus 15) with under
+1 unsupported claim, in under 15 minutes and under $2, prefer it. If the needed research stops varying, B is simpler.
 
 ### Trade-offs accepted
 - **About 2.8 times the cost of one agent** ($1.70 against $0.60). Alert on runs above the p95 cost and

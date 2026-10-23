@@ -5,7 +5,7 @@ name: System reliability
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -68,6 +68,8 @@ allowance. The second provider alone would cost the same 6 weeks and leave 252 m
 the SLO.
 - **Ranked by impact, not by recency or noise:** the two chosen rows are both self-inflicted and both
   detection problems, which is the cheapest term to cut.
+- **Quotas wait:** they cap what batch tenants may send, a tenant-facing limit the constraint rules out
+  this quarter, and they would save only 12 minutes.
 - **Sales gets a written answer:** the fallback is scheduled once its row dominates, and the impact
   table shows why it is not first.
 

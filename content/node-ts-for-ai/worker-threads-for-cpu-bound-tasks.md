@@ -5,7 +5,7 @@ name: Worker threads for CPU-bound tasks
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -57,7 +57,7 @@ document, and let a stopped agent run free its slot through a shared cancel flag
 import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 import { pathToFileURL } from "node:url";
 
-export type Job = { query: Float32Array; k: number; spinMs?: number; crash?: boolean };
+export type Job = { query: Float32Array<ArrayBuffer>; k: number; spinMs?: number; crash?: boolean };
 export type Hit = { index: number; score: number };
 type Reply = { hits: Hit[] } | { cancelled: true };
 

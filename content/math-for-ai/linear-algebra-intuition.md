@@ -5,7 +5,7 @@ name: Linear algebra intuition
 kind: concept
 difficulty: intro
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement

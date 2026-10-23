@@ -5,7 +5,7 @@ name: Runtime schema validation (Zod)
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -191,8 +191,9 @@ solution passes all five.
   booked without the room the model asked for. The schema test catches it; in production, log raw and
   parsed arguments side by side.
 - **Unbounded repair.** A `while (true)` loop with a model that never fixes the call burns a model call per
-  turn forever; the bounded test times out on the endless `"{}"` replies. Cap attempts and return an explicit failure the
-  agent loop can report.
+  turn forever. With the recorded model the bounded test hangs on the endless `"{}"` replies and Vitest's
+  timeout never fires: each `await` resolves at once, so the timer phase never runs. Cap attempts and
+  return an explicit failure the agent loop can report.
 - **Feed the raw `ZodError` back.** The model gets a large JSON dump and internal details; `path: message`
   lines are shorter and are what the repair test asserts on.
 

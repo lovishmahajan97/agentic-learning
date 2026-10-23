@@ -5,7 +5,7 @@ name: OpenTelemetry instrumentation
 kind: practice
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -51,10 +51,12 @@ link to the request.
 - **Time box:** 45-60 minutes.
 - **Prerequisites:** this lesson's "Context propagation in a process", "Context propagation across
   processes" and the BullMQ carrier example; BullMQ & durable jobs for the queue side.
-- **Needs:** Node 20+ with `npm i @opentelemetry/api@1.9.1 @opentelemetry/sdk-trace-node@2.12.0
-  @opentelemetry/sdk-trace-base@2.12.0` and `npm i -D tsx vitest`. The real SDK runs; spans go to an
-  in-memory exporter instead of a collector. Checked with those versions on Node 24.21, tsx 4.23 and
-  vitest 5.0.5. In SDK 2.x a span's parent is `parentSpanContext`, not the 1.x `parentSpanId`.
+- **Needs:** Node 20+, `npm init -y && npm pkg set type=module` (ESM, for the top-level `await`), then
+  `npm i @opentelemetry/api@1.9.1 @opentelemetry/sdk-trace-node@2.12.0
+  @opentelemetry/sdk-trace-base@2.12.0` and `npm i -D tsx vitest`. Checked with those versions on
+  Node 24.21, tsx 4.23 and vitest 5.0.5.
+- **What runs:** the real SDK, with spans sent to an in-memory exporter instead of a collector. In SDK
+  2.x a span's parent is `parentSpanContext`, not the 1.x `parentSpanId`.
 
 ### Starter code
 ```ts

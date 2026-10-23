@@ -5,7 +5,7 @@ name: Domain modeling
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -55,7 +55,7 @@ All figures are illustrative.
 | Option | How it works | Wrong-entity actions | SME time | Fits 6 weeks |
 |---|---|---|---|---|
 | A. One canonical "order" | Force one definition on both teams | Low for one team, wrong for the other | High: the definition is debated | Unlikely |
-| B. Prompt glossary only | Explain both meanings and let the model infer | 15%: 45 a week, about $8,100 a week at $180 | Low | Yes |
+| B. Prompt glossary only | Explain both meanings and let the model infer | 15%: 45 a week, up to about $8,100 a week at $180 if each one hits a picked shipment | Low | Yes |
 | C. Two bounded contexts plus guarded tools | `SalesOrder` and `Shipment` models, an explicit mapping, identity resolution by key pattern, `cancel_sales_order` refusing anything picked | Spike: 1 in 60 wrong, 6 in 60 sent to a person; cancelling a picked shipment is refused in code | Moderate: four sessions | Yes |
 | D. Knowledge graph of all entities | Model customers, orders, shipments, invoices and returns as a graph | Low | High | No: build and sync cost |
 
@@ -68,7 +68,8 @@ the agent tools on aggregate roots with the lifecycle guard inside.
   agent as data, so the $180 return case cannot happen through the tool.
 - **The mapping is small and testable:** one sales order to 1 to 4 shipments; "where is my order" for a
   split order lists every shipment.
-- **B's error rate is too costly** at about $8,100 a week; A and D do not fit the SME time or deadline.
+- **B's error rate is too costly:** 45 wrong-entity actions a week, with exposure up to about $8,100 a
+  week (45 × $180) and no code path that stops the worst case; A and D do not fit the SME time or deadline.
 
 **What would change it:**
 - **Sales and finance agree one definition in the first session:** collapse to one context and drop the

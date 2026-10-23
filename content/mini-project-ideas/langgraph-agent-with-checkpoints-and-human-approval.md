@@ -5,7 +5,7 @@ name: LangGraph agent with checkpoints and human approval
 kind: practice
 difficulty: core
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -189,8 +189,8 @@ def test_retried_run_for_same_ticket_is_a_no_op():
 - **Resume with a different `thread_id`.** That thread has no pending interrupt, so the graph starts from
   `START` with empty state and fails with `KeyError: 'amount'`. Print `get_state(cfg).next` for the config
   you resume with before sending `Command`.
-- **Key the ledger by thread id.** The retry test fails with two payments, because a retry runs on a new
-  thread. Key side effects by the business object (`ticket_id`), not by the run.
+- **Key the ledger by thread id.** The retry test fails: the second run returns `refund 30 USD ok` instead
+  of `already refunded`, a second payment, because a retry runs on a new thread. Key side effects by the business object (`ticket_id`), not by the run.
 
 ### Submission
 - **`lab.py`** with both `YOUR CODE HERE` parts done and the graph wiring unchanged.

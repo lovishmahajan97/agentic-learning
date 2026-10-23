@@ -5,7 +5,7 @@ name: Eval review loops
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -78,7 +78,8 @@ rule and the monthly report:
 
 What would change it:
 - **A product, policy or traffic-mix change.** Agreement measured on the old mix does not transfer, so
-  double the audit for a month, using the pilot loop on the affected strata.
+  double the audit for a month, using the pilot loop on the affected strata. That is about 40 more reviews
+  a week, over the 60-review budget, so agree the extra SME time with the sponsor first.
 - **Pooled agreement falls.** If the four-week figure drops against recent months (the team uses 85% as
   its own trigger), recalibrate the judge before trusting any score movement.
 - **High-stakes failures exceed 20 a week.** Then ask the sponsor for more SME time rather than sampling

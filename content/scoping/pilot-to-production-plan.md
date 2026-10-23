@@ -5,7 +5,7 @@ name: Pilot → production plan
 kind: practice
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -48,7 +48,8 @@ refunds. Its service organisation has 400 agents in 20 teams of 20. All figures 
   - refunds may not run without review until the agent agrees with human decisions on at least 98% of 500
     shadow cases;
   - security and privacy reviews take about 4 weeks each and can run in parallel;
-  - the sponsor wants production within weeks of a go, not months.
+  - the result must predict the effect for typical teams, since most of the 400 did not volunteer;
+  - the sponsor wants production within two weeks of a go.
 - **Volume:** the pilot teams see about 120 refund-eligible tickets a week, so 720 in six weeks.
 
 ### Options
@@ -62,13 +63,16 @@ refunds. Its service organisation has 400 agents in 20 teams of 20. All figures 
 ### Decision
 Choose **C**, because it is the only option that meets every constraint at once.
 - **Sample size:** 16 × 4² / 1.65² ≈ 95 independent tickets per group; with about 200 tickets per human agent
-  and an ICC of 0.05 the design effect is 10.95, so about 1,030 tickets, roughly six agents' worth. Forty
-  agents per arm clear it; team-level differences are what the comparison group and difference-in-differences
-  absorb.
+  and an ICC of 0.05 the design effect is 10.95, so about 1,030 tickets, roughly five agents' worth. Forty
+  agents per arm clear that agent-level bar.
+- **Team-level limit:** the tool is assigned by team, and two teams per arm cannot pin down team-level
+  variance. Difference-in-differences removes stable team differences, not a shock that hits one team
+  mid-pilot, so the readout reports per-team effects beside the pooled one.
 - **Cohort:** one typical team checks that results transfer beyond volunteers, inside the 40-agent cap.
 - **Refund autonomy:** 720 shadow cases exceed the 500 required; at 98% agreement, 500 cases give a 95%
   half-width of about ±1.2 points.
-- **Speed after go:** reviews started in week 1 finish around week 4, before the week-6 decision.
+- **Speed after go:** reviews started in week 1 finish around week 4, before the week-6 decision, so
+  production can follow within two weeks; A and B leave about 4 weeks of reviews after go.
 - **Rollback:** pooled two-week audits of 400 tickets with an 88% trigger. That fires falsely about 1.8% of
   the time at a true 91% and catches a real drop to 85% about 95% of the time; a single-week 90% trigger on
   200 would fire falsely about 31% of the time.

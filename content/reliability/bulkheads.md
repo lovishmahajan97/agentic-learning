@@ -5,7 +5,7 @@ name: Bulkheads
 kind: pattern
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -42,8 +42,8 @@ detects failure; the price is capacity that cannot be borrowed.
 
 ## Decision case
 ### Scenario
-One fleet of 300 agent workers runs interactive support agents by day and a document-review batch by
-night. Each run holds a worker for its whole duration. All figures are illustrative.
+One fleet of 300 agent workers runs interactive support agents around the clock and a document-review
+batch every night, so the two overlap. Each run holds a worker for its whole duration. All figures are illustrative.
 - **Interactive load:** 3 runs a second at 15 seconds each, so 3 × 15 = 45 workers by Little's law.
 - **Nightly batch:** 10,000 runs at 60 seconds each, 600,000 worker-seconds, due within 8 hours.
 - **Tools:**

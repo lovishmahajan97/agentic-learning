@@ -5,7 +5,7 @@ name: VPN
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 mastery: implement
@@ -72,7 +72,9 @@ hosts routed and only their two ports allowed.**
 - **It is the only option that serves live lookups by week 8.** SFTP fails the freshness need; the circuit
   misses the date.
 - **The address overlap is solved on your side.** Confirm the insurer uses nothing in 172.16.0.0/12,
-  then build the integration VPC as 172.31.240.0/22, so neither side re-addresses or runs NAT.
+  then build the integration VPC as 172.31.240.0/22 and run the `lookup_policy` and ingestion workers
+  in it, so neither side re-addresses or runs NAT. Calls from the 10.40.0.0/16 production VPC would
+  still collide, so nothing there talks to the tunnel directly.
 - **The numbers fit.** The initial sync is about 11 hours, run over a weekend with a bandwidth cap. The
   daily delta is 3 GB x 8 = 24 Gbit / 0.3 Gbit/s = 80 s. The 1,200 small lookups are negligible traffic.
 - **Agent behaviour is designed in:** MSS clamped at the gateway, tool deadlines sized from measured

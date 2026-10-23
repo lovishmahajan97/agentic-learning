@@ -5,7 +5,7 @@ name: Supply-chain security for models & datasets
 kind: practice
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: implement
@@ -135,7 +135,8 @@ flowchart TD
 ## Misconceptions
 - **"Loading a model file is reading data."** A PyTorch `.bin` or `.pt` is a pickle, and unpickling runs
   whatever `__reduce__` returns. Only formats like `safetensors`, with no code path, make loading
-  data-only; otherwise pass `weights_only=True`.
+  data-only; where `torch.load` is unavoidable, `weights_only=True` restricts the unpickler to tensors
+  and allow-listed types (the default from PyTorch 2.6, not in older pins).
 - **"Pinning the repository name pins the model."** Names, branches and `main` move, and namespaces
   get squatted. Pin a commit with `revision=` and check the hash and the set of every file.
 - **"Only the weights matter; configs are inert."** The chat template in `tokenizer_config.json` is a

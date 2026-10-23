@@ -5,7 +5,7 @@ name: Data classification
 kind: practice
 difficulty: intro
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -57,7 +57,7 @@ its derived chunks. All figures are illustrative planning numbers, not benchmark
 |---|---|---|---|---|
 | Owner labels every document | Owners review each document | 1.2M x 30 s = 10,000 hours | high, but never finishes | yes |
 | Everything Restricted until declassified | Safe default, owners downgrade on request | low up front | over-labels nearly everything | no: 100% of traffic to an endpoint sized for 20% |
-| Scanner assigns labels both ways | DLP decides each chunk's label | low | misses lower labels silently | yes, but unsafe |
+| Scanner assigns labels both ways | DLP decides each chunk's label | low | under-labels silently whenever a detector misses | yes, but unsafe |
 | Source defaults plus scan-raise per chunk | Owners label each of the 8 sources (and folders where a source is mixed); chunks inherit, the scanner may only raise a chunk's label; sessions use high-water mark | about a week of owner time | good where sources are coherent | yes, if the Restricted share stays under 20% |
 
 ### Decision
@@ -69,7 +69,8 @@ pilot without making the self-hosted endpoint the bottleneck.
 - **Audit answer:** every chunk payload, trace and memory entry carries its label, so the Restricted
   stores are a metadata query.
 - **Aggregates labelled explicitly:** cross-source outputs such as "account health overview" get a label
-  set by the feature owner, not the computed maximum.
+  set by the feature owner, not the computed maximum, because many Internal facts combined can be
+  Confidential.
 
 **What would change it.** If the Restricted share passes 20% of peak, add self-hosted capacity or split
 sessions so Restricted reads run separately. If a source turns out to be a mixed dump with no coherent

@@ -5,7 +5,7 @@ name: State persistence & conversation recovery
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 mastery: implement

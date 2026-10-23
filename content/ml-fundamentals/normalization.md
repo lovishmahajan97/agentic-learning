@@ -5,7 +5,7 @@ name: Normalization (LayerNorm, RMSNorm)
 kind: concept
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: background
 related:
@@ -184,13 +184,14 @@ flowchart TD
   the bias. `[11, 12, 13, 14]` keeps its offset under RMSNorm, so swapping one for the other in a port
   changes the model.
 - **"`ε` is a negligible numerical detail."** It is baked into the checkpoint, and 1e-8 becomes exactly
-  zero in fp16. A wrong `ε` or gain convention (`w` vs `1 + w`) gives logits that match to two digits and
-  tool calls that drift after a few hundred tokens.
+  zero in fp16. A wrong `ε` or cast order gives logits that match to two digits and tool calls that drift
+  after a few hundred tokens. A wrong gain convention (`w` vs `1 + w`) is not subtle: it breaks the model
+  outright.
 - **"Pre-LN normalizes the residual stream."** It normalizes each sublayer's input and leaves the stream
   untouched, so the stream's norm grows with depth. Only the final norm rescales it before the head.
-- **"Norm gains are ordinary weights, so weight decay is fine."** Decaying `γ` toward zero fights the
-  normalization and makes per-layer effective learning rates wander. Put 1-D parameters in a no-decay
-  group.
+- **"Norm gains are ordinary weights, so weight decay is fine."** Weight decay pulls `γ` toward zero, not
+  toward its identity value of 1, so it keeps shrinking the per-feature scale the network chose and fights
+  the normalization. Put 1-D parameters in a no-decay group.
 
 ## Examples
 ### LayerNorm and RMSNorm from scratch, plus the Pre-LN block
@@ -316,7 +317,8 @@ def adamw_with_no_decay_norms(model, lr=3e-4, weight_decay=0.1):
 ## Pitfalls
 - **Porting weights across implementations that differ in detail:** gain `1 + w` versus `w`, multiplying
   by `γ` before or after casting back to bf16, and `ε`. Symptom: logits that match to two digits and
-  generations (and agent tool calls) that diverge after a few hundred tokens.
+  generations (and agent tool calls) that diverge after a few hundred tokens. A gain-convention mismatch
+  is usually louder: plainly wrong output from the first tokens.
 - **Statistics in bf16 or fp16 in a custom implementation.** Symptom: a slow quality gap against the
   reference (bf16) or NaNs after a few hundred steps (fp16 overflow in the sum of squares). Upcast to fp32
   inside the op.

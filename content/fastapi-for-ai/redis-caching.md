@@ -204,12 +204,10 @@ result); a correct solution passes all six.
 - **Let `RedisError` escape from `GET`.** `test_fails_open_when_redis_is_down` errors with
   `RedisError: connection refused`, the same outage an agent would hit. Debug by reading the traceback:
   the cache call, not the provider call, is the raising frame.
-- **Get the single-flight bookkeeping wrong.** Never pop the in-flight entry and the map keeps one
-  finished future per key forever (the burst test fails on `c.inflight == {}`); pop it before the
-  provider call returns and the other callers miss it, so the burst makes 20 provider calls; set the
-  future's result but not its exception and, when the provider fails, the waiters hang forever
-  (`test_provider_error_reaches_every_waiter` times out). Debug by logging `len(self.inflight)` after
-  the burst, counting `emb.calls`, and dumping pending tasks with `asyncio.all_tasks()`.
+- **Get the single-flight bookkeeping wrong.** Never pop the entry: the burst test fails on
+  `c.inflight == {}`. Pop it before the provider returns: the burst makes 20 calls. Resolve the future
+  only on success: waiters hang when the provider fails, and the provider-error test times out. Debug
+  with `len(self.inflight)`, `emb.calls` and `asyncio.all_tasks()`.
 - **Remove the jitter.** The TTL test still passes, but every key written in one burst expires in the
   same second; check `set(r.ttls.values())` in a burst and expect many distinct values.
 

@@ -5,7 +5,7 @@ name: agent memory libraries (Mem0, Letta)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -41,8 +41,8 @@ user, while Letta (formerly MemGPT) runs stateful agents that edit their own mem
 
 ## Lab
 ### Task
-Fix the four memory bugs from this lesson's Pitfalls in a small memory layer shaped like Mem0's add,
-search, delete and history calls: stale facts that pile up, memories that leak across users, card
+Fix four memory bugs this lesson warns about (three from Pitfalls, one from Why it exists) in a
+small memory layer shaped like Mem0's add, search, delete and history calls: stale facts that pile up, memories that leak across users, card
 numbers that get stored, and a "forget me" that forgets nothing.
 - **Time box:** 45-60 minutes.
 - **Prerequisites:** this lesson's Mem0 flow (add, search, manage) and the cross-tenant leakage lesson.
@@ -185,7 +185,7 @@ log itself never holds the raw card number.
 ### Submission
 - **Code:** `memory_layer.py` with the three `YOUR CODE` parts done; `extract_facts` and `CARD` unchanged.
 - **Test run:** `pytest -q` showing 5 passed.
-- **Program output:** the six stdout lines from `python memory_layer.py`, matching Expected output.
+- **Program output:** the seven stdout lines from `python memory_layer.py`, matching Expected output.
 - **Mapping note:** for each fix, the Mem0 call or setting you would use instead (update path, `user_id`
   scoping, redaction before `add`, `delete_all` plus `history`).
 - **One extra test** for a scenario this lab misses, such as a fact that is retracted rather than changed.

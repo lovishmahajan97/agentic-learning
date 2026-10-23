@@ -5,7 +5,7 @@ name: Graceful shutdown
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -52,7 +52,8 @@ You write the orchestrator and make the worker yield at a step boundary.
 - **Time box:** 45-75 minutes.
 - **Prerequisites:** this lesson's "The sequence inside Node", "Agent runs: stop at a step boundary"
   and "Close order and exit"; BullMQ & durable jobs for what `worker.close()` waits for.
-- **Needs:** Node 20+ with `npm i -D tsx vitest`. The HTTP server is real `node:http`; the worker,
+- **Needs:** Node 20+ and `npm init -y && npm pkg set type=module && npm i -D tsx vitest` (ESM, for
+  the top-level `await`). The HTTP server is real `node:http`; the worker,
   Redis, pool and exporter are small fakes, and `exit` is injected so tests can read the code.
   Checked with Node 24.21, tsx 4.23 and vitest 5.0.5.
 
@@ -76,8 +77,8 @@ export type Deps = {
 // 1. on a second call: log "second signal" and exit(1) at once;
 // 2. setReady(false), log `${signal}: draining`, wait drainDelayMs while still serving;
 // 3. start a deadline timer (unref'd) that logs "drain timeout" and exits 1;
-// 4. close the HTTP server and the worker in parallel, then redis, then the pool, then telemetry
-//    capped at telemetryCapMs; log "closed http+worker", "closed redis", "closed pool", "flushed telemetry";
+// 4. close the HTTP server and the worker in parallel and log "closed http+worker", then redis, then
+//    the pool, then telemetry capped at telemetryCapMs (those three log their own lines when they close);
 // 5. clear the deadline and exit(0); on any error log "shutdown error" and exit(1).
 export function createShutdown(d: Deps) {
   return async (signal: string) => {

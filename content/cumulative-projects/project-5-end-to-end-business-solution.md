@@ -5,7 +5,7 @@ name: "Project 5: end-to-end business solution"
 kind: practice
 difficulty: advanced
 est_minutes: 35
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 mastery: evaluate
@@ -96,8 +96,9 @@ week against $160 of system cost.
   credit recovers within 30 days; scaling now with that change would then be a decision on record.
 
 ### Trade-offs accepted
-- **About 243 clerk hours a week forgone** while the other two teams wait, plus the pilot team returning
-  to manual work during the pause. Report this cost to the sponsor; do not hide it.
+- **About 243 clerk hours a week forgone** while the other two teams wait, rising to 3 x 121.5 = 364.5
+  hours (about $16,400) in weeks when the pilot team is also back on manual work in shadow mode. Report
+  this cost to the sponsor; do not hide it.
 - **A stricter duplicate key may flag real repeat invoices** (monthly fixed fees). Track the false
   duplicate rate in shadow mode; those cases go to the human queue, not to rejection.
 - **Re-checking at 30% eats part of the saving.** Run the sample audit, publish its error rate to clerks,

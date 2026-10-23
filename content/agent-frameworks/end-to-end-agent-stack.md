@@ -5,7 +5,7 @@ name: end-to-end agent stack (framework, LLM gateway, vector store, tracing, eva
 kind: decision
 difficulty: advanced
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -59,12 +59,12 @@ All figures below are illustrative.
 - **Deadline:** production pilot in 12 weeks.
 
 ### Options
-| Option | How it works | Residency | Cost vs €12k cap | Team and ops | 3-day approvals |
-|---|---|---|---|---|---|
-| A. Managed agent platform | a cloud vendor's hosted runtime, memory, tracing and evals | only if the vendor runs it in the insurer's EU account; must be verified | model spend plus platform fees; budgets set in the vendor console | least ops; new platform to learn | vendor-specific pause and resume |
-| B. Reference stack, self-hosted | LangGraph, LiteLLM proxy, pgvector, OTel to self-hosted Langfuse, CI evals, containers plus Postgres checkpoints | everything runs in the insurer's EU account | gateway virtual keys enforce the cap | two new services to run (proxy, Langfuse); Postgres already known | checkpoint the run, resume on the adjuster's decision |
-| C. B plus a workflow engine | as B, with Temporal owning the claim lifecycle | as B | as B | a third new stateful system and a new programming model | strongest durability, timers and visibility |
-| D. Hosted SaaS per layer | managed gateway, managed vector database, SaaS tracing | prompts and traces leave the account | per-vendor bills, harder to cap in one place | least ops | depends on the chosen framework |
+| Option | How it works | Residency | Cost vs €12k cap | Team and ops | 2 s latency and 12 weeks | 3-day approvals |
+|---|---|---|---|---|---|---|
+| A. Managed agent platform | a cloud vendor's hosted runtime, memory, tracing and evals | only if the vendor runs it in the insurer's EU account; must be verified | model spend plus platform fees; budgets set in the vendor console | least ops; new platform to learn | no extra hop if models are served in-region; fast to build, but procurement can eat the 12 weeks | vendor-specific pause and resume |
+| B. Reference stack, self-hosted | LangGraph, LiteLLM proxy, pgvector, OTel to self-hosted Langfuse, CI evals, containers plus Postgres checkpoints | everything runs in the insurer's EU account | gateway virtual keys enforce the cap | two new services to run (proxy, Langfuse); Postgres already known | one proxy hop to measure; known Python and Postgres fit 12 weeks | checkpoint the run, resume on the adjuster's decision |
+| C. B plus a workflow engine | as B, with Temporal owning the claim lifecycle | as B | as B | a third new stateful system and a new programming model | as B for latency; learning the engine competes with the 12 weeks | strongest durability, timers and visibility |
+| D. Hosted SaaS per layer | managed gateway, managed vector database, SaaS tracing | prompts and traces leave the account | per-vendor bills, harder to cap in one place | least ops | hops to several vendors to measure; quickest setup | depends on the chosen framework |
 
 ### Decision
 Choose **B**, the reference stack, self-hosted in the insurer's EU account.

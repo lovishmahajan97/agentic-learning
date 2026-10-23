@@ -5,7 +5,7 @@ name: Vendor evaluation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -78,7 +78,9 @@ and cost constraints. X and Y both pass, and the evidence does not separate them
   failure rates are cut.
 - **A larger paired sample separates them:** re-run on 600 tasks if the buyers report more failures than
   the bake-off predicted.
-- **Volume triples to 60,000:** Z's fixed cost falls to $0.10 per request, so re-test it if its latency improves.
+- **Volume triples to 60,000:** Z's fixed cost falls to $0.10 per request, but with 20% of runs failing it
+  still costs 0.10 + 0.20 × 1.00 = $0.30, over budget. Re-test Z only if its latency fits and its completion
+  reaches at least 0.85 (0.10 + 0.15 × 1.00 = $0.25).
 
 ### Trade-offs accepted
 - **Y takes 50% more steps than X.** More steps mean more places to fail; watch steps per completed task

@@ -5,7 +5,7 @@ name: Stakeholder alignment
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: background
 related:
@@ -63,8 +63,9 @@ illustrative.
 **Standard apps only, as a provisional operating point.** It is the only option that meets the sponsor's
 50%, fits approver capacity (1,350 of 1,500) and stays inside both security red lines. Security saw this
 table one-to-one before the decision meeting, so the meeting ratified it.
-- **The margin is thin, and the one-pager says so.** 8 errors in 2,000 replays gives an upper 95% bound of
-  about 0.68%, which is 3,000 × 0.55 × 0.68% ≈ 11 wrong grants a month, just over the limit.
+- **The margin is thin, and the one-pager says so.** 8 errors in 2,000 replays gives an exact upper 95%
+  bound of about 0.79%, which is 3,000 × 0.55 × 0.79% ≈ 13 wrong grants a month, over the limit. The point
+  estimate fits; the worst plausible rate does not.
 - **So the rollback trigger is owned by security:** if a rolling audit of auto-grants projects more than
   10 a month, the agent drops to approve-everything mode without a deploy.
 - **Paid licences and privileged groups go through the approval gate,** enforced in the grant tool's config.

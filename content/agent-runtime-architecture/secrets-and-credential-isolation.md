@@ -5,7 +5,7 @@ name: Secrets & credential isolation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -67,10 +67,12 @@ numbers.
 and mint a repo-scoped installation token from the broker for each call.**
 - **Meets "no credential readable by generated code":** the sandbox holds nothing and can reach only the
   package mirror, so "print your environment" returns nothing useful.
-- **Meets attribution:** the broker records run, org and repo for each mint; 4,000 runs with about 2
-  write calls each is about 8,000 mints a day, under 0.1 a second.
-- **Meets 15-minute revocation:** when an org disconnects, the broker refuses new mints at once, and no
-  token ever left the worker, so none is outstanding in a sandbox.
+- **Meets attribution:** the broker records run, org and repo for each mint, and the worker logs each
+  call against its run; 4,000 runs with about 3 git calls each (clone, push, open PR) is at most 12,000
+  mints a day, about 0.14 a second, and caching only lowers that.
+- **Meets 15-minute revocation:** when an org disconnects, the broker refuses new mints at once, a token
+  cached in the worker lives at most 10 minutes before it is re-minted, and no token ever left the worker,
+  so none is outstanding in a sandbox.
 - **Fits the deadline:** it avoids TLS interception, which is the riskiest part of the proxy option.
 - **The model sees references:** tools take a repo name from the runtime-bound set for this tenant, never
   a token or URL.
@@ -85,8 +87,9 @@ and mint a repo-scoped installation token from the broker for each call.**
 ### Trade-offs accepted
 - **Less flexible sandboxes.** Code that wants to `git push` itself fails; the tools cover clone, push and
   pull request, and we count tool-missing errors to see what else is needed.
-- **Broker on the hot path.** A broker outage stops pushes; tokens are cached per run and repo for their
-  lifetime, and broker availability is part of the tool's SLO.
+- **Broker on the hot path.** A broker outage stops pushes; tokens are cached per run and repo for at
+  most 10 minutes rather than their full hour, so a revoked org stops working inside the 15-minute limit,
+  and broker availability is part of the tool's SLO.
 - **Worker holds tokens briefly.** The worker logs without auth headers, and the scrubber pages on any hit
   in tool results.
 - **App-attributed writes.** Commits come from the app, not the user; the pull request body names the

@@ -5,7 +5,7 @@ name: Durable execution & checkpointing
 kind: concept
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 mastery: implement
@@ -225,7 +225,8 @@ def test_stale_epoch_cannot_write():
   `tickets=4`: the resumed call no longer matches the first one downstream. Log the key each attempt
   sends for one (run, step, index) and compare.
 - **Drop the "without a result" check.** Tickets stay at 3 because the API dedupes, but `api_calls`
-  climbs on every resume after `after_result_saved`; against a tool without keys that is a duplicate.
+  rises to 5 on the two step-0 lines with `idx=1`, where the resume re-sends a call whose result was
+  already saved; against a tool without keys that is a duplicate.
   Count tool executions per key in the trace.
 - **Claim only when `owner is null`.** The resume at `t=31` returns `busy` forever and the crash tests
   fail on `"busy" != "done"`. Query runs whose `lease_until` is in the past but still have an owner.

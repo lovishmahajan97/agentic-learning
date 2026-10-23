@@ -6,7 +6,7 @@ kind: practice
 difficulty: advanced
 est_minutes: 40
 agent_relevance: core
-status: typed
+status: typed-verified
 lesson_type: decision
 related:
   - agents/model-context-protocol
@@ -48,11 +48,11 @@ An engineering org of 80 people uses three MCP hosts (an IDE, a desktop assistan
 and wants shared tools for docs, ticketing, GitHub and the metrics database. A two-person platform team
 must choose the hub topology. Incident hours are illustrative, from last quarter's logs, not benchmarks.
 - **Security rule:** no long-lived downstream credentials on laptops; offboarding must cut access centrally.
-- **Availability:** 99.5%+ a month for the docs, ticketing and GitHub tools (the target above).
+- **Availability:** 99.5%+ a month for the docs, ticketing and GitHub tools (the target in the evals table below).
 - **Known risk:** the metrics database has slow-query incidents about 4 hours a month; in a shared process,
   those calls hold workers and stall every tool.
 - **Operations capacity:** the team can run and be on call for about 3 deployments.
-- **Deadline:** the 3-week phased plan above.
+- **Deadline:** the 3-week phased plan below.
 
 ### Options
 | Option | How it works | Credentials on laptops | Deployments | Availability of stable tools |

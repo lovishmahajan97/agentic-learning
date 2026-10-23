@@ -5,7 +5,7 @@ name: Compliance architecture (GDPR, SOC 2, HIPAA, ISO 42001, EU AI Act, DPDP Ac
 kind: concept
 difficulty: advanced
 est_minutes: 25
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -70,8 +70,10 @@ effort figures are illustrative engineer-weeks.
 Choose **C, common controls enforced in the agent platform**, because only enforcement can prove the
 contract terms that carry audit rights.
 - **Capacity:** 20 engineer-weeks fits under 26; A uses 25 and must repeat its manual evidence each cycle.
-- **Type II:** C's controls emit evidence from the first day of the observation period, which A cannot
-  reconstruct afterwards.
+- **Type II:** 26 engineer-weeks over 6 months is one engineer-equivalent, so only about 8-9 weeks of work
+  lands before the observation period starts. Build the gateway policy and audit events first (8 weeks),
+  so the controls the contracts name emit evidence from day one; deletion fan-out, evidence jobs and the
+  mapping follow in months 3-5. A's hand-gathered evidence cannot be reconstructed afterwards.
 - **Drift:** a new tool calling a US endpoint with EU data is denied at the gateway; under B it is a policy
   breach nobody sees.
 - **Agent data paths:** deletion reaches memory, vectors and eval sets with a receipt each, so an erasure
@@ -81,8 +83,8 @@ contract terms that carry audit rights.
 **What would change it:**
 - **One framework only** (SOC 2 for US-only buyers): a direct checklist is simpler, as the lesson's
   trade-offs note.
-- **Capacity below 20 weeks:** phase it. Gateway policy and the audit trail first (8 weeks), because
-  contracts name them; deletion fan-out next.
+- **Capacity below 20 weeks:** keep the first 8 weeks (gateway policy and audit trail), because contracts
+  name them, and defer deletion fan-out to the next audit cycle behind a logged manual erasure runbook.
 - **The healthcare deals fall through:** drop the BAA routing branch and the HIPAA mapping.
 
 ### Trade-offs accepted
@@ -92,6 +94,8 @@ contract terms that carry audit rights.
   with no fresh evidence in their period.
 - **New features wait for agreements.** A tool that sends data to a SaaS vendor without a DPA cannot ship
   until one is signed. Track time from tool request to allow-list entry.
+- **Late controls have a shorter tested window.** Deletion receipts that start in month 4 cover only part
+  of the first Type II period; tell the auditor the start date and expect a narrower opinion on them.
 - **Effort figures are estimates.** Re-plan after the gateway work, the best-understood piece, is done.
 
 ### Review rubric

@@ -5,7 +5,7 @@ name: Tenant-specific configuration & feature flags
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -55,12 +55,12 @@ new `refund_order` tool and prompt v8 tenant by tenant. All figures are illustra
 - **Team:** three engineers; no budget approved yet for a flag vendor.
 
 ### Options
-| Option | How it works | Weekly changes | Contracts | Latency | Audit |
-|---|---|---|---|---|---|
-| A. Keep code checks | Per-tenant `if` branches, shipped by deploy | a deploy per change | enforced only by review | none added | git history, not per run |
-| B. Typed config you own plus a few flags | Versioned, schema-validated tenant config table, layered resolution, in-process cache; release and kill flags behind a vendor-neutral interface | admin save through the eval gate | validation rejects a barred provider at save time | cache read, pinned per run | config version stamped on every trace |
-| C. Everything in a flag service | Prompt version, tool list and model stored as JSON flag variants | admin save | no typed schema: a typo or barred provider fails at request time | cache read | depends on the service's change log |
-| D. Fork per tenant | A branch or deployment per tenant | per-branch deploy | per branch | none added | 40 histories |
+| Option | How it works | Weekly changes | Contracts | Latency | Audit | Budget and team |
+|---|---|---|---|---|---|---|
+| A. Keep code checks | Per-tenant `if` branches, shipped by deploy | a deploy per change | enforced only by review | none added | git history, not per run | nothing new to buy or run |
+| B. Typed config you own plus a few flags | Versioned, schema-validated tenant config table, layered resolution, in-process cache; release and kill flags behind a vendor-neutral interface | admin save through the eval gate | validation rejects a barred provider at save time | cache read, pinned per run | config version stamped on every trace | no purchase; the team builds a config table and admin tool |
+| C. Everything in a flag service | Prompt version, tool list and model stored as JSON flag variants | admin save | JSON variants usually lack your typed schema and contract rules: a typo or barred provider fails at request time | cache read | depends on the service's change log | a vendor contract not yet approved, or a self-hosted flag server to run |
+| D. Fork per tenant | A branch or deployment per tenant | per-branch deploy | per branch | none added | 40 histories | 40 deployments for three engineers to run |
 
 ### Decision
 Choose **B**, because it is the only option that moves weekly changes off the deploy path and still

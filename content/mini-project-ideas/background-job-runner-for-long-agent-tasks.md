@@ -5,7 +5,7 @@ name: Background job runner for long agent tasks
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

@@ -5,7 +5,7 @@ name: Cross-tenant data leakage
 kind: concept
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement
@@ -144,9 +144,9 @@ flowchart TD
   relational store. The vector index, semantic cache, memory, traces and fine-tuned weights are
   copies outside it, and each needs its own tenant key or pre-filter.
 - **"Filtering retrieved chunks by tenant afterwards is equivalent to filtering in the search."**
-  Post-filtering is safe only if nobody touches it, and it destroys recall for small tenants: in the
-  simulation the 300-chunk tenant gets 0.15 of 8 hits, which tempts someone to raise k or drop the
-  filter. Filter inside the ANN search.
+  Post-filtering keeps foreign chunks out, but k now means k across all tenants: with 40,000, 2,000
+  and 300 chunks in one index, the 300-chunk tenant averages 0.15 of 8 hits (simulation below). That
+  collapse tempts someone to raise k or drop the filter. Filter inside the ANN search instead.
 - **"Telling the model to use only this customer's documents is a second line of defence."** Once a
   foreign chunk is in the prompt the leak has happened, and it is already in the trace store. The
   model cannot verify ownership; isolation belongs to the data layer.

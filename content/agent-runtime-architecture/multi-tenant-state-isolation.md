@@ -5,7 +5,7 @@ name: Multi-tenant state isolation
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -57,7 +57,7 @@ illustrative planning numbers.
 |---|---|---|---|---|---|
 | Shared everything, storage-level scoping | Postgres RLS, one vector collection with a tenant payload index, prefix-scoped object credentials, per-run sandboxes | platform-wide if a policy is wrong | fails the 2 healthcare tenants | lowest | must be measured with filtered search |
 | Collection or schema per tenant | 1,200 schemas and 1,200 vector collections | one tenant per bug | still a shared database | many tiny collections strain the engine and the SREs | good |
-| Tiered | shared with storage-level scoping for small and mid; a dedicated collection for each enterprise tenant; an EU cell for the 2 healthcare tenants | shared tier: wide; enterprise: per tenant | met by the cells | 2 cells, about $3,000 a month | measured for the smallest tenants |
+| Tiered | shared with storage-level scoping for small and mid; a dedicated collection for each enterprise tenant; an EU cell for the 2 healthcare tenants | shared tier: wide; enterprise: per tenant | met by the cells | the shared deployment plus 2 cells, about $3,000 a month extra | measured for the smallest tenants |
 | Cell per tenant | a separate deployment for everyone | one tenant | met | 1,200 × $1,500 = $1.8M a month | good |
 
 ### Decision
@@ -68,7 +68,7 @@ illustrative planning numbers.
 - **Enterprise collections (3 tenants):** at about 2 million vectors each they are large enough to justify
   their own collection, which removes filter selectivity from their recall.
 - **EU cells (2 tenants):** the only option that satisfies residency and the "no shared database" clause;
-  2 × $1,500 = $3,000 a month against 0.17% of the cost of a cell for everyone.
+  2 × $1,500 = $3,000 a month, about 0.17% of the $1.8M a month a cell for everyone would cost.
 - **One rule across all tiers:** tenant identity comes from authentication into the run context, and no
   tool schema accepts `tenant_id`.
 

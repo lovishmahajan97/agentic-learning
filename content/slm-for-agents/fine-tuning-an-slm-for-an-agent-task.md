@@ -6,7 +6,7 @@ kind: concept
 difficulty: advanced
 est_minutes: 18
 agent_relevance: useful
-status: typed
+status: typed-verified
 lesson_type: concept
 mastery: implement
 code_tested: partial
@@ -128,8 +128,9 @@ flowchart TD
   behaviour and format; facts picked up this way are patchy, slow to update and stated confidently when
   wrong. Fine-tune the call pattern and put the facts in retrieval.
 - **"When accuracy stalls, add epochs or rank."** More epochs on small data memorise phrasing, and more rank
-  overfits sooner. In the triage scenario below the big jump came from adding "no tool" and
-  missing-argument cases; fix coverage first, then check with a learning curve.
+  overfits sooner. In the triage scenario below the last 8 points (86% to 94%) came with "no tool" and
+  missing-argument cases, not more epochs; that run also had more data, so an equal-size ablation (the
+  Exercise) separates coverage from size. Fix coverage first, then check with a learning curve.
 - **"QLoRA trains a 4-bit model."** Only the frozen base is stored in 4-bit (NF4); the LoRA adapters train
   in higher precision with bf16 compute, and what you ship is that small adapter.
 - **"Low validation loss means the agent is ready."** Loss measures token fit on the training format, not

@@ -5,7 +5,7 @@ name: AutoGen / AG2 (conversational multi-agent)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:

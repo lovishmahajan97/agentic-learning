@@ -5,7 +5,7 @@ name: Prompt registry
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -57,6 +57,7 @@ Facts and constraints, with illustrative figures:
 - **Team.** A platform team of two already runs an EU config service with pub/sub change events.
 - **Deadline.** Six weeks, because two new tenants sign with custom policies.
 - **Forensics.** Every agent step must be traceable to the exact text it ran with.
+- **Run length.** A contract review runs for up to 5 minutes and pins its prompt versions at the start.
 
 ### Options
 | Option | How it works | Rollback within 2 min | EU residency | Non-engineer editing | Build and run cost |

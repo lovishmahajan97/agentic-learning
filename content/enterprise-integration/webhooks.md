@@ -5,7 +5,7 @@ name: Webhooks
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -71,8 +71,11 @@ for the 30 tenants without webhooks, and hourly reconciliation everywhere.** It 
 meets the 30-second start for every tenant and bounds missed changes to 1 hour.
 - **Receiver:** verify the signature on raw bytes, take the tenant from the secret that verified it,
   enqueue durably by event ID, return 2xx; no LLM work inline.
-- **Once per assignment:** the run ID derives from the event ID (or ticket ID plus updated version for
-  polled tenants), and the reply is claimed with an atomic insert before posting.
+- **Once per assignment:** the event ID deduplicates redeliveries at intake, but the run ID and the reply
+  claim derive from the assignment itself (ticket ID plus the time it entered the AI queue, read from the
+  re-fetched ticket). Webhook, polling and reconciliation then converge on one key, and a later edit to a
+  ticket still in the queue cannot start a second run. The reply is claimed with an atomic insert before
+  posting.
 - **Untrusted input:** the worker re-fetches the ticket and passes its text to the model as data.
 - **Why not 30-second polling:** 28.8 million calls a day and almost no latency headroom.
 - **Why not webhooks alone:** no answer for 30 tenants and no bound on lost events.
@@ -95,7 +98,8 @@ tenants costs 170 x 50 = 8,500 calls.
 - **Delivery semantics named:** at-least-once, unordered and lossy, and how each is handled.
 - **Calls and latency computed:** for polling and for push, from stated tenants, containers and change
   rate.
-- **Exactly-once side effects:** run keyed by event and an atomic claim before the reply.
+- **Exactly-once side effects:** a run key that every intake path derives the same way (event ID for
+  dedup, assignment for the run) and an atomic claim before the reply.
 - **Payloads as hints:** re-fetch through the source and treat text as untrusted model input.
 - **Missed-event bound:** a reconciliation interval chosen from the freshness requirement.
 - **Sources without webhooks handled:** a stated fallback, not silence.

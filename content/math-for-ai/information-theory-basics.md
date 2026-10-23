@@ -5,7 +5,7 @@ name: Information theory basics
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 mastery: understand
@@ -109,9 +109,10 @@ flowchart TD
 ```
 
 ## Misconceptions
-- **"A well-trained model drives loss toward zero."** Cross-entropy can never drop below the entropy of
-  the target. Real next tokens are genuinely uncertain, so validation loss has a floor above 0; a
-  training loss near 0 on agent traces usually means memorization, not mastery.
+- **"A well-trained model drives loss toward zero."** Expected cross-entropy can never drop
+  below the entropy of the true next-token distribution. Real next tokens are genuinely uncertain, so
+  validation loss has a floor above 0; a training loss near 0 on agent traces usually means
+  memorization, not mastery.
 - **"KL divergence is a distance between distributions."** It is not symmetric (0.184 versus 0.192 in the
   example) and has no triangle inequality. Which distribution comes first changes what the student is
   punished for, so it is a design choice in distillation.

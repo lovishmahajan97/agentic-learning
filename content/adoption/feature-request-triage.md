@@ -5,7 +5,7 @@ name: Feature-request triage
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -75,6 +75,8 @@ a routing rule, trial it on real payouts first; it may be a capability limit.
 ### Trade-offs accepted
 - **A customer-specific tool to maintain.** Track it in the extension register with an owner, and test
   it in MegaCorp's suite on every release.
+- **MegaCorp's workflow team is on the critical path.** The chain lives in their system, so agree its
+  delivery date in week 1 and test the gate against a stub until it lands.
 - **Two approval paths in the field.** Watch approval latency and rejection rate per path, so the
   external chain does not hide a slow or failing step.
 - **MegaCorp may still want it in core.** Log every further ask from any account into the same cluster,

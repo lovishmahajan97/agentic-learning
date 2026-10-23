@@ -5,7 +5,7 @@ name: tiktoken
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

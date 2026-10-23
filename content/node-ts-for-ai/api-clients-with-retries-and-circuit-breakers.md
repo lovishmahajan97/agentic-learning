@@ -5,7 +5,7 @@ name: API clients with retries & circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -53,7 +53,8 @@ lets a down CRM crash every agent step.
 - **Prerequisites:** this lesson's "Classify before retrying", "Exponential backoff with full jitter",
   "Circuit breaker" and "In an agent loop: failures become tool results"; AbortController &
   cancellation for the per-attempt timeout you would add in production.
-- **Needs:** Node 20+ with `npm i -D tsx vitest`. A fake clock replaces timers, so backoff is
+- **Needs:** Node 20+ and `npm init -y && npm pkg set type=module && npm i -D tsx vitest` (ESM, for
+  the top-level `await`). A fake clock replaces timers, so backoff is
   deterministic and the tests take milliseconds. Checked with Node 24.21, tsx 4.23 and vitest 5.0.5.
 
 ### Starter code
@@ -267,8 +268,8 @@ reset retried, no deadline check), the breaker tests on `not implemented: Breake
 - **Inject the breaker inside `retry`** (wrap each attempt, not the whole sequence). The CRM opens after
   one logical call instead of two, as the lesson's layering table predicts. Log breaker transitions
   with the attempt number; each logical call should count once.
-- **Inject `Math.random` instead of `p.random`.** The jitter tests flake and the demo's sleeps change
-  per run. Every source of non-determinism the code reads (clock, randomness) belongs in the policy.
+- **Inject `Math.random` instead of `p.random`.** The jitter, cap and deadline tests fail on
+  sleeps that no longer match, and the demo's sleeps change per run. Every source of non-determinism the code reads (clock, randomness) belongs in the policy.
 - **Inject a half-open state that lets every caller through.** The in-flight-probe test fails: after a
   reset, all queued agent steps hit the recovering CRM at once. Count calls that reach the dependency
   while the state is `half-open`; it must be one.

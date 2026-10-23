@@ -5,7 +5,7 @@ name: Small fine-tune for tool-call formatting (LoRA)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:

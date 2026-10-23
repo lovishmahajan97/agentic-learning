@@ -5,7 +5,7 @@ name: Precision / recall / F1
 kind: metric
 difficulty: intro
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 related:

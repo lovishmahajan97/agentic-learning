@@ -5,7 +5,7 @@ name: using MCP servers inside agents (Claude, OpenAI Agents SDK, LangGraph adap
 kind: tool
 difficulty: core
 est_minutes: 20
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -156,9 +156,10 @@ def test_tools_are_filtered_prefixed_and_cached():
     assert (tickets.list_calls, kb.list_calls) == (1, 1)          # cached across agent steps
 
 def test_calls_route_to_the_right_server_by_prefix():
-    router, _, _ = build()
+    router, tickets, kb = build()
     assert router.call("kb__search", {"q": "x"})["content"] == "['KB-7: refunds take 5 days']"
     assert router.call("tickets__search", {"q": "x"})["content"] == "['T-1']"
+    assert (tickets.list_calls, kb.list_calls) == (1, 1)          # call() reuses the cached list
 
 def test_tool_errors_come_back_as_tool_messages():
     router, _, _ = build()
@@ -188,8 +189,8 @@ def test_server_outage_degrades_instead_of_crashing():
   reverse, depending on dict order), and the filter and routing tests fail. Debug by
   printing the tool list the model receives and checking for duplicate names.
 - **Call `list_tools()` inside `call()` to validate names.** Output is still correct, but `list_calls`
-  grows with every step, the same per-request cost the Pitfalls describe. The caching assertion catches
-  it; in production, count `tools/list` spans per run in your traces.
+  grows with every step: the round-trip `cache_tools_list=True` exists to avoid. The `list_calls` assertion in
+  the routing test catches it; in production, count `tools/list` spans per run in your traces.
 - **Let `ConnectionError` propagate.** The outage test errors and, in a real agent, the whole run dies
   on one flaky server. Find it by forcing `fail=True` and checking the agent still produces an answer.
 - **Check approval after calling the server.** The write already happened when the human says no. The

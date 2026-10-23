@@ -5,7 +5,7 @@ name: Warmup
 kind: practice
 difficulty: core
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -142,8 +142,8 @@ flowchart TD
 
 ## Misconceptions
 - **"Gradient clipping makes warmup redundant."** Adam's first step is `η · sign(g)` whatever the
-  gradient's size, so clipping a huge gradient changes nothing. Only a smaller η on those first steps
-  shrinks the move.
+  gradient's size, so clipping a huge gradient changes nothing on that step, and on the next few Adam
+  still divides most of the scale back out. Only a smaller η on those first steps shrinks the move.
 - **"Fine-tuning an already-trained model needs no warmup."** The weights are trained, but each new
   optimizer (and each new LoRA adapter, whose `B` starts at zero) begins with empty `m` and `v`. A fresh
   optimizer needs a fresh ramp.

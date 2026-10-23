@@ -5,7 +5,7 @@ name: Dropout / regularization
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:

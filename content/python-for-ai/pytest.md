@@ -5,7 +5,7 @@ name: pytest
 kind: tool
 difficulty: intro
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

@@ -5,7 +5,7 @@ name: Security questionnaires
 kind: practice
 difficulty: intro
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: background
 mastery: evaluate
@@ -52,8 +52,9 @@ refunds through a tool behind an approval gate. All figures are illustrative pla
 - **Capacity:** 2 security engineers can give a quarter of their time for 13 weeks:
   2 x 40 h x 0.25 x 13 = 260 hours.
 - **Effort assumptions:** writing an answer from scratch takes about 10 minutes with the owner's input;
-  reviewing a draft from approved material takes about 2 minutes. About 70% of questions match an
-  existing answer once a library exists.
+  reviewing a draft from approved material takes about 2 minutes. About 70% of the 2,700 questions
+  repeat one already answered in an earlier questionnaire or in existing policies, so about 30% need a
+  new answer written once.
 - **No audit report yet.** A SOC 2 Type II needs an observation period, so no report arrives this quarter.
 - **Known gaps:** agent traces keep full prompts for 30 days, and a recent change added a US-hosted
   model fallback, while 4 of the 9 buyers ask about EU-only processing.
@@ -77,8 +78,12 @@ parallel, and fix the two known gaps before they become answers.**
 - **Generated from config:** the agent section (tools that write, approval gates, retention) is
   exported from the tool registry, so the refund tool is never described as read-only.
 
-**What would change it.** If deal volume doubled, the SOC 2 report becomes urgent, because removing an
-illustrative third of questions saves more than any drafting gain. With only one or two deals a year, a
+**What would change it.** If deal volume doubled, the library alone no longer fits: at the same rates,
+18 deals give 5,400 x 0.3 x 10 min = 270 h plus 5,400 x 0.7 x 2 min = 126 h, about 396 h, over the
+260 h budget.
+
+The SOC 2 report then becomes urgent, since buyers can accept it in place of an illustrative third of
+their questions, together with more reviewer time. With only one or two deals a year, a
 library without the drafting agent is enough.
 
 ### Trade-offs accepted

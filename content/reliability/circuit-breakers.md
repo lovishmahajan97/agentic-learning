@@ -5,7 +5,7 @@ name: Circuit breakers
 kind: pattern
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -43,7 +43,7 @@ around instead of hanging.
 ## Decision case
 ### Scenario
 A support-agent service sends its model calls to four deployments (two models in two regions), about 10
-calls per second each, 40 in total. All figures are illustrative.
+calls per second each, 40 in total, one model call per agent turn. All figures are illustrative.
 - **The incident to design for:** one deployment starts timing out every call while the other three stay
   healthy, which is the common shape of a provider degradation.
 - **Resources:** the service has 400 concurrent call slots. Healthy calls take 3 seconds at the p99.
@@ -60,15 +60,17 @@ calls per second each, 40 in total. All figures are illustrative.
 |---|---|---|---|---|---|
 | **A. Timeouts and retries only** | 30 s timeout, 3 attempts | 10 × 30 × 3 = 900 at steady state: fails | 90 s, then an error | unaffected until slots run out | none |
 | **B. One consecutive-count breaker for the provider** | trip after 5 failures in a row, all 40 calls a second counted together | about 10 × 30 = 300 until it trips | 30 s turns for about a minute | healthy calls break the run of failures, so 5 in a row takes about 1,364 calls (34 s) once timeouts land; the trip then fails all four over | a library default, one day |
-| **C. Ratio breaker per deployment, timeout inside, bulkhead beside** | key by provider × model × region; window 50, minimum 20, 50% trip ratio; 8 s timeout and slow calls counted; bulkhead of 60 per deployment; 4xx ignored; `CircuitOpen` non-retryable | at most 60, the bulkhead | 8 s, then the fallback; trips about 10 s in | untouched | about two weeks |
+| **C. Ratio breaker per deployment, timeout inside, bulkhead beside** | key by provider × model × region; window 50, minimum 20, 50% trip ratio; 8 s timeout and slow calls counted; bulkhead of 60 per deployment; 4xx ignored; `CircuitOpen` non-retryable | at most 60, the bulkhead | 8 s plus the fallback, about 11 s, for the 10 s before it trips; then the fallback alone | untouched | about two weeks |
 | **D. Mesh outlier detection only** | eject hosts after consecutive 5xx | no cap: the provider is one external hostname, and timeouts are not 5xx | 30 s | ejects nothing useful | a config change |
 
 ### Decision
 Choose **C**, because it is the only option that holds every constraint during a single-deployment outage.
 - **Slots:** the bulkhead caps the sick deployment at 60 slots, so 340 remain. Normal demand is 10 × 3 = 30
   per deployment, so the three healthy ones need about 90.
-- **Latency:** an 8-second timeout inside the breaker bounds the worst turn below the 10-second limit. The
-  first 20 calls fail within about 10 seconds, so the breaker trips well before B's minute.
+- **Latency:** the first 20 calls fail within about 10 seconds, so the breaker trips well before B's
+  minute. Before the trip, at most about 80 sick-path turns wait out the 8-second timeout and then take
+  the fallback, up to about 11 seconds. That is 80 of the 2,400 turns in a minute, about 3%, so the p95
+  stays under 10 seconds; after the trip, turns go straight to the fallback.
 - **Blast radius:** keying by failure domain keeps three quarters of traffic on the primary. B's
   provider-wide breaker sends it all to the pricier secondary.
 - **4xx:** ignored exceptions keep a bad prompt from opening a healthy breaker.

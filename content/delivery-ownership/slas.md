@@ -5,7 +5,7 @@ name: SLAs
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -50,6 +50,9 @@ draft SLA. All figures are illustrative planning numbers, not vendor terms.
 - **Path per run:** 4 model calls, 2 calls to the insurer's claims API, 1 vector-store query, in series.
   Contract terms behind it: provider 99.9 percent, vector store 99.95 percent, your own service measured
   at about 99.9 percent.
+- **Ceiling rules:** the draft excludes failures of the insurer's own claims API, so it stays out of the
+  ceiling. The terms are monthly and time-based, so each dependency enters the product once however many
+  calls a run makes; per-call errors inside an up window are what retries absorb.
 - **Loop:** step cap 8; a step averages about 1.5 seconds of model time plus 0.5 seconds of tool time.
 - **Team:** 5 engineers in one time zone; no secondary provider integrated yet.
 - **Deadline:** signature in 4 weeks; a cross-provider fallback needs about 6 weeks to build and drill.
@@ -76,9 +79,12 @@ alone.
   run-level availability at or above 99.95 percent. Note that the fallback alone is not enough: your own
   service at 99.9 percent caps the ceiling at 99.9.
 
-**What would change it.** If the insurer mandates the model provider, push for a provider-outage
-exclusion and the 99.9 target becomes defensible sooner. If measured own-service availability stays
-under 99.75 percent, even 99.5 gets thin, so fix your own reliability before selling the step-up.
+**What would change it.**
+- **A mandated provider:** push for a provider-outage exclusion. The ceiling rises to 0.999 x 0.9995 ≈
+  99.85 percent, widening the 99.5 margin from 0.25 to 0.35 percent, but it still sits below 99.9, so the
+  step-up still waits on your own service.
+- **Weak own service:** if measured own-service availability stays under 99.75 percent, even 99.5 gets
+  thin, so fix your own reliability before selling the step-up.
 
 ### Trade-offs accepted
 - **A weaker headline number in the deal.** Procurement may push back. Answer with the allowance table
@@ -90,7 +96,7 @@ under 99.75 percent, even 99.5 gets thin, so fix your own reliability before sel
 
 ### Review rubric
 - **Ceiling computed from the run path:** the write-up multiplies the contract terms of every serial
-  dependency and its own service, not the model provider's number alone.
+  dependency the contract does not exclude, and its own service, not the model provider's number alone.
 - **Ordering stated:** the signed SLA sits below an internal SLO, which sits below the ceiling, with the
   margin converted to minutes.
 - **Latency tied to loop caps:** step cap, per-step time and retry room add up to the promised bound.

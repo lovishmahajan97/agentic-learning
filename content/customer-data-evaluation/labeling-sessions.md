@@ -5,7 +5,7 @@ name: Labeling sessions
 kind: practice
 difficulty: intro
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -74,8 +74,10 @@ What would change it:
 - **Async completion falls.** If any SME finishes under 80% of their batch two weeks running (a team
   threshold, not a standard), raise it with the sponsor and move part of their labelling into a second
   shared slot.
-- **A wider overlap.** If the Singapore SME's hours shift to give a 90-minute window, the full live
-  session format (A) returns, with 50 labelling minutes.
+- **A much wider overlap.** A 90-minute window with 50 labelling minutes, as in the worked session, still
+  gives only 32 traces a week, about 13 weeks to 400. The all-live format (A) returns only if the window
+  reaches about 2 hours (about 75 labelling minutes, 52 traces a week, just under 8 weeks with no slack) or
+  the deadline moves past 13 weeks.
 - **Stable, high agreement.** Once pooled agreement and gold-check accuracy hold for several weeks, the live
   call can go fortnightly.
 

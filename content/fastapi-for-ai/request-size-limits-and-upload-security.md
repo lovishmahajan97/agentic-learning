@@ -5,7 +5,7 @@ name: Request-size limits & upload security
 kind: practice
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

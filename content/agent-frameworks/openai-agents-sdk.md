@@ -5,7 +5,7 @@ name: OpenAI Agents SDK (agents, tools, handoffs, guardrails, tracing)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

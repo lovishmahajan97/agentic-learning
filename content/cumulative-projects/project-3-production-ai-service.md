@@ -5,7 +5,7 @@ name: "Project 3: production AI service"
 kind: practice
 difficulty: advanced
 est_minutes: 30
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 mastery: evaluate

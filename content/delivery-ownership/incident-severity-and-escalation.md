@@ -5,7 +5,7 @@ name: Incident severity & escalation
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -51,7 +51,8 @@ illustrative planning numbers from a two-week shadow run of candidate alerts.
 - **Shadow results:** uptime and error alerts fired 1 time (1 real). Guardrail-block spikes and
   quality-score dips at unvalidated thresholds fired 18 times (2 real). Side-effect alerts (refunds per
   hour against ticket volume, emails to addresses not in the CRM, another tenant's document IDs in a
-  response) fired 3 times (2 real).
+  response) fired 3 times (2 real: a duplicate-refund burst and one cross-tenant document). Both real
+  side-effect incidents returned HTTP 200 throughout.
 
 ### Options
 | Option | How it works | Real incidents caught in shadow | Pages per on-call week | Mitigation without deploy |
@@ -63,8 +64,8 @@ illustrative planning numbers from a two-week shadow run of candidate alerts.
 ### Decision
 **Agent criteria plus action and leak alerts.** It is the only option inside the page budget that pages
 for the incidents agents cause while dashboards stay green.
-- **Why not the company scale as is:** both real refund and leak incidents in the shadow run returned
-  HTTP 200, so it caught 1 of 5 real incidents.
+- **Why not the company scale as is:** the real refund and leak incidents in the shadow run returned
+  HTTP 200, so it caught only the 1 outage among 5 real incidents.
 - **Why not page on everything:** 11 pages a week at 5 real out of 22 means precision of about 23%, and
   for the quality alerts alone 2 of 18, about 11%. People learn to ignore that pager.
 - **What makes it work:** irreversible actions and cross-tenant exposure are SEV1 even for one case,

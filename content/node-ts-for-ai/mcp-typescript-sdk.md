@@ -5,7 +5,7 @@ name: MCP TypeScript SDK
 kind: tool
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -230,7 +230,8 @@ message), and the last two throw `not implemented: callPrefixed`.
   client named `orders_lookup` that does not exist, and the routing test fails. Log the prefix and the
   bare tool name for every call; names with underscores are why the prefix itself must not contain one.
 - **Inject the gate in the server:** move the approval check into `refund_order`'s handler. The server
-  cannot see the user or the run, so it either always refuses or always runs. Keep `NEEDS_APPROVAL` in the
+  cannot see the user or the run, so it either always refuses or always runs: the routing test fails at
+  `refunds` (filled after `deny`) or at the `allow` call (`isError: true`). Keep `NEEDS_APPROVAL` in the
   host, where the per-call decision and its log line belong.
 - **Inject a missing `catch`:** let `callTool` reject. The timeout test fails with `McpError` and
   `Request timed out`, which in a real loop ends the whole run on one slow tool. Track p95 tool latency

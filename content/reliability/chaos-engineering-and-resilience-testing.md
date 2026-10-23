@@ -5,7 +5,7 @@ name: Chaos engineering & resilience testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:

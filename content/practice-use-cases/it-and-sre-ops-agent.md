@@ -5,7 +5,7 @@ name: IT and SRE ops agent (alerts, runbooks, safe remediation)
 kind: practice
 difficulty: advanced
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -59,7 +59,7 @@ itself. All figures are illustrative planning numbers from the team's own alert 
   budget $500 a month; one engineer for 6 weeks.
 
 ### Options
-| Option | How it works | Night pages avoided a week | Change policy | Stateful risk | Cost and effort |
+| Option | How it works | Pages avoided a week | Change policy | Stateful risk | Cost and effort |
 |---|---|---|---|---|---|
 | A. Read-only triage (today) | Note plus shadow-logged proposals | 0; triage faster, mitigation unchanged | met: no writes | none | about 520 x $0.50 = $260 a month; done |
 | B. Approve every write in Slack | Agent proposes, on-call taps approve | 0: on-call still wakes to tap, but mitigates in minutes | met: named approver each time | low: human sees evidence | same model cost; about 2 weeks |

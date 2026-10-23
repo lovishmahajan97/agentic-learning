@@ -5,7 +5,7 @@ name: PostgreSQL transactions & migrations
 kind: practice
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -50,7 +50,8 @@ client and every later step hangs on `connect()`.
 - **Time box:** 60-90 minutes.
 - **Prerequisites:** this lesson's "Transactions on one client", "Idempotency and the outbox" and
   "Migrations" sections; the idempotency key idea from BullMQ & durable jobs helps.
-- **Needs:** Node 20+ with `npm i @electric-sql/pglite` and `npm i -D tsx vitest`. PGlite is real
+- **Needs:** Node 20+ and `npm init -y && npm pkg set type=module && npm i @electric-sql/pglite &&
+  npm i -D tsx vitest` (ESM, for the top-level `await`). PGlite is real
   Postgres compiled to WebAssembly, so no server or Docker is needed and SQLSTATE codes are real.
   Checked with Node 24.21, PGlite 0.5.11, tsx 4.23 and vitest 5.0.5.
 
@@ -264,7 +265,8 @@ describe("migrate", () => {
 ```
 
 All 8 fail on the starter. The helper tests fail with `AssertionError` (a client still checked out,
-one attempt instead of three) or the raw `40001`.
+one attempt instead of three) or the raw `40001`; the redelivery test stops on the raw `23505`
+duplicate-key error.
 
 The budget test times out after 5 s, the leaked client in action: `one()` waits on `connect()`
 forever. The read-then-write test sees
@@ -272,7 +274,7 @@ forever. The read-then-write test sees
 
 ### Failure scenarios
 - **Inject `client.release()` only after `COMMIT`,** not in `finally`. The budget test times out
-  instead of failing. Debug with `pool.stats()`: `checkedOut` stuck at 1 and `waiting` growing is the
+  instead of failing, and so do both retry tests. Debug with `pool.stats()`: `checkedOut` stuck at 1 and `waiting` growing is the
   same signature as `pool.waitingCount` at `max` in production.
 - **Inject `BEGIN` inside the 0003 file's transaction.** Postgres refuses with SQLSTATE `25001`
   ("CREATE INDEX CONCURRENTLY cannot run inside a transaction block"). Check the opt-out marker is

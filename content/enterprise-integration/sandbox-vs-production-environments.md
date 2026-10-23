@@ -5,7 +5,7 @@ name: Sandbox vs production environments
 kind: practice
 difficulty: core
 est_minutes: 13
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -75,6 +75,9 @@ sign-off and still fits the deadline.
 
 - **The sample is large enough.** To estimate 88% agreement within ±1 point at 95% confidence needs
   about 1.96² × 0.88 × 0.12 / 0.01² ≈ 4,057 cases, so even the first two shadow days (6,000) suffice.
+- **Shadow respects the data agreement.** The comparison log outside the tenant keeps only case id,
+  proposed and human category and priority; drafted replies, which quote case text, stay in the
+  customer's tenant.
 - **Rollback criteria are agreed before the canary:** agreement below 85% or a write-error rate above
   1% on the canary queue returns it to shadow.
 

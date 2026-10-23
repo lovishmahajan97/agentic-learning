@@ -5,7 +5,7 @@ name: MCP server primitives (tools, resources, prompts)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -214,7 +214,7 @@ def test_load_context_reads_only_hits():
   `build_server` fails at decoration with `ValueError: Mismatch between URI parameters`. Read the two sets
   in the message and make them match.
 - **Let an unknown id fall through to a bare `KeyError`.** The client gets an `McpError` whose message is
-  just `'nope'`, and `test_unknown_section_is_an_error_with_next_step` fails. The agent cannot recover from
+  `Error creating resource from template: ... 'nope'` (in mcp 1.30.0), and `test_unknown_section_is_an_error_with_next_step` fails. The agent cannot recover from
   that text; raise with a message that names the tool that returns valid ids.
 - **Forget `readOnlyHint`.** `t.annotations` is `None` and `main` raises `AttributeError`. A host that
   auto-approves only read-only tools from trusted servers would now ask for approval on every search.

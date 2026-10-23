@@ -5,7 +5,7 @@ name: safetensors
 kind: tool
 difficulty: intro
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -154,8 +154,9 @@ adapter.bin: REJECTED
 - **Check the bytes:** each of the 4 tensors is 8 × 64 values × 2 bytes (F16) = 1,024 bytes, so 4,096.
 
 ### Tests
-Save as `test_lab.py` and run `pytest -q`. Six cases fail on the starter with "DID NOT RAISE"; the good
-adapter and the pickle case pass.
+Save as `test_lab.py` and run `pytest -q`. Seven cases fail on the starter with "DID NOT RAISE"; the good
+adapter and the pickle case pass. The last test saves a valid adapter as `adapter.bin`, because the
+pickle case alone cannot tell a real extension check from the starter's lucky header-size rejection.
 
 ```python
 import pickle
@@ -218,6 +219,12 @@ def test_missing_provenance_is_rejected(tmp_path):
     save_file(dict(zip([A, A.replace("lora_A", "lora_B")], lora())), tmp_path / "m.safetensors")
     with pytest.raises(ValueError):
         audit_adapter(str(tmp_path / "m.safetensors"))
+
+
+def test_non_safetensors_name_is_rejected(tmp_path):      # a valid file under the wrong name
+    make_good(tmp_path / "adapter.bin")
+    with pytest.raises(ValueError):
+        audit_adapter(str(tmp_path / "adapter.bin"))
 ```
 
 ### Failure scenarios
@@ -232,7 +239,7 @@ def test_missing_provenance_is_rejected(tmp_path):
   the danger. Debug: grep the intake path for `torch.load`; conversion belongs in a sandbox job.
 
 ### Submission
-- **`lab.py` passing all eight tests**, with output matching Expected output.
+- **`lab.py` passing all nine tests**, with output matching Expected output.
 - **A manifest** printed for a real PEFT `adapter_model.safetensors` (any small public adapter), with the
   `base` shapes you derived from its base model's config.
 - **A note** listing which checks still do not prove the adapter is safe to run, and the eval gate that

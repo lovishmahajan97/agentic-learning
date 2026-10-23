@@ -5,7 +5,7 @@ name: agent tracing dashboard (OpenTelemetry or Langfuse)
 kind: practice
 difficulty: core
 est_minutes: 22
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -184,11 +184,11 @@ def test_step_budget_ends_a_looping_run():
 ```
 
 ### Failure scenarios
-- **Use `tracer.start_span` without making it current.** Children get no parent, the tree test shows six
-  roots and the backend shows six one-span traces. Print `span.parent` for a `chat` span; it must point at
+- **Use `tracer.start_span` without making it current.** Children get no parent, the tree test shows seven
+  roots (the agent span plus six unparented children) and the backend shows seven one-span traces. Print `span.parent` for a `chat` span; it must point at
   the root's `span_id`.
-- **Catch the tool exception but skip the status.** The run survives, but the error test fails and every
-  dashboard error rate reads zero. Filter spans by `status.status_code` before trusting a tool's error rate.
+- **Catch the tool exception but skip the status.** The run survives, but the error, tree and summary tests
+  fail (`errors: 0`) and every dashboard error rate reads zero. Filter spans by `status.status_code` before trusting a tool's error rate.
 - **Put the user question on every span by default.** The capture test fails on `sk-999`; in production
   secrets and personal data land in a third-party backend. Gate content behind a flag and grep exported
   spans for a planted canary in CI.

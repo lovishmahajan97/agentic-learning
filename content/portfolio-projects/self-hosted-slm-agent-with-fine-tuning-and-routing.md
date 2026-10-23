@@ -6,7 +6,7 @@ kind: practice
 difficulty: advanced
 est_minutes: 40
 agent_relevance: core
-status: typed
+status: typed-verified
 lesson_type: decision
 related:
   - slm-for-agents/fine-tuning-an-slm-for-an-agent-task

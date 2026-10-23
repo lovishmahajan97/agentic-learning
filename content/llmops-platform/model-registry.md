@@ -5,7 +5,7 @@ name: Model registry
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -48,7 +48,8 @@ monthly and served merged in fp16, an embedder behind the claims-document index,
 
 Facts and constraints, with illustrative figures:
 - **Size.** Each fine-tuned version is about 16 GB (8 billion × 2 bytes), served on 12 GPU replicas.
-- **Rollback drill.** The self-hosted model must be back on the previous version within 5 minutes.
+- **Rollback drill.** The self-hosted model must be back on the previous version within 5 minutes. A
+  config change goes through PR review and a deploy pipeline that takes about 25 minutes.
 - **Audit.** A SOC 2 audit in four months will ask who approved each model that served production and on
   what evidence.
 - **Team.** Three ML engineers who already log training runs to MLflow tracking.
@@ -63,9 +64,9 @@ Rollback arithmetic for the 8B model, all rates illustrative:
 ### Options
 | Option | How it works | Rollback under 5 min | Audit: who approved what | Embedder-index guard | Effort |
 |---|---|---|---|---|---|
-| **A. Pinned URIs and hashes in config** | Each role pinned in a config file, changed by PR | No: a PR and deploy | Partial: git blame, no evidence link | Manual | Lowest |
+| **A. Pinned URIs and hashes in config** | Each role pinned in a config file, changed by PR | No: a PR and deploy, about 25 min | Partial: git blame, no evidence link | Manual | Lowest |
 | **B. MLflow registry, all four roles** | Versions from tracked runs, `champion` aliases moved only by CI, a virtual version for the hosted LLM, previous champion kept warm | Yes: about 76 s with the cache | Yes: alias permissions, evidence tags, lineage to runs | Startup check against index metadata | Moderate; the tracking server already exists |
-| **C. Private Hub repositories pinned by sha** | Weights in Hub repos, config pins commit shas | No: a config change and deploy | Partial: commit history, no run lineage | Manual | Low |
+| **C. Private Hub repositories pinned by sha** | Weights in Hub repos, config pins commit shas | No: a config change and deploy, about 25 min | Partial: commit history, no run lineage | Manual | Low |
 | **D. Register model plus prompt as one bundle** | One versioned unit per combination, one alias move | Yes, if cached | Yes | Yes | High: every prompt edit or retrain makes a new bundle |
 
 ### Decision

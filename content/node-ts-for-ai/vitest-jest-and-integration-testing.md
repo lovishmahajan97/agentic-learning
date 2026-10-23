@@ -5,7 +5,7 @@ name: Vitest / Jest & integration testing
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -202,9 +202,10 @@ and `opts.tools[call.name] is not a function`).
 - **Inject a swallowed error:** catch the tool error but push `isError: false`. The model would read a
   failure as data. The `toMatchObject` diff shows `isError` flipped; grep your loop for every place that
   builds a `ToolResult`.
-- **Inject a real-network leak:** import an SDK client at module scope in `agent.ts`. Tests still pass
-  offline but CI now needs a key to import the file. Run the suite with no provider key in the
-  environment; a key error at import time means the model is no longer injected.
+- **Inject a real-network leak:** construct an SDK client at module scope in `agent.ts` (for example
+  `new OpenAI()`). The suite still passes on a laptop with a key set, but importing the file now needs one:
+  run it with no provider key in the environment and the OpenAI constructor throws at import time (some
+  SDKs, such as Anthropic's, only fail at the first request). Either way the model is no longer injected.
 
 ### Submission
 - **Your `agent.ts`** with the three `YOUR CODE` parts done and the file's exports unchanged.

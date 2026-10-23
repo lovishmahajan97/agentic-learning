@@ -5,7 +5,7 @@ name: Typed tool contracts
 kind: pattern
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: core
 mastery: implement
@@ -153,8 +153,10 @@ flowchart TD
 - **"MCP annotations tell me which tools are safe."** `readOnlyHint` and `destructiveHint` from a server
   you do not control are claims, not guarantees. Gate on your own side-effect class.
 - **"Retrying a write after a timeout is safe if the tool is typed."** Types do not show whether the
-  downstream commit already happened. An idempotency key derived from the `tool_use` id is what makes
-  the retry a no-op.
+  downstream commit already happened. An idempotency key the harness passes downstream is what makes
+  the retry a no-op: the `tool_use` id covers harness retries of the same call, but a model that
+  re-issues the call gets a new id, so that case needs a key from the operation itself (for example
+  run id, tool name and order id).
 
 ## Examples
 ### A registry entry derived from types

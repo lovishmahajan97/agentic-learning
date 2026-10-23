@@ -5,7 +5,7 @@ name: CLIP
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -170,8 +170,8 @@ flowchart TD
 - **"CLIP understands the whole scene."** The loss rewards only what distinguishes captions in a batch,
   so it learns objects, scenes and styles but not counts or layout; "how many" and "left of" need a VLM
   or a detector.
-- **"A longer, more detailed query retrieves more precisely."** The text encoder stops at 77 tokens, so
-  later constraints are silently dropped. Keep the tool's query a short visual description and move
+- **"A longer, more detailed query retrieves more precisely."** The text encoder sees at most 77 tokens; with
+  truncation on, as search code usually sets it, later constraints are silently dropped. Keep the tool's query a short visual description and move
   dates, SKUs or prices into structured filters.
 
 ## Examples

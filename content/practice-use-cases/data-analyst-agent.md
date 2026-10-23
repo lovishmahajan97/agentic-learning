@@ -5,7 +5,7 @@ name: data analyst agent (text-to-SQL, charts, guarded queries)
 kind: practice
 difficulty: core
 est_minutes: 20
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -65,7 +65,7 @@ as are all figures here.
 reviewed by the analyst.** It is the only option that meets the finance accuracy bar inside 8 weeks. Raw
 SQL is faster to build but its join mistakes land exactly on the revenue questions that must match.
 - **Review load fits:** 225 finance answers x 3 min = 11.25 hours, plus a 10% spot check of the other 675
-  (about 68 x 3 min = about 3.4 hours), so about 14.6 of the 20 hours.
+  (about 68 x 3 min = about 3.4 hours), so about 14.7 of the 20 hours.
 - **Agent sees views first:** schema retrieval ranks the 12 views above raw tables, and raw tables stay
   reachable for the other 15% of questions.
 - **SQL and assumptions shown** on every answer, so users can challenge a number.

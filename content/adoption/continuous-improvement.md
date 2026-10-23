@@ -5,7 +5,7 @@ name: Continuous improvement
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -68,6 +68,11 @@ the model untouched, so the gate result is attributable.
   of 6 per 1,000 that is about 24 loop runs, a Poisson error of `sqrt(24) ≈ 4.9` runs, or 6.0 ± 1.2 per
   1,000.
 - **Baseline over the same weeks:** 36,000 runs at 18 per 1,000 is 648 loop runs, about 18 ± 0.7.
+- **What the canary does and does not prove:** 6.0 ± 1.2 is far from the baseline, but its two-error
+  band reaches 8.4, so it cannot yet show "below 8". At full rollout, 20,000 runs a week give about 120
+  loop runs, `sqrt(120) ≈ 11`, or 6.0 ± 0.55 per 1,000, which does.
+- **Count the cap, do not hide it:** runs stopped by the loop detector still count in the loop bucket,
+  so the rate measures the tool fix; the detector only caps the wasted steps and wait per remaining loop.
 - **Week 4:** full rollout and the review number.
 
 **What would change it.** If traces showed loops spread over many tools with good results, the cause is
@@ -89,7 +94,8 @@ quarter, the model move becomes its own gated release, never bundled with this f
 - **Encode-first step present:** failing cases enter the suite and are shown to fail before the fix.
 - **Verification sized:** canary volume and duration give an error band that separates the target from
   the baseline.
-- **Attribution protected:** one change per release, with model or prompt moves kept separate.
+- **Attribution protected:** one targeted bucket per release, with model or prompt moves kept separate
+  and any safety cap counted in the bucket rather than hiding it.
 - **Flip conditions named:** what trace evidence or vendor change would make another option right.
 
 ## Why it exists

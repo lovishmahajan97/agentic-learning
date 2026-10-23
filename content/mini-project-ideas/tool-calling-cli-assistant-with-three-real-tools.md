@@ -5,7 +5,7 @@ name: tool-calling CLI assistant with three real tools
 kind: practice
 difficulty: intro
 est_minutes: 20
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

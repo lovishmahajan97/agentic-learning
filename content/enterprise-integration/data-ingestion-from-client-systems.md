@@ -5,7 +5,7 @@ name: Data ingestion from client systems
 kind: pattern
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -73,8 +73,9 @@ outbound-only path without DBA work. The quota arithmetic, at 200 records per pa
 
 - **Agent calls get priority.** In business hours the live tool may use up to 20 per minute, so sync
   runs at the remaining 20; the incremental job's 1 page per poll fits easily.
-- **Deletes meet 24 hours** because the ID diff runs nightly and tombstones go through the same index
-  path.
+- **Deletes meet 24 hours** because the ID diff runs at the same time each night and tombstones each id
+  page as it is compared, so a ticket deleted just after its page was read is removed on the next run,
+  about 24 hours later; tombstones go through the same index path.
 - **Raw landing keeps ACLs** with content, so the index can enforce them and be rebuilt without asking
   the bank again.
 

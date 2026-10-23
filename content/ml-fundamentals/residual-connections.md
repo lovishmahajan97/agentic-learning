@@ -5,7 +5,7 @@ name: Residual connections
 kind: concept
 difficulty: core
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: background
 related:
@@ -155,9 +155,11 @@ flowchart TD
 ```
 
 ## Misconceptions
-- **"Residual connections solved vanishing gradients."** He et al.'s deeper plain nets already used batch
-  normalization and sound init, and their gradients were not zero. The problem was optimization: layers
-  could not learn the identity. Learning `F(x) = H(x) − x` makes "do nothing" the easy starting point.
+- **"Residual connections were invented to fix vanishing gradients."** He et al.'s deeper plain nets
+  already used batch normalization and sound init, and the authors checked their gradients were healthy,
+  yet they had higher *training* error (degradation). The diagnosis was that stacked layers struggle to
+  learn the identity; learning `F(x) = H(x) − x` makes "do nothing" the easy start. The identity gradient
+  path is a real second benefit, not the original problem.
 - **"The stream at layer k is what layer k computed."** It is the sum of the embedding and every earlier
   write. Hook the branch output when you want one layer's contribution for steering or interpretability.
 - **"A gated or learned skip scale is a harmless generalization."** Any factor on the skip path compounds

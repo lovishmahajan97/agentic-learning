@@ -5,7 +5,7 @@ name: User training
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -57,7 +57,7 @@ illustrative planning numbers.
 | Recorded video and job aid | 20-minute video, in-tool "always check" card | 400 x 20 min = about 133 | about 5 to record | No: completion only |
 | Full live program | Three 45-minute sessions per cohort of 20, drill in session two | 400 x 2.25 h = 900, over the 600 cap | 20 cohorts x 3 x 0.75 h = 45, over 30 | Yes |
 | Blended with a drill gate | One 45-minute live session per cohort of 40 (mental model, real failures, data rules), then a 30-minute in-product drill of 20 items that unlocks approval rights | 400 x 1.25 h = 500, plus retakes | 10 x 0.75 h = 7.5 | Yes: every handler's catch and false-reject scores |
-| Train-the-trainer only | FDEs train 40 champions, who run the live program for their teams | As full program, 900 | about 10 plus coaching | Yes, but scoring quality varies by champion |
+| Train-the-trainer only | FDEs train 40 champions, who run the live program for their teams | As full program, 900, over the 600 cap | about 10 plus coaching | Yes, but scoring quality varies by champion |
 
 ### Decision
 **Blended with a drill gate.** It is the only option inside both caps that also produces the evidence

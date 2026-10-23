@@ -5,7 +5,7 @@ name: Retry / deduplication / reconciliation
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -43,9 +43,10 @@ events that never arrived. Each covers a failure the other two cannot see.
 ## Decision case
 ### Scenario
 An accounts-payable agent reads supplier invoices and posts them as vendor bills into a mid-size
-customer's ERP through its REST API. Volume is 12,000 postings per day. The API has no idempotency-key
-header, but the customer's admin can add a custom external-id field on bills. All figures are
-illustrative.
+customer's ERP through its REST API. Volume is 12,000 postings per day.
+
+The API has no idempotency-key header, but the customer's admin can add a custom external-id field on bills, and the API can upsert a
+bill keyed on that field. All figures are illustrative.
 
 - **Correctness:** zero duplicate bills, because a duplicate bill becomes a duplicate payment.
 - **Latency:** a bill must appear in the ERP within 15 minutes (p95) of the invoice arriving, so

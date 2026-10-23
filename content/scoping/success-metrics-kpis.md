@@ -5,7 +5,7 @@ name: Success metrics / KPIs
 kind: metric
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -49,19 +49,24 @@ Constraints (figures illustrative):
 - **Data.** No new warehouse: only a join on the ticket ID that the agent already logs in the CRM.
 - **People.** One analyst at 20% time, about 8 hours a week.
 - **Known guardrail.** The 7-day repeat-contact rate is 12% today; a rise to 14% would be unacceptable.
+- **Noisy weeks.** Network outages swing chat volume and intent mix from week to week, which moves cost
+  per contact and repeat contact with no change to the agent.
 
 ### Options
-| Option | How it works | Fits the CFO's number? | Catches gaming? | Fits data and people? |
-|---|---|---|---|---|
-| **A. Containment only** | Pass if 70% of chats end without a human | No: containment is not cost | No: ending chats early raises it | Yes, one counter |
-| **B. Agent evals as criterion** | Pass on golden-set task completion and tool-call accuracy | No: says nothing about money | No: the agent self-reports success | Yes, already built |
-| **C. CSAT only** | Pass if post-chat CSAT holds | No | Partly: unhappy customers often skip the survey | Yes |
-| **D. Metric tree with holdout** | Outcome: cost per successfully resolved contact. Drivers: true resolution, adoption. Quality: audited completion. Guardrails: repeat contact, CSAT, severe escalations. 25% holdout | Yes, it is the outcome | Yes, guardrails paired with each driver | Yes, all from the ticket join plus a weekly audit |
+| Option | How it works | Fits the CFO's number? | Catches gaming? | Separates the agent from outage weeks? | Fits data and people? |
+|---|---|---|---|---|---|
+| **A. Containment only** | Pass if 70% of chats end without a human | No: containment is not cost | No: ending chats early raises it | No | Yes, one counter |
+| **B. Agent evals as criterion** | Pass on golden-set task completion and tool-call accuracy | No: says nothing about money | No: the agent self-reports success | Offline only: a fixed set, not live traffic | Yes, already built |
+| **C. Metric tree, before/after** | Same tree as D, compared with the 8 weeks before launch; every chat goes to the agent | Yes, it is the outcome | Yes, guardrails paired with each driver | No: an outage week lands in one period only | Yes, and no customer waits |
+| **D. Metric tree with holdout** | Outcome: cost per successfully resolved contact. Drivers: true resolution, adoption. Quality: audited completion. Guardrails: repeat contact, CSAT, severe escalations. 25% holdout | Yes, it is the outcome | Yes, guardrails paired with each driver | Yes: both groups see the same outages | Yes, all from the ticket join plus a weekly audit |
 
 ### Decision
-Choose **D**, with a 25% holdout, because three constraints point to it:
+Choose **D**, with a 25% holdout, because four constraints point to it:
 - **The outcome must be the CFO's number.** Containment becomes a driver, defined strictly as no human
   touch and no repeat contact within 7 days, so the agent cannot win by closing chats.
+- **Outages rule out before/after.** C measures the right tree, but one outage week can move repeat
+  contact by more than the 2 points the guardrail must detect. A concurrent holdout sees the same
+  outages in both groups, so the difference is the agent's.
 - **The guardrail sets the holdout size.** Detecting 12% to 14% needs about 16 × 0.12 × 0.88 / 0.02² ≈
   4,224 chats per group. A 25% holdout gets 750 a week and reaches that in about 5.6 weeks, inside the
   8-week window. A 10% holdout (300 a week) would need about 14 weeks.

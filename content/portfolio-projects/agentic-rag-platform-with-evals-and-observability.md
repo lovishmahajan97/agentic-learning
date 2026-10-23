@@ -6,7 +6,7 @@ kind: practice
 difficulty: advanced
 est_minutes: 35
 agent_relevance: core
-status: typed
+status: typed-verified
 lesson_type: decision
 related:
   - rag-retrieval/agentic-rag
@@ -61,12 +61,14 @@ agentic search to run per question. All figures are illustrative results from th
 |---|---|---|---|---|
 | Single-shot | One hybrid search and rerank, then answer | 82%, 55%, 73.9% | $200 | 3 s / 3 s |
 | Always agentic | Every question goes through the search loop | 86%, 80%, 84.2% | $600 | 5 s / 11 s |
-| Routed | Classifier sends simple questions to single-shot, the rest to the loop | 80.9% overall | $356 | 3 s / 11 s |
+| Routed | Classifier sends simple questions to single-shot, the rest to the loop | 80.9% overall | $356 | about 5 s / 11 s |
 | Decompose once | One call splits the question, searches run in parallel, no loop | 84%, 65%, 78.3% | $300 | 4 s / 4 s |
 
 Routed quality: 63% of traffic is simple and routed right (82%), 7% simple sent to the loop (86%), 27%
 multi-part routed right (80%) and 3% multi-part sent to single-shot (55%), giving 80.9%. Its cost per
 answer is 0.34 x $0.03 + 0.66 x $0.01 + $0.001 = $0.0178.
+
+Routed latency: its simple-lookup p95 is about 5 s, not 3 s. 10% of simple lookups (7 of 70) are misrouted to the loop, more than the slowest 5%, so they set the p95.
 
 ### Decision
 **Route: single-shot for simple lookups, the agent loop for multi-part questions.** It is the only option

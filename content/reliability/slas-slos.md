@@ -5,7 +5,7 @@ name: SLAs / SLOs (and SLIs, error budgets)
 kind: concept
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -58,7 +58,7 @@ before it signs. All figures are illustrative.
 ### Options
 | Option | SLA and internal SLO | Can the stack support it? | Deadline | Measurable from the customer's side? |
 |---|---|---|---|---|
-| **A. Sign 99.95% now** | SLA 99.95% (21.6 min a month) | no: the ceiling is 0.999 × 0.9995 ≈ 99.85%; the provider alone may use 43.2 min | met | yes |
+| **A. Sign 99.95% now** | SLA 99.95% (21.6 min a month) | no: the contractual ceiling is 0.999 × 0.9995 ≈ 99.85% (history beat it, but the vendors do not promise that); the provider alone may use 43.2 min | met | yes |
 | **B. Sign 99.5%, run 99.8% inside** | SLA 99.5% (216 min); SLO 99.8% (86.4 min) | yes: dependencies may use 64.8 min, leaving 21.6 min for your own failures; the worst month passed | met | yes: task outcomes counted at the gateway |
 | **C. Add a fallback, then sign 99.9%** | SLA 99.9% (43.2 min); SLO near 99.93% (30.24 min) | only with an independent fallback: about 99.95% ceiling, and independence is rarely true | fails: six weeks against four | yes |
 | **D. Sign a task-quality SLA** | "99% of tasks correct" | no: vendors do not promise quality | met | no: needs sampled evals the customer cannot audit |

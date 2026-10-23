@@ -5,7 +5,7 @@ name: Acceptance testing against customer KPIs
 kind: practice
 difficulty: advanced
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -60,7 +60,7 @@ Constraints:
 | Option | Error guardrail | Sample it needs (true rate 1.5%) | Fits 3,600 pilot invoices? | High-value segment |
 |---|---|---|---|---|
 | **A. Draft as written** | Upper bound ≤ 2.0% on 400 offline invoices | About 7,400 for a 90% pass chance | Already failed: about an 8% pass chance at 400 | Floor of 3% on 80 items: unpassable |
-| **B. Superiority on pilot volume** | Upper bound ≤ 2.0% | About 7,400, or 6.2 weeks of traffic | No: about a 56% pass chance on 3,420 | As A |
+| **B. Superiority on pilot volume** | Upper bound ≤ 2.0% | About 7,400, or 6.2 weeks of traffic | No: about a 58% pass chance on 3,600 | As A |
 | **C. Non-inferiority plus routing** | Upper bound ≤ 2.5% (δ = 0.5 points) | About 2,133, or 1.8 weeks of traffic | Yes: about a 99% pass chance on 3,420 | Always escalated, out of automated scope |
 | **D. Point estimates plus rollback** | Point estimate ≤ 2.0% | Any size | Yes | Point estimate floor |
 

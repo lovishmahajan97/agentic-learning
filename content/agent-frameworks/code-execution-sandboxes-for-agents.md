@@ -5,7 +5,7 @@ name: code-execution sandboxes for agents (E2B, Modal, Docker)
 kind: tool
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:
@@ -44,8 +44,8 @@ before they are safe.
 ### Task
 Build the agent side of a `run_python` tool: the part you own whichever sandbox product sits behind
 it. You add one sandbox per session, an environment allowlist so no host secret enters, a kill after
-timeouts, tail-preserving output truncation, and an idle reaper. These are the five steps of the
-agent-side contract in How it works.
+timeouts, tail-preserving output truncation, and an idle reaper. Together they implement steps 2 to 5
+of the agent-side contract in How it works.
 - **Time box:** 45-75 minutes.
 - **Prerequisites:** this lesson's contract and hardening checklist; the sandboxing lesson's threat model.
 - **Runs anywhere:** `FakeBackend` stands in for E2B, Modal or the Docker tool in Examples. It is
@@ -192,8 +192,9 @@ def test_timeout_kills_the_sandbox(env):
 def test_idle_sandboxes_are_reaped(env):
     backend, tool, now = env
     tool.run_python("old", "x = 1")
-    now[0] = 250.0
     tool.run_python("busy", "x = 1")
+    now[0] = 250.0
+    tool.run_python("busy", "print(x)")               # use refreshes idle time
     now[0] = 400.0
     assert tool.reap() == ["old"]
     assert list(tool.sessions) == ["busy"] and len(backend.live) == 1
@@ -208,9 +209,11 @@ test never sleeps.
 - **Copy `os.environ` and delete known keys.** The next secret someone adds leaks. Debug by diffing
   the sandbox env against `SAFE_ENV`; only an allowlist survives new variables.
 - **Refresh `last_used` only on create.** Busy sessions get reaped mid-analysis and lose their data
-  frames. Debug by logging sandbox age and idle time at each reap.
-- **Reuse a sandbox after a timeout.** The next call queues behind a spinning loop and also times out.
-  Debug by counting consecutive timeouts per sandbox id.
+  frames; here the reaper test returns `['old', 'busy']`. Debug by logging sandbox age and idle time
+  at each reap.
+- **Reuse a sandbox after a timeout.** On a real backend the next call queues behind the spinning loop
+  and also times out; here the timeout test fails because the sandbox is still live. Debug by counting
+  consecutive timeouts per sandbox id.
 
 ### Submission
 - **Code:** `code_tool.py` with the five `YOUR CODE` parts done; `FakeBackend` unchanged.

@@ -5,7 +5,7 @@ name: Policy enforcement across agents & tools
 kind: pattern
 difficulty: advanced
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:

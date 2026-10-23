@@ -5,7 +5,7 @@ name: UploadFile
 kind: tool
 difficulty: intro
 est_minutes: 12
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -185,7 +185,7 @@ All five fail on the starter: client filenames as keys, the closed-file error, n
   `ValueError: I/O operation on closed file.` Debug by logging, inside the run, whether `a.file.closed`
   is true; anything that outlives the request must get a key, not the object.
 - **Inject `await f.read()` with no size.** Everything still works, but `test_persist_reads_in_chunks`
-  sees one read of `-1`: the whole file lands in memory, which OOMs a pod at 10 parallel 300 MB uploads.
+  sees a read of `-1`: the whole file lands in memory, so 10 parallel 300 MB uploads hold about 3 GB.
 - **Inject `key = f.filename`.** The generated-key test fails and `../../etc/notes.txt` resolves
   outside `STORE`. Print `os.path.realpath` of the target before writing to see the traversal.
 

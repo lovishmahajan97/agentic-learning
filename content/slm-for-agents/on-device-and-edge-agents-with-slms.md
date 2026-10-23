@@ -6,7 +6,7 @@ kind: concept
 difficulty: advanced
 est_minutes: 16
 agent_relevance: useful
-status: typed
+status: typed-verified
 lesson_type: concept
 mastery: implement
 code_tested: yes

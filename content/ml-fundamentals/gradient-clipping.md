@@ -5,7 +5,7 @@ name: Gradient clipping
 kind: practice
 difficulty: core
 est_minutes: 11
-status: typed
+status: typed-verified
 lesson_type: concept
 agent_relevance: useful
 related:
@@ -168,8 +168,8 @@ flowchart TD
   one scalar, so the step points exactly where backprop said, only shorter. Per-tensor, per-micro-batch
   and value clipping are the variants that change direction.
 - **"Adam normalizes steps, so it does not need clipping."** The raw step is normalized, but the spike
-  still enters `v`. One gradient 50× normal inflates `v` and slows that parameter for hundreds of steps
-  (β2 = 0.999), which shows up as a plateau nobody can explain.
+  still enters `v`. One gradient 50× normal inflates `v` and, with β2 = 0.999, leaves that parameter at
+  roughly half to three-quarters speed for the next thousand steps, a plateau nobody can explain.
 - **"A clip that fires every step means the run is well protected."** It means the clip is throttling,
   not filtering outliers: a hidden learning-rate cut under SGD, or a switch to unit-norm gradients under
   Adam. Look for a summed loss, too high a learning rate or a copied threshold.

@@ -5,7 +5,7 @@ name: deep research agent (search, read, cite, synthesise)
 kind: practice
 difficulty: advanced
 est_minutes: 20
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:

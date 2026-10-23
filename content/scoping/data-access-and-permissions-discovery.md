@@ -5,7 +5,7 @@ name: Data access & permissions discovery
 kind: practice
 difficulty: core
 est_minutes: 16
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -43,10 +43,12 @@ partners work their cases. Week-one inventory, all figures illustrative:
 - **HR knowledge base:** 3,000 articles with coarse permissions, either "all employees" or "managers only";
   changes are rare.
 - **HR case system:** per-case ACLs that change when an investigation is reassigned. HR requires a
-  revocation to take effect within 15 minutes. The API exposes current permissions but no change events,
-  and allows about 5 calls a second for the whole tenant.
+  revocation to take effect within 15 minutes. The API exposes current permissions but no change events.
+- **Shared rate limit:** the knowledge base and the case system sit behind one HR-platform API that allows
+  about 5 calls a second for the whole tenant.
 - **Payroll:** regulated personal data; the owner requires a privacy review of about 12 weeks.
-- **Load:** about 3,000 policy questions a day, peaking near 6 a second on Monday mornings.
+- **Load:** about 3,000 policy questions a day on average, but bursty: in the minutes after a company-wide
+  policy announcement, questions peak near 6 a second.
 - **Constraints:** pilot in 8 weeks; registering a delegated (on-behalf-of) app needs a 4-week security
   review.
 

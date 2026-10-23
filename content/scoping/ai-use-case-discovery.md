@@ -5,7 +5,7 @@ name: AI use-case discovery
 kind: practice
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -74,14 +74,16 @@ Choose **A** as the first agent, and route the others instead of dropping them.
 - **D goes to a scheduled script**; it needs no model.
 
 **What would change it:**
-- **A's probe below about 50% on the ugly scans,** or the brokers' review step unavailable: re-probe B in
-  assist mode as the first agent instead.
+- **A's probe below about 46% on the ugly scans** (where 11 − 8p minutes leaves only 2.7 saved and A's
+  value falls to B's $90,000), or the brokers' review step unavailable: re-probe B in assist mode as the
+  first agent instead.
 - **Pricing data approved within 4 weeks:** run C's probe and compare it with A on the same table.
 - **Rebookings made free to cancel within an hour:** errors become reversible, the effective `C` falls and
   B's error budget grows.
 
 ### Trade-offs accepted
-- **Half of the headline value is left for later:** C's claimed $400,000 waits on access; track the
+- **Most of the headline value is left for later:** C's claimed $400,000 (of about $670,000 across A, B
+  and C) waits on access; track the
   approval's days in review and report them to the COO.
 - **Assisted, not autonomous, value:** brokers still spend 4.6 minutes a document; track median handling
   time against the 10-minute baseline.

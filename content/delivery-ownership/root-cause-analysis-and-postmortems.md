@@ -5,7 +5,7 @@ name: Root-cause analysis & postmortems
 kind: practice
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -47,6 +47,7 @@ illustrative planning numbers.
 - **Detection today:** a customer call; there is no alert on cancellations per hour.
 - **Baseline:** about 4 legitimate cancellations an hour, so about 1 per 15 minutes.
 - **Incident rate:** 23 / 50 ≈ 0.46 bad cancellations a minute.
+- **Response time:** once paged, on-call can flip a feature flag in about 5 minutes.
 - **Product constraint:** cancellation in chat is a contracted feature for this customer, so it cannot
   simply be removed.
 - **Team and deadline:** 2 engineers, peak season in 3 weeks, and the customer expects the postmortem
@@ -65,8 +66,8 @@ illustrative planning numbers.
 different trigger next time still meets a defence.
 - **Detection has a number:** an alert at more than 3 times baseline in a rolling 15-minute window fires
   at the 4th cancellation. At 0.46 + 0.07 ≈ 0.53 a minute that is about 4 / 0.53 ≈ 8 minutes in.
-- **Blast radius shrinks:** with the kill switch flipped about 5 minutes after the page, roughly 0.46 x
-  13 ≈ 6 orders are cancelled instead of 23, before the gate even exists.
+- **Blast radius shrinks:** with the kill switch flipped about 5 minutes after the page, 8 + 5 = 13
+  minutes in, roughly 0.46 x 13 ≈ 6 orders are cancelled instead of 23, before the gate even exists.
 - **Prevention does not depend on the model:** the confirmation gate stops the irreversible step even
   when the model picks the wrong tool.
 - **The prompt rewrite stays,** as one item among the others, never the only one.

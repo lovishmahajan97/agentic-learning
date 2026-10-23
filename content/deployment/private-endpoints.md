@@ -5,7 +5,7 @@ name: Private endpoints
 kind: pattern
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 mastery: implement
@@ -64,7 +64,7 @@ All figures are illustrative planning numbers, not quotes or SLAs.
 |---|---|---|---|---|---|
 | NAT plus egress proxy allowlist | NAT gateway, proxy filters by hostname | no: a route to the internet exists, guarded only by proxy rules | over VPN to the proxy | none | low |
 | Endpoints in every VPC | 5 interface endpoints per VPC, one interface per zone, private DNS on | yes | needs DNS forwarding into one of the 12 VPCs | 12 x 5 x 2 = 120 | high: 60 endpoints to review and keep identical |
-| Shared endpoint hub | 5 endpoints in one hub VPC, private DNS zones shared with spokes, spokes attached by a transit network | yes | one inbound resolver in the hub | 5 x 2 = 10 | medium: one module, one DNS design |
+| Shared endpoint hub | 5 endpoints in one hub VPC with the endpoint's own private DNS off, private DNS zones for the service names associated with every spoke, spokes attached by a transit network | yes | one inbound resolver in the hub | 5 x 2 = 10 | medium: one module, one DNS design |
 
 ### Decision
 **Shared endpoint hub, with object storage on gateway endpoints in each spoke and NAT routes removed from
@@ -72,7 +72,8 @@ every agent subnet.**
 - **It meets the hard rule.** No agent subnet has an internet route, so a call that resolves publicly
   fails loudly instead of leaking.
 - **One place for hybrid DNS.** On-prem resolvers forward the service domains to a single inbound
-  resolver in the hub, so the eval jobs and every spoke resolve the same private IPs.
+  resolver in the hub, so the eval jobs and every spoke resolve the same private IPs. The per-VPC
+  `private_dns_enabled = true` check becomes a check that every spoke is associated with the hub's zones.
 - **It fits the team.** 10 interfaces and 5 endpoints in one module instead of 60 endpoints across 12
   state files. A new team's VPC becomes a transit attachment plus a zone association.
 - **Why not NAT plus proxy:** the proxy is one misconfigured rule away from an open path, which is the

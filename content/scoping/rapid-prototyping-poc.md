@@ -5,7 +5,7 @@ name: Rapid prototyping / PoC
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -66,8 +66,9 @@ Choose **C**, because it is the only option that answers both unknowns inside th
   p = 0.78 takes about 103 tasks; 150 gives about ±6.6.
 - **Risk order:** the security form for the scoped account is filed on day 1, and tools not under test are
   stubbed with real schemas.
-- **Readout:** one held-out run on day 14; pass if the lower bound clears 70%, inconclusive if the interval
-  straddles it.
+- **Readout:** one held-out run on day 14; pass if the lower bound clears 70% with zero unauthorised writes
+  and no task over 10 tool calls, inconclusive if the interval straddles 70%, fail if the upper bound is
+  below it or any guardrail is breached.
 
 **What would change it:**
 - **The same agent pattern already runs elsewhere in the company:** skip the PoC; a pilot is cheaper.

@@ -5,7 +5,7 @@ name: CrewAI (crews, roles, tasks, flows)
 kind: tool
 difficulty: core
 est_minutes: 17
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: useful
 related:
@@ -169,8 +169,9 @@ All four fail on the starter: a crew call on a general ticket, zero logged token
 and no refund even when approved (the proposal was never stored).
 
 ### Failure scenarios
-- **Inject an LLM classifier:** replace the keyword rule with a crew call in `classify`. Every ticket
-  now costs a crew call, which `crew_calls` shows at once. Put deterministic routing back in code and
+- **Inject an LLM classifier:** replace the keyword rule with a crew call in `classify`, counted in
+  `crew_calls` like the billing call. Every ticket now costs a crew call, so the general ticket shows
+  `calls=1` and billing tickets `calls=2`. Put deterministic routing back in code and
   compare calls per 1,000 tickets.
 - **Inject `approved` from the crew:** set `state.approved` from a field in the crew's output. The
   model can now approve its own refund. Trace where each state field is written; approval must come

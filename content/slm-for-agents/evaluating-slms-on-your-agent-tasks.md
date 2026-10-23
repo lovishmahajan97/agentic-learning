@@ -6,7 +6,7 @@ kind: concept
 difficulty: core
 est_minutes: 16
 agent_relevance: core
-status: typed
+status: typed-verified
 lesson_type: concept
 mastery: evaluate
 code_tested: partial
@@ -122,7 +122,8 @@ flowchart TD
   of 10-step tasks finish fully correct, assuming independent steps. Measure task success in a sandbox as
   well as call-level metrics.
 - **"A 2-point gap on one run picks the winner."** On 100 cases near 90% success the standard error is about
-  3 points per rate, so the gap is noise until repeated runs show spread smaller than it.
+  3 points per rate, so a 2-point gap is noise. Repeated runs expose sampling spread but cannot shrink
+  that case-sampling error; grow the set, or compare per-case outcomes with a paired test.
 - **"The model with the cheapest call is the cheapest to run."** A model that fails more pays for retries
   and escalations; compare cost per successful task, not cost per call.
 

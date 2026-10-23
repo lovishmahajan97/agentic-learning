@@ -5,7 +5,7 @@ name: Job queues & durable workers (Celery / ARQ + job-status endpoint)
 kind: pattern
 difficulty: core
 est_minutes: 18
-status: typed
+status: typed-verified
 lesson_type: lab
 agent_relevance: core
 related:

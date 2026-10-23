@@ -5,7 +5,7 @@ name: Handoff to customer teams
 kind: practice
 difficulty: core
 est_minutes: 14
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: useful
 related:
@@ -38,7 +38,7 @@ with exit criteria the customer has demonstrated, not a calendar date.
 
 ## Decision case
 ### Scenario
-The support agent from the examples above (order search, refunds behind an approval gate, email) is due
+The support agent from the first example in Examples below (order search, refunds behind an approval gate, email) is due
 to leave the FDE team in 4 weeks. The customer's platform team is 2 engineers and 1 operations analyst.
 All dates and figures are illustrative.
 - **Readiness today:** the skills matrix shows 1 of 5 exit criteria evidenced by two customer people.
@@ -53,9 +53,9 @@ All dates and figures are illustrative.
 | Option | How it works | Covers the week-12 upgrade | Budget | Ends dependency |
 |---|---|---|---|---|
 | Exit on the date | full handoff in week 4, best-effort support | no: nobody has run an upgrade | fits | yes, on paper |
-| Extend until ready | full FDE time until every criterion has two names | only by staying to week 12, 8 weeks over | over budget | yes, late |
+| Extend until ready | full FDE time until every criterion has two names | only by staying until the upgrade has shipped: released in week 7, then gate and canary, so about week 9, 5 weeks over | over budget | yes, late |
 | Managed service | vendor keeps run, change and quality | yes | ongoing fee | no |
-| Split, time-boxed | customer owns run and access in week 4; vendor co-owns quality and model change on a retainer until the upgrade is done by 2 customer engineers | yes, paired | fits | yes, by about week 13 |
+| Split, time-boxed | customer owns run and access in week 4; vendor co-owns quality and model change on a retainer until the upgrade is done by 2 customer engineers | yes, paired | fits | yes, by week 12 at the latest |
 
 ### Decision
 **Split ownership, time-boxed.** In the remaining 4 weeks, close the three single-name gaps (game day,
@@ -65,8 +65,10 @@ The customer takes run and access then. The vendor stays accountable for quality
 customer engineers have shipped the snapshot upgrade through the trajectory gate.
 - **Why not exit on the date:** the one task nobody can do arrives 3 weeks after exit, on a tool that
   moves money.
-- **Why not extend:** covering the upgrade with full FDE time means staying 8 weeks past the planned
-  exit, against the 2 the budget allows.
+- **Why not extend:** covering the upgrade with full FDE time means staying about 5 weeks past the
+  planned exit (to about week 9), against the 2 the budget allows.
+- **Why the retainer has a hard end:** the upgrade, with its canary against the current snapshot, must
+  finish before that snapshot retires in week 12.
 - **Why not managed service:** it contradicts the sponsor's goal and keeps the vendor in every change.
 - **Exit test for the retainer:** the upgrade PR, gate report and canary result are authored by customer
   engineers, with the FDE only reviewing.
@@ -76,7 +78,7 @@ in week 4 with a booked check-in would do. If the platform team lost an engineer
 everywhere, and managed service becomes the honest option.
 
 ### Trade-offs accepted
-- **A blurred boundary for about 9 weeks.** The RACI names the vendor for quality and model change only;
+- **A blurred boundary for up to 8 weeks (weeks 4 to 12).** The RACI names the vendor for quality and model change only;
   track escalations by area, which should fall to zero outside those two.
 - **Approval gates stay on refunds** through the upgrade, keeping the customer's review load; watch
   approval rates per tool for a later threshold decision.

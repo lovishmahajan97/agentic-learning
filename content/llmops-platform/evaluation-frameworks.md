@@ -5,7 +5,7 @@ name: Evaluation frameworks
 kind: concept
 difficulty: core
 est_minutes: 15
-status: typed
+status: typed-verified
 lesson_type: decision
 agent_relevance: core
 related:
@@ -47,9 +47,8 @@ A fintech company runs three agents, each with its own eval script. The support 
 from a CSV. The analyst agent reports "judge score 0.71" from JSONL. The KYC agent is a long multi-turn
 agent with sandboxed write tools, and its team has no script at all.
 
-A platform team of three is asked
-for one evaluation setup in 8 weeks, because the company is about to choose a new model snapshot for all
-three.
+A platform team of three is asked for one evaluation setup in 8 weeks, because the company is about to
+choose a new model snapshot for all three.
 
 Facts and constraints, with illustrative figures:
 - **Golden sets.** 400 support tasks, 250 analyst tasks and 600 KYC tasks: 1,250 tasks in total. Agent
@@ -65,7 +64,7 @@ Facts and constraints, with illustrative figures:
 ### Options
 | Option | How it works | Residency | KYC agent fits | Cross-team comparability | 8-week feasibility |
 |---|---|---|---|---|---|
-| **A. Adopt one application framework as-is** | Every team moves to, say, Promptfoo configs | Yes, runs locally | No: the KYC team forks within weeks | Only for teams that fit | Yes |
+| **A. Adopt one application framework as-is** | Every team moves to, say, Promptfoo configs | Yes, runs locally | Poorly: a custom provider can wrap the loop, but multi-turn state and side-effect checks sit outside the data model, so the KYC team forks | Only for teams that fit | Yes |
 | **B. Adopt a SaaS platform-integrated tool** | Datasets, experiments and traces in the vendor's cloud | No | With a custom target adapter | Yes | Yes |
 | **C. Build everything** | Own runner, store, UI and comparison | Yes | Yes | Yes | No: three people rebuild the non-differentiating parts |
 | **D. Thin layer on the five interfaces** | Shared dataset schema, a versioned scorer package and a runner that stores raw trajectories by generation id, writing to a self-hosted open-source platform; Promptfoo kept for prompt-level CI checks | Yes | Yes: the KYC target is the real loop with sandboxed tools | Yes | Yes: build the target adapters and scorers only |
