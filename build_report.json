@@ -1,29 +1,7 @@
 {
- "ok": 656,
- "missing": [
-  "engineering-fundamentals/http-from-first-principles",
-  "engineering-fundamentals/debugging-method",
-  "engineering-fundamentals/testing-fundamentals",
-  "engineering-fundamentals/git-and-code-review-workflow",
-  "engineering-fundamentals/reading-errors-logs-and-stack-traces",
-  "engineering-fundamentals/command-line-and-environment-basics",
-  "math-for-ai/probability-for-ai-engineers",
-  "math-for-ai/statistics-for-evaluation",
-  "math-for-ai/linear-algebra-intuition",
-  "math-for-ai/calculus-intuition-for-gradients",
-  "math-for-ai/information-theory-basics",
-  "math-for-ai/numerical-precision",
-  "cumulative-projects/project-1-reliable-rag-application",
-  "cumulative-projects/project-2-tool-using-agent-with-guardrails",
-  "cumulative-projects/project-3-production-ai-service",
-  "cumulative-projects/project-4-slm-feasibility-study",
-  "cumulative-projects/project-5-end-to-end-business-solution"
- ],
+ "ok": 673,
+ "missing": [],
  "invalid": {},
- "module_missing": [
-  "engineering-fundamentals",
-  "math-for-ai",
-  "cumulative-projects"
- ],
+ "module_missing": [],
  "module_invalid": {}
 }

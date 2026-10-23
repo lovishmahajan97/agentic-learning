@@ -1,5 +1,21 @@
 # Continuing the lesson build (handoff)
 
+## Status 2026-10-23: mastery edition (learner's improvement plan, phases A, B, C, E)
+
+- A. App: mastery is evidence-based (Understand: explain from memory; Implement: exercise without a
+  solution; Evaluate: diagnosed failure + mastery test). Quiz is a knowledge check only. Mistake log
+  feeds review; dashboard shows mastery, open mistakes, weak areas and a study-session routine.
+- B. 135 high-value lessons (agents, agent reliability, RAG, evals, safety, deployment, SLMs) upgraded
+  to SPEC v4: failure modes with diagnosis, solution-free exercise, mastery test with rubric,
+  prerequisites, target level, executed code; prose growth capped at 5% vs tag `pre-mastery`.
+- C. New: Engineering fundamentals (6) and Math and statistics for AI (6).
+- E. New: Cumulative projects 1-5, each with 6 milestones shown on the module pages that unlock them.
+- Checks: 673/673 lessons valid; 0 lost data vs `pre-mastery`; 712/712 diagrams parse;
+  code_tested yes 116, partial 37 (GPU, paid API or external service needed).
+- Not yet upgraded to v4 (by design, priority order): the other modules stay in v3. To extend, add module
+  ids to UPGRADE in `scripts/make_mastery_workflow.py` and regenerate.
+
+
 ## Status 2026-10-22 (update): Practice lab added
 
 - Stage 7 "Practice lab" after Customer delivery: Agent use cases to practice (12), Mini project ideas

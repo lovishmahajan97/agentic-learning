@@ -6,9 +6,9 @@ kind: concept
 difficulty: advanced
 est_minutes: 16
 agent_relevance: useful
-status: mastery
+status: mastery-verified
 mastery: implement
-code_tested: partial
+code_tested: yes
 prerequisites:
   - slm-for-agents/running-slms-locally
   - slm-for-agents/quantized-slms
