@@ -3595,5 +3595,33 @@
     "kind_hint": "project"
    }
   ]
+ },
+ {
+  "module": "tool-labs",
+  "module_title": "Hands-on tool labs",
+  "tier": 1,
+  "index": 0,
+  "topics": [
+   {
+    "id": "temporal-durable-agent-lab",
+    "name": "Temporal durable agent lab (workers, crash recovery, replay tests, OpenAI Agents SDK integration)",
+    "kind_hint": "tool"
+   },
+   {
+    "id": "web-search-and-fetch-tools-for-agents",
+    "name": "web search and fetch tools for agents (Tavily, Exa, provider web tools)",
+    "kind_hint": "tool"
+   },
+   {
+    "id": "pipecat-voice-agent-lab",
+    "name": "Pipecat voice agent lab (VAD, streaming STT, tool calls, TTS, latency budget)",
+    "kind_hint": "tool"
+   },
+   {
+    "id": "inspect-ai-agent-evals-lab",
+    "name": "Inspect AI agent evals lab (tasks, solvers, scorers, sandboxes)",
+    "kind_hint": "tool"
+   }
+  ]
  }
 ]

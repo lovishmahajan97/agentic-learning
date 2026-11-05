@@ -321,6 +321,12 @@ TAXONOMY = [
   ("Project 4: SLM feasibility study", "project"),
   ("Project 5: end-to-end business solution", "project"),
  ]),
+ ("tool-labs", 1, "Hands-on tool labs", [
+  ("Temporal durable agent lab (workers, crash recovery, replay tests, OpenAI Agents SDK integration)", "tool"),
+  ("web search and fetch tools for agents (Tavily, Exa, provider web tools)", "tool"),
+  ("Pipecat voice agent lab (VAD, streaming STT, tool calls, TTS, latency budget)", "tool"),
+  ("Inspect AI agent evals lab (tasks, solvers, scorers, sandboxes)", "tool"),
+ ]),
 ]
 
 TIER_INFO = {

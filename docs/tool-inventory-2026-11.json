@@ -1,0 +1,1903 @@
+{
+ "Fine-tuning & training platforms": {
+  "Tinker (Thinking Machines)": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Unsloth": {
+   "dedicated": [
+    "training-adaptation/tooling"
+   ],
+   "lessons": 2,
+   "mentions": 36,
+   "in_code": 1,
+   "top": [
+    "training-adaptation/tooling",
+    "training-adaptation/gradient-checkpointing"
+   ]
+  },
+  "Axolotl": {
+   "dedicated": [
+    "training-adaptation/tooling"
+   ],
+   "lessons": 5,
+   "mentions": 37,
+   "in_code": 1,
+   "top": [
+    "training-adaptation/tooling",
+    "training-adaptation/distributed-training",
+    "training-adaptation/gradient-checkpointing",
+    "training-adaptation/fine-tune-vs-rag-vs-prompt-decision"
+   ]
+  },
+  "TRL": {
+   "dedicated": [
+    "training-adaptation/tooling",
+    "python-for-ai/hugging-face"
+   ],
+   "lessons": 27,
+   "mentions": 120,
+   "in_code": 4,
+   "top": [
+    "training-adaptation/tooling",
+    "python-for-ai/hugging-face",
+    "training-adaptation/dpo",
+    "slm-for-agents/fine-tuning-an-slm-for-an-agent-task"
+   ]
+  },
+  "Hugging Face PEFT": {
+   "dedicated": [
+    "training-adaptation/peft",
+    "python-for-ai/hugging-face"
+   ],
+   "lessons": 21,
+   "mentions": 86,
+   "in_code": 2,
+   "top": [
+    "python-for-ai/hugging-face",
+    "training-adaptation/tooling",
+    "training-adaptation/peft",
+    "python-for-ai/pytorch"
+   ]
+  },
+  "LLaMA-Factory": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 1,
+   "in_code": 0,
+   "top": [
+    "training-adaptation/tooling"
+   ]
+  },
+  "torchtune": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 1,
+   "in_code": 0,
+   "top": [
+    "training-adaptation/tooling"
+   ]
+  },
+  "OpenPipe": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Predibase": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Together AI fine-tuning": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Fireworks AI": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Modal": {
+   "dedicated": [
+    "agent-frameworks/code-execution-sandboxes-for-agents"
+   ],
+   "lessons": 5,
+   "mentions": 44,
+   "in_code": 2,
+   "top": [
+    "agent-frameworks/code-execution-sandboxes-for-agents",
+    "infra-capacity-economics/serverless-gpus",
+    "multimodal/image-embeddings",
+    "multimodal/clip"
+   ]
+  },
+  "OpenAI fine-tuning API": {
+   "dedicated": [],
+   "lessons": 16,
+   "mentions": 22,
+   "in_code": 0,
+   "top": [
+    "training-adaptation/tooling",
+    "customer-data-evaluation/fine-tuning-pipelines-on-client-data",
+    "training-adaptation/distributed-training",
+    "training-adaptation/fine-tune-vs-rag-vs-prompt-decision"
+   ]
+  },
+  "DeepSpeed": {
+   "dedicated": [
+    "training-adaptation/distributed-training"
+   ],
+   "lessons": 9,
+   "mentions": 25,
+   "in_code": 1,
+   "top": [
+    "training-adaptation/distributed-training",
+    "ml-fundamentals/gradient-clipping",
+    "ml-fundamentals/gradient-accumulation",
+    "ml-fundamentals/optimizers"
+   ]
+  },
+  "FSDP": {
+   "dedicated": [
+    "training-adaptation/distributed-training"
+   ],
+   "lessons": 10,
+   "mentions": 60,
+   "in_code": 1,
+   "top": [
+    "training-adaptation/distributed-training",
+    "ml-fundamentals/gradient-accumulation",
+    "ml-fundamentals/optimizers",
+    "training-adaptation/gradient-checkpointing"
+   ]
+  },
+  "Weights & Biases": {
+   "dedicated": [
+    "llmops-platform/experiment-tracking"
+   ],
+   "lessons": 1,
+   "mentions": 41,
+   "in_code": 1,
+   "top": [
+    "llmops-platform/experiment-tracking"
+   ]
+  },
+  "MLflow": {
+   "dedicated": [
+    "llmops-platform/experiment-tracking"
+   ],
+   "lessons": 9,
+   "mentions": 81,
+   "in_code": 2,
+   "top": [
+    "llmops-platform/experiment-tracking",
+    "llmops-platform/model-registry",
+    "data-architecture/model-and-dataset-provenance",
+    "llmops-platform/prompt-registry"
+   ]
+  },
+  "Argilla": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 1,
+   "in_code": 0,
+   "top": [
+    "customer-data-evaluation/labeling-sessions"
+   ]
+  },
+  "Label Studio": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 2,
+   "in_code": 0,
+   "top": [
+    "customer-data-evaluation/golden-dataset-creation-with-client-smes",
+    "customer-data-evaluation/labeling-sessions"
+   ]
+  },
+  "Distilabel": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  }
+ },
+ "Evals": {
+  "RAGAS": {
+   "dedicated": [
+    "evals/tooling"
+   ],
+   "lessons": 7,
+   "mentions": 31,
+   "in_code": 1,
+   "top": [
+    "evals/tooling",
+    "evals/faithfulness-groundedness",
+    "llmops-platform/evaluation-frameworks",
+    "cumulative-projects/project-1-reliable-rag-application"
+   ]
+  },
+  "DeepEval": {
+   "dedicated": [
+    "evals/tooling"
+   ],
+   "lessons": 2,
+   "mentions": 31,
+   "in_code": 1,
+   "top": [
+    "evals/tooling",
+    "llmops-platform/evaluation-frameworks"
+   ]
+  },
+  "Promptfoo": {
+   "dedicated": [
+    "evals/tooling"
+   ],
+   "lessons": 16,
+   "mentions": 58,
+   "in_code": 1,
+   "top": [
+    "evals/tooling",
+    "llmops-platform/evaluation-frameworks",
+    "mini-project-ideas/llm-as-judge-eval-harness-for-a-small-agent",
+    "mini-project-ideas/prompt-injection-red-team-suite-for-a-tool-using-agent"
+   ]
+  },
+  "Braintrust": {
+   "dedicated": [
+    "evals/tooling"
+   ],
+   "lessons": 20,
+   "mentions": 30,
+   "in_code": 0,
+   "top": [
+    "evals/tooling",
+    "evals/eval-harness",
+    "llmops-platform/evaluation-frameworks",
+    "llmops-platform/prompt-registry"
+   ]
+  },
+  "OpenAI Evals": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 4,
+   "in_code": 0,
+   "top": [
+    "mini-project-ideas/llm-as-judge-eval-harness-for-a-small-agent",
+    "evals/model-evaluation"
+   ]
+  },
+  "Inspect AI (UK AISI)": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 4,
+   "in_code": 0,
+   "top": [
+    "mini-project-ideas/llm-as-judge-eval-harness-for-a-small-agent"
+   ]
+  },
+  "lm-evaluation-harness": {
+   "dedicated": [],
+   "lessons": 13,
+   "mentions": 23,
+   "in_code": 0,
+   "top": [
+    "evals/benchmarking",
+    "llmops-platform/evaluation-frameworks",
+    "serving-inference/quantization-quality-evaluation",
+    "evals/eval-harness"
+   ]
+  },
+  "TruLens": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Opik (Comet)": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Patronus": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Galileo": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Giskard": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "W&B Weave": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 2,
+   "in_code": 0,
+   "top": [
+    "llmops-platform/experiment-tracking"
+   ]
+  },
+  "HELM": {
+   "dedicated": [],
+   "lessons": 3,
+   "mentions": 5,
+   "in_code": 0,
+   "top": [
+    "llmops-platform/evaluation-frameworks",
+    "cumulative-projects/project-4-slm-feasibility-study",
+    "evals/model-evaluation"
+   ]
+  },
+  "SWE-bench": {
+   "dedicated": [
+    "evals/benchmarking"
+   ],
+   "lessons": 3,
+   "mentions": 34,
+   "in_code": 1,
+   "top": [
+    "evals/benchmarking",
+    "practice-use-cases/coding-agent",
+    "evals/model-evaluation"
+   ]
+  },
+  "tau-bench": {
+   "dedicated": [],
+   "lessons": 5,
+   "mentions": 11,
+   "in_code": 1,
+   "top": [
+    "evals/pass-k",
+    "agent-reliability/agent-trajectory-evaluation",
+    "practice-use-cases/customer-support-agent",
+    "agent-reliability/task-completion-rate"
+   ]
+  }
+ },
+ "Observability & tracing": {
+  "LangSmith": {
+   "dedicated": [
+    "evals/tooling",
+    "observability/langsmith",
+    "agent-frameworks/langsmith-for-agents"
+   ],
+   "lessons": 106,
+   "mentions": 257,
+   "in_code": 4,
+   "top": [
+    "agent-frameworks/langsmith-for-agents",
+    "evals/tooling",
+    "observability/langsmith",
+    "agents/frameworks"
+   ]
+  },
+  "Langfuse": {
+   "dedicated": [
+    "evals/tooling",
+    "observability/langfuse",
+    "mini-project-ideas/agent-tracing-dashboard"
+   ],
+   "lessons": 65,
+   "mentions": 226,
+   "in_code": 5,
+   "top": [
+    "observability/langfuse",
+    "evals/tooling",
+    "mini-project-ideas/agent-tracing-dashboard",
+    "agent-frameworks/end-to-end-agent-stack"
+   ]
+  },
+  "Arize Phoenix": {
+   "dedicated": [
+    "observability/arize-phoenix"
+   ],
+   "lessons": 17,
+   "mentions": 90,
+   "in_code": 2,
+   "top": [
+    "observability/arize-phoenix",
+    "observability/opentelemetry",
+    "node-ts-for-ai/opentelemetry-instrumentation",
+    "observability/langsmith"
+   ]
+  },
+  "Helicone": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "OpenTelemetry": {
+   "dedicated": [
+    "observability/opentelemetry",
+    "fastapi-for-ai/opentelemetry-instrumentation",
+    "node-ts-for-ai/opentelemetry-instrumentation",
+    "mini-project-ideas/agent-tracing-dashboard"
+   ],
+   "lessons": 87,
+   "mentions": 459,
+   "in_code": 13,
+   "top": [
+    "node-ts-for-ai/opentelemetry-instrumentation",
+    "observability/opentelemetry",
+    "observability/arize-phoenix",
+    "fastapi-for-ai/opentelemetry-instrumentation"
+   ]
+  },
+  "OpenLLMetry / Traceloop": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 3,
+   "in_code": 0,
+   "top": [
+    "observability/opentelemetry",
+    "observability/langfuse"
+   ]
+  },
+  "Datadog LLM Obs": {
+   "dedicated": [],
+   "lessons": 3,
+   "mentions": 4,
+   "in_code": 1,
+   "top": [
+    "observability/arize-phoenix",
+    "node-ts-for-ai/opentelemetry-instrumentation",
+    "observability/opentelemetry"
+   ]
+  },
+  "Grafana / Prometheus": {
+   "dedicated": [],
+   "lessons": 21,
+   "mentions": 51,
+   "in_code": 3,
+   "top": [
+    "infra-capacity-economics/keda-autoscaling",
+    "observability/monitoring",
+    "practice-use-cases/it-and-sre-ops-agent",
+    "infra-capacity-economics/scalability"
+   ]
+  },
+  "Sentry": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 11,
+   "in_code": 0,
+   "top": [
+    "mcp/mcp-ecosystem",
+    "engineering-fundamentals/reading-errors-logs-and-stack-traces"
+   ]
+  },
+  "PromptLayer": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 1,
+   "in_code": 0,
+   "top": [
+    "prompting/prompt-versioning"
+   ]
+  },
+  "Logfire (Pydantic)": {
+   "dedicated": [],
+   "lessons": 3,
+   "mentions": 13,
+   "in_code": 0,
+   "top": [
+    "agent-frameworks/pydantic-ai",
+    "agents/frameworks",
+    "agent-frameworks/openai-agents-sdk"
+   ]
+  }
+ },
+ "Agent frameworks & SDKs": {
+  "LangChain": {
+   "dedicated": [
+    "agents/frameworks",
+    "agent-frameworks/langchain"
+   ],
+   "lessons": 91,
+   "mentions": 282,
+   "in_code": 9,
+   "top": [
+    "agent-frameworks/langchain",
+    "agents/frameworks",
+    "mcp/using-mcp-servers-inside-agents",
+    "observability/langsmith"
+   ]
+  },
+  "LangGraph": {
+   "dedicated": [
+    "agents/frameworks",
+    "agent-frameworks/langgraph-fundamentals",
+    "agent-frameworks/langgraph-persistence-streaming-and-human-in-the-loop",
+    "agent-frameworks/langgraph-multi-agent-patterns",
+    "mcp/using-mcp-servers-inside-agents",
+    "mini-project-ideas/langgraph-agent-with-checkpoints-and-human-approval"
+   ],
+   "lessons": 128,
+   "mentions": 537,
+   "in_code": 14,
+   "top": [
+    "agents/frameworks",
+    "mini-project-ideas/langgraph-agent-with-checkpoints-and-human-approval",
+    "agent-frameworks/langgraph-multi-agent-patterns",
+    "agent-frameworks/langgraph-persistence-streaming-and-human-in-the-loop"
+   ]
+  },
+  "LlamaIndex": {
+   "dedicated": [
+    "agents/frameworks",
+    "agent-frameworks/llamaindex"
+   ],
+   "lessons": 38,
+   "mentions": 107,
+   "in_code": 3,
+   "top": [
+    "agents/frameworks",
+    "agent-frameworks/llamaindex",
+    "agent-frameworks/choosing-an-agent-framework",
+    "rag-retrieval/chunking-strategies"
+   ]
+  },
+  "CrewAI": {
+   "dedicated": [
+    "agent-frameworks/crewai"
+   ],
+   "lessons": 10,
+   "mentions": 43,
+   "in_code": 1,
+   "top": [
+    "agent-frameworks/crewai",
+    "agent-frameworks/choosing-an-agent-framework",
+    "agent-frameworks/autogen-ag2",
+    "agents/frameworks"
+   ]
+  },
+  "AutoGen / AG2": {
+   "dedicated": [
+    "agent-frameworks/autogen-ag2"
+   ],
+   "lessons": 6,
+   "mentions": 83,
+   "in_code": 1,
+   "top": [
+    "agent-frameworks/autogen-ag2",
+    "agents/frameworks",
+    "agent-frameworks/choosing-an-agent-framework",
+    "agent-frameworks/crewai"
+   ]
+  },
+  "OpenAI Agents SDK": {
+   "dedicated": [
+    "agent-frameworks/openai-agents-sdk",
+    "mcp/using-mcp-servers-inside-agents"
+   ],
+   "lessons": 42,
+   "mentions": 85,
+   "in_code": 1,
+   "top": [
+    "mcp/using-mcp-servers-inside-agents",
+    "agent-frameworks/choosing-an-agent-framework",
+    "agent-frameworks/openai-agents-sdk",
+    "mcp/mcp-security-in-practice"
+   ]
+  },
+  "Claude Agent SDK": {
+   "dedicated": [
+    "agent-frameworks/claude-agent-sdk"
+   ],
+   "lessons": 14,
+   "mentions": 33,
+   "in_code": 0,
+   "top": [
+    "mcp/using-mcp-servers-inside-agents",
+    "agent-frameworks/choosing-an-agent-framework",
+    "agent-frameworks/claude-agent-sdk",
+    "agents/frameworks"
+   ]
+  },
+  "Google ADK": {
+   "dedicated": [
+    "agent-frameworks/google-agent-development-kit"
+   ],
+   "lessons": 7,
+   "mentions": 40,
+   "in_code": 1,
+   "top": [
+    "agent-frameworks/google-agent-development-kit",
+    "agent-frameworks/end-to-end-agent-stack",
+    "agents/frameworks",
+    "agent-frameworks/dspy"
+   ]
+  },
+  "Pydantic AI": {
+   "dedicated": [
+    "agents/frameworks",
+    "agent-frameworks/pydantic-ai"
+   ],
+   "lessons": 19,
+   "mentions": 72,
+   "in_code": 3,
+   "top": [
+    "agents/frameworks",
+    "agent-frameworks/pydantic-ai",
+    "agent-frameworks/choosing-an-agent-framework",
+    "agent-frameworks/llamaindex"
+   ]
+  },
+  "DSPy": {
+   "dedicated": [
+    "agents/frameworks",
+    "agent-frameworks/dspy"
+   ],
+   "lessons": 3,
+   "mentions": 138,
+   "in_code": 2,
+   "top": [
+    "agent-frameworks/dspy",
+    "agents/frameworks",
+    "observability/arize-phoenix"
+   ]
+  },
+  "Haystack": {
+   "dedicated": [],
+   "lessons": 3,
+   "mentions": 6,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/lost-in-the-middle",
+    "model-internals/positional-encoding",
+    "model-internals/context-window"
+   ]
+  },
+  "Semantic Kernel / MS Agent Framework": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Mastra": {
+   "dedicated": [
+    "agent-frameworks/mastra"
+   ],
+   "lessons": 6,
+   "mentions": 75,
+   "in_code": 1,
+   "top": [
+    "agent-frameworks/mastra",
+    "agent-frameworks/end-to-end-agent-stack",
+    "agent-frameworks/google-agent-development-kit",
+    "agent-frameworks/agent-memory-libraries"
+   ]
+  },
+  "Vercel AI SDK": {
+   "dedicated": [
+    "node-ts-for-ai/vercel-ai-sdk"
+   ],
+   "lessons": 12,
+   "mentions": 45,
+   "in_code": 2,
+   "top": [
+    "agent-frameworks/mastra",
+    "node-ts-for-ai/vercel-ai-sdk",
+    "backend-fundamentals/node-js-typescript",
+    "infra-capacity-economics/cloud-ai-architecture"
+   ]
+  },
+  "smolagents": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 1,
+   "in_code": 0,
+   "top": [
+    "python-for-ai/hugging-face"
+   ]
+  },
+  "Agno": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Strands Agents": {
+   "dedicated": [],
+   "lessons": 3,
+   "mentions": 4,
+   "in_code": 0,
+   "top": [
+    "serving-inference/rate-limiting",
+    "infra-capacity-economics/gpu-infrastructure",
+    "rag-retrieval/metadata-filtering"
+   ]
+  },
+  "BeeAI": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "n8n": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Dify": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Flowise": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Langflow": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  }
+ },
+ "Durable execution & orchestration": {
+  "Temporal": {
+   "dedicated": [
+    "system-design/workflow-orchestration"
+   ],
+   "lessons": 28,
+   "mentions": 136,
+   "in_code": 3,
+   "top": [
+    "system-design/workflow-orchestration",
+    "reliability/durable-workflow-execution",
+    "agent-reliability/durable-execution-and-checkpointing",
+    "agent-runtime-architecture/agent-runtime-and-orchestration-layer"
+   ]
+  },
+  "Inngest": {
+   "dedicated": [],
+   "lessons": 4,
+   "mentions": 6,
+   "in_code": 0,
+   "top": [
+    "agent-frameworks/mastra",
+    "reliability/durable-workflow-execution",
+    "agent-frameworks/end-to-end-agent-stack",
+    "node-ts-for-ai/bullmq-and-durable-jobs"
+   ]
+  },
+  "Restate": {
+   "dedicated": [],
+   "lessons": 14,
+   "mentions": 25,
+   "in_code": 1,
+   "top": [
+    "rag-retrieval/lost-in-the-middle",
+    "scoping/customer-discovery",
+    "adoption/exec-communication",
+    "evals/task-specific-acceptance-criteria"
+   ]
+  },
+  "Prefect": {
+   "dedicated": [
+    "system-design/workflow-orchestration"
+   ],
+   "lessons": 3,
+   "mentions": 21,
+   "in_code": 0,
+   "top": [
+    "system-design/workflow-orchestration",
+    "data-architecture/etl-elt-for-rag",
+    "data-architecture/ingestion-pipelines"
+   ]
+  },
+  "Airflow": {
+   "dedicated": [
+    "system-design/workflow-orchestration"
+   ],
+   "lessons": 4,
+   "mentions": 45,
+   "in_code": 1,
+   "top": [
+    "system-design/workflow-orchestration",
+    "data-architecture/ingestion-pipelines",
+    "data-architecture/data-lineage",
+    "data-architecture/etl-elt-for-rag"
+   ]
+  },
+  "Dagster": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 5,
+   "in_code": 0,
+   "top": [
+    "data-architecture/etl-elt-for-rag",
+    "data-architecture/ingestion-pipelines"
+   ]
+  },
+  "Celery": {
+   "dedicated": [
+    "fastapi-for-ai/job-queues-and-durable-workers"
+   ],
+   "lessons": 11,
+   "mentions": 60,
+   "in_code": 1,
+   "top": [
+    "fastapi-for-ai/job-queues-and-durable-workers",
+    "backend-fundamentals/background-jobs-durable-workers",
+    "backend-fundamentals/redis",
+    "mini-project-ideas/background-job-runner-for-long-agent-tasks"
+   ]
+  },
+  "ARQ": {
+   "dedicated": [
+    "fastapi-for-ai/job-queues-and-durable-workers"
+   ],
+   "lessons": 4,
+   "mentions": 31,
+   "in_code": 1,
+   "top": [
+    "fastapi-for-ai/job-queues-and-durable-workers",
+    "fastapi-for-ai/backgroundtasks",
+    "fastapi-for-ai/async-database-access-and-connection-pooling",
+    "fastapi-for-ai/structured-logging"
+   ]
+  },
+  "BullMQ": {
+   "dedicated": [
+    "node-ts-for-ai/bullmq-and-durable-jobs"
+   ],
+   "lessons": 11,
+   "mentions": 103,
+   "in_code": 3,
+   "top": [
+    "node-ts-for-ai/bullmq-and-durable-jobs",
+    "node-ts-for-ai/graceful-shutdown",
+    "node-ts-for-ai/redis",
+    "node-ts-for-ai/opentelemetry-instrumentation"
+   ]
+  },
+  "Hatchet": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "DBOS": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 2,
+   "in_code": 0,
+   "top": [
+    "reliability/durable-workflow-execution"
+   ]
+  },
+  "Trigger.dev": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "AWS Step Functions": {
+   "dedicated": [],
+   "lessons": 3,
+   "mentions": 9,
+   "in_code": 0,
+   "top": [
+    "reliability/durable-workflow-execution",
+    "agents/state-machines",
+    "agents/workflows-vs-agents"
+   ]
+  }
+ },
+ "RAG data, parsing & search": {
+  "Unstructured": {
+   "dedicated": [],
+   "lessons": 5,
+   "mentions": 6,
+   "in_code": 0,
+   "top": [
+    "data-architecture/document-processing-pipelines",
+    "adoption/workshops",
+    "rag-retrieval/chunking-strategies",
+    "scoping/ai-use-case-discovery"
+   ]
+  },
+  "LlamaParse": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 1,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/document-parsing"
+   ]
+  },
+  "Docling": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 7,
+   "in_code": 0,
+   "top": [
+    "data-architecture/document-processing-pipelines",
+    "rag-retrieval/document-parsing"
+   ]
+  },
+  "Marker": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Apache Tika": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Firecrawl": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Jina Reader": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 1,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/reranking"
+   ]
+  },
+  "Tavily": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Exa": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Perplexity API": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Cohere Rerank": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 1,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/reranking"
+   ]
+  },
+  "Voyage AI": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 3,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/embedding-models",
+    "rag-retrieval/reranking"
+   ]
+  },
+  "ColBERT / RAGatouille": {
+   "dedicated": [],
+   "lessons": 4,
+   "mentions": 10,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/dense-vs-sparse-retrieval",
+    "rag-retrieval/reranking",
+    "rag-retrieval/embedding-models",
+    "rag-retrieval/retrieval-granularity"
+   ]
+  },
+  "Elasticsearch / OpenSearch": {
+   "dedicated": [],
+   "lessons": 12,
+   "mentions": 55,
+   "in_code": 1,
+   "top": [
+    "rag-retrieval/inverted-indexes",
+    "rag-retrieval/hybrid-search",
+    "rag-retrieval/bm25-internals",
+    "data-architecture/vector-database-architecture"
+   ]
+  },
+  "Vespa": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 2,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/inverted-indexes",
+    "rag-retrieval/vector-databases"
+   ]
+  },
+  "Neo4j": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 9,
+   "in_code": 1,
+   "top": [
+    "rag-retrieval/knowledge-graphs",
+    "backend-fundamentals/nosql"
+   ]
+  },
+  "Microsoft GraphRAG": {
+   "dedicated": [
+    "rag-retrieval/graphrag"
+   ],
+   "lessons": 5,
+   "mentions": 52,
+   "in_code": 1,
+   "top": [
+    "rag-retrieval/graphrag",
+    "rag-retrieval/knowledge-graphs",
+    "cumulative-projects/project-1-reliable-rag-application",
+    "rag-retrieval/acl-aware-retrieval"
+   ]
+  },
+  "LightRAG": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 3,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/graphrag"
+   ]
+  }
+ },
+ "Vector databases": {
+  "pgvector": {
+   "dedicated": [
+    "rag-retrieval/vector-databases"
+   ],
+   "lessons": 41,
+   "mentions": 238,
+   "in_code": 8,
+   "top": [
+    "rag-retrieval/vector-databases",
+    "fastapi-for-ai/integration-tests-with-real-dependencies",
+    "agent-frameworks/end-to-end-agent-stack",
+    "rag-retrieval/ann-indexes"
+   ]
+  },
+  "Qdrant": {
+   "dedicated": [
+    "rag-retrieval/vector-databases"
+   ],
+   "lessons": 20,
+   "mentions": 97,
+   "in_code": 5,
+   "top": [
+    "rag-retrieval/vector-databases",
+    "data-architecture/vector-database-architecture",
+    "rag-retrieval/metadata-filtering",
+    "agent-runtime-architecture/multi-tenant-state-isolation"
+   ]
+  },
+  "Pinecone": {
+   "dedicated": [
+    "rag-retrieval/vector-databases"
+   ],
+   "lessons": 3,
+   "mentions": 12,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/vector-databases",
+    "agent-runtime-architecture/multi-tenant-state-isolation",
+    "rag-retrieval/ann-indexes"
+   ]
+  },
+  "Weaviate": {
+   "dedicated": [
+    "rag-retrieval/vector-databases"
+   ],
+   "lessons": 6,
+   "mentions": 27,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/metadata-filtering",
+    "rag-retrieval/vector-databases",
+    "rag-retrieval/hybrid-search",
+    "data-architecture/vector-database-architecture"
+   ]
+  },
+  "Milvus / Zilliz": {
+   "dedicated": [
+    "rag-retrieval/vector-databases"
+   ],
+   "lessons": 3,
+   "mentions": 23,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/vector-databases",
+    "data-architecture/vector-database-architecture",
+    "rag-retrieval/embedding-dimension-and-normalization"
+   ]
+  },
+  "Chroma": {
+   "dedicated": [
+    "rag-retrieval/vector-databases"
+   ],
+   "lessons": 2,
+   "mentions": 9,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/vector-databases",
+    "agent-frameworks/agent-memory-libraries"
+   ]
+  },
+  "LanceDB": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 4,
+   "in_code": 0,
+   "top": [
+    "rag-retrieval/vector-databases",
+    "python-for-ai/pyarrow"
+   ]
+  },
+  "FAISS": {
+   "dedicated": [],
+   "lessons": 5,
+   "mentions": 24,
+   "in_code": 1,
+   "top": [
+    "rag-retrieval/ann-indexes",
+    "rag-retrieval/vector-databases",
+    "rag-retrieval/similarity-search",
+    "python-for-ai/numpy"
+   ]
+  },
+  "Turbopuffer": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Redis vector": {
+   "dedicated": [],
+   "lessons": 11,
+   "mentions": 16,
+   "in_code": 1,
+   "top": [
+    "mini-project-ideas/semantic-cache-and-model-router-to-cut-cost",
+    "backend-fundamentals/docker",
+    "fastapi-for-ai/integration-tests-with-real-dependencies",
+    "fastapi-for-ai/redis-caching"
+   ]
+  }
+ },
+ "Inference, serving & gateways": {
+  "vLLM": {
+   "dedicated": [
+    "serving-inference/engines",
+    "slm-for-agents/running-slms-locally"
+   ],
+   "lessons": 94,
+   "mentions": 501,
+   "in_code": 19,
+   "top": [
+    "serving-inference/engines",
+    "slm-for-agents/running-slms-locally",
+    "infra-capacity-economics/keda-autoscaling",
+    "portfolio-projects/self-hosted-slm-agent-with-fine-tuning-and-routing"
+   ]
+  },
+  "SGLang": {
+   "dedicated": [
+    "serving-inference/engines"
+   ],
+   "lessons": 25,
+   "mentions": 79,
+   "in_code": 1,
+   "top": [
+    "serving-inference/engines",
+    "serving-inference/kv-cache-paging-and-eviction",
+    "prompting/prompt-caching",
+    "serving-inference/caching"
+   ]
+  },
+  "TGI": {
+   "dedicated": [
+    "serving-inference/engines"
+   ],
+   "lessons": 6,
+   "mentions": 15,
+   "in_code": 1,
+   "top": [
+    "serving-inference/engines",
+    "infra-capacity-economics/hybrid-on-prem",
+    "serving-inference/model-serving",
+    "infra-capacity-economics/inference-clusters"
+   ]
+  },
+  "TensorRT-LLM": {
+   "dedicated": [
+    "serving-inference/engines"
+   ],
+   "lessons": 9,
+   "mentions": 32,
+   "in_code": 1,
+   "top": [
+    "serving-inference/engines",
+    "serving-inference/pagedattention",
+    "training-adaptation/quantization",
+    "infra-capacity-economics/edge-ai-deployment"
+   ]
+  },
+  "Ollama": {
+   "dedicated": [
+    "serving-inference/engines",
+    "slm-for-agents/running-slms-locally"
+   ],
+   "lessons": 20,
+   "mentions": 166,
+   "in_code": 9,
+   "top": [
+    "slm-for-agents/running-slms-locally",
+    "serving-inference/engines",
+    "slm-for-agents/quantized-slms",
+    "slm-for-agents/choosing-an-slm"
+   ]
+  },
+  "llama.cpp": {
+   "dedicated": [
+    "serving-inference/engines",
+    "slm-for-agents/running-slms-locally"
+   ],
+   "lessons": 24,
+   "mentions": 129,
+   "in_code": 5,
+   "top": [
+    "serving-inference/engines",
+    "slm-for-agents/running-slms-locally",
+    "slm-for-agents/quantized-slms",
+    "serving-inference/cpu-offloading"
+   ]
+  },
+  "LM Studio": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "MLX": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 5,
+   "in_code": 0,
+   "top": [
+    "slm-for-agents/on-device-and-edge-agents-with-slms",
+    "python-for-ai/outlines"
+   ]
+  },
+  "LiteLLM": {
+   "dedicated": [
+    "python-for-ai/litellm",
+    "system-design/ai-gateway"
+   ],
+   "lessons": 36,
+   "mentions": 175,
+   "in_code": 7,
+   "top": [
+    "python-for-ai/litellm",
+    "system-design/ai-gateway",
+    "agent-frameworks/end-to-end-agent-stack",
+    "agent-frameworks/choosing-an-agent-framework"
+   ]
+  },
+  "Portkey": {
+   "dedicated": [
+    "system-design/ai-gateway"
+   ],
+   "lessons": 5,
+   "mentions": 30,
+   "in_code": 0,
+   "top": [
+    "system-design/ai-gateway",
+    "serving-inference/fallbacks",
+    "system-design/ai-solution-architecture",
+    "system-design/build-vs-buy"
+   ]
+  },
+  "OpenRouter": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 3,
+   "in_code": 0,
+   "top": [
+    "serving-inference/fallbacks"
+   ]
+  },
+  "Groq": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Cerebras": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "AWS Bedrock": {
+   "dedicated": [
+    "infra-capacity-economics/cloud-ai-architecture"
+   ],
+   "lessons": 12,
+   "mentions": 70,
+   "in_code": 4,
+   "top": [
+    "infra-capacity-economics/cloud-ai-architecture",
+    "deployment/customer-vpc-on-prem-air-gapped",
+    "python-for-ai/anthropic-sdk",
+    "infra-capacity-economics/api-provider-quotas-and-regional-limits"
+   ]
+  },
+  "Azure OpenAI / AI Foundry": {
+   "dedicated": [
+    "infra-capacity-economics/cloud-ai-architecture"
+   ],
+   "lessons": 7,
+   "mentions": 29,
+   "in_code": 0,
+   "top": [
+    "infra-capacity-economics/cloud-ai-architecture",
+    "infra-capacity-economics/api-provider-quotas-and-regional-limits",
+    "deployment/customer-vpc-on-prem-air-gapped",
+    "deployment/private-endpoints"
+   ]
+  },
+  "Vertex AI": {
+   "dedicated": [
+    "infra-capacity-economics/cloud-ai-architecture"
+   ],
+   "lessons": 6,
+   "mentions": 16,
+   "in_code": 0,
+   "top": [
+    "infra-capacity-economics/cloud-ai-architecture",
+    "agent-frameworks/google-agent-development-kit",
+    "python-for-ai/anthropic-sdk",
+    "data-architecture/feature-stores"
+   ]
+  },
+  "Ray Serve / KubeRay": {
+   "dedicated": [
+    "infra-capacity-economics/ray-kuberay"
+   ],
+   "lessons": 5,
+   "mentions": 127,
+   "in_code": 1,
+   "top": [
+    "infra-capacity-economics/ray-kuberay",
+    "backend-fundamentals/kubernetes",
+    "infra-capacity-economics/inference-clusters",
+    "infra-capacity-economics/keda-autoscaling"
+   ]
+  },
+  "KServe": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 4,
+   "in_code": 0,
+   "top": [
+    "backend-fundamentals/kubernetes",
+    "infra-capacity-economics/inference-clusters"
+   ]
+  },
+  "BentoML": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Baseten": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "RunPod": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 2,
+   "in_code": 0,
+   "top": [
+    "infra-capacity-economics/serverless-gpus"
+   ]
+  }
+ },
+ "Guardrails, safety & security": {
+  "Guardrails AI": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 4,
+   "in_code": 0,
+   "top": [
+    "safety-security/input-output-guardrails",
+    "safety-security/nemo-guardrails"
+   ]
+  },
+  "NeMo Guardrails": {
+   "dedicated": [
+    "safety-security/nemo-guardrails"
+   ],
+   "lessons": 3,
+   "mentions": 16,
+   "in_code": 1,
+   "top": [
+    "safety-security/nemo-guardrails",
+    "safety-security/input-output-guardrails",
+    "safety-security/llama-guard"
+   ]
+  },
+  "Llama Guard": {
+   "dedicated": [
+    "safety-security/llama-guard"
+   ],
+   "lessons": 4,
+   "mentions": 44,
+   "in_code": 3,
+   "top": [
+    "safety-security/llama-guard",
+    "safety-security/nemo-guardrails",
+    "safety-security/content-moderation",
+    "prompting/jailbreaks"
+   ]
+  },
+  "Lakera": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Microsoft Presidio": {
+   "dedicated": [],
+   "lessons": 4,
+   "mentions": 18,
+   "in_code": 2,
+   "top": [
+    "safety-security/pii-redaction",
+    "security-governance-compliance/pii-protection-dlp",
+    "safety-security/nemo-guardrails",
+    "data-architecture/data-retention-and-deletion-architecture"
+   ]
+  },
+  "garak": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 6,
+   "in_code": 0,
+   "top": [
+    "mini-project-ideas/prompt-injection-red-team-suite-for-a-tool-using-agent",
+    "evals/red-teaming"
+   ]
+  },
+  "PyRIT": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 5,
+   "in_code": 0,
+   "top": [
+    "mini-project-ideas/prompt-injection-red-team-suite-for-a-tool-using-agent",
+    "evals/red-teaming"
+   ]
+  },
+  "Prompt Guard": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 1,
+   "in_code": 0,
+   "top": [
+    "safety-security/llama-guard"
+   ]
+  },
+  "OpenAI Moderation API": {
+   "dedicated": [],
+   "lessons": 3,
+   "mentions": 13,
+   "in_code": 1,
+   "top": [
+    "safety-security/content-moderation",
+    "safety-security/llama-guard",
+    "prompting/jailbreaks"
+   ]
+  },
+  "Rebuff": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "LLM Guard (Protect AI)": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 1,
+   "in_code": 0,
+   "top": [
+    "system-design/slm-vs-llm-trade-offs"
+   ]
+  }
+ },
+ "Structured output & prompting libs": {
+  "Instructor": {
+   "dedicated": [
+    "safety-security/output-validation",
+    "python-for-ai/instructor"
+   ],
+   "lessons": 16,
+   "mentions": 103,
+   "in_code": 3,
+   "top": [
+    "python-for-ai/instructor",
+    "safety-security/output-validation",
+    "mini-project-ideas/structured-extraction-pipeline-with-pydantic-validation-and-retries",
+    "python-for-ai/pydantic"
+   ]
+  },
+  "Outlines": {
+   "dedicated": [
+    "safety-security/output-validation",
+    "python-for-ai/outlines"
+   ],
+   "lessons": 6,
+   "mentions": 50,
+   "in_code": 1,
+   "top": [
+    "python-for-ai/outlines",
+    "safety-security/output-validation",
+    "serving-inference/structured-constrained-generation",
+    "python-for-ai/instructor"
+   ]
+  },
+  "Guidance": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "XGrammar": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 10,
+   "in_code": 0,
+   "top": [
+    "serving-inference/structured-constrained-generation",
+    "safety-security/output-validation"
+   ]
+  },
+  "BAML": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Marvin": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Zod": {
+   "dedicated": [
+    "node-ts-for-ai/runtime-schema-validation"
+   ],
+   "lessons": 14,
+   "mentions": 143,
+   "in_code": 7,
+   "top": [
+    "node-ts-for-ai/runtime-schema-validation",
+    "node-ts-for-ai/mcp-typescript-sdk",
+    "backend-fundamentals/node-js-typescript",
+    "agent-frameworks/mastra"
+   ]
+  }
+ },
+ "Tool integration, sandboxes & browser": {
+  "MCP": {
+   "dedicated": [
+    "agents/model-context-protocol",
+    "agents/mcp-authentication-authorization-transport-security",
+    "python-for-ai/mcp-python-sdk",
+    "node-ts-for-ai/mcp-typescript-sdk",
+    "agent-frameworks/claude-agent-sdk",
+    "mcp/mcp-architecture",
+    "mcp/mcp-server-primitives",
+    "mcp/mcp-client-primitives",
+    "mcp/mcp-transports",
+    "mcp/building-an-mcp-server-end-to-end",
+    "mcp/designing-mcp-tools-for-agents",
+    "mcp/using-mcp-servers-inside-agents",
+    "mcp/testing-and-debugging-mcp-servers",
+    "mcp/deploying-remote-mcp-servers",
+    "mcp/mcp-security-in-practice",
+    "mcp/mcp-ecosystem",
+    "mini-project-ideas/mcp-server-for-a-personal-api",
+    "portfolio-projects/mcp-tool-hub-for-a-team"
+   ],
+   "lessons": 93,
+   "mentions": 827,
+   "in_code": 20,
+   "top": [
+    "mcp/mcp-ecosystem",
+    "mcp/using-mcp-servers-inside-agents",
+    "agents/mcp-authentication-authorization-transport-security",
+    "agent-frameworks/claude-agent-sdk"
+   ]
+  },
+  "Composio": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Arcade.dev": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Zapier": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "E2B": {
+   "dedicated": [
+    "agent-frameworks/code-execution-sandboxes-for-agents"
+   ],
+   "lessons": 1,
+   "mentions": 15,
+   "in_code": 1,
+   "top": [
+    "agent-frameworks/code-execution-sandboxes-for-agents"
+   ]
+  },
+  "Daytona": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Modal sandboxes": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 2,
+   "in_code": 0,
+   "top": [
+    "agent-frameworks/code-execution-sandboxes-for-agents"
+   ]
+  },
+  "Playwright": {
+   "dedicated": [],
+   "lessons": 4,
+   "mentions": 20,
+   "in_code": 1,
+   "top": [
+    "practice-use-cases/browser-and-computer-use-agent",
+    "agents/computer-use",
+    "mcp/mcp-ecosystem",
+    "mcp/using-mcp-servers-inside-agents"
+   ]
+  },
+  "Browserbase / Stagehand": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Browser Use": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "Anthropic computer use": {
+   "dedicated": [
+    "agents/computer-use"
+   ],
+   "lessons": 3,
+   "mentions": 14,
+   "in_code": 0,
+   "top": [
+    "agents/computer-use",
+    "practice-use-cases/browser-and-computer-use-agent",
+    "multimodal/vision-language-models"
+   ]
+  }
+ },
+ "Memory": {
+  "Mem0": {
+   "dedicated": [
+    "agent-frameworks/agent-memory-libraries"
+   ],
+   "lessons": 5,
+   "mentions": 32,
+   "in_code": 1,
+   "top": [
+    "agent-frameworks/agent-memory-libraries",
+    "mini-project-ideas/memory-layer-for-a-chat-agent",
+    "agents/agent-memory",
+    "agents/memory-retrieval-update-deletion-policies"
+   ]
+  },
+  "Letta / MemGPT": {
+   "dedicated": [
+    "agent-frameworks/agent-memory-libraries"
+   ],
+   "lessons": 4,
+   "mentions": 40,
+   "in_code": 1,
+   "top": [
+    "agent-frameworks/agent-memory-libraries",
+    "system-design/memory-architecture",
+    "agents/agent-memory",
+    "mini-project-ideas/memory-layer-for-a-chat-agent"
+   ]
+  },
+  "Zep / Graphiti": {
+   "dedicated": [],
+   "lessons": 3,
+   "mentions": 4,
+   "in_code": 0,
+   "top": [
+    "mini-project-ideas/memory-layer-for-a-chat-agent",
+    "agent-frameworks/agent-memory-libraries",
+    "system-design/memory-architecture"
+   ]
+  },
+  "LangMem": {
+   "dedicated": [],
+   "lessons": 2,
+   "mentions": 2,
+   "in_code": 0,
+   "top": [
+    "agents/agent-memory",
+    "agents/memory-retrieval-update-deletion-policies"
+   ]
+  },
+  "Cognee": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  }
+ },
+ "Voice & multimodal": {
+  "Whisper": {
+   "dedicated": [
+    "multimodal/speech-to-text"
+   ],
+   "lessons": 2,
+   "mentions": 36,
+   "in_code": 0,
+   "top": [
+    "multimodal/speech-to-text",
+    "model-internals/llm-architecture"
+   ]
+  },
+  "Deepgram": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "ElevenLabs": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  },
+  "LiveKit Agents": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 5,
+   "in_code": 0,
+   "top": [
+    "practice-use-cases/voice-agent"
+   ]
+  },
+  "Pipecat": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 5,
+   "in_code": 0,
+   "top": [
+    "practice-use-cases/voice-agent"
+   ]
+  },
+  "OpenAI Realtime API": {
+   "dedicated": [],
+   "lessons": 1,
+   "mentions": 2,
+   "in_code": 0,
+   "top": [
+    "practice-use-cases/voice-agent"
+   ]
+  },
+  "Vapi": {
+   "dedicated": [],
+   "lessons": 0,
+   "mentions": 0,
+   "in_code": 0,
+   "top": []
+  }
+ }
+}
