@@ -17,6 +17,7 @@ related:
   - system-design/agent-orchestration
   - system-design/saga-pattern-and-distributed-transactions
   - system-design/exactly-once-processing-limitations
+  - tool-labs/temporal-durable-agent-lab
 sources:
   - Official docs: Temporal
   - Official docs: Apache Airflow
@@ -135,8 +136,13 @@ Prefect for that side.
 - **Data intervals make retries safe.** Each DAG run is bound to a *data interval* (its logical date).
   Well-written tasks read only that interval's data and overwrite only that interval's output, so
   re-running "2024-03-14" replaces that day's partition instead of appending a duplicate.
-- **Strengths:** retries, SLAs, backfills over past dates and a mature UI. Fits nightly re-embedding,
+- **Airflow 3 caveat (checked against apache-airflow 3.3.2, 2026-11).** A plain cron string such as
+  `"@daily"` now maps to `CronTriggerTimetable`, whose runs have a zero-length interval (start equals
+  end). Interval-scoped tasks need `CronDataIntervalTimetable`, as in the example below.
+- **Strengths:** retries, backfills over past dates and a mature UI. Fits nightly re-embedding,
   daily data-quality checks, hourly connector syncs.
+- **Missed-deadline alerts.** Airflow 3.0 removed SLAs; Deadline Alerts replaced them in 3.1 and are
+  still marked experimental in the 3.3 docs (checked 2026-11).
 - **Fits poorly** when the graph depends on runtime data or a run must wait on a human for days.
 
 ### Prefect: dynamic Python dataflows
@@ -243,7 +249,8 @@ sequenceDiagram
 ### Temporal: document extraction with a durable approval wait
 Activities carry the side effects and retry policies; the workflow carries only deterministic
 orchestration; the approval wait is a durable signal rather than a blocked thread. `blob_store`, `db` and
-`llm_extract` stand in for your own clients.
+`llm_extract` stand in for your own clients. Both Temporal examples here were run with stub clients in
+`WorkflowEnvironment.start_time_skipping()`, checked against temporalio 1.35.0, 2026-11.
 
 ```python
 import asyncio
@@ -291,6 +298,8 @@ class DocumentExtraction:
 ### Temporal: an agent loop as a durable workflow
 Model and tool calls are activities; the step budget and the approval gate are deterministic workflow
 code. `CONSEQUENTIAL`, `llm_step` and `tools.execute` stand in for your own tool registry and clients.
+The Temporal lab (see tool-labs/temporal-durable-agent-lab) builds this loop end to end, with
+time-skipping and replay tests.
 
 ```python
 @activity.defn
@@ -362,14 +371,17 @@ A fresh worker replays `run` from the top:
   `workflow.now()` exist to prevent exactly this class of bug.
 
 ### Airflow: an interval-scoped nightly re-embed
-A TaskFlow-style DAG (Airflow 2.x imports) where each run touches only its own day, so retries and
-backfills overwrite rather than duplicate. `docs`, `embed` and `index` stand in for your clients.
+A TaskFlow-style DAG (Airflow 3.x Task SDK imports) where each run touches only its own day, so retries
+and backfills overwrite rather than duplicate. `docs`, `embed` and `index` stand in for your clients.
+Checked with stub clients against apache-airflow 3.3.2 (`airflow dags test`), 2026-11.
 
 ```python
 from datetime import datetime, timedelta
-from airflow.decorators import dag, task
+from airflow.sdk import dag, task
+from airflow.timetables.interval import CronDataIntervalTimetable
 
-@dag(schedule="@daily", start_date=datetime(2024, 1, 1), catchup=True,
+@dag(schedule=CronDataIntervalTimetable("@daily", timezone="UTC"),   # a real one-day data interval
+     start_date=datetime(2024, 1, 1), catchup=True,
      default_args={"retries": 3, "retry_delay": timedelta(minutes=5)})
 def reembed_daily():
     @task
@@ -397,6 +409,10 @@ reembed_daily()
 - **Patch-based versioning for in-flight runs.** Wrap changed workflow logic in `workflow.patched("change-id")`
   so old histories replay the old branch and new runs take the new one; remove the patch once old runs
   finish. Monitor non-determinism errors after each deploy and the count of open runs on old versions.
+- **Worker Versioning as the deploy-level alternative.** Temporal's Worker Versioning (GA since
+  2026-03-30, checked 2026-11) can pin each run to the worker deployment version that started it, so
+  pinned runs drain on old workers and need no patch; auto-upgrading runs still do. Monitor open runs
+  per deployment version.
 - **Continue-as-new for long-lived workflows.** For workflows that loop for weeks (an agent that wakes
   daily), call `workflow.continue_as_new(...)` with compact state before history grows large. Monitor
   history event count and size per workflow against the server's limits.
@@ -404,8 +420,9 @@ reembed_daily()
   `data_interval_end` and overwrite that partition, with `catchup` set deliberately. Monitor row counts
   per partition before and after retries or backfills; any growth on a re-run is a bug.
 - **Persisted, cache-keyed Prefect tasks.** Give expensive tasks (parse, embed) `retries`, a cache key
-  derived from their inputs (for example `cache_key_fn=task_input_hash`) and persisted results, so a
-  re-run flow skips finished work. Monitor cache-hit rate on retried flow runs.
+  derived from their inputs (for example `cache_key_fn=task_input_hash`, or Prefect 3's
+  `cache_policy=INPUTS`) and persisted results, so a re-run flow skips finished work. Monitor cache-hit
+  rate on retried flow runs. Prefect 3.x; both names checked against prefect 3.9.1, 2026-11.
 
 ## Trade-offs
 - **Airflow's static DAGs vs runtime-shaped graphs.** Predictable scheduling, backfills and a mature

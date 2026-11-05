@@ -204,7 +204,8 @@ the schema, and an uncaught `MaxTurnsExceeded`.
 | Function tool | a Python function exposed as a tool | `@function_tool`; schema from type hints and docstring |
 | Handoff | delegation to another agent, offered to the model as a tool | `handoffs=[agent]`, `handoff_description`, `handoff()` for options |
 | Agent as tool | call another agent and get its result back, without transferring control | `agent.as_tool(tool_name=..., tool_description=...)` |
-| Guardrail | a check on input or final output that can trip and abort | `@input_guardrail`, `@output_guardrail`, `GuardrailFunctionOutput` |
+| Guardrail | a check on input, final output, or each function-tool call, that can trip and abort | `@input_guardrail`, `@output_guardrail`, `GuardrailFunctionOutput`; per tool `@tool_input_guardrail` and `@tool_output_guardrail` passed via `function_tool(tool_input_guardrails=[...])` |
+| Approval | a pause before a tool runs, resumable later | `function_tool(needs_approval=True)`, `result.interruptions`, `result.to_state()`, `RunState.approve()` |
 | Session | stored conversation history across runs | for example `SQLiteSession(session_id)` passed as `session=` (check the docs for current backends) |
 | Context | your typed dependencies, never sent to the model | `context=` on run, `RunContextWrapper[T]` in tools |
 | Trace | a span tree of one workflow | automatic; `with trace("name"):` groups several runs |
@@ -353,6 +354,9 @@ async def handle(user_id: str, message: str) -> str:
   processor with `add_trace_processor` (or use an integration such as Langfuse or Logfire) so traces
   live next to your other telemetry. Use `set_tracing_disabled(True)` or the documented environment
   variable when data policy forbids export. Monitor turns, tool errors and handoffs per trace.
+- **Sentry agent monitoring (checked against sentry-sdk 2.73.0, 2026-11).** Its OpenAI Agents integration
+  turns on when `sentry_sdk.init()` runs with `agents` installed. Prompts and outputs are treated as PII and
+  are not sent unless you set `send_default_pii=True`.
 - **Guard expensive agents with cheap checks.** Put a small-model input guardrail in front of the agent
   that uses the large model, and an output guardrail on anything user-facing (PII, policy). Count
   tripwire rate per guardrail; a sudden rise usually means a prompt regression, not an attack.
@@ -361,15 +365,17 @@ async def handle(user_id: str, message: str) -> str:
 - **Keep identity and secrets in context.** Pass user, tenant and clients through `context`, read them
   via `RunContextWrapper` in tools, and never accept IDs for authorization from tool arguments.
 - **Persist conversations explicitly.** Use a session store, or save `result.to_input_list()` yourself,
-  keyed by conversation ID. For long or approval-gated runs, wrap runs in a durable workflow engine
-  (the docs describe integrations; check which are current) because the SDK itself keeps no checkpoints.
+  keyed by conversation ID. For approvals, serialize `result.to_state()` and resume it later. For runs
+  that must survive crashes, use Temporal's `temporalio-openai-agents` plugin (`temporalio.openai_agents`;
+  1.1.0 pins openai-agents below 0.23, checked 2026-11).
 - **Budget and fail closed.** Set `max_turns`, catch `MaxTurnsExceeded` and guardrail exceptions, and
   record token usage per run from the result's usage data (check the attribute path in your version) so
   cost per conversation is a dashboard, not a guess.
 
 ## Trade-offs
-- **Small API vs no orchestration model.** A handful of primitives is quick to learn, but there is no graph,
-  checkpointing or interrupt primitive. Flips to LangGraph or a durable engine when runs pause for days.
+- **Small API vs no orchestration model.** A handful of primitives is quick to learn, but there is no graph.
+  It does pause: `needs_approval` tools surface as `result.interruptions`, and a saved `RunState` resumes
+  the run. It has no crash-safe checkpointer; flips to LangGraph or Temporal when runs must survive a crash.
 - **OpenAI-first defaults vs portability.** Responses API features and hosted tools work best on OpenAI
   models; other providers work through adapters with uneven feature support. Test your exact model.
 - **Handoffs vs explicit routing code.** Handoffs let the model route, which is flexible but probabilistic.
@@ -386,7 +392,8 @@ async def handle(user_id: str, message: str) -> str:
 - **Vague `handoff_description`s.** Symptom: triage bounces between specialists or picks the wrong one.
   Fix: make descriptions mutually exclusive and evaluate routing on labelled messages.
 - **Treating guardrails as complete security.** Symptom: injected tool output still triggers a write.
-  Fix: guardrails are checks on input and final output; enforce permissions in the tools themselves.
+  Fix: agent guardrails check only input and final output. Add tool guardrails or `needs_approval` on
+  writes, and still enforce permissions in the tools themselves.
 
 ## When to use
 - **Use when** you want a thin, well-traced tool loop with handoffs, mostly on OpenAI models, and your
@@ -395,6 +402,9 @@ async def handle(user_id: str, message: str) -> str:
   for LangGraph, a durable-execution engine, or Pydantic AI.
 - **Compare with** the Claude Agent SDK, which ships a full computer-access harness (files, shell, MCP)
   rather than a bare loop.
+- **Not Agent Builder.** OpenAI is winding down Agent Builder and the hosted Evals platform: shutdown
+  2026-11-30, Evals read-only from 2026-10-31 (OpenAI deprecations page, checked 2026-11). It points
+  code workflows to this SDK. ChatKit is not part of the shutdown.
 - **Measure** turns per run, handoff accuracy, guardrail tripwire rate, tool error rate and cost per run.
 
 ## Role lens
@@ -428,7 +438,8 @@ the fix for the wrong-customer refund is in the tool's contract, not in the prom
 - **Execution:** input guardrails run alongside the first agent's model call; output guardrails run on
   the final output. A tripped guardrail raises an exception that aborts the run.
 - **Good for:** cheap topic, policy and PII checks that block expensive runs or unsafe replies.
-- **Not good for:** authorization or protecting side-effecting tools mid-run; enforce those in tool code.
+- **Not good for:** authorization. Agent guardrails do not see tool calls mid-run; `@tool_input_guardrail`
+  and `@tool_output_guardrail` do, per function tool. Still enforce permissions in tool code.
 
 ### A run occasionally loops for 40 turns. How do you find and fix the cause?
 - **Find it in the trace:** look for repeated identical tool calls, tools returning errors the model keeps

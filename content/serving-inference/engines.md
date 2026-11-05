@@ -26,8 +26,8 @@ sources:
 
 ## TL;DR
 An inference engine owns batching, KV memory, kernels and the API. For a self-hosted agent it decides how
-many runs fit, whether prefixes are reused and whether tool calls parse. vLLM, SGLang, TGI and
-TensorRT-LLM serve fleets; llama.cpp and Ollama run locally.
+many runs fit, whether prefixes are reused and whether tool calls parse. vLLM, SGLang and TensorRT-LLM
+serve fleets; llama.cpp and Ollama run locally.
 
 ## For agent builders
 - **Why it matters for agents.** Agent traffic is many calls per run over long, repeated prefixes with
@@ -39,8 +39,8 @@ TensorRT-LLM serve fleets; llama.cpp and Ollama run locally.
 - **What you control.** Engine choice per deployment, context ceiling and batch cap from KV arithmetic,
   prefix caching, the chat template and tool-call parser for the model, and a contract test suite for tool
   calling and JSON on every engine and model pair.
-- **What you can skip.** Kernel internals and the TensorRT build details unless you run a fixed,
-  high-volume model fleet. Most agent teams use a hosted API or vLLM or SGLang.
+- **What you can skip.** Kernel internals and TensorRT-LLM tuning unless you run a fixed, high-volume
+  NVIDIA fleet. Most agent teams use a hosted API or vLLM or SGLang.
 
 ## Lab
 ### Task
@@ -53,7 +53,8 @@ the deploy gate for that move.
 - **Prerequisites:** KV cache memory estimation, and this lesson's capacity calculator and tool-calling
   contract test.
 - **Runs offline:** the five responses were recorded in OpenAI chat-completions shape, so no GPU, engine
-  or API key is needed. Standard library plus `pytest`; checked on Python 3.12 with pytest 9.1.
+  or API key is needed. Standard library plus `pytest`; checked on Python 3.12 with pytest 9.1. The vLLM
+  flags named here are checked against vllm 0.33.0, 2026-11.
 - **Done means** the tests pass and the script prints the expected report.
 
 ### Starter code
@@ -281,24 +282,24 @@ They differ in emphasis, hardware reach, model format and how much work it takes
   fast constrained decoding.
 - **API and deployment** are similar to vLLM; teams usually benchmark both on their own traffic.
 
-### TGI (Text Generation Inference)
-- **Hugging Face's server:** a Rust router in front of Python model shards, continuous batching, paged
-  attention, several quantization backends, token streaming, and an OpenAI-style Messages API.
-- **Its draw** is integration with the Hub and Inference Endpoints; if your fleet already lives in the
-  Hugging Face ecosystem it is the shortest path.
-- **Caveat:** its pace on the newest serving tricks has generally trailed vLLM and SGLang, so check the
-  project's current maintenance status and roadmap before choosing it for a new deployment.
+### TGI (Text Generation Inference): legacy
+- **Status (checked 2026-11):** Hugging Face put TGI in maintenance mode; the README accepts only minor
+  fixes and docs, and the last release is v3.3.7. Do not choose it for a new deployment.
+- **What it was:** a Rust router in front of Python model shards with continuous batching, paged
+  attention and an OpenAI-style Messages API. You may still meet it in older Hub-centric stacks.
+- **Migrating off it:** Hugging Face points new work to vLLM, SGLang, llama.cpp or MLX; the same
+  OpenAI-compatible client code moves over, but re-run the tool-calling contract test on the new engine.
 
 ### TensorRT-LLM
-- **NVIDIA's engine.** It compiles models ahead of time into TensorRT engines specialised for a GPU
-  architecture and a configuration (maximum batch size, sequence length, parallelism).
-- **That buys** aggressive kernel fusion and FP8 on Hopper-class parts. It implements in-flight batching
-  and paged KV cache.
-- **Newer option:** recent releases add a PyTorch-based backend that loads checkpoints directly,
-  narrowing the operational gap, but the compiled path remains the reason to choose it.
-- **Serving:** typically behind Triton Inference Server (NVIDIA's NIM containers build on the same stack).
-- **Ceiling vs cost:** the highest performance ceiling on NVIDIA hardware and the highest operational
-  cost: a build step per model and GPU type, NVIDIA-only, and rebuilds when limits change.
+- **NVIDIA's engine.** Since 1.0 its default is a PyTorch backend that loads Hugging Face checkpoints
+  directly, with NVIDIA-tuned kernels, FP8 on Hopper-class parts, in-flight batching and paged KV cache.
+- **The old compiled path is going away.** Ahead-of-time TensorRT engines, built per GPU type and limits,
+  are legacy in stable 1.2.1 and removed in the 1.3 pre-releases, where `backend="tensorrt"` raises a
+  `ValueError` (checked against tensorrt-llm 1.2.1, 2026-11). Older tutorials still show `trtllm-build`.
+- **Serving:** `trtllm-serve` gives an OpenAI-compatible endpoint, or run it behind Dynamo-Triton (the
+  renamed Triton Inference Server). NVIDIA's NIM containers build on the same stack.
+- **Ceiling vs cost:** a high performance ceiling on NVIDIA hardware, at the price of NVIDIA-only
+  deployment and a narrower model list than vLLM.
 
 ### llama.cpp
 - **A C/C++ runtime** built around the GGUF weight format and its k-quant family (Q4_K_M and relatives).
@@ -322,8 +323,7 @@ They differ in emphasis, hardware reach, model format and how much work it takes
 |---|---|---|---|---|
 | vLLM | datacenter | continuous batching, paged KV, prefix cache | NVIDIA, AMD, others | HF checkpoints; AWQ/GPTQ/FP8 |
 | SGLang | datacenter | as vLLM, plus RadixAttention | NVIDIA, AMD | HF checkpoints; quantized variants |
-| TGI | datacenter, HF ecosystem | continuous batching, paged attention | NVIDIA, AMD, others | HF checkpoints; several quant backends |
-| TensorRT-LLM | datacenter, peak performance | in-flight batching, paged KV | NVIDIA only | compiled TensorRT engines |
+| TensorRT-LLM | datacenter, peak performance | in-flight batching, paged KV | NVIDIA only | HF checkpoints (PyTorch backend, 1.x default) |
 | llama.cpp | laptop, edge, CPU | small-scale batching | CPU, Apple Silicon, consumer GPUs | GGUF |
 | Ollama | developer machine | single-user defaults | as llama.cpp | GGUF via registry |
 
@@ -354,30 +354,30 @@ flowchart TD
     Q2 -->|"heavy prefix reuse, agents"| SG["SGLang"]
     Q2 -->|"unique prompts, broad models"| VL["vLLM"]
     Q2 -->|"few fixed models, NVIDIA fleet"| TR["TensorRT-LLM"]
-    Q2 -->|"Hugging Face platform"| TG["TGI"]
     SG --> B["Benchmark at target concurrency"]
     VL --> B
     TR --> B
-    TG --> B
 ```
 
 ## Examples
 ### One client, two engines
 The same client code runs against a datacenter engine and a laptop runtime because both speak the OpenAI
 chat API; only the base URL and model name change. The vLLM flags set the context ceiling, the share of
-GPU memory handed to weights plus KV cache, the batch cap and prefix caching.
+GPU memory handed to weights plus KV cache and the batch cap; prefix caching needs no flag.
 
 ```bash
 # Datacenter: vLLM serving an 8B instruct model, OpenAI-compatible API on :8000
+# Prefix caching is on by default (vllm 0.33.0); --no-enable-prefix-caching turns it off
 vllm serve meta-llama/Llama-3.1-8B-Instruct --max-model-len 8192 \
-  --gpu-memory-utilization 0.90 --max-num-seqs 128 --enable-prefix-caching
+  --gpu-memory-utilization 0.90 --max-num-seqs 128
 # Laptop: Ollama (llama.cpp underneath), OpenAI-compatible API on :11434
-ollama pull llama3.1:8b && ollama serve
+ollama serve &              # start the server first; pull talks to it
+ollama pull llama3.1:8b
 ```
 
 - **Order matters for Ollama:** `ollama pull` talks to a running server, so on a headless Linux box start
-  `ollama serve` first (in another shell or as a service); the desktop app on macOS and Windows already
-  runs it.
+  `ollama serve` first (in the background, another shell or as a service); the desktop app on macOS and
+  Windows already runs it.
 
 ```python
 from openai import OpenAI
@@ -499,17 +499,16 @@ Same 80 GB GPU and Llama-3.1-8B (128 KiB per token, about 400,000 tokens of KV p
 - **Configure Ollama before sharing it.** For a small team, raise `OLLAMA_NUM_PARALLEL` and set the context
   length explicitly (for example `PARAMETER num_ctx 8192` in a Modelfile), so long prompts are not
   silently truncated. Monitor latency as users are added; move to a GPU engine when it climbs.
-- **Build TensorRT-LLM engines per GPU type in CI.** Treat the compiled engine as an artifact tagged by
-  model, GPU architecture and limits, and fail the deploy if the node type does not match. Monitor load
-  failures after hardware refreshes.
+- **Move TensorRT-LLM deployments to the PyTorch backend.** If you still ship compiled TensorRT engines
+  built in CI, plan the move before upgrading past 1.2.x, where that path is legacy and then removed.
+  Monitor load failures and throughput on the first upgraded nodes.
 
 ## Trade-offs
 - **vLLM breadth vs churn.** Breadth (models, hardware, features) comes with a fast-moving codebase;
-  pinning and re-benchmarking on upgrade is part of owning it, whereas a compiled TensorRT-LLM engine is
-  frozen and predictable until you need to change it.
-- **TensorRT-LLM peak vs rigidity.** Peak throughput is bought with an ahead-of-time build per model, GPU
-  type and configuration; it pays off for a few high-volume models on a homogeneous NVIDIA fleet, not for
-  a long tail of models or mixed hardware.
+  pinning and re-benchmarking on upgrade is part of owning it, for TensorRT-LLM as much as for vLLM.
+- **TensorRT-LLM peak vs reach.** NVIDIA-tuned kernels raise the ceiling on NVIDIA GPUs, but the model
+  list is narrower and you are locked to one vendor; it pays off for a few high-volume models on a
+  homogeneous NVIDIA fleet, not for a long tail of models or mixed hardware.
 - **SGLang prefix sharing vs unique prompts.** Radix-tree sharing wins with heavy prefix reuse (agents,
   multi-turn, shared system prompts); on single-shot traffic with unique prompts the advantage over vLLM
   shrinks to whatever the current kernels give.
@@ -519,8 +518,6 @@ Same 80 GB GPU and Llama-3.1-8B (128 KiB per token, about 400,000 tokens of KV p
 - **Self-hosted engine vs hosted API for agents.** Self-hosting controls data and per-token cost at volume
   and lets you serve a fine-tuned agent model, but you take on tool-call parsing, template correctness and
   capacity; a hosted API wins until volume or data rules force the move.
-- **TGI ecosystem fit vs cadence.** Hub and Inference Endpoints integration saves work, but adopting it
-  means accepting Hugging Face's cadence for serving optimisations.
 
 ## Pitfalls
 - **Benchmarking a single request and choosing llama.cpp or Ollama for a multi-user service.** Symptom:
@@ -537,8 +534,8 @@ Same 80 GB GPU and Llama-3.1-8B (128 KiB per token, about 400,000 tokens of KV p
   runtime applies its own context window unless the model or request overrides it.
 - **Serving a base model with an instruct chat template, or the reverse.** Symptom: rambling or
   never-terminating output.
-- **A TensorRT engine built on one GPU type deployed to another.** Symptom: a load failure on the new
-  nodes after a hardware refresh.
+- **Following an older TensorRT-LLM tutorial.** Symptom: a `trtllm-build` engine pipeline that breaks on
+  upgrade, because 1.3+ removes the TensorRT backend; load the checkpoint with the default PyTorch backend.
 - **Serving an agent model without tool-call parsing enabled.** Symptom: the agent loop receives the tool
   call as plain text in `content` and either stops or answers without acting. Fix: enable the engine's
   tool-calling support with the right parser and template, and gate the deploy on the contract test.
@@ -548,19 +545,19 @@ Same 80 GB GPU and Llama-3.1-8B (128 KiB per token, about 400,000 tokens of KV p
   datacenter engines.
 - **What concurrency and traffic shape?** Unique single-shot prompts favour vLLM; heavy prefix reuse and
   structured programs favour SGLang; a few very high-volume models on a homogeneous NVIDIA fleet justify
-  TensorRT-LLM; a Hugging Face-centric platform points at TGI.
-- **How much operational effort?** Compiled engines need a build pipeline, vLLM and SGLang need version
-  discipline, Ollama needs almost nothing.
+  TensorRT-LLM. TGI is maintenance-only, so do not pick it for new work.
+- **How much operational effort?** vLLM, SGLang and TensorRT-LLM need version discipline, Ollama needs
+  almost nothing.
 - **Measure** tokens per second at your target concurrency, p95 time to first token and GPU memory
   headroom; never choose on a single-request benchmark.
 - **Interviews:** explain what continuous batching and paged KV cache do, why llama.cpp and vLLM are not
-  competitors, and what the TensorRT-LLM build step buys and costs.
+  competitors, and what changed when TensorRT-LLM 1.x made a PyTorch backend its default.
 
 ## Role lens
 - **Engineer:** Runs the engine, tunes context length, memory utilisation and batch caps, enables prefix
   caching and quantization, and benchmarks candidates on recorded production traffic.
-- **Architect:** Chooses the engine family per deployment target, decides whether the TensorRT-LLM build
-  pipeline is worth its rigidity, and standardises on an OpenAI-compatible contract so engines stay swappable.
+- **Architect:** Chooses the engine family per deployment target, decides whether TensorRT-LLM's NVIDIA
+  lock-in is worth its ceiling, and standardises on an OpenAI-compatible contract so engines stay swappable.
 - **FDE:** Stands up vLLM or SGLang inside a customer's VPC, or Ollama on an analyst's workstation, and
   translates their "it is slow" into the batching and memory numbers that explain it.
 
@@ -597,11 +594,11 @@ fixed.
   KV cache (`--kv-cache-dtype fp8`) or a quantized model, or more GPUs.
 
 ### When would you not pick TensorRT-LLM despite its higher ceiling?
-- **When the model list is long or changing,** because every model, GPU type and limit change needs a
-  rebuild.
+- **When the model list is long or changing,** because its supported-model list is narrower than vLLM's
+  and each new model needs its own benchmark and contract test.
 - **On mixed or non-NVIDIA hardware,** since it is NVIDIA-only.
-- **When the team cannot own a build pipeline;** vLLM or SGLang get most of the performance with far less
-  operational cost.
+- **When the team already runs vLLM or SGLang well;** they get most of the performance with less
+  vendor lock-in. (The old per-GPU engine build is no longer the reason: 1.x defaults to PyTorch.)
 
 ### Are llama.cpp and vLLM competitors?
 - **No: they target different deployments.** llama.cpp runs GGUF weights on CPUs, Apple Silicon and
@@ -624,14 +621,13 @@ fixed.
   and `--tool-call-parser`) and a contract suite passing before any traffic moves.
 
 ## Quiz
-### Q: Which engine's distinctive workflow compiles the model ahead of time for a specific GPU architecture and configuration?
-- [ ] vLLM
-- [ ] SGLang
-- [x] TensorRT-LLM
-- [ ] TGI
-> TensorRT-LLM builds a TensorRT engine specialised to the GPU type, batch and sequence limits, which
-> enables aggressive kernel fusion but means a rebuild when hardware or limits change. The others load
-> checkpoints at startup and need no per-GPU build step.
+### Q: A team plans a new TensorRT-LLM deployment on release 1.2.1. Which path should it build on?
+- [ ] Compile per-GPU TensorRT engines with `trtllm-build` in CI
+- [x] The default PyTorch backend, loading the Hugging Face checkpoint directly
+- [ ] Convert the model to GGUF first
+- [ ] Serve it through TGI's router
+> Since 1.0 the PyTorch backend is the default; the compiled TensorRT-engine path is legacy in 1.2.1 and
+> removed in the 1.3 pre-releases. GGUF is llama.cpp's format, and TGI is in maintenance mode.
 
 ### Q: What is the relationship between Ollama and llama.cpp?
 - [ ] They are independent implementations of the same GGUF specification
@@ -661,7 +657,7 @@ fixed.
 - **Serving a fine-tuned agent model.** An engine hosts the model the provider does not, with prefix
   caching for the agent's stable prompt.
 - **High-volume agent fleets.** A fixed model on a homogeneous NVIDIA fleet can justify TensorRT-LLM's
-  build pipeline for peak throughput.
+  NVIDIA lock-in for peak throughput.
 
 ### Mini project
 **Run one agent on two engines and compare (2-3 hours).**

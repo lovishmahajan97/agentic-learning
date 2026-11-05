@@ -154,7 +154,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 name = "Qwen/Qwen2.5-0.5B"          # any small causal LM
 tok = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16).cuda().eval()
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float16).cuda().eval()
 ids = tok("The KV cache exists because", return_tensors="pt").input_ids.cuda()
 
 @torch.no_grad()

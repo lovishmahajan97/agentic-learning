@@ -283,6 +283,32 @@ e = Σᵢ mᵢ·hᵢ / Σᵢ mᵢ        hᵢ = token i's output vector, mᵢ = 
 - **Retrieve-then-rerank.** A bi-encoder fetches the top 50-200 candidates cheaply; a cross-encoder
   rescores only those, and the agent sees only the few that survive.
 
+### Beyond one vector: `SparseEncoder` and `MultiVectorEncoder` (checked 2026-11)
+- **`SparseEncoder` (since v5)** loads SPLADE-style models that output sparse term weights, for the
+  lexical half of hybrid search.
+- **`MultiVectorEncoder` (new in v6.0)** loads ColBERT-style late-interaction models: one vector per
+  token, scored with MaxSim (each query token takes its best-matching document token, then the maxima are
+  summed). PyLate, Stanford ColBERT and colpali-engine checkpoints load into it.
+- **The cost is index size,** because you store a matrix per chunk instead of one vector.
+
+```python
+# checked against sentence-transformers 6.2.0, 2026-11
+from sentence_transformers import MultiVectorEncoder
+
+mv = MultiVectorEncoder("answerdotai/answerai-colbert-small-v1")
+q = mv.encode_query(["How do I reset my password?"])          # required: queries get their own prefix
+d = mv.encode_document(["Open Settings, choose Security, then Reset password.",
+                        "Our office is closed on public holidays."])
+print(q[0].shape, d[0].shape)    # a list of (tokens, 96) tensors, one per input; they do not stack
+print(mv.similarity(q, d))       # MaxSim scores; the first document wins
+```
+
+- **MaxSim scores sit close together** (about 31.4 against 30.1 in this run); the ranking is what counts.
+- **`encode_query` and `encode_document` are required** here, not a convenience: the two sides use
+  different prefixes and length caps.
+- **A load report listing `linear.weight` as UNEXPECTED is harmless** for this checkpoint: the
+  projection to 96 dimensions loads into the separate `Dense` module (checked in the same run).
+
 ### Training with contrastive losses
 `MultipleNegativesRankingLoss` takes (anchor, positive) pairs and treats every other positive in the batch
 as a negative. For anchor `aᵢ` in a batch of B pairs it is a B-way softmax cross-entropy:

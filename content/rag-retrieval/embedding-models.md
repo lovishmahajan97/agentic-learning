@@ -267,7 +267,8 @@ print(select_tools("I want my money back for order 1182"))
   reranker already corrects first-stage mistakes.
 - **Hosted vs self-hosted.** Hosted API models (OpenAI, Cohere, Voyage, Google) remove serving work, but
   every chunk's text leaves your network and a vendor deprecation forces a full re-embed; self-hosted
-  open models (BGE, E5, GTE, Nomic) reverse both sides.
+  open models (BGE, E5, GTE, Nomic) reverse both sides. FastEmbed 0.9.1 (Qdrant's ONNX library, checked
+  2026-11) runs many of them on CPU without PyTorch.
 - **Multilingual vs English-specialised.** Multilingual models handle cross-language queries but tend to
   be a little weaker on English-only tasks than a same-size English model.
 - **Long-context embeddings vs precision.** Less chunking, but each vector is a blurrier average of more

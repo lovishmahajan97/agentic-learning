@@ -141,12 +141,19 @@ a base URL and a key.
 |---|---|---|
 | What | Open-source Python server (`litellm --config config.yaml`) plus a matching in-process `Router` class | Hosted gateway; the core gateway is also open source, written in TypeScript |
 | Behaviour defined in | YAML config file you run yourself | Declarative JSON configs: a `strategy` (fallback or load-balance) over `targets` |
-| Credentials | Keys referenced as `os.environ/VAR`; virtual keys per key, team or user | Provider credentials in Portkey's vault; clients reference them by an id (virtual keys, in Portkey's terms) |
+| Credentials | Keys referenced as `os.environ/VAR`; virtual keys per key, team or user | Provider credentials stored as AI Providers in the Model Catalog (formerly virtual keys); clients name `@provider-slug/model` |
 | State | Postgres for virtual keys, budgets and rate limits; Redis for rate-limit counters, cache entries and cooldowns across replicas | Managed by Portkey |
-| Per-target options | Retries, fallbacks, cooldowns in `router_settings` | Each target has its own virtual key and optional retry, cache (exact or semantic) and timeout settings |
+| Per-target options | Retries, fallbacks, cooldowns in `router_settings` | Each target names its provider and model and has optional retry, cache (exact or semantic) and timeout settings |
 | Client side | OpenAI SDK pointed at the proxy | Config id or inline config in request headers |
 | Observability | Logging callbacks to tracing backends | Traces, cost and metadata tags in its dashboards; guardrails attach to configs |
 | Compliance | Prompts stay in your network | A third-party processor in your data path, unless you deploy the gateway in your own environment |
+
+- **Portkey status (checked 2026-11).** Palo Alto Networks completed its acquisition of Portkey on
+  2026-05-29 and is folding it into Prisma AIRS. The open-source gateway (`@portkey-ai/gateway`) has had
+  no release since 1.15.2 on 2026-01-12, so check its activity before self-hosting it.
+- **Supply chain applies to the gateway too.** LiteLLM releases 1.82.7 and 1.82.8 were malicious
+  (2026-03-24); the LiteLLM lesson's supply-chain section covers hash-pinned installs, pinned images and
+  key rotation.
 
 **LiteLLM config sections:**
 - `model_list`: deployments, each an alias name plus `litellm_params` with provider and model.
@@ -189,13 +196,29 @@ Two consequences:
 ### Alternatives
 - **API-gateway vendors with AI plugins** (Kong AI Gateway).
 - **CDN-hosted gateways** (Cloudflare AI Gateway).
-- **Envoy AI Gateway,** built on Envoy, for teams already running it on Kubernetes.
+- **Agent Router (formerly Envoy AI Gateway, renamed 2026-09),** built on Envoy, for teams already
+  running it on Kubernetes; CRD, API and CLI names are unchanged.
+- **Vercel AI Gateway,** a hosted aggregator on Vercel's platform, the natural fit for AI SDK apps.
+- **vLLM Semantic Router,** a decision layer that selects or combines models for each call by your
+  quality, latency and cost priorities, across local, private and cloud backends (checked against v0.4,
+  2026-11); it chooses the model, while the gateway still holds keys and budgets.
 - **The choice axes** are the same as LiteLLM versus Portkey: where prompts flow, who operates it, which
   providers and provider-specific features pass through intact, and fit with traffic infrastructure you
   already run.
 - **The light end:** an in-process library such as the LiteLLM SDK's `Router` gives the same routing and
   fallbacks with no extra hop, but no central enforcement: every service holds keys again and budgets are
   per process.
+
+### Hosted aggregator vs self-hosted gateway
+A hosted aggregator such as OpenRouter is one OpenAI-compatible endpoint, one key and one bill in front of
+many providers. A self-hosted gateway keeps your own provider contracts behind it.
+- **Aggregator wins** for prototypes, model shopping and open-weight models you have no contract for.
+- **What you give up:** your traffic goes through another processor, and each request may be served by
+  any of several upstream hosts with their own retention and quantization.
+- **Pin it per request (checked 2026-11):** OpenRouter's `provider` object takes `data_collection: "deny"`,
+  `zdr: true`, `order`, `allow_fallbacks`, `quantizations` and `require_parameters`.
+- **Gateway wins** when you need central budgets per agent, your own DPAs, or prompts that never leave
+  your network. An aggregator can also sit behind your gateway as one more upstream.
 
 ### What it centralises
 - Key custody.
@@ -329,17 +352,17 @@ print(r.choices[0].message.content)
 - **Moving `fast` to a different model** is a config change and a canary, not a deploy of every service.
 
 ### Portkey config: fallback with retries
-The same idea declared as a Portkey config. Check field names against the current Portkey docs (newer
-versions can name providers from a model catalog instead of `virtual_key`); the shape is a `strategy` over
-`targets`.
+The same idea declared as a Portkey config: a `strategy` over `targets`. Each target names a Model
+Catalog provider slug and model as `@provider-slug/model`, which replaced `virtual_key` (checked against
+Portkey's docs, 2026-11).
 
 ```json
 {
   "strategy": { "mode": "fallback" },
   "retry": { "attempts": 2 },
   "targets": [
-    { "virtual_key": "openai-prod", "override_params": { "model": "gpt-4o-mini" } },
-    { "virtual_key": "anthropic-prod", "override_params": { "model": "claude-sonnet-4-20250514" } }
+    { "override_params": { "model": "@openai-prod/gpt-4o-mini" } },
+    { "override_params": { "model": "@anthropic-prod/claude-sonnet-4-20250514" } }
   ]
 }
 ```

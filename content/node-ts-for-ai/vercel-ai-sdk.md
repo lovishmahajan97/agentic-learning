@@ -46,21 +46,21 @@ Turn a broken AI SDK support agent into a budgeted, validated, approval-gated to
 an order up and then says nothing, runs tools on malformed ids, and issues refunds with no confirmation:
 three of this lesson's pitfalls in one file.
 
-A scripted `MockLanguageModelV2` stands in for the provider,
+A scripted `MockLanguageModelV4` stands in for the provider,
 so the loop, validation and usage accounting are the real SDK code.
 - **Time box:** 45-60 minutes.
 - **Prerequisites:** this lesson's "One request through the tool loop" and the step-budget worked
   scenario; Runtime schema validation; Vitest / Jest & integration testing.
-- **Version:** checked with `ai` 5.0.280 (AI SDK 5 naming, as in this lesson), `zod` 4.6.7, Vitest 5.0.5
-  and Node 24.21. The mock class is `MockLanguageModelV2` from `ai/test` in v5; later majors renamed it and
-  the loop options, so pin `ai@5` for this lab.
-- **Setup:** `npm init -y && npm pkg set type=module && npm i ai@5 zod && npm i -D vitest`.
+- **Version:** checked against `ai` 7.0.163, `zod` 4.6.7, Vitest 5.1.0 and Node 24.21, 2026-11. v7 is
+  ESM-only and needs Node 22+. `MockLanguageModelV2` no longer exists; use `MockLanguageModelV4` (or
+  V3) from `ai/test`, whose usage and finish reason are objects. Pin `ai@7` for this lab.
+- **Setup:** `npm init -y && npm pkg set type=module && npm i ai@7 zod && npm i -D vitest`.
 
 ### Starter code
 ```ts
 // support.ts: a support agent on the AI SDK's tool loop, driven by a scripted mock model (no key needed)
 import { generateText, tool, stepCountIs, type LanguageModel } from "ai";
-import { MockLanguageModelV2 } from "ai/test";
+import { MockLanguageModelV4 } from "ai/test";
 import { z } from "zod";
 import { fileURLToPath } from "node:url";
 
@@ -93,23 +93,27 @@ export async function answer(model: LanguageModel, prompt: string) {
   return {
     text: result.text,
     steps: result.steps.length,
-    inputTokens: result.totalUsage.inputTokens,   // summed over every step: the request's real cost
+    inputTokens: result.usage.inputTokens,   // v7: summed over every step, the request's real cost
     awaitingApproval: last.toolCalls.filter((c) => !last.toolResults.some((r) => r.toolCallId === c.toolCallId))
       .map((c) => c.toolName),
   };
 }
 
-// A scripted model: each doGenerate call returns the next turn. inputTokens grows like a resent history.
+// A scripted model: each doGenerate call returns the next turn. Input tokens grow like a resent history.
 type Turn = { text: string } | { call: string; input: object };
 export function scriptedModel(...turns: Turn[]) {
   let n = 0;
-  return new MockLanguageModelV2({
+  return new MockLanguageModelV4({
     doGenerate: async () => {
       const t = turns[n++] ?? { text: "(script exhausted)" };
-      const usage = { inputTokens: 3000 + 1000 * (n - 1), outputTokens: 50, totalTokens: 3050 + 1000 * (n - 1) };
-      if ("text" in t) return { content: [{ type: "text", text: t.text }], finishReason: "stop", usage, warnings: [] };
+      const usage = {
+        inputTokens: { total: 3000 + 1000 * (n - 1), noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
+        outputTokens: { total: 50, text: undefined, reasoning: undefined },
+      };
+      if ("text" in t) return { content: [{ type: "text", text: t.text }], usage, warnings: [],
+                                finishReason: { unified: "stop", raw: undefined } };
       return { content: [{ type: "tool-call", toolCallId: `call_${n}`, toolName: t.call, input: JSON.stringify(t.input) }],
-               finishReason: "tool-calls", usage, warnings: [] };
+               usage, warnings: [], finishReason: { unified: "tool-calls", raw: undefined } };
     },
   });
 }
@@ -181,22 +185,24 @@ after 1 step instead of 4.
 
 ### Failure scenarios
 - **Inject a generous budget:** use `stepCountIs(10)`. The cap test sees 10 steps and `inputTokens` of
-  75,000 instead of 18,000, the worked scenario's third row. Log `steps.length` and `totalUsage` per
+  75,000 instead of 18,000, the worked scenario's third row. Log `steps.length` and `usage` per
   request; a tail of requests at the budget means the model is looping, not finishing.
-- **Inject `usage` instead of `totalUsage`:** the first test reports 4,000, the last step only. Compare
-  each step's `usage` in `result.steps` with the total to see which number your cost dashboard reads.
+- **Inject `finalStep.usage` instead of `usage`:** the first test reports 4,000, the last step only. In v7
+  the top-level `usage` sums every step (`totalUsage` is a deprecated alias); in v5 `usage` was the last
+  step. Compare each step's `usage` in `result.steps` with the total your cost dashboard reads.
 - **Inject validation inside `execute`:** check the id with an `if` in the handler and return an error
   object. The tool now runs (it pushes to `lookups`) for bad input. Keep the contract in `inputSchema`, so
   the SDK rejects input before `execute` and sends the error back to the model for a second try.
 - **Inject a gate in the prompt only:** keep `execute` and add "ask before refunding" to the prompt. The
   scripted model ignores it, as a real one sometimes will, and `refunds` fills up. Approval has to be
-  structural: no `execute` (or v6's `needsApproval`), with the app running the refund after a click.
+  structural: no `execute` (or v7's call-level `toolApproval`), with the app running the refund after a
+  click.
 
 ### Submission
 - **Your `support.ts`** with the three `YOUR CODE` changes and nothing else edited.
 - **A `npx vitest run` log** showing 4 passed, and the `node support.ts` output matching the expected lines.
 - **A per-step trace** for the looping case (step number, tool calls, `usage.inputTokens`) printed from
-  `result.steps` or `onStepFinish`.
+  `result.steps` or `onStepEnd` (v7's name for `onStepFinish`).
 - **A short note** on how the app resumes after approval: what it appends to the messages and why the next
   request then continues the loop.
 - **Evaluated on:** green tests, validation in the schema, the refund impossible without an app-side
@@ -285,8 +291,13 @@ Two consequences of step 4:
 - **`wrapLanguageModel`** wraps any model with middleware that can transform the prompt, intercept the
   result or short-circuit the call. Logging, caching, guardrails and default settings live here instead of
   at every call site.
-- **OpenTelemetry**, switched on per call with the `experimental_telemetry` option, emits spans for each
-  call and step with token usage, into the same tracing pipeline as the rest of the service.
+- **OpenTelemetry** emits spans for each call and step with token usage, into the same tracing pipeline
+  as the rest of the service. In v7 the span exporter moved out of `ai`: install `@ai-sdk/otel` and call
+  `registerTelemetry(new OpenTelemetry())` once (`registerTelemetry` from `ai`, `OpenTelemetry` from
+  `@ai-sdk/otel`).
+- **v7 traces every call by default** once an integration is registered. The per-call `telemetry` option
+  sets `functionId`, input and output recording, or `isEnabled: false`; `experimental_telemetry` is a
+  deprecated alias (checked against ai 7.0.163 and @ai-sdk/otel 1.0.163, 2026-11).
 
 ### Runtime fit and versions
 - **Runs anywhere `fetch` exists:** Node, Bun, Deno, edge runtimes, and inside Express, Fastify, Hono or
@@ -296,6 +307,12 @@ Two consequences of step 4:
 - **v6 moved again.** It deprecated `generateObject` / `streamObject` in favour of `generateText` /
   `streamText` with an `output` setting, added an agent abstraction, and its migration guide lists further
   signature changes. Check the version you install against its docs rather than copying old snippets.
+- **v7 (2026-06-25) is ESM-only and needs Node 22+.** Top-level `usage` now sums every step, with
+  `finalStep.usage` for the last one; `totalUsage`, `onFinish` and `onStepFinish` are deprecated aliases
+  (`onEnd`, `onStepEnd`). Checked against ai 7.0.163, 2026-11.
+- **Durable agents.** v7 adds `WorkflowAgent` in `@ai-sdk/workflow`, which runs on Vercel's Workflow SDK
+  (checked against @ai-sdk/workflow 2.0.95 and npm `workflow` 5.4.0, 2026-11) so a run survives
+  restarts and long approval waits.
 
 ## Diagram
 One `streamText` call with a tool is two billed provider requests; the second resends the history plus the
@@ -323,7 +340,7 @@ sequenceDiagram
 ### Streaming tool route plus typed classification
 A route handler that streams a tool-using answer to a `useChat` client, and a separate function that
 classifies text into a typed object. The model line is the only provider-specific code; written against
-AI SDK 5 naming.
+AI SDK 5 naming (v7 renames are listed under "Runtime fit and versions").
 
 ```ts
 import { streamText, generateObject, tool, stepCountIs, convertToModelMessages } from "ai";
@@ -348,7 +365,7 @@ export async function chatHandler(req: Request): Promise<Response> {
     },
     stopWhen: stepCountIs(4),          // at most 4 model/tool rounds per request
     abortSignal: req.signal,           // client disconnect stops generation and further billing
-    onFinish: ({ totalUsage, steps }) =>   // `usage` here is the last step only; totalUsage sums all
+    onFinish: ({ totalUsage, steps }) =>   // v5: `usage` is the last step, totalUsage sums all; v7: both sum
       console.log({ totalUsage, steps: steps.length, toolCalls: steps.flatMap((s) => s.toolCalls).length }),
   });
   return result.toUIMessageStreamResponse();   // tokens, tool state and data to the browser
@@ -424,8 +441,9 @@ export async function classifySafe(text: string) {
 - **Cross-cutting policy in middleware.** Wrap the shared model once with `wrapLanguageModel` for logging,
   default settings or a guardrail, and export that wrapped model to every route. Monitor latency added by
   the middleware and keep per-route exceptions out of it.
-- **Per-call tracing.** Pass `experimental_telemetry: { isEnabled: true }` on production calls so each call and step emits an
-  OpenTelemetry span with token usage. Track p95 time to first token, tool-call counts and cost per route
+- **Per-call tracing.** Register `@ai-sdk/otel` once at startup (v7) and every call and step emits an
+  OpenTelemetry span with token usage; pass `telemetry: { functionId: "<route>" }` to group spans by
+  route. In v5 you opted in per call with `experimental_telemetry: { isEnabled: true }`. Track p95 time to first token, tool-call counts and cost per route
   in the same dashboards as the HTTP spans.
 - **Provider comparison as an eval job.** Run the golden set through the same code with the model line set
   to each candidate (`anthropic(...)`, `openai(...)`) in a scheduled job, and record quality, latency and
@@ -518,7 +536,8 @@ provider-specific economics.
 ### Why can a tool-using request cost several times its first request's input tokens?
 - **Each step is a new billed request** that resends the full history plus the appended tool call and result.
 - **So input grows every round:** with two steps the system prompt is counted twice in `totalUsage`.
-- **Control it** with a step limit, a short system prompt or provider caching, and monitor `totalUsage`, not `usage`.
+- **Control it** with a step limit, a short system prompt or provider caching, and monitor the summed
+  usage: `totalUsage` in v5, plain `usage` in v7 (where `finalStep.usage` is the last step only).
 
 ### When would you not use the AI SDK?
 - **One provider, deep features:** batch jobs, server-side tools or a new feature not yet exposed through
@@ -540,7 +559,7 @@ provider-specific economics.
 - **Keep read tools server-run** with `execute`, so only consequential actions pause, and log approvals
   and denials per tool.
 - **Check your major:** v6 adds a built-in approval flag on tools (`needsApproval`), which replaces the
-  hand-rolled pattern above; confirm it in the docs for the version you install.
+  hand-rolled pattern above; v7 deprecates the tool-level flag for a call-level `toolApproval` setting.
 
 ## Quiz
 ### Q: What makes `anthropic("...")` and `openai("...")` interchangeable in a `streamText` call?

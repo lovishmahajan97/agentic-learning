@@ -243,7 +243,7 @@ from transformers import AutoModelForCausalLM
 
 model = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen2.5-7B-Instruct",
-    torch_dtype=torch.bfloat16,
+    dtype=torch.bfloat16,
     device_map="auto",
     max_memory={0: "20GiB", "cpu": "64GiB"},   # GPU 0 budget, host budget for overflow
     offload_folder="offload",                  # used only if even host RAM runs out

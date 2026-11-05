@@ -22,6 +22,7 @@ related:
   - llmops-platform/reproducible-evaluations
   - llmops-platform/ci-cd-for-prompts-and-models
   - backend-fundamentals/ci-cd
+  - tool-labs/inspect-ai-agent-evals-lab
 sources:
   - Official docs: EleutherAI lm-evaluation-harness
   - Official docs: Inspect (UK AI Security Institute)
@@ -396,8 +397,12 @@ An agent changes the shape of `run(item)`:
   build cost.
 
 ### Capability harnesses versus application harnesses
-- **Capability harnesses** such as EleutherAI's lm-evaluation-harness and Inspect standardize prompting
-  and scoring for public benchmarks, so an MMLU number from one lab is comparable with another's.
+- **Capability harnesses** such as EleutherAI's lm-evaluation-harness and the `inspect_evals` suite
+  standardize prompting and scoring for public benchmarks, so an MMLU number from one lab is comparable
+  with another's.
+- **Inspect itself spans both** (inspect-ai 0.3.287, checked 2026-11): its Task, Solver and Scorer core
+  runs your own tool-using agent in a Docker sandbox and grades the final environment state. The
+  Inspect AI lab builds one.
 - **Application harnesses** (hosted products, open-source libraries or a few hundred lines you own)
   point at your dataset and your graders.
 - **Same structure;** the difference is who owns the dataset and the grading rules. The tooling lesson

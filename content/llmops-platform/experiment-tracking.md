@@ -168,6 +168,8 @@ Both clients are thin writers to a store; their transport explains several sharp
   autologging that captures params and metrics from common frameworks without explicit calls.
 - **GenAI features:** through the later 2.x releases and the 3.x line it added tracing, LLM evaluation APIs
   and a prompt registry, so an LLM team can keep evals and prompts in the same store as training runs.
+- **MLflow 3 tracing (checked against mlflow 3.18.0, 2026-11):** `@mlflow.trace` wraps a function in a span,
+  and one call such as `mlflow.openai.autolog()` traces every client call. Traces are OpenTelemetry-compatible.
 - **Hosting:** Databricks offers a managed version, and some cloud ML platforms (Amazon SageMaker, for
   example) offer managed MLflow tracking servers; otherwise you self-host.
 
@@ -183,6 +185,9 @@ Both clients are thin writers to a store; their transport explains several sharp
   - **Weave:** its toolkit for tracing and evaluating LLM applications.
 - **Why teams pick it:** the UI. **Why they do not:** cost per seat, and metrics and artifacts leave the
   network unless you self-host.
+- **Ownership:** W&B is owned by CoreWeave; the acquisition closed on 2025-05-05.
+- **A lighter option (checked against trackio 0.45.0, 2026-11):** Hugging Face's Trackio is free and
+  local-first (SQLite), with a `wandb.init`/`log`/`finish`-compatible API and optional sync to a Space.
 
 ### How an agent team uses either
 | Run type | Params | Metrics | Artifacts | Then |

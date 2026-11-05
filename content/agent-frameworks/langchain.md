@@ -368,6 +368,7 @@ print(order_status.args_schema.model_json_schema()["properties"])
 | Look up orders and open tickets | `create_agent` with 2-4 tools | loop is standard, no custom branching |
 | Refunds needing approval | `create_agent` plus HITL middleware, or a LangGraph graph | needs durable pause and resume |
 | Swap providers for cost | `init_chat_model` string per environment | same message format everywhere |
+| Long investigations that need files and subagents | LangChain Deep Agents: `create_deep_agent` (deepagents 0.7.32, built on `create_agent`; checked 2026-11) | this is the heavier harness (filesystem, subagents, skills, memory); pick it only for long runs |
 
 ## Production patterns
 - **Install only the integrations you use.** Depend on `langchain-core`, `langchain` and the specific

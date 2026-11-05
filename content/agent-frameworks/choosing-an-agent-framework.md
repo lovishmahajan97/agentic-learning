@@ -122,9 +122,10 @@ LangGraph losing on the eval set or needing more glue than the raw loop, the evi
 | Typed tools and validated outputs | you want type checking and retries on bad output | Pydantic AI, Instructor |
 | Durable state, pause and resume, branching | runs last minutes to days or need approvals | LangGraph, a durable workflow engine |
 | Retrieval over many documents | data plumbing dominates | LlamaIndex, LangChain retrievers |
-| Role-based multi-agent teams | you are prototyping a crew of roles quickly | CrewAI, AutoGen / AG2 |
+| Role-based multi-agent teams | you are prototyping a crew of roles quickly | CrewAI, Microsoft Agent Framework, AG2 |
 | A full agent harness (files, shell, MCP, subagents) | you want a coding or ops agent out of the box | Claude Agent SDK |
 | Provider-native handoffs, guardrails, tracing | you are committed to one provider | OpenAI Agents SDK, Google ADK |
+| A visual builder for simple flows owned by non-engineers | the flow is short and its owners do not ship code | low-code: n8n (SAP invested at a $5.2B valuation, 2026-05), Dify, Flowise (Workday, 2025-08), Langflow (DataStax, now IBM) |
 
 ### The candidates in one line each
 - **Raw SDK loop.** Full control and the fewest surprises; you build persistence, retries and tracing.
@@ -137,6 +138,9 @@ LangGraph losing on the eval set or needing more glue than the raw loop, the evi
   permission modes.
 - **CrewAI.** Agents with a role, goal and backstory, assigned tasks in a crew; Flows for explicit control.
 - **Pydantic AI.** Typed agents with dependency injection and validated structured output, model-agnostic.
+- **Microsoft Agent Framework.** The GA 1.x successor to AutoGen and Semantic Kernel: agents plus
+  graph workflows and group-chat, handoff and Magentic orchestrations (checked against agent-framework
+  1.24.0, 2026-11).
 
 ### A scoring procedure that holds up
 1. **Write the hard requirements first:** longest run time, need for human approval, multi-agent or not,

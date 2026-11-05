@@ -337,6 +337,9 @@ def test_repair_cap_and_reset():
   raise `max_retries`.
 - **Semantic rules become retryable:** any Python assertion in a validator becomes an instruction the
   model can act on.
+- **An alternative shape: BAML.** You declare types and prompt functions in `.baml` files and generate a
+  typed client; its parser tolerates loosely formatted replies before validating (checked against
+  baml-py 0.226.3, 2026-11).
 
 ### Outlines: constraints inside decoding
 1. **Compile the constraint.** A regex, or a JSON schema first converted to a regex, becomes a

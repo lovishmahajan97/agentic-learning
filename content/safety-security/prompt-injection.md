@@ -145,6 +145,20 @@ useless; benchmarks such as AgentDojo measure exactly this pair.
 - **An allowlist on email recipients holds at 100%** regardless of wording, because it never reads the
   words. So layers 1, 2 and 4 carry the guarantees, and layer 3 is an early-warning signal.
 
+### Screening tool outputs with a classifier (checked 2026-11)
+- **Prompt Guard 2** (Meta; 86M multilingual, 22M faster but weaker outside English) labels text
+  benign or malicious, with no separate injection label. Run it on every tool result before the result
+  enters context.
+- **It reads 512 tokens at a time,** so split long pages and emails into segments and scan them in
+  parallel, or the payload hides past the window.
+- **Route hits to a signal, not a silent block:** log the source, quarantine the result or require
+  approval for the next consequential call, and track the false-positive rate on clean tool output.
+- **LlamaFirewall** (llamafirewall 1.0.3, last release 2025-05) packages Prompt Guard 2 as a scanner and
+  adds AlignmentCheck, an experimental LLM auditor that reads the agent's trace and flags actions that
+  drift from the user's goal. Each check is one more model call.
+- **Both are detection layers, not a boundary:** the asymmetry above still applies, so the executor
+  allowlist and approvals carry the guarantee.
+
 ## Diagram
 The model may be fooled; guarantees come from runtime checks between its proposal and any side effect.
 
@@ -299,6 +313,9 @@ Ship the third design; keep the classifier as an early-warning signal in the log
   argument strings appear in them; alert when they do.
 - **Pin third-party tool definitions.** Record the tool names and descriptions an MCP server served at
   review and alert or refuse on change, because a changed description is a new injection carrier.
+- **Scan installed agent components.** Snyk Agent Scan (`snyk-agent-scan` 0.6.10, formerly Invariant's
+  mcp-scan, checked 2026-11) inventories MCP servers and skills and checks them for injections. It starts
+  stdio servers and needs a Snyk API token, so run it in a sandbox. Monitor new findings per scan.
 - **Injection regression suite in CI.** Run fixed injected tasks after every prompt or model change and
   track both metrics side by side; AgentDojo-style task pairs are a good template.
 

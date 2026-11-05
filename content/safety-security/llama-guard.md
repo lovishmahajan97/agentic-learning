@@ -314,8 +314,13 @@ p_unsafe = exp(z_unsafe) / (exp(z_unsafe) + exp(z_safe))
 | Option | Shape | When it fits |
 |---|---|---|
 | Hosted moderation APIs (OpenAI, Azure AI Content Safety) | free or cheap, no GPUs | data may leave your boundary and their taxonomy fits |
-| ShieldGemma, Granite Guardian | open, similar policy-in-prompt designs; Granite Guardian adds RAG checks such as groundedness | open-weight alternatives |
-| Meta's Prompt Guard | small classifier for jailbreak and injection text | the job Llama Guard does not attempt |
+| Cloud guardrail services (Bedrock Guardrails, Azure Prompt Shields (GA), Google Model Armor) | managed filters, including prompt-attack detection | you already run on that cloud and its data terms fit |
+| Lakera Guard (Check Point acquisition closed) | commercial runtime screening API | you want a vendor-run injection filter |
+| ShieldGemma, Granite Guardian 4.1 (8B, Apache 2.0, 2026-04) | open, similar policy-in-prompt designs; Granite Guardian adds RAG checks such as groundedness | open-weight alternatives |
+| Qwen3Guard (Gen and Stream; 0.6B, 4B, 8B) | open; the Stream variant classifies output token by token | moderating a stream without buffering, many languages |
+| gpt-oss-safeguard (20b, 120b; Apache 2.0) | open reasoning model that reads your written policy at inference time | a custom policy with too few labels to train a classifier |
+| Meta's Prompt Guard 2 (86M, 22M) | binary benign or malicious classifier for jailbreak and injection text; no separate injection label | the job Llama Guard does not attempt |
+| any-guardrail (Mozilla.ai, 0.7.7, checked 2026-11) | one Python interface over many guard models | comparing guards on your own labelled set |
 | NeMo Guardrails | orchestration layer | calls Llama Guard as one rail among several |
 
 ## Diagram
@@ -356,17 +361,17 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 model_id = "meta-llama/Llama-Guard-3-8B"
 tok = AutoTokenizer.from_pretrained(model_id)
-model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto").eval()
+model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map="auto").eval()
 SAFE_ID = tok.encode("safe", add_special_tokens=False)[0]
 UNSAFE_ID = tok.encode("unsafe", add_special_tokens=False)[0]
 
 @torch.no_grad()
 def moderate(chat: list[dict]) -> tuple[str, float]:
     # the chat template inserts the S1..S14 policy block and "assess only the last message"
-    ids = tok.apply_chat_template(chat, return_tensors="pt").to(model.device)
-    out = model.generate(input_ids=ids, max_new_tokens=16, do_sample=False, output_scores=True,
+    enc = tok.apply_chat_template(chat, return_tensors="pt", return_dict=True).to(model.device)
+    out = model.generate(**enc, max_new_tokens=16, do_sample=False, output_scores=True,
                          return_dict_in_generate=True, pad_token_id=tok.eos_token_id)
-    gen = out.sequences[0, ids.shape[-1]:]
+    gen = out.sequences[0, enc["input_ids"].shape[-1]:]
     p_unsafe = float("nan")
     for pos, t in enumerate(gen.tolist()):       # skip any leading newline tokens
         if t in (SAFE_ID, UNSAFE_ID):
@@ -382,8 +387,10 @@ reply = {"role": "assistant", "content": "I can't help with that. If it's your o
 print(moderate([user, reply]))                   # output rail: the reply is judged given the question
 ```
 
-- **Versions:** mechanics checked on transformers 4.57, where `device_map` needs `accelerate` and
-  `torch_dtype` is deprecated for `dtype`; verdicts not run.
+- **Versions:** mechanics re-checked against transformers 5.22.1 with torch 2.15.0, 2026-11, on a tiny
+  random Llama, not the gated model; verdicts not run. `device_map` still needs `accelerate`.
+- **What changed in 5.x:** `apply_chat_template` now returns a dict-like `BatchEncoding`, so the old
+  `generate(input_ids=ids)` and `ids.shape` lines fail; unpack `**enc` as above.
 - **Expected (typical, verify on your setup):** the input call comes back `unsafe` with a non-violent-crimes
   code (S2); the output call comes back `safe`, because the refusal is judged in context.
 

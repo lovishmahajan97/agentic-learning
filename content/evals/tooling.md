@@ -23,6 +23,7 @@ related:
   - observability/langfuse
   - observability/langsmith
   - llmops-platform/evaluation-frameworks
+  - agent-frameworks/langsmith-for-agents
 sources:
   - Es et al., 2023 — RAGAS: Automated Evaluation of Retrieval Augmented Generation
   - Official docs: Promptfoo
@@ -305,6 +306,11 @@ output and the list of tool calls, so scorers can grade the outcome and the traj
 | Braintrust | hosted platform + open-source `autoevals` | tight experiment-diff loop with a readable UI | hosted: data residency is a plan-level question |
 | LangSmith | platform | LangChain or LangGraph shops, human annotation workflow | hosted by default; native schema is LangSmith-specific |
 | Langfuse | open-source, self-hostable platform | data residency, unifying production feedback and offline evals | you run a multi-service stack and bring your own graders |
+| Pydantic Evals | Python library, `Dataset` of `Case`s plus evaluators (pydantic-evals 2.66.0, 2026-11) | code-first evals for any Python agent; used in the Pydantic AI lab | ships from the pydantic-ai repo, so pin it alongside pydantic-ai |
+| Opik | open-source (Apache-2.0) platform by Comet (opik 2.2.140, 2026-11) | self-hosted traces and evals, a Langfuse alternative | you run the stack, as with Langfuse |
+| Azure AI Evaluation SDK | Python library, `evaluate()` plus built-in evaluators such as `ToolCallAccuracyEvaluator` (azure-ai-evaluation 1.18.11, 2026-11) | teams on Azure AI Foundry | AI-assisted evaluators need an Azure OpenAI or Foundry project |
+| MLflow GenAI evaluation | `mlflow.genai.evaluate(data, scorers, predict_fn)` with built-in scorers such as `Correctness` and `Guidelines` or your own `@scorer` (mlflow 3.18.0, 2026-11) | teams already tracking runs in MLflow or Databricks | LLM-judge scorers need a judge model; results live in MLflow runs |
+| OpenAI Evals (hosted) | Evals API and dashboard, plus trace grading of agent traces | none for new work | read-only since 2026-10-31, shutdown 2026-11-30, migration path is Promptfoo; not the open-source `openai/evals` repo |
 
 ### Promptfoo (library, config-driven)
 - **Shape:** an open-source TypeScript CLI run with `npx promptfoo`. A YAML file declares `prompts`,
@@ -318,6 +324,9 @@ output and the list of tool calls, so scorers can grade the outcome and the traj
 - **Red-team mode:** generates adversarial probes by plugin and strategy.
 - **Sharp edges:** the YAML grows with the suite; model-graded assertions use a default grader you should
   pin explicitly; a multi-step agent has to be wrapped as a custom provider.
+- **Status (checked 2026-11, promptfoo 0.125.1 on npm):** OpenAI announced on 2026-03-09 that it will
+  acquire Promptfoo (promptfoo.dev/blog/promptfoo-joining-openai). Whether the deal has closed is
+  unverified; the CLI stays open source under MIT. Pin the version like any other dependency.
 
 ### RAGAS (library, RAG metrics)
 A Python library born from the paper of the same name. Core metrics are LLM-judge chains plus
@@ -337,6 +346,16 @@ embeddings:
 - **Sharp edge 2:** every score depends on the judge model and on the statement-splitting prompt.
 - **Sharp edge 3:** metric definitions have changed across library versions, so pin the version and never
   compare scores across versions.
+
+#### Current version and agent metrics (checked against ragas 0.4.3, 2026-11)
+- **Pin:** ragas 0.4.3 (released 2026-01-13, no release since). The repository is now
+  `vibrantlabsai/ragas`; the paper is unchanged.
+- **Import path:** `from ragas.metrics.collections import Faithfulness`. Importing metrics from
+  `ragas.metrics` prints a deprecation warning and is due to be removed in 1.0.
+- **Agent metrics ship today:** `ToolCallAccuracy`, `ToolCallF1`, `AgentGoalAccuracy` and
+  `TopicAdherence`, all in `ragas.metrics.collections`. Calibrate them like any judge.
+- **Install trap:** on a fresh install, `import ragas` 0.4.3 failed with langchain-community 0.4.2
+  (`langchain_community.chat_models.vertexai` is gone). Pinning `langchain-community==0.4.1` fixed it.
 
 ### DeepEval (library, pytest-style)
 - **Shape:** Python, shaped like unit tests: an `LLMTestCase(input, actual_output, expected_output, retrieval_context)` is checked with `assert_test(case, metrics)` and run through `deepeval test run`.
@@ -446,19 +465,19 @@ providers with deterministic and rubric assertions.
 
 ```python
 # test_support_bot.py — run with: deepeval test run test_support_bot.py
-# imports and signatures checked against deepeval 4.3.1 (needs Python 3.10+); there LLMTestCaseParams
-# still works but is deprecated in favour of SingleTurnParams. Judge metrics need a model API key.
+# imports and signatures checked against deepeval 4.3.3, 2026-11 (needs Python 3.10+). SingleTurnParams
+# replaces LLMTestCaseParams, which now only emits a DeprecationWarning. Judge metrics need a model API key.
 import pytest
 from deepeval import assert_test
 from deepeval.metrics import FaithfulnessMetric, GEval
-from deepeval.test_case import LLMTestCase, LLMTestCaseParams
+from deepeval.test_case import LLMTestCase, SingleTurnParams
 from my_app import answer_with_context      # returns (answer: str, retrieved_chunks: list[str])
 
 handoff = GEval(
     name="AccountDataHandoff",
     criteria="If the input asks for account-specific data (invoices, usage, balances), the output must "
              "offer a handoff to a person or a self-service link instead of stating a figure.",
-    evaluation_params=[LLMTestCaseParams.INPUT, LLMTestCaseParams.ACTUAL_OUTPUT],
+    evaluation_params=[SingleTurnParams.INPUT, SingleTurnParams.ACTUAL_OUTPUT],
     threshold=0.8,
 )
 
@@ -471,7 +490,7 @@ def test_answer(question):
 
 ```yaml
 # promptfooconfig.yaml — run with: npx promptfoo eval && npx promptfoo view
-# `promptfoo validate` accepts this config (checked with promptfoo 0.124.1)
+# `promptfoo validate` accepts this config (checked with promptfoo 0.125.1, 2026-11)
 prompts: [file://prompts/support_v7.txt, file://prompts/support_v8.txt]
 providers: [openai:chat:MODEL_A, anthropic:messages:MODEL_B]   # substitute current model ids
 tests:
@@ -485,6 +504,37 @@ tests:
       - { type: python, value: "'billing' in output.lower() or 'contact' in output.lower()" }
 ```
 
+### Grading tool use with a packaged DeepEval metric
+`ToolCorrectnessMetric` compares the tools your agent called with the tools the case expects. Without
+`available_tools` it is a deterministic name match and makes no judge call.
+
+```python
+# checked against deepeval 4.3.3, 2026-11 (pin deepeval 4.3.x). The constructor still builds the default
+# judge, so set OPENAI_API_KEY (a placeholder works for this path) or pass model=.
+from deepeval.metrics import ToolCorrectnessMetric
+from deepeval.test_case import LLMTestCase, ToolCall
+
+def tool_case(question, answer, called):
+    return LLMTestCase(input=question, actual_output=answer,
+                       tools_called=[ToolCall(name=n) for n in called],
+                       expected_tools=[ToolCall(name="get_account")])
+
+good = tool_case("What was my last invoice total?", "It was $412.00.", ["get_account"])
+skipped = tool_case("What was my last invoice total?", "It was $380.00.", [])   # invented figure
+for case in (good, skipped):
+    metric = ToolCorrectnessMetric(threshold=1.0, async_mode=False)
+    metric.measure(case)
+    print(metric.score, metric.success)
+# 1.0 True
+# 0.0 False
+```
+
+- **What it adds over your own check:** the score and a `reason` in DeepEval's report, and options such
+  as `should_consider_ordering`. Forbidden tools are still your own code.
+- **Goal-level grading:** `TaskCompletionMetric` is an LLM judge built to read a DeepEval trace of the
+  run. Without a trace it falls back to input, output and tools called, a path its source marks for
+  deprecation, so instrument the agent first and calibrate the judge before it gates anything.
+
 ### An agent experiment in LangSmith
 A LangGraph agent evaluated on a LangSmith dataset with two of your own scorers: one on the outcome, one
 on the trajectory. The target runs the full loop per item and returns the tool calls it made.
@@ -494,7 +544,7 @@ on the trajectory. The target runs the full loop per item and returns the tool c
 # signature, incl. num_repetitions, checked against langsmith 0.14.12), LANGSMITH_API_KEY and tracing
 # env vars set, and a dataset "support-agent-v3" that already exists
 from langsmith.evaluation import evaluate
-from my_agent import agent          # compiled LangGraph graph, e.g. create_react_agent(model, tools)
+from my_agent import agent          # compiled graph, e.g. langchain.agents.create_agent(model, tools)
 
 def target(inputs: dict) -> dict:
     result = agent.invoke({"messages": [("user", inputs["question"])]})
@@ -694,8 +744,9 @@ numbers are components, not the verdict.
 - **Return the trajectory from the target:** the list of tool calls with arguments, alongside the answer.
 - **Score it with your own functions** (required tools, forbidden tools, confirmation before writes,
   step budget), because these are cheap and exact.
-- **Use packaged agent metrics** from DeepEval, RAGAS or LangChain's trajectory evaluators only after
-  checking the installed version and calibrating against labelled runs.
+- **Use packaged agent metrics** from DeepEval, RAGAS or LangChain's `agentevals` (trajectory match and
+  judge) and `openevals` only after checking the installed version and calibrating against labelled
+  runs. The LangSmith-for-agents lab runs `agentevals` 0.0.9 (`openevals` is 0.2.2, 2026-11).
 
 ### When would you choose a self-hosted platform over a hosted one?
 - **Data residency or contractual limits** on where prompts and customer traces may live; Langfuse is

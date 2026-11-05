@@ -475,7 +475,8 @@ and log every call for audit.
 - **Support agents over tickets and CRM.** Tickets are attacker-controlled text; reads of customer data
   are scoped to the ticket's customer and replies are policy-checked.
 - **Enterprise MCP gateways.** A central gateway allowlists servers, pins definitions, injects scoped
-  credentials and logs every call for audit across many agents.
+  credentials and logs every call for audit across many agents. Docker MCP Gateway (open source,
+  `docker mcp gateway run`, checked 2026-11) runs servers in containers; check its flags per release.
 - **Desktop assistants with local servers.** File-system and shell servers run in containers with roots
   limited to a project directory and no host credentials.
 

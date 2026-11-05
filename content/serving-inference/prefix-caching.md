@@ -33,7 +33,8 @@ under causal attention, but only for byte-identical beginnings.
   append-only transcript each step prefills only the newest tool result; without it, every step
   re-prefills the whole trajectory and step latency and cost climb with step count.
 - **Where it shows up in your stack.** Hosted APIs: automatic caching or explicit breakpoints such as
-  `cache_control`, and cached-token fields in `usage`. Self-hosted: `--enable-prefix-caching` in vLLM,
+  `cache_control`, and cached-token fields in `usage`. Self-hosted: vLLM's automatic prefix caching (on
+  by default; `--no-enable-prefix-caching` turns it off, checked against vllm 0.33.0, 2026-11),
   RadixAttention in SGLang, and the router that decides which replica sees step *n*.
 - **What you control.** Prompt layout (system prompt and tool definitions first, byte-identical), whether
   history is append-only or rewritten, where timestamps and run ids go, deterministic ordering of retrieved
@@ -163,7 +164,7 @@ flowchart TD
 - **"One volatile token costs only that token."** Block keys chain the previous key, so the first changed
   token invalidates every later block. A step id placed before the system prompt turns 19,548 prefill
   tokens into 127,510 over a 10-step run, about 6.5x.
-- **"Enabling `--enable-prefix-caching` is enough on a fleet."** The cache lives on one GPU. Behind
+- **"vLLM's prefix caching (on by default) is enough on a fleet."** The cache lives on one GPU. Behind
   round-robin routing an agent's next step usually lands on a replica that never saw its trajectory, so
   route by run or conversation id.
 - **"Once cached, my agent's prefix stays cached."** Between steps its blocks have zero references and
@@ -304,8 +305,8 @@ A 4k-token system prompt plus a growing trajectory, 10 tool steps per task, illu
 - **Route every step of a run to the same replica.** Use consistent hashing on conversation, tenant or
   agent run id at the gateway, or a cache-aware router (SGLang's router offers one), so repeat traffic hits
   a warm replica. Monitor fleet hit rate against single-replica hit rate.
-- **Track hit rate and TTFT as a pair, with preemptions.** Enable caching (`--enable-prefix-caching` in
-  vLLM, on by default in recent versions) and chart prefix hit rate, TTFT p50/p95 and the preemption
+- **Track hit rate and TTFT as a pair, with preemptions.** Keep caching on (the vLLM default; check no
+  one passed `--no-enable-prefix-caching`) and chart prefix hit rate, TTFT p50/p95 and the preemption
   counter together; a falling hit rate with rising preemptions means the pool is too small.
 - **Log cached tokens per agent step from managed-API responses.** Place stable content first and add
   breakpoints where the provider needs them (for example `cache_control` blocks on Anthropic's Messages

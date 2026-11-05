@@ -312,9 +312,13 @@ week-3 configuration.
 - **Run best-of-n rejection sampling as round one.** Sample several responses per prompt, keep the top
   reward-model score, and SFT on them before setting up PPO. Monitor the reward gap between best and
   median sample; when it shrinks, the cheap round has done its work.
-- **Use an established RL stack.** Libraries such as Hugging Face TRL (`RewardTrainer`, PPO trainer) or
-  OpenRLHF provide the four-model orchestration and generation loop. Still log per-token KL, value loss,
-  clip fraction and reward per step, because default hyperparameters do not transfer between models.
+- **Use an established RL stack.** Train the reward model with Hugging Face TRL's `RewardTrainer`, then
+  run PPO in OpenRLHF or verl, which provide the four-model orchestration and generation loop. Still log
+  per-token KL, value loss, clip fraction and reward per step, because default hyperparameters do not
+  transfer between models.
+- **TRL no longer ships PPO.** `PPOTrainer` was deleted in trl 1.13.0. Existing TRL PPO code needs
+  `trl<1.13` pinned and the `trl.experimental.ppo` import; `from trl import PPOTrainer` last worked in
+  0.28. Checked against trl 1.17.1, openrlhf 0.11.2 and verl 0.9.1, 2026-11.
 
 ## Trade-offs
 - **Learned reward vs off-distribution error.** It lets you optimise against millions of samples from tens

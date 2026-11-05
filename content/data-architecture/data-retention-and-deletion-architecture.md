@@ -369,9 +369,10 @@ Object storage enforces the trace-export TTL mechanically, so nobody has to reme
 
 ## Production patterns
 - **Redact before the trace is written.** Use whenever full prompts and tool results reach observability.
-  Run a PII detector (Microsoft Presidio is a common open-source choice) in the app or in an OpenTelemetry
-  Collector processor that deletes or hashes span attributes, so the trace store holds nothing deletable.
-  Monitor the detector's hit rate and sample traces for missed PII.
+  Run a PII detector (Presidio, now the community project `data-privacy-stack/presidio`, is a common
+  open-source choice) in the app or in an OpenTelemetry Collector processor that deletes or hashes span
+  attributes, so the trace store holds nothing deletable. Monitor the detector's hit rate and sample
+  traces for missed PII.
 - **Mechanical TTLs per store.** Use for every store with a retention class. S3-style lifecycle expiration
   rules for exports, time-partitioned Postgres tables dropped by date (`DROP TABLE` on the old partition),
   and the trace backend's own retention setting. Monitor the number of stores with no automated TTL; the

@@ -297,14 +297,18 @@ def test_overlong_rows_are_dropped_not_truncated():
 - **`SFTTrainer` with `SFTConfig`.** Accepts a dataset of `messages` (conversational) or plain `text`,
   renders it with the tokenizer's chat template, optionally packs sequences, applies LoRA through a
   `peft_config`, and runs the standard `Trainer` loop. Agent traces are conversational rows whose
-  assistant turns carry tool calls; check your TRL version's docs for how it passes tool schemas.
+  assistant turns carry tool calls.
+- **Tool schemas in SFT rows.** `SFTTrainer` reads a per-row `tools` field (a list or a JSON string) and
+  passes it to the chat template. `from trl import supports_tool_calling` returns `False` when a template
+  drops tool calls or tool results, as the basic Llama 3 template does. Checked against trl 1.17.1, 2026-11.
 - **`DPOTrainer`.** Takes `prompt`/`chosen`/`rejected` rows, computes the log-probability ratio of each
   answer against a reference model, and minimises `−log σ(β · (Δ_chosen − Δ_rejected))`. With a LoRA
   policy the reference is the base model with the adapter disabled, so no second copy is held in memory.
 - **`GRPOTrainer`.** Samples several completions per prompt (optionally through vLLM), scores them with
   plain Python reward functions, and normalises rewards within each group to form advantages. The reward
   can be an agent check, such as "the emitted tool call parses and names a valid tool".
-- **`RewardTrainer` and `PPOTrainer`.** Cover the classic RLHF path.
+- **`RewardTrainer` for the classic RLHF path.** `PPOTrainer` was deleted in trl 1.13.0. Run PPO in
+  OpenRLHF or verl, or pin `trl<1.13` for old PPO code (imported from `trl.experimental.ppo` since 0.29).
 - **Why choose it.** You write Python and every piece is overridable; that is the point. TRL is the layer
   for people who need control or a custom loss.
 
@@ -337,13 +341,13 @@ num_epochs: 2
 learning_rate: 2e-4
 lr_scheduler: cosine
 bf16: auto
-flash_attention: true
+attn_implementation: flash_attention_2   # older releases: flash_attention: true (now deprecated)
 gradient_checkpointing: true
 output_dir: ./out/support-qlora
 ```
 
 Run it with the Axolotl CLI (`axolotl train config.yml`; older releases use
-`accelerate launch -m axolotl.cli.train config.yml`).
+`accelerate launch -m axolotl.cli.train config.yml`). Keys and CLI checked against axolotl 0.21.1, 2026-11.
 
 ### Unsloth: the kernels
 - **What it replaces.** The attention, MLP and LoRA forward and backward passes of supported model
@@ -364,11 +368,25 @@ Run it with the Axolotl CLI (`axolotl train config.yml`; older releases use
   it.
 - **Exports.** Merged 16-bit weights, bare adapters, or GGUF for llama.cpp.
 
+### Hosted training primitives: Tinker (checked 2026-11)
+- **What it is.** Thinking Machines' hosted LoRA training API, GA since 2025-12-12. You write the training
+  loop in Python on your laptop; forward, backward and optimizer steps run on their GPUs.
+- **The primitives.** `tinker.ServiceClient().create_lora_training_client(base_model=..., rank=32)`,
+  then `forward_backward(data, loss_fn="cross_entropy")`, `optim_step(...)` and, on a sampling client,
+  `sample(...)`. The SFT and RL recipes live in `tinker-cookbook`.
+- **Weights are yours.** `tinker checkpoint download` fetches the LoRA weights, so you can serve the
+  adapter in vLLM with the same template parity test as above.
+- **Pricing meters.** Per-million-token meters for prefill, sampling and training that vary by model,
+  plus checkpoint storage at $0.10 per GB-month. Read current rates on the pricing page; they change.
+- **Where it fits.** A custom loop or agent RL reward without owning GPUs. TRL stays the one tool to know
+  in this category. Checked against tinker 0.37.0 and tinker-cookbook 0.5.9, 2026-11.
+
 ### How they compose
 - **TRL is the base.**
 - **Axolotl configures** Transformers/TRL/PEFT/`accelerate` from YAML.
 - **Unsloth swaps in faster kernels** underneath a TRL trainer.
-- **Same mental model elsewhere.** Similar config-driven frameworks exist (LLaMA-Factory, torchtune).
+- **Same mental model elsewhere.** Similar config-driven frameworks exist (LLaMA-Factory, ms-swift 4.x).
+  torchtune is no longer actively maintained; its last release, 0.6.1, is from 2025-04.
 
 ## Diagram
 Agent traces flow through the same steps whichever tool drives training; the adapter then goes back to
@@ -430,6 +448,8 @@ A LoRA SFT on reviewed support conversations. The rows carry a `messages` list, 
 them with the model's chat template. The adapter is saved on its own and merged into the bf16 base later
 only if the serving stack needs a single checkpoint. The commented lines show the Unsloth swap-in.
 
+Checked against trl 1.17.1, peft 0.21.2, transformers 5.22.1 and unsloth 2026.11.2, 2026-11.
+
 ```python
 from datasets import load_dataset
 from peft import LoraConfig
@@ -438,7 +458,7 @@ from trl import SFTConfig, SFTTrainer
 
 name = "Qwen/Qwen2.5-1.5B-Instruct"
 tok = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name, torch_dtype="bfloat16")
+model = AutoModelForCausalLM.from_pretrained(name, dtype="bfloat16")
 
 # rows: {"messages": [{"role": "user", "content": ...}, {"role": "assistant", "content": ...}]}
 ds = load_dataset("json", data_files="support_chats.jsonl", split="train")
@@ -450,7 +470,8 @@ peft_cfg = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, task_type="CAUSAL_
 args = SFTConfig(
     output_dir="out/support-lora",
     per_device_train_batch_size=4, gradient_accumulation_steps=4,   # effective batch 16
-    learning_rate=2e-4, num_train_epochs=2, lr_scheduler_type="cosine", warmup_ratio=0.03,
+    learning_rate=2e-4, num_train_epochs=2, lr_scheduler_type="cosine",
+    warmup_steps=0.03,                   # below 1 is a ratio; transformers <5.15: warmup_ratio=0.03
     bf16=True, gradient_checkpointing=True, packing=True,
     max_length=2048,                     # older TRL releases call this max_seq_length
     assistant_only_loss=True,            # needs a chat template that marks assistant turns;
@@ -488,7 +509,7 @@ Illustrative numbers for the run above, and for an agent-trace run with longer r
 | Tokens per optimizer step (effective batch 16) | 16 × 2,048 ≈ 32.8k | 16 × 8,192 ≈ 131k |
 | Steps per epoch | ~46 | ~92 |
 | Steps for two epochs | ~92 | ~184 |
-| `warmup_ratio=0.03` | about three steps | about six steps |
+| `warmup_steps=0.03` (a ratio) | about three steps | about six steps |
 | `save_strategy="epoch"` | two checkpoints | two checkpoints |
 
 - **Agent traces carry less loss per token.** Tool schemas and tool results are context, so only the

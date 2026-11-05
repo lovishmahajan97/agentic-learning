@@ -105,10 +105,12 @@ without walking each token.
 ### Regular vs context-free grammars
 - **Non-recursive JSON schemas** compile to regexes.
 - **Recursive or deeply nested grammars** need a pushdown automaton (a context-free grammar): llama.cpp's
-  GBNF grammars and XGrammar implement this. Nested tool arguments (a list of objects with sub-objects)
-  land here.
+  GBNF grammars, XGrammar and llguidance (the engine behind Guidance) implement this. Nested tool
+  arguments (a list of objects with sub-objects) land here.
 - **XGrammar caches** the tokens whose legality does not depend on the stack, so most steps are still a
   lookup.
+- **Engines checked 2026-11:** xgrammar 0.2.8, llguidance 1.9.1 and guidance 0.3.1 on PyPI; vLLM accepts
+  both `xgrammar` and `guidance` as structured-output backends.
 
 ### What the automaton controls
 - **No stopping halfway.** End-of-sequence is allowed only in an accepting state.
@@ -309,7 +311,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, L
 
 name = "Qwen/Qwen2.5-0.5B-Instruct"
 tok = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16).cuda().eval()
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float16).cuda().eval()
 
 class ChoiceConstraint(LogitsProcessor):
     """Allow only token sequences that spell one of `choices`, then EOS."""

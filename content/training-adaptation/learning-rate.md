@@ -33,9 +33,11 @@ nothing. Set peak, warmup and decay together.
 - **Why it matters for agents.** When you fine-tune a model on agent trajectories (tool selection,
   argument formatting, a house style for final answers), the rate decides how far the model moves from
   the instruction-tuned base. Too far and it loses the general skills and chat format your agent relies on.
-- **Where it shows up in your stack.** A learning-rate multiplier on hosted fine-tuning jobs (OpenAI's
-  API calls it `learning_rate_multiplier`), `learning_rate`, `warmup_ratio` and `lr_scheduler_type` in
-  Hugging Face and TRL trainers, and the rate you pick for LoRA adapters you serve behind the agent.
+- **Where it shows up in your stack.** The learning rate on hosted fine-tuning jobs (Together's API takes
+  `learning_rate` and `warmup_ratio`, checked 2026-11), `learning_rate`, `warmup_steps` (a float below 1
+  is a ratio; `warmup_ratio` was deprecated in transformers 5.0 and removed in 5.15) and
+  `lr_scheduler_type` in Hugging Face and TRL trainers, and the rate you pick for LoRA adapters you serve
+  behind the agent.
 - **What you control.** The peak rate per parameterisation (full fine-tune versus LoRA), the warmup as a
   share of a short run, and a small grid scored on held-out tool-call accuracy and a general suite.
 - **What you can skip.** Deriving schedules and μP in depth. Know the 2/λ intuition, that Adam makes η
@@ -241,7 +243,8 @@ print(tool_call_validity([
 #     print(lr, tool_call_validity(generate_calls(adapter, heldout_prompts)), run_suite(adapter))
 ```
 
-In a Hugging Face fine-tune the same ideas appear as `learning_rate=2e-5`, `warmup_ratio=0.03` and
+In a Hugging Face fine-tune the same ideas appear as `learning_rate=2e-5`, `warmup_steps=0.03` (a
+ratio, because it is below 1; `warmup_ratio=0.03` before transformers 5.15) and
 `lr_scheduler_type="cosine"`; the peak, the ramp and the decay are three settings of one trajectory.
 
 ### Worked scenario: reading the grid
@@ -297,7 +300,7 @@ A team fine-tunes on 2,400 examples at batch 16 for 2 epochs and copies a fixed 
 | Steps per epoch | 2,400 ÷ 16 = 150 |
 | Total steps | 300 |
 | Copied warmup | 500 steps: the peak is never reached |
-| `warmup_ratio=0.03` instead | 9 steps, then cosine decay over the remaining 291 |
+| A 0.03 warmup ratio (`warmup_steps=0.03`) instead | 9 steps, then cosine decay over the remaining 291 |
 
 - **Symptom.** The run "learns almost nothing", which looks like a too-low rate.
 - **Fix.** Express warmup as a ratio of total steps for fine-tunes, and recompute it when epochs or
@@ -309,7 +312,7 @@ A team fine-tunes on 2,400 examples at batch 16 for 2 epochs and copies a fixed 
   held-out tool-call validity and a general suite. Monitor for spikes at the top and a flat curve at the
   bottom.
 - **Record the trajectory as one unit.** In every training config and experiment record, store peak
-  `learning_rate`, warmup (`warmup_ratio` or steps), `lr_scheduler_type`, effective batch size and
+  `learning_rate`, warmup (as a ratio or steps), `lr_scheduler_type`, effective batch size and
   optimiser together. Log the actual learning rate per step (the Hugging Face `Trainer` logs it) and
   check it matches the plan.
 - **Gradient-norm and clip-rate dashboard.** Keep clipping on (`max_grad_norm=1.0` is the Hugging Face
@@ -424,7 +427,7 @@ training loss alone.
   and early gradients (for example from a new random head) are large and uninformative.
 - **Copied fixed warmup:** a 500-step warmup on a 300-step fine-tune never reaches the peak, so the run
   learns almost nothing and looks like a too-low rate.
-- **Fix:** express warmup as a ratio of total steps (for example `warmup_ratio=0.03`) and recompute it when
+- **Fix:** express warmup as a ratio of total steps (for example `warmup_steps=0.03`) and recompute it when
   epochs or dataset size change.
 
 ### You double the batch size. Should you change the learning rate?

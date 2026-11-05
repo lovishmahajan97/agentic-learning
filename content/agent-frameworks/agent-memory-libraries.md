@@ -32,8 +32,10 @@ user, while Letta (formerly MemGPT) runs stateful agents that edit their own mem
   with naive memory (dump all history), cost and confusion grow every turn. These libraries extract,
   store, retrieve and update what matters.
 - **Where it shows up in your stack.** Mem0 as a Python or TypeScript library (`mem0ai` package) over a
-  vector store, or its hosted platform; Letta as a server (self-hosted or cloud) with a client SDK and an
-  agent development UI.
+  vector store, or its hosted platform. Letta as a stateful agent runtime reached through its TypeScript
+  Agent SDK, on Letta's cloud, locally, or on a self-hosted App Server.
+- **Status, checked 2026-11.** Letta's V1 API server is retired and its V1 SDK (`letta-client`) is listed
+  as legacy. `pip install letta` now installs the Letta Code CLI, not a server.
 - **What you control.** What gets stored (extraction prompts or memory tools), scoping ids (user, agent,
   session), retrieval count, update and deletion policy, and which store backs it.
 - **What you can skip.** Building your own extraction and deduplication pipeline unless you have unusual
@@ -186,15 +188,17 @@ log itself never holds the raw card number.
 - **Code:** `memory_layer.py` with the three `YOUR CODE` parts done; `extract_facts` and `CARD` unchanged.
 - **Test run:** `pytest -q` showing 5 passed.
 - **Program output:** the seven stdout lines from `python memory_layer.py`, matching Expected output.
-- **Mapping note:** for each fix, the Mem0 call or setting you would use instead (update path, `user_id`
-  scoping, redaction before `add`, `delete_all` plus `history`).
+- **Mapping note:** for each fix, the Mem0 call or setting you would use instead (`update` on the stale
+  memory, since 2.x `add` is ADD-only; `filters={"user_id": ...}` scoping; redaction before `add`;
+  `delete_all` plus `history`).
 - **One extra test** for a scenario this lab misses, such as a fact that is retracted rather than changed.
 
 ## Why it exists
 - **Context windows are not memory.** Long histories cost tokens on every call and degrade attention;
   the agent needs a compact, retrievable store of facts and preferences.
 - **Plain RAG over chat logs is noisy.** Retrieving raw old messages returns contradictions ("I live in
-  Pune" then "I moved to Delhi"); memory layers extract facts and update or replace stale ones.
+  Pune" then "I moved to Delhi"); memory layers extract facts and give you the calls to update or
+  replace stale ones.
 - **Memory needs lifecycle operations.** Users ask to forget; facts change; tenants must not mix. Both
   tools expose add, search, update and delete keyed by ids.
 - **Some agents must manage memory themselves.** The MemGPT idea, carried into Letta, treats the context
@@ -202,26 +206,37 @@ log itself never holds the raw card number.
 
 ## How it works
 ### Mem0: a memory layer you call around your agent
-1. **Add.** After a turn, call `m.add(messages, user_id=...)`. An LLM extracts candidate facts and compares
-   them with existing memories, then adds, updates or deletes entries, because storing every message
-   would duplicate and contradict. Passing `infer=False` skips extraction and stores the messages as
-   given, which is cheaper but loses consolidation.
-2. **Search.** Before the next model call, `m.search(query, user_id=...)` returns the most relevant
-   memories, which you inject into the prompt.
-3. **Manage.** `get_all`, `update`, `delete` and `history` support inspection, corrections and
-   right-to-be-forgotten requests.
-4. **Configure.** `Memory.from_config(...)` picks the LLM, embedder and vector store (Qdrant, pgvector,
-   Chroma and others); an optional graph store adds entity relations. `MemoryClient` targets the hosted
-   platform instead.
+Checked against mem0ai 2.2.1 (Python) and mem0ai 3.3.x (npm), 2026-11.
+
+1. **Add.** After a turn, call `m.add(messages, user_id=...)`; `add` still takes entity ids at the top
+   level. An LLM extracts new facts, and in 2.x every result has event `ADD`.
+2. **Add never replaces.** `add` is ADD-only in 2.x: it does not update or delete an older, contradictory
+   memory. Changing a fact is your job, with `update(memory_id, text)` or `delete(memory_id)`.
+3. **Skip extraction.** Passing `infer=False` stores the messages as given, which is cheaper but stores
+   raw text instead of facts.
+4. **Search.** Before the next model call, `m.search(query, filters={"user_id": ...}, top_k=5)` returns
+   the most relevant memories, which you inject into the prompt.
+5. **Search scoping moved.** In 2.x entity ids go in `filters=`. A top-level `user_id` raises
+   `ValueError`, and `limit` is now `top_k` (default 20, `threshold` default 0.1).
+6. **Manage.** `get_all(filters=...)`, `update`, `delete`, `delete_all(user_id=...)` and `history`
+   support inspection, corrections and right-to-be-forgotten requests.
+7. **Configure.** `Memory.from_config(...)` picks the LLM, embedder and vector store (Qdrant, pgvector,
+   Chroma and others). `MemoryClient` targets the hosted platform instead.
+8. **Graph memory is Platform-only.** In 2.x the open-source config has no graph store; entity relations
+   need the hosted platform.
 
 ### Letta: stateful agents that edit their own memory
+The table holds the MemGPT concepts, which still explain how Letta thinks. As of 2026-11
+(`@letta-ai/letta-agent-sdk` 0.8.x), new agents keep memory in a git-backed memory filesystem
+(`memfs`, on by default), and the SDK marks memory blocks as legacy.
+
 | Concept | What it is | Why it exists |
 |---|---|---|
 | Memory blocks (core memory) | labelled text blocks such as `human` and `persona` always in context | the agent always sees key facts, and can edit them |
 | Archival memory | a vector-searchable store outside the context | long-term facts that do not fit in context |
 | Recall memory | searchable past conversation history | find earlier turns without keeping them in context |
 | Memory tools | built-in tools the agent calls to edit blocks and search or insert into archival memory | the model decides what to remember |
-| Server | agents, state and tools persist in a database behind an API | agents are long-lived objects, not prompts |
+| Backend | agents and state persist on Letta's cloud, a local runtime or a self-hosted App Server | agents are long-lived objects, not prompts |
 
 ### Choosing among memory options
 | Option | Model | Pick when |
@@ -229,7 +244,9 @@ log itself never holds the raw card number.
 | Mem0 | library or hosted layer; your framework stays in charge | you have an agent already and want per-user memory added |
 | Letta | the server owns the agent, its state and memory | you want long-lived agents that self-manage memory |
 | Framework memory (LangGraph stores, ADK MemoryService, Mastra memory) | built into your runtime | you want fewer moving parts and simple recall |
-| Zep or other memory services | managed memory with temporal knowledge graphs | you need time-aware facts and a managed service |
+| Zep Cloud (`zep-cloud` 4.x) or Graphiti (`graphiti-core`, open source), checked 2026-11 | managed context layer, or the open-source temporal knowledge graph behind it (per the getzep/zep README) | you need time-aware facts; pick Graphiti to self-host |
+| Anthropic memory tool `memory_20250818`, checked 2026-11 | a client tool: Claude asks for file operations under `/memories`, and your code stores them | you call Claude directly and want the model to manage its own notes on your storage |
+| Amazon Bedrock AgentCore Memory, checked 2026-11 | managed short- and long-term memory inside AgentCore | your agents already run on AgentCore |
 | Your own table plus vector search | full control | memory needs are narrow and audit rules are strict |
 
 ## Diagram
@@ -251,8 +268,9 @@ flowchart TD
 
 ## Examples
 ### Mem0 around a plain chat loop
-Requires `pip install mem0ai openai` and `OPENAI_API_KEY`; the default config uses OpenAI models and a
-local vector store. The search return shape has changed across versions, so check the current docs.
+Requires `pip install "mem0ai>=2.2,<3" openai` and `OPENAI_API_KEY`; the default config uses OpenAI
+models and a local vector store. Checked against mem0ai 2.2.1, 2026-11: `search` and `get_all` return
+`{"results": [...]}` and take entity ids only inside `filters=`.
 
 ```python
 from mem0 import Memory
@@ -262,8 +280,8 @@ memory = Memory()                      # Memory.from_config({...}) to choose LLM
 llm = OpenAI()
 
 def chat(user_id: str, message: str) -> str:
-    found = memory.search(message, user_id=user_id, limit=5)
-    hits = found["results"] if isinstance(found, dict) else found
+    found = memory.search(message, filters={"user_id": user_id}, top_k=5)
+    hits = found["results"]
     facts = "\n".join(f"- {h['memory']}" for h in hits)
     msgs = [
         {"role": "system", "content": f"Known facts about the user:\n{facts or '- none'}"},
@@ -275,33 +293,34 @@ def chat(user_id: str, message: str) -> str:
 
 print(chat("u-7", "I'm vegetarian and I live in Pune."))
 print(chat("u-7", "Suggest a dinner place near me."))   # retrieves both facts
-print(memory.get_all(user_id="u-7"))                    # inspect what was stored
+print(memory.get_all(filters={"user_id": "u-7"}))       # inspect what was stored
 ```
 
-### Letta: create a stateful agent with memory blocks
-Requires a running Letta server (self-hosted or cloud) and `pip install letta-client`. Model handles are
-illustrative; check the current docs for supported names.
+### Letta: create a stateful agent and resume it
+A sketch, checked against `@letta-ai/letta-agent-sdk` 0.8.70, 2026-11 (pre-1.0, so pin it). It type-checks
+but needs `npm i @letta-ai/letta-agent-sdk@0.8.70`, Node 22.19+, ESM and `LETTA_API_KEY` to run.
 
-```python
-from letta_client import Letta
+```typescript
+import { LettaAgentClient } from "@letta-ai/letta-agent-sdk";
 
-client = Letta(base_url="http://localhost:8283")
-agent = client.agents.create(
-    model="openai/gpt-4o-mini",
-    embedding="openai/text-embedding-3-small",
-    memory_blocks=[
-        {"label": "human", "value": "Name unknown. Preferences unknown."},
-        {"label": "persona", "value": "A concise travel assistant that remembers preferences."},
-    ],
-)
-resp = client.agents.messages.create(
-    agent_id=agent.id,
-    messages=[{"role": "user", "content": "I'm Asha and I only fly window seats."}],
-)
-for m in resp.messages:
-    print(m.message_type, getattr(m, "content", ""))   # includes the agent's memory-edit tool calls
-# The agent persists on the server: later calls with the same agent_id see the updated human block.
+await using client = new LettaAgentClient({ backend: "cloud" });   // or "local" / "remote"
+
+// Create once: memfs (git-backed memory files, the default) replaces legacy memory blocks.
+const agentId = await client.createAgent({
+  systemPrompt: "You are a concise travel assistant that remembers preferences.",
+  memfs: true,
+});
+
+// Resume from anywhere: the agent keeps its memory between sessions.
+await using session = client.resumeSession(agentId);
+await session.send("I'm Asha and I only fly window seats.");
+for await (const message of session.stream()) {
+  if (message.type === "assistant") process.stdout.write(message.content);
+}
 ```
+
+A later `resumeSession(agentId)` sees what the agent chose to remember. The legacy Python
+`letta-client` and Docker server path still appear in old tutorials; do not start new work on it.
 
 | Question | Mem0 | Letta |
 |---|---|---|
@@ -311,16 +330,18 @@ for m in resp.messages:
 
 ## Production patterns
 - **Scope every memory by tenant and user.** Pass `user_id` (and `agent_id` or run ids where supported)
-  derived from authenticated identity, and filter by tenant in the store, because a missing id becomes a
-  global memory. Monitor queries without a user scope; there should be none.
+  derived from authenticated identity, top-level on `add` and inside `filters=` on `search` and `get_all`
+  in mem0ai 2.x. Filter by tenant in the store too. Monitor queries without a user scope; there should
+  be none.
 - **Retrieve a few, inject compactly.** Limit search to a handful of results and render them as short
   bullets in the system prompt. Monitor memory tokens per call and answer quality on an eval set.
 - **Support deletion and audit.** Wire user "forget me" requests to `delete` or `delete_all`, keep
   `history` for audit, and test that deleted facts never resurface. Monitor deletion latency.
 - **Add asynchronously when latency matters.** Memory extraction is an extra LLM call; run `add` after the
   response is sent (a background task or queue) so users do not wait. Monitor extraction failures.
-- **Self-host Letta with a real database.** Run the Letta server with Postgres, back it up like any
-  stateful service, and version agent configurations. Monitor agent state size and tool errors per agent.
+- **Self-host Letta deliberately.** The V1 Docker server is retired (checked 2026-11); self-hosting now
+  means a Letta App Server behind the Agent SDK's `"remote"` backend. Back up its state like any stateful
+  service and version agent configurations. Monitor agent state size and tool errors per agent.
 - **Evaluate memory explicitly.** Build multi-session test scripts (state a fact, change it, ask later) and
   score whether the agent uses the latest fact. Track precision of injected memories.
 
@@ -365,17 +386,17 @@ for m in resp.messages:
 ## Check yourself
 **Q:** After adding Mem0, your assistant sometimes recommends meat dishes to a user who said last month
 they turned vegetarian, and costs rose 20%. What do you investigate and change?
-**A:** For the stale fact, inspect `get_all` and `history` for that user: if both "eats meat" and
-"vegetarian" exist, the update step did not replace the old fact, so improve extraction instructions,
-check the conflict handling of your version, and add an eval case where a preference changes. Also check
-retrieval: a limit too low or a poor query may miss the newer fact. For cost, memory extraction adds an
-LLM call per `add`; run it asynchronously, use a cheaper extraction model, and cap injected memories to a
-handful of short bullets.
+**A:** For the stale fact, inspect `get_all` and `history` for that user. If both "eats meat" and
+"vegetarian" exist, that is expected in mem0ai 2.x: `add` is ADD-only and never replaces the old fact.
+Find the conflicting memory and call `update` or `delete` on it, and add an eval case where a preference
+changes. Also check retrieval: a `top_k` too low or a poor query may miss the newer fact. For cost,
+memory extraction adds an LLM call per `add`; run it asynchronously, use a cheaper extraction model, and
+cap injected memories to a handful of short bullets.
 
 ## Interview questions
 ### How does Mem0's approach to memory differ from Letta's?
-- **Mem0 is a layer.** Your agent calls `search` before and `add` after a turn; an extraction step decides
-  which facts to add, update or delete in a vector store.
+- **Mem0 is a layer.** Your agent calls `search` before and `add` after a turn; an extraction step adds
+  new facts to a vector store. In mem0ai 2.x `add` is ADD-only, so updates and deletes are your calls.
 - **Letta is a runtime.** Agents live on a server with memory blocks in context and archival storage
   outside it, and the agent itself calls tools to edit what it remembers.
 
@@ -404,13 +425,13 @@ handful of short bullets.
   missing id can leak memories across users.
 
 ## Quiz
-### Q: In Mem0, what happens when you call add with a new conversation turn?
+### Q: In Mem0 2.x, what happens when you call add with a new conversation turn?
 - [ ] The raw messages are appended to a log with no processing
-- [x] An LLM extracts facts and the library adds, updates or deletes memories so they stay consistent
-- [ ] The vector store is rebuilt from scratch
+- [ ] An LLM extracts facts and replaces any older memory that contradicts them
+- [x] An LLM extracts facts and adds them as new memories, leaving existing memories untouched
 - [ ] The messages are sent to every user in the tenant
-> Mem0 runs an extraction and consolidation step, so a changed preference updates or replaces the old
-> memory rather than leaving two contradictory facts side by side.
+> In mem0ai 2.x `add` is ADD-only (checked 2026-11). A changed preference sits next to the old one until
+> you call `update` or `delete` on the stale memory yourself.
 
 ### Q: What are Letta's core memory blocks?
 - [ ] Encrypted backups of the agent database

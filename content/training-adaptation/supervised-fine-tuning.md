@@ -182,7 +182,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 name = "Qwen/Qwen2.5-0.5B-Instruct"                    # its template renders tools and tool turns
 tok = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16).cuda()
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16).cuda()
 opt = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.0)
 
 tools = [{"type": "function", "function": {"name": "get_order", "description": "Look up an order",

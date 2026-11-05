@@ -126,6 +126,9 @@ All three platforms present the same layers, and your design decisions live in e
 1. **Identity.** No API keys from the model vendor. Bedrock uses IAM principals and policies per model;
    Azure OpenAI uses Entra ID (keys exist but are the weaker option); Vertex uses Google Cloud IAM and
    service accounts. *Decide:* which workload identities may call which models.
+   - **Bedrock API keys (checked 2026-11):** Bedrock also issues its own bearer-token API keys. AWS
+     recommends short-term keys for production; long-term keys are for exploration, and an IAM policy
+     on `bedrock:bearerTokenType` (`LONG_TERM`) can deny them account-wide.
 2. **Network.** Private connectivity so traffic never crosses the public internet: VPC endpoints
    (PrivateLink) for Bedrock, Private Endpoints for Azure OpenAI, Private Service Connect and VPC Service
    Controls for Vertex. *Decide:* where the endpoint sits and which networks can reach it.
@@ -152,6 +155,9 @@ All three platforms present the same layers, and your design decisions live in e
   change often) adds other vendors' models.
 - **Vertex** serves Gemini natively and partner models (Anthropic, Meta, Mistral and others) through Model
   Garden.
+- **Rename (2026-04-22):** Google now calls Vertex AI "Gemini Enterprise Agent Platform, formerly Vertex
+  AI", and its consoles and docs use the new name. This lesson keeps "Vertex"; check current docs
+  before changing endpoint or SDK code.
 
 ### Capacity modes and regions
 - **Two modes everywhere, with different names.** Pay-as-you-go shares a regional pool under quotas
@@ -188,9 +194,9 @@ All three platforms present the same layers, and your design decisions live in e
 ### SDK shape
 | Platform | SDK | Notes |
 |---|---|---|
-| Bedrock | Its own SDK (boto3) | Two call styles: `InvokeModel`, whose request body is each vendor's native format, and the Converse API, one message format across models; vendor SDKs can also use Bedrock as a backend |
-| Azure OpenAI | The OpenAI SDK with an Azure client | `model` means the deployment name. Azure has also added a versionless "v1" endpoint usable from the standard OpenAI client, so check which style the current docs recommend |
-| Vertex | The Google Gen AI SDK, or vendor SDKs with a Vertex backend | Authenticates with Application Default Credentials and a project/location |
+| Bedrock | Its own SDK (boto3) | Two call styles: `InvokeModel`, whose request body is each vendor's native format, and the Converse API, one message format across models; vendor SDKs can also use Bedrock as a backend. For OpenAI models on Bedrock (such as gpt-oss), the standard OpenAI client can point at `https://bedrock-runtime.<region>.amazonaws.com/openai/v1` (Chat Completions only, checked 2026-11; the separate `https://bedrock-mantle.<region>.api.aws/v1` endpoint adds the Responses API) |
+| Azure OpenAI | The standard OpenAI SDK | The v1 API is the default: `OpenAI(base_url="https://<resource>.openai.azure.com/openai/v1/")`, no `api_version`, Entra ID via a token provider passed as `api_key`. `model` still means the deployment name. `AzureOpenAI` with dated API versions is the older style |
+| Vertex | The Google Gen AI SDK, or vendor SDKs with a Vertex backend | Authenticates with Application Default Credentials and a project/location. The same SDK with `genai.Client(api_key=...)` calls the Gemini Developer API instead: an API key, outside your cloud perimeter (checked against google-genai 2.34.0, 2026-11) |
 
 - **Hide the differences.** An internal gateway or an abstraction such as LiteLLM usually hides this so that
   application code is not rewritten when a model moves.
@@ -255,13 +261,15 @@ flowchart TD
 
 ## Examples
 ### The same one-turn request on all three platforms
-Notice what differs: Bedrock has no key and signs with the IAM identity in the environment; Azure needs an
-endpoint, an API version and the *deployment* name; Vertex authenticates with Application Default
-Credentials and a project/location. Model identifiers are placeholders to look up in each catalog.
+Notice what differs: Bedrock signs with the IAM identity in the environment (its short-term API keys are
+the alternative); Azure's v1 API needs the resource's `/openai/v1/` URL, an Entra token and the
+*deployment* name; Vertex authenticates with Application Default Credentials and a project/location.
+Model identifiers are placeholders to look up in each catalog.
 
 ```python
 import os, boto3
-from openai import AzureOpenAI
+from openai import OpenAI
+from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from google import genai
 
 QUESTION = "Summarise our refund policy in one sentence."
@@ -276,10 +284,11 @@ def via_bedrock(model_id: str) -> str:
     return r["output"]["message"]["content"][0]["text"]
 
 def via_azure(deployment_name: str) -> str:
-    client = AzureOpenAI(
-        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],   # https://<resource>.openai.azure.com
-        api_key=os.environ["AZURE_OPENAI_API_KEY"],            # prefer Entra ID token auth in prod
-        api_version=os.environ["AZURE_OPENAI_API_VERSION"],
+    # v1 API (checked against openai 3.46.0, 2026-11): standard client, no api_version
+    token = get_bearer_token_provider(DefaultAzureCredential(), "https://ai.azure.com/.default")
+    client = OpenAI(
+        base_url=os.environ["AZURE_OPENAI_ENDPOINT"] + "/openai/v1/",  # https://<resource>.openai.azure.com
+        api_key=token,                                     # Entra ID; refreshed automatically
     )
     r = client.chat.completions.create(
         model=deployment_name,                               # deployment, not the model family name
@@ -319,7 +328,7 @@ reserved call disables the SDK's automatic retries so a 429 spills at once inste
 ```python
 import openai
 
-def complete_with_spill(client: openai.AzureOpenAI, reserved: str, paygo: str, messages, **kw):
+def complete_with_spill(client: openai.OpenAI, reserved: str, paygo: str, messages, **kw):
     """Base load on the provisioned deployment; burst spills to pay-as-you-go on 429."""
     try:
         r = client.with_options(max_retries=0).chat.completions.create(

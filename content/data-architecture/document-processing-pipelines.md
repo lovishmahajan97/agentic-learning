@@ -218,7 +218,7 @@ A text-layer check, a quality score and escalation. The extractors are stand-ins
 one page and return canonical blocks; the control flow is the point.
 
 ```python
-import fitz, re                                   # PyMuPDF
+import pymupdf, re            # PyMuPDF 2.x needs Python 3.11+; checked against pymupdf 2.1, 2026-11
 
 MIN_CHARS_PER_PAGE, MIN_WORD_RATIO = 200, 0.85
 
@@ -234,7 +234,7 @@ def quality(blocks):                              # English prose heuristic; tab
 def process(path, tiers):
     """tiers: ordered list of (name, extract_page) returning canonical blocks for one page."""
     pages, errors = [], []
-    for page in fitz.open(path):
+    for page in pymupdf.open(path):
         native = page.get_text().strip()
         if not native and not page.get_images():
             pages.append({"page": page.number, "tier": "blank", "blocks": []}); continue
@@ -261,6 +261,45 @@ def process(path, tiers):
   (consistent column counts per row, numeric cells that parse).
 - **Header and footer removal runs after routing,** across all pages, because it depends on text repeating
   from page to page.
+
+### Filling the layout tier with Docling
+A real tier 3 for the router above. Docling runs layout and table-structure models over a page range and
+returns typed items with page provenance, which map straight onto the canonical blocks.
+
+```python
+# checked against docling 2.147.0, 2026-11; the first run downloads layout and table models
+from docling.document_converter import DocumentConverter
+
+converter = DocumentConverter()                      # build once per worker, not per page
+
+def layout_pages(path, first, last):
+    """Tier 3: Docling layout analysis for pages first..last (1-based), as canonical blocks."""
+    doc = converter.convert(path, page_range=(first, last)).document
+    blocks = []
+    for item, _level in doc.iterate_items():
+        prov = item.prov[0]                              # page number and bounding box
+        text = item.export_to_markdown(doc=doc) if item.label == "table" else getattr(item, "text", "")
+        blocks.append({"type": str(item.label), "text": text, "page": prov.page_no,
+                       "bbox": prov.bbox.as_tuple()})
+    return blocks
+
+def layout_page(page):                                   # router adapter: takes a PyMuPDF page
+    n = page.number + 1                                  # PyMuPDF counts from 0, Docling from 1
+    return layout_pages(page.parent.name, n, n)          # ("layout", layout_page) in the tiers list
+
+for b in layout_pages("statement.pdf", 1, 1):
+    print(b["page"], b["type"], b["text"][:70].replace("\n", " | "))
+# On a one-page statement with a ruled table this printed three blocks:
+# 1 section_header Quarterly statement
+# 1 text This statement summarises the account activity for the quarter. Fees a
+# 1 table | Month     |   Fees |   Interest | | |-----------|--------|------------
+```
+
+- **The table arrives as a table,** serialized to Markdown with its header row, which tier 1 returned as a
+  loose column of numbers.
+- **Run it in a background worker.** Model loading and the first-run download take far longer than one
+  agent tool call can wait, so this tier belongs on the asynchronous path.
+- **Docling's page numbers are 1-based,** while PyMuPDF's `page.number` is 0-based; `layout_page` converts at the boundary.
 
 ### Worked scenario: a contract with a scanned annex
 A 60-page born-digital contract whose last 8 pages are a scanned, signed annex.

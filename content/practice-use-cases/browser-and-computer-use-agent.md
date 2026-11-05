@@ -134,6 +134,8 @@ suite, with zero unsafe actions, adds it.
 |---|---|---|
 | Browser control | Playwright (headless Chromium) | Stable selectors, network control, tracing |
 | Decision model | Vision-capable LLM or a provider computer-use tool | Reads pages and screenshots |
+| Provider toolset (checked 2026-11) | Anthropic `browser_toolset_20260801` (`read_page` returns `[ref_N]` refs) or `computer_toolset_20260801`; your code runs every call | Ref-based clicks survive layout shifts; `computer_20251124` returns 400 on Claude 5.5+ via the Claude API |
+| Browser-agent library (checked 2026-11) | Browser Use (`browser-use` 0.13.x) or Stagehand by Browserbase (`stagehand` 4.4.x) | Prebuilt loop and hosted browsers; keep your own policy gate |
 | Sandbox | Container or VM with a fresh browser profile | No access to personal sessions or files |
 | Network policy | Domain allowlist via request routing | Blocks exfiltration and drift to other sites |
 | Memory | Task state: fields filled, pages visited | Resume after failures, avoid loops |

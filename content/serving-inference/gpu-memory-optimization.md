@@ -251,7 +251,7 @@ import torch
 from transformers import AutoModelForCausalLM
 
 GB, T = 2**30, 4096
-model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B", torch_dtype=torch.bfloat16).cuda().eval()
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-0.5B", dtype=torch.bfloat16).cuda().eval()
 cfg = model.config
 params = sum(p.numel() for p in model.parameters())
 print(f"Line 1 weights: predicted {params * 2 / GB:.2f} GiB, "

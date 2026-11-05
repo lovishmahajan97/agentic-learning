@@ -272,7 +272,7 @@ dist.init_process_group("nccl")
 rank = int(os.environ["LOCAL_RANK"]); torch.cuda.set_device(rank)
 name = "Qwen/Qwen2.5-7B"
 tok = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.bfloat16)
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16)
 model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
 model = FSDP(

@@ -264,7 +264,7 @@ name = "Qwen/Qwen2.5-0.5B-Instruct"                 # any small open-weight chat
 revision = "<commit hash from the model page>"      # pin exact weights, never a moving branch
 tok = AutoTokenizer.from_pretrained(name, revision=revision)
 model = AutoModelForCausalLM.from_pretrained(
-    name, revision=revision, torch_dtype=torch.bfloat16,
+    name, revision=revision, dtype=torch.bfloat16,
     use_safetensors=True,                           # refuse pickle checkpoints: they can run code on load
 ).eval()
 

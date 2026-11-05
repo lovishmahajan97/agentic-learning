@@ -141,7 +141,11 @@ read text the parser garbled, reordered or flattened.
 | Text-layer libraries | pdfplumber, PyMuPDF, pdfminer.six |
 | OCR engines | Tesseract and cloud OCR |
 | Pipelines bundling layout and tables | Unstructured, Docling |
+| PDF and Office to Markdown converters (checked 2026-11) | Marker, MinerU, MarkItDown (lightweight; no layout model by default) |
 | Managed services | AWS Textract, Azure AI Document Intelligence, Google Document AI |
+| Managed parsing APIs (checked 2026-11) | Mistral OCR 4.1, Reducto, LlamaParse through the `llama-cloud` package (`llama-parse` is deprecated) |
+| Web pages | trafilatura as the default extractor; Firecrawl (hosted) or Crawl4AI (open source) when pages need crawling or JavaScript |
+| Skip text extraction | ColPali-style retrievers embed page images directly (`colpali-engine`) |
 
 - **They differ mainly in layout and table quality on *your* documents**, so compare them on a sample of
   your hardest pages.

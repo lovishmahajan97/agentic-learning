@@ -16,6 +16,7 @@ related:
   - system-design/model-routing-cascading
   - safety-security/pii-redaction
   - agents/human-in-the-loop
+  - tool-labs/pipecat-voice-agent-lab
 sources:
   - Pipecat documentation
   - LiveKit Agents documentation
@@ -37,7 +38,8 @@ without a queue.
   latency budgets per stage, and conversational tool design.
 - **Where it shows up in your stack.** A transport (WebRTC, or telephony via SIP or Twilio Media
   Streams), voice activity detection, streaming speech-to-text, an LLM with tools, streaming
-  text-to-speech, often orchestrated by Pipecat or LiveKit Agents.
+  text-to-speech, often orchestrated by Pipecat (pipecat-ai 1.15.0) or LiveKit Agents (livekit-agents
+  1.8.10), checked 2026-11.
 - **What you can skip.** Training speech models. Use hosted or open STT and TTS and spend your effort on
   the turn loop, tools and evals.
 
@@ -60,8 +62,9 @@ numbers, not vendor quotes.
 | Option | How it works | Latency | Redaction and residency | Team fit | Cost shape |
 |---|---|---|---|---|---|
 | A. Cascaded, hosted streaming STT, LLM and TTS | Pipecat or LiveKit Agents wiring three in-region vendors | planned p50 about 0.95 s (see below); p95 must be measured | text in the middle: redact before storage, log every turn | good: Python orchestration, swappable vendors | sum of three per-minute prices plus telephony |
-| B. Speech-to-speech realtime model | One model takes and returns audio, with tool calls | often lower, fewer hops | depends on one vendor's region, terms and transcript output; check current docs | good: simplest pipeline | per audio minute or token |
+| B. Speech-to-speech realtime model | One model takes and returns audio, with tool calls | often lower, fewer hops | transcripts and tool calls are standard (2026-11); the decider is one vendor's region and DPA. In-region candidates: Azure Voice Live, Amazon Nova Sonic (check each region list) | good: simplest pipeline | per audio minute or token |
 | C. Cascaded, self-hosted open STT and TTS on own GPUs | Same pipeline, models run in the clinics' cloud account | depends on GPU sizing and warm capacity | full control | poor: needs GPU operations and speech tuning | fixed GPU cost even at night |
+| D. Managed voice-agent platform (Vapi, Retell, ElevenAgents; 2026-11) | Platform runs STT, LLM, TTS, turn-taking and telephony; you supply prompts and tools | vendor-tuned; p95 must be measured | the deciding column: EU hosting and a signed DPA per platform, plus its sub-processors | good: least code, least per-stage control | platform per-minute fee on top of models and telephony |
 
 The latency plan for A keeps each stage in the lower half of its range above, as the budget requires:
 300 ms endpointing + 100 STT + 250 LLM first token + 100 first sentence + 100 TTS first audio + 100
@@ -73,14 +76,16 @@ storage and a full text audit trail need text between stages, and A lets the tea
 EU hosting and signed terms.
 
 C fails the team-skills and 8-week constraints. B could be faster, but its compliance depends on a
-single vendor meeting every term at once.
+single vendor meeting every term at once. D adds the platform's sub-processors to that problem and hides
+the per-stage timestamps the pilot needs.
 - **Latency headroom:** the 950 ms plan is only 50 ms under the 1 s p50 target and leaves 850 ms
   under the 1.8 s p95 target for tail stages; the pilot must confirm both with per-stage timestamps.
 - **Cost check:** the team prices the three vendors plus telephony per minute before signing, against
   the $0.20 ceiling.
 
-**What would change it.** If a realtime vendor offers EU hosting, signed terms, text transcripts and tool
-calls, run B against the same replay suite and switch if task success matches and p95 is lower.
+**What would change it.** Realtime APIs now ship transcripts and tool calls (2026-11), so B turns on
+EU hosting and signed terms. If a vendor offers both, run B against the same replay
+suite and switch if task success matches and p95 is lower.
 
 If measured p50 stays above 1 s or p95 above 1.8 s after tuning, test B for the conversational turns. If volume grows to
 steady high concurrency and the team hires speech engineers, re-cost C.
@@ -91,7 +96,8 @@ steady high concurrency and the team hires speech engineers, re-cost C.
 - **Three vendors, three failure points.** Keep a backup STT and TTS and a fixed apology plus transfer;
   watch per-stage timeout rates per day.
 - **Short endpointing cuts off slow speakers.** At 300 ms, callers who pause while reading a date get
-  interrupted. Watch interruptions per call, and use a turn-detection model on date and number questions.
+  interrupted. Watch interruptions per call, and use a turn-detection model (Pipecat's Smart Turn v3 or
+  the LiveKit turn-detector plugin) on date and number questions.
 - **Cost can creep.** Longer calls or a premium voice push past the ceiling; chart cost per call minute
   weekly.
 
@@ -124,8 +130,9 @@ steady high concurrency and the team hires speech engineers, re-cost C.
 |---|---|---|
 | Pipeline | Three swappable streaming stages | One model takes and returns audio |
 | Latency | Sum of stages; tuned by overlap | Often lower, fewer hops |
-| Control | Text in the middle: easy to log, filter, redact | Less inspectable; check current docs for transcripts |
-| Tools | Any text LLM with tool calling | Supported by some realtime APIs |
+| Control | Text in the middle: easy to log, filter, redact | Transcripts are standard (2026-11), but you cannot filter text before the model acts on it |
+| Tools | Any text LLM with tool calling | Standard in current realtime APIs (2026-11) |
+| Residency and DPA | Pick each vendor for region and signed terms | The real differentiator: one vendor's region and terms cover all audio |
 | Cost | Mix and match vendors | Usually priced per audio minute or token |
 | Pick when | You need control, compliance, custom voices | You want the most natural turn-taking fast |
 
@@ -133,7 +140,9 @@ steady high concurrency and the team hires speech engineers, re-cost C.
 1. **Transport.** Audio frames arrive over WebRTC or a telephony media stream (often 8 kHz on phone
    lines, which lowers STT accuracy).
 2. **Voice activity detection and endpointing.** A VAD (for example Silero VAD) decides speech vs
-   silence; an endpointing rule or turn-detection model decides the caller has finished.
+   silence; an endpointing rule or turn-detection model decides the caller has finished. Named models
+   (2026-11): Smart Turn v3, Pipecat's default stop strategy, reads the audio; the LiveKit turn-detector
+   plugin reads the STT transcript.
 3. **Streaming STT.** Partial transcripts arrive while the caller speaks; the final transcript arrives
    shortly after end of speech.
 4. **LLM with tools.** The agent streams tokens. Short spoken answers, no Markdown, numbers written as
@@ -147,7 +156,7 @@ steady high concurrency and the team hires speech engineers, re-cost C.
 ### Latency budget (illustrative, voice-to-voice)
 | Stage | Budget | Levers |
 |---|---|---|
-| Endpointing (silence wait) | 200-500 ms | Shorter silence threshold, turn-detection model |
+| Endpointing (silence wait) | 200-500 ms | Shorter silence threshold, turn-detection model (Smart Turn v3, LiveKit turn-detector) |
 | STT final transcript | 100-300 ms | Streaming STT, region close to caller |
 | LLM time to first token | 200-500 ms | Smaller model, prompt caching, short prompts |
 | First sentence complete | 100-300 ms | Ask for a short opening clause |
@@ -225,6 +234,66 @@ asyncio.run(main())
 asyncio.run(main(barge_in_after=0.3))
 ```
 
+### Speech-to-speech in practice: a RealtimeAgent with one tool
+Checked against openai-agents 0.24.0 and `gpt-realtime-2.1`, 2026-11. This is option B: one realtime
+model hears the caller, calls the tool and speaks, while the SDK runs the tool and returns its result.
+It needs `OPENAI_API_KEY` and a paid realtime session.
+
+```python
+import asyncio
+from agents import function_tool
+from agents.realtime import RealtimeAgent, RealtimeRunner
+
+@function_tool
+def check_availability(clinic: str, date: str) -> str:
+    """Return free slots for a clinic on a date (YYYY-MM-DD)."""
+    return "09:30, 14:00"                       # stub: call the booking system here
+
+agent = RealtimeAgent(
+    name="Booking line",
+    instructions="Answer in one or two short spoken sentences. Read back date and time.",
+    tools=[check_availability],
+)
+runner = RealtimeRunner(agent, config={"model_settings": {
+    "model_name": "gpt-realtime-2.1",
+    "audio": {
+        "input": {"transcription": {"model": "gpt-4o-mini-transcribe"},   # text transcripts
+                  "turn_detection": {"type": "semantic_vad", "interrupt_response": True}},
+        "output": {"voice": "ash"},
+    },
+}})
+
+async def main():
+    session = await runner.run()                # opens a WebSocket session
+    tool_called = replying = False
+    async with session:
+        await session.send_message("Any slots at the Lyon clinic on 2026-11-12?")
+        async for event in session:
+            if event.type == "tool_start":
+                tool_called = True
+                print("tool:", event.tool.name)
+            elif event.type == "agent_start" and tool_called:
+                replying = True                 # the turn that speaks the tool result
+            elif event.type == "history_added":
+                print(event.item)               # user and assistant transcripts
+            elif event.type == "agent_end" and replying:
+                break                           # the first agent_end only ends the tool-call turn
+            elif event.type == "error":
+                print("error:", event.error)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+- **Real audio.** Replace `send_message` with `session.send_audio(pcm16_bytes)` from the call, and play
+  each `audio` event's `event.audio.data` back to the caller.
+- **Transports.** The Python SDK speaks WebSocket (server side) or SIP (`OpenAIRealtimeSIPModel`) for
+  telephony. Browser WebRTC is not in the Python SDK.
+- **Other option-B models (2026-11).** Gemini Live uses `gemini-3.8-live` on the Gemini API; the
+  `gemini-3.1-flash-live-preview` model shuts down on 2026-11-17. On Vertex AI,
+  `gemini-live-2.5-flash-native-audio` retires on 2026-12-13. Do not start on either.
+- **Hands-on.** The lab `tool-labs/pipecat-voice-agent-lab` builds option A for this booking line.
+
 ### Cost, latency and accuracy targets for a booking line
 Illustrative targets for a restaurant or clinic booking agent; vendor prices change, so check current
 pricing.
@@ -256,6 +325,9 @@ pricing.
 - **Replay-based evals.** Run synthetic and recorded test calls on every change; score task success from
   the final tool state, latency from traces, and transcripts with an LLM judge for politeness and
   policy. Gate releases on p95 latency as well as success.
+- **Voice eval platforms (a category, 2026-11).** Hosted tools that run simulated callers against your
+  agent and score the calls. Vendor status shifts fast, so check current options, and keep your own
+  replay suite as the release gate.
 - **Compliance by design.** Announce recording and AI use where the law requires it, redact PII from
   transcripts before storage, and route card payments to a compliant IVR or payment provider flow so
   card numbers never enter the LLM.
@@ -267,7 +339,8 @@ pricing.
   realtime models give smoother turn-taking with fewer hops. Flip to speech-to-speech when naturalness
   matters more than inspectability and the vendor meets your compliance needs.
 - **Short endpointing vs interruptions.** A short silence threshold makes the agent snappy but cuts off
-  callers who pause to think. Use a turn-detection model or adapt the threshold per question type.
+  callers who pause to think. Use a turn-detection model (Smart Turn v3 or the LiveKit turn-detector)
+  or adapt the threshold per question type.
 - **Big model vs latency.** A larger model reasons better but adds time to first token. Route most turns
   to a fast model and escalate hard turns, or use a fast model with strong tools.
 - **Natural voice vs cost.** Premium TTS voices sound better and cost more per character; test whether

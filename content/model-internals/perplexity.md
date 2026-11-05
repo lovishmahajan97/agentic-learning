@@ -228,7 +228,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 name = "Qwen/Qwen2.5-0.5B"                              # any causal LM
 tok = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16).cuda().eval()
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float16).cuda().eval()
 
 text = open("eval.txt", encoding="utf-8").read()
 ids = tok(text, return_tensors="pt").input_ids.cuda()    # [1, T]

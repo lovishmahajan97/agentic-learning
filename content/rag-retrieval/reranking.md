@@ -130,6 +130,9 @@ large and latency and cost grow for no gain, because recall@n has plateaued.
 | LLM rerankers | prompt a generative model for pointwise relevance, a pairwise preference, or a listwise ordering | strongest on nuanced relevance and instructions such as "prefer the newest policy"; slowest, most expensive, sensitive to candidate order |
 | Hosted rerank APIs | providers (Cohere, Voyage, Jina and others) expose a reranking model behind an endpoint, typically cross-encoder style though architectures are not always disclosed | no GPU to run, but a network call per query and per-call pricing |
 
+- **Hosted rerankers, checked 2026-11:** Cohere's current pair is `rerank-v5.0-pro` (quality) and
+  `rerank-v5.0-fast` (throughput). Voyage AI is owned by MongoDB (announced 2025-02-24) and Jina AI by
+  Elastic (completed 2025-10-09), so check where their models are now sold before you pick one.
 - Listwise LLM reranking usually runs as a sliding window from the bottom of the list to the top, because
   the full pool does not fit or degrades in one prompt.
 - **The agent itself is an LLM reranker** if you hand it 30 chunks; a dedicated reranker is usually far
@@ -218,10 +221,11 @@ pairs = [(query, passages[i]) for i in stage1]
 scores = ce.predict(pairs)                            # one joint forward pass per pair
 for i, s in sorted(zip(stage1, scores), key=lambda t: -t[1]):
     print(f"{s:+6.2f}  {passages[i][:60]}")
-# One run (sentence-transformers 5.1): the 14-day laptop rule +5.79 first, unopened software +3.61,
-# the general 30-day rule +2.27, then warranty -1.98 and price-match -7.45 at the bottom. The order
-# of the top three varies by model, and neither model reasons that the exception overrides the rule:
-# that is the LLM's job, so k must be large enough (here 3) for the rule and exception to survive.
+# Re-run on sentence-transformers 6.2.0 (2026-11), same as on 5.1: the 14-day laptop rule +5.79
+# first, unopened software +3.61, the general 30-day rule +2.27, then warranty -1.98 and price-match
+# -7.45 at the bottom. The order of the top three varies by model, and neither model reasons that the
+# exception overrides the rule: that is the LLM's job, so k must be large enough (here 3) for the
+# rule and exception to survive.
 ```
 
 ### Worked scenario: what reranking saves an agent in context tokens

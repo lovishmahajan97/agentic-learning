@@ -35,7 +35,8 @@ agent searched and found nothing" bugs.
   between tools. Agent-written queries also differ from human ones (longer, more terms, copied
   fragments), and BM25 scores scale with query length, so thresholds tuned on humans break on agents.
 - **Where it shows up in your stack.** Elasticsearch and OpenSearch (BM25 by default), LangChain's
-  `BM25Retriever` built on `rank_bm25`, BM25 extensions for Postgres, and the keyword half of hybrid
+  `BM25Retriever` (in `langchain-community`) built on `rank_bm25`, BM25 extensions for Postgres such as
+  ParadeDB `pg_search` v0.26.5 (checked 2026-11), and the keyword half of hybrid
   modes in vector databases. Postgres's built-in `ts_rank` is not BM25.
 - **What you control.** The analyzer (tokenization of identifiers, stemming, stopwords), k1 and b, field
   boosts, and how the search tool turns raw scores into something the agent or fusion layer can use.
@@ -340,6 +341,10 @@ GET /manuals/_search
 - **Normalize before fusion or cutoffs.** Never threshold or add raw BM25 scores to cosine scores; fuse by
   rank or normalize per query first, and give the agent ranks or relative scores. Monitor fused-result
   overlap with each arm alone.
+- **Pick a maintained Python BM25 (checked 2026-11).** `rank_bm25` has had no release since 0.2.2
+  (2022-02). `bm25s` 0.3.16 is the maintained replacement and defaults to Lucene's variant
+  (`method="lucene"`). LangChain announced the sunset of `langchain-community`, home of `BM25Retriever`,
+  on 2026-05-22 and archived its repo on 2026-06-19, so pin it or call `bm25s` directly.
 
 ## Trade-offs
 - **No training data, no GPU.** BM25 is the cheapest retriever to stand up and the easiest to debug; it

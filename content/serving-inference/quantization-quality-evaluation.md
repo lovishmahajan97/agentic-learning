@@ -226,7 +226,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 name = "Qwen/Qwen2.5-0.5B"                        # swap in the checkpoint you plan to ship
 tok = AutoTokenizer.from_pretrained(name)
-fp16 = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float16, device_map="cuda").eval()
+fp16 = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float16, device_map="cuda").eval()
 q4 = AutoModelForCausalLM.from_pretrained(
     name, device_map="cuda",
     quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",

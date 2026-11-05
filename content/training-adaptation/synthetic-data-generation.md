@@ -36,6 +36,9 @@ choosing survivors, and unfiltered recursion collapses.
 - **Where it shows up in your stack.** A generation script calling your provider, tool schemas as the
   source of labels, a sandbox or mock tool backend that executes calls, an LLM judge or end-state
   checker, and the eval harness that replays the tasks against every agent version.
+- **If you want a library.** NVIDIA's NeMo Data Designer (`pip install data-designer`, Apache-2.0) generates
+  datasets from scratch or from your own seed data; distilabel has had no release since 2025-01. Checked
+  against data-designer 0.10.0, 2026-11.
 - **What you control.** The specification (tools, task types, personas, difficulty), the verifier
   (executed end state beats judge), the mix with real traces, dedup and diversity gates, and which sets
   stay walled off as evals.

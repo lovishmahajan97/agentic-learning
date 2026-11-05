@@ -205,7 +205,7 @@ print(triage("I was charged twice for March, account 8812.", stats), stats)
 
 ### Fine-tune and serve: the minimal commands
 A LoRA config with PEFT, trained with TRL's `SFTTrainer`; argument names in TRL move between releases,
-so check the current docs before copying.
+so pin the versions. Checked against trl 1.17.1, peft 0.21.2 and transformers 5.22.1, 2026-11.
 
 ```python
 from peft import LoraConfig

@@ -226,6 +226,10 @@ because it also sets the W3C level 2 random-trace-id bit.
   pays off whichever of them you use.
 - **What it buys:** the backend (Jaeger, Tempo, Datadog, Langfuse, Phoenix) is a configuration choice, and an
   LLM span lands in the same trace as the HTTP, queue and database spans around it.
+- **Datadog example (checked 2026-11):** Datadog LLM Observability ingests OTLP spans that follow the GenAI
+  semantic conventions v1.37 and later, so compliant instrumentation needs no Datadog SDK.
+- **AWS example (checked 2026-11):** Amazon Bedrock AgentCore Observability emits OTel-compatible spans,
+  metrics and logs into CloudWatch, with dashboards for sessions, latency, token usage and errors.
 
 ## How it works
 ### One data model, three signals
@@ -300,6 +304,14 @@ because it also sets the W3C level 2 random-trace-id bit.
   OpenLLMetry and the provider-specific `opentelemetry-instrumentation-*` packages follow the GenAI
   conventions; Arize's OpenInference instrumentors emit plain OTel spans with their own LLM vocabulary
   (`openinference.span.kind`, `llm.token_count.*`).
+- **Where the spec lives now (checked 2026-11).** The GenAI conventions (client spans, metrics, events, MCP
+  and provider-specific pages) are maintained in the `open-telemetry/semantic-conventions-genai` repository,
+  which extends the core semantic conventions. Read the attribute names there.
+- **The opt-in switch is set on the instrumentor.** `OTEL_SEMCONV_STABILITY_OPT_IN=gen_ai_latest_experimental`
+  tells an instrumentation library that still emits older GenAI names to emit the latest experimental ones
+  instead. A backend that needs v1.37+ names gets old ones until you set it.
+- **OpenLLMetry ownership (checked 2026-11).** Traceloop, its maintainer, joined ServiceNow; OpenLLMetry
+  stays open source.
 
 ### Auto-instrumentation
 - **Whole process:** `opentelemetry-instrument python app.py` (Python) patches supported libraries at start-up.

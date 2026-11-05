@@ -37,8 +37,9 @@ production agents usually run both and fuse.
   tool result (ticket ids, error codes, function names); others are paraphrased questions. Each family
   fails on one of those, and the agent cannot tell a retrieval miss from "the answer does not exist".
 - **Where it shows up in your stack.** Vector stores for the dense arm; Elasticsearch, OpenSearch or
-  LangChain's `BM25Retriever` for the sparse arm; `EnsembleRetriever` or a store's built-in hybrid mode
-  to combine them; a LangGraph retrieval node or tool that wraps the result.
+  LangChain's `BM25Retriever` (in `langchain-community`) for the sparse arm; `EnsembleRetriever` (in
+  `langchain-classic`) or a store's built-in hybrid mode to combine them; a LangGraph retrieval node or
+  tool that wraps the result.
 - **What you control.** Whether the agent gets one fused search tool or separate keyword and semantic
   tools, the analyzer that tokenizes identifiers, the embedding model, and the eval slices you track.
 - **What you can skip.** The training details of SPLADE and ColBERT. Know what each adds and when it is

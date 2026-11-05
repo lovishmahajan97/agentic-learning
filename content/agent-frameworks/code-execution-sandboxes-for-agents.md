@@ -311,11 +311,12 @@ print(run_python("while True: pass", timeout_s=3))                              
 ```
 
 ### Hosted sandboxes: E2B and Modal for a data-analysis agent
-Both snippets show the core calls; method names have changed between major SDK versions, so check the
-current docs.
+Both snippets show the core calls. Checked against e2b-code-interpreter 2.11.9 and modal 1.6.3,
+2026-11: the call signatures match, but the snippets need API keys and were not run end to end. Method
+names have changed between major SDK versions, so pin the major version.
 
 ```python
-# E2B: pip install e2b-code-interpreter, E2B_API_KEY set
+# E2B: pip install "e2b-code-interpreter>=2,<3", E2B_API_KEY set
 from e2b_code_interpreter import Sandbox
 
 sbx = Sandbox.create(timeout=300)              # older SDKs used Sandbox(); stateful for this session
@@ -325,7 +326,7 @@ print(ex.logs.stdout, ex.error, ex.results)    # results can include rich output
 ex2 = sbx.run_code("df['revenue'].sum()")      # same interpreter: df still exists
 sbx.kill()
 
-# Modal: pip install modal, modal token set
+# Modal: pip install "modal>=1,<2", modal token set
 import modal
 app = modal.App.lookup("agent-sandboxes", create_if_missing=True)
 sb = modal.Sandbox.create(app=app, image=modal.Image.debian_slim().pip_install("pandas"),
@@ -340,6 +341,10 @@ sb.terminate()
 | Stateful notebook-style analysis with charts | E2B code interpreter |
 | Custom images, GPUs, or jobs already on Modal | Modal Sandboxes |
 | Data must stay on your infrastructure | Docker with gVisor or Kata, or a self-hosted product |
+| Code runs on the model provider's side (checked 2026-11) | Anthropic's server tool `code_execution_20260521` (or `code_execution_20260120`), next to its server-side `web_search` and `web_fetch` tools |
+| Agents already on AWS (checked 2026-11) | Amazon Bedrock AgentCore Code Interpreter, with AgentCore Memory for state |
+| Agents already on Workers or Vercel (checked 2026-11) | Cloudflare Sandbox (GA 2026-04-13, `@cloudflare/sandbox` 1.x) or Vercel Sandbox (GA 2026-01-30, Firecracker microVMs) |
+| Another hosted alternative to E2B (checked 2026-11) | Daytona (`daytona` 0.227.x; `daytona-sdk` is deprecated): hosted and closed-source since June 2026; the public repo was archived read-only on 2026-10-03 at v0.190.0 (AGPL) |
 
 ## Production patterns
 - **One sandbox per session, killed on idle.** Map agent session id to sandbox id, reuse it across tool

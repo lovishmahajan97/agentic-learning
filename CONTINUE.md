@@ -1,5 +1,21 @@
 # Continuing the lesson build (handoff)
 
+## Status 2026-11-05: tool coverage audit applied
+
+- Audit report: `docs/tool-coverage-audit-2026-11.md` (inventory in `docs/tool-inventory-2026-11.json`).
+- New module "Hands-on tool labs" (stage Building LLM applications): Temporal durable agent, web search
+  and fetch tools (Tavily, Exa), Pipecat voice agent, Inspect AI agent evals. Each lab ran offline with fakes.
+- About 80 existing lessons gained sections, tool mentions and accuracy fixes (Mem0 2.x add-only, AutoGen
+  archived and Microsoft Agent Framework, Vercel AI SDK v7, Langfuse and Phoenix API changes, TGI in
+  maintenance, `torch_dtype` to `dtype`, LiteLLM 1.82.7/1.82.8 compromise). Versions checked 2026-11.
+- Checks: 677/677 valid; 40/40 guides; every diagram parses. Changes vs tag `pre-tools` are deliberate
+  fixes (quiz answers and code updated for changed APIs), reviewed by hand.
+- Skipped, unverified: SWE-bench Pro 642-task count, Tinker cached-prefill meter, Vertex AI sub-product
+  renames, running Unsloth and Axolotl examples (need CUDA). Not done: shrinking the Temporal loop in
+  `reliability/durable-workflow-execution.md` to a link to the new lab.
+- Workflow script: scratchpad `tools/apply.workflow.js` (not in repo); pins are re-checkable on PyPI/npm.
+
+
 ## Status 2026-10-23 (update): three lesson types
 
 - Every lesson has `lesson_type`: 212 concept, 215 lab, 246 decision (SPEC v5). Each gained its type

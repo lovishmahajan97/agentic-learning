@@ -318,14 +318,18 @@ SDKs, multi-agent libraries):
 | Layer | Common choices | What it owns in your agent |
 |---|---|---|
 | Orchestration | LangGraph, Pydantic AI, LlamaIndex Workflows, hand-rolled loop | control flow, state, interrupts |
-| Vendor agent SDKs | OpenAI Agents SDK, Claude Agent SDK, Google ADK | the loop, tools and handoffs for one provider's models |
-| Multi-agent libraries | CrewAI, AutoGen / AG2, LangGraph subgraphs | roles, delegation, agent-to-agent messages |
+| Vendor agent SDKs | OpenAI Agents SDK, Claude Agent SDK, Google ADK, AWS Strands Agents (deploys to Bedrock AgentCore Runtime) | the loop, tools and handoffs for one provider's models |
+| Multi-agent libraries | CrewAI, Microsoft Agent Framework (AutoGen's successor, GA 1.x), AG2, LangGraph subgraphs | roles, delegation, agent-to-agent messages |
 | Integrations | LangChain, LiteLLM-style gateways | provider and vector-store adapters |
-| Retrieval | LlamaIndex, LangChain retrievers, a vector database | ingestion, chunking, search |
+| Retrieval | LlamaIndex, Haystack, LangChain retrievers, a vector database | ingestion, chunking, search |
 | Tools | MCP servers, typed function tools | what the agent can touch |
 | Tracing and evals | LangSmith, Langfuse, Logfire, Phoenix | traces, datasets, scores |
 | Durability | LangGraph checkpointers, Temporal | resume after crash or a human pause |
 | Prompt optimization | DSPy | compiled prompts against a metric |
+| Code agents | smolagents (Hugging Face), the small reference implementation | the model writes Python that calls tools; run it in a sandbox |
+
+New rows checked against PyPI, 2026-11-05: agent-framework 1.24.0, strands-agents 1.64.0, haystack-ai
+3.4.1, smolagents 1.26.0. AutoGen itself is archived; see the AutoGen / AG2 lesson.
 
 The rows combine freely: a typical production agent is one orchestrator, one tracing tool, a vector
 store and MCP or typed tools, with the rest hand-written.

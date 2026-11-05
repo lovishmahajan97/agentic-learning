@@ -32,9 +32,9 @@ agent evals decide when to stop.
 - **Why it matters for agents.** Agent fine-tuning sets are small (hundreds to a few thousand
   trajectories), so they are seen several times. Too few passes and the model still mangles tool
   arguments; too many and it replays training traces verbatim and breaks on new tasks.
-- **Where it shows up in your stack.** The epoch setting of a hosted fine-tuning job (OpenAI's API calls
-  it `n_epochs`), `num_train_epochs` or `max_steps` in Hugging Face and TRL trainers, and the eval
-  cadence that decides which checkpoint you deploy behind the agent.
+- **Where it shows up in your stack.** The epoch setting of a hosted fine-tuning job (Together's API calls
+  it `n_epochs`, checked 2026-11), `num_train_epochs` or `max_steps` in Hugging Face and TRL trainers,
+  and the eval cadence that decides which checkpoint you deploy behind the agent.
 - **What you control.** The epoch cap, packing, how often you run held-out tool-call and task evals,
   and early stopping with patience so the cap is an upper bound.
 - **What you can skip.** Data-constrained pretraining scaling laws. Know that pretraining counts tokens

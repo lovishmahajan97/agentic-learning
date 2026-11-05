@@ -203,6 +203,18 @@ fine-tune pays   when monthly saving × months between upgrades > cost per cycle
 That tax is why "prompt until proven insufficient" is the default ordering, not a statement that
 fine-tuning is bad.
 
+### Hosted fine-tuning landscape (checked 2026-11)
+The lock-in risk is real: OpenAI is winding down its fine-tuning platform, so check a provider's
+deprecations page before the fine-tune rung depends on it.
+
+| Option | Status, 2026-11 | Note |
+|---|---|---|
+| OpenAI fine-tuning | Closed to new organisations; existing customers can create jobs until 2027-01-06 | gpt-4.1 and gpt-4.1-mini fine-tunes shut down with their bases on 2027-01-14 |
+| Azure Foundry gpt-4o fine-tuning | gpt-4o and gpt-4o-mini open only to customers onboarded by 2026-03-31 | Not a fallback for a team that has not started |
+| Together, Fireworks | Live | Hosted fine-tuning of open-weight models; check which base models each lists |
+| Amazon Bedrock reinforcement fine-tuning | Live for qwen3-32b and gpt-oss-20b since 2026-02-17 | Rewards are Lambda functions; OpenAI-compatible APIs |
+| Tinker (Thinking Machines) | GA since 2025-12-12 | Hosted training primitives in Python; LoRA weights can be downloaded (see Tooling) |
+
 ## Diagram
 Start from labelled agent failures, route each gap to its lever, and only climb to fine-tuning when the
 eval set plateaus on the cheaper rung.

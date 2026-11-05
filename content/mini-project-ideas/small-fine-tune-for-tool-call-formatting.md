@@ -276,8 +276,9 @@ flowchart TD
 
 ## Examples
 ### Starter code: render the data and train a LoRA adapter
-TRL's argument names change between releases (for example how prompt tokens are masked), so check the
-current SFTTrainer docs for your installed version. Print one rendered example before training.
+TRL's argument names change between releases (for example how prompt tokens are masked), so pin the
+versions. Checked against trl 1.17.1, peft 0.21.2 and transformers 5.22.1, 2026-11. Print one rendered
+example before training.
 
 ```python
 from datasets import Dataset

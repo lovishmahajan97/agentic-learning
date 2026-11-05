@@ -313,6 +313,10 @@ pass@k ≈ 1 − C(n − c, k) / C(n, k)
   withholds details the way real users do.
 - **How:** benchmarks such as τ-bench drive the conversation with an LLM playing the user from a scripted
   goal and persona, then score the end state of the environment. Multi-turn tasks become repeatable.
+- **Where to get it (checked 2026-11):** the maintained code is `sierra-research/tau2-bench`. It
+  shipped τ³-bench 1.0 (2026-03, adding the `banking_knowledge` domain) and τ-bench 2.0 (2026-10,
+  airline, retail and telecom in six languages). The original `tau-bench` repo is no longer updated and
+  holds outdated tasks. Install from a clone (`uv sync`); `pip install tau2` is an unrelated package.
 - **Catch:** the simulator is a second stochastic component. Its mistakes (revealing the answer, forgetting
   the goal) show up as agent failures, so check that the simulated user stayed on script before blaming
   the agent.

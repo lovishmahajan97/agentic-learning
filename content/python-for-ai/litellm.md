@@ -306,6 +306,21 @@ example two Azure regions plus OpenAI direct).
 - **Licensing.** The core is open source, but some enterprise proxy features (for example SSO and certain
   audit and admin controls) need a commercial licence; check which you need before standardising.
 
+### Supply chain: the 2026-03-24 PyPI compromise
+LiteLLM sits next to every provider key you own, so a poisoned release is a key-theft event, not a bug.
+Checked against litellm 1.108.0, 2026-11.
+- **What happened.** Attackers published 1.82.7 and 1.82.8 to PyPI with no matching GitHub release; both
+  were pulled the same day. 1.82.7 hid a credential stealer in `litellm/proxy/proxy_server.py`, run on
+  import.
+- **Why 1.82.8 was worse.** It added a `.pth` file (`litellm_init.pth`) to site-packages, which Python
+  runs on every interpreter start, so any Python process on that machine ran the payload.
+- **Hash-pinned installs.** Lock exact versions with hashes (`uv pip compile --generate-hashes`, then
+  `pip install --require-hashes -r requirements.txt`), so a new upload under a trusted name cannot slip in.
+- **Pinned official image for the proxy.** Run the official LiteLLM proxy image pinned by digest; LiteLLM
+  reported that users of that image were not affected, because it did not install from PyPI.
+- **Rotate keys.** Treat any host or CI runner that installed either version as compromised: rotate every
+  provider, cloud and gateway key it could read, and look for `litellm_init.pth` in site-packages.
+
 ## Diagram
 A request for the logical name "chat": retries stay inside the group first, a failing deployment cools
 down, and only when the whole group fails does the call fall back to another provider's model.

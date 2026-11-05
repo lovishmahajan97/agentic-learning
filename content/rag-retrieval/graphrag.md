@@ -115,6 +115,7 @@ or shrink it.
 |---|---|---|
 | LazyGraphRAG (Microsoft) | graph from cheap NLP noun-phrase co-occurrence instead of LLM extraction; all LLM summarisation deferred to query time; indexing roughly as cheap as vector RAG, paid per query instead | corpora that change often or are queried rarely |
 | LightRAG and similar | keep LLM extraction, skip the community hierarchy; retrieve over entity-level and theme-level keys; merge new documents incrementally rather than re-clustering | incremental updates |
+| neo4j-graphrag (Neo4j's Python package, 1.23.0, checked 2026-11) | LLM extraction into a Neo4j graph, then vector, hybrid, vector-plus-Cypher or Text2Cypher retrievers; no community reports | teams that already run Neo4j |
 
 ### Why each piece is there
 Extraction turns text into joinable keys (entities); communities give the corpus a table of contents no

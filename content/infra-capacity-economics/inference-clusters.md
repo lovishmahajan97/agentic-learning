@@ -164,6 +164,19 @@ A good router does not round-robin. The usual signals, in rough order of value:
 - **Always spill over** to least-loaded when the preferred replica is saturated, *because* affinity is
   worth little if it adds queueing delay.
 
+### KV-cache-aware routing you can adopt (checked 2026-11)
+You rarely need to write the advanced-affinity router yourself; these open projects ship one.
+- **Gateway API Inference Extension** (Kubernetes SIG, v1.6.2): an `InferencePool` groups model-server
+  pods, and an endpoint picker scores each pod on queue depth, KV usage and prefix-cache locality.
+- **llm-d 1.0** (released 2026-10): a Kubernetes-native stack whose scheduler builds on that extension,
+  with prefix-cache-aware and session-aware routing and prefill/decode disaggregation over vLLM or SGLang.
+- **NVIDIA Dynamo** (PyPI `ai-dynamo` 1.6.1, not `nvidia-dynamo`): a KV-aware router plus disaggregated
+  serving, installed with an engine extra such as `ai-dynamo[vllm]`, `[sglang]` or `[trtllm]`.
+- **vLLM production-stack** (Helm chart `vllm-stack` 0.1.13): vLLM's reference Kubernetes deployment, with
+  a router offering session-id routing (prefix-aware routing is still marked work in progress).
+- **Use them for the mechanics, keep the policy:** you still choose the run-id key, the spillover
+  threshold and the admission rules above.
+
 ### Disaggregated prefill and decode
 - **The phases differ.** Prefill is compute-bound (big matrix multiplies over the whole prompt); decode is
   bandwidth-bound (one token per step, reading the weights and the whole cache).

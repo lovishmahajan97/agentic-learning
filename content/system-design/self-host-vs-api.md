@@ -172,7 +172,17 @@ price reach opposite answers.
 | **Elasticity** | Spikes absorbed up to your headroom; a new replica means minutes of model loading | APIs absorb spikes up to your quota |
 
 ### The middle options
-- **Managed open-weight hosting:** a vendor serves open models per token.
+- **Managed open-weight hosting:** a vendor serves open models per token. The usual names compare as
+  follows (from each provider's docs, checked 2026-11; confirm in the DPA before regulated data).
+
+| Provider | Residency | Data retention | Quantization disclosure | Tool-call parser |
+|---|---|---|---|---|
+| Together | US and EU; EU or VPC deployments on dedicated endpoints via sales | Zero data retention is an org setting you turn on | A Quantization column on the serverless models page; "Turbo" names are FP8 and "Lite" INT4, but some INT4 or FP8 models carry neither suffix | Not named; run your contract test |
+| Fireworks | Ask; no self-serve region choice documented | Open-model prompts not stored by default; Responses API keeps 30 days unless `store=false` | Not stated per model; ask | Not named; run your contract test |
+| Groq | Data centers in several countries; no region pinning per key documented | Zero data retention can be enabled in Data Controls | Not stated per model; ask | Not named; run your contract test |
+| Cerebras | No region selection documented for the self-serve API | Policy says inference inputs and outputs are not retained | Launched on original 16-bit weights; confirm per model | Not named; run your contract test |
+| HF Inference Providers | Set by the provider each request is routed to | The routed provider's policy applies | Per routed provider | Per routed provider |
+
 - **Provisioned-throughput plans** from API vendors: fixed cost, no ops.
 - **Cloud model platforms** inside your account boundary.
 - **Serverless GPUs** for spiky loads.

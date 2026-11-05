@@ -234,8 +234,11 @@ Timings are illustrative.
 
 ### Agent write tool that is searchable on return
 The write tool blocks until the document is visible to search and returns the id, so the next step's
-search sees it. It uses the Elasticsearch Python client (8.x); map `tenant_id` as a `keyword` field, as
-in the mapping snippet below, so the filter is one exact term.
+search sees it. Map `tenant_id` as a `keyword` field, as in the mapping snippet below, so the filter is
+one exact term.
+
+It uses the Elasticsearch Python client 9.x (checked against elasticsearch 9.5.1 and server 9.5.0,
+2026-11). Keep the client's major version equal to the server's.
 
 ```python
 from elasticsearch import Elasticsearch

@@ -207,7 +207,7 @@ hallucinated amounts.
 Review routing is the output, not just the fields.
 
 ```python
-import base64, json, fitz                     # PyMuPDF
+import base64, json, pymupdf                  # PyMuPDF 2.x needs Python 3.11+; checked against pymupdf 2.1, 2026-11
 from pydantic import BaseModel, ValidationError
 from openai import OpenAI
 
@@ -221,7 +221,7 @@ SCHEMA = json.dumps(Invoice.model_json_schema())
 client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
 
 def extract(pdf_path, page_no=0):
-    page = fitz.open(pdf_path)[page_no]
+    page = pymupdf.open(pdf_path)[page_no]
     has_text_layer = len(page.get_text().strip()) > 50         # born-digital: text is already exact
     png = page.get_pixmap(dpi=200).tobytes("png")               # resolution preserves small print
     prompt = ("Extract this invoice page into JSON matching the schema. Use null for any field not "

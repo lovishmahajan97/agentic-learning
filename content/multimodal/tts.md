@@ -150,6 +150,16 @@ A worked budget (illustrative numbers) shows why sentence streaming is non-negot
 - **Control** comes from SSML-style markup (breaks, emphasis, say-as for digits and dates, explicit
   phonemes) or from style prompts in newer models.
 
+### Engines to know (dated, checked 2026-11)
+| Engine | Kind | Voice-agent note | Checked against |
+|---|---|---|---|
+| ElevenLabs | Managed API, large voice library and cloning | Streams over WebSocket; priced per character | elevenlabs 2.76.0 |
+| Cartesia | Managed API, Sonic models (`sonic-3.6` current; `sonic-3.5` and `sonic-3` older) | WebSocket contexts keep prosody across LLM-streamed chunks | cartesia 4.2.0 |
+| Kokoro | Open weights (Kokoro-82M, Apache-2.0), self-hosted | Small enough to self-host cheaply; packaging last released 2025-04, so pin it | kokoro 0.9.4 |
+
+- **Left out on purpose.** OpenAI lists `tts-1`, `tts-1-hd` and the `gpt-4o-mini-tts` snapshots for
+  shutdown on 2027-01-06, so do not start new work on them.
+
 ### What the agent's LLM should hand to TTS
 - **Write for the ear.** Instruct the agent to answer in short spoken sentences with no markdown, tables,
   URLs or JSON, because anything visual either gets read aloud or stripped.

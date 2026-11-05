@@ -123,6 +123,27 @@ and parsing actions from free text is unreliable.
 
 - **Both kinds can be declared in one request.**
 
+### Provider-native web tools (checked 2026-11)
+Each provider ships search as a server-side tool. Type strings are dated versions that change, so pin
+the string you tested and re-check the provider's docs before upgrading.
+
+| Provider | Tool type (checked 2026-11-05) | Restriction controls |
+|---|---|---|
+| Anthropic | `web_search_20260318` (name `web_search`) and `web_fetch_20260318` (name `web_fetch`); the basic `web_search_20250305` and `web_fetch_20250910` are what some cloud platforms accept | `allowed_domains` or `blocked_domains` (not both), `max_uses`; fetch also has `url_sources` |
+| OpenAI Responses | `web_search` (`web_search_preview` is the legacy type, without `filters`) | `filters.allowed_domains` or `filters.blocked_domains`, up to 100 domains per list |
+| Gemini API | `google_search` (Grounding with Google Search; older models used `google_search_retrieval`) | none documented on the tool; check the current docs |
+
+- **Domain and URL limits are exfiltration controls.** Page text is untrusted input, and an injected
+  instruction can ask the model to put your data into a URL it then fetches. An allow list, a use cap
+  and a narrow set of URL sources shrink that channel.
+- **Anthropic's fetch only follows URLs already in the conversation.** It refuses URLs that appear only
+  in the model's own output, and `url_sources` can also exclude client tool results. Anthropic still
+  warns against the tool where untrusted input sits next to sensitive data.
+- **Third-party search APIs (checked 2026-11):** besides Exa (`exa-py`) and Tavily (`tavily-python`), Perplexity (`perplexityai`),
+  Parallel (`parallel-web`) and Linkup (`linkup-sdk`) ship official Python SDKs. Brave has a search API
+  but no verified official SDK; the `brave-search` package on PyPI is a community wrapper.
+- **For a full build** with a third-party search API, see the `tool-labs/web-search-and-fetch-tools-for-agents` lab.
+
 ### Token and latency accounting
 - **Every declared tool costs tokens on every call** (fifty tools can be several thousand tokens), and
   selection accuracy degrades as the catalogue grows. **Each round trip** is a full model call plus your

@@ -33,6 +33,8 @@ Decide on break-even, gated by the SLO.
   shape, but a cold start can land mid-run when a slow tool call outlasts the idle window.
 - **Where it shows up in your stack.** Platforms such as Modal, RunPod Serverless or Cloud Run with GPUs
   hosting a self-hosted agent model, embedder or judge; per-token model APIs are the layer above.
+  Baseten is a model-serving variant: deployments scale to zero and bill per replica-minute, cold starts
+  included (checked 2026-11).
 - **What you control.** Scale-down window versus tool-call gaps, per-container concurrency, weights on a
   cached volume, and a hybrid base for interactive agents.
 - **What you can skip.** How the provider pools its fleet. Measure cold start by stage and run the

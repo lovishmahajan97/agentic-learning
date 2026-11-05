@@ -35,10 +35,11 @@ both arms, and prove the gain with recall@k.
 - **Why it matters for agents.** An agent's queries mix ids copied from tool output with paraphrased
   questions, and it cannot tell a retrieval miss from a missing fact. Hybrid raises first-stage recall,
   which bounds every answer, plan and tool call that depends on retrieved context.
-- **Where it shows up in your stack.** LangChain's `EnsembleRetriever` (weighted rank fusion over a BM25
-  retriever and a vector retriever), hybrid modes in Elasticsearch, OpenSearch, Qdrant and Weaviate, SQL
-  RRF in Postgres, and the retrieve node of a LangGraph RAG agent. LangSmith or your tracer shows which
-  arm produced each chunk.
+- **Where it shows up in your stack.** LangChain's `EnsembleRetriever` (now in `langchain-classic`;
+  weighted rank fusion over a BM25 retriever and a vector retriever), hybrid modes in Elasticsearch,
+  OpenSearch, Qdrant and Weaviate, SQL RRF in Postgres (ParadeDB `pg_search` v0.26.5 adds real BM25 to
+  Postgres, checked 2026-11), and the retrieve node of a LangGraph RAG agent. LangSmith or your tracer
+  shows which arm produced each chunk.
 - **What you control.** Arm depth, fusion method and weights, the shared tenant/ACL filter, reranker
   depth, and whether the agent sees one fused tool or two separate ones.
 - **What you can skip.** Fusion variants beyond RRF and weighted scores. Start with RRF; tune only with
@@ -301,8 +302,9 @@ A vague query. BM25's top three are a near-tie among weak matches; dense has a c
 ## Production patterns
 - **Start with server-side or library RRF.** Use your engine's built-in rank fusion (for example
   Elasticsearch's `rrf` retriever, 8.14 and later, whose rank constant defaults to 60) or LangChain's `EnsembleRetriever`
-  before writing custom fusion. Monitor recall@10 per arm and fused on a labeled set of real agent queries
-  each release.
+  (`from langchain_classic.retrievers import EnsembleRetriever`, checked against langchain-classic 1.0.8,
+  2026-11) before writing custom fusion. Monitor recall@10 per arm and fused on a labeled set of real
+  agent queries each release.
 - **One filter object, both arms.** Build tenant, ACL and metadata filters once from the agent's
   authenticated session, never from model-written arguments, and pass the same object to the lexical and
   dense queries; add a CI canary that runs a cross-tenant query and fails if any foreign chunk appears.

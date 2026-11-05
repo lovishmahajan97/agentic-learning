@@ -199,7 +199,7 @@ loaded it in fp16 to save memory.
 | 4-bit checkpoint works but tool JSON breaks more often | quantization error shifts close logits | compare tool-call validity versus bf16 on an eval |
 
 ## Production patterns
-- **Serve in bf16 by default on hardware that supports it.** Set `torch_dtype=torch.bfloat16` (or
+- **Serve in bf16 by default on hardware that supports it.** Set `dtype=torch.bfloat16` in Transformers (or
   `dtype="bfloat16"` in vLLM) for models trained in bf16, and avoid casting them to fp16. Monitor for NaN
   logits and empty generations.
 - **Quantize with an agent eval as the gate.** Before shipping a 4-bit or 8-bit checkpoint, run the same

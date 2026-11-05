@@ -293,12 +293,16 @@ A small asyncio-native queue on Redis.
 - **So classify errors yourself.** Transient ones (a provider 429 or 5xx, a network timeout) become
   `Retry` with a growing `defer`; permanent ones (bad input, a deleted document) fail immediately.
 - **Small by design.** Redis-only; named queues exist, but no canvas workflows, priorities or RabbitMQ.
+- **Maintenance-only (checked against arq 0.28.0, 2026-11).** The ARQ README marks the project "in
+  maintenance only mode". For a maintained async alternative, taskiq 0.13.0 supports several brokers and
+  Procrastinate 3.10.0 queues jobs in Postgres.
 
 ### Choosing
 | Pick | When |
 |---|---|
 | Celery | the organisation already runs it; you need RabbitMQ, multiple queues with priorities, Beat schedules or canvas workflows; jobs are CPU-bound |
-| ARQ | the codebase is asyncio, Redis is already present, jobs are IO-bound model calls, a small operational surface matters |
+| ARQ | the codebase is asyncio, Redis is already present, jobs are IO-bound model calls, a small operational surface matters; note ARQ is maintenance-only |
+| taskiq or Procrastinate | you want a maintained async-native queue: taskiq over Redis, NATS or RabbitMQ brokers, Procrastinate on Postgres |
 | Workflow engine | multi-step agent runs that need checkpoints and resumption (see the durable workflow lesson) |
 
 Either way delivery is at-least-once, so the body must be idempotent:
@@ -520,7 +524,8 @@ More workers past the rate limit add retries, not throughput; CPU never enters t
   highest-QPS route; once clients number in the thousands, push via SSE or webhooks pays for itself.
 - **Celery breadth vs ARQ fit.** Celery's brokers, routing, Beat and canvas cost sync task bodies and
   more configuration; ARQ's asyncio model fits LLM IO but stops at Redis and a minimal feature set (no
-  canvas, no priorities, retries only on explicit `Retry`).
+  canvas, no priorities, retries only on explicit `Retry`), and it is maintenance-only, so new projects
+  may prefer taskiq or Procrastinate.
 
 ## Pitfalls
 - **Restarting an agent job from step 1 on redelivery.** Symptom: after a worker crash the customer gets

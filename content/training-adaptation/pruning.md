@@ -225,7 +225,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 name = "Qwen/Qwen2.5-0.5B"                                   # any causal LM
 tok = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float32).eval()
+model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32).eval()
 texts = ["Summarise this support ticket: printer offline after update.",
          "Write a SQL query that counts orders per customer."]   # use a few hundred real prompts
 

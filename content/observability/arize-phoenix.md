@@ -267,21 +267,27 @@ def test_rate_counts_only_parseable_labels(spans):
 - **Any OTel SDK can send spans;** those using other conventions still arrive but render with less structure.
 
 ### The evaluation library
-`phoenix.evals` is a DataFrame-oriented runner.
-- **`llm_classify`** applies a judge prompt template to each row with a model wrapper (`OpenAIModel`,
-  `AnthropicModel`, `LiteLLMModel`, …), constrains the answer to rails such as `["factual", "hallucinated"]`,
-  optionally asks for an explanation, and runs rows concurrently.
-- **Why rails:** a judge's free-text verdict cannot be counted. The output is snapped to an allowed label (or
-  marked unparseable), so a column of labels becomes a rate, a filter and a trend line.
+`phoenix.evals` is a DataFrame-oriented runner (checked against arize-phoenix-evals 3.9.5 and
+arize-phoenix-client 3.7.0, 2026-11).
+- **`LLM(provider=..., model=...)`** wraps the judge model (OpenAI, Anthropic, LiteLLM and others). A
+  `ClassificationEvaluator`, or `create_classifier(...)`, applies a prompt template and constrains the answer
+  to fixed `choices` (rails) such as `{"faithful": 1.0, "unfaithful": 0.0}`, with an explanation by default.
+- **Why rails:** a judge's free-text verdict cannot be counted. The output is snapped to an allowed label, so
+  a column of labels becomes a rate, a filter and a trend line.
 - **Why explanations:** the opposite trade, unaggregatable but the only way a human can audit why the judge
   decided, which is what calibration needs.
-- **Pre-built evaluators** (`HallucinationEvaluator`, `QAEvaluator`, `RelevanceEvaluator`,
-  `ToxicityEvaluator`, …) wrap tested templates; `run_evals(dataframe, evaluators)` returns one DataFrame per
-  evaluator.
-- **Helper queries build rows from traces:** `get_qa_with_reference` yields one row per answered question with
-  its retrieved context; `get_retrieved_documents` one row per retrieved document for relevance scoring.
-- **Write back** with `log_evaluations(SpanEvaluations(...))` or `DocumentEvaluations(...)`. The UI then shows
-  per-span labels and aggregates such as precision@k or NDCG derived from document relevance labels.
+- **Pre-built evaluators** in `phoenix.evals.metrics` take the judge as `llm=`.
+  `HallucinationEvaluator(llm=...)` grounds an answer against the conversation (turns, tool calls and
+  results). `FaithfulnessEvaluator(llm=...)` grounds it against a supplied `context`, the right one for RAG.
+- **Running them:** `evaluate_dataframe(dataframe, evaluators)` returns the input DataFrame plus one
+  `{name}_score` column per score; `async_evaluate_dataframe` runs rows concurrently.
+- **Rows from traces:** `phoenix.client.Client().spans.get_spans_dataframe(query=...)` pulls spans. The helper
+  `get_input_output_context` (in `phoenix.client.helpers.spans`) joins root input and output with retrieved
+  documents; `get_retrieved_documents` gives one row per document for relevance scoring.
+- **Write back** with `to_annotation_dataframe(results)` then `client.spans.log_span_annotations_dataframe(...)`,
+  or `log_document_annotations_dataframe` for documents. The UI shows per-span labels and retrieval metrics.
+- **Older code** used `llm_classify`, `run_evals`, `OpenAIModel`, `px.Client().log_evaluations` and
+  `SpanEvaluations`; match import paths to the version you pin.
 
 ### Datasets, experiments, prompts, sessions, annotations
 - **Datasets** come from spans or DataFrames; `run_experiment(dataset, task, evaluators)` executes a task over
@@ -306,10 +312,10 @@ flowchart TD
     SDK --> COL["OTel Collector"]
     COL -->|"OTLP HTTP 6006"| PX[("Phoenix: Postgres")]
     COL --> TEMPO[("Tempo or Datadog")]
-    PX --> Q["get_qa_with_reference"]
-    Q --> J["run_evals: judge with rails"]
-    J -->|"log_evaluations"| PX
-    PX --> UI["UI: filter hallucinated spans"]
+    PX --> Q["spans.get_spans_dataframe"]
+    Q --> J["evaluate_dataframe: judge with rails"]
+    J -->|"log_span_annotations_dataframe"| PX
+    PX --> UI["UI: filter unfaithful spans"]
 ```
 
 ## Examples
@@ -318,12 +324,12 @@ Plain OpenTelemetry plus OpenInference attributes, with the OpenAI instrumentor 
 then a notebook step that judges every answered question against its retrieved context and writes verdicts
 back.
 
-Function names follow the long-standing evaluator/`run_evals` interface of `phoenix.evals`; newer
-releases add a redesigned evals API alongside it and move span queries and write-back to the separate
-`phoenix.client` package, so pin the version and check import paths for your release.
+Checked against arize-phoenix 21.0.0, arize-phoenix-evals 3.9.5 and arize-phoenix-client 3.7.0, 2026-11.
+Span queries and write-back live in the separate `phoenix.client` package; the judge is a
+`FaithfulnessEvaluator`, because this answer is graded against retrieved context.
 
 ```python
-# pip install arize-phoenix openinference-instrumentation-openai openai
+# pip install "arize-phoenix==21.*" "arize-phoenix-evals==3.9.5" openinference-instrumentation-openai openai
 # terminal: phoenix serve   -> UI http://localhost:6006, OTLP http://localhost:6006/v1/traces
 from phoenix.otel import register
 from openinference.instrumentation.openai import OpenAIInstrumentor
@@ -358,20 +364,24 @@ def answer(question: str) -> str:
 answer("How do I reset my password?")
 
 # Later, in a notebook: judge each answered question against its retrieved context, write results back
-import phoenix as px
-from phoenix.evals import HallucinationEvaluator, OpenAIModel, run_evals
-from phoenix.session.evaluation import get_qa_with_reference
-from phoenix.trace import SpanEvaluations
-px_client = px.Client()                                    # talks to the running server
-qa = get_qa_with_reference(px_client)                      # columns: input, output, reference
-(halluc,) = run_evals(dataframe=qa, provide_explanation=True,
-                      evaluators=[HallucinationEvaluator(OpenAIModel(model="gpt-4o-mini"))])
-px_client.log_evaluations(SpanEvaluations(eval_name="Hallucination", dataframe=halluc))
+from phoenix.client import Client
+from phoenix.client.helpers.spans import get_input_output_context
+from phoenix.evals import LLM, evaluate_dataframe
+from phoenix.evals.metrics import FaithfulnessEvaluator
+from phoenix.evals.utils import to_annotation_dataframe
+
+px_client = Client(base_url="http://localhost:6006")       # talks to the running server
+qa = get_input_output_context(px_client, project_name="support-bot")   # index span id; input, output, context
+judge = FaithfulnessEvaluator(llm=LLM(provider="openai", model="gpt-4o-mini"))
+results = evaluate_dataframe(dataframe=qa, evaluators=[judge])         # adds a faithfulness_score column
+px_client.spans.log_span_annotations_dataframe(dataframe=to_annotation_dataframe(dataframe=results))
 ```
 
 - **In the UI** the trace reads `support.answer` → `retrieve` and `support.answer` → `ChatCompletion`; the chain
-  span carries a `Hallucination` label with the judge's explanation, and the project view filters to the
-  hallucinated ones.
+  span carries a `faithfulness` annotation with the judge's explanation, and the project view filters to the
+  unfaithful ones.
+- **For an agent turn** with no retrieved context, swap in `HallucinationEvaluator(llm=...)`, which grounds
+  the answer in the conversation and its tool results.
 
 ### Marking agent and tool spans with OpenInference kinds
 For a hand-written agent loop, set the span kind on the run and on each tool call so Phoenix renders them
@@ -427,15 +437,16 @@ The part worth understanding is how a verdict lands on exactly the right span.
 
 | Step | What happens |
 |---|---|
-| Query | `get_qa_with_reference` returns a DataFrame indexed by the span id of each root span with an input and an output |
-| Reference | Built by concatenating the document contents on the retriever spans of the same trace |
-| This request | One row: input "How do I reset my password?", the model's answer, the one-sentence reference |
-| Judge | Receives all three in its template; returns `label` (`factual` or `hallucinated`), a numeric `score` derived from the label, and an `explanation`, still indexed by span id |
-| Write back | `log_evaluations` attaches that row to exactly that span |
-| A day of traffic | 2,000 answered questions give 2,000 labels; if 140 are `hallucinated`, the project shows a 7% rate you can filter, open and read |
+| Query | `get_input_output_context` runs `spans.get_spans_dataframe` and returns a DataFrame indexed by the span id of each root span with an input and an output |
+| Context | Built by concatenating the document contents on the retriever spans of the same trace |
+| This request | One row: input "How do I reset my password?", the model's answer, the one-sentence context |
+| Judge | Receives all three in its template; returns a `Score` with `label` (`faithful` or `unfaithful`), a numeric `score` (1.0 or 0.0) and an `explanation`, still indexed by span id |
+| Write back | `to_annotation_dataframe` flattens the scores; `log_span_annotations_dataframe` attaches each row to exactly that span |
+| A day of traffic | 2,000 answered questions give 2,000 labels; if 140 are `unfaithful`, the project shows a 7% rate you can filter, open and read |
 
-If the retriever span had carried no documents, the reference would be empty and the judge would be grading
-against nothing, a pitfall listed below.
+If the retriever span had carried no documents, `get_input_output_context` would drop the row in its inner
+join (checked against arize-phoenix-client 3.7.0, 2026-11), so the run is never judged and never counted. A
+hand-built query that keeps it grades against nothing, a pitfall listed below.
 
 ### Fanning one trace stream out to Phoenix and Tempo
 A Collector config that keeps the existing tracing store and adds Phoenix, with no application change. The
@@ -473,7 +484,7 @@ retriever and tool steps.
   infrastructure and LLM views share trace ids. Monitor exporter failures per destination.
 - **Scheduled, sampled evaluation job.** Run a daily job that pulls the previous day's question–answer–reference
   and retrieved-document rows, samples to the judge budget, runs hallucination and relevance evaluators, and
-  logs span and document evaluations. Monitor the hallucination rate and relevance aggregates over time.
+  logs span and document annotations. Monitor the hallucination rate and relevance aggregates over time.
 - **Judge with a different model.** Use a judge from another model family than the generator to limit
   self-preference bias, and calibrate against about a hundred human-labelled examples. Monitor judge-human
   agreement.
@@ -605,8 +616,8 @@ evaluations. Calibrate the judge against a hundred human-labelled examples befor
 > Phoenix standardises attribute names on top of OTel rather than defining a new protocol. That makes
 > instrumentation portable and lets a Collector fan the same spans out to Phoenix and a general tracing store.
 
-### Q: Why are evaluation results logged back as span evaluations rather than kept in the notebook?
-- [ ] Because `run_evals` cannot return a DataFrame
+### Q: Why are evaluation results logged back as span annotations rather than kept in the notebook?
+- [ ] Because `evaluate_dataframe` cannot return a DataFrame
 - [ ] Because cost is computed from evaluation labels
 - [x] So traces can be filtered and aggregated by quality in the UI and compared over time next to the spans they describe
 - [ ] Because the judge model needs them to be stored before it can run again

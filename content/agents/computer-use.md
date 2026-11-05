@@ -101,6 +101,11 @@ it for the long tail, and sandbox it.
 - **Set-of-mark prompting** draws numbered labels on interactive elements, so the model answers "click
   14" and the harness maps 14 to the element's known bounds.
 - **Desktop agents** query the accessibility API.
+- **Vendor toolsets ship this split (Anthropic docs, checked 2026-11).** `computer_toolset_20260801` is
+  the stable screen toolset. `browser_toolset_20260801` adds `read_page`, which returns the accessibility
+  tree tagged `[ref_N]`; clicks can target a ref instead of a coordinate.
+- **Old tool versions are model-keyed.** `computer_20251124` returns a 400 for Claude 5.5 and later on the
+  Claude API, though Bedrock still accepts it with its beta header. Migrate before switching models.
 - **Division of labour:** the screenshot gives understanding, the structured layer precision; computer
   use is a fallback inside a tool set with real APIs.
 

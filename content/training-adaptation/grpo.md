@@ -33,8 +33,8 @@ common way to RL-train agents.
   created with the right fields, the database row changed. GRPO turns those checks directly into training
   signal, so the model learns which tool sequences actually succeed instead of imitating traces.
 - **Where it shows up in your stack.** TRL's `GRPOTrainer` and `GRPOConfig`, OpenRLHF, vLLM as the rollout
-  engine, and a sandbox that executes tool calls during training. Multi-turn tool rollout support varies
-  by library and version, so check yours.
+  engine, and a sandbox that executes tool calls during training. In trl 1.17.1 `GRPOTrainer` runs
+  multi-turn tool rollouts itself through `tools=` or `environment_factory=` (see Examples).
 - **What you control.** The reward function (the real product decision), the task set and its pass-rate
   curation, group size G, the KL leash, the length cap, and which tokens are trained (the agent's turns,
   not tool output).
@@ -214,6 +214,67 @@ print("rewards:", r, "advantages:", adv)
 # malformed call. Train only on the agent's own tokens; tool-result tokens are masked.
 ```
 
+### Multi-turn agent RL in TRL
+The same refund task as a TRL environment. `GRPOTrainer` creates one `SupportEnv` per rollout, calls
+`reset` with the dataset row's columns, exposes each public method as a tool, runs the tool loop, and
+scores the end state with `get_reward`. Checked against trl 1.17.1 and transformers 5.22.1, 2026-11.
+
+```python
+from datasets import Dataset
+from trl import GRPOConfig, GRPOTrainer
+
+class SupportEnv:
+    """One instance per rollout. Public methods are tools; reset and get_reward are reserved."""
+
+    def reset(self, ticket_id, **row):        # receives the row's columns, prompt included
+        self.ticket_id, self.state = ticket_id, {ticket_id: "open"}   # fresh sandbox per rollout
+        return None                           # or a string appended to the last user message
+
+    def refund(self, ticket_id: str) -> str:
+        """Refund the order behind a support ticket.
+
+        Args:
+            ticket_id: The ticket id, for example A-1042.
+        """
+        if ticket_id not in self.state:
+            return "error: unknown ticket"
+        self.state[ticket_id] = "refunded"
+        return "refunded"
+
+    def close_ticket(self, ticket_id: str) -> str:
+        """Close a support ticket without changing the order.
+
+        Args:
+            ticket_id: The ticket id, for example A-1042.
+        """
+        self.state[ticket_id] = "closed"
+        return "closed"
+
+    def get_reward(self) -> float:            # optional: the environment owns the reward
+        return 1.0 if self.state[self.ticket_id] == "refunded" else 0.0
+
+ds = Dataset.from_list([{"prompt": [{"role": "user", "content": "Ticket A-1042: please refund me."}],
+                         "ticket_id": "A-1042"}] * 64)
+
+trainer = GRPOTrainer(
+    model="Qwen/Qwen3-0.6B",
+    args=GRPOConfig(output_dir="out/support-grpo", num_generations=8,
+                    max_completion_length=512, max_tool_calling_iterations=4),   # turn cap
+    train_dataset=ds,
+    environment_factory=SupportEnv,           # reward_funcs becomes optional with get_reward
+)
+trainer.train()
+```
+
+- **Experimental APIs.** `environment_factory` and `rollout_func` print an experimental warning and may
+  change without notice. `environment_factory` needs transformers 5.2.0 or later; plain `tools=` (a list
+  of typed, docstringed functions) needs 5.0.0 or later.
+- **Your own rollout loop.** `rollout_func(prompts, trainer)` replaces generation entirely; it must
+  return `prompt_ids`, `completion_ids` and `logprobs`, and extra keys reach the reward functions.
+- **The template must be one TRL can parse.** With tools, TRL adds a response schema for known chat
+  templates (Qwen3's is one) and raises `Unrecognized chat template` otherwise. Plumbing tested on CPU
+  with a tiny Qwen3 model and Qwen3's tokenizer: one `reset` and one `get_reward` per rollout.
+
 ### Group advantages and the GRPO loss
 One prompt, eight sampled responses, verifier rewards with three of eight correct. Token log-probs are
 illustrative placeholders.
@@ -309,6 +370,9 @@ for itself because every all-solved task burns 8 rollouts for nothing.
   `GRPOConfig(num_generations=..., use_vllm=True)`) or OpenRLHF hand sampling to vLLM. If π_old comes
   from the sampler's log-probs, monitor the ratio at the first gradient step on fresh samples; values far
   from 1 mean the sampler and trainer disagree.
+- **Pick one agent-RL library (checked 2026-11).** TRL `GRPOTrainer` is the default. OpenPipe ART
+  (openpipe-art 0.5.24; CoreWeave acquired OpenPipe in 2025) wraps agent RL behind a client.
+  verifiers 0.4.1 packages RL environments. verl 0.9.1 and OpenRLHF 0.11.2 suit large multi-node runs.
 - **Unit-test the reward function like production code.** Keep a suite of known hacks (empty reasoning
   tags, hard-coded test outputs, answers that fool a lax parser, a "done" tool call with no real change)
   and assert they score zero. Log each reward component separately per step so a format term cannot hide

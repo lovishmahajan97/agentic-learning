@@ -309,7 +309,8 @@ step)=(r1, 1)` on both redelivery tests, and empty idempotency keys. The budget 
 - **The dedup window is the job's lifetime in Redis.** Once `removeOnComplete` deletes the job, the same
   id can be added again; while a completed job is retained, a deliberate re-run with that id is silently
   ignored.
-- **Explicit windows.** BullMQ 5 also offers a `deduplication` option with its own id and TTL.
+- **Explicit windows.** BullMQ (5 and 6) also offers a `deduplication` option with its own id and TTL;
+  v6 removed the older `debounce` option in its favour (checked against bullmq 6.7.0, 2026-11).
 
 ### Job lifecycle
 Each state is a Redis structure, and a job is in exactly one:
@@ -336,9 +337,11 @@ Each state is a Redis structure, and a job is in exactly one:
 - **Retention.** `removeOnComplete` and `removeOnFail` with a count or an age keep Redis from filling
   with history.
 - **Recurring work** (nightly evals, hourly re-index) uses a job scheduler:
-  `queue.upsertJobScheduler(id, { pattern: cron } or { every: ms }, template)` in recent BullMQ 5
-  releases, which supersedes the older repeatable-job API. It keeps one upcoming delayed job per
-  schedule, so several producer replicas do not multiply the runs.
+  `queue.upsertJobScheduler(id, { pattern: cron } or { every: ms }, template)`, added in BullMQ 5 and
+  the only option in BullMQ 6, which removed the repeatable-job API (`add(..., { repeat })`). It keeps
+  one upcoming delayed job per schedule, so several producer replicas do not multiply the runs.
+- **Upgrading to 6.** v6 raises an error on legacy repeatable-job metadata, so move to job schedulers and
+  clear the old entries while still on v5 (BullMQ's v5-to-v6 migration guide, checked 2026-11).
 
 ### Locks and stalled jobs
 1. **Claim:** the worker sets a lock with `lockDuration` and renews it on an interval while the processor
@@ -356,9 +359,9 @@ Each state is a Redis structure, and a job is in exactly one:
 ### Rate limiting for LLM providers
 - **Fleet-wide cap.** `Worker` takes `limiter: { max, duration }` to cap jobs started per window across
   all workers of a queue.
-- **Reacting to 429s.** A processor calls `await queue.rateLimit(ms)` (in BullMQ 5 this replaces the
-  deprecated `worker.rateLimit`) and throws `Worker.RateLimitError()`; the job returns to the queue
-  without consuming an attempt while the queue pauses for that window.
+- **Reacting to 429s.** A processor calls `await queue.rateLimit(ms)` (since BullMQ 5 this replaces the
+  deprecated `worker.rateLimit`, which bullmq 6.7.0 still ships) and throws `Worker.RateLimitError()`;
+  the job returns to the queue without consuming an attempt while the queue pauses for that window.
 - **Per-tenant limits.** Per-group limits are a BullMQ Pro feature; the open-source approach is a queue
   per tenant tier, or a Redis token bucket checked inside the processor.
 
@@ -369,7 +372,12 @@ Each state is a Redis structure, and a job is in exactly one:
   constraint, an idempotency key on a downstream API).
 - **Not a workflow engine.** It does not checkpoint the middle of a processor. Split a ten-step agent run
   into one job per step with state in Postgres, or use a durable-execution engine (Temporal, Inngest,
-  Restate and similar) for replayable history, long timers and human-in-the-loop waits.
+  Restate and similar) for replayable history, long timers and human-in-the-loop waits. Trigger.dev
+  (@trigger.dev/sdk 4.8.3, checked 2026-11) is the hosted or self-hosted TypeScript option with durable
+  waits.
+- **Not only Redis since v6.** BullMQ 6 adds an optional PostgreSQL backend with the same Queue and
+  Worker API: install `pg` and pass `createPostgresBackend` as the last constructor argument
+  (PostgreSQL 13+, checked against bullmq 6.7.0, 2026-11). This lesson keeps the Redis backend.
 
 ## Diagram
 The job lifecycle: every arrow is one atomic Lua script, and the stall arrow from active back to
@@ -409,6 +417,9 @@ because the vector write keys on document id and chunk index.
 Each BullMQ object gets its own ioredis connection from a factory here; BullMQ also duplicates a
 Worker's connection internally for its blocking commands, and refuses a Worker connection whose
 `maxRetriesPerRequest` is not `null`.
+
+Install both packages with `npm i bullmq ioredis`: since BullMQ 6, ioredis is an optional peer
+dependency, not a bundled one (checked against bullmq 6.7.0 and ioredis 6.0.0, 2026-11).
 
 ```ts
 import IORedis from "ioredis";
@@ -652,7 +663,8 @@ resumes instead of restarting, move CPU-heavy work to a sandboxed processor, and
   still stored.
 - **It stops at retention:** once `removeOnComplete` deletes the job the id can be reused, so a late
   duplicate runs again; while it is retained, an intended re-run is silently ignored.
-- **So** keep processor-side idempotency, or use BullMQ 5's `deduplication` option with an explicit TTL.
+- **So** keep processor-side idempotency, or use BullMQ's `deduplication` option (5.x and 6.x) with an
+  explicit TTL.
 
 ## Quiz
 ### Q: What makes a job survive a worker process crash in BullMQ?

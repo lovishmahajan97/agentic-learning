@@ -39,6 +39,13 @@ a tested fix.
 - **What you can skip.** The server internals (ClickHouse, Redis, object storage) unless you self-host.
   Know the data model and that the SDK ships events in background batches.
 
+> **Version banner (checked against langfuse 5.2.0 and @langfuse/tracing 6.1.1, 2026-11).**
+> - **Python SDK 5.x** needs Python 3.11+ and Langfuse Cloud or a self-hosted server v4.59.0 or later.
+> - **Self-hosted v3 servers** must stay on Python SDK v4 until the server is upgraded.
+> - **The JS/TS SDK** is now the `@langfuse/*` packages at 6.x, not the old single `langfuse` package.
+> - **Ownership:** ClickHouse acquired Langfuse (announced 2026-01-16); Langfuse says there are "no planned
+>   changes to licensing".
+
 ## Lab
 ### Task
 Build the cost-per-customer report an agent product needs from a recorded Langfuse export, and make the
@@ -223,6 +230,9 @@ input and 50 output tokens ($0.00063 each, $0.00252), and `t3` is the $0.0003495
   others that render differently in the UI.
 - **Generation is the type that matters mechanically,** because it is the only one that carries usage and
   cost.
+- **Observations first (SDK v4 and later, checked against langfuse 5.2.0, 2026-11).** `user_id`,
+  `session_id`, tags and metadata propagate to every observation rather than living only on the trace.
+  Trace input and output come from the root observation, and v5 evaluators read observations only.
 
 ### Scores
 - **What:** a named numeric, categorical or boolean value, with an optional comment, on a trace or observation.
@@ -283,6 +293,9 @@ cost = input_tokens × input_price + output_tokens × output_price (+ cached-rea
 | OTLP endpoint | Spans from any OpenTelemetry SDK, OpenLLMetry or OpenInference instrumentation are mapped onto generations using the GenAI attribute conventions |
 
 - **Built on OTel.** The current Python SDK is itself built on the OpenTelemetry SDK.
+- **Default span-export filter (since SDK v4).** Only Langfuse spans, spans with `gen_ai.*` attributes and
+  spans from known LLM instrumentors are exported; v3 exported every unblocked scope. To keep your own HTTP
+  or database spans, pass `should_export_span` combined with `is_default_export_span`.
 - **Masking.** A `mask` callback redacts fields before data leaves the process.
 - **Sampling.** A client-side sample rate keeps a fixed fraction of traces. It is decided per trace so a kept
   trace is complete, but scores and cost totals then describe the sample and must be scaled to estimate the
@@ -310,12 +323,13 @@ flowchart TD
 The decorator builds the trace, the OpenAI drop-in records the generation, the prompt comes from prompt
 management and is linked to the generation, and the trace is tagged with user and session.
 
-Method names follow the OTel-based v3 Python SDK; the earlier SDK exposed the same ideas through
-`langfuse_context`, so check the names against the major version you pin.
+Method names follow Python SDK 5.x (checked against langfuse 5.2.0, 2026-11). `propagate_attributes`
+replaced `update_current_trace` in v4; older SDKs used `langfuse_context`, so match the names to the major
+version you pin.
 
 ```python
-# pip install langfuse openai ; env: LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and the host URL if self-hosted
-from langfuse import observe, get_client
+# pip install "langfuse>=5,<6" openai ; env: LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL if self-hosted
+from langfuse import get_client, observe, propagate_attributes
 from langfuse.openai import openai         # drop-in client: every call becomes a 'generation' observation
 
 langfuse = get_client()
@@ -327,13 +341,14 @@ def retrieve(question: str) -> list[str]:
 
 @observe()                                  # the outermost @observe becomes the trace
 def answer(question: str, user_id: str, session_id: str) -> str:
-    langfuse.update_current_trace(user_id=user_id, session_id=session_id, tags=["support"])
-    docs = retrieve(question)
-    resp = openai.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=PROMPT.compile(context="\n".join(docs), question=question),   # chat prompt -> messages
-        langfuse_prompt=PROMPT,             # links this generation to the prompt name + version
-    )
+    # user, session and tags apply to the current observation and every child created inside the block
+    with propagate_attributes(user_id=user_id, session_id=session_id, tags=["support"]):
+        docs = retrieve(question)
+        resp = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=PROMPT.compile(context="\n".join(docs), question=question),   # chat prompt -> messages
+            langfuse_prompt=PROMPT,         # links this generation to the prompt name + version
+        )
     trace_id = langfuse.get_current_trace_id()      # hand this to the client so feedback can be scored later
     return resp.choices[0].message.content
 
@@ -354,7 +369,7 @@ and tool observations exist in recent SDK versions, so drop the argument on olde
 
 ```python
 import json
-from langfuse import observe, get_client
+from langfuse import get_client, observe, propagate_attributes
 from langfuse.openai import openai           # every model call becomes a generation
 
 langfuse = get_client()
@@ -365,20 +380,20 @@ def call_tool(name: str, args: dict):
 
 @observe(as_type="agent")
 def run_agent(task: str, user_id: str, session_id: str, max_steps: int = 8) -> str:
-    langfuse.update_current_trace(user_id=user_id, session_id=session_id, tags=["agent"])
-    messages = [{"role": "user", "content": task}]
-    for step in range(max_steps):
-        msg = openai.chat.completions.create(model="gpt-4o-mini", messages=messages,
-                                             tools=TOOL_SCHEMAS).choices[0].message
-        if not msg.tool_calls:
-            langfuse.score_current_trace(name="steps_used", value=step + 1)
-            return msg.content
-        messages.append(msg)
-        for c in msg.tool_calls:
-            result = call_tool(c.function.name, json.loads(c.function.arguments))
-            messages.append({"role": "tool", "tool_call_id": c.id, "content": json.dumps(result)})
-    langfuse.score_current_trace(name="hit_step_budget", value=1)
-    return "Sorry, I could not finish this task."
+    with propagate_attributes(user_id=user_id, session_id=session_id, tags=["agent"]):
+        messages = [{"role": "user", "content": task}]
+        for step in range(max_steps):
+            msg = openai.chat.completions.create(model="gpt-4o-mini", messages=messages,
+                                                 tools=TOOL_SCHEMAS).choices[0].message
+            if not msg.tool_calls:
+                langfuse.score_current_trace(name="steps_used", value=step + 1)
+                return msg.content
+            messages.append(msg)
+            for c in msg.tool_calls:
+                result = call_tool(c.function.name, json.loads(c.function.arguments))
+                messages.append({"role": "tool", "tool_call_id": c.id, "content": json.dumps(result)})
+        langfuse.score_current_trace(name="hit_step_budget", value=1)
+        return "Sorry, I could not finish this task."
 
 run_agent("Refund order 1182 if it shipped late", user_id="u_42", session_id="s_9")
 langfuse.flush()
@@ -490,6 +505,8 @@ Illustrative prices: $0.15 per million input tokens, $0.60 per million output to
 - **Prefer LangSmith** when the application is LangGraph end to end and the hosted model is acceptable.
 - **Prefer Phoenix** when the work is evaluation-heavy notebook analysis over OpenTelemetry traces you already
   produce.
+- **Also compare Opik** (Comet, Apache-2.0, self-hostable; checked against opik 2.2.140, 2026-11), which
+  covers the same trace, dataset and evaluation loop.
 - **Measure:** ingestion lag, the share of generations with a matched cost, the fraction of traces carrying
   `user_id`, and agreement between judge scores and human annotations.
 - **Day to day,** it is the tab you open when a customer forwards a bad answer.

@@ -17,6 +17,7 @@ related:
   - system-design/exactly-once-processing-limitations
   - backend-fundamentals/background-jobs-durable-workers
   - reliability/fault-tolerance
+  - tool-labs/temporal-durable-agent-lab
 sources:
   - Official docs: Temporal
   - Garcia-Molina & Salem, 1987 — Sagas
@@ -60,7 +61,7 @@ to 14 days to reply. All figures are illustrative.
 | A. Status column plus cron | a run table, a sweeper job, retries per step | polling sweeper you write | only as good as your status updates; races with crashes | hand-written | familiar, but grows the bugs in Why it exists |
 | B. Framework checkpointer | agent graph with a Postgres checkpointer, pause on approval | pause works; timers need an external scheduler | resumes at the last superstep; tool idempotency is yours | hand-written | fits, with a scheduler and saga code added |
 | C. Code-first durable engine | Temporal-style workflow; model and tools as activities | durable timers and signals, no worker held | replay returns recorded results; activities keyed by workflow, run and activity ID | `try`/`except` saga in workflow code | a new runtime to learn and operate |
-| D. Declarative state machine | Step Functions style JSON states | built in | built in | built in | awkward for a loop whose next step is chosen by the model |
+| D. Declarative state machine | Step Functions style JSON states (AWS's code-first Lambda durable functions belong under C) | built in | built in | built in | awkward for a loop whose next step is chosen by the model |
 
 ### Decision
 **Option C, a code-first durable engine.** Multi-day waits with reminders, about 1,286 runs mostly
@@ -162,6 +163,9 @@ Workflows and activities are dispatched through named task queues that workers p
 ### Living with long-running code
 - **Versioning.** Deploying new workflow code while old histories exist can break replay, so engines offer
   a patch marker that lets new code take the old branch for histories recorded before the change.
+- **Version the workers instead.** Temporal's Worker Versioning (GA since 2026-03-30, checked 2026-11)
+  can pin a run to the worker deployment version that started it, so pinned runs finish on old code
+  and need no patch marker; runs set to auto-upgrade still need patches.
 - **Continue-as-new.** Very long or unbounded loops, like an agent that may take thousands of steps, close
   the current history and start a fresh one carrying only the needed state, *because* replaying millions
   of events is slow and memory-hungry.
@@ -196,7 +200,22 @@ Workflows and activities are dispatched through named task queues that workers p
 | Hand-built saga | compensation | resumption |
 | Queue | retries | orchestration |
 | Declarative state machine (Step Functions style) | durability with JSON-defined states; excellent for fixed pipelines | awkward for branching agent logic |
-| Code-first engine | ordinary programs | simplicity: determinism rules apply |
+| Code-first engine (Temporal, or Lambda durable functions on AWS) | ordinary programs | simplicity: determinism rules apply |
+
+### Engines compared (checked 2026-11)
+All share the record-and-replay model above; they differ in where state lives and what you operate.
+
+| Engine | Shape | State and hosting | Status, checked 2026-11 |
+|---|---|---|---|
+| Temporal | workflow code plus activities | Temporal server, self-hosted or Temporal Cloud | temporalio 1.35.0 |
+| Restate | handlers whose steps are journaled | a single-binary Restate server in front of your services | restate-sdk 1.4.0 (Python) |
+| DBOS | decorated workflow and step functions in your process | your own Postgres; no extra server, closest to the toy engine below | dbos 3.4.0 |
+| AWS Lambda durable functions | `context.step()` checkpoints, `context.wait()` without compute | managed by Lambda (Python, Node.js, Java) | launched December 2025 |
+| Inngest | event-triggered functions with memoized steps | Inngest Cloud or self-hosted | inngest 0.5.20 (Python) |
+| Vercel Workflows | TypeScript workflow and step functions | managed on Vercel (Workflow SDK) | GA 2026-04-16; npm `workflow` 5.4.0 |
+| Cloudflare Workflows | steps, sleeps and `waitForEvent` on Workers | managed by Cloudflare | GA 2025-04-07 |
+| Dapr Agents | Python agent framework on Dapr workflows | Dapr sidecar plus a state store you choose | v1.0 GA 2026-03-23; dapr-agents 1.1.0 |
+| MAF Durable Task extension | Microsoft Agent Framework agents as durable entities | Azure Durable Functions or Durable Task Scheduler | beta: agent-framework-durabletask 1.0.0b261029 |
 
 ## Diagram
 A worker restart mid-run: replay returns recorded results for finished steps, so only the step with no
@@ -221,9 +240,12 @@ sequenceDiagram
 
 ## Examples
 ### A Temporal-style approval workflow
-A Temporal-style workflow (Python SDK conventions; check names against the current docs) in which the
-LLM call and the send are activities, and the approval wait is a durable timer plus signal. A crash
-after `draft_reply` completes resumes at the wait without calling the model again.
+A Temporal workflow (Python SDK) in which the LLM call and the send are activities, and the approval
+wait is a durable timer plus signal. A crash after `draft_reply` completes resumes at the wait without
+calling the model again.
+
+This and the next example were run with stub `llm`, `mailer` and activities in
+`WorkflowEnvironment.start_time_skipping()`, checked against temporalio 1.35.0, 2026-11.
 
 ```python
 import asyncio
@@ -277,7 +299,7 @@ class TicketReplyWorkflow:
 ### A durable tool-calling agent loop
 The same conventions applied to a whole agent loop: one activity asks the model for the next action, one
 runs the chosen tool, and the step budget lives in workflow state. `start_transcript`, `call_model` and
-`run_tool` are your own activities; check SDK names against the current Temporal docs.
+`run_tool` are your own activities (checked against temporalio 1.35.0, 2026-11).
 
 ```python
 from datetime import timedelta
@@ -401,6 +423,12 @@ print(research(ctx, "kv"), ctx.executed)
 - **Approval gates as signals.** Before a consequential tool call, the agent workflow waits on an
   approval signal with a durable timeout and an escalation branch, so no worker is held for hours.
   Monitor approval wait time and the share of runs that expire waiting.
+- **Framework plugins before hand-wrapping (checked 2026-11).** `temporalio-openai-agents` 1.1.0
+  (import `temporalio.openai_agents`, worker plugin `OpenAIAgentsPlugin`) and Pydantic AI's
+  `TemporalDurability` (from `pydantic_ai.durable_exec.temporal`, pydantic-ai 2.66.0) run model and
+  tool calls as activities. Temporal's catalog
+  also lists LangGraph, Claude Agent SDK, Google ADK, Strands, Deep Agents, MCP and the Vercel AI SDK.
+  Check each plugin's maturity label before relying on it.
 
 ## Trade-offs
 - **Crash-proof resumption vs determinism rules.** You get readable straight-line orchestration in
@@ -551,6 +579,6 @@ continue-as-new and add heartbeats to long model calls.
 - **Steps:** extend the toy replay engine above into a 6-step agent loop with a fake model that picks
   tools and a fake "create document" tool that counts calls; kill the process at a random step, restart
   it against the saved history (a JSON file), then repeat with the real SDK in a local Temporal dev server
-  if you have one.
+  if you have one. The Temporal lab (tool-labs/temporal-durable-agent-lab) walks through that step.
 - **Done when:** across 20 random crashes, each run's model call count equals its step count and the
   tool created exactly one document per intended action.

@@ -349,6 +349,7 @@ worker renews.
 | PostgreSQL table with `SKIP LOCKED` | no new infrastructure, transactional enqueue, trivially inspectable | polling (idle workers cost queries); finished rows must be archived or the table bloats |
 | Redis-backed (Celery with Redis, RQ, BullMQ, Sidekiq) | blocking pops, low latency | Redis's weaker durability and the dual-write problem |
 | Broker-backed (Celery with RabbitMQ, SQS consumers) | the message-queue lesson from the consumer's chair | another system to run |
+| Task platform on Postgres (Hatchet; hatchet-sdk 1.45.0, checked 2026-11) | retries, scheduling, durable tasks and a dashboard; MIT, self-hosted or Hatchet Cloud | a separate engine service to run beside your database |
 
 Choose by what losing a job costs and by throughput; a few hundred jobs per second (illustrative) is well
 within a Postgres table on modest hardware.

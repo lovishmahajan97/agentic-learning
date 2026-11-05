@@ -294,7 +294,8 @@ def test_forget_user_removes_all_and_only_that_user():
   Many index types (IVF variants, HNSW, DiskANN, GPU).
 - **Milvus at scale:** targets billions of vectors, heavier to operate; Milvus Lite embeds in Python for
   development, Zilliz Cloud is managed.
-- **Pinecone:** fully managed, proprietary; serverless and pod-based deployments, namespaces for tenant
+- **Pinecone:** fully managed, proprietary; serverless indexes (pod-based indexes are legacy, and
+  serverless is the only option for new customers, checked 2026-11), namespaces for tenant
   isolation, metadata filtering, sparse-dense hybrid search. Zero operations; you pay per usage and data
   and index live with the vendor.
 - **Chroma:** open source, Python/JS-first; embedded in the app process with on-disk persistence or as a
@@ -303,6 +304,11 @@ def test_forget_user_removes_all_and_only_that_user():
 - **Chroma hosted:** a separate, distributed offering; check its current capabilities.
 - **Adjacent options:** FAISS and hnswlib (libraries, not databases), Elasticsearch and OpenSearch kNN
   (if you already run them for lexical search), Redis, LanceDB and Vespa.
+- **More options, checked 2026-11:** Turbopuffer (managed, built on object storage), Amazon S3 Vectors
+  (GA 2025-12-02, up to two billion vectors per index), MongoDB Atlas Vector Search when
+  documents already live in MongoDB, and RedisVL 0.30 as Redis's Python vector client.
+- **pgvectorscale 0.9.1** (`timescale/pgvectorscale`) adds a disk-friendly StreamingDiskANN index to
+  pgvector when the HNSW graph no longer fits in RAM.
 
 ### When a write becomes searchable
 | System | Read-your-writes behaviour |
@@ -371,7 +377,7 @@ CREATE INDEX chunks_tenant_idx ON chunks (tenant_id);
 -- Query time: wider graph search for better recall (default 40).
 SET hnsw.ef_search = 100;
 -- pgvector 0.8.0+: keep scanning the graph until LIMIT rows survive the WHERE clause.
-SET hnsw.iterative_scan = relaxed_order;   -- checked against pgvector 0.8.2
+SET hnsw.iterative_scan = relaxed_order;   -- checked against pgvector 0.8.7, 2026-11
 
 SELECT id, doc_id, 1 - (embedding <=> $1::vector) AS cosine_similarity
 FROM chunks
@@ -392,7 +398,7 @@ Save waits for the write to apply, so the next agent step can recall it; recall 
 
 ```python
 import uuid
-from qdrant_client import QdrantClient, models   # checked: qdrant-client 1.20.0, server 1.19.1
+from qdrant_client import QdrantClient, models   # checked: qdrant-client 1.20.0, server 1.20.0, 2026-11
 
 client = QdrantClient(url="http://localhost:6333")
 if not client.collection_exists("memories"):

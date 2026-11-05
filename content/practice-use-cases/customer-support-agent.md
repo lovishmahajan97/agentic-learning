@@ -218,6 +218,10 @@ baseline week of tickets.
 ### Practice data
 - **Conversations.** The Bitext customer-support dataset on Hugging Face (intents with example
   utterances), or tau-bench's retail domain, which ships policies, a mock order database and tools.
+- **Which tau-bench repo (checked 2026-11):** clone `sierra-research/tau2-bench`, which carries the
+  latest fixed tasks (τ³-bench 1.0, then τ-bench 2.0 in 2026-10); the original `tau-bench` repo is no
+  longer updated and holds outdated airline and retail tasks. Install from the clone with `uv sync`;
+  never `pip install tau2`, an unrelated PyPI package.
 - **Synthetic orders.** Generate a few hundred customers and orders with Faker into SQLite, including
   edge cases: old orders, partial refunds, duplicate charges.
 

@@ -230,7 +230,11 @@ On the starter all 6 tests fail with `NotImplementedError`.
 | **Core abstraction** | Model tag plus Modelfile (`FROM`, `PARAMETER`, `SYSTEM`) | A GGUF file plus command-line flags | A model repo id plus engine arguments |
 | **Concurrency** | A few parallel requests per model | Fixed number of slots | Continuous batching, PagedAttention, prefix caching |
 | **Default port** | 11434 | 8080 | 8000 |
-| **Tool calls** | `tools` in its native and OpenAI-compatible APIs for models whose template supports them | Pass `--jinja` to use the model's chat template (explicitly, whatever your build's default) | `--enable-auto-tool-choice` plus a `--tool-call-parser` for the model family |
+| **Tool calls** | `tools` in its native and OpenAI-compatible APIs for models whose template supports them | The model's Jinja chat template, on by default in current builds (`--no-jinja` turns it off, which disables tools; checked against llama.cpp b12125, 2026-11) | `--enable-auto-tool-choice` plus a `--tool-call-parser` for the model family |
+
+- **Other local runtimes (checked 2026-11):** LM Studio is a desktop app that serves GGUF (via llama.cpp)
+  and, on Apple Silicon, MLX models on an OpenAI-compatible server at `:1234`. On a Mac, Apple's MLX
+  stack (`mlx-lm` 0.32.2, `mlx_lm.server`) is the native alternative to GGUF.
 
 ### Starting each one
 ```bash
@@ -239,6 +243,7 @@ ollama pull qwen2.5:7b
 ollama run qwen2.5:7b "Say hi"          # quick test; ollama ps shows loaded models
 
 # llama.cpp: serve a GGUF file on :8080, offload all layers to GPU, 8k context
+# (--jinja is the default in current builds; kept here so older builds also parse tool calls)
 llama-server -m ./qwen2.5-7b-instruct-q4_k_m.gguf -c 8192 -ngl 99 --port 8080 --jinja
 
 # vLLM: serve Hugging Face weights on :8000 with native tool-call parsing
@@ -258,6 +263,11 @@ vllm serve Qwen/Qwen2.5-7B-Instruct --max-model-len 8192 \
   concurrent requests; each one needs its own KV cache.
 - **Tool parser match.** The vLLM parser must match the model's tool format (for example `hermes`,
   `llama3_json`, `mistral`); check the vLLM tool-calling docs for the current list.
+- **Cloud tags are not local (checked against Ollama v0.40.14, 2026-11).** A tag such as `gemma4:cloud`
+  runs on Ollama's servers, so prompts and tool results leave the machine. For private or air-gapped
+  work, set `"disable_ollama_cloud": true` in `~/.ollama/server.json` or `OLLAMA_NO_CLOUD=1`, then restart.
+- **Ollama on MLX is a preview.** Since 2026-03 Ollama can run on Apple's MLX on Apple Silicon, but only
+  for the models Ollama lists as supported, and it asks for a Mac with more than 32 GB of unified memory.
 
 ## Diagram
 The agent code stays the same; only the base URL changes, and each engine maps a model file or repo to an
@@ -322,7 +332,7 @@ hardware and model.
 |---|---|---|
 | Developer laptops (16-32 GB unified memory) | Ollama | Pinned model tags, Modelfile with `num_ctx 8192`, one shared Modelfile in the repo |
 | Branch-office edge box, CPU only | llama.cpp `llama-server` | Q4_K_M GGUF, `-c 4096`, `--parallel 2`, started as a system service |
-| Central GPU server, 40 concurrent agents | vLLM | AWQ 4-bit 7B model, `--max-model-len 8192`, `--enable-prefix-caching`, tool parser matched to the model |
+| Central GPU server, 40 concurrent agents | vLLM | AWQ 4-bit 7B model, `--max-model-len 8192`, prefix caching left on (the default), tool parser matched to the model |
 
 All three expose `/v1/chat/completions`, so the agent and its eval suite run unchanged in each place.
 
@@ -358,6 +368,9 @@ All three expose `/v1/chat/completions`, so the agent and its eval suite run unc
 - **Cold starts between steps.** Symptom: some agent steps take seconds longer. Diagnose: `ollama ps` or the
   server log shows a load before the slow step. Fix: set keep-alive, and avoid loading several large models
   on one small GPU.
+- **A `:cloud` tag in a "local" agent.** Symptom: the agent works with no GPU and no download, and its
+  prompts reach Ollama's servers. Diagnose: the model tag ends in `cloud` (check `ollama ls`). Fix: use a
+  local tag and disable cloud features (`OLLAMA_NO_CLOUD=1`); the log shows `Ollama cloud disabled: true`.
 - **Benchmarking at batch 1.** Symptom: fine in testing, slow under load. Diagnose: plot time to first token
   against concurrency. Fix: load-test with the real number of concurrent agents and long prompts.
 

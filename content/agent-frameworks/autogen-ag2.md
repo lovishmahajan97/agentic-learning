@@ -20,13 +20,14 @@ related:
 sources:
   - Microsoft AutoGen documentation (AgentChat, Core, Extensions)
   - AG2 documentation
+  - Microsoft Agent Framework documentation (agent-framework, orchestrations)
   - Wu et al., 2023 — AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation
 ---
 
 ## TL;DR
 AutoGen models multi-agent systems as conversations: agents exchange messages in pairs or group chats
-until a termination condition fires. It now exists as two lines, Microsoft's rewritten AutoGen 0.4+ and
-the community fork AG2, which keeps the original API.
+until a termination condition fires. Microsoft's AutoGen is now archived; its successor is Microsoft
+Agent Framework (MAF). The community fork AG2 lives on.
 
 ## For agent builders
 - **Why it matters for agents.** It popularised the "agents talk to each other" pattern: a coder and a
@@ -40,49 +41,79 @@ the community fork AG2, which keeps the original API.
 - **What you can skip.** The lineage trivia beyond what you need to pick the right package and read old
   examples correctly; the next section gives exactly that.
 
+### Status as of 2026-11
+Checked against PyPI and the project READMEs, 2026-11-05.
+- **Microsoft AutoGen is archived.** Its README says it is "no longer maintained": no bug or security
+  fixes. `autogen-agentchat` is frozen at 0.7.5 (2025-09). Read old code with it; do not start on it.
+- **Microsoft Agent Framework is the successor.** It is GA at 1.x (checked against agent-framework
+  1.24.0) and has migration guides from both AutoGen and Semantic Kernel.
+- **AG2 split in two.** AG2 v1 (2026-07-27) is the `ag2` package with `from ag2 import Agent` and
+  multi-agent work in `ag2.network`. Classic AG2, the 0.2-style API, is the PyPI package `autogen`
+  (checked against autogen 0.14.1), still imports as `autogen`, and is in maintenance mode.
+
 ## Lab
 ### Task
 Fix the termination of a writer-critic team, the runaway case from this lesson's Check yourself. You
-accept APPROVE only from the critic, add a hard message cap, and report how each run ended, so a
+accept APPROVE only from the critic, add a hard cap on agent turns, and report how each run ended, so a
 self-approved draft or a critic that never approves shows up in your logs instead of on the bill.
 - **Time box:** 30-60 minutes.
-- **Prerequisites:** this lesson's AgentChat section and the investigator-reviewer example;
+- **Prerequisites:** this lesson's status block, the termination conditions under How it works, and
   multi-agent patterns.
-- **Runs offline:** each agent uses `ReplayChatCompletionClient`, which replays recorded model replies,
-  so no key is needed. The team, agents and termination conditions are the real ones.
-- **Needs:** `autogen-agentchat`, `autogen-ext` and `pytest`; checked with 0.7.5 of all three AutoGen
-  packages on Python 3.12. This is the Microsoft line; in AG2 the same fix is an
+- **Runs offline:** each agent uses `ReplayClient`, a ten-line `BaseChatClient` subclass in the file
+  that replays recorded model replies, so no key is needed. The agents, group chat orchestrator and
+  termination logic are the real ones.
+- **Needs:** `agent-framework-core`, `agent-framework-orchestrations` and `pytest`; checked against
+  agent-framework-core 1.24.0 and agent-framework-orchestrations 1.4.1 on Python 3.12, 2026-11. This
+  is Microsoft Agent Framework, AutoGen's successor; in AG2 Classic the same fix is an
   `is_termination_msg` that checks the sender, plus `max_turns`.
 
 ### Starter code
 ```python
-# critic_team.py: termination you can trust in a writer-critic team (AutoGen AgentChat 0.4+, offline)
+# critic_team.py: termination you can trust in a writer-critic group chat (Microsoft Agent Framework, offline)
 import asyncio
-from autogen_agentchat.agents import AssistantAgent
-from autogen_agentchat.conditions import MaxMessageTermination, TextMentionTermination
-from autogen_agentchat.teams import RoundRobinGroupChat
-from autogen_ext.models.replay import ReplayChatCompletionClient
+from agent_framework import Agent, BaseChatClient, ChatResponse, FunctionInvocationLayer, Message
+from agent_framework_orchestrations import (GroupChatBuilder, GroupChatOrchestrator,
+                                            GroupChatResponseReceivedEvent, GroupChatState)
 
-CAP = 6  # hard cap on messages in a run, counting the task message
+CAP = 5  # hard cap on agent turns (orchestrator rounds) in one run
 
-def build_team(writer_replies: list[str], critic_replies: list[str]) -> RoundRobinGroupChat:
-    """Each agent replays recorded model replies, so runs are deterministic and need no key."""
-    writer = AssistantAgent("writer", model_client=ReplayChatCompletionClient(writer_replies),
-                            system_message="Draft a status update. Revise on feedback.")
-    critic = AssistantAgent("critic", model_client=ReplayChatCompletionClient(critic_replies),
-                            system_message="Check the draft names cause, impact and ETA. "
-                                           "Say APPROVE only when all three are present.")
+class ReplayClient(FunctionInvocationLayer, BaseChatClient):
+    """Replays recorded model replies, so runs are deterministic and need no key."""
+    def __init__(self, replies: list[str]):
+        super().__init__()
+        self._replies = list(replies)
+
+    async def _inner_get_response(self, *, messages, stream, options, **kwargs):
+        if not self._replies:
+            raise RuntimeError("No more recorded replies")
+        return ChatResponse(messages=[Message(role="assistant", contents=[self._replies.pop(0)])])
+
+def round_robin(state: GroupChatState) -> str:
+    names = list(state.participants)
+    return names[state.current_round % len(names)]
+
+def build_team(writer_replies: list[str], critic_replies: list[str]):
+    writer = Agent(client=ReplayClient(writer_replies), name="writer",
+                   instructions="Draft a status update. Revise on feedback.")
+    critic = Agent(client=ReplayClient(critic_replies), name="critic",
+                   instructions="Check the draft names cause, impact and ETA. "
+                                "Reply exactly APPROVE only when all three are present.")
     # YOUR CODE 1: anyone who says APPROVE ends the run, and nothing bounds a critic that never
-    # approves. Accept APPROVE only from "critic", and OR it with MaxMessageTermination(CAP).
-    stop = TextMentionTermination("APPROVE")
-    return RoundRobinGroupChat([writer, critic], termination_condition=stop)
+    # approves. Accept APPROVE only from "critic" (Message.author_name) and pass max_rounds=CAP.
+    def stop(conversation: list[Message]) -> bool:
+        return "APPROVE" in conversation[-1].text
+    return GroupChatBuilder(participants=[writer, critic], selection_func=round_robin,
+                            termination_condition=stop).build()
 
 async def review(writer_replies: list[str], critic_replies: list[str]) -> dict:
-    result = await build_team(writer_replies, critic_replies).run(task="Write the checkout incident update.")
-    last = result.messages[-1]
-    # YOUR CODE 2: approved must be True only when the last message is the critic's APPROVE,
-    # and capped must be True when the run ended by the message cap
-    return {"messages": len(result.messages), "approved": "APPROVE" in last.to_text(),
+    result = await build_team(writer_replies, critic_replies).run("Write the checkout incident update.")
+    speakers = [e.data.participant_name for e in result
+                if isinstance(e.data, GroupChatResponseReceivedEvent)]
+    ending = result.get_outputs()[-1].messages[-1].text  # the orchestrator's completion message
+    # YOUR CODE 2: approved must be True only when the critic spoke last and the stop condition
+    # fired, and capped must be True when the run ended by the round cap
+    return {"turns": len(speakers),
+            "approved": ending == GroupChatOrchestrator.TERMINATION_CONDITION_MET_MESSAGE,
             "capped": False}
 
 GOOD = (["Draft 1: checkout is down.", "Draft 2: checkout down; cause: bad deploy; impact: 30% of "
@@ -104,16 +135,18 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-As given, `self-approved` stops after 2 messages with `approved: True` (the writer said APPROVE), and
-`stubborn` keeps going until the replay runs out of replies, ending in `crashed with RuntimeError`
-plus a logged traceback. With a real model that run would continue and bill instead.
+As given, `self-approved` stops after 1 turn with `approved: True` (the writer said APPROVE), and
+`stubborn` keeps going until the replay runs out of replies, ending in `crashed with RuntimeError`.
+With a real model that run would continue and bill instead.
 
 ### Expected output
 ```
-good -> {'messages': 5, 'approved': True, 'capped': False}
-self-approved -> {'messages': 6, 'approved': False, 'capped': True}
-stubborn -> {'messages': 6, 'approved': False, 'capped': True}
+good -> {'turns': 4, 'approved': True, 'capped': False}
+self-approved -> {'turns': 5, 'approved': False, 'capped': True}
+stubborn -> {'turns': 5, 'approved': False, 'capped': True}
 ```
+
+The orchestrator also logs "reached max_rounds=5; forcing completion" for each capped run.
 
 ### Tests
 ```python
@@ -125,41 +158,40 @@ def review(case):
     return asyncio.run(m.review(*case))
 
 def test_critic_approval_ends_the_run():
-    assert review(m.GOOD) == {"messages": 5, "approved": True, "capped": False}
+    assert review(m.GOOD) == {"turns": 4, "approved": True, "capped": False}
 
 def test_writer_cannot_approve_its_own_draft():
     r = review(m.SELF_APPROVED)
     assert r["approved"] is False
-    assert r["messages"] > 2
+    assert r["turns"] > 1
 
 def test_stubborn_critic_hits_the_cap():
-    assert review(m.STUBBORN) == {"messages": m.CAP, "approved": False, "capped": True}
+    assert review(m.STUBBORN) == {"turns": m.CAP, "approved": False, "capped": True}
 
-def test_cap_counts_every_message_including_the_task():
-    w, c = m.STUBBORN
-    team = m.build_team(w, c)
-    result = asyncio.run(team.run(task="Write the checkout incident update."))
-    assert len(result.messages) == m.CAP
-    assert result.messages[0].source == "user"
+def test_polite_rejection_does_not_approve():
+    w, _ = m.STUBBORN
+    r = review((w, ["Missing cause, impact and ETA.", "Not APPROVED yet, missing ETA."]))
+    assert r == {"turns": m.CAP, "approved": False, "capped": True}
 ```
 
-On the starter 3 of 4 fail: the self-approval, and two runs that crash with "No more mock responses
-available". The `GOOD` case passes on purpose, so a fix that never approves is caught.
+On the starter 3 of 4 fail: the self-approval, the polite rejection that a substring match accepts,
+and a run that crashes with "No more recorded replies". The `GOOD` case passes on purpose, so a fix
+that never approves is caught.
 
 ### Failure scenarios
-- **Inject AND instead of OR:** combine the conditions with `&`. Both must fire, so a critic's APPROVE
-  at message 5 no longer ends the run, and all three cases crash once the replies run out. Print
-  `result.stop_reason` per run; it names the condition that actually fired.
-- **Inject a cap that ignores the task message:** set the cap assuming only agent messages count. Runs
-  end one agent turn earlier than you planned. Check `result.messages[0].source`; the task is message 1.
+- **Inject a condition without the sender check:** keep only `last.text.strip() == "APPROVE"`. The
+  self-approved case still passes because the writer's line is longer, but a writer that replies
+  exactly `APPROVE` ends the run. Add that case to the tests.
+- **Inject a cap that counts the task:** set `max_rounds=CAP - 1` "because the task is a turn". Runs
+  end one agent turn early. In this orchestrator a round is one participant reply; the task is not one.
 - **Inject a polite critic:** change the critic's reply to "Not APPROVED yet, missing ETA." A plain
-  text match ends the run on a rejection. Make the approval token unambiguous (a line that is exactly
-  `APPROVE`) and add the rejection to your test set.
+  substring match ends the run on a rejection. Make the approval token unambiguous (a reply that is
+  exactly `APPROVE`) and keep the rejection in your test set.
 
 ### Submission
 - **Your `critic_team.py`** with both `YOUR CODE` steps done and nothing else changed.
 - **A `pytest -q` run** showing 4 passed, plus the script output matching the expected lines.
-- **The `stop_reason`** printed for each of the three cases.
+- **The ending message** (`result.get_outputs()[-1]`) printed for each of the three cases.
 - **A short note** on what alert you would set on the share of runs that end by the cap, and what a
   rising share usually means.
 - **Evaluated on:** green tests, approval accepted only from the critic, and every run bounded.
@@ -179,11 +211,18 @@ available". The `GOOD` case passes on purpose, so a fix that never approves is c
 | Line | Package and import | API style | Status (check current docs) |
 |---|---|---|---|
 | AutoGen 0.2 (original, 2023) | `pyautogen`, `import autogen` | `ConversableAgent`, `initiate_chat` | superseded |
-| AG2 (community fork, late 2024) | `ag2` (also published under older names), `import autogen` | 0.2-compatible, extended | actively developed |
-| Microsoft AutoGen 0.4+ (early 2025 rewrite) | `autogen-agentchat`, `autogen-core`, `autogen-ext` | async, event-driven, layered | Microsoft has announced Agent Framework as its successor |
+| AG2 Classic (community fork, late 2024) | `autogen` (0.14.1), `import autogen` | 0.2-compatible, extended | maintenance mode: security and critical fixes only |
+| AG2 v1 (2026-07-27) | `ag2`, `from ag2 import Agent` | new API; multi-agent in `ag2.network` | actively developed |
+| Microsoft AutoGen 0.4+ (early 2025 rewrite) | `autogen-agentchat`, `autogen-core`, `autogen-ext` | async, event-driven, layered | archived, frozen at 0.7.5 |
+| Microsoft Agent Framework (GA 1.x) | `agent-framework`, `import agent_framework` | agents plus workflow orchestrations | AutoGen's successor |
 
-- **Read imports first.** `from autogen import ...` is AG2 or 0.2 style; `from autogen_agentchat ...` is
-  Microsoft 0.4+. Mixing tutorials from both lines is the most common source of confusion.
+Versions checked against PyPI, 2026-11-05.
+
+- **Read imports first.** `from autogen import ...` is AG2 Classic or 0.2 style; `from ag2 import ...`
+  is AG2 v1; `from autogen_agentchat ...` is archived Microsoft 0.4+; `from agent_framework ...` is MAF.
+  Mixing tutorials from these lines is the most common source of confusion.
+- **`pip install ag2` changed meaning.** Since v1 it installs the new `ag2` module, so old
+  `from autogen import ...` code needs `pip install autogen` (AG2 Classic) instead.
 
 ### Microsoft AutoGen 0.4+ (AgentChat layer)
 - **Model clients** such as `OpenAIChatCompletionClient` (from `autogen_ext.models.openai`) are passed to
@@ -199,7 +238,7 @@ available". The `GOOD` case passes on purpose, so a fix that never approves is c
 - **Core layer** (`autogen-core`) is an actor-style runtime for event-driven agents, including
   distributed runtimes, for teams building their own patterns.
 
-### AG2 (0.2-style API)
+### AG2 Classic (0.2-style API)
 - **`ConversableAgent`** is the base; `AssistantAgent` is an LLM agent and `UserProxyAgent` stands in for
   a human and can execute code.
 - **`initiate_chat(recipient, message=...)`** runs a two-agent conversation until
@@ -229,7 +268,8 @@ flowchart TD
 
 ## Examples
 ### Investigator and reviewer team (Microsoft AutoGen 0.4+ AgentChat)
-Requires `pip install autogen-agentchat "autogen-ext[openai]"` and `OPENAI_API_KEY`. The tool returns
+Kept for reading existing code: AgentChat is archived at 0.7.5. Requires
+`pip install "autogen-agentchat==0.7.5" "autogen-ext[openai]==0.7.5"` and `OPENAI_API_KEY`. The tool returns
 canned metrics so you can watch the critique loop.
 
 ```python
@@ -265,9 +305,11 @@ asyncio.run(main())
 - **State:** `await team.save_state()` returns a serialisable dict you can store and later
   `load_state()` to resume.
 
-### Code-writing assistant with a sandboxed executor (AG2)
+### Code-writing assistant with a sandboxed executor (AG2 Classic)
 The classic two-agent pattern: the assistant writes code, the user proxy runs it in Docker and reports
-the output back.
+the output back. Requires `pip install "autogen[openai]==0.14.1"` (AG2 Classic, checked 2026-11), a
+running Docker daemon and `OPENAI_API_KEY`; `pip install ag2` now gives the v1 API, which has no
+`autogen` module.
 
 ```python
 import os
@@ -285,13 +327,13 @@ executor = UserProxyAgent(
 executor.initiate_chat(assistant, message="Compute the median of [3, 9, 4, 12, 7] in Python and print it.")
 ```
 
-| Question | Microsoft AutoGen 0.4+ | AG2 |
+| Question | Microsoft AutoGen 0.4+ | AG2 Classic |
 |---|---|---|
 | Programming model | async teams over an event-driven core | synchronous-style chats, 0.2-compatible |
 | Termination | composable condition objects | `is_termination_msg`, `max_consecutive_auto_reply`, `max_turns` |
 | Code execution | `CodeExecutorAgent` with Docker or local executors | `UserProxyAgent` with `code_execution_config` |
 | Best fit | new builds needing async and distribution | existing 0.2 code and its tutorials |
-| Watch | successor Agent Framework direction | package-name overlap with older releases |
+| Watch | archived; migrate to Agent Framework | `pip install ag2` now gives the v1 API |
 
 ## Production patterns
 - **Always pair a semantic stop with a hard cap.** Combine a text or handoff condition with
@@ -306,9 +348,10 @@ executor.initiate_chat(assistant, message="Compute the median of [3, 9, 4, 12, 7
 - **Trace message flow.** Use the built-in OpenTelemetry support (check the current docs for setup) or
   log every message with sender, tokens and tool calls. Count messages and tokens per agent; one chatty
   agent is the usual cost driver.
-- **Pin the line and version.** Pin `autogen-agentchat` and `autogen-ext` together, or pin `ag2`,
-  and check imports in CI so a dependency resolver cannot pull the other line. Review the Microsoft
-  Agent Framework migration guidance before starting new long-lived projects.
+- **Pin the line and version.** Pin `agent-framework` (MAF), `ag2` (v1) or `autogen` (AG2 Classic),
+  and check imports in CI so a dependency resolver cannot pull another line. Existing
+  `autogen-agentchat` code gets no security fixes, so plan its move with Microsoft's AutoGen-to-MAF
+  migration guide.
 
 ## Trade-offs
 - **Conversation as the abstraction vs explicit control.** Group chats are quick to express and good for
@@ -319,8 +362,8 @@ executor.initiate_chat(assistant, message="Compute the median of [3, 9, 4, 12, 7
   are cheaper and testable.
 - **Code execution power vs risk.** Running generated code solves real tasks, but the sandbox becomes
   your security boundary. Flips to predefined tools when the code would touch production data.
-- **Ecosystem split vs stability.** Two active lines plus an announced successor mean tutorials and
-  APIs diverge. Choose the line whose roadmap you trust for the system's lifetime.
+- **Ecosystem split vs stability.** An archived line, its successor MAF, and AG2 v1 beside AG2 Classic
+  mean tutorials and APIs diverge. Choose the line whose roadmap you trust for the system's lifetime.
 
 ## Pitfalls
 - **Mixing AG2 and AutoGen 0.4 examples.** Symptom: import errors or classes with unexpected arguments.
@@ -335,8 +378,8 @@ executor.initiate_chat(assistant, message="Compute the median of [3, 9, 4, 12, 7
 ## When to use
 - **Use when** the problem benefits from agents critiquing each other or from generated code executed
   in a sandbox, especially in research, data analysis and prototyping.
-- **Use Microsoft AutoGen 0.4+ when** you want async, event-driven teams and are comfortable tracking its
-  transition to Agent Framework; use AG2 when you maintain 0.2-style code.
+- **Use Microsoft Agent Framework when** you want Microsoft's supported multi-agent stack (AutoGen 0.4+ is
+  archived); use AG2 Classic when you maintain 0.2-style code, or AG2 v1 for new AG2 work.
 - **Avoid when** you need deterministic, auditable workflows, durable approval pauses, or tight latency;
   choose LangGraph, a vendor SDK or Pydantic AI.
 - **Measure** messages and tokens per task, termination reason mix, task success on an eval set and
@@ -366,7 +409,7 @@ measure whether the critic is worth its cost at all.
   APIs.
 - **AG2** is the community fork that keeps and extends that API under the `autogen` import.
 - **AutoGen 0.4** is Microsoft's async, event-driven rewrite with Core, AgentChat and Extensions
-  layers; Microsoft has since announced Agent Framework as the successor, so check its status.
+  layers. It is now archived, and Microsoft Agent Framework (GA 1.x) is its successor.
 
 ### How do termination conditions work, and why are they critical?
 - **Conditions decide when a conversation ends:** a keyword, a handoff, a message count, a token budget,
@@ -399,8 +442,8 @@ measure whether the critic is worth its cost at all.
 - [x] Microsoft AutoGen 0.4 or later, the AgentChat layer
 - [ ] AutoGen 0.2
 - [ ] CrewAI
-> The `autogen_agentchat` package belongs to Microsoft's rewritten AutoGen. AG2 and AutoGen 0.2 use
-> `import autogen` with `ConversableAgent`-style classes.
+> The `autogen_agentchat` package belongs to Microsoft's rewritten AutoGen, now archived. AG2 Classic
+> and AutoGen 0.2 use `import autogen` with `ConversableAgent`-style classes; AG2 v1 uses `import ag2`.
 
 ### Q: Why combine TextMentionTermination with MaxMessageTermination?
 - [ ] Because TextMentionTermination only works with one agent

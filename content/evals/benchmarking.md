@@ -21,11 +21,14 @@ related:
   - system-design/model-selection
   - model-internals/reasoning-models-test-time-compute
   - agent-reliability/task-completion-rate
+  - tool-labs/inspect-ai-agent-evals-lab
 sources:
   - Hendrycks et al., 2020 — Measuring Massive Multitask Language Understanding
   - Chen et al., 2021 — Evaluating Large Language Models Trained on Code
   - Jimenez et al., 2023 — SWE-bench: Can Language Models Resolve Real-World GitHub Issues?
   - Rein et al., 2023 — GPQA: A Graduate-Level Google-Proof Q&A Benchmark
+  - OpenAI, 2026 — Why we no longer evaluate SWE-bench Verified
+  - Scale AI — SWE-Bench Pro: Can AI Agents Solve Long-Horizon Software Engineering Tasks?
 ---
 
 ## TL;DR
@@ -130,6 +133,10 @@ pass@k = 1 − C(n−c, k) / C(n, k)
 - **Measures** agentic software engineering: navigating a codebase, editing, running tests.
 - **Sharp edge: it is a *system* score.** The scaffold (agent loop, tools, retries) moves results as
   much as the model, so "model X scores Y%" is incomplete without the scaffold and the cost per task.
+- **Status (checked 2026-11):** Verified is no longer the default comparison. OpenAI stopped reporting
+  it on 2026-02-23 and recommends SWE-bench Pro, Scale AI's harder successor (1,865 tasks from 41
+  repositories; the original public set has 731, and the V2 public split from 2026-09-22 has 642).
+  See the case study under Examples.
 
 ### GPQA: expert reasoning that search cannot shortcut
 - **What it is:** 448 four-option questions in biology, physics and chemistry, written by domain experts
@@ -176,8 +183,9 @@ pass@k = 1 − C(n−c, k) / C(n, k)
 ### What agent builders take from this
 | Your agent | Shortlist signal | Then decide on |
 |---|---|---|
-| Coding agent | SWE-bench Verified with scaffold and cost per task | Your repos and tasks through your own loop |
-| Tool-calling support agent | Tool-calling benchmarks, instruction following | Your golden tasks with seeded tools, run several times each |
+| Coding agent | SWE-bench Pro with scaffold and cost per task | Your repos and tasks through your own loop |
+| Terminal or DevOps agent | Terminal-Bench 2.0 (89 tasks, 2025-11), run in containers by the Harbor harness (harbor 0.25.0, 2026-11) | Your own shell tasks in the same sandbox |
+| Tool-calling support agent | Tool-calling benchmarks (BFCL, τ-bench), instruction following | Your golden tasks with seeded tools, run several times each |
 | Research or RAG agent | Knowledge and reasoning (MMLU-style, GPQA) | Your documents, retrieval and citation checks |
 
 - **Agentic scores need a cost column.** A higher resolved rate bought with many more steps per task
@@ -225,8 +233,8 @@ flowchart TD
 
 ## Examples
 ### Agent scenario: picking the model for a coding agent
-Numbers illustrative. Three candidates run 500 SWE-bench Verified instances through *your* agent loop
-and tools, one attempt each, with token cost logged per task.
+Numbers illustrative. Three candidates run a fixed 500-task sample of the SWE-bench Pro public set
+through *your* agent loop and tools, one attempt each, with token cost logged per task.
 
 | Model | Resolved | 95% interval | Mean cost per task | Cost per resolved issue |
 |---|---|---|---|---|
@@ -289,17 +297,34 @@ reaches a selection memo.
 | Source | B's number copied from an older report | Re-run both under one protocol or discard |
 | Decision | Both models shortlisted | Run both through your golden dataset and scaffold |
 
+### Case study: SWE-bench Verified retired for contamination (checked 2026-11)
+The benchmark lifecycle from "Why it exists", on the benchmark most coding-agent tables used.
+
+| Date | Event | Lesson for your memo |
+|---|---|---|
+| 2024 | Verified: 500 human-screened SWE-bench instances become the default coding number | A screened subset fixes label noise, not leakage |
+| 2026-02-23 | OpenAI stops reporting Verified: its repos are in training data, and an audit of 138 hard problems found too-narrow or too-broad tests | Gains near the ceiling measure exposure and test flaws |
+| 2026-02-23 | OpenAI recommends reporting SWE-bench Pro until new uncontaminated evals exist | Follow the successor, but read its protocol |
+| 2026-09-22 | Scale AI releases the V2 public split: 642 tasks from 11 repositories, after dropping 89 of the 731 that its review found invalid | Quote the version; V1 and V2 scores do not compare |
+
+- **What to change:** treat a Verified score as background only, shortlist on SWE-bench Pro, and keep a
+  private look-alike set, because every public set goes the same way.
+
 ## Production patterns
 - **Model-selection memo with protocol and intervals.** For each shortlisted model, record the score,
   the subset, shots, chain-of-thought setting, pass@1 or pass@k, scaffold, date, and the 95% interval
   computed as above. Monitor how often memo rankings agree with the golden-dataset run that follows.
 - **Reproduce before trusting.** Re-run claimed scores with an open harness such as EleutherAI's
   lm-evaluation-harness (for example `lm_eval --tasks mmlu --num_fewshot 5`, plus `--model` and
-  `--model_args` naming the model under test; flags as of lm-eval 0.4.x) or Inspect, pinning the
-  same protocol for every model. Monitor the gap between your number and the reported one.
-- **Benchmark in your own scaffold.** For coding agents, run SWE-bench Verified instances through your
-  agent loop and tools, and log resolved rate and cost per task together. Monitor cost per resolved
-  issue across model candidates, not just resolved rate.
+  `--model_args` naming the model under test; flags as of lm-eval 0.4.x) or the `inspect_evals`
+  benchmark suite, pinning the same protocol for every model. Monitor the gap between your number and
+  the reported one.
+- **Inspect is more than a benchmark runner.** Inspect itself (inspect-ai 0.3.287, 2026-11) is mainly
+  a framework for sandboxed agent evals that grade the final environment state; see the Inspect AI lab.
+- **Benchmark in your own scaffold.** For coding agents, run SWE-bench Pro public instances through your
+  agent loop and tools (the Harbor registry lists them as `scale-ai/swe-bench-pro`), and log resolved
+  rate and cost per task together. Monitor cost per resolved issue across candidates, not just resolved
+  rate.
 - **Repeat small benchmarks.** For sampled or reasoning models on sets like GPQA Diamond, average
   several runs per item and report mean and spread. Monitor run-to-run spread; if it exceeds the gap
   you are deciding on, the benchmark cannot decide.
@@ -398,8 +423,8 @@ nothing more.
   the model, and the vendor likely used its own.
 - **Check the subset and protocol:** Verified (500), Lite (300) and the full set (about 2,300) are
   different item sets, and attempts allowed per task change the number.
-- **Fix the comparison:** run SWE-bench Verified instances through your own scaffold and log resolved
-  rate together with cost per task.
+- **Fix the comparison:** run SWE-bench Pro instances (not the contaminated Verified set) through your
+  own scaffold and log resolved rate together with cost per task.
 
 ### How would you pick the model for a new tool-calling support agent?
 - **Shortlist on public signals:** tool-calling and instruction-following benchmarks, read with their

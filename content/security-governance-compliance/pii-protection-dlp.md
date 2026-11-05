@@ -17,7 +17,7 @@ related:
   - data-architecture/data-retention-and-deletion-architecture
   - observability/logging
 sources:
-  - Official docs: Microsoft Presidio
+  - Official docs: Presidio (data-privacy-stack/presidio, formerly Microsoft)
   - NIST, 2010 — SP 800-122, Guide to Protecting the Confidentiality of Personally Identifiable Information
   - Regulation (EU) 2016/679 — General Data Protection Regulation
 ---

@@ -139,6 +139,21 @@ agent needs, and the 4 order tools as native functions.
 | Community servers | Thousands in directories | Mostly stdio | Unknown code running with your credentials |
 | Internal servers | Ticketing, CRM, data warehouse at your company | Remote HTTP | Your own review, auth and SLOs |
 
+### Build or buy: managed integration platforms (checked 2026-11)
+A managed platform hosts many app integrations and the per-user OAuth behind them, and exposes them as
+tools or MCP. You buy breadth and auth handling; you give a vendor your users' tokens and your tool
+descriptions. Use one when an agent needs many SaaS apps with end-user accounts.
+
+| Platform | What you get | Watch for |
+|---|---|---|
+| Composio (`composio` 0.31.x) | 1,000+ apps in its docs (1,500+ on its site); sessions are the recommended entry point and load app schemas on demand | A session is long-lived and acts as one user: keep `session.mcp.url` and its headers server-side, and scope toolkits per session |
+| Arcade (`arcade-mcp` 1.17.x) | Tool-calling platform with user auth, plus a framework for your own MCP servers | `arcade-ai` was renamed to `arcade-mcp` |
+| Zapier MCP | Zapier's app actions exposed as an MCP server | Enable only the actions the agent needs; each one is a tool definition in context |
+| Pipedream | 3,000+ prebuilt connectors for agents | Now owned by Workday (deal announced 2025-11-19, closed per Workday's 2026-02-24 results); check roadmap fit |
+
+- **When building wins.** Fewer than a handful of apps, strict residency, or tools on your own data:
+  native tools or your own server, as in the decision case above.
+
 ### Clients that load servers
 - **Chat and desktop apps:** Claude (desktop and web connectors), ChatGPT (connectors and developer
   features), and others; check each app's current docs for which transports and auth they support.

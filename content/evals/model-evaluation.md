@@ -37,8 +37,9 @@ prompt, tool or model change.
   schemas, retrieval and a multi-step loop. One reworded tool description can change which tool gets
   picked on step 3. Without an eval, every such edit is a guess you ship to users.
 - **Where it shows up in your stack.** Eval frameworks and tracing platforms (LangSmith, Braintrust,
-  promptfoo, Inspect, OpenAI Evals) store datasets, run your agent over them and attach graders to
-  traces; a CI job runs them on every pull request.
+  promptfoo, Inspect) store datasets, run your agent over them and attach graders to traces; a CI job
+  runs them on every pull request. OpenAI's hosted Evals API and dashboard are read-only since 2026-10-31
+  and shut down on 2026-11-30 (checked 2026-11); the open-source `openai/evals` repo is a separate, older framework.
 - **What you control.** The task set, what you grade (final answer, final state, the trajectory of tool
   calls), the grader for each, the slices you report, and the rule that turns scores into ship or block.
 - **What you can skip.** Building yet another leaderboard or arguing about benchmark rankings. Know how

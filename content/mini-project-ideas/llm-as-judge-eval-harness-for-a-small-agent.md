@@ -18,7 +18,7 @@ related:
   - evals/tooling
   - evals/regression-tests
 sources:
-  - OpenAI Evals documentation
+  - openai/evals repository (open-source framework; OpenAI's hosted Evals API shuts down 2026-11-30)
   - Inspect AI documentation
   - promptfoo documentation
 ---
@@ -179,7 +179,9 @@ def test_gate_blocks_drops_beyond_margin():
 - **Cases:** `cases.jsonl` with `question`, `reference`, `expected_tool`, `max_steps` and a `tags` list (lookup,
   multi-step, should-refuse, adversarial).
 - **Judge:** a different model from the agent where possible, temperature 0, JSON verdicts.
-- **Optional frameworks:** Inspect AI, promptfoo or OpenAI Evals once the hand-rolled version works.
+- **Optional frameworks:** Inspect AI, promptfoo or the open-source `openai/evals` framework once the
+  hand-rolled version works. Not OpenAI's hosted Evals API: it shuts down on 2026-11-30 (checked
+  2026-11) and OpenAI points its users to promptfoo.
 
 ### Three layers of scoring
 | Layer | Examples | Cost |
@@ -290,8 +292,8 @@ Illustrative numbers showing the shape of a length-bias incident; your own will 
   humans to calibrate the judge rather than replacing either.
 - **Reference-based vs reference-free judging.** References make verdicts more reliable but cost labelling time;
   reference-free rubrics suit open-ended tasks with lower agreement.
-- **Hand-rolled harness vs a framework.** Your script is transparent and tiny; Inspect AI, promptfoo or OpenAI Evals add
-  logging, viewers and parallelism, with their own conventions to learn.
+- **Hand-rolled harness vs a framework.** Your script is transparent and tiny; Inspect AI, promptfoo or the open-source `openai/evals`
+  framework add logging, viewers and parallelism, with their own conventions to learn.
 - **Strong judge vs cheap judge.** A stronger judge agrees more with humans but costs more per run; measure kappa for
   both and pick the cheapest that meets your bar.
 

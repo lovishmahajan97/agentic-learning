@@ -167,6 +167,7 @@ Where training runs is a separate decision:
 |---|---|---|
 | **Provider's hosted fine-tuning API** | Least engineering | Data goes to that provider (the data agreement must allow it); the tuned model typically lives only there and cannot be exported; when the provider retires the base model you retrain on whatever replaces it |
 | **Self-hosted on an open model** | Data stays in the customer's boundary; portable adapter | You own GPUs, the training stack and serving |
+| **Tuning in the customer's own cloud (checked 2026-11)** | Bedrock, Vertex AI or Azure Foundry tuning runs under the customer's existing cloud agreement and region | Base models are the platform's list (Bedrock reinforcement fine-tuning: qwen3-32b and gpt-oss-20b since 2026-02-17; Azure gpt-4o and gpt-4o-mini fine-tuning only for customers onboarded by 2026-03-31); check whether weights can be exported |
 
 - **Distillation has its own terms.** If training targets are outputs of a large prompted model, check
   that model's terms too: some providers restrict using outputs to train other models.

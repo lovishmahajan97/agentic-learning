@@ -22,7 +22,7 @@ related:
   - data-architecture/data-retention-and-deletion-architecture
   - rag-retrieval/acl-aware-retrieval
 sources:
-  - Official docs: Microsoft Presidio
+  - Official docs: Presidio (data-privacy-stack/presidio, formerly Microsoft)
   - NIST, 2010 — SP 800-122, Guide to Protecting the Confidentiality of PII
 ---
 
@@ -76,7 +76,7 @@ agent able to reason and act.
 1. **Patterns with checksums.** Regex plus a validity check: Luhn for card numbers, mod-97 for IBANs,
    structural rules for national ids. The checksum exists *because* format alone matches too much; any
    16-digit order number looks like a card.
-2. **NER models.** Statistical taggers (spaCy, transformer NER, the recognizers in Microsoft Presidio)
+2. **NER models.** Statistical taggers (spaCy, transformer NER, the recognizers in Presidio)
    find names, locations and organisations that have no fixed format. Recall is good on common,
    well-cased English text and drops on unusual names, other languages, lowercase chat and OCR noise.
 3. **LLM-based detection.** Best recall on messy text and novel identifier types, at the price of another
@@ -238,6 +238,71 @@ print(Redactor().redact("Order 1234567890123456 shipped 2026-09-30; call me on 0
 # swallowed it and the date: precision failures that break a support workflow. Real phone detection
 # needs per-locale rules (or a library such as phonenumbers) plus context words, not one regex.
 ```
+
+### Presidio: a custom recognizer and per-entity recall on the fixtures
+The same two fixtures, plus one CRM line carrying the customer's own policy-id format, go through
+Presidio's `AnalyzerEngine` with a custom `PatternRecognizer`, then `AnonymizerEngine`. The script
+scores recall per entity type against hand labels, which is the number this lesson asks you to track.
+- **Checked against** presidio-analyzer and presidio-anonymizer 2.2.366 (Python 3.11+), spacy 3.8.18
+  and en_core_web_sm 3.8.0 on Python 3.12, 2026-11. Install the spaCy model wheel yourself; the default
+  configuration loads the larger en_core_web_lg.
+
+```python
+# pip install presidio-analyzer==2.2.366 presidio-anonymizer==2.2.366, plus the en_core_web_sm 3.8.0 wheel
+from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
+from presidio_analyzer.nlp_engine import NlpEngineProvider
+from presidio_anonymizer import AnonymizerEngine
+
+nlp = NlpEngineProvider(nlp_configuration={"nlp_engine_name": "spacy",
+      "models": [{"lang_code": "en", "model_name": "en_core_web_sm"}]}).create_engine()
+analyzer = AnalyzerEngine(nlp_engine=nlp, supported_languages=["en"])
+analyzer.registry.add_recognizer(PatternRecognizer(          # the customer's own format
+    supported_entity="POLICY_ID", context=["policy"],
+    patterns=[Pattern("policy id", r"\bPOL-\d{8}\b", 0.6)]))
+
+ENTITIES = ["PERSON", "EMAIL_ADDRESS", "PHONE_NUMBER", "CREDIT_CARD", "POLICY_ID"]
+FIXTURES = [  # (text, hand labels as (entity, exact substring))
+    ("Hi, I'm Dana (dana.k@example.com, +1 415 555 0134). Card 4111 1111 1111 1111 was charged twice.",
+     [("PERSON", "Dana"), ("EMAIL_ADDRESS", "dana.k@example.com"),
+      ("PHONE_NUMBER", "+1 415 555 0134"), ("CREDIT_CARD", "4111 1111 1111 1111")]),
+    ("Order 1234567890123456 shipped 2026-09-30; call me on 07700 900123.",
+     [("PHONE_NUMBER", "07700 900123")]),
+    ("Claim on policy POL-20481193 filed by priya.n@example.org.",
+     [("POLICY_ID", "POL-20481193"), ("EMAIL_ADDRESS", "priya.n@example.org")]),
+]
+
+hits, totals = {}, {}
+for text, labels in FIXTURES:
+    found = analyzer.analyze(text, language="en", entities=ENTITIES, score_threshold=0.3)
+    for ent, value in labels:
+        start = text.index(value)
+        totals[ent] = totals.get(ent, 0) + 1
+        if any(r.entity_type == ent and r.start <= start and r.end >= start + len(value) for r in found):
+            hits[ent] = hits.get(ent, 0) + 1
+    print(AnonymizerEngine().anonymize(text=text, analyzer_results=found).text)
+
+for ent in ENTITIES:
+    print(f"{ent:<14} recall {hits.get(ent, 0)}/{totals[ent]}")
+# Hi, I'm <PERSON> (<EMAIL_ADDRESS>, <PHONE_NUMBER>). Card <CREDIT_CARD> was charged twice.
+# Order 1234567890123456 shipped 2026-09-30; call me on <PHONE_NUMBER>.
+# Claim on policy <POLICY_ID> filed by <EMAIL_ADDRESS>.
+# PERSON         recall 1/1
+# EMAIL_ADDRESS  recall 2/2
+# PHONE_NUMBER   recall 2/2
+# CREDIT_CARD    recall 1/1
+# POLICY_ID      recall 1/1
+```
+
+- **NER caught "Dana",** which the regex redactor missed, and the Luhn-checked card recognizer left
+  the order number alone.
+- **Thresholds are per entity in practice.** Both phones scored 0.4, so `score_threshold=0.5` drops
+  phone recall to 0/2 while every other type stays at full recall.
+- **The `entities=` list is a precision control.** Without it, this run also tagged "0134" and the
+  order number as DATE_TIME and the email as an ORGANIZATION.
+- **The default operator writes `<PERSON>`,** with no number, so coreference needs a custom operator or
+  the vault-based redactor above.
+- **For more name recall,** Presidio ships a `GLiNERRecognizer` (needs the `gliner` package); score it
+  on the same fixtures before switching.
 
 ### Keyed pseudonyms and a streaming re-hydrator
 Standard library only. The HMAC pseudonym is stable for joins but cannot be reversed by enumerating

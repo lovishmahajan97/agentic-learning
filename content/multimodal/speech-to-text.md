@@ -119,6 +119,8 @@ can hallucinate fluent text or loop on a phrase. The reference implementation's 
 | Smaller models | several times faster, noticeably less accurate, especially on accents and non-English |
 | faster-whisper (CTranslate2), whisper.cpp (CPUs, Apple silicon) | same weights, lower memory, higher throughput |
 | WhisperX | forced alignment with a phoneme model for accurate word timestamps, plus speaker diarization, which Whisper itself does not do |
+| large-v3-turbo (MIT, 2026-11) | large-v3 with the decoder cut from 32 to 4 layers: much faster, close in accuracy; trained for transcription, not translation. faster-whisper loads it as `"large-v3-turbo"` |
+| Parakeet-TDT-0.6B-v3 (CC-BY-4.0, 2026-11) | NVIDIA, not Whisper: 600M-parameter FastConformer encoder with a token-and-duration transducer decoder, 25 European languages, run with NeMo |
 
 ### Streaming is not native
 - **Whisper is a batch model** because of its 30-second encoder window.
@@ -126,6 +128,10 @@ can hallucinate fluent text or loop on a phrase. The reference implementation's 
   latency and can flicker.
 - **Streaming-native models** (RNN-transducer or chunked-attention encoders, as in several managed ASR
   APIs) emit words as they arrive with sub-second delay.
+- **Dated examples (checked 2026-11).** OpenAI GPT-Realtime-Whisper streams transcript deltas through
+  Realtime transcription sessions. Deepgram Flux (`flux-general-en`) adds end-of-turn detection to the
+  transcript; Deepgram Nova-3 is its general streaming model. NVIDIA Parakeet runs in streaming mode
+  through a NeMo chunking script.
 - **For a live voice agent,** that difference drives the architecture more than the error rate does.
 
 ### ASR inside an agent turn
@@ -189,6 +195,9 @@ flowchart TD
 Transcribe a call recording with faster-whisper, using VAD to suppress silence hallucinations and word
 timestamps for alignment, then write out segments. The `initial_prompt` seeds the decoder with domain
 vocabulary so product names are spelled consistently.
+- **Pin it.** Checked against faster-whisper 1.2.1, 2026-11: `pip install "faster-whisper==1.2.*" "av<19"`.
+  With PyAV 19.0.2, decoding fails with `open() got an unexpected keyword argument 'metadata_errors'`;
+  PyAV 18.1.0 works.
 
 ```python
 from faster_whisper import WhisperModel
