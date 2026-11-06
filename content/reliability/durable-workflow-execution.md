@@ -285,7 +285,8 @@ class TicketReplyWorkflow:
   legitimately get a second reply from a later workflow, while a retry of this step must never send twice.
 
 ### A durable tool-calling agent loop
-The same conventions applied to a whole agent loop, in outline:
+The same conventions applied to a whole agent loop, in outline. tool-labs/temporal-durable-agent-lab builds it
+end to end with replay tests.
 
 - **One activity asks the model for the next action (`call_model`), one runs the chosen tool
   (`run_tool`),** and the step budget (for example 200) lives in workflow state, so it is deterministic and

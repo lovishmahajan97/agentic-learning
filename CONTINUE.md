@@ -22,8 +22,8 @@
 - Checks: 677/677 valid; 40/40 guides; every diagram parses. Changes vs tag `pre-tools` are deliberate
   fixes (quiz answers and code updated for changed APIs), reviewed by hand.
 - Skipped, unverified: SWE-bench Pro 642-task count, Tinker cached-prefill meter, Vertex AI sub-product
-  renames, running Unsloth and Axolotl examples (need CUDA). Not done: shrinking the Temporal loop in
-  `reliability/durable-workflow-execution.md` to a link to the new lab.
+  renames, running Unsloth and Axolotl examples (need CUDA). Done: the Temporal loop in
+  `reliability/durable-workflow-execution.md` is an outline that links to the new lab.
 - Workflow script: scratchpad `tools/apply.workflow.js` (not in repo); pins are re-checkable on PyPI/npm.
 
 
